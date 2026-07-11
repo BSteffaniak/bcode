@@ -337,9 +337,14 @@ pub async fn compact_context_with_selected_backend(
         .as_deref()
         .ok_or(CompactionError::ProviderUnavailable)?;
     let capabilities = provider_context_management_capabilities(state, selection).await;
+    let context_format = capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.context_format.as_ref())
+        .filter(|format| format.version > 0 && !format.compatibility_key.trim().is_empty());
     let native_supported = capabilities
         .as_ref()
-        .is_some_and(|capabilities| capabilities.native_compaction);
+        .is_some_and(|capabilities| capabilities.native_compaction)
+        && context_format.is_some();
     if !native_supported {
         return match state.auto_compaction.backend {
             bcode_config::CompactionBackend::ProviderNative => Err(CompactionError::Provider(
@@ -357,14 +362,8 @@ pub async fn compact_context_with_selected_backend(
         Some(provider_plugin_id),
         Some(&model_id),
         selection.provider_context.auth_profile.as_deref(),
-        capabilities
-            .as_ref()
-            .and_then(|capabilities| capabilities.context_format.as_ref())
-            .map(|format| format.version),
-        capabilities
-            .as_ref()
-            .and_then(|capabilities| capabilities.context_format.as_ref())
-            .map(|format| format.compatibility_key.as_str()),
+        context_format.map(|format| format.version),
+        context_format.map(|format| format.compatibility_key.as_str()),
     );
     let response = state
         .plugins
@@ -383,7 +382,11 @@ pub async fn compact_context_with_selected_backend(
         )
         .await;
     match response {
-        Ok(response) if !response.messages.is_empty() => {
+        Ok(response)
+            if !response.messages.is_empty()
+                && response.context_format.version > 0
+                && !response.context_format.compatibility_key.trim().is_empty() =>
+        {
             let encoded = serde_json::to_string(&response.messages).map_err(|error| {
                 CompactionError::Provider(format!(
                     "failed to encode provider-native compacted context: {error}"
@@ -400,8 +403,12 @@ pub async fn compact_context_with_selected_backend(
                 portable_summary: String::new(),
             }))
         }
-        Ok(_) => Err(CompactionError::Provider(
+        Ok(response) if response.messages.is_empty() => Err(CompactionError::Provider(
             "provider returned empty native compacted context".to_string(),
+        )),
+        Ok(_) => Err(CompactionError::Provider(
+            "provider returned native compacted context without a non-empty versioned compatibility key"
+                .to_string(),
         )),
         Err(error)
             if matches!(

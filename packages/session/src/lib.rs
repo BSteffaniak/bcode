@@ -4126,6 +4126,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clone_before_any_boundary_preserves_uncompacted_context() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let source = manager
+            .create_session(Some("source".to_string()), test_working_directory())
+            .await
+            .expect("source");
+        manager
+            .append_user_message(source.id, ClientId::new(), "prompt".to_string())
+            .await
+            .expect("prompt");
+        manager
+            .append_assistant_message(source.id, "response".to_string())
+            .await
+            .expect("response");
+        let clone = manager.clone_session(source.id, None).await.expect("clone");
+        let context = manager
+            .model_context_events(clone.session.id)
+            .await
+            .expect("context");
+        assert!(context.iter().any(|event| matches!(&event.kind, SessionEventKind::UserMessage { text, .. } if text == "prompt")));
+        assert!(context.iter().any(|event| matches!(&event.kind, SessionEventKind::AssistantMessage { text } if text == "response")));
+        assert!(!context.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn clone_after_provider_boundary_preserves_rewritten_canonical_context() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let source = manager
+            .create_session(Some("source".to_string()), test_working_directory())
+            .await
+            .expect("source");
+        let old = manager
+            .append_assistant_message(source.id, "old".to_string())
+            .await
+            .expect("old");
+        manager
+            .append_event(
+                source.id,
+                SessionEventKind::ProviderContextCompacted {
+                    snapshot: provider_snapshot(),
+                    compacted_through_sequence: old.sequence,
+                },
+            )
+            .await
+            .expect("boundary");
+        manager
+            .append_assistant_message(source.id, "tail".to_string())
+            .await
+            .expect("tail");
+        let clone = manager.clone_session(source.id, None).await.expect("clone");
+        let context = manager
+            .model_context_events(clone.session.id)
+            .await
+            .expect("context");
+        assert_eq!(
+            context
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ProviderContextCompacted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(!context.iter().any(|event| matches!(&event.kind, SessionEventKind::AssistantMessage { text } if text == "old")));
+        assert!(context.iter().any(|event| matches!(&event.kind, SessionEventKind::AssistantMessage { text } if text == "tail")));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
     async fn append_event_with_provenance_persists_source_metadata() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");

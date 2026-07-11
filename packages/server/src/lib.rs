@@ -19731,7 +19731,7 @@ mod tests {
                     provider_plugin_id: "provider-a".to_string(),
                     model_id: "model-a".to_string(),
                     compatibility_key: "surface-a".to_string(),
-                    auth_profile: None,
+                    auth_profile: Some("profile-a".to_string()),
                     origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
                     messages_json: serde_json::to_string(&provider_messages).expect("messages"),
                     portable_summary: "portable context".to_string(),
@@ -19745,25 +19745,68 @@ mod tests {
             1_000,
             Some("provider-a"),
             Some("model-a"),
-            None,
+            Some("profile-a"),
             Some(1),
             Some("surface-a"),
         );
-        let mismatched = session_events_to_model_messages_for_target(
+        let mismatched = [
+            (
+                Some("provider-b"),
+                Some("model-a"),
+                Some("profile-a"),
+                Some(1),
+                Some("surface-a"),
+            ),
+            (
+                Some("provider-a"),
+                Some("model-b"),
+                Some("profile-a"),
+                Some(1),
+                Some("surface-a"),
+            ),
+            (
+                Some("provider-a"),
+                Some("model-a"),
+                Some("profile-b"),
+                Some(1),
+                Some("surface-a"),
+            ),
+            (
+                Some("provider-a"),
+                Some("model-a"),
+                Some("profile-a"),
+                Some(2),
+                Some("surface-a"),
+            ),
+            (
+                Some("provider-a"),
+                Some("model-a"),
+                Some("profile-a"),
+                Some(1),
+                Some("surface-b"),
+            ),
+        ]
+        .map(|(provider, model, auth, version, key)| {
+            session_events_to_model_messages_for_target(
+                &history, 1_000, provider, model, auth, version, key,
+            )
+        });
+
+        let matching_after_switch_back = session_events_to_model_messages_for_target(
             &history,
             1_000,
-            Some("provider-b"),
-            Some("model-b"),
-            None,
+            Some("provider-a"),
+            Some("model-a"),
+            Some("profile-a"),
             Some(1),
             Some("surface-a"),
         );
-
         assert_eq!(matching, provider_messages);
-        assert!(matches!(
-            &mismatched[0].content[0],
+        assert_eq!(matching_after_switch_back, provider_messages);
+        assert!(mismatched.iter().all(|messages| matches!(
+            &messages[0].content[0],
             ContentBlock::Text { text } if text.contains("portable context")
-        ));
+        )));
     }
 
     #[test]

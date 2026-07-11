@@ -4342,6 +4342,28 @@ mod tests {
     }
 
     #[test]
+    fn live_usage_from_different_provider_or_model_is_rejected() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        for (provider, model) in [("other", "model"), ("provider", "other")] {
+            let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+            let mut snapshot = usage_snapshot(bcode_session_models::ContextUsageSource::Provider);
+            snapshot.provider_plugin_id = provider.to_string();
+            snapshot.model_id = model.to_string();
+            app.apply_session_event(
+                &context_event(2, SessionEventKind::ContextUsageObserved { snapshot }),
+                SessionEventApplication::Live,
+            );
+            assert_eq!(app.token_usage.latest_context_input_tokens, None);
+        }
+    }
+
+    #[test]
     fn live_estimated_usage_preserves_approximate_source() {
         let history = vec![context_event(
             1,
@@ -4412,6 +4434,83 @@ mod tests {
             messages_json: "[]".to_string(),
             portable_summary: "portable".to_string(),
         }
+    }
+
+    #[test]
+    fn live_and_replay_context_semantics_are_equivalent() {
+        let events = vec![
+            context_event(
+                1,
+                SessionEventKind::ModelChanged {
+                    provider: "provider".to_string(),
+                    model: "model".to_string(),
+                },
+            ),
+            context_event(
+                2,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Estimated),
+                },
+            ),
+            context_event(
+                3,
+                SessionEventKind::ProviderContextCompacted {
+                    snapshot: provider_context_snapshot(
+                        bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
+                    ),
+                    compacted_through_sequence: 2,
+                },
+            ),
+        ];
+        let replayed = BmuxApp::new_with_history(None, &events, &[], false);
+        let mut live = BmuxApp::new_with_history(None, &[], &[], false);
+        for event in &events {
+            live.apply_session_event(event, SessionEventApplication::Live);
+        }
+        assert_eq!(
+            live.token_usage.latest_context_input_tokens,
+            replayed.token_usage.latest_context_input_tokens
+        );
+        assert_eq!(
+            live.token_usage.context_usage_estimated,
+            replayed.token_usage.context_usage_estimated
+        );
+        let projection = |app: &BmuxApp| {
+            app.transcript
+                .iter()
+                .map(|item| (item.role, item.text.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(projection(&live), projection(&replayed));
+    }
+
+    #[test]
+    fn provider_snapshot_transcript_never_displays_opaque_or_portable_data() {
+        let mut snapshot = provider_context_snapshot(
+            bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+        );
+        snapshot.messages_json = "opaque-secret".to_string();
+        snapshot.portable_summary = "portable-secret".to_string();
+        let app = BmuxApp::new_with_history(
+            None,
+            &[context_event(
+                1,
+                SessionEventKind::ProviderContextCompacted {
+                    snapshot,
+                    compacted_through_sequence: 0,
+                },
+            )],
+            &[],
+            false,
+        );
+        let rendered = app
+            .transcript
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("opaque-secret"));
+        assert!(!rendered.contains("portable-secret"));
     }
 
     #[test]

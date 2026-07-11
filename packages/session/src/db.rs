@@ -2663,6 +2663,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_snapshot_opaque_json_survives_exact_db_persistence_and_replay() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open db");
+        let opaque = r#"[{"type":"provider_state","nested":{"escaped":"a\\nb","order":[3,2,1]},"unicode":"λ"}]"#;
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ProviderContextCompacted {
+                snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 7,
+                    provider_plugin_id: "provider".to_string(),
+                    model_id: "model".to_string(),
+                    compatibility_key: "surface".to_string(),
+                    auth_profile: Some("profile".to_string()),
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: opaque.to_string(),
+                    portable_summary: "portable".to_string(),
+                },
+                compacted_through_sequence: 0,
+            },
+        ))
+        .await
+        .expect("append snapshot");
+        drop(db);
+
+        let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("reopen db");
+        let context = reopened.model_context_events().await.expect("context");
+        let SessionEventKind::ProviderContextCompacted { snapshot, .. } = &context[0].kind else {
+            panic!("expected provider snapshot");
+        };
+        assert_eq!(snapshot.messages_json.as_bytes(), opaque.as_bytes());
+        assert_eq!(snapshot.format_version, 7);
+        assert_eq!(snapshot.compatibility_key, "surface");
+        assert_eq!(snapshot.auth_profile.as_deref(), Some("profile"));
+    }
+
+    #[tokio::test]
+    async fn normal_model_context_read_is_non_mutating_and_does_not_replay_replaced_prefix() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open db");
+        db.append_event(&message(session_id, 0, "old"))
+            .await
+            .expect("old");
+        db.append_event(&local_marker(session_id, 1, 0))
+            .await
+            .expect("marker");
+        db.append_event(&message(session_id, 2, "tail"))
+            .await
+            .expect("tail");
+        db.database()
+            .update("events")
+            .value("payload", "not valid json")
+            .where_eq("event_seq", seq_to_value(0))
+            .execute(db.database())
+            .await
+            .expect("corrupt replaced prefix");
+        let rows_before = db
+            .database()
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .sort("event_seq", SortDirection::Asc)
+            .execute(db.database())
+            .await
+            .expect("before");
+
+        let context = db
+            .model_context_events()
+            .await
+            .expect("bounded context read");
+
+        assert_eq!(
+            context
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let rows_after = db
+            .database()
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .sort("event_seq", SortDirection::Asc)
+            .execute(db.database())
+            .await
+            .expect("after");
+        assert_eq!(rows_before, rows_after);
+        assert_eq!(db.last_event_sequence().await.expect("last"), Some(2));
+    }
+
+    #[tokio::test]
     async fn model_context_events_start_at_latest_compaction() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
