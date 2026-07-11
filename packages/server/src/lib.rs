@@ -12283,43 +12283,9 @@ fn portable_content_block(block: &ContentBlock) -> String {
 }
 
 fn estimated_model_request_tokens(request: &ModelTurnRequest) -> u64 {
-    let message_chars = request
-        .messages
-        .iter()
-        .map(model_message_context_chars)
-        .sum::<usize>();
-    let system_chars = request
-        .system_prompt
-        .as_deref()
-        .map_or(0, |prompt| prompt.chars().count());
-    let tool_chars = request
-        .tools
-        .iter()
-        .map(|tool| {
-            tool.name.chars().count()
-                + tool.description.chars().count()
-                + tool.input_schema.to_string().chars().count()
-        })
-        .sum::<usize>();
-    let extension_chars = request
-        .provider_context
-        .request
-        .iter()
-        .map(|(key, value)| {
-            key.chars().count()
-                + serde_json::to_string(value).map_or(0, |value| value.chars().count())
-        })
-        .sum::<usize>();
-    let structural_chars = request.messages.len().saturating_mul(16)
-        + request.tools.len().saturating_mul(24)
-        + request.metadata.len().saturating_mul(8);
-    estimated_tokens_from_chars(
-        message_chars
-            .saturating_add(system_chars)
-            .saturating_add(tool_chars)
-            .saturating_add(extension_chars)
-            .saturating_add(structural_chars),
-    )
+    serde_json::to_string(request).map_or(u64::MAX, |serialized| {
+        estimated_tokens_from_chars(serialized.chars().count())
+    })
 }
 
 fn model_request_metric_labels(
@@ -16793,6 +16759,147 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn overflow_recovery_retries_at_most_once() {
+        let decision = CompactionDecision {
+            strategy: AutomaticCompactionStrategy::OverflowOnly,
+            overflow_recovery: true,
+            reason: "test",
+        };
+        let error = bcode_model::ProviderError {
+            category: bcode_model::ProviderErrorCategory::ContextLength,
+            code: "context_length_exceeded".to_string(),
+            message: "too large".to_string(),
+            retryable: false,
+            retry: None,
+            provider_message: None,
+        };
+
+        assert!(should_retry_after_context_overflow(decision, &error, false));
+        assert!(!should_retry_after_context_overflow(decision, &error, true));
+    }
+
+    fn request_for_accounting_tests() -> ModelTurnRequest {
+        ModelTurnRequest {
+            session_id: SessionId::new(),
+            turn_id: "turn".to_string(),
+            model_id: "model".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: Some("system".to_string()),
+            messages: vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "message".to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            parameters: bcode_model::ModelParameters::default(),
+            structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn request_estimate_accounts_for_every_serialized_request_component() {
+        let baseline = request_for_accounting_tests();
+        let baseline_tokens = estimated_model_request_tokens(&baseline);
+        let assert_increases = |mutate: fn(&mut ModelTurnRequest)| {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            assert!(estimated_model_request_tokens(&request) > baseline_tokens);
+        };
+
+        assert_increases(|request| {
+            request.system_prompt = Some("system instructions ".repeat(100));
+        });
+        assert_increases(|request| {
+            request.messages.push(ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "assistant context ".repeat(100),
+                }],
+            });
+        });
+        assert_increases(|request| {
+            request.tools.push(bcode_model::ToolDefinition {
+                name: "large_tool".to_string(),
+                description: "tool description ".repeat(100),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"large": {"description": "schema ".repeat(100)}}
+                }),
+                side_effect: bcode_model::ToolSideEffect::ReadOnly,
+                requires_permission: false,
+            });
+        });
+        assert_increases(|request| {
+            request.provider_context.request.insert(
+                "extension".to_string(),
+                serde_json::json!({"payload": "extension ".repeat(100)}).into(),
+            );
+        });
+        assert_increases(|request| {
+            request.parameters.stop_sequences = vec!["stop sequence ".repeat(100)];
+        });
+        assert_increases(|request| {
+            request.metadata.insert(
+                "request-option".to_string(),
+                "request metadata ".repeat(100),
+            );
+        });
+        assert_increases(|request| {
+            request.prompt_cache.mode = bcode_model::PromptCacheMode::Aggressive;
+        });
+        assert_increases(|request| {
+            request.conversation_reuse.provider_state =
+                Some(serde_json::json!({"reuse": "state ".repeat(100)}));
+        });
+    }
+
+    #[test]
+    fn tool_schema_and_provider_extension_can_cross_a_fit_threshold() {
+        let baseline = request_for_accounting_tests();
+        let baseline_tokens = estimated_model_request_tokens(&baseline);
+
+        let mut with_tool = baseline.clone();
+        with_tool.tools.push(bcode_model::ToolDefinition {
+            name: "large_tool".to_string(),
+            description: "tool description ".repeat(500),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"large": {"description": "schema ".repeat(500)}}
+            }),
+            side_effect: bcode_model::ToolSideEffect::ReadOnly,
+            requires_permission: false,
+        });
+        let tool_tokens = estimated_model_request_tokens(&with_tool);
+        assert!(baseline_tokens < tool_tokens);
+        let tool_threshold = baseline_tokens + (tool_tokens - baseline_tokens) / 2;
+        assert!(baseline_tokens <= tool_threshold && tool_tokens > tool_threshold);
+
+        let mut with_extension = baseline;
+        with_extension.provider_context.request.insert(
+            "extension".to_string(),
+            serde_json::json!({"payload": "extension ".repeat(1_000)}).into(),
+        );
+        let extension_tokens = estimated_model_request_tokens(&with_extension);
+        assert!(baseline_tokens < extension_tokens);
+        let extension_threshold = baseline_tokens + (extension_tokens - baseline_tokens) / 2;
+        assert!(baseline_tokens <= extension_threshold && extension_tokens > extension_threshold);
+    }
+
+    #[test]
+    fn output_reserve_can_make_an_otherwise_fitting_request_oversized() {
+        let without_reserve = compaction_capacity_tokens(10_000, 100, Some(0), Some(8_000));
+        let with_reserve = compaction_capacity_tokens(10_000, 100, Some(4_000), Some(8_000));
+
+        assert!(7_000 <= without_reserve.available_input_tokens);
+        assert!(7_000 > with_reserve.available_input_tokens);
     }
 
     #[test]
