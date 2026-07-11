@@ -33,9 +33,7 @@ use bcode_skill::{SkillRegistry, SkillRegistryOptions, skill_source_roots_from_c
 use bcode_skill_models::{
     SkillDiagnosticSeverity, SkillSourceKind, SkillToolDecision, SkillToolDecisionEntry,
 };
-use bcode_worktree_models::{
-    WorktreeBaseRef, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
-};
+use bcode_worktree_models::WorktreeCreateRequest;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::{Deserialize, Serialize};
@@ -224,7 +222,6 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         )?,
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
-        Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Eval { command } => Box::pin(handle_eval_command(command)).await?,
         Commands::Metrics { path, repo } => bcode_tui::run_metrics_dashboard(repo, path).await?,
@@ -575,7 +572,6 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         Commands::Onboard { .. }
         | Commands::Server { .. }
         | Commands::Session { .. }
-        | Commands::Worktree { .. }
         | Commands::Blims { .. }
         | Commands::Eval { .. }
         | Commands::Metrics { .. }
@@ -1129,10 +1125,6 @@ enum Commands {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
-    },
-    Worktree {
-        #[command(subcommand)]
-        command: WorktreeCommand,
     },
     Blims {
         #[command(subcommand)]
@@ -1898,71 +1890,6 @@ enum ServerCommand {
     Stop,
     Cleanup,
     StopAll,
-}
-
-#[derive(Debug, Subcommand)]
-enum WorktreeCommand {
-    List {
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    Create {
-        name: String,
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        #[arg(long)]
-        path: Option<PathBuf>,
-        #[arg(long)]
-        session: Option<SessionId>,
-        #[arg(long)]
-        new_session: bool,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        new_branch: Option<String>,
-        #[arg(long, value_enum)]
-        base: Option<WorktreeBaseRefArg>,
-        #[arg(long)]
-        detach: bool,
-        #[arg(long)]
-        force: bool,
-        #[arg(long)]
-        no_setup: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    Attach {
-        session_id: SessionId,
-        path: PathBuf,
-    },
-    Remove {
-        path: PathBuf,
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        #[arg(long)]
-        force: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum WorktreeBaseRefArg {
-    Auto,
-    DefaultBranch,
-    Head,
-}
-
-impl WorktreeBaseRefArg {
-    const fn into_config(self) -> bcode_config::WorktreeBaseRefConfig {
-        match self {
-            Self::Auto => bcode_config::WorktreeBaseRefConfig::Auto,
-            Self::DefaultBranch => bcode_config::WorktreeBaseRefConfig::DefaultBranch,
-            Self::Head => bcode_config::WorktreeBaseRefConfig::Head,
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -7785,166 +7712,6 @@ fn server_is_unreachable(error: &ClientError) -> bool {
         ),
         _ => false,
     }
-}
-
-async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliError> {
-    match command {
-        WorktreeCommand::List { repo, json } => worktree_list_command(repo, json).await,
-        WorktreeCommand::Create {
-            name,
-            repo,
-            path,
-            session,
-            new_session,
-            branch,
-            new_branch,
-            base,
-            detach,
-            force,
-            no_setup,
-            json,
-        } => {
-            let _config_override = base.map(|base| {
-                bcode_config::push_process_config_overrides(
-                    bcode_config::ConfigLoadOverrides::from_env_with_cli(
-                        None,
-                        Some(bcode_config::worktree_base_ref_override_toml(
-                            base.into_config(),
-                        )),
-                    ),
-                )
-            });
-            worktree_create_command(WorktreeCreateCliArgs {
-                name,
-                repo,
-                path,
-                session,
-                new_session,
-                branch,
-                new_branch,
-                base,
-                detach,
-                force,
-                no_setup,
-                json,
-            })
-            .await
-        }
-        WorktreeCommand::Attach { session_id, path } => {
-            let client = BcodeClient::default_endpoint();
-            let session = client
-                .change_session_working_directory(session_id, path)
-                .await?;
-            println!("{}\t{}", session.id, session.working_directory.display());
-            Ok(())
-        }
-        WorktreeCommand::Remove {
-            path,
-            repo,
-            force,
-            json,
-        } => worktree_remove_command(path, repo, force, json).await,
-    }
-}
-
-#[allow(clippy::struct_excessive_bools)]
-struct WorktreeCreateCliArgs {
-    name: String,
-    repo: Option<PathBuf>,
-    path: Option<PathBuf>,
-    session: Option<SessionId>,
-    new_session: bool,
-    branch: Option<String>,
-    new_branch: Option<String>,
-    base: Option<WorktreeBaseRefArg>,
-    detach: bool,
-    force: bool,
-    no_setup: bool,
-    json: bool,
-}
-
-async fn worktree_list_command(repo: Option<PathBuf>, json: bool) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    let response = client
-        .list_worktrees(WorktreeListRequest { cwd: repo })
-        .await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-        return Ok(());
-    }
-    println!("repo\t{}", response.repo_root.display());
-    for worktree in response.worktrees {
-        let marker = if worktree.is_main { "main" } else { "linked" };
-        let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_string());
-        let commit = worktree.commit.unwrap_or_else(|| "-".to_string());
-        println!(
-            "{}\t{}\t{}\t{}",
-            marker,
-            branch,
-            commit,
-            worktree.path.display()
-        );
-    }
-    Ok(())
-}
-
-async fn worktree_create_command(args: WorktreeCreateCliArgs) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    let response = client
-        .create_worktree(WorktreeCreateRequest {
-            name: args.name,
-            cwd: args.repo,
-            path: args.path,
-            branch: args.branch,
-            new_branch: args.new_branch,
-            base_ref: args.base.map(|base| match base.into_config() {
-                bcode_config::WorktreeBaseRefConfig::Auto => WorktreeBaseRef::Auto,
-                bcode_config::WorktreeBaseRefConfig::DefaultBranch => {
-                    WorktreeBaseRef::DefaultBranch
-                }
-                bcode_config::WorktreeBaseRefConfig::Head => WorktreeBaseRef::Head,
-            }),
-            detach: args.detach,
-            force: args.force,
-            attach_session_id: args.session,
-            new_session: args.new_session,
-            no_setup: args.no_setup,
-        })
-        .await?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-        return Ok(());
-    }
-    println!("created\t{}", response.path.display());
-    if let Some(branch) = response.branch {
-        println!("branch\t{branch}");
-    }
-    if let Some(session) = response.session {
-        println!("session\t{}", session.id);
-    }
-    Ok(())
-}
-
-async fn worktree_remove_command(
-    path: PathBuf,
-    repo: Option<PathBuf>,
-    force: bool,
-    json: bool,
-) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    let response = client
-        .remove_worktree(WorktreeRemoveRequest {
-            cwd: repo,
-            path,
-            force,
-        })
-        .await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    } else {
-        println!("removed\t{}", response.path.display());
-    }
-    Ok(())
 }
 
 async fn run_new_session_tui(worktree: Option<String>) -> Result<(), CliError> {

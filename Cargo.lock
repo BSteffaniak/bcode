@@ -2431,6 +2431,7 @@ dependencies = [
 name = "bcode_worktree_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_client",
  "bcode_command",
  "bcode_config",
  "bcode_plugin_sdk",
@@ -2440,6 +2441,7 @@ dependencies = [
  "bcode_worktree_models",
  "bmux_keyboard",
  "bmux_tui",
+ "clap",
  "serde",
  "serde_json",
 ]

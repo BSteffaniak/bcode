@@ -23,9 +23,89 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
+#[cfg(feature = "static-bundled")]
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 use std::path::PathBuf;
+
+#[cfg(feature = "static-bundled")]
+#[derive(Debug, Parser)]
+#[command(name = "worktree", about = "Manage Git worktrees")]
+struct WorktreeCli {
+    #[command(subcommand)]
+    command: WorktreeCliCommand,
+}
+
+#[cfg(feature = "static-bundled")]
+#[derive(Debug, Subcommand)]
+enum WorktreeCliCommand {
+    List(WorktreeListArgs),
+    Create(WorktreeCreateArgs),
+    Attach {
+        session_id: bcode_session_models::SessionId,
+        path: PathBuf,
+    },
+    Remove(WorktreeRemoveArgs),
+}
+
+#[cfg(feature = "static-bundled")]
+#[derive(Debug, Args)]
+struct WorktreeListArgs {
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[cfg(feature = "static-bundled")]
+#[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)]
+struct WorktreeCreateArgs {
+    name: String,
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    #[arg(long)]
+    path: Option<PathBuf>,
+    #[arg(long)]
+    session: Option<bcode_session_models::SessionId>,
+    #[arg(long)]
+    new_session: bool,
+    #[arg(long)]
+    branch: Option<String>,
+    #[arg(long)]
+    new_branch: Option<String>,
+    #[arg(long, value_enum)]
+    base: Option<WorktreeCliBaseRef>,
+    #[arg(long)]
+    detach: bool,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    no_setup: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[cfg(feature = "static-bundled")]
+#[derive(Debug, Args)]
+struct WorktreeRemoveArgs {
+    path: PathBuf,
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[cfg(feature = "static-bundled")]
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WorktreeCliBaseRef {
+    Auto,
+    DefaultBranch,
+    Head,
+}
 use std::str::FromStr;
 
 const WORKTREE_PLUGIN_ID: &str = "bcode.worktree";
@@ -475,6 +555,118 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
+#[cfg(feature = "static-bundled")]
+fn worktree_cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    bcode_plugin_sdk::StaticCliRegistration {
+        command: || WorktreeCli::command(),
+        invoke: |matches| {
+            Box::pin(async move {
+                let cli =
+                    WorktreeCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+                run_worktree_cli(cli.command).await
+            })
+        },
+    }
+}
+
+#[cfg(feature = "static-bundled")]
+async fn run_worktree_cli(command: WorktreeCliCommand) -> Result<(), String> {
+    let client = bcode_client::BcodeClient::default_endpoint();
+    match command {
+        WorktreeCliCommand::List(args) => {
+            let response = client
+                .list_worktrees(WorktreeListRequest { cwd: args.repo })
+                .await
+                .map_err(|error| error.to_string())?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!("repo\t{}", response.repo_root.display());
+                for worktree in response.worktrees {
+                    let marker = if worktree.is_main { "main" } else { "linked" };
+                    let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_owned());
+                    let commit = worktree.commit.unwrap_or_else(|| "-".to_owned());
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        marker,
+                        branch,
+                        commit,
+                        worktree.path.display()
+                    );
+                }
+            }
+        }
+        WorktreeCliCommand::Create(args) => {
+            let base_ref = args.base.map(|base| match base {
+                WorktreeCliBaseRef::Auto => bcode_worktree_models::WorktreeBaseRef::Auto,
+                WorktreeCliBaseRef::DefaultBranch => {
+                    bcode_worktree_models::WorktreeBaseRef::DefaultBranch
+                }
+                WorktreeCliBaseRef::Head => bcode_worktree_models::WorktreeBaseRef::Head,
+            });
+            let response = client
+                .create_worktree(WorktreeCreateRequest {
+                    name: args.name,
+                    cwd: args.repo,
+                    path: args.path,
+                    branch: args.branch,
+                    new_branch: args.new_branch,
+                    base_ref,
+                    detach: args.detach,
+                    force: args.force,
+                    attach_session_id: args.session,
+                    new_session: args.new_session,
+                    no_setup: args.no_setup,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!("created\t{}", response.path.display());
+                if let Some(branch) = response.branch {
+                    println!("branch\t{branch}");
+                }
+                if let Some(session) = response.session {
+                    println!("session\t{}", session.id);
+                }
+            }
+        }
+        WorktreeCliCommand::Attach { session_id, path } => {
+            let session = client
+                .change_session_working_directory(session_id, path)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("{}\t{}", session.id, session.working_directory.display());
+        }
+        WorktreeCliCommand::Remove(args) => {
+            let response = client
+                .remove_worktree(WorktreeRemoveRequest {
+                    cwd: args.repo,
+                    path: args.path,
+                    force: args.force,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!("removed\t{}", response.path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
@@ -482,6 +674,10 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
         include_str!("../bcode-plugin.toml")
     );
     vtable.tui_registry = Some(worktree_tui_registry);
+    #[cfg(feature = "static-bundled")]
+    {
+        vtable.cli_registration = Some(worktree_cli_registration);
+    }
     vtable
 }
 
@@ -927,6 +1123,29 @@ fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) 
 }
 
 bcode_plugin_sdk::export_plugin!(WorktreePlugin, include_str!("../bcode-plugin.toml"));
+
+#[cfg(all(test, feature = "static-bundled"))]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn worktree_cli_exposes_typed_subcommands() {
+        let command = WorktreeCli::command();
+        let matches = command
+            .try_get_matches_from(["worktree", "create", "feature", "--new-session"])
+            .expect("worktree command should parse");
+        let cli = WorktreeCli::from_arg_matches(&matches).expect("matches should decode");
+
+        assert!(matches!(
+            cli.command,
+            WorktreeCliCommand::Create(WorktreeCreateArgs {
+                name,
+                new_session: true,
+                ..
+            }) if name == "feature"
+        ));
+    }
+}
 
 #[cfg(test)]
 mod tests {
