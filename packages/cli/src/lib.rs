@@ -1333,10 +1333,19 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
     Ok(())
 }
 
+fn default_model_provider_id() -> Result<String, CliError> {
+    bcode_config::load_config()?
+        .resolved_model_selection()
+        .provider_plugin_id
+        .ok_or_else(|| {
+            CliError::PluginCli("no model provider is configured; pass --provider".to_string())
+        })
+}
+
 async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
     match command {
         ModelCommand::Ignore { model_id, provider } => {
-            let provider = provider.unwrap_or_else(|| "bcode.openai-compatible".to_string());
+            let provider = provider.unwrap_or(default_model_provider_id()?);
             let path = bcode_config::ignore_model_in_state(&provider, model_id.clone())?;
             println!(
                 "Ignored model '{model_id}' for provider '{provider}' in {}",
@@ -1344,7 +1353,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
             );
         }
         ModelCommand::Unignore { model_id, provider } => {
-            let provider = provider.unwrap_or_else(|| "bcode.openai-compatible".to_string());
+            let provider = provider.unwrap_or(default_model_provider_id()?);
             let path = bcode_config::unignore_model_in_state(&provider, &model_id)?;
             println!(
                 "Removed state ignore for model '{model_id}' and provider '{provider}' in {}",
