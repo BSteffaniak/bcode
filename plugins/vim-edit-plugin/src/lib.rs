@@ -12,6 +12,7 @@ mod vim_edit_interaction;
 #[cfg(feature = "static-bundled")]
 mod vim_edit_playback_tui;
 
+use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     InteractiveToolRequest, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
@@ -343,7 +344,7 @@ fn run_single_vim_edit_tool(
     events: ServiceEventEmitter,
 ) -> ToolInvocationResponse {
     let path = resolve_path(run.cwd, &run.path);
-    let display_path = path.display().to_string();
+    let display_path = display(&path, run.cwd.unwrap_or_else(|| Path::new("."))).to_string();
     let edit_request = VimEditRequest {
         path,
         nvim_executable: run.nvim_executable,

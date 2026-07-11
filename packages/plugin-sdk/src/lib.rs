@@ -5,6 +5,7 @@
 //! Plugin author SDK for Bcode native plugins.
 
 pub mod interaction;
+pub mod path;
 pub mod tui;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
