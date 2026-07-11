@@ -12235,24 +12235,51 @@ fn bounded_portable_context(messages: &[ModelMessage]) -> String {
     let text = messages
         .iter()
         .filter_map(|message| {
-            let content = joined_model_message_text(message);
+            let content = message
+                .content
+                .iter()
+                .map(portable_content_block)
+                .filter(|block| !block.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
             (!content.is_empty()).then(|| format!("{:?}: {content}", message.role))
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    truncate_text(&text, COMPACTION_MAX_CARRIED_SUMMARY_CHARS)
+    text.chars()
+        .take(COMPACTION_MAX_CARRIED_SUMMARY_CHARS)
+        .collect()
 }
 
-fn joined_model_message_text(message: &ModelMessage) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn portable_content_block(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::Text { text } => text.clone(),
+        ContentBlock::Image { image } => format!(
+            "[image: mime_type={}, dimensions={}, bytes={}, source={}]",
+            image.mime_type,
+            image.metadata.width.zip(image.metadata.height).map_or_else(
+                || "unknown".to_string(),
+                |(width, height)| format!("{width}x{height}")
+            ),
+            image
+                .metadata
+                .byte_len
+                .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string()),
+            image.metadata.source_path.as_deref().unwrap_or("unknown"),
+        ),
+        ContentBlock::ToolCall { call } => format!(
+            "[tool call: id={}, name={}, arguments={}]",
+            call.id, call.name, call.arguments
+        ),
+        ContentBlock::ToolResult { result } => format!(
+            "[tool result: call_id={}, error={}]\n{}",
+            result.call_id, result.is_error, result.output
+        ),
+        ContentBlock::CachePoint { .. } => String::new(),
+        ContentBlock::ProviderExtension { .. } => {
+            "[provider-specific context omitted from portable fallback]".to_string()
+        }
+    }
 }
 
 fn estimated_model_request_tokens(request: &ModelTurnRequest) -> u64 {
@@ -20056,6 +20083,90 @@ mod tests {
     }
 
     #[test]
+    fn provider_context_replay_keeps_events_after_exact_request_boundary() {
+        let session_id = SessionId::new();
+        let opaque = ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "opaque replacement".to_string(),
+            }],
+        };
+        let history = [
+            session_event(
+                session_id,
+                5,
+                SessionEventKind::ProviderContextCompacted {
+                    snapshot: bcode_session_models::ProviderContextSnapshot {
+                        format_version: 1,
+                        request_fingerprint: Some("fingerprint".to_string()),
+                        request_id: Some("request".to_string()),
+                        provider_plugin_id: "provider".to_string(),
+                        model_id: "model".to_string(),
+                        compatibility_key: "surface".to_string(),
+                        auth_profile: None,
+                        origin:
+                            bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
+                        messages_json: serde_json::to_string(std::slice::from_ref(&opaque))
+                            .expect("opaque"),
+                        portable_summary: "portable".to_string(),
+                    },
+                    compacted_through_sequence: 2,
+                },
+            ),
+            session_event(
+                session_id,
+                6,
+                SessionEventKind::AssistantMessage {
+                    text: "assistant tail".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                7,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-tail".to_string(),
+                    producer_plugin_id: None,
+                    tool_name: "shell".to_string(),
+                    arguments_json: r#"{"command":"pwd"}"#.to_string(),
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            session_event(
+                session_id,
+                8,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-tail".to_string(),
+                    result: "workspace".to_string(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages_for_target(
+            &history,
+            1_000,
+            Some("provider"),
+            Some("model"),
+            None,
+            Some(1),
+            Some("surface"),
+        );
+
+        assert_eq!(messages[0], opaque);
+        assert!(messages.iter().any(|message| matches!(
+            &message.content[0],
+            ContentBlock::Text { text } if text == "assistant tail"
+        )));
+        assert!(messages.iter().any(|message| matches!(
+            &message.content[0],
+            ContentBlock::ToolResult { result } if result.call_id == "call-tail"
+        )));
+    }
+
+    #[test]
     fn provider_context_snapshot_with_malformed_opaque_messages_uses_portable_fallback() {
         let session_id = SessionId::new();
         let history = [session_event(
@@ -20092,6 +20203,67 @@ mod tests {
             &messages[0].content[0],
             ContentBlock::Text { text } if text.contains("portable context")
         ));
+    }
+
+    #[test]
+    fn portable_fallback_preserves_tool_protocol_without_opaque_provider_data() {
+        let messages = [
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "checking".to_string(),
+                    },
+                    ContentBlock::ToolCall {
+                        call: bcode_model::ToolCall {
+                            id: "call-1".to_string(),
+                            name: "filesystem.read".to_string(),
+                            arguments: serde_json::json!({"path": "Cargo.toml"}),
+                        },
+                    },
+                    ContentBlock::ProviderExtension {
+                        value: serde_json::json!({"encrypted": "secret-opaque-value"}),
+                    },
+                ],
+            },
+            ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    result: bcode_model::ToolResult {
+                        call_id: "call-1".to_string(),
+                        output: "workspace manifest".to_string(),
+                        is_error: false,
+                        content: Vec::new(),
+                    },
+                }],
+            },
+        ];
+
+        let fallback = bounded_portable_context(&messages);
+
+        assert!(fallback.contains("checking"));
+        assert!(fallback.contains("tool call: id=call-1"));
+        assert!(fallback.contains("filesystem.read"));
+        assert!(fallback.contains("Cargo.toml"));
+        assert!(fallback.contains("tool result: call_id=call-1"));
+        assert!(fallback.contains("workspace manifest"));
+        assert!(fallback.contains("provider-specific context omitted"));
+        assert!(!fallback.contains("secret-opaque-value"));
+    }
+
+    #[test]
+    fn portable_fallback_is_bounded() {
+        let messages = [ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "x".repeat(COMPACTION_MAX_CARRIED_SUMMARY_CHARS * 2),
+            }],
+        }];
+
+        assert!(
+            bounded_portable_context(&messages).chars().count()
+                <= COMPACTION_MAX_CARRIED_SUMMARY_CHARS
+        );
     }
 
     #[tokio::test]

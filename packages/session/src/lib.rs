@@ -4577,6 +4577,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_snapshot_opaque_context_survives_manager_restart() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("opaque restart".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let snapshot = bcode_session_models::ProviderContextSnapshot {
+            format_version: 7,
+            request_fingerprint: Some("fingerprint".to_string()),
+            request_id: Some("request".to_string()),
+            provider_plugin_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            compatibility_key: "surface".to_string(),
+            auth_profile: Some("profile".to_string()),
+            origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+            messages_json: r#"[{"opaque":"ciphertext"}]"#.to_string(),
+            portable_summary: "portable fallback".to_string(),
+        };
+        manager
+            .append_provider_context_compacted(session.id, snapshot.clone(), 0)
+            .await
+            .expect("snapshot should persist");
+        drop(manager);
+
+        let restored = SessionManager::persistent_lazy(&root);
+        let context = restored
+            .model_context_events(session.id)
+            .await
+            .expect("context should reload");
+
+        assert!(context.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ProviderContextCompacted { snapshot: actual, .. }
+                if actual == &snapshot
+        )));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn catalog_status_subscription_reports_loaded() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
