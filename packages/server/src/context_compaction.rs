@@ -269,6 +269,7 @@ pub async fn compact_session_context_with_limit(
             .await?
     };
     publish_session_event(state, &event).await;
+    state.invalidate_session_continuations(session_id).await;
 
     Ok(CompactionCompletion {
         message: format!(

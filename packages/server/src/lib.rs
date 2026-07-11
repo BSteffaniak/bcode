@@ -486,6 +486,7 @@ struct ModelRequestAttempt {
     compatibility_key: Option<String>,
     portable_context: String,
     estimated_input_tokens: u64,
+    managed_compaction_persisted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -553,6 +554,8 @@ struct ProviderTelemetryState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProviderStateRecord {
     #[serde(default)]
+    session_id: Option<SessionId>,
+    #[serde(default)]
     continuation: Option<ProviderContinuationState>,
     #[serde(default)]
     telemetry: ProviderTelemetryState,
@@ -573,6 +576,15 @@ impl ProviderStateStore {
             .and_then(|contents| serde_json::from_str(&contents).ok())
             .unwrap_or_default();
         Self { path, records }
+    }
+
+    fn invalidate_continuations(&mut self, session_id: SessionId) {
+        self.records.retain(|_, record| {
+            record
+                .session_id
+                .is_some_and(|record_session| record_session != session_id)
+        });
+        self.save();
     }
 
     fn save(&self) {
@@ -1009,6 +1021,13 @@ impl ServerState {
             self.release_session_resources_if_idle(session_id).await;
         }
         Ok(())
+    }
+
+    async fn invalidate_session_continuations(&self, session_id: SessionId) {
+        self.provider_state
+            .lock()
+            .await
+            .invalidate_continuations(session_id);
     }
 
     async fn session_current_turn(&self, session_id: SessionId) -> Option<RuntimeCurrentTurn> {
@@ -6194,6 +6213,21 @@ async fn begin_provider_round(
     drop(current_turn_guard);
 }
 
+async fn take_managed_compaction_attempt(
+    context: &RuntimeCommandContext<'_>,
+    provider_turn_id: &str,
+) -> Option<ModelRequestAttempt> {
+    let mut current_turn = context.current_turn.lock().await;
+    let attempt = current_turn.as_mut()?.model.as_mut()?;
+    if attempt.provider_turn_id != provider_turn_id || attempt.managed_compaction_persisted {
+        return None;
+    }
+    attempt.managed_compaction_persisted = true;
+    let attempt = attempt.clone();
+    drop(current_turn);
+    Some(attempt)
+}
+
 async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<ModelRequestAttempt> {
     let mut current_turn_guard = context.current_turn.lock().await;
     let Some(current_turn) = current_turn_guard.as_mut() else {
@@ -10369,6 +10403,7 @@ async fn run_model_turn_round(
         compatibility_key: request.metadata.get("bcode_compatibility_key").cloned(),
         portable_context: bounded_portable_context(&request.messages),
         estimated_input_tokens: estimated_model_request_tokens(request),
+        managed_compaction_persisted: false,
     };
     begin_provider_round(command_context, active_model_turn).await;
 
@@ -10923,11 +10958,18 @@ async fn handle_provider_turn_event(
             messages,
             context_format,
         } => {
-            let active_turn = state
-                .session_current_turn(session_id)
-                .await
-                .and_then(|turn| turn.model)
-                .filter(|turn| turn.provider_turn_id == turn_id);
+            let Ok(messages_json) = serde_json::to_string(&messages) else {
+                append_provider_event_trace(
+                    state,
+                    session_id,
+                    turn_id,
+                    "context_compaction_ignored",
+                    Some("provider compaction payload could not be serialized".to_string()),
+                )
+                .await;
+                return;
+            };
+            let active_turn = take_managed_compaction_attempt(command_context, turn_id).await;
             let Some(active_turn) = active_turn else {
                 append_provider_event_trace(
                     state,
@@ -10935,39 +10977,38 @@ async fn handle_provider_turn_event(
                     turn_id,
                     "context_compaction_ignored",
                     Some(
-                        "provider compaction was not associated with the active request"
+                        "provider compaction was not associated with the active request or was already persisted"
                             .to_string(),
                     ),
                 )
                 .await;
                 return;
             };
-            if let Ok(messages_json) = serde_json::to_string(&messages) {
-                let snapshot = bcode_session_models::ProviderContextSnapshot {
-                    format_version: context_format.version,
-                    request_fingerprint: Some(active_turn.request_fingerprint.clone()),
-                    request_id: Some(active_turn.request_id.clone()),
-                    provider_plugin_id: active_turn
-                        .provider_plugin_id
-                        .unwrap_or_else(|| "<auto>".to_string()),
-                    model_id: active_turn.model_id,
-                    compatibility_key: context_format.compatibility_key,
-                    auth_profile: active_turn.auth_profile,
-                    origin: bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
-                    messages_json,
-                    portable_summary: active_turn.portable_context,
-                };
-                if let Ok(event) = state
-                    .sessions
-                    .append_provider_context_compacted(
-                        session_id,
-                        snapshot,
-                        active_turn.context_through_sequence,
-                    )
-                    .await
-                {
-                    publish_session_event(state, &event).await;
-                }
+            let snapshot = bcode_session_models::ProviderContextSnapshot {
+                format_version: context_format.version,
+                request_fingerprint: Some(active_turn.request_fingerprint.clone()),
+                request_id: Some(active_turn.request_id.clone()),
+                provider_plugin_id: active_turn
+                    .provider_plugin_id
+                    .unwrap_or_else(|| "<auto>".to_string()),
+                model_id: active_turn.model_id,
+                compatibility_key: context_format.compatibility_key,
+                auth_profile: active_turn.auth_profile,
+                origin: bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
+                messages_json,
+                portable_summary: active_turn.portable_context,
+            };
+            if let Ok(event) = state
+                .sessions
+                .append_provider_context_compacted(
+                    session_id,
+                    snapshot,
+                    active_turn.context_through_sequence,
+                )
+                .await
+            {
+                publish_session_event(state, &event).await;
+                state.invalidate_session_continuations(session_id).await;
             }
         }
         ProviderTurnEvent::RequestProjection { projection } => {
@@ -11366,6 +11407,7 @@ async fn update_provider_usage_state(
 
     let mut provider_state = state.provider_state.lock().await;
     let record = provider_state.records.entry(reuse_key).or_default();
+    record.session_id = Some(session_id);
     record.telemetry = ProviderTelemetryState {
         input: usage.input_tokens,
         cached: usage.cached_input_tokens,
@@ -11395,6 +11437,7 @@ async fn update_provider_metadata_state(
         };
         let mut provider_state = state.provider_state.lock().await;
         let record = provider_state.records.entry(reuse_key).or_default();
+        record.session_id = Some(session_id);
         record.provider_state = Some(provider_state_value);
         provider_state.save();
         drop(provider_state);
@@ -11411,6 +11454,7 @@ async fn update_provider_metadata_state(
 
     let mut provider_state = state.provider_state.lock().await;
     let record = provider_state.records.entry(reuse_key).or_default();
+    record.session_id = Some(session_id);
     record.continuation = Some(ProviderContinuationState {
         provider_response_id: value,
         reusable_message_count,
@@ -16881,6 +16925,51 @@ mod tests {
     }
 
     #[test]
+    fn provider_state_invalidation_removes_only_target_session_records() {
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let path = std::env::temp_dir().join(format!(
+            "bcode-provider-state-invalidation-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = ProviderStateStore {
+            path: path.clone(),
+            records: BTreeMap::from([
+                (
+                    "first".to_string(),
+                    ProviderStateRecord {
+                        session_id: Some(first_session),
+                        continuation: Some(ProviderContinuationState {
+                            provider_response_id: "stale".to_string(),
+                            reusable_message_count: 1,
+                            updated_sequence: 1,
+                        }),
+                        ..ProviderStateRecord::default()
+                    },
+                ),
+                (
+                    "second".to_string(),
+                    ProviderStateRecord {
+                        session_id: Some(second_session),
+                        ..ProviderStateRecord::default()
+                    },
+                ),
+                ("legacy".to_string(), ProviderStateRecord::default()),
+            ]),
+        };
+
+        store.invalidate_continuations(first_session);
+
+        assert!(!store.records.contains_key("first"));
+        assert!(store.records.contains_key("second"));
+        assert!(!store.records.contains_key("legacy"));
+        let loaded = ProviderStateStore::load(path.clone());
+        assert_eq!(loaded.records.len(), 1);
+        assert!(loaded.records.contains_key("second"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn provider_attempt_request_ids_are_unique_across_rounds() {
         let session_id = SessionId::new();
         let trigger_sequence = 42;
@@ -20291,6 +20380,7 @@ mod tests {
             compatibility_key: None,
             portable_context: "context".to_string(),
             estimated_input_tokens: 1,
+            managed_compaction_persisted: false,
         };
         begin_provider_round(&context, model_turn.clone()).await;
         assert_eq!(
@@ -20301,6 +20391,21 @@ mod tests {
                 .and_then(|turn| turn.model.as_ref())
                 .map(|turn| turn.provider_turn_id.as_str()),
             Some("provider-turn-test")
+        );
+
+        assert!(
+            take_managed_compaction_attempt(&context, "other-turn")
+                .await
+                .is_none()
+        );
+        let managed = take_managed_compaction_attempt(&context, "provider-turn-test")
+            .await
+            .expect("first managed compaction should own the request attempt");
+        assert_eq!(managed.request_id, model_turn.request_id);
+        assert!(
+            take_managed_compaction_attempt(&context, "provider-turn-test")
+                .await
+                .is_none()
         );
 
         let finished = finish_provider_round(&context)

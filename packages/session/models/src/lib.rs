@@ -208,7 +208,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 27;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 28;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
