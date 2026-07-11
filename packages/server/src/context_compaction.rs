@@ -808,8 +808,8 @@ pub async fn collect_compaction_summary(
             transcript,
             "provider returned an empty summary",
         )),
-        Err(error) if error == "compaction cancelled" => Err(CompactionError::Cancelled),
-        Err(error) if is_retriable_compaction_error(&error) => {
+        Err(CompactionError::Cancelled) => Err(CompactionError::Cancelled),
+        Err(CompactionError::Provider(error)) if is_retriable_compaction_error(&error) => {
             append_context_compaction_trace(
                 state,
                 session_id,
@@ -823,7 +823,8 @@ pub async fn collect_compaction_summary(
             .await;
             Ok(local_compaction_summary(transcript, &error))
         }
-        Err(error) => Err(CompactionError::Provider(error)),
+        Err(CompactionError::Provider(error)) => Err(CompactionError::Provider(error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -835,15 +836,17 @@ pub async fn collect_compaction_summary_once(
     prompt_text: &str,
     mut command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
-) -> Result<String, String> {
+) -> Result<String, CompactionError> {
     let turn_id = format!(
         "{session_id}-compact-{}",
         transcript.compacted_through_sequence
     );
     let mut request = build_compaction_request(session_id, selection, prompt_text, turn_id.clone());
-    request.model_id = effective_model_id(state, selection).await?;
+    request.model_id = effective_model_id(state, selection)
+        .await
+        .map_err(CompactionError::Provider)?;
     if cancel_state.is_cancelled() {
-        return Err("compaction cancelled".to_string());
+        return Err(CompactionError::Cancelled);
     }
     let provider_turn_id = if let Some(context) = &mut command_context {
         match wait_for_finalizable_provider_call(
@@ -860,7 +863,9 @@ pub async fn collect_compaction_summary_once(
         )
         .await
         {
-            FinalizedProviderCall::Completed(result) => result?.provider_turn_id,
+            FinalizedProviderCall::Completed(result) => {
+                result.map_err(CompactionError::Provider)?.provider_turn_id
+            }
             FinalizedProviderCall::Cancelled(result) => {
                 if let Ok(response) = result {
                     finish_provider_turn(
@@ -870,7 +875,7 @@ pub async fn collect_compaction_summary_once(
                     )
                     .await;
                 }
-                return Err("compaction cancelled".to_string());
+                return Err(CompactionError::Cancelled);
             }
         }
     } else {
@@ -880,7 +885,8 @@ pub async fn collect_compaction_summary_once(
             OP_START_TURN,
             request,
         )
-        .await?
+        .await
+        .map_err(CompactionError::Provider)?
         .provider_turn_id
     };
 
@@ -905,8 +911,7 @@ pub async fn collect_compaction_summary_once(
             cancel_state,
         )
         .await
-    }
-    .map_err(compaction_error_detail);
+    };
     finish_provider_turn(
         state,
         selection.provider_plugin_id.clone(),
@@ -1585,5 +1590,25 @@ pub fn session_event_compaction_line(
             new_working_directory.display()
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_progress_wait_returns_cancelled() {
+        let cancel_state = TurnCancelState::default();
+        cancel_state.cancel();
+
+        let result = wait_for_compaction_progress(
+            &bcode_config::StreamingConfig::default(),
+            Duration::ZERO,
+            &cancel_state,
+        )
+        .await;
+
+        assert!(matches!(result, Err(CompactionError::Cancelled)));
     }
 }
