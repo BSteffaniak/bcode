@@ -7,6 +7,19 @@ use std::path::{Path, PathBuf};
 
 const RENDERER_NEUTRAL_SCAN_ROOTS: &[&str] = &["packages/session-view", "packages/web-render"];
 
+const PLUGIN_OWNED_CORE_CLI_NEEDLES: &[&str] = &[
+    "Commands::Worktree",
+    "Commands::Ralph",
+    "Commands::Metrics",
+    "Commands::Provider",
+    "enum WorktreeCommand",
+    "enum ProviderCommand",
+    "handle_worktree_command",
+    "handle_ralph_command",
+    "handle_provider_command",
+    "run_metrics_dashboard(repo, path)",
+];
+
 const BCODE_BROWSER_TRANSPORT_NEEDLES: &[&str] = &[
     "WebSocket",
     "EventSource",
@@ -129,6 +142,20 @@ struct BoundaryOffender {
     needle: &'static str,
     category: &'static str,
     line: String,
+}
+
+#[test]
+fn plugin_owned_commands_do_not_return_to_core_cli() {
+    let source = include_str!("../src/lib.rs");
+    let offenders = PLUGIN_OWNED_CORE_CLI_NEEDLES
+        .iter()
+        .filter(|needle| source.contains(**needle))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        offenders.is_empty(),
+        "plugin-owned CLI code returned to packages/cli/src/lib.rs: {offenders:?}"
+    );
 }
 
 #[test]
