@@ -1535,6 +1535,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",
+ "clap",
  "crossterm",
  "serde",
  "serde_json",

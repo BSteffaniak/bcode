@@ -4,6 +4,9 @@
 
 //! local Git code review plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod cli;
+
 pub mod async_values;
 pub mod code_review_home;
 pub mod code_review_tui;
@@ -3854,6 +3857,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
         include_str!("../bcode-plugin.toml")
     );
     vtable.tui_registry = Some(tui::tui_registry);
+    vtable.cli_registration = Some(cli::registration);
     vtable
 }
 

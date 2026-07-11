@@ -27,6 +27,7 @@ bcode_syntax_render = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["crossterm", "diff"] }
+clap = { workspace = true, features = ["derive", "std"] }
 crossterm = { workspace = true, features = ["events"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

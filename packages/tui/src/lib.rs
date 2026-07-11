@@ -361,6 +361,13 @@ pub async fn run_plugin_surface(
     if surface_kind == "ralph-home" {
         return run_ralph_home().await;
     }
+    if surface_kind == "code-review" {
+        let repo = repo_path.unwrap_or_else(|| std::path::PathBuf::from("."));
+        if let Some(target) = options.get("target") {
+            return run_code_review(repo, serde_json::from_str(target)?).await;
+        }
+        return run_code_review_home(repo).await;
+    }
     if surface_kind == "eval-run-picker" {
         return run_eval_viewer_picker(repo_path.unwrap_or_else(|| std::path::PathBuf::from(".")))
             .await;
