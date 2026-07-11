@@ -4,6 +4,9 @@
 
 //! Blims AI company simulator plugin.
 
+#[cfg(feature = "static-bundled")]
+mod cli;
+
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -9861,7 +9864,10 @@ export_plugin!(BlimsPlugin, MANIFEST);
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(BlimsPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable =
+        bcode_plugin_sdk::static_plugin_vtable!(BlimsPlugin, include_str!("../bcode-plugin.toml"));
+    vtable.cli_registration = Some(cli::registration);
+    vtable
 }
 
 #[cfg(test)]

@@ -4,7 +4,6 @@
 
 //! Command-line interface for Bcode.
 
-mod blims;
 mod plugin_cli;
 
 use base64::Engine as _;
@@ -81,8 +80,6 @@ pub enum CliError {
     NewSessionWithCommand,
     #[error("{0}")]
     LoginProfile(String),
-    #[error("Blims error: {0}")]
-    Blims(String),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
     #[error("plugin service error {code}: {message}")]
@@ -216,7 +213,6 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         )?,
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
-        Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Web {
             bind,
             port,
@@ -560,7 +556,6 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         Commands::Onboard { .. }
         | Commands::Server { .. }
         | Commands::Session { .. }
-        | Commands::Blims { .. }
         | Commands::Web { .. }
         | Commands::Plugin { .. }
         | Commands::Model { .. }
@@ -677,11 +672,6 @@ enum Commands {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    Blims {
-        #[command(subcommand)]
-        command: blims::BlimsCommand,
-    },
-    /// Serve the `HyperChad` web renderer.
     Web {
         /// Address to bind. Defaults to IPv4 loopback.
         #[arg(long, default_value_t = bcode_web_render::DEFAULT_BIND_ADDRESS)]

@@ -1,8 +1,9 @@
 #![allow(clippy::module_name_repetitions)]
 
-use bcode_plugin_sdk::{StaticCliFuture, StaticCliHostAction, StaticCliOutcome, StaticCliRegistration};
-use clap::{CommandFactory, FromArgMatches, Parser};
 use bcode_client::BcodeClient;
+use bcode_plugin_sdk::{
+    StaticCliFuture, StaticCliHostAction, StaticCliOutcome, StaticCliRegistration,
+};
 use bcode_session_models::SessionId;
 use bcode_worktree_models::{WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse};
 use bmux_keyboard::KeyCode;
@@ -12,6 +13,7 @@ use bmux_tui::prelude::{
     Size, Span, Style, Terminal, Text, TextBlock, TextWrap, Widget, event_from_crossterm, split,
 };
 use clap::Subcommand;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{IsTerminal as _, Write as _};
@@ -20,21 +22,45 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-
 #[derive(Debug, Parser)]
 #[command(name = "blims", about = "Manage the Blims AI company simulator")]
-struct BlimsCli { #[command(subcommand)] command: BlimsCommand }
+struct BlimsCli {
+    #[command(subcommand)]
+    command: BlimsCommand,
+}
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {
-    #[error("Blims error: {0}")] Blims(String),
-    #[error(transparent)] Client(#[from] bcode_client::ClientError),
-    #[error(transparent)] Io(#[from] std::io::Error),
-    #[error(transparent)] Json(#[from] serde_json::Error),
+    #[error("Blims error: {0}")]
+    Blims(String),
+    #[error("attach session {0}")]
+    AttachSession(SessionId),
+    #[error(transparent)]
+    Client(#[from] bcode_client::ClientError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
-pub(super) fn registration() -> StaticCliRegistration { StaticCliRegistration { command: BlimsCli::command, invoke } }
-fn invoke(matches: clap::ArgMatches) -> StaticCliFuture { Box::pin(async move { let cli=BlimsCli::from_arg_matches(&matches).map_err(|e|e.to_string())?; handle_blims_command(cli.command).await.map_err(|e|e.to_string()) }) }
+pub fn registration() -> StaticCliRegistration {
+    StaticCliRegistration {
+        command: BlimsCli::command,
+        invoke,
+    }
+}
+fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
+    Box::pin(async move {
+        let cli = BlimsCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+        match handle_blims_command(cli.command).await {
+            Ok(outcome) => Ok(outcome),
+            Err(CliError::AttachSession(session_id)) => Ok(StaticCliOutcome {
+                host_action: Some(StaticCliHostAction::AttachSession { session_id }),
+            }),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+}
 
 #[derive(Debug, Subcommand)]
 pub enum BlimsCommand {
@@ -743,7 +769,7 @@ impl BlimsCeoDashboardState {
     }
 }
 
-pub async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome, CliError> {
+async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome, CliError> {
     match command {
         BlimsCommand::Status { json } => print_blims_status(json).await?,
         BlimsCommand::Create { json } => create_blims_company(json).await?,
@@ -3449,8 +3475,7 @@ async fn start_blims_agent_talk_cli(agent_id: String) -> Result<(), CliError> {
         handle.agent_id, handle.session
     );
     println!("Attaching now. Press Ctrl-C to return to the Blims office.");
-    return Err(CliError::Blims(format!("attach session {} using the host attach action", handle.session)));
-    Ok(())
+    Err(CliError::AttachSession(handle.session))
 }
 
 async fn create_blims_agent_conversation(
@@ -3532,8 +3557,7 @@ async fn start_blims_task_work(task_id: String) -> Result<(), CliError> {
         println!("proposal\t{}", proposal.id);
     }
     println!("Attaching now. Press Ctrl-C to return.");
-    return Err(CliError::Blims(format!("attach session {} using the host attach action", session.id)));
-    Ok(())
+    Err(CliError::AttachSession(session.id))
 }
 
 async fn create_blims_task_worktree(
@@ -3947,8 +3971,7 @@ async fn start_blims_prepared_ai_work(work_id: String) -> Result<(), CliError> {
     println!("work: {}", work.id);
     println!("kind: {}", work.kind);
     println!("agent: {}", work.agent_id);
-    return Err(CliError::Blims(format!("attach session {} using the host attach action", session.id)));
-    Ok(())
+    Err(CliError::AttachSession(session.id))
 }
 
 async fn start_blims_prepared_ai_work_detached(work_id: String) -> Result<(), CliError> {
@@ -4647,8 +4670,7 @@ async fn start_blims_initiative_plan(initiative_id: String) -> Result<(), CliErr
         prompt.initiative_id
     );
     println!("Attaching now. Press Ctrl-C to return.");
-    return Err(CliError::Blims(format!("attach session {} using the host attach action", session.id)));
-    Ok(())
+    Err(CliError::AttachSession(session.id))
 }
 
 async fn import_blims_initiative_plan(
@@ -4744,5 +4766,9 @@ fn decode_blims_response<T: for<'de> Deserialize<'de>>(
 }
 
 fn print_blims_service_response(response: bcode_ipc::PluginServiceResponse) {
-    if let Some(error) = response.error { eprintln!("{}: {}", error.code, error.message); } else if !response.payload.is_empty() { println!("{}", String::from_utf8_lossy(&response.payload)); }
+    if let Some(error) = response.error {
+        eprintln!("{}: {}", error.code, error.message);
+    } else if !response.payload.is_empty() {
+        println!("{}", String::from_utf8_lossy(&response.payload));
+    }
 }
