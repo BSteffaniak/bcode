@@ -9,14 +9,6 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactionAuthority {
-    /// Exclusive command serialized by the session runtime.
-    Manual,
-    /// Compaction performed by the model turn that owns the session runtime.
-    CurrentTurn,
-}
-
 #[derive(Debug, Error)]
 pub enum CompactionError {
     #[error("nothing to compact: {0}")]
@@ -30,8 +22,6 @@ pub enum CompactionError {
     Session(#[from] bcode_session::SessionError),
     #[error("model provider unavailable")]
     ProviderUnavailable,
-    #[error("session has an active model turn")]
-    Busy,
     #[error("compaction cancelled")]
     Cancelled,
     #[error(
@@ -139,6 +129,7 @@ pub async fn compact_session_context_before_sequence(
     session_id: SessionId,
     selection: &SessionModelSelection,
     first_kept_sequence: u64,
+    cancel_state: &TurnCancelState,
 ) -> Result<CompactionCompletion, CompactionError> {
     compact_session_context_with_limit(
         state,
@@ -146,7 +137,7 @@ pub async fn compact_session_context_before_sequence(
         selection,
         Some(first_kept_sequence),
         None,
-        CompactionAuthority::CurrentTurn,
+        cancel_state,
         None,
     )
     .await
@@ -159,11 +150,11 @@ pub async fn compact_session_context_with_limit(
     selection: &SessionModelSelection,
     first_kept_sequence: Option<u64>,
     command_context: Option<&mut RuntimeCommandContext<'_>>,
-    authority: CompactionAuthority,
+    cancel_state: &TurnCancelState,
     progress_requirement: Option<CompactionProgressRequirement>,
 ) -> Result<CompactionCompletion, CompactionError> {
-    if authority == CompactionAuthority::Manual && state.session_has_active_turn(session_id).await {
-        return Err(CompactionError::Busy);
+    if cancel_state.is_cancelled() {
+        return Err(CompactionError::Cancelled);
     }
 
     let history = state.sessions.model_context_events(session_id).await?;
@@ -228,8 +219,15 @@ pub async fn compact_session_context_with_limit(
     )
     .await?;
     let portable_summary = if native_snapshot.is_some() {
-        match collect_compaction_summary(state, session_id, selection, &transcript, command_context)
-            .await
+        match collect_compaction_summary(
+            state,
+            session_id,
+            selection,
+            &transcript,
+            command_context,
+            cancel_state,
+        )
+        .await
         {
             Ok(summary) if !summary.trim().is_empty() => summary.trim().to_string(),
             Ok(_) => local_compaction_summary(&transcript, "provider returned an empty summary"),
@@ -237,9 +235,15 @@ pub async fn compact_session_context_with_limit(
             Err(error) => local_compaction_summary(&transcript, &compaction_error_detail(error)),
         }
     } else {
-        let summary =
-            collect_compaction_summary(state, session_id, selection, &transcript, command_context)
-                .await?;
+        let summary = collect_compaction_summary(
+            state,
+            session_id,
+            selection,
+            &transcript,
+            command_context,
+            cancel_state,
+        )
+        .await?;
         let summary = summary.trim().to_string();
         if summary.is_empty() {
             return Err(CompactionError::Provider(
@@ -248,6 +252,9 @@ pub async fn compact_session_context_with_limit(
         }
         summary
     };
+    if cancel_state.is_cancelled() {
+        return Err(CompactionError::Cancelled);
+    }
     let event = if let Some(mut snapshot) = native_snapshot {
         snapshot.portable_summary = portable_summary;
         state
@@ -698,7 +705,7 @@ pub async fn maybe_auto_compact_session_context(
         selection,
         None,
         Some(command_context),
-        CompactionAuthority::CurrentTurn,
+        cancel_state,
         Some(CompactionProgressRequirement {
             minimum_reclaimable_tokens: projected_context_tokens
                 .saturating_sub(threshold_tokens)
@@ -757,6 +764,7 @@ pub async fn collect_compaction_summary(
     selection: &SessionModelSelection,
     transcript: &CompactionTranscript,
     command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     append_context_compaction_trace(
         state,
@@ -776,6 +784,7 @@ pub async fn collect_compaction_summary(
         transcript,
         &prompt_text,
         command_context,
+        cancel_state,
     )
     .await
     {
@@ -813,6 +822,7 @@ pub async fn collect_compaction_summary_once(
     transcript: &CompactionTranscript,
     prompt_text: &str,
     mut command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
 ) -> Result<String, String> {
     let turn_id = format!(
         "{session_id}-compact-{}",
@@ -820,13 +830,15 @@ pub async fn collect_compaction_summary_once(
     );
     let mut request = build_compaction_request(session_id, selection, prompt_text, turn_id.clone());
     request.model_id = effective_model_id(state, selection).await?;
-    let compaction_cancel_state = TurnCancelState::default();
+    if cancel_state.is_cancelled() {
+        return Err("compaction cancelled".to_string());
+    }
     let provider_turn_id = if let Some(context) = &mut command_context {
         match wait_for_provider_call(
             state,
             session_id,
             context,
-            &compaction_cancel_state,
+            cancel_state,
             Box::pin(invoke_model_provider_json_blocking::<_, StartTurnResponse>(
                 state,
                 selection.provider_plugin_id.clone(),
@@ -858,7 +870,7 @@ pub async fn collect_compaction_summary_once(
             &provider_turn_id,
             &turn_id,
             context,
-            &compaction_cancel_state,
+            cancel_state,
         )
         .await
     } else {

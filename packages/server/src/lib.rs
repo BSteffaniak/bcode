@@ -22,7 +22,7 @@ use context_accounting::{
 use context_compaction::compaction_event_is_progress;
 use context_compaction::{
     AutomaticCompactionPolicy, AutomaticCompactionStrategy, COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
-    CompactionAuthority, CompactionDecision, CompactionError, ProactiveCompactionEvaluation,
+    CompactionDecision, CompactionError, ProactiveCompactionEvaluation,
     append_context_compaction_trace, automatic_compaction_policy,
     compact_session_context_before_sequence, compact_session_context_with_limit,
     compaction_capacity_tokens, maybe_auto_compact_session_context,
@@ -419,6 +419,7 @@ enum FollowupCommand {
         display_text: String,
     },
     CompactSession {
+        client_id: ClientId,
         selection: SessionModelSelection,
         response: oneshot::Sender<Result<String, CompactionError>>,
     },
@@ -489,8 +490,15 @@ struct ModelRequestAttempt {
     managed_compaction_persisted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeOperationKind {
+    ModelTurn,
+    ManualCompaction,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeCurrentTurn {
+    kind: RuntimeOperationKind,
     client_id: ClientId,
     turn_id: String,
     cancel_state: Arc<TurnCancelState>,
@@ -499,6 +507,7 @@ struct RuntimeCurrentTurn {
 
 impl RuntimeCurrentTurn {
     fn plugin_scope_for_model(&self, session_id: SessionId) -> PluginInvocationScope {
+        debug_assert_eq!(self.kind, RuntimeOperationKind::ModelTurn);
         PluginInvocationScope::session(session_id.to_string())
             .with_client_id(self.client_id.to_string())
             .with_turn_id(self.turn_id.clone())
@@ -5783,6 +5792,7 @@ async fn enqueue_followup_command(
 async fn enqueue_compact_session_command(
     state: &Arc<ServerState>,
     session_id: SessionId,
+    client_id: ClientId,
     selection: SessionModelSelection,
 ) -> Result<Result<String, CompactionError>, ServerError> {
     let (response, completion) = oneshot::channel();
@@ -5790,6 +5800,7 @@ async fn enqueue_compact_session_command(
         state,
         session_id,
         FollowupCommand::CompactSession {
+            client_id,
             selection,
             response,
         },
@@ -5976,6 +5987,7 @@ async fn run_session_runtime(
                 .await;
             }
             FollowupCommand::CompactSession {
+                client_id,
                 selection,
                 response,
             } => {
@@ -5988,6 +6000,7 @@ async fn run_session_runtime(
                     &mut cancel_commands,
                     queued_followups.as_ref(),
                     Arc::clone(&current_turn),
+                    client_id,
                     selection,
                 )
                 .await;
@@ -6177,6 +6190,7 @@ async fn begin_current_turn(
         "begin_current_turn requires no active current turn"
     );
     *current_turn = Some(RuntimeCurrentTurn {
+        kind: RuntimeOperationKind::ModelTurn,
         client_id,
         turn_id,
         cancel_state,
@@ -6472,15 +6486,24 @@ async fn process_compact_session_command(
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
     queued_followups: &AtomicUsize,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+    client_id: ClientId,
     selection: SessionModelSelection,
 ) -> Result<String, CompactionError> {
+    let cancel_state = Arc::new(TurnCancelState::default());
+    *current_turn.lock().await = Some(RuntimeCurrentTurn {
+        kind: RuntimeOperationKind::ManualCompaction,
+        client_id,
+        turn_id: format!("{session_id}-manual-compact-{}", uuid::Uuid::new_v4()),
+        cancel_state: Arc::clone(&cancel_state),
+        model: None,
+    });
     set_runtime_phase(&phase, SessionRuntimePhase::Compacting).await;
     let mut command_context = RuntimeCommandContext::new(
         followup_commands,
         steering_commands,
         cancel_commands,
         queued_followups,
-        current_turn,
+        Arc::clone(&current_turn),
     );
     let result = compact_session_context_with_limit(
         state,
@@ -6488,10 +6511,11 @@ async fn process_compact_session_command(
         &selection,
         None,
         Some(&mut command_context),
-        CompactionAuthority::Manual,
+        cancel_state.as_ref(),
         None,
     )
     .await;
+    *current_turn.lock().await = None;
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
     result.map(|completion| completion.message)
 }
@@ -7825,20 +7849,22 @@ async fn request_session_turn_cancellation(
     };
 
     current_turn.cancel_state.cancel();
-    append_model_turn_cancel_requested_event(
-        state,
-        session_id,
-        current_turn.turn_id.clone(),
-        requested_by,
-    )
-    .await;
-    cancel_registered_runtime_work(
-        state,
-        session_id,
-        RuntimeWorkId::new(format!("model_{}", current_turn.turn_id)),
-        requested_by,
-    )
-    .await;
+    if current_turn.kind == RuntimeOperationKind::ModelTurn {
+        append_model_turn_cancel_requested_event(
+            state,
+            session_id,
+            current_turn.turn_id.clone(),
+            requested_by,
+        )
+        .await;
+        cancel_registered_runtime_work(
+            state,
+            session_id,
+            RuntimeWorkId::new(format!("model_{}", current_turn.turn_id)),
+            requested_by,
+        )
+        .await;
+    }
 
     let active_turn = state.active_model_turn_snapshot(session_id).await;
     let Some(active_turn) = active_turn else {
@@ -8060,7 +8086,7 @@ async fn handle_compact_session(
         state.client_runtime_context(client_id).await,
     )
     .await;
-    match enqueue_compact_session_command(state, session_id, selection).await? {
+    match enqueue_compact_session_command(state, session_id, client_id, selection).await? {
         Ok(message) => {
             send_response(
                 writer,
@@ -8081,17 +8107,6 @@ async fn handle_compact_session(
                 writer,
                 request_id,
                 Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-        Err(CompactionError::Busy) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_busy",
-                    "cannot compact while a model turn is active for this session",
-                )),
             )
             .await
         }
@@ -9259,6 +9274,7 @@ struct ProviderErrorRetryContext<'a> {
     provider_retry_rules: &'a [bcode_model::ProviderRetryRule],
     remote_catalog_retry_rules: &'a [bcode_model::ProviderRetryRule],
     cancel_state: &'a TurnCancelState,
+    phase: &'a Arc<Mutex<SessionRuntimePhase>>,
     compaction_decision: CompactionDecision,
 }
 
@@ -9607,6 +9623,7 @@ async fn run_model_turn_inner(
             provider_retry_rules: &provider_retry_rules,
             remote_catalog_retry_rules: &remote_catalog_retry_rules,
             cancel_state: cancel_state.as_ref(),
+            phase,
             compaction_decision,
         };
         match maybe_retry_after_provider_error(
@@ -9690,15 +9707,18 @@ async fn maybe_retry_after_provider_error(
         recovery.retried_after_context_overflow,
     ) {
         recovery.retried_after_context_overflow = true;
-        return match compact_session_after_context_overflow(
+        set_runtime_phase(context.phase, SessionRuntimePhase::Compacting).await;
+        let result = compact_session_after_context_overflow(
             state,
             session_id,
             context.selection,
             context.trigger_event_sequence,
             error,
+            context.cancel_state,
         )
-        .await
-        {
+        .await;
+        set_runtime_phase(context.phase, SessionRuntimePhase::ProviderActive).await;
+        return match result {
             Ok(()) => ModelTurnRetry::Continue,
             Err(completion) => ModelTurnRetry::Return(completion),
         };
@@ -10193,6 +10213,7 @@ async fn compact_session_after_context_overflow(
     selection: &SessionModelSelection,
     first_kept_sequence: u64,
     error: &bcode_model::ProviderError,
+    cancel_state: &TurnCancelState,
 ) -> Result<(), ModelTurnCompletion> {
     append_context_compaction_trace(
         state,
@@ -10206,8 +10227,14 @@ async fn compact_session_after_context_overflow(
         )),
     )
     .await;
-    match compact_session_context_before_sequence(state, session_id, selection, first_kept_sequence)
-        .await
+    match compact_session_context_before_sequence(
+        state,
+        session_id,
+        selection,
+        first_kept_sequence,
+        cancel_state,
+    )
+    .await
     {
         Ok(completion) => {
             append_context_compaction_trace(
