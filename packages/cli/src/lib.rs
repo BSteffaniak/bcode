@@ -5,6 +5,7 @@
 //! Command-line interface for Bcode.
 
 mod blims;
+mod plugin_cli;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -106,14 +107,8 @@ pub enum CliError {
     PluginService { code: String, message: String },
     #[error("session repair usage error: {0}")]
     SessionRepairUsage(String),
-    #[error(
-        "plugin CLI command `{command}` is contributed by both `{first_plugin}` and `{second_plugin}`"
-    )]
-    PluginCliConflict {
-        command: String,
-        first_plugin: String,
-        second_plugin: String,
-    },
+    #[error(transparent)]
+    PluginCliComposition(#[from] plugin_cli::CompositionError),
     #[error("plugin CLI command failed: {0}")]
     PluginCli(String),
     #[error("{0}")]
@@ -154,13 +149,19 @@ pub async fn run_with_static_bundled(
     let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
     let _ = STATIC_BUNDLED_PLUGIN_IDS.set(static_plugin_ids);
     init_tracing();
-    let registrations = static_cli_registrations()?;
-    let command = compose_root_command(&registrations);
+    let registrations = plugin_cli::registrations(
+        STATIC_BUNDLED_PLUGINS.get().map_or(&[][..], Vec::as_slice),
+        STATIC_BUNDLED_PLUGIN_IDS
+            .get()
+            .map_or(&[][..], Vec::as_slice),
+    )?;
+    let command = plugin_cli::compose(Cli::command(), &registrations);
     let matches = command.get_matches();
-    if let Some(plugin) = plugin_cli_match(&matches, &registrations)
+    if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
         && let Some((_, subcommand_matches)) = matches.subcommand()
     {
-        return (plugin.invoke)(subcommand_matches.clone())
+        return plugin
+            .invoke(subcommand_matches.clone())
             .await
             .map_err(CliError::PluginCli);
     }
@@ -990,79 +991,6 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .finish();
     let _ = subscriber.try_init();
-}
-
-struct StaticCliContribution {
-    plugin_id: String,
-    command_name: String,
-    invoke: fn(clap::ArgMatches) -> bcode_plugin_sdk::StaticCliFuture,
-    command: clap::Command,
-}
-
-fn static_cli_registrations() -> Result<Vec<StaticCliContribution>, CliError> {
-    let plugins = STATIC_BUNDLED_PLUGINS.get().map_or(&[][..], Vec::as_slice);
-    let ids = STATIC_BUNDLED_PLUGIN_IDS
-        .get()
-        .map_or(&[][..], Vec::as_slice);
-    let mut contributions = Vec::new();
-    for (plugin, plugin_id) in plugins.iter().zip(ids) {
-        let Some(registration) = plugin.cli_registration() else {
-            continue;
-        };
-        let command = (registration.command)();
-        contributions.push(StaticCliContribution {
-            plugin_id: plugin_id.clone(),
-            command_name: command.get_name().to_owned(),
-            invoke: registration.invoke,
-            command,
-        });
-    }
-    contributions.sort_by(|left, right| {
-        left.command_name
-            .cmp(&right.command_name)
-            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
-    });
-    validate_cli_contributions(&contributions)?;
-    Ok(contributions)
-}
-
-fn validate_cli_contributions(contributions: &[StaticCliContribution]) -> Result<(), CliError> {
-    for pair in contributions.windows(2) {
-        if pair[0].command_name == pair[1].command_name {
-            return Err(CliError::PluginCliConflict {
-                command: pair[0].command_name.clone(),
-                first_plugin: pair[0].plugin_id.clone(),
-                second_plugin: pair[1].plugin_id.clone(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn compose_root_command(contributions: &[StaticCliContribution]) -> clap::Command {
-    let mut root = Cli::command();
-    for contribution in contributions {
-        if root
-            .get_subcommands()
-            .any(|command| command.get_name() == contribution.command_name)
-        {
-            root =
-                root.mut_subcommand(&contribution.command_name, |_| contribution.command.clone());
-        } else {
-            root = root.subcommand(contribution.command.clone());
-        }
-    }
-    root
-}
-
-fn plugin_cli_match<'a>(
-    matches: &clap::ArgMatches,
-    contributions: &'a [StaticCliContribution],
-) -> Option<&'a StaticCliContribution> {
-    let (name, _) = matches.subcommand()?;
-    contributions
-        .iter()
-        .find(|contribution| contribution.command_name == name)
 }
 
 /// Return the root `bcode` CLI command definition.
@@ -9034,77 +8962,6 @@ fn print_model_usage_event(
         usage.cache_write_input_tokens,
         usage.reasoning_tokens,
     );
-}
-
-#[cfg(test)]
-mod plugin_cli_tests {
-    use super::*;
-
-    fn unused_invoke(_: clap::ArgMatches) -> bcode_plugin_sdk::StaticCliFuture {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn contribution(plugin_id: &str, command: clap::Command) -> StaticCliContribution {
-        StaticCliContribution {
-            plugin_id: plugin_id.to_owned(),
-            command_name: command.get_name().to_owned(),
-            invoke: unused_invoke,
-            command,
-        }
-    }
-
-    #[test]
-    fn plugin_command_replaces_matching_core_command() {
-        let contributions = [contribution(
-            "bcode.plugin-web",
-            clap::Command::new("web").arg(clap::Arg::new("plugin-option").long("plugin-option")),
-        )];
-        let root = compose_root_command(&contributions);
-        let web = root
-            .find_subcommand("web")
-            .expect("plugin web command should be composed");
-
-        assert!(
-            web.get_arguments()
-                .any(|argument| argument.get_id() == "plugin-option")
-        );
-        assert!(
-            !web.get_arguments()
-                .any(|argument| argument.get_id() == "bind")
-        );
-    }
-
-    #[test]
-    fn plugin_command_can_extend_root() {
-        let contributions = [contribution(
-            "bcode.plugin-example",
-            clap::Command::new("example"),
-        )];
-        let root = compose_root_command(&contributions);
-
-        assert!(root.find_subcommand("example").is_some());
-    }
-
-    #[test]
-    fn duplicate_plugin_commands_are_rejected() {
-        let contributions = [
-            contribution("bcode.first", clap::Command::new("example")),
-            contribution("bcode.second", clap::Command::new("example")),
-        ];
-        let error = validate_cli_contributions(&contributions)
-            .expect_err("duplicate plugin commands should fail");
-
-        assert!(matches!(
-            error,
-            CliError::PluginCliConflict {
-                command,
-                first_plugin,
-                second_plugin,
-            } if command == "example"
-                && first_plugin == "bcode.first"
-                && second_plugin == "bcode.second"
-        ));
-    }
 }
 
 #[cfg(test)]
