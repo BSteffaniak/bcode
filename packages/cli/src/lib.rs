@@ -1026,6 +1026,11 @@ fn static_cli_registrations() -> Result<Vec<StaticCliContribution>, CliError> {
             .cmp(&right.command_name)
             .then_with(|| left.plugin_id.cmp(&right.plugin_id))
     });
+    validate_cli_contributions(&contributions)?;
+    Ok(contributions)
+}
+
+fn validate_cli_contributions(contributions: &[StaticCliContribution]) -> Result<(), CliError> {
     for pair in contributions.windows(2) {
         if pair[0].command_name == pair[1].command_name {
             return Err(CliError::PluginCliConflict {
@@ -1035,7 +1040,7 @@ fn static_cli_registrations() -> Result<Vec<StaticCliContribution>, CliError> {
             });
         }
     }
-    Ok(contributions)
+    Ok(())
 }
 
 fn compose_root_command(contributions: &[StaticCliContribution]) -> clap::Command {
@@ -9262,6 +9267,77 @@ fn print_model_usage_event(
         usage.cache_write_input_tokens,
         usage.reasoning_tokens,
     );
+}
+
+#[cfg(test)]
+mod plugin_cli_tests {
+    use super::*;
+
+    fn unused_invoke(_: clap::ArgMatches) -> bcode_plugin_sdk::StaticCliFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn contribution(plugin_id: &str, command: clap::Command) -> StaticCliContribution {
+        StaticCliContribution {
+            plugin_id: plugin_id.to_owned(),
+            command_name: command.get_name().to_owned(),
+            invoke: unused_invoke,
+            command,
+        }
+    }
+
+    #[test]
+    fn plugin_command_replaces_matching_core_command() {
+        let contributions = [contribution(
+            "bcode.plugin-web",
+            clap::Command::new("web").arg(clap::Arg::new("plugin-option").long("plugin-option")),
+        )];
+        let root = compose_root_command(&contributions);
+        let web = root
+            .find_subcommand("web")
+            .expect("plugin web command should be composed");
+
+        assert!(
+            web.get_arguments()
+                .any(|argument| argument.get_id() == "plugin-option")
+        );
+        assert!(
+            !web.get_arguments()
+                .any(|argument| argument.get_id() == "bind")
+        );
+    }
+
+    #[test]
+    fn plugin_command_can_extend_root() {
+        let contributions = [contribution(
+            "bcode.plugin-example",
+            clap::Command::new("example"),
+        )];
+        let root = compose_root_command(&contributions);
+
+        assert!(root.find_subcommand("example").is_some());
+    }
+
+    #[test]
+    fn duplicate_plugin_commands_are_rejected() {
+        let contributions = [
+            contribution("bcode.first", clap::Command::new("example")),
+            contribution("bcode.second", clap::Command::new("example")),
+        ];
+        let error = validate_cli_contributions(&contributions)
+            .expect_err("duplicate plugin commands should fail");
+
+        assert!(matches!(
+            error,
+            CliError::PluginCliConflict {
+                command,
+                first_plugin,
+                second_plugin,
+            } if command == "example"
+                && first_plugin == "bcode.first"
+                && second_plugin == "bcode.second"
+        ));
+    }
 }
 
 #[cfg(test)]
