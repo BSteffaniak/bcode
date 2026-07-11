@@ -1,5 +1,6 @@
 //! Native TUI rendering for web search and fetch visuals.
 
+use bcode_tui_components::compact::{header_rows, truncate_width};
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use serde_json::Value;
 
@@ -84,33 +85,51 @@ fn search_result_rows(payload: &Value, width: u16) -> Vec<Line> {
         .get("results")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    let mut rows = header(&format!("Search results ({result_count})"));
-    push_kv(&mut rows, "query", text(payload, "query"));
-    push_kv(&mut rows, "provider", text(payload, "provider"));
-    push_kv(&mut rows, "partial", bool_text(payload, "partial"));
-    if let Some(message) = text(payload, "message") {
-        push_kv(&mut rows, "note", Some(message));
-    }
+    let metadata =
+        [text(payload, "query").map(|value| Span::styled(format!("“{value}”"), value_style()))]
+            .into_iter()
+            .flatten();
+    let mut rows = header_rows(
+        Span::styled("◆ ", accent()),
+        Span::styled(format!("Search results ({result_count})"), title_style()),
+        metadata,
+        width,
+        muted(),
+    );
     rows.push(Line::raw(""));
     if let Some(results) = payload.get("results").and_then(Value::as_array) {
         for (index, result) in results.iter().take(10).enumerate() {
+            let url = text(result, "url").unwrap_or_default();
+            let host = url
+                .split_once("://")
+                .map_or(url, |(_, rest)| rest)
+                .split('/')
+                .next()
+                .unwrap_or_default();
             rows.push(Line::from_spans(vec![
-                Span::styled(format!("  {}. ", index + 1), accent()),
+                Span::styled(format!("  {}  ", index + 1), accent()),
                 Span::styled(
                     text(result, "title").unwrap_or("Untitled").to_owned(),
                     title_style(),
                 ),
+                Span::styled(format!(" · {host}"), muted()),
             ]));
-            if let Some(url) = text(result, "url") {
+            if !url.is_empty() {
                 rows.push(Line::from_spans(vec![
                     Span::styled("     ↳ ", muted()),
-                    Span::styled(url.to_owned(), url_style()),
+                    Span::styled(
+                        truncate_width(url, usize::from(width.saturating_sub(8))),
+                        url_style(),
+                    ),
                 ]));
             }
             if let Some(snippet) = text(result, "snippet") {
                 rows.push(Line::from_spans(vec![
                     Span::styled("     │ ", muted()),
-                    Span::raw(truncate(snippet, usize::from(width.saturating_sub(8)))),
+                    Span::raw(truncate_width(
+                        snippet,
+                        usize::from(width.saturating_sub(8)),
+                    )),
                 ]));
             }
         }
@@ -120,6 +139,17 @@ fn search_result_rows(payload: &Value, width: u16) -> Vec<Line> {
                 muted(),
             )]));
         }
+    }
+    if text(payload, "provider").is_some()
+        || payload.get("partial").and_then(Value::as_bool) == Some(true)
+        || text(payload, "message").is_some()
+    {
+        rows.push(Line::raw(""));
+        push_kv(&mut rows, "provider", text(payload, "provider"));
+        if payload.get("partial").and_then(Value::as_bool) == Some(true) {
+            push_kv(&mut rows, "partial", Some("yes"));
+        }
+        push_kv(&mut rows, "note", text(payload, "message"));
     }
     rows
 }

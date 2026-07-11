@@ -1,5 +1,6 @@
 //! Native TUI rendering for document extraction visuals.
 
+use bcode_tui_components::compact::header_rows;
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use serde_json::Value;
 
@@ -42,14 +43,28 @@ fn request_rows(payload: &Value) -> Vec<Line> {
 }
 
 fn extract_rows(payload: &Value, width: u16) -> Vec<Line> {
-    let mut rows = header("Document extraction");
-    push_kv(&mut rows, "source", text(payload, "source"));
-    push_kv(&mut rows, "type", text(payload, "content_type"));
-    push_kv(&mut rows, "extractor", text(payload, "extractor"));
-    push_kv(&mut rows, "fallback", text(payload, "fallback_used"));
+    let metadata = [
+        text(payload, "source").map(|value| Span::styled(value.to_owned(), value_style())),
+        text(payload, "content_type").map(|value| Span::styled(value.to_owned(), muted())),
+        text(payload, "extractor").map(|value| Span::styled(value.to_owned(), muted())),
+    ]
+    .into_iter()
+    .flatten();
+    let mut rows = header_rows(
+        Span::styled("◆ ", accent()),
+        Span::styled("Document extraction", title_style()),
+        metadata,
+        width,
+        muted(),
+    );
+    if text(payload, "fallback_used").is_some_and(|value| value != "false") {
+        push_kv(&mut rows, "fallback", text(payload, "fallback_used"));
+    }
     push_kv(&mut rows, "document", text(payload, "document_path"));
     push_kv(&mut rows, "text path", text(payload, "text_path"));
-    push_kv(&mut rows, "truncated", value(payload, "truncated"));
+    if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
+        push_kv(&mut rows, "truncated", Some("yes"));
+    }
     if let Some(text) = text(payload, "text") {
         rows.push(Line::raw(""));
         rows.extend(preview_rows(text, width));

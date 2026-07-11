@@ -1633,6 +1633,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bcode_tui_components",
  "bmux_tui",
  "pdf-extract",
  "reqwest",
@@ -1716,6 +1717,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bcode_tui_components",
  "bmux_tui",
  "serde",
  "serde_json",
@@ -2391,6 +2393,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bcode_tui_components",
  "bmux_tui",
  "reqwest",
  "serde",

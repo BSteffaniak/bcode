@@ -1,5 +1,6 @@
 //! Native TUI rendering for Git tool visuals.
 
+use bcode_tui_components::compact::header_rows;
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use serde_json::Value;
 
@@ -19,46 +20,60 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for GitTuiVisualAdapter {
         bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
     }
 
-    fn rows(&self, kind: &str, payload: &Value, _width: u16) -> Vec<Line> {
+    fn rows(&self, kind: &str, payload: &Value, width: u16) -> Vec<Line> {
         match kind {
-            "bcode.git.clone_request" => clone_request_rows(payload),
-            "bcode.git.clone_result" => clone_result_rows(payload),
+            "bcode.git.clone_request" => clone_request_rows(payload, width),
+            "bcode.git.clone_result" => clone_result_rows(payload, width),
             _ => Vec::new(),
         }
     }
 }
 
-fn clone_request_rows(payload: &Value) -> Vec<Line> {
+fn clone_request_rows(payload: &Value, width: u16) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
-    let mut rows = header("Clone repository");
-    push_kv(&mut rows, "url", text(arguments, "url"));
-    push_kv(
-        &mut rows,
-        "ref",
-        text(arguments, "ref").or_else(|| text(arguments, "branch")),
-    );
-    push_kv(&mut rows, "destination", text(arguments, "destination"));
-    rows
+    let metadata = [
+        text(arguments, "url").map(|value| Span::styled(value.to_owned(), value_style())),
+        text(arguments, "ref")
+            .or_else(|| text(arguments, "branch"))
+            .map(|value| Span::styled(value.to_owned(), value_style())),
+        text(arguments, "destination")
+            .map(|value| Span::styled(format!("→ {value}"), value_style())),
+    ]
+    .into_iter()
+    .flatten();
+    header_rows(
+        Span::styled("◆ ", accent()),
+        Span::styled("Clone repository", title_style()),
+        metadata,
+        width,
+        label(),
+    )
 }
 
-fn clone_result_rows(payload: &Value) -> Vec<Line> {
-    let mut rows = header("Repository clone");
-    push_kv(&mut rows, "repo", repo_name(payload));
-    push_kv(&mut rows, "host", text(payload, "host"));
-    push_kv(
-        &mut rows,
-        "url",
-        text(payload, "clone_url").or_else(|| text(payload, "url")),
-    );
-    push_kv(&mut rows, "ref", text(payload, "git_ref"));
-    push_kv(&mut rows, "path", text(payload, "path"));
-    push_kv(
-        &mut rows,
-        "already existed",
-        bool_text(payload, "already_exists"),
-    );
-    push_kv(&mut rows, "scope", text(payload, "artifact_scope"));
-    rows
+fn clone_result_rows(payload: &Value, width: u16) -> Vec<Line> {
+    let existed = payload.get("already_exists").and_then(Value::as_bool) == Some(true);
+    let metadata = [
+        repo_name(payload).map(|value| Span::styled(value, value_style())),
+        text(payload, "path").map(|value| Span::styled(format!("→ {value}"), value_style())),
+        text(payload, "git_ref").map(|value| Span::styled(value.to_owned(), value_style())),
+        text(payload, "artifact_scope").map(|value| Span::styled(value.to_owned(), value_style())),
+    ]
+    .into_iter()
+    .flatten();
+    header_rows(
+        Span::styled(if existed { "◆ " } else { "✓ " }, accent()),
+        Span::styled(
+            if existed {
+                "Repository already exists"
+            } else {
+                "Repository cloned"
+            },
+            title_style(),
+        ),
+        metadata,
+        width,
+        label(),
+    )
 }
 
 fn repo_name(payload: &Value) -> Option<String> {
@@ -66,34 +81,8 @@ fn repo_name(payload: &Value) -> Option<String> {
     Some(text(payload, "owner").map_or_else(|| repo.to_owned(), |owner| format!("{owner}/{repo}")))
 }
 
-fn header(title: &str) -> Vec<Line> {
-    vec![Line::from_spans(vec![
-        Span::styled("◆ ", accent()),
-        Span::styled(title.to_owned(), title_style()),
-    ])]
-}
-
-fn push_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>)
-where
-    T: Into<String>,
-{
-    if let Some(value) = value.map(Into::into).filter(|value| !value.is_empty()) {
-        rows.push(Line::from_spans(vec![
-            Span::styled(format!("  {key}: "), label()),
-            Span::styled(value, value_style()),
-        ]));
-    }
-}
-
 fn text<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(Value::as_str)
-}
-
-fn bool_text(payload: &Value, key: &str) -> Option<String> {
-    payload
-        .get(key)
-        .and_then(Value::as_bool)
-        .map(|value| if value { "yes" } else { "no" }.to_owned())
 }
 
 const fn accent() -> Style {

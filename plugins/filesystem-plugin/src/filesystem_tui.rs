@@ -89,7 +89,9 @@ fn read_rows(kind: &str, payload: &Value, width: u16) -> Vec<Line> {
         range_text(payload, "start_line", "end_line", "total_lines"),
     );
     push_kv(&mut rows, "bytes", byte_summary(payload));
-    push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
+    if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
+        push_kv(&mut rows, "truncated", Some("yes"));
+    }
     if let Some(contents) = text(payload, "contents").or_else(|| text(payload, "preview")) {
         rows.push(Line::raw(""));
         let numbered = !kind.contains("artifact");
@@ -161,7 +163,14 @@ fn list_rows(payload: &Value) -> Vec<Line> {
             rows.push(Line::from_spans(vec![
                 Span::styled(format!("  {icon} "), icon_style),
                 Span::styled(path, path_style()),
-                Span::styled(format!("  {kind}"), muted()),
+                Span::styled(
+                    if kind == "file" {
+                        String::new()
+                    } else {
+                        format!("  {kind}")
+                    },
+                    muted(),
+                ),
             ]));
         }
         if values.len() > 25 {
@@ -180,9 +189,6 @@ fn find_rows(payload: &Value) -> Vec<Line> {
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
     let mut rows = card_header(&format!("Path matches ({paths})"));
-    push_kv(&mut rows, "backend", text(payload, "backend"));
-    push_kv(&mut rows, "visited", number(payload, "visited_entries"));
-    push_kv(&mut rows, "partial", bool_text(payload, "partial"));
     rows.push(Line::raw(""));
     if let Some(values) = payload.get("paths").and_then(Value::as_array) {
         for path in values.iter().filter_map(Value::as_str).take(30) {
@@ -196,6 +202,17 @@ fn find_rows(payload: &Value) -> Vec<Line> {
                 format!("  … {} more paths", values.len() - 30),
                 muted(),
             )]));
+        }
+    }
+    if text(payload, "backend").is_some()
+        || number(payload, "visited_entries").is_some()
+        || payload.get("partial").and_then(Value::as_bool) == Some(true)
+    {
+        rows.push(Line::raw(""));
+        push_kv(&mut rows, "backend", text(payload, "backend"));
+        push_kv(&mut rows, "visited", number(payload, "visited_entries"));
+        if payload.get("partial").and_then(Value::as_bool) == Some(true) {
+            push_kv(&mut rows, "partial", Some("yes"));
         }
     }
     rows
