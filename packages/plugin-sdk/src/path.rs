@@ -48,6 +48,18 @@ pub fn display(path: impl AsRef<Path>, working_directory: impl AsRef<Path>) -> D
     DisplayPath(path)
 }
 
+/// Format `path` relative to the process working directory when it remains concise.
+///
+/// If the process working directory is unavailable, relative paths are formatted against `.` and
+/// absolute paths remain normalized.
+#[must_use]
+pub fn display_from_current_dir(path: impl AsRef<Path>) -> DisplayPath {
+    display(
+        path,
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    )
+}
+
 fn normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 

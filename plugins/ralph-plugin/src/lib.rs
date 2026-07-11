@@ -9,6 +9,7 @@ mod cli;
 
 use std::path::PathBuf;
 
+use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::tui::{
     PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface, PluginTuiSurfaceFactory,
@@ -432,16 +433,16 @@ impl RalphHomeSurface {
             ),
             format!(
                 "  Worktree: {}",
-                draft
-                    .work_area_path
-                    .as_ref()
-                    .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string())
+                draft.work_area_path.as_ref().map_or_else(
+                    || "<default>".to_owned(),
+                    |path| display(path, &self.repo_path).to_string()
+                )
             ),
             format!(
                 "  Ready: charter={} progress={} approved={}",
                 readiness.has_charter, readiness.has_progress, readiness.approved
             ),
-            format!("  Path: {}", draft.draft_path.display()),
+            format!("  Path: {}", display(&draft.draft_path, &self.repo_path)),
         ] {
             write_line(frame, area, y, Line::from(line));
             y = y.saturating_add(1);
@@ -516,14 +517,23 @@ impl RalphHomeSurface {
         for line in [
             format!("  Name: {}", summary.loop_name),
             format!("  Lifecycle: {}", summary.status),
-            format!("  State dir: {}", summary.state_dir.display()),
-            format!("  Charter: {}", summary.charter_doc_path.display()),
-            format!("  Progress: {}", summary.progress_doc_path.display()),
+            format!(
+                "  State dir: {}",
+                display(&summary.state_dir, &self.repo_path)
+            ),
+            format!(
+                "  Charter: {}",
+                display(&summary.charter_doc_path, &self.repo_path)
+            ),
+            format!(
+                "  Progress: {}",
+                display(&summary.progress_doc_path, &self.repo_path)
+            ),
             format!(
                 "  Work area: {}",
                 summary.work_area_path.as_ref().map_or_else(
                     || "<not created>".to_owned(),
-                    |path| path.display().to_string()
+                    |path| display(path, &self.repo_path).to_string()
                 )
             ),
             format!(
@@ -608,9 +618,15 @@ impl RalphHomeSurface {
         if let Some(summary) = &self.loop_summary {
             for line in [
                 format!("Loop: {}", summary.loop_name),
-                format!("State: {}", summary.state_dir.display()),
-                format!("Charter: {}", summary.charter_doc_path.display()),
-                format!("Progress: {}", summary.progress_doc_path.display()),
+                format!("State: {}", display(&summary.state_dir, &self.repo_path)),
+                format!(
+                    "Charter: {}",
+                    display(&summary.charter_doc_path, &self.repo_path)
+                ),
+                format!(
+                    "Progress: {}",
+                    display(&summary.progress_doc_path, &self.repo_path)
+                ),
             ] {
                 write_line(frame, area, y, Line::from(line));
                 y = y.saturating_add(1);
@@ -690,7 +706,10 @@ impl PluginTuiSurface for RalphHomeSurface {
             frame,
             area,
             y,
-            Line::from(format!("Repo: {}", self.repo_path.display())),
+            Line::from(format!(
+                "Repo: {}",
+                display_from_current_dir(&self.repo_path)
+            )),
         );
         y = y.saturating_add(1);
         write_line(

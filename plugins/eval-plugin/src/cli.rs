@@ -1,6 +1,7 @@
 //! Statically bundled eval CLI contribution.
 
 use bcode_client::BcodeClient;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{
     StaticCliFuture, StaticCliHostAction, StaticCliOutcome, StaticCliRegistration,
 };
@@ -288,7 +289,7 @@ async fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
                 println!("eval run: {}", result.manifest.run_id);
                 println!(
                     "summary: {}",
-                    result.manifest.output_dir.join("summary.md").display()
+                    display_from_current_dir(result.manifest.output_dir.join("summary.md"))
                 );
                 print!("{}", bcode_eval::render_terminal_summary(&result));
                 println!("passed: {}", result.passed);
@@ -396,7 +397,12 @@ async fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
         EvalCommand::List { root } => {
             for suite in bcode_eval::list_suites(root)? {
                 let loaded = bcode_eval::load_suite(&suite)?;
-                println!("{}\t{}\t{}", loaded.id, loaded.name, suite.display());
+                println!(
+                    "{}\t{}\t{}",
+                    loaded.id,
+                    loaded.name,
+                    display_from_current_dir(&suite)
+                );
             }
         }
         EvalCommand::AddCase {
@@ -418,7 +424,10 @@ async fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
         }
         EvalCommand::ReplaySession { session_id, output } => {
             bcode_eval::export_session_replay(&session_id, &output)?;
-            println!("exported replay transcript to {}", output.display());
+            println!(
+                "exported replay transcript to {}",
+                display_from_current_dir(&output)
+            );
         }
         EvalCommand::Tools { json } => {
             let tools = bcode_eval::list_loaded_tools()?;
@@ -467,7 +476,7 @@ fn handle_eval_improve_command(command: EvalImproveCommand) -> Result<(), CliErr
                 },
             )?;
             println!("improvement campaign: {}", campaign.id);
-            println!("path: {}", campaign.output_dir.display());
+            println!("path: {}", display_from_current_dir(&campaign.output_dir));
         }
         EvalImproveCommand::Record {
             campaign,
