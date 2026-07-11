@@ -1303,7 +1303,7 @@ impl StartCampaignWizard {
         if !self.suite_path().exists() {
             return Err(format!(
                 "suite path does not exist: {}",
-                self.suite_path().display()
+                display_from_current_dir(self.suite_path())
             ));
         }
         let output_path = self.output_root.join(&campaign_id);

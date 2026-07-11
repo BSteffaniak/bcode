@@ -1942,9 +1942,7 @@ fn workspace_item_matches_query(item: &ReviewWorkspaceListItem, query: &str) -> 
 fn workspace_matches_query(workspace: &ReviewWorkspace, query: &str) -> bool {
     workspace.title.to_ascii_lowercase().contains(query)
         || workspace.id.to_ascii_lowercase().contains(query)
-        || workspace
-            .repo_root
-            .display()
+        || display_from_current_dir(&workspace.repo_root)
             .to_string()
             .to_ascii_lowercase()
             .contains(query)

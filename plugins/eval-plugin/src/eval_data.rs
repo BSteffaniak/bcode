@@ -4,6 +4,7 @@ use bcode_eval_models::{
     EvalImprovementCampaign, EvalImprovementGeneration, EvalRepetitionResult, EvalRunResult,
     EvalSuite, EvalVariantRunResult,
 };
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Read;
@@ -667,7 +668,7 @@ pub fn load_repetition_artifact(
         String::from_utf8_lossy(&bytes).into_owned()
     };
     Some(TextArtifact {
-        title: format!("{}: {}", kind, path.display()),
+        title: format!("{}: {}", kind, display_from_current_dir(path)),
         text,
         truncated,
         binary,

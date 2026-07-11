@@ -291,9 +291,7 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
             .fork
             .as_ref()
             .is_some_and(|fork| fork_matches_query(fork, query))
-        || session
-            .working_directory
-            .display()
+        || display_from_current_dir(&session.working_directory)
             .to_string()
             .to_ascii_lowercase()
             .contains(query)

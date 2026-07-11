@@ -865,7 +865,7 @@ fn read_path_for_tool(
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
     match image_file_metadata(path) {
-        Ok(Some(image)) => image_tool_response(path, image, tool_call_id),
+        Ok(Some(image)) => image_tool_response(path, image, working_directory, tool_call_id),
         Ok(None) => match std::fs::read(path) {
             Ok(bytes) => text_tool_response(path, request, &bytes, working_directory, tool_call_id),
             Err(error) => tool_io_error(&error),
@@ -1155,6 +1155,7 @@ fn utf8_boundary_at_or_before_bytes(bytes: &[u8], mut index: usize) -> usize {
 fn image_tool_response(
     path: &Path,
     image: ImageFileMetadata,
+    working_directory: &Path,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
     let metadata = std::fs::metadata(path);
@@ -1162,7 +1163,7 @@ fn image_tool_response(
     let output = format!(
         "Read image file [{}]\nPath: {}\nDimensions: {}x{}\nSize: {} bytes\nReturned image reference for visual inspection.",
         image.mime_type,
-        path.display(),
+        display(path, working_directory),
         image.width,
         image.height,
         byte_len
