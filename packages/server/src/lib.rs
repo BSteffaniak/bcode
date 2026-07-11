@@ -61,7 +61,7 @@ use bcode_model::{
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
-use bcode_plugin_sdk::path::display;
+use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_session::{
     AppendToolCallRequestedInput, CatalogLoadStatus, SessionManager,
     lease::SessionLeaseOwnerContext,
@@ -4878,7 +4878,7 @@ async fn handle_remove_worktree(
                 format!(
                     "session {} is rooted inside worktree {}; move or delete it before removal",
                     session.id,
-                    request.path.display()
+                    display_from_current_dir(&request.path)
                 ),
             )),
         )
@@ -13339,7 +13339,7 @@ fn project_tool_result_for_model_context(
 
     let path = full_output_path.map_or_else(
         || "the session trace blob store".to_string(),
-        |path| path.display().to_string(),
+        |path| display_from_current_dir(path).to_string(),
     );
     let footer = format!(
         "\n\n[tool output truncated for model context: original {char_count} chars / {} bytes. Full retained output saved at: {path}. Bcode already includes the beginning and end of long tool output when possible; do not rerun the same shell command with sed/head/tail just to inspect omitted output. Prefer artifact.metadata, artifact.grep, or artifact.read with max_bytes/from_end for saved tool-output artifacts; filesystem.grep or filesystem.read with offset/limit also work for regular files. Avoid reading the whole file unless necessary.]\n\n",

@@ -5,6 +5,7 @@
 //! Configuration loading for Bcode.
 
 use bcode_plugin::PluginSelection;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_skill_models::SkillId;
 pub use hyperchad_docs_config::{ConfigDocSchema, FieldDoc, NestedFieldDoc};
 use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
@@ -3726,7 +3727,10 @@ pub fn load_model_ignores_state_from(
     })?;
     let state =
         toml::from_str::<ModelIgnoresState>(&raw).map_err(|source| ConfigError::Composition {
-            message: format!("failed to parse {}: {source}", path.display()),
+            message: format!(
+                "failed to parse {}: {source}",
+                display_from_current_dir(path)
+            ),
         })?;
     Ok(state.providers)
 }
@@ -3901,7 +3905,7 @@ pub fn load_permissions_state_from(
         return Ok(BTreeMap::new());
     }
     let value = load_toml_file(path)?;
-    let context = format!("permissions state {}", path.display());
+    let context = format!("permissions state {}", display_from_current_dir(path));
     let config = validate_config_value(value, &context)?;
     Ok(config.agent)
 }
@@ -5396,14 +5400,17 @@ fn load_toml_file(path: &Path) -> Result<toml::Value, ConfigError> {
         source,
     })?;
     toml::from_str(&contents).map_err(|source| ConfigError::Composition {
-        message: format!("failed to parse config {}: {source}", path.display()),
+        message: format!(
+            "failed to parse config {}: {source}",
+            display_from_current_dir(path)
+        ),
     })
 }
 
 fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
     let raw = load_toml_file(path)?;
     let (resolved, _resolution) = resolve_composed_config_value(&raw)?;
-    let context = format!("config {}", path.display());
+    let context = format!("config {}", display_from_current_dir(path));
     validate_config_value(resolved, &context)
 }
 

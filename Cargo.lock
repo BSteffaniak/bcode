@@ -1313,6 +1313,7 @@ dependencies = [
  "bcode_client",
  "bcode_model",
  "bcode_plugin",
+ "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_tool",
  "jsonschema",
@@ -1568,6 +1569,7 @@ dependencies = [
  "bcode_command",
  "bcode_model",
  "bcode_plugin",
+ "bcode_plugin_sdk",
  "bcode_skill_models",
  "hyperchad_docs_config",
  "hyperchad_docs_config_derive",
@@ -2367,6 +2369,7 @@ dependencies = [
 name = "bcode_vim_edit"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_plugin_sdk",
  "bcode_tui_components",
  "nvim-rs",
  "serde",

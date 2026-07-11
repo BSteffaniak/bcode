@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_plugin_sdk     = { workspace = true }
 bcode_tui_components = { workspace = true, features = ["syntax"] }
 nvim-rs              = { workspace = true, features = ["use_tokio"] }
 serde                = { workspace = true, features = ["derive", "std"] }

@@ -11,6 +11,7 @@
 //! this crate does not need a dedicated diff dependency. Neovim is controlled
 //! through the embedded msgpack-RPC transport provided by `nvim --embed`.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_tui_components::diff_viewer::{DiffLineKind, diff_from_text};
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio as nvim_create;
@@ -1288,7 +1289,7 @@ impl NeovimSession {
             nvim_create::new_child_cmd(&mut command, Dummy::<Compat<ChildStdin>>::new())
                 .await
                 .map_err(|source| VimEditError::StartNeovim {
-                    executable: executable.display().to_string(),
+                    executable: display_from_current_dir(executable).to_string(),
                     source,
                 })?;
         Ok(Self {
@@ -1631,7 +1632,11 @@ const EX_COMMAND_MODIFIERS: &[&str] = &[
 ];
 
 fn render_diff(path: &Path, old_text: &str, new_text: &str) -> String {
-    let document = diff_from_text(&path.display().to_string(), old_text, new_text);
+    let document = diff_from_text(
+        &display_from_current_dir(path).to_string(),
+        old_text,
+        new_text,
+    );
     let mut rendered = String::new();
     for line in document.lines {
         let prefix = match line.kind {

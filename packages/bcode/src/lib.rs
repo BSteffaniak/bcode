@@ -19,6 +19,7 @@ use bcode_model::{
     StartTurnResponse,
 };
 use bcode_model::{ModelParameters, ProviderRequestContext};
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::SessionId;
 use bcode_tool::{ToolDefinition, ToolInvocationRequest, ToolInvocationResponse};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1902,20 +1903,20 @@ impl LocalSessionStore {
             Err(error) => {
                 return Err(BcodeError::SessionPersistence(format!(
                     "failed to read session store {}: {error}",
-                    self.path.display()
+                    display_from_current_dir(&self.path)
                 )));
             }
         };
         if contents.trim().is_empty() {
             return Err(BcodeError::SessionState(format!(
                 "session store {} is empty and requires repair or replacement",
-                self.path.display()
+                display_from_current_dir(&self.path)
             )));
         }
         serde_json::from_str(&contents).map(Some).map_err(|error| {
             BcodeError::SessionState(format!(
                 "session store {} is corrupt and requires repair or replacement: {error}",
-                self.path.display()
+                display_from_current_dir(&self.path)
             ))
         })
     }
@@ -1930,7 +1931,7 @@ impl LocalSessionStore {
             std::fs::create_dir_all(parent).map_err(|error| {
                 BcodeError::SessionPersistence(format!(
                     "failed to create session store directory {}: {error}",
-                    parent.display()
+                    display_from_current_dir(parent)
                 ))
             })?;
         }
@@ -1941,13 +1942,13 @@ impl LocalSessionStore {
         std::fs::write(&temporary_path, encoded).map_err(|error| {
             BcodeError::SessionPersistence(format!(
                 "failed to write temporary session store {}: {error}",
-                temporary_path.display()
+                display_from_current_dir(&temporary_path)
             ))
         })?;
         std::fs::rename(&temporary_path, &self.path).map_err(|error| {
             BcodeError::SessionPersistence(format!(
                 "failed to replace session store {}: {error}",
-                self.path.display()
+                display_from_current_dir(&self.path)
             ))
         })
     }

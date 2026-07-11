@@ -7,6 +7,7 @@
 //! The wrapper owns API handles, text allocation cleanup, runtime tessdata
 //! resolution, and conversion from idiomatic Rust inputs to Tesseract's C API.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::env;
 use std::ffi::{CStr, CString, NulError};
 use std::fs;
@@ -366,7 +367,7 @@ fn runtime_load_diagnostics(library_path: &Path, loader_error: &str) -> String {
     );
     format!(
         "library: {}; exists: {}; lib dir entries: {}; loader error: {}; hint: {}",
-        library_path.display(),
+        display_from_current_dir(library_path),
         library_path.exists(),
         entries,
         loader_error,
@@ -376,9 +377,9 @@ fn runtime_load_diagnostics(library_path: &Path, loader_error: &str) -> String {
 
 fn platform_loader_hint(library_path: &Path) -> String {
     if cfg!(target_os = "macos") {
-        format!("run `otool -L {}`", library_path.display())
+        format!("run `otool -L {}`", display_from_current_dir(library_path))
     } else if cfg!(target_os = "linux") {
-        format!("run `ldd {}`", library_path.display())
+        format!("run `ldd {}`", display_from_current_dir(library_path))
     } else {
         "verify the dependent DLLs are next to the runtime library".to_string()
     }

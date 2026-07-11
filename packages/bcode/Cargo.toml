@@ -33,6 +33,7 @@ bcode_cli = { workspace = true, optional = true }
 bcode_client = { workspace = true, optional = true }
 bcode_model = { workspace = true }
 bcode_plugin = { workspace = true, optional = true }
+bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool = { workspace = true }
 jsonschema = { workspace = true }
