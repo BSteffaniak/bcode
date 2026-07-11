@@ -37,7 +37,7 @@ enum CliError {
 }
 pub(super) fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: false,
+        requires_daemon: true,
         command: ReviewCli::command,
         invoke,
     }
