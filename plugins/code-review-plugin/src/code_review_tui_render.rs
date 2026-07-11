@@ -1,5 +1,6 @@
 //! Rendering for full-screen code review mode.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::fmt::Write as _;
 
 use bcode_code_review_models::{
@@ -848,7 +849,7 @@ fn render_review_summary(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let lines = [
         " Summary".to_string(),
         format!(" title: {}", app.review.title),
-        format!(" repo: {}", app.review.repo_root.display()),
+        format!(" repo: {}", display_from_current_dir(&app.review.repo_root)),
         format!(" files: {viewed}/{total_files} viewed"),
         format!(" diff: +{} -{}", app.review.additions, app.review.deletions),
         format!(" threads: {open_threads} open, {resolved_threads} resolved"),

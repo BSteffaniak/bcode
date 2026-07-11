@@ -1,5 +1,6 @@
 //! Code review workspace home/picker TUI.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1793,7 +1794,7 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
         format!(" {}", workspace.title),
         format!(" health: {}", workspace_health_label(item)),
         format!(" id: {}", workspace.id),
-        format!(" repo: {}", workspace.repo_root.display()),
+        format!(" repo: {}", display_from_current_dir(&workspace.repo_root)),
         format!(
             " updated: {}",
             workspace

@@ -1,5 +1,6 @@
 //! Clipboard image paste support for the TUI.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -268,7 +269,7 @@ fn working_directory_key(path: &Path) -> String {
 /// Format composer text inserted for a saved clipboard image.
 #[must_use]
 pub fn pasted_image_text(path: &Path) -> String {
-    format!("{}\n", path.display())
+    format!("{}\n", display_from_current_dir(path))
 }
 
 struct ModelRgbaImage {
@@ -344,6 +345,7 @@ mod tests {
         MODEL_MAX_DIMENSION, clipboard_image_artifact_paths, draft_clipboard_image_artifact_paths,
         pasted_image_text, promote_draft_clipboard_images_in_state, resized_model_rgba,
     };
+    use bcode_plugin_sdk::path::display_from_current_dir;
     use bcode_session_models::SessionId;
     use uuid::Uuid;
 
@@ -393,7 +395,7 @@ mod tests {
         std::fs::write(&draft_paths.source, b"source").unwrap();
         std::fs::write(&draft_paths.model, b"model").unwrap();
         std::fs::write(&draft_paths.metadata, b"metadata").unwrap();
-        let message = format!("look at {}", draft_paths.model.display());
+        let message = format!("look at {}", display_from_current_dir(&draft_paths.model));
 
         let rewritten = promote_draft_clipboard_images_in_state(
             temp.path(),
@@ -409,7 +411,7 @@ mod tests {
         assert_eq!(std::fs::read(&session_paths.metadata).unwrap(), b"metadata");
         assert_eq!(
             rewritten,
-            format!("look at {}", session_paths.model.display())
+            format!("look at {}", display_from_current_dir(&session_paths.model))
         );
     }
 

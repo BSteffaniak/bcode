@@ -61,6 +61,7 @@ use bcode_model::{
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
+use bcode_plugin_sdk::path::display;
 use bcode_session::{
     AppendToolCallRequestedInput, CatalogLoadStatus, SessionManager,
     lease::SessionLeaseOwnerContext,
@@ -13234,10 +13235,10 @@ fn build_repository_context_parts(cwd: &Path) -> (String, String) {
 
     let mut dynamic_lines = vec![
         "Dynamic repository context:".to_string(),
-        format!("* Current directory: {}", cwd.display()),
+        format!("* Current directory: {}", display(cwd, cwd)),
     ];
     if let Some(repo_root) = &repo_root {
-        dynamic_lines.push(format!("* Git root: {}", repo_root.display()));
+        dynamic_lines.push(format!("* Git root: {}", display(repo_root, cwd)));
     }
     if let Some(branch) = run_command(context_root, "git", &["branch", "--show-current"][..])
         && !branch.is_empty()
@@ -15109,8 +15110,8 @@ fn working_directory_changed_message(
 ) -> String {
     format!(
         "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
-        old_working_directory.display(),
-        new_working_directory.display()
+        display(old_working_directory, old_working_directory),
+        display(new_working_directory, old_working_directory)
     )
 }
 

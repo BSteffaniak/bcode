@@ -1,5 +1,6 @@
 //! Full-screen local code review TUI mode.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -9122,7 +9123,7 @@ impl ReviewApp {
         format!(
             "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nFile: {}\nDiff rows: {}-{}\nOld range: {}-{}\nNew range: {}-{}\nLine kind: {:?}\nOther draft comment threads in this review: {}\n\nCurrent draft/comment:\n{}\n\nSelected diff lines:\n```diff\n{}\n```\n\nNearby diff hunk/context:\n```diff\n{}\n```\n\nReview context is also available through the code-review plugin service. The relevant interface is `bcode.code_review/v1`; useful operations are `review.context.get`, `review.comments.list`, `review.thread.get`, and `review.diff.get`. Request payloads include `repo_path` plus the review `target`; `review.thread.get` accepts `thread_id` or `anchor`, and `review.diff.get` accepts optional `file_path`.\n\nPlease analyze this review thread. Keep the anchored file and line context in mind. If broader context is needed, inspect the repository from the session working directory.",
             self.review.title,
-            self.review.repo_root.display(),
+            display_from_current_dir(&self.review.repo_root),
             ask.anchor.path,
             ask.anchor.start_diff_row(),
             ask.anchor.end_diff_row(),

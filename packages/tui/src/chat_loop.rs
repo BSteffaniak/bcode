@@ -1,5 +1,6 @@
 //! Main chat event loop for the TUI.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1128,7 +1129,8 @@ fn apply_attach_worktree_result(
     match result {
         Ok(session) => {
             chat.app.apply_session_summary(&session);
-            chat.app.set_status(format!("worktree: {}", path.display()));
+            chat.app
+                .set_status(format!("worktree: {}", display_from_current_dir(path)));
         }
         Err(error) => {
             daemon_issue::report_client_issue(&mut chat.app, "worktree attach failed", &error);
@@ -1153,8 +1155,10 @@ fn apply_create_worktree_result(
         chat.app.apply_session_summary(&session);
         chat.session_id = Some(session_id);
     }
-    chat.app
-        .push_system_note(format!("Created worktree\n* Path: {}", path.display()));
+    chat.app.push_system_note(format!(
+        "Created worktree\n* Path: {}",
+        display_from_current_dir(&path)
+    ));
     chat.app.set_status("created worktree".to_owned());
 }
 
@@ -1895,7 +1899,7 @@ fn paste_clipboard_image(chat: &mut ActiveChat) {
             chat.app.wake_cursor();
             chat.app.set_status(format!(
                 "Image pasted: {}; source saved in session artifacts",
-                artifact.model.display()
+                display_from_current_dir(&artifact.model)
             ));
         }
         Err(error) => {

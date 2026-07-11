@@ -2,6 +2,7 @@
 
 use super::{daemon_issue, slash_registry};
 use bcode_client::BcodeClient;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::SessionId;
 use bcode_skill_models::SkillId;
 use bcode_worktree_models::WorktreeListRequest;
@@ -428,11 +429,17 @@ async fn worktree_command(
             let response = client
                 .list_worktrees(WorktreeListRequest { cwd: None })
                 .await?;
-            let mut lines = vec![format!("worktrees for {}", response.repo_root.display())];
+            let mut lines = vec![format!(
+                "worktrees for {}",
+                display_from_current_dir(&response.repo_root)
+            )];
             lines.extend(response.worktrees.into_iter().map(|worktree| {
                 let marker = if worktree.is_main { "main" } else { "linked" };
                 let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_string());
-                format!("* {marker} {branch} — {}", worktree.path.display())
+                format!(
+                    "* {marker} {branch} — {}",
+                    display_from_current_dir(&worktree.path)
+                )
             }));
             Ok(SlashCommandOutcome::SystemNote(lines.join("\n")))
         }

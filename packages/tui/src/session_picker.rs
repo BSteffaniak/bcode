@@ -1,5 +1,6 @@
 //! TUI session picker state.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{SessionId, SessionSummary};
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
@@ -254,7 +255,7 @@ fn session_item(session: &SessionSummary) -> ListItem {
         },
     );
     let id = session.id.to_string();
-    let cwd = session.working_directory.display().to_string();
+    let cwd = display_from_current_dir(&session.working_directory).to_string();
     ListItem::new(Line::from_spans(vec![
         Span::styled(display_name, Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),

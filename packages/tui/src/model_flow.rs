@@ -1,5 +1,6 @@
 //! Model/provider picker flow for the TUI.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::io::Write;
 
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -220,7 +221,10 @@ fn ignore_selected_model(
         match bcode_config::ignore_model_in_state(provider, model_id.clone()) {
             Ok(path) => {
                 picker.mark_state_ignored(&model_id);
-                picker.set_status(format!("Ignored {model_id} in state ({})", path.display()));
+                picker.set_status(format!(
+                    "Ignored {model_id} in state ({})",
+                    display_from_current_dir(&path)
+                ));
             }
             Err(error) => picker.set_status(format!("Failed to ignore {model_id}: {error}")),
         }
@@ -238,7 +242,7 @@ fn unignore_selected_model(
                 picker.mark_state_unignored(&model_id);
                 picker.set_status(format!(
                     "Removed state ignore for {model_id} ({})",
-                    path.display()
+                    display_from_current_dir(&path)
                 ));
             }
             Err(error) => picker.set_status(format!("Failed to unignore {model_id}: {error}")),

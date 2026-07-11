@@ -1,5 +1,6 @@
 //! TUI worktree picker state.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_worktree_models::WorktreeInfo;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
@@ -105,7 +106,7 @@ fn worktree_matches(worktree: &WorktreeInfo, query: &str) -> bool {
     }
     let haystack = format!(
         "{} {} {}",
-        worktree.path.display(),
+        display_from_current_dir(&worktree.path),
         worktree.branch.as_deref().unwrap_or(""),
         worktree.commit.as_deref().unwrap_or("")
     )
@@ -124,7 +125,7 @@ fn worktree_item(worktree: &WorktreeInfo) -> ListItem {
         Span::raw("  "),
         Span::styled(commit.to_owned(), Style::new().fg(Color::BrightBlack)),
         Span::raw("  "),
-        Span::raw(worktree.path.display().to_string()),
+        Span::raw(display_from_current_dir(&worktree.path).to_string()),
     ]))
 }
 

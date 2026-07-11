@@ -1526,8 +1526,8 @@ pub fn session_event_compaction_line(
         } => Some(format!(
             "#{} working directory changed from {} to {}",
             event.sequence,
-            old_working_directory.display(),
-            new_working_directory.display()
+            display(old_working_directory, old_working_directory),
+            display(new_working_directory, old_working_directory)
         )),
         _ => None,
     }
