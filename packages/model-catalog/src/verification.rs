@@ -1,6 +1,7 @@
 //! Model verification runner and OpenAI-compatible transports.
 
 use crate::ModelCatalog;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -306,7 +307,7 @@ fn write_report(
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(output, body)?;
-        println!("wrote {}", output.display());
+        println!("wrote {}", display_from_current_dir(output));
     } else {
         println!("{body}");
     }

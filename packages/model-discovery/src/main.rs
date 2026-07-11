@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -53,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "wrote {} Bedrock live models to {}",
                 snapshot.models.len(),
-                output.display()
+                display_from_current_dir(&output)
             );
         }
         Command::Xai { api_key, output } => {
@@ -62,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "wrote {} xAI live models to {}",
                 snapshot.models.len(),
-                output.display()
+                display_from_current_dir(&output)
             );
         }
     }

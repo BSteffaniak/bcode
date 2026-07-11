@@ -7,6 +7,7 @@ use bcode_model_catalog::{
     VerificationAuthMode, VerificationOptions, build_artifacts_with_live, default_source_dir,
     load_catalog, run_verification,
 };
+use bcode_plugin_sdk::path::display_from_current_dir;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -156,7 +157,7 @@ fn validate_catalog(source: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "validated {} providers from {}",
         catalog.providers.len(),
-        source.display()
+        display_from_current_dir(&source)
     );
     Ok(())
 }
@@ -168,7 +169,10 @@ fn print_status() -> Result<(), Box<dyn std::error::Error>> {
     println!("bundled_generated_at={}", bundled.generated_at);
     println!("bundled_providers={}", bundled.providers.len());
     println!("remote_url={}", options.base_url);
-    println!("remote_cache_dir={}", options.cache_dir.display());
+    println!(
+        "remote_cache_dir={}",
+        display_from_current_dir(&options.cache_dir)
+    );
     println!("remote_disabled={}", options.disabled);
     if options.disabled {
         return Ok(());

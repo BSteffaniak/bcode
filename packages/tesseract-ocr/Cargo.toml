@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_plugin_sdk    = { workspace = true }
 bcode_tesseract_sys = { workspace = true, default-features = false }
 libloading          = { workspace = true, features = ["std"] }
 thiserror           = { workspace = true }

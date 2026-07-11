@@ -19,6 +19,7 @@ test = false
 aws-config = { workspace = true }
 aws-sdk-bedrock = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
 clap = { workspace = true, features = ["derive", "std"] }
 reqwest = { workspace = true, default-features = false, features = [
     "json",

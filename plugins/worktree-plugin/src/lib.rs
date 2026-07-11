@@ -714,7 +714,10 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
             frame,
             area,
             area.y.saturating_add(1),
-            Line::from(format!("Repo: {}", self.repo_path.display())),
+            Line::from(format!(
+                "Repo: {}",
+                display(&self.repo_path, &self.repo_path)
+            )),
         );
         let mut y = area.y.saturating_add(3);
         for (index, line) in self.lines.iter().enumerate() {

@@ -1836,6 +1836,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model",
  "bcode_model_catalog_models",
+ "bcode_plugin_sdk",
  "clap",
  "reqwest",
  "serde",
@@ -1859,6 +1860,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-bedrock",
  "bcode_model_catalog_models",
+ "bcode_plugin_sdk",
  "clap",
  "reqwest",
  "serde",
@@ -2263,6 +2265,7 @@ dependencies = [
 name = "bcode_tesseract_ocr"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_plugin_sdk",
  "bcode_tesseract_sys",
  "libloading 0.9.0",
  "thiserror 2.0.18",

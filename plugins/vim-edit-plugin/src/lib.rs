@@ -12,7 +12,7 @@ mod vim_edit_interaction;
 #[cfg(feature = "static-bundled")]
 mod vim_edit_playback_tui;
 
-use bcode_plugin_sdk::path::display;
+use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     InteractiveToolRequest, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
@@ -693,7 +693,7 @@ fn emit_vim_live_frame(
             title: Some("Vim edit live".to_string()),
             subtitle: Some(format!(
                 "{} · step {}/{}",
-                frame.path.display(),
+                display_from_current_dir(&frame.path),
                 frame.step_index.saturating_add(1),
                 frame.step_total
             )),

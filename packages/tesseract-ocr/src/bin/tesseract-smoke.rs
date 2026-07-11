@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_tesseract_ocr::{
     ImageView, PageSegMode, RuntimeSelection, TesseractEngine, TesseractRuntime,
     available_bundled_versions,
@@ -18,7 +19,7 @@ fn main() -> bcode_tesseract_ocr::Result<()> {
     println!(
         "default bundled runtime: {} ({})",
         default_runtime.version(),
-        default_runtime.tessdata_dir().display()
+        display_from_current_dir(default_runtime.tessdata_dir())
     );
     let latest_runtime = TesseractRuntime::load_latest()?;
     println!("latest bundled runtime: {}", latest_runtime.version());
