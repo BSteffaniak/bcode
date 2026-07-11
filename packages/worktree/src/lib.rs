@@ -5,6 +5,7 @@
 //! Git worktree orchestration for Bcode.
 
 use bcode_config::{BcodeConfig, WorktreeBaseRefConfig};
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_worktree_models::{
     WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeInfo,
     WorktreeListResponse, WorktreeRemoveResponse,
@@ -155,7 +156,7 @@ pub fn remove_worktree(
     }) else {
         return Err(WorktreeError::RemoveRefused(format!(
             "{} is not a registered worktree",
-            path.display()
+            display_from_current_dir(path)
         )));
     };
     if worktree.is_main {
@@ -166,7 +167,7 @@ pub fn remove_worktree(
     if !force && worktree_is_dirty(path) {
         return Err(WorktreeError::RemoveRefused(format!(
             "{} has uncommitted changes; use force to remove it",
-            path.display()
+            display_from_current_dir(path)
         )));
     }
     setup_remove_worktree(&repo, path, force)?;
@@ -310,7 +311,7 @@ fn allow_direnv_for_worktree(path: &Path) -> Result<(), WorktreeError> {
         .map_err(|error| {
             WorktreeError::Setup(format!(
                 "direnv_allow is enabled, but `direnv allow {}` could not run: {error}",
-                envrc.display()
+                display_from_current_dir(&envrc)
             ))
         })?;
     if output.status.success() {
@@ -318,7 +319,7 @@ fn allow_direnv_for_worktree(path: &Path) -> Result<(), WorktreeError> {
     }
     Err(WorktreeError::Setup(format!(
         "direnv_allow is enabled, but `direnv allow {}` failed with status {}: {}",
-        envrc.display(),
+        display_from_current_dir(&envrc),
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     )))

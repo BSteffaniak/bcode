@@ -1,3 +1,4 @@
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
@@ -35,8 +36,8 @@ impl fmt::Display for AuthIdentityError {
             } => write!(
                 formatter,
                 "Bcode-managed auth vault identity is incomplete; expected both {} and {}. Remove the incomplete key files and run `bcode login` again.",
-                private_key.display(),
-                public_key.display()
+                display_from_current_dir(private_key),
+                display_from_current_dir(public_key)
             ),
             Self::OperationFailed { message } => formatter.write_str(message),
         }
@@ -106,7 +107,7 @@ pub fn ensure_vault_recipient_key(vault_path: &Path) -> Result<String, AuthIdent
     fs::create_dir_all(&identity_dir).map_err(|error| AuthIdentityError::OperationFailed {
         message: format!(
             "failed to create Bcode auth vault key directory {}: {error}",
-            identity_dir.display()
+            display_from_current_dir(&identity_dir)
         ),
     })?;
     restrict_dir_permissions(&identity_dir)?;
@@ -141,7 +142,7 @@ fn read_public_key_file(path: &Path) -> Result<String, AuthIdentityError> {
         fs::read_to_string(path).map_err(|error| AuthIdentityError::OperationFailed {
             message: format!(
                 "failed to read Bcode auth vault public key {}: {error}",
-                path.display()
+                display_from_current_dir(path)
             ),
         })?;
     contents
@@ -152,7 +153,7 @@ fn read_public_key_file(path: &Path) -> Result<String, AuthIdentityError> {
         .ok_or_else(|| AuthIdentityError::OperationFailed {
             message: format!(
                 "Bcode auth vault public key {} does not contain a public key line",
-                path.display()
+                display_from_current_dir(path)
             ),
         })
 }
@@ -161,7 +162,7 @@ fn write_private_key_file(path: &Path, contents: &str) -> Result<(), AuthIdentit
     fs::write(path, contents).map_err(|error| AuthIdentityError::OperationFailed {
         message: format!(
             "failed to write Bcode auth vault private key {}: {error}",
-            path.display()
+            display_from_current_dir(path)
         ),
     })?;
     restrict_private_key_permissions(path)
@@ -172,7 +173,7 @@ fn write_public_key_file(path: &Path, contents: &str) -> Result<(), AuthIdentity
         AuthIdentityError::OperationFailed {
             message: format!(
                 "failed to write Bcode auth vault public key {}: {error}",
-                path.display()
+                display_from_current_dir(path)
             ),
         }
     })?;
@@ -186,7 +187,7 @@ fn restrict_dir_permissions(path: &Path) -> Result<(), AuthIdentityError> {
         AuthIdentityError::OperationFailed {
             message: format!(
                 "failed to restrict Bcode auth vault key directory permissions {}: {error}",
-                path.display()
+                display_from_current_dir(path)
             ),
         }
     })
@@ -204,7 +205,7 @@ fn restrict_private_key_permissions(path: &Path) -> Result<(), AuthIdentityError
         AuthIdentityError::OperationFailed {
             message: format!(
                 "failed to restrict Bcode auth vault private key permissions {}: {error}",
-                path.display()
+                display_from_current_dir(path)
             ),
         }
     })
@@ -222,7 +223,7 @@ fn restrict_public_key_permissions(path: &Path) -> Result<(), AuthIdentityError>
         AuthIdentityError::OperationFailed {
             message: format!(
                 "failed to set Bcode auth vault public key permissions {}: {error}",
-                path.display()
+                display_from_current_dir(path)
             ),
         }
     })
@@ -375,7 +376,10 @@ pub fn inspect_auth_vault_security(
     if !status.vault_exists {
         status.diagnostics.push(AuthSecurityDiagnostic::warning(
             "auth_vault_missing",
-            format!("Auth vault does not exist: {}", vault_path.display()),
+            format!(
+                "Auth vault does not exist: {}",
+                display_from_current_dir(vault_path)
+            ),
             "Run `bcode login` for the selected provider.",
         ));
         return status;
@@ -390,7 +394,7 @@ pub fn inspect_auth_vault_security(
             "auth_vault_unlock_failed",
             format!(
                 "Auth vault metadata could not be unlocked: {}",
-                vault_path.display()
+                display_from_current_dir(vault_path)
             ),
             "Ensure the SSH identity used for this vault is available, then retry.",
         ));
@@ -464,7 +468,7 @@ pub(crate) fn read_auth_vault_profile(
     let (mut vault, data_key) = load_auth_vault_metadata(vault_path).map_err(|error| {
         format!(
             "failed to unlock auth vault metadata at {}: {error}",
-            vault_path.display()
+            display_from_current_dir(vault_path)
         )
     })?;
     if vault.profiles.get(profile).is_none() && vault.profiles.profile_entries.contains_key(profile)

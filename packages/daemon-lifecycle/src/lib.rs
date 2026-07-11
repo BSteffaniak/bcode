@@ -5,6 +5,7 @@
 //! Daemon lifecycle registry and cleanup models.
 
 use bcode_ipc::{BUILD_FINGERPRINT, CURRENT_PROTOCOL_VERSION, IpcEndpoint, daemon_namespace};
+use bcode_plugin_sdk::path::display_from_current_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write as _;
@@ -641,7 +642,7 @@ fn print_daemon_status(options: &EnsureDaemonOptions, status: &str) {
     if !options.quiet {
         println!("{status}");
         println!("namespace: {}", daemon_namespace());
-        println!("log: {}", options.log_path.display());
+        println!("log: {}", display_from_current_dir(&options.log_path));
     }
 }
 
@@ -718,7 +719,7 @@ async fn wait_for_server_ready(
             if let Some(status) = child.try_wait()? {
                 return Err(DaemonStartError::Exited {
                     status: status.to_string(),
-                    log_path: log_path.display().to_string(),
+                    log_path: display_from_current_dir(log_path).to_string(),
                     recent_log: recent_log_excerpt(log_path),
                 });
             }
@@ -727,7 +728,7 @@ async fn wait_for_server_ready(
         if let Some(status) = child.try_wait()? {
             let error = DaemonStartError::Exited {
                 status: status.to_string(),
-                log_path: log_path.display().to_string(),
+                log_path: display_from_current_dir(log_path).to_string(),
                 recent_log: recent_log_excerpt(log_path),
             };
             if error.is_existing_daemon_race() && wait_for_existing_daemon(endpoint).await {
@@ -739,7 +740,7 @@ async fn wait_for_server_ready(
     }
 
     Err(DaemonStartError::StartTimeout {
-        log_path: log_path.display().to_string(),
+        log_path: display_from_current_dir(log_path).to_string(),
         recent_log: recent_log_excerpt(log_path),
     })
 }
@@ -756,7 +757,7 @@ async fn wait_for_daemon_ready(
     }
 
     Err(DaemonStartError::StartTimeout {
-        log_path: log_path.display().to_string(),
+        log_path: display_from_current_dir(log_path).to_string(),
         recent_log: recent_log_excerpt(log_path),
     })
 }

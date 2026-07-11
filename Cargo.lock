@@ -1583,6 +1583,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
  "bcode_ipc",
+ "bcode_plugin_sdk",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2030,6 +2031,7 @@ dependencies = [
  "base64 0.22.1",
  "bcode_config",
  "bcode_model",
+ "bcode_plugin_sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2441,6 +2443,7 @@ name = "bcode_worktree"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
+ "bcode_plugin_sdk",
  "bcode_worktree_models",
  "serde",
  "tempfile",
