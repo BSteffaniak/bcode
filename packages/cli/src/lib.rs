@@ -164,11 +164,14 @@ pub async fn run_with_static_bundled(
             .invoke(subcommand_matches.clone())
             .await
             .map_err(CliError::PluginCli)?;
-        if let Some(bcode_plugin_sdk::StaticCliHostAction::OpenTuiSurface { surface_kind }) =
-            outcome.host_action
+        if let Some(bcode_plugin_sdk::StaticCliHostAction::OpenTuiSurface {
+            surface_kind,
+            repo_path,
+            options,
+        }) = outcome.host_action
         {
             ensure_server_running().await?;
-            bcode_tui::run_plugin_surface(surface_kind).await?;
+            bcode_tui::run_plugin_surface(surface_kind, repo_path, options).await?;
         }
         return Ok(());
     }
@@ -232,7 +235,6 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Session { command } => handle_session_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Eval { command } => Box::pin(handle_eval_command(command)).await?,
-        Commands::Metrics { path, repo } => bcode_tui::run_metrics_dashboard(repo, path).await?,
         Commands::Web {
             bind,
             port,
@@ -581,7 +583,6 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Session { .. }
         | Commands::Blims { .. }
         | Commands::Eval { .. }
-        | Commands::Metrics { .. }
         | Commands::Web { .. }
         | Commands::Review { .. }
         | Commands::Plugin { .. }
@@ -1066,15 +1067,6 @@ enum Commands {
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
-    },
-    /// Open the persisted performance metrics dashboard.
-    Metrics {
-        /// Metrics event log path. Defaults to Bcode's persisted metrics store.
-        #[arg(long)]
-        path: Option<PathBuf>,
-        /// Repository path used for plugin surface context.
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
     },
     /// Serve the `HyperChad` web renderer.
     Web {

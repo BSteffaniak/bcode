@@ -20,6 +20,7 @@ bcode_plugin_sdk    = { workspace = true }
 bmux_keyboard       = { workspace = true }
 bmux_tui            = { workspace = true }
 bmux_tui_components = { workspace = true }
+clap                = { workspace = true, features = ["derive", "std"] }
 serde               = { workspace = true }
 serde_json          = { workspace = true }
 

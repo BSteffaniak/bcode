@@ -26,10 +26,11 @@ pub(super) fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = RalphCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
-        let _repo = cli.repo;
         Ok(StaticCliOutcome {
             host_action: Some(StaticCliHostAction::OpenTuiSurface {
                 surface_kind: RALPH_HOME_SURFACE_KIND.to_owned(),
+                repo_path: Some(cli.repo),
+                options: std::collections::BTreeMap::new(),
             }),
         })
     })

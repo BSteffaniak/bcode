@@ -1,5 +1,8 @@
 //! Metrics dashboard plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod cli;
+
 pub mod metrics_dashboard;
 pub mod tui;
 
@@ -121,6 +124,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
         include_str!("../bcode-plugin.toml")
     );
     vtable.tui_registry = Some(tui::tui_registry);
+    vtable.cli_registration = Some(cli::registration);
     vtable
 }
 

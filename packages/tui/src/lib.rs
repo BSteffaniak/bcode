@@ -353,9 +353,20 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
 /// Returns I/O or plugin service errors, or an error when the surface does not
 /// yet have a full-screen startup flow.
 #[allow(clippy::future_not_send)]
-pub async fn run_plugin_surface(surface_kind: String) -> Result<(), TuiError> {
+pub async fn run_plugin_surface(
+    surface_kind: String,
+    repo_path: Option<std::path::PathBuf>,
+    options: std::collections::BTreeMap<String, String>,
+) -> Result<(), TuiError> {
     if surface_kind == "ralph-home" {
         return run_ralph_home().await;
+    }
+    if surface_kind == "metrics-dashboard" {
+        return run_metrics_dashboard(
+            repo_path.unwrap_or_else(|| std::path::PathBuf::from(".")),
+            options.get("metrics_path").map(std::path::PathBuf::from),
+        )
+        .await;
     }
     Err(TuiError::PluginService {
         code: "unsupported_startup_surface".to_owned(),

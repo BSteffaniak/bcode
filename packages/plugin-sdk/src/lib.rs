@@ -872,6 +872,10 @@ pub enum StaticCliHostAction {
     OpenTuiSurface {
         /// Plugin surface kind.
         surface_kind: String,
+        /// Repository path used as surface context.
+        repo_path: Option<std::path::PathBuf>,
+        /// Plugin-defined string options for the surface.
+        options: std::collections::BTreeMap<String, String>,
     },
 }
 
