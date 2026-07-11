@@ -2872,6 +2872,16 @@ fn rewrite_copied_event_kind(
                 .copied()
                 .unwrap_or(compacted_through_sequence),
         },
+        SessionEventKind::ProviderContextCompacted {
+            snapshot,
+            compacted_through_sequence,
+        } => SessionEventKind::ProviderContextCompacted {
+            snapshot,
+            compacted_through_sequence: sequence_map
+                .get(&compacted_through_sequence)
+                .copied()
+                .unwrap_or(compacted_through_sequence),
+        },
         other => other,
     }
 }
@@ -2916,41 +2926,45 @@ fn input_history_from_events(history: &[SessionEvent]) -> Vec<SessionInputHistor
 }
 
 fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEvent> {
-    let latest_compaction =
-        history
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, event)| match &event.kind {
-                SessionEventKind::ContextCompacted {
-                    compacted_through_sequence,
-                    ..
-                }
-                | SessionEventKind::ProviderContextCompacted {
-                    compacted_through_sequence,
-                    ..
-                } => Some((index, *compacted_through_sequence)),
-                _ => None,
-            });
-    let Some((index, compacted_through_sequence)) = latest_compaction else {
+    let latest_compaction = history
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                SessionEventKind::ContextCompacted { .. }
+                    | SessionEventKind::ProviderContextCompacted { .. }
+            )
+        })
+        .max_by_key(|event| event.sequence);
+    let Some(marker) = latest_compaction else {
         return history.to_vec();
     };
-    std::iter::once(history[index].clone())
-        .chain(
-            history
-                .iter()
-                .filter(|event| event.sequence > compacted_through_sequence)
-                .filter(|event| event.sequence != history[index].sequence)
-                .filter(|event| {
-                    !matches!(
-                        event.kind,
-                        SessionEventKind::ContextCompacted { .. }
-                            | SessionEventKind::ProviderContextCompacted { .. }
-                    )
-                })
-                .cloned(),
-        )
-        .collect()
+    let compacted_through_sequence = match &marker.kind {
+        SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        }
+        | SessionEventKind::ProviderContextCompacted {
+            compacted_through_sequence,
+            ..
+        } => *compacted_through_sequence,
+        _ => unreachable!("marker selection accepts only compaction events"),
+    };
+    let mut retained = history
+        .iter()
+        .filter(|event| event.sequence > compacted_through_sequence)
+        .filter(|event| event.sequence != marker.sequence)
+        .filter(|event| {
+            !matches!(
+                event.kind,
+                SessionEventKind::ContextCompacted { .. }
+                    | SessionEventKind::ProviderContextCompacted { .. }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    retained.sort_by_key(|event| event.sequence);
+    std::iter::once(marker.clone()).chain(retained).collect()
 }
 
 fn current_unix_millis() -> u64 {
@@ -3034,11 +3048,12 @@ mod tests {
     use super::{SessionLeaseOwnerContext, SessionManager, db};
     use bcode_metrics::MetricsRegistry;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
-        RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
-        SessionForkKind, SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent,
-        SessionTracePayload, SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent,
-        ToolOutputStream, TraceBlobRef,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderContextSnapshot,
+        ProviderContextSnapshotOrigin, ProviderStreamEvent, RuntimeWorkId, RuntimeWorkKind,
+        RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind,
+        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
+        SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+        TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -3048,6 +3063,183 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_session_event(
+        session_id: SessionId,
+        sequence: u64,
+        kind: SessionEventKind,
+    ) -> SessionEvent {
+        SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        }
+    }
+
+    fn provider_snapshot() -> ProviderContextSnapshot {
+        ProviderContextSnapshot {
+            format_version: 1,
+            provider_plugin_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            compatibility_key: "surface".to_string(),
+            auth_profile: None,
+            origin: ProviderContextSnapshotOrigin::Explicit,
+            messages_json: "[]".to_string(),
+            portable_summary: "portable".to_string(),
+        }
+    }
+
+    #[test]
+    fn in_memory_projection_selects_newest_marker_by_sequence_not_storage_order() {
+        let id = SessionId::new();
+        let history = vec![
+            test_session_event(
+                id,
+                8,
+                SessionEventKind::ContextCompacted {
+                    summary: "newest".to_string(),
+                    compacted_through_sequence: 2,
+                },
+            ),
+            test_session_event(
+                id,
+                4,
+                SessionEventKind::ProviderContextCompacted {
+                    snapshot: provider_snapshot(),
+                    compacted_through_sequence: 1,
+                },
+            ),
+            test_session_event(
+                id,
+                5,
+                SessionEventKind::AssistantMessage {
+                    text: "retained".to_string(),
+                },
+            ),
+        ];
+        let projected = super::model_context_events_from_history(&history);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![8, 5]
+        );
+    }
+
+    #[test]
+    fn copied_local_boundary_is_rewritten_to_destination_sequence() {
+        let rewritten = super::rewrite_copied_event_kind(
+            SessionEventKind::ContextCompacted {
+                summary: "summary".to_string(),
+                compacted_through_sequence: 10,
+            },
+            &BTreeMap::from([(10, 4)]),
+        );
+        assert!(matches!(
+            rewritten,
+            SessionEventKind::ContextCompacted {
+                compacted_through_sequence: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn copied_provider_boundary_is_rewritten_to_destination_sequence() {
+        let rewritten = super::rewrite_copied_event_kind(
+            SessionEventKind::ProviderContextCompacted {
+                snapshot: provider_snapshot(),
+                compacted_through_sequence: 10,
+            },
+            &BTreeMap::from([(10, 4)]),
+        );
+        assert!(matches!(
+            rewritten,
+            SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fork_cut_before_boundary_contains_no_future_marker() {
+        let id = SessionId::new();
+        let history = vec![
+            test_session_event(
+                id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "old".to_string(),
+                },
+            ),
+            test_session_event(
+                id,
+                3,
+                SessionEventKind::ContextCompacted {
+                    summary: "summary".to_string(),
+                    compacted_through_sequence: 1,
+                },
+            ),
+        ];
+        let forked = history
+            .into_iter()
+            .filter(|event| event.sequence < 2)
+            .collect::<Vec<_>>();
+        assert!(
+            !super::model_context_events_from_history(&forked)
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ContextCompacted { .. }
+                        | SessionEventKind::ProviderContextCompacted { .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn fork_cut_after_boundary_preserves_marker_and_retained_tail() {
+        let id = SessionId::new();
+        let history = vec![
+            test_session_event(
+                id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "old".to_string(),
+                },
+            ),
+            test_session_event(
+                id,
+                3,
+                SessionEventKind::ContextCompacted {
+                    summary: "summary".to_string(),
+                    compacted_through_sequence: 1,
+                },
+            ),
+            test_session_event(
+                id,
+                4,
+                SessionEventKind::AssistantMessage {
+                    text: "tail".to_string(),
+                },
+            ),
+        ];
+        let forked = history
+            .into_iter()
+            .filter(|event| event.sequence < 5)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            super::model_context_events_from_history(&forked)
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
 
     #[tokio::test]
     async fn live_assistant_text_delta_is_not_persisted() {

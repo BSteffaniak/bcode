@@ -8642,6 +8642,18 @@ const fn provider_compaction_origin_label(
     }
 }
 
+fn provider_compaction_description(
+    snapshot: &bcode_session_models::ProviderContextSnapshot,
+    compacted_through_sequence: u64,
+) -> String {
+    format!(
+        "{} context compacted through #{compacted_through_sequence}: {} {}",
+        provider_compaction_origin_label(snapshot.origin),
+        snapshot.provider_plugin_id,
+        snapshot.model_id
+    )
+}
+
 fn print_session_event(event: &SessionEvent) {
     match &event.kind {
         SessionEventKind::TraceEvent { trace } => print_trace_session_event(event, trace),
@@ -8798,11 +8810,9 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             snapshot,
             compacted_through_sequence,
         } => println!(
-            "#{} {} context compacted through #{compacted_through_sequence}: {} {}",
+            "#{} {}",
             event.sequence,
-            provider_compaction_origin_label(snapshot.origin),
-            snapshot.provider_plugin_id,
-            snapshot.model_id
+            provider_compaction_description(snapshot, *compacted_through_sequence)
         ),
         SessionEventKind::ContextUsageObserved { snapshot } => println!(
             "#{} context usage: {} tokens for {} through #{} ({:?})",
@@ -9213,5 +9223,43 @@ mod web_command_tests {
         );
         assert_eq!(port, Some(4321));
         assert!(allow_non_loopback);
+    }
+}
+
+#[cfg(test)]
+mod context_compaction_tests {
+    use super::*;
+
+    fn snapshot(
+        origin: bcode_session_models::ProviderContextSnapshotOrigin,
+    ) -> bcode_session_models::ProviderContextSnapshot {
+        bcode_session_models::ProviderContextSnapshot {
+            format_version: 1,
+            provider_plugin_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            compatibility_key: "surface".to_string(),
+            auth_profile: None,
+            origin,
+            messages_json: "opaque-secret".to_string(),
+            portable_summary: "portable-secret".to_string(),
+        }
+    }
+
+    #[test]
+    fn cli_origin_labels_are_distinct_and_opaque_data_is_not_disclosed() {
+        let explicit = provider_compaction_description(
+            &snapshot(bcode_session_models::ProviderContextSnapshotOrigin::Explicit),
+            7,
+        );
+        let managed = provider_compaction_description(
+            &snapshot(bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged),
+            7,
+        );
+        assert!(explicit.contains("explicit provider-native"));
+        assert!(managed.contains("provider-managed"));
+        for output in [explicit, managed] {
+            assert!(!output.contains("opaque-secret"));
+            assert!(!output.contains("portable-secret"));
+        }
     }
 }

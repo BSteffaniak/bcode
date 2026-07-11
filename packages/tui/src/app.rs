@@ -4293,6 +4293,100 @@ fn derive_session_title_from_prompt(prompt: &str) -> String {
 mod tests {
     use super::*;
 
+    fn context_event(sequence: u64, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind,
+        }
+    }
+
+    fn usage_snapshot(
+        source: bcode_session_models::ContextUsageSource,
+    ) -> bcode_session_models::ContextUsageSnapshot {
+        bcode_session_models::ContextUsageSnapshot {
+            provider_plugin_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            input_tokens: 2_500,
+            context_through_sequence: 1,
+            turn_id: Some("turn".to_string()),
+            auth_profile: None,
+            estimated_input_tokens: Some(2_500),
+            source,
+        }
+    }
+
+    #[test]
+    fn hydrated_estimated_usage_preserves_approximate_source() {
+        let history = vec![
+            context_event(
+                1,
+                SessionEventKind::ModelChanged {
+                    provider: "provider".to_string(),
+                    model: "model".to_string(),
+                },
+            ),
+            context_event(
+                2,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Estimated),
+                },
+            ),
+        ];
+        let app = BmuxApp::new_with_history(None, &history, &[], false);
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
+        assert!(app.token_usage.context_usage_estimated);
+    }
+
+    #[test]
+    fn live_estimated_usage_preserves_approximate_source() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        app.apply_session_event(
+            &context_event(
+                2,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Estimated),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
+        assert!(app.token_usage.context_usage_estimated);
+    }
+
+    #[test]
+    fn live_exact_provider_usage_preserves_exact_source() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        app.apply_session_event(
+            &context_event(
+                2,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Provider),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
+        assert!(!app.token_usage.context_usage_estimated);
+    }
+
     #[test]
     fn estimated_context_usage_is_visibly_approximate_and_exact_is_not() {
         let mut meter = TokenUsageMeter {
@@ -4303,6 +4397,50 @@ mod tests {
         assert!(meter.context_summary().starts_with('~'));
         meter.observe_context_usage(2_500, false);
         assert!(!meter.context_summary().starts_with('~'));
+    }
+
+    fn provider_context_snapshot(
+        origin: bcode_session_models::ProviderContextSnapshotOrigin,
+    ) -> bcode_session_models::ProviderContextSnapshot {
+        bcode_session_models::ProviderContextSnapshot {
+            format_version: 1,
+            provider_plugin_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            compatibility_key: "surface".to_string(),
+            auth_profile: None,
+            origin,
+            messages_json: "[]".to_string(),
+            portable_summary: "portable".to_string(),
+        }
+    }
+
+    #[test]
+    fn all_boundary_origins_reset_live_occupancy() {
+        let kinds = [
+            SessionEventKind::ContextCompacted {
+                summary: "summary".to_string(),
+                compacted_through_sequence: 1,
+            },
+            SessionEventKind::ProviderContextCompacted {
+                snapshot: provider_context_snapshot(
+                    bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                ),
+                compacted_through_sequence: 1,
+            },
+            SessionEventKind::ProviderContextCompacted {
+                snapshot: provider_context_snapshot(
+                    bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
+                ),
+                compacted_through_sequence: 1,
+            },
+        ];
+        for kind in kinds {
+            let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+            app.token_usage.observe_context_usage(2_500, true);
+            app.apply_session_event(&context_event(2, kind), SessionEventApplication::Live);
+            assert_eq!(app.token_usage.latest_context_input_tokens, None);
+            assert!(!app.token_usage.context_usage_estimated);
+        }
     }
 
     #[test]
