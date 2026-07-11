@@ -3903,6 +3903,7 @@ struct TokenUsageMeter {
     session_cost_micros: Option<u64>,
     latest_context_input_tokens: Option<u32>,
     context_usage_estimated: bool,
+    pending_context_input_tokens: Option<u32>,
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
     provider_reuse_active: bool,
@@ -3921,6 +3922,7 @@ impl TokenUsageMeter {
         if let Some(pricing) = &self.pricing {
             let usage = bcode_model::TokenUsage {
                 input_tokens: usage.input_tokens,
+                active_context_tokens: None,
                 context_input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 total_tokens: usage.total_tokens,
@@ -3938,19 +3940,29 @@ impl TokenUsageMeter {
         }
         if let Some(input_tokens) = usage.context_input_tokens() {
             self.latest_context_input_tokens = Some(input_tokens);
+            self.context_usage_estimated = false;
+            self.pending_context_input_tokens = None;
         }
         self.latest_cached_input_tokens = usage.cached_input_tokens;
         self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
 
     fn observe_context_usage(&mut self, input_tokens: u64, estimated: bool) {
-        self.latest_context_input_tokens = Some(u32::try_from(input_tokens).unwrap_or(u32::MAX));
+        let input_tokens = u32::try_from(input_tokens).unwrap_or(u32::MAX);
+        if estimated && self.latest_context_input_tokens.is_some() && !self.context_usage_estimated
+        {
+            self.pending_context_input_tokens = Some(input_tokens);
+            return;
+        }
+        self.latest_context_input_tokens = Some(input_tokens);
         self.context_usage_estimated = estimated;
+        self.pending_context_input_tokens = None;
     }
 
     const fn clear_context_occupancy(&mut self) {
         self.latest_context_input_tokens = None;
         self.context_usage_estimated = false;
+        self.pending_context_input_tokens = None;
         self.latest_cached_input_tokens = None;
         self.latest_cache_write_input_tokens = None;
     }
@@ -3965,6 +3977,7 @@ impl TokenUsageMeter {
     fn clear_model_info(&mut self) {
         self.latest_context_input_tokens = None;
         self.context_usage_estimated = false;
+        self.pending_context_input_tokens = None;
         self.latest_cached_input_tokens = None;
         self.latest_cache_write_input_tokens = None;
         self.context_window = None;
@@ -4022,14 +4035,17 @@ impl TokenUsageMeter {
     }
 
     fn context_summary(&self) -> String {
-        match (self.latest_context_input_tokens, self.context_window) {
+        let (tokens, estimated) = self.pending_context_input_tokens.map_or(
+            (
+                self.latest_context_input_tokens,
+                self.context_usage_estimated,
+            ),
+            |pending| (Some(pending), true),
+        );
+        match (tokens, self.context_window) {
             (Some(input), Some(window)) if window > 0 => format!(
                 "{}{}/{} {}%",
-                if self.context_usage_estimated {
-                    "~"
-                } else {
-                    ""
-                },
+                if estimated { "~" } else { "" },
                 format_context_count(u64::from(input)),
                 compact_context_window(u64::from(window)),
                 context_window_percentage(input, window)
@@ -4605,6 +4621,25 @@ mod tests {
         );
         assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
         assert!(!app.token_usage.context_usage_estimated);
+    }
+
+    #[test]
+    fn pending_estimate_does_not_replace_confirmed_context() {
+        let mut meter = TokenUsageMeter {
+            context_window: Some(10_000),
+            ..TokenUsageMeter::default()
+        };
+        meter.observe_context_usage(2_500, false);
+        meter.observe_context_usage(3_000, true);
+
+        assert_eq!(meter.latest_context_input_tokens, Some(2_500));
+        assert!(!meter.context_usage_estimated);
+        assert_eq!(meter.pending_context_input_tokens, Some(3_000));
+        assert_eq!(meter.context_summary(), "~3,000/10k 30%");
+
+        meter.observe_context_usage(3_100, false);
+        assert_eq!(meter.latest_context_input_tokens, Some(3_100));
+        assert_eq!(meter.pending_context_input_tokens, None);
     }
 
     #[test]

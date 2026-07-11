@@ -3139,7 +3139,7 @@ fn process_responses_stream_line(
             process_responses_function_arguments_done(&event, tool_calls);
         }
         "response.completed" | "response.done" | "response.incomplete" => {
-            if let Some(usage) = token_usage_from_responses_event(&event) {
+            if let Some(usage) = token_usage_from_responses_event(&event, processor.dialect) {
                 processor.turn.push(ProviderTurnEvent::Usage { usage });
             }
             let outcome = if *saw_tool_call {
@@ -3427,7 +3427,7 @@ fn process_stream_line(
     })?;
     if let Some(usage) = chunk.usage {
         turn.push(ProviderTurnEvent::Usage {
-            usage: token_usage_from_openai_usage(usage),
+            usage: token_usage_from_openai_usage(usage, OpenAiCompatibleDialect::ChatCompletions),
         });
     }
     for choice in chunk.choices {
@@ -3452,7 +3452,10 @@ fn process_stream_line(
     Ok(StreamOutcome::Cancelled)
 }
 
-fn token_usage_from_openai_usage(usage: OpenAiUsage) -> TokenUsage {
+fn token_usage_from_openai_usage(
+    usage: OpenAiUsage,
+    dialect: OpenAiCompatibleDialect,
+) -> TokenUsage {
     let cached_input_tokens = usage
         .prompt_tokens_details
         .and_then(|details| details.cached_tokens)
@@ -3470,25 +3473,32 @@ fn token_usage_from_openai_usage(usage: OpenAiUsage) -> TokenUsage {
                 .and_then(|details| details.reasoning_tokens)
         });
     let input_tokens = usage.prompt_tokens.or(usage.input_tokens);
+    let total_tokens = usage.total_tokens;
     TokenUsage {
         input_tokens,
-        context_input_tokens: input_tokens,
+        active_context_tokens: matches!(dialect, OpenAiCompatibleDialect::ChatGptCodex)
+            .then_some(total_tokens)
+            .flatten(),
+        context_input_tokens: None,
         output_tokens: usage.completion_tokens.or(usage.output_tokens),
-        total_tokens: usage.total_tokens,
+        total_tokens,
         cached_input_tokens,
         cache_write_input_tokens: None,
         reasoning_tokens,
     }
 }
 
-fn token_usage_from_responses_event(event: &serde_json::Value) -> Option<TokenUsage> {
+fn token_usage_from_responses_event(
+    event: &serde_json::Value,
+    dialect: OpenAiCompatibleDialect,
+) -> Option<TokenUsage> {
     let usage = event
         .get("response")
         .and_then(|response| response.get("usage"))
         .or_else(|| event.get("usage"))?;
     serde_json::from_value::<OpenAiUsage>(usage.clone())
         .ok()
-        .map(token_usage_from_openai_usage)
+        .map(|usage| token_usage_from_openai_usage(usage, dialect))
 }
 
 fn process_tool_call_deltas(
@@ -7046,9 +7056,10 @@ mod tests {
         )
         .expect("usage should decode");
 
-        let usage = token_usage_from_openai_usage(usage);
+        let usage = token_usage_from_openai_usage(usage, OpenAiCompatibleDialect::ChatCompletions);
 
         assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.active_context_tokens, None);
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.total_tokens, Some(15));
         assert_eq!(usage.cached_input_tokens, Some(3));
@@ -7070,9 +7081,11 @@ mod tests {
             }
         });
 
-        let usage = token_usage_from_responses_event(&event).expect("usage should parse");
+        let usage = token_usage_from_responses_event(&event, OpenAiCompatibleDialect::ChatGptCodex)
+            .expect("usage should parse");
 
         assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.active_context_tokens, Some(27));
         assert_eq!(usage.output_tokens, Some(7));
         assert_eq!(usage.total_tokens, Some(27));
         assert_eq!(usage.cached_input_tokens, Some(4));

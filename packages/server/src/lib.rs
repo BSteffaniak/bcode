@@ -11146,6 +11146,7 @@ async fn handle_provider_turn_event(
                 .await
                 .and_then(|turn| turn.model)
                 .filter(|turn| turn.provider_turn_id == turn_id);
+            append_model_usage_event(state, session_id, turn_id.to_string(), usage.clone()).await;
             append_provider_context_usage_observation(
                 state,
                 session_id,
@@ -11153,7 +11154,6 @@ async fn handle_provider_turn_event(
                 active_turn.as_ref(),
             )
             .await;
-            append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
         }
         ProviderTurnEvent::ContextCompacted {
             messages,
@@ -12483,7 +12483,20 @@ fn portable_content_block(block: &ContentBlock) -> String {
 }
 
 fn estimated_model_request_tokens(request: &ModelTurnRequest) -> u64 {
-    serde_json::to_string(request).map_or(u64::MAX, |serialized| {
+    // Estimate only model-visible content. Host routing, auth, request identity, metrics metadata,
+    // and retry bookkeeping are not tokenized by the provider.
+    serde_json::to_string(&(
+        request.system_prompt.as_ref(),
+        &request.messages,
+        &request.tools,
+        &request.parameters,
+        request.structured_output.as_ref(),
+        &request.provider_context.request,
+        &request.metadata,
+        &request.prompt_cache,
+        request.conversation_reuse.provider_state.as_ref(),
+    ))
+    .map_or(u64::MAX, |serialized| {
         estimated_tokens_from_chars(serialized.chars().count())
     })
 }
@@ -16022,7 +16035,7 @@ async fn append_provider_context_usage_observation(
     usage: &TokenUsage,
     attempt: Option<&ModelRequestAttempt>,
 ) {
-    let Some(input_tokens) = usage.context_input_tokens() else {
+    let Some(input_tokens) = usage.active_context_tokens() else {
         return;
     };
     let Some(attempt) = attempt else {
@@ -19687,6 +19700,7 @@ mod tests {
     fn session_token_usage_preserves_normalized_fields() {
         let usage = session_token_usage(&TokenUsage {
             input_tokens: Some(10),
+            active_context_tokens: Some(15),
             context_input_tokens: Some(10),
             output_tokens: Some(5),
             total_tokens: Some(15),

@@ -1526,6 +1526,10 @@ pub struct TokenUsage {
     /// Tokens supplied to the model for this turn or provider round.
     #[serde(default)]
     pub input_tokens: Option<u32>,
+    /// Full active context occupancy after this provider round, when the provider surface defines
+    /// that semantic explicitly.
+    #[serde(default)]
+    pub active_context_tokens: Option<u32>,
     /// Full active input context occupancy when provider semantics distinguish it from billed input.
     #[serde(default)]
     pub context_input_tokens: Option<u32>,
@@ -1563,13 +1567,16 @@ impl TokenUsage {
         })
     }
 
-    /// Return the token count that best represents current context pressure.
+    /// Return provider-confirmed active context occupancy, when known.
+    #[must_use]
+    pub const fn active_context_tokens(&self) -> Option<u32> {
+        self.active_context_tokens
+    }
+
+    /// Return the token count that best represents active input context pressure.
     #[must_use]
     pub const fn context_input_tokens(&self) -> Option<u32> {
-        match self.context_input_tokens {
-            Some(tokens) => Some(tokens),
-            None => self.input_tokens,
-        }
+        self.context_input_tokens
     }
 
     /// Return uncached input tokens when both input and cached counts are known.
