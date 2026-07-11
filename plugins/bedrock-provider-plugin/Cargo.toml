@@ -24,6 +24,7 @@ bcode_config = { workspace = true }
 bcode_model = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
+clap = { workspace = true, features = ["derive", "std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = [

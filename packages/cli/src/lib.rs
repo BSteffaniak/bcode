@@ -245,7 +245,6 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Auth { command } => handle_auth_command(command)?,
         Commands::Login { command } => handle_login_command(command).await?,
-        Commands::Provider { command } => handle_provider_command(command)?,
         Commands::Skill { command } => handle_skill_command(&command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
@@ -589,7 +588,6 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Model { .. }
         | Commands::Auth { .. }
         | Commands::Login { .. }
-        | Commands::Provider { .. }
         | Commands::Skill { .. }
         | Commands::Permission { .. }
         | Commands::RuntimeWork { .. } => unreachable!("handled by handle_cli"),
@@ -1099,10 +1097,6 @@ enum Commands {
     Login {
         #[command(subcommand)]
         command: LoginCommand,
-    },
-    Provider {
-        #[command(subcommand)]
-        command: ProviderCommand,
     },
     Skill {
         #[command(subcommand)]
@@ -2139,39 +2133,6 @@ enum AuthPrimeCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum ProviderCommand {
-    Configure {
-        #[command(subcommand)]
-        command: ProviderConfigureCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ProviderConfigureCommand {
-    /// Configure Amazon Bedrock using AWS's default credential chain.
-    Bedrock {
-        /// Bcode model profile name to create and select.
-        #[arg(long, default_value = "bedrock")]
-        profile: String,
-        /// AWS shared-config profile name to use for credentials/region.
-        #[arg(long)]
-        aws_profile: Option<String>,
-        /// AWS region for Bedrock Runtime.
-        #[arg(long)]
-        region: Option<String>,
-        /// Optional Bedrock Runtime endpoint override.
-        #[arg(long)]
-        endpoint_url: Option<String>,
-        /// Bedrock model ID or inference profile ID to use by default.
-        #[arg(long)]
-        model: String,
-        /// Additional model IDs to show in `bcode model list`.
-        #[arg(long = "model-id")]
-        model_ids: Vec<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum LoginCommand {
     Openai {
         /// Store an `OpenAI` platform API key instead of using `ChatGPT` subscription OAuth.
@@ -2753,39 +2714,6 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
                 | ModelCommand::Unignore { .. }
                 | ModelCommand::Ignored { .. } => unreachable!("handled above"),
             }
-        }
-    }
-    Ok(())
-}
-
-fn handle_provider_command(command: ProviderCommand) -> Result<(), CliError> {
-    match command {
-        ProviderCommand::Configure {
-            command:
-                ProviderConfigureCommand::Bedrock {
-                    profile,
-                    aws_profile,
-                    region,
-                    endpoint_url,
-                    model,
-                    mut model_ids,
-                },
-        } => {
-            if !model_ids.contains(&model) {
-                model_ids.insert(0, model.clone());
-            }
-            let config_path = bcode_config::set_bedrock_model_profile(
-                &profile,
-                model,
-                aws_profile,
-                region,
-                endpoint_url.as_deref(),
-                &model_ids,
-            )?;
-            println!(
-                "Bedrock provider profile '{profile}' configured; config updated: {}",
-                config_path.display()
-            );
         }
     }
     Ok(())

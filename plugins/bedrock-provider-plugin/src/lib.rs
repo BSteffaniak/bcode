@@ -4,6 +4,9 @@
 
 //! Amazon Bedrock model provider plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod cli;
+
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_bedrock as bedrock;
@@ -2071,10 +2074,12 @@ fn json_value_to_document(value: &serde_json::Value) -> Document {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
+    let mut vtable = bcode_plugin_sdk::static_concurrent_plugin_vtable!(
         BedrockProviderPlugin,
         include_str!("../bcode-plugin.toml")
-    )
+    );
+    vtable.cli_registration = Some(cli::registration);
+    vtable
 }
 
 bcode_plugin_sdk::export_concurrent_plugin!(
