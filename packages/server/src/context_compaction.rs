@@ -228,6 +228,7 @@ pub async fn compact_session_context_with_limit(
         }
         summary
     };
+    let marker_commit = cancel_state.marker_commit.lock().await;
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
@@ -253,6 +254,7 @@ pub async fn compact_session_context_with_limit(
     };
     publish_session_event(state, &event).await;
     state.invalidate_session_continuations(session_id).await;
+    drop(marker_commit);
 
     Ok(CompactionCompletion {
         message: format!(
@@ -696,9 +698,12 @@ pub async fn maybe_auto_compact_session_context(
         Some(CompactionProgressRequirement {
             minimum_reclaimable_tokens: projected_context_tokens
                 .saturating_sub(threshold_tokens)
-                .saturating_add(estimated_tokens_from_chars(
-                    COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
-                )),
+                .saturating_add(estimated_model_messages_tokens(&[ModelMessage {
+                    role: MessageRole::System,
+                    content: vec![ContentBlock::Text {
+                        text: "x".repeat(COMPACTION_MAX_CARRIED_SUMMARY_CHARS),
+                    }],
+                }])),
             previous_compacted_through_sequence: evaluation.previous_compacted_through_sequence,
         }),
     )
@@ -1357,8 +1362,7 @@ pub fn conversational_units(
     for unit in &mut units {
         let messages =
             session_events_to_model_messages_with_limit(&unit.events, tool_output_context_chars);
-        unit.estimated_tokens =
-            estimated_tokens_from_chars(messages.iter().map(model_message_context_chars).sum());
+        unit.estimated_tokens = estimated_model_messages_tokens(&messages);
     }
     units
 }
@@ -1536,7 +1540,7 @@ mod cancellation_tests {
     #[tokio::test]
     async fn cancelled_progress_wait_returns_cancelled() {
         let cancel_state = TurnCancelState::default();
-        cancel_state.cancel();
+        cancel_state.cancel().await;
 
         let result = wait_for_compaction_progress(
             &bcode_config::StreamingConfig::default(),
@@ -1551,7 +1555,7 @@ mod cancellation_tests {
     #[tokio::test]
     async fn cancellation_waits_for_started_provider_call_to_be_finalizable() {
         let cancel_state = TurnCancelState::default();
-        cancel_state.cancel();
+        cancel_state.cancel().await;
 
         let outcome = finalize_provider_call_after_cancellation(
             &cancel_state,

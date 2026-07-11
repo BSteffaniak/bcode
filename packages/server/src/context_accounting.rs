@@ -2,8 +2,10 @@
 //!
 //! Provider observations are exact only through their attributed canonical sequence. Newer events
 //! are conservatively estimated and added to that observation. If no compatible observation
-//! exists, accounting estimates the entire model-visible projection. All estimates use the same
-//! character-to-token conversion so proactive decisions and request projection remain aligned.
+//! exists, accounting estimates the entire model-visible projection. Structural retention uses
+//! canonical serialized model-message accounting so cuts include protocol overhead rather than raw
+//! content character counts; occupancy fallback remains a conservative character estimate when no
+//! exact provider observation exists.
 
 use super::{
     ContentBlock, ModelMessage, SessionEventKind, SessionModelSelection,
@@ -54,6 +56,15 @@ pub fn projected_model_context_chars(
 
 pub fn estimated_tokens_from_chars(chars: usize) -> u64 {
     u64::try_from(chars).unwrap_or(u64::MAX).saturating_add(3) / 4
+}
+
+pub fn estimated_model_messages_tokens(messages: &[ModelMessage]) -> u64 {
+    serde_json::to_vec(messages).map_or(u64::MAX, |serialized| {
+        u64::try_from(serialized.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(3)
+            / 4
+    })
 }
 
 pub fn model_message_context_chars(message: &ModelMessage) -> usize {

@@ -9,14 +9,14 @@
 //! Every provider usage or managed-compaction event must be applied to the exact request boundary
 //! captured before that request was sent rather than inferred from later session history.
 
-mod context_accounting;
-mod context_compaction;
+pub(crate) mod context_accounting;
+pub(crate) mod context_compaction;
 mod model_ignores;
 mod runtime_work;
 
 use context_accounting::{
-    context_occupancy_tokens, estimated_tokens_from_chars, model_message_context_chars,
-    projected_model_context_chars,
+    context_occupancy_tokens, estimated_model_messages_tokens, estimated_tokens_from_chars,
+    model_message_context_chars, projected_model_context_chars,
 };
 #[cfg(test)]
 use context_compaction::compaction_event_is_progress;
@@ -485,7 +485,26 @@ impl SessionTurnPermit {
     }
 }
 
-type TurnCancelState = CancellationToken;
+#[derive(Debug, Default)]
+struct TurnCancelState {
+    token: CancellationToken,
+    marker_commit: Mutex<()>,
+}
+
+impl TurnCancelState {
+    async fn cancel(&self) {
+        let _commit = self.marker_commit.lock().await;
+        self.token.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ModelRequestAttempt {
@@ -614,6 +633,31 @@ impl ProviderStateStore {
                 .is_some_and(|record_session| record_session != session_id)
         });
         self.save();
+    }
+
+    fn continuation_for_projection(
+        &mut self,
+        reuse_key: &str,
+        message_count: usize,
+    ) -> Option<ProviderContinuationState> {
+        let mut rebased = false;
+        let continuation = self
+            .records
+            .get_mut(reuse_key)
+            .and_then(|record| record.continuation.as_mut())
+            .and_then(|continuation| {
+                if continuation.rebase_on_next_projection {
+                    continuation.reusable_message_count = message_count;
+                    continuation.updated_sequence = message_count.try_into().unwrap_or(u64::MAX);
+                    continuation.rebase_on_next_projection = false;
+                    rebased = true;
+                }
+                (continuation.reusable_message_count <= message_count).then(|| continuation.clone())
+            });
+        if rebased {
+            self.save();
+        }
+        continuation
     }
 
     fn save(&self) {
@@ -7920,7 +7964,7 @@ async fn request_session_turn_cancellation(
         return false;
     };
 
-    current_turn.cancel_state.cancel();
+    current_turn.cancel_state.cancel().await;
     if current_turn.kind == RuntimeOperationKind::ModelTurn {
         append_model_turn_cancel_requested_event(
             state,
@@ -10559,6 +10603,7 @@ async fn run_model_turn_round(
     service_runtime_priority_commands(state, session_id, command_context).await;
     ensure_terminal_poll_outcome(state, session_id, &mut outcome).await;
 
+    let marker_commit = cancel_state.marker_commit.lock().await;
     let round_succeeded = !cancel_state.is_cancelled()
         && outcome.stop_reason != Some(bcode_model::StopReason::Cancelled)
         && outcome.stop_reason != Some(bcode_model::StopReason::Error)
@@ -10591,6 +10636,7 @@ async fn run_model_turn_round(
         )
         .await;
     }
+    drop(marker_commit);
 
     if !assistant_text.is_empty() {
         append_assistant_message_event(state, session_id, assistant_text).await;
@@ -13002,21 +13048,6 @@ impl ConversationProjection {
     }
 }
 
-fn reusable_continuation(
-    record: Option<&ProviderStateRecord>,
-    message_count: usize,
-) -> Option<ProviderContinuationState> {
-    record
-        .and_then(|record| record.continuation.clone())
-        .map(|mut continuation| {
-            if continuation.rebase_on_next_projection {
-                continuation.reusable_message_count = message_count;
-            }
-            continuation
-        })
-        .filter(|continuation| continuation.reusable_message_count <= message_count)
-}
-
 async fn plan_conversation_reuse(
     state: &ServerState,
     projection: &ConversationProjection,
@@ -13028,14 +13059,11 @@ async fn plan_conversation_reuse(
     }
 
     let reuse_key = projection.reuse_key();
-    let record = state
-        .provider_state
-        .lock()
-        .await
-        .records
-        .get(&reuse_key)
-        .cloned();
-    let previous = reusable_continuation(record.as_ref(), message_count);
+    let (record, previous) = {
+        let mut provider_state = state.provider_state.lock().await;
+        let previous = provider_state.continuation_for_projection(&reuse_key, message_count);
+        (provider_state.records.get(&reuse_key).cloned(), previous)
+    };
 
     bcode_model::ConversationReuseHints {
         mode,
@@ -16939,13 +16967,41 @@ mod tests {
             ..ProviderStateRecord::default()
         };
 
-        let continuation = reusable_continuation(Some(&record), 3).expect("continuation");
+        let path =
+            std::env::temp_dir().join(format!("bcode-continuation-{}.json", SessionId::new()));
+        let mut store = ProviderStateStore {
+            path: path.clone(),
+            records: BTreeMap::from([("key".to_string(), record)]),
+        };
+        let continuation = store
+            .continuation_for_projection("key", 3)
+            .expect("continuation");
 
         assert_eq!(
             continuation.provider_response_id,
             "post-compaction-response"
         );
         assert_eq!(continuation.reusable_message_count, 3);
+        assert!(
+            !store.records["key"]
+                .continuation
+                .as_ref()
+                .expect("persisted continuation")
+                .rebase_on_next_projection
+        );
+        let next = store
+            .continuation_for_projection("key", 5)
+            .expect("continuation remains reusable");
+        assert_eq!(next.reusable_message_count, 3);
+        let reloaded = ProviderStateStore::load(path.clone());
+        assert!(
+            !reloaded.records["key"]
+                .continuation
+                .as_ref()
+                .expect("reloaded continuation")
+                .rebase_on_next_projection
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -19859,7 +19915,7 @@ mod tests {
         let session_id = summary.id;
         let state = test_server_state(sessions);
         let cancel_state = TurnCancelState::default();
-        cancel_state.cancel();
+        cancel_state.cancel().await;
         let definition = ServiceToolDefinition {
             name: "example.tool".to_owned(),
             description: "example".to_owned(),

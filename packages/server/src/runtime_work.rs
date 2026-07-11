@@ -28,9 +28,9 @@ pub enum CancellationHandle {
 
 impl CancellationHandle {
     /// Request cancellation through the underlying handle.
-    pub fn cancel(&self) {
+    pub async fn cancel(&self) {
         match self {
-            Self::SessionTurn(cancel_state) => cancel_state.cancel(),
+            Self::SessionTurn(cancel_state) => cancel_state.cancel().await,
             Self::PluginInvocation(cancel) => cancel.cancel(),
             Self::RalphRun { store, run_id } => {
                 let _ = store.request_run_cancel(run_id);
@@ -178,7 +178,7 @@ impl RuntimeWorkManager {
         }
         drop(active);
         for cancellation in cancellations {
-            cancellation.cancel();
+            cancellation.cancel().await;
         }
         cancelled_work_ids
     }
