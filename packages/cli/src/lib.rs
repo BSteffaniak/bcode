@@ -160,10 +160,17 @@ pub async fn run_with_static_bundled(
     if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
         && let Some((_, subcommand_matches)) = matches.subcommand()
     {
-        return plugin
+        let outcome = plugin
             .invoke(subcommand_matches.clone())
             .await
-            .map_err(CliError::PluginCli);
+            .map_err(CliError::PluginCli)?;
+        if let Some(bcode_plugin_sdk::StaticCliHostAction::OpenTuiSurface { surface_kind }) =
+            outcome.host_action
+        {
+            ensure_server_running().await?;
+            bcode_tui::run_plugin_surface(surface_kind).await?;
+        }
+        return Ok(());
     }
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
@@ -232,7 +239,6 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             allow_non_loopback,
         } => handle_web_command(bind, port, allow_non_loopback).await?,
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
-        Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Auth { command } => handle_auth_command(command)?,
@@ -578,7 +584,6 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Metrics { .. }
         | Commands::Web { .. }
         | Commands::Review { .. }
-        | Commands::Ralph { .. }
         | Commands::Plugin { .. }
         | Commands::Model { .. }
         | Commands::Auth { .. }
@@ -1086,11 +1091,6 @@ enum Commands {
     Review {
         #[command(subcommand)]
         command: Option<ReviewCommand>,
-    },
-    Ralph {
-        /// Repository path.
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
     },
     Plugin {
         #[command(subcommand)]
@@ -2410,12 +2410,6 @@ enum PluginCommand {
         topic: String,
         payload: Option<String>,
     },
-}
-
-async fn handle_ralph_command(_repo: PathBuf) -> Result<(), CliError> {
-    ensure_server_running().await?;
-    bcode_tui::run_ralph_home().await?;
-    Ok(())
 }
 
 async fn handle_review_command(command: Option<ReviewCommand>) -> Result<(), CliError> {

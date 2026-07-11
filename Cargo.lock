@@ -2049,6 +2049,7 @@ dependencies = [
  "bcode_ralph",
  "bmux_keyboard",
  "bmux_tui",
+ "clap",
  "serde",
  "serde_json",
 ]

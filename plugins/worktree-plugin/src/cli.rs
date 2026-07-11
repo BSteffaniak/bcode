@@ -89,7 +89,8 @@ pub(super) fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = WorktreeCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
-        run(cli.command).await
+        run(cli.command).await?;
+        Ok(bcode_plugin_sdk::StaticCliOutcome::default())
     })
 }
 

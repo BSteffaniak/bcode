@@ -99,7 +99,7 @@ mod tests {
     use super::*;
 
     fn unused_invoke(_: clap::ArgMatches) -> StaticCliFuture {
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(bcode_plugin_sdk::StaticCliOutcome::default()) })
     }
 
     fn contribution(plugin_id: &str, command: Command) -> Contribution {

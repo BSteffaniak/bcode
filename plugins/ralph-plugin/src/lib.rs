@@ -4,6 +4,9 @@
 
 //! Ralph TUI plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod cli;
+
 use std::path::PathBuf;
 
 use bcode_plugin_sdk::prelude::*;
@@ -815,6 +818,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     let mut vtable =
         bcode_plugin_sdk::static_plugin_vtable!(RalphPlugin, include_str!("../bcode-plugin.toml"));
     vtable.tui_registry = Some(tui_registry);
+    vtable.cli_registration = Some(cli::registration);
     vtable
 }
 

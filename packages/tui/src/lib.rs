@@ -346,6 +346,23 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     bcode_bundled_plugins::static_bundled_plugins()
 }
 
+/// Run the main terminal UI and open a plugin-owned surface on startup.
+///
+/// # Errors
+///
+/// Returns I/O or plugin service errors, or an error when the surface does not
+/// yet have a full-screen startup flow.
+#[allow(clippy::future_not_send)]
+pub async fn run_plugin_surface(surface_kind: String) -> Result<(), TuiError> {
+    if surface_kind == "ralph-home" {
+        return run_ralph_home().await;
+    }
+    Err(TuiError::PluginService {
+        code: "unsupported_startup_surface".to_owned(),
+        message: format!("plugin surface `{surface_kind}` cannot be opened as a startup surface"),
+    })
+}
+
 /// Run the main terminal user interface and open Ralph on startup.
 ///
 /// # Errors

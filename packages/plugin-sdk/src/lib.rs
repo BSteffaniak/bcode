@@ -865,8 +865,26 @@ pub fn handle_event_export<P: RustPlugin>(
 use std::future::Future;
 use std::pin::Pin;
 
+/// Host action requested after a statically linked plugin CLI handler completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaticCliHostAction {
+    /// Launch the host TUI and open a plugin-owned surface.
+    OpenTuiSurface {
+        /// Plugin surface kind.
+        surface_kind: String,
+    },
+}
+
+/// Result of a statically linked plugin CLI invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StaticCliOutcome {
+    /// Optional action for the CLI host to perform.
+    pub host_action: Option<StaticCliHostAction>,
+}
+
 /// Future returned by a statically linked plugin CLI handler.
-pub type StaticCliFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+pub type StaticCliFuture =
+    Pin<Box<dyn Future<Output = Result<StaticCliOutcome, String>> + Send + 'static>>;
 
 /// Rust-native CLI contribution from a statically linked plugin.
 ///
