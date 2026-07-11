@@ -216,6 +216,7 @@ pub async fn compact_session_context_with_limit(
         session_id,
         selection,
         &plan.compactable_prefix,
+        cancel_state,
     )
     .await?;
     let portable_summary = if native_snapshot.is_some() {
@@ -333,7 +334,11 @@ pub async fn compact_context_with_selected_backend(
     session_id: SessionId,
     selection: &SessionModelSelection,
     history: &[bcode_session_models::SessionEvent],
+    cancel_state: &TurnCancelState,
 ) -> Result<Option<bcode_session_models::ProviderContextSnapshot>, CompactionError> {
+    if cancel_state.is_cancelled() {
+        return Err(CompactionError::Cancelled);
+    }
     if matches!(
         state.auto_compaction.backend,
         bcode_config::CompactionBackend::Local
@@ -345,6 +350,9 @@ pub async fn compact_context_with_selected_backend(
         .as_deref()
         .ok_or(CompactionError::ProviderUnavailable)?;
     let capabilities = provider_context_management_capabilities(state, selection).await;
+    if cancel_state.is_cancelled() {
+        return Err(CompactionError::Cancelled);
+    }
     let context_format = capabilities
         .as_ref()
         .and_then(|capabilities| capabilities.context_format.as_ref())
@@ -373,22 +381,26 @@ pub async fn compact_context_with_selected_backend(
         context_format.map(|format| format.version),
         context_format.map(|format| format.compatibility_key.as_str()),
     );
-    let response = state
-        .plugins
-        .invoke_service_json::<_, bcode_model::CompactContextResponse>(
+    let request = bcode_model::CompactContextRequest {
+        session_id,
+        provider_context: selection.provider_context.clone(),
+        model_id: model_id.clone(),
+        system_prompt: None,
+        messages,
+        tools: Vec::new(),
+    };
+    let response = tokio::select! {
+        () = cancel_state.cancelled() => return Err(CompactionError::Cancelled),
+        response = state.plugins.invoke_service_json::<_, bcode_model::CompactContextResponse>(
             provider_plugin_id,
             bcode_model::MODEL_PROVIDER_INTERFACE_ID,
             bcode_model::OP_COMPACT_CONTEXT,
-            &bcode_model::CompactContextRequest {
-                session_id,
-                provider_context: selection.provider_context.clone(),
-                model_id: model_id.clone(),
-                system_prompt: None,
-                messages,
-                tools: Vec::new(),
-            },
-        )
-        .await;
+            &request,
+        ) => response,
+    };
+    if cancel_state.is_cancelled() {
+        return Err(CompactionError::Cancelled);
+    }
     match response {
         Ok(response)
             if !response.messages.is_empty()
