@@ -18,6 +18,7 @@ struct RalphCli {
 
 pub(super) fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
+        requires_daemon: false,
         command: RalphCli::command,
         invoke,
     }

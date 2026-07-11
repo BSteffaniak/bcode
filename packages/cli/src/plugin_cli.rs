@@ -19,6 +19,7 @@ pub enum CompositionError {
 pub struct Contribution {
     plugin_id: String,
     command_name: String,
+    pub requires_daemon: bool,
     invoke: fn(clap::ArgMatches) -> StaticCliFuture,
     command: Command,
 }
@@ -36,6 +37,7 @@ pub fn registrations(
         contributions.push(Contribution {
             plugin_id: plugin_id.clone(),
             command_name: command.get_name().to_owned(),
+            requires_daemon: registration.requires_daemon,
             invoke: registration.invoke,
             command,
         });
@@ -106,6 +108,7 @@ mod tests {
         Contribution {
             plugin_id: plugin_id.to_owned(),
             command_name: command.get_name().to_owned(),
+            requires_daemon: false,
             invoke: unused_invoke,
             command,
         }

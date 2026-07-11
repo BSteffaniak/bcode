@@ -134,6 +134,9 @@ pub async fn run_with_static_bundled(
     if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
         && let Some((_, subcommand_matches)) = matches.subcommand()
     {
+        if plugin.requires_daemon {
+            ensure_server_running().await?;
+        }
         let outcome = plugin
             .invoke(subcommand_matches.clone())
             .await

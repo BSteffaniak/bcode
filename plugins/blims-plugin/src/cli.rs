@@ -45,6 +45,7 @@ enum CliError {
 
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
+        requires_daemon: false,
         command: BlimsCli::command,
         invoke,
     }

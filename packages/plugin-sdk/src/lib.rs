@@ -902,6 +902,8 @@ pub type StaticCliFuture =
 pub struct StaticCliRegistration {
     /// Build the plugin-owned top-level command.
     pub command: fn() -> clap::Command,
+    /// Whether the host must ensure its daemon is available before invocation.
+    pub requires_daemon: bool,
     /// Invoke the plugin command using matches from the composed root parser.
     pub invoke: fn(clap::ArgMatches) -> StaticCliFuture,
 }
