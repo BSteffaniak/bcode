@@ -18794,9 +18794,9 @@ mod tests {
         .expect("compaction transcript");
 
         let text = transcript
-            .lines
+            .summary_input
             .iter()
-            .map(|line| line.text.as_str())
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join("\n\n");
         assert!(text.contains("tool output truncated"));
@@ -18833,12 +18833,7 @@ mod tests {
     fn compaction_progress_requirement_rejects_negligible_reclaim() {
         let transcript = CompactionTranscript {
             previous_summary: None,
-            lines: vec![CompactionLine {
-                sequence: 1,
-                text: "small prefix".to_string(),
-                estimated_tokens: 100,
-                can_cut_after: true,
-            }],
+            summary_input: vec!["small prefix".to_string()],
             compacted_through_sequence: 1,
             event_count: 1,
             estimated_reclaimable_tokens: 100,
@@ -18888,61 +18883,10 @@ mod tests {
     }
 
     #[test]
-    fn compaction_does_not_summarize_when_entire_context_fits_retained_budget() {
-        let lines = compaction_lines_to_summarize(
-            vec![
-                CompactionLine {
-                    sequence: 1,
-                    text: "older turn".to_string(),
-                    estimated_tokens: 4,
-                    can_cut_after: true,
-                },
-                CompactionLine {
-                    sequence: 2,
-                    text: "recent turn".to_string(),
-                    estimated_tokens: 4,
-                    can_cut_after: true,
-                },
-            ],
-            20,
-        );
-
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn compaction_cut_never_leaves_orphan_tool_result() {
-        let lines = compaction_lines_to_summarize(
-            vec![
-                CompactionLine {
-                    sequence: 1,
-                    text: "tool call".to_string(),
-                    estimated_tokens: 2,
-                    can_cut_after: false,
-                },
-                CompactionLine {
-                    sequence: 2,
-                    text: "recent tail".repeat(COMPACTION_DEFAULT_KEEP_RECENT_CHARS),
-                    estimated_tokens: COMPACTION_DEFAULT_KEEP_RECENT_CHARS,
-                    can_cut_after: true,
-                },
-            ],
-            COMPACTION_DEFAULT_KEEP_RECENT_CHARS,
-        );
-
-        assert!(lines.is_empty());
-    }
-
-    #[test]
     fn compaction_prompt_truncates_carried_summary() {
         let transcript = CompactionTranscript {
             previous_summary: Some("s".repeat(COMPACTION_MAX_CARRIED_SUMMARY_CHARS + 100)),
-            lines: vec![CompactionLine {
-                sequence: 1,
-                text: "next chunk".to_string(),
-                estimated_tokens: 2,
-                can_cut_after: true,
-            }],
+            summary_input: vec!["next chunk".to_string()],
             compacted_through_sequence: 1,
             event_count: 1,
             estimated_reclaimable_tokens: 2,

@@ -69,7 +69,7 @@ pub struct ConversationalUnit {
 
 pub struct CompactionTranscript {
     pub previous_summary: Option<String>,
-    pub lines: Vec<CompactionLine>,
+    pub summary_input: Vec<String>,
     pub compacted_through_sequence: u64,
     pub event_count: usize,
     pub estimated_reclaimable_tokens: u64,
@@ -79,31 +79,6 @@ pub struct CompactionTranscript {
 pub struct CompactionProgressRequirement {
     pub minimum_reclaimable_tokens: u64,
     pub previous_compacted_through_sequence: Option<u64>,
-}
-
-pub struct CompactionLine {
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub sequence: u64,
-    pub text: String,
-    #[cfg(test)]
-    pub estimated_tokens: usize,
-    #[cfg(test)]
-    pub can_cut_after: bool,
-}
-
-#[allow(clippy::missing_const_for_fn, unused_variables)]
-fn compaction_line(event: &bcode_session_models::SessionEvent, text: String) -> CompactionLine {
-    CompactionLine {
-        #[cfg(test)]
-        sequence: event.sequence,
-        #[cfg(test)]
-        estimated_tokens: usize::try_from(estimated_tokens_from_chars(text.chars().count()))
-            .unwrap_or(usize::MAX),
-        #[cfg(test)]
-        can_cut_after: true,
-        text,
-    }
 }
 
 pub const COMPACTION_SYSTEM_PROMPT: &str = "You compact coding-agent session history. Produce only a durable continuation summary for future model turns. Preserve all facts needed to continue the work, including user goals, decisions, constraints, files changed, commands run, validation results, current blockers, and next steps. Do not invent details. Do not include markdown fences.";
@@ -177,7 +152,7 @@ pub async fn compact_session_context_with_limit(
             "nothing new to compact".to_string(),
         ));
     };
-    let transcript = compaction_transcript_from_plan(&plan, state.tool_output_context_chars);
+    let transcript = compaction_transcript_from_plan(&plan);
     debug_assert!(
         plan.retained_tail
             .iter()
@@ -190,7 +165,7 @@ pub async fn compact_session_context_with_limit(
             state.tool_output_context_chars,
         )
     );
-    debug_assert_eq!(plan.summary_input.len(), transcript.lines.len());
+    debug_assert_eq!(plan.summary_input, transcript.summary_input);
     debug_assert!(
         plan.prior_boundary
             .is_none_or(|boundary| plan.compacted_through_sequence > boundary)
@@ -956,8 +931,10 @@ pub fn compaction_prompt_text(transcript: &CompactionTranscript) -> String {
         .unwrap_or_default()
         .trim();
     let carried_summary = truncate_text(previous_summary, COMPACTION_MAX_CARRIED_SUMMARY_CHARS);
-    let transcript_text =
-        bounded_compaction_body(&transcript.lines, COMPACTION_MAX_SUMMARY_INPUT_CHARS);
+    let transcript_text = bounded_compaction_body(
+        &transcript.summary_input,
+        COMPACTION_MAX_SUMMARY_INPUT_CHARS,
+    );
     if carried_summary.is_empty() {
         return format!(
             "Compact this Bcode session transcript for future continuation. Return only the durable continuation summary.\n\nTranscript excerpt:\n\n{transcript_text}"
@@ -968,11 +945,11 @@ pub fn compaction_prompt_text(transcript: &CompactionTranscript) -> String {
     )
 }
 
-pub fn bounded_compaction_body(lines: &[CompactionLine], max_chars: usize) -> String {
+pub fn bounded_compaction_body(lines: &[String], max_chars: usize) -> String {
     truncate_text(
         &lines
             .iter()
-            .map(|line| line.text.as_str())
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join("\n\n"),
         max_chars,
@@ -996,7 +973,7 @@ pub fn local_compaction_summary(transcript: &CompactionTranscript, reason: &str)
     ));
     parts.push("## Older Context Outline".to_string());
     parts.push(bounded_compaction_body(
-        &transcript.lines,
+        &transcript.summary_input,
         COMPACTION_MAX_CARRIED_SUMMARY_CHARS / 2,
     ));
     truncate_text(&parts.join("\n\n"), COMPACTION_MAX_CARRIED_SUMMARY_CHARS)
@@ -1455,26 +1432,15 @@ pub fn structural_compaction_plan(
     })
 }
 
-pub fn compaction_transcript_from_plan(
-    plan: &CompactionPlan,
-    tool_output_context_chars: usize,
-) -> CompactionTranscript {
+pub fn compaction_transcript_from_plan(plan: &CompactionPlan) -> CompactionTranscript {
     let previous_summary =
         (!plan.portable_fallback.is_empty()).then(|| plan.portable_fallback.clone());
-    let lines = plan
-        .compactable_prefix
-        .iter()
-        .filter_map(|event| {
-            session_event_compaction_line(event, tool_output_context_chars)
-                .map(|text| compaction_line(event, text))
-        })
-        .collect::<Vec<_>>();
     CompactionTranscript {
         previous_summary,
+        summary_input: plan.summary_input.clone(),
         event_count: plan.compactable_prefix.len(),
         estimated_reclaimable_tokens: plan.estimated_prefix_tokens,
         compacted_through_sequence: plan.compacted_through_sequence,
-        lines,
     }
 }
 
@@ -1485,54 +1451,7 @@ pub fn compaction_transcript(
     keep_recent_tokens: usize,
 ) -> Option<CompactionTranscript> {
     let plan = structural_compaction_plan(history, tool_output_context_chars, keep_recent_tokens)?;
-    Some(compaction_transcript_from_plan(
-        &plan,
-        tool_output_context_chars,
-    ))
-}
-
-#[cfg(test)]
-pub fn compaction_lines_to_summarize(
-    mut candidates: Vec<CompactionLine>,
-    keep_recent_tokens: usize,
-) -> Vec<CompactionLine> {
-    if candidates.len() <= 1 {
-        return Vec::new();
-    }
-
-    let mut kept_recent_tokens = 0_usize;
-    let mut keep_start = candidates.len();
-    for (index, line) in candidates.iter().enumerate().rev() {
-        if kept_recent_tokens >= keep_recent_tokens {
-            break;
-        }
-        kept_recent_tokens = kept_recent_tokens.saturating_add(line.estimated_tokens);
-        keep_start = index;
-    }
-
-    if keep_start == 0 {
-        return Vec::new();
-    }
-    candidates.truncate(keep_start);
-    while candidates.last().is_some_and(|line| !line.can_cut_after) {
-        candidates.pop();
-    }
-    candidates
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-const fn session_event_is_safe_compaction_cut(
-    event: &bcode_session_models::SessionEvent,
-    no_pending_tool_calls: bool,
-) -> bool {
-    no_pending_tool_calls
-        && matches!(
-            &event.kind,
-            SessionEventKind::AssistantMessage { .. }
-                | SessionEventKind::ToolCallFinished { .. }
-                | SessionEventKind::SystemMessage { .. }
-        )
+    Some(compaction_transcript_from_plan(&plan))
 }
 
 pub fn session_event_compaction_line(
