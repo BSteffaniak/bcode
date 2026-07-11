@@ -862,6 +862,30 @@ pub fn handle_event_export<P: RustPlugin>(
         })
 }
 
+use std::future::Future;
+use std::pin::Pin;
+
+/// Future returned by a statically linked plugin CLI handler.
+pub type StaticCliFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+
+/// Rust-native CLI contribution from a statically linked plugin.
+///
+/// This API deliberately uses Clap directly. It is not part of the dynamic-library ABI.
+#[derive(Clone, Copy)]
+pub struct StaticCliRegistration {
+    /// Build the plugin-owned top-level command.
+    pub command: fn() -> clap::Command,
+    /// Invoke the plugin command using matches from the composed root parser.
+    pub invoke: fn(clap::ArgMatches) -> StaticCliFuture,
+}
+
+impl std::fmt::Debug for StaticCliRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticCliRegistration")
+            .finish_non_exhaustive()
+    }
+}
+
 pub type StaticCommandRegistrationFn =
     fn(*const c_void, Option<CommandRegistrationCallback>, *mut c_void) -> i32;
 
@@ -888,6 +912,8 @@ pub struct StaticPluginVtable {
     pub tui_registry: Option<fn() -> crate::tui::PluginTuiRegistry>,
     /// Renderer-neutral interaction registry provider, when statically linked.
     pub interaction_registry: Option<fn() -> crate::interaction::PluginInteractionRegistry>,
+    /// Rust-native CLI contribution provider, when statically linked.
+    pub cli_registration: Option<fn() -> StaticCliRegistration>,
 }
 
 impl std::fmt::Debug for StaticPluginVtable {
@@ -1184,6 +1210,7 @@ macro_rules! static_plugin_vtable {
             handle_event: $crate::static_handle_event_export::<$plugin>,
             tui_registry: None,
             interaction_registry: None,
+            cli_registration: None,
         }
     }};
 }
@@ -1269,6 +1296,7 @@ macro_rules! static_concurrent_plugin_vtable {
             handle_event,
             tui_registry: None,
             interaction_registry: None,
+            cli_registration: None,
         }
     }};
 }

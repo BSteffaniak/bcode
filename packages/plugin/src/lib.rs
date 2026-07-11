@@ -514,6 +514,14 @@ impl StaticBundledPlugin {
             vtable,
         }
     }
+
+    /// Return this plugin's Rust-native CLI contribution, when registered.
+    #[must_use]
+    pub fn cli_registration(self) -> Option<bcode_plugin_sdk::StaticCliRegistration> {
+        self.vtable
+            .cli_registration
+            .map(|registration| registration())
+    }
 }
 
 #[derive(Debug)]
@@ -3797,6 +3805,7 @@ library = "libdisabled.dylib"
                 invoke_service_streaming: test_streaming_service,
                 tui_registry: None,
                 interaction_registry: None,
+                cli_registration: None,
                 handle_event: event,
             },
         )];
@@ -3856,6 +3865,7 @@ library = "libexample_static.dylib"
                 invoke_service_streaming: test_streaming_service,
                 tui_registry: None,
                 interaction_registry: None,
+                cli_registration: None,
                 handle_event: event,
             },
         )];
@@ -3963,6 +3973,7 @@ library = "libcommands.dylib"
                     invoke_service_streaming: test_streaming_service,
                     tui_registry: None,
                     interaction_registry: None,
+                    cli_registration: None,
                     handle_event: test_handle_event,
                 },
             },
@@ -4606,6 +4617,7 @@ library = "libexample_plugin.dylib"
                                 handle_event,
                                 tui_registry: None,
                                 interaction_registry: None,
+                                cli_registration: None,
                             },
                         },
                     },
@@ -4643,6 +4655,7 @@ library = "libexample_plugin.dylib"
                                 handle_event,
                                 tui_registry: None,
                                 interaction_registry: None,
+                                cli_registration: None,
                             },
                         },
                     },
@@ -4761,6 +4774,7 @@ library = "libexample_plugin.dylib"
                             handle_event: test_handle_event,
                             tui_registry: None,
                             interaction_registry: None,
+                            cli_registration: None,
                         },
                     },
                 }],
@@ -4890,6 +4904,7 @@ library = "libexample_plugin.dylib"
                             handle_event: test_handle_event,
                             tui_registry: None,
                             interaction_registry: None,
+                            cli_registration: None,
                         },
                     },
                 }],
@@ -5050,6 +5065,7 @@ library = "libexample_plugin.dylib"
             invoke_service_streaming: test_large_chunking_service,
             tui_registry: None,
             interaction_registry: None,
+            cli_registration: None,
             handle_event: test_handle_event,
         }
     }
@@ -5067,6 +5083,7 @@ library = "libexample_plugin.dylib"
             },
             tui_registry: None,
             interaction_registry: None,
+            cli_registration: None,
             handle_event: test_handle_event,
         }
     }
@@ -5082,6 +5099,7 @@ library = "libexample_plugin.dylib"
             invoke_service_streaming: test_streaming_service,
             tui_registry: None,
             interaction_registry: None,
+            cli_registration: None,
             handle_event: test_handle_event,
         }
     }

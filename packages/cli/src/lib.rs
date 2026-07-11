@@ -36,7 +36,7 @@ use bcode_skill_models::{
 use bcode_worktree_models::{
     WorktreeBaseRef, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
 };
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -108,6 +108,16 @@ pub enum CliError {
     PluginService { code: String, message: String },
     #[error("session repair usage error: {0}")]
     SessionRepairUsage(String),
+    #[error(
+        "plugin CLI command `{command}` is contributed by both `{first_plugin}` and `{second_plugin}`"
+    )]
+    PluginCliConflict {
+        command: String,
+        first_plugin: String,
+        second_plugin: String,
+    },
+    #[error("plugin CLI command failed: {0}")]
+    PluginCli(String),
     #[error("{0}")]
     AuthPrimeFailed(String),
     #[error("skill check failed: {warning_count} warnings, {error_count} errors")]
@@ -146,7 +156,20 @@ pub async fn run_with_static_bundled(
     let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
     let _ = STATIC_BUNDLED_PLUGIN_IDS.set(static_plugin_ids);
     init_tracing();
-    let cli = Cli::parse();
+    let registrations = static_cli_registrations()?;
+    let command = compose_root_command(&registrations);
+    let matches = command.get_matches();
+    if let Some(plugin) = plugin_cli_match(&matches, &registrations)
+        && let Some((_, subcommand_matches)) = matches.subcommand()
+    {
+        return (plugin.invoke)(subcommand_matches.clone())
+            .await
+            .map_err(CliError::PluginCli);
+    }
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    };
     Box::pin(handle_cli(cli)).await
 }
 
@@ -971,6 +994,74 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .finish();
     let _ = subscriber.try_init();
+}
+
+struct StaticCliContribution {
+    plugin_id: String,
+    command_name: String,
+    invoke: fn(clap::ArgMatches) -> bcode_plugin_sdk::StaticCliFuture,
+    command: clap::Command,
+}
+
+fn static_cli_registrations() -> Result<Vec<StaticCliContribution>, CliError> {
+    let plugins = STATIC_BUNDLED_PLUGINS.get().map_or(&[][..], Vec::as_slice);
+    let ids = STATIC_BUNDLED_PLUGIN_IDS
+        .get()
+        .map_or(&[][..], Vec::as_slice);
+    let mut contributions = Vec::new();
+    for (plugin, plugin_id) in plugins.iter().zip(ids) {
+        let Some(registration) = plugin.cli_registration() else {
+            continue;
+        };
+        let command = (registration.command)();
+        contributions.push(StaticCliContribution {
+            plugin_id: plugin_id.clone(),
+            command_name: command.get_name().to_owned(),
+            invoke: registration.invoke,
+            command,
+        });
+    }
+    contributions.sort_by(|left, right| {
+        left.command_name
+            .cmp(&right.command_name)
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+    });
+    for pair in contributions.windows(2) {
+        if pair[0].command_name == pair[1].command_name {
+            return Err(CliError::PluginCliConflict {
+                command: pair[0].command_name.clone(),
+                first_plugin: pair[0].plugin_id.clone(),
+                second_plugin: pair[1].plugin_id.clone(),
+            });
+        }
+    }
+    Ok(contributions)
+}
+
+fn compose_root_command(contributions: &[StaticCliContribution]) -> clap::Command {
+    let mut root = Cli::command();
+    for contribution in contributions {
+        if root
+            .get_subcommands()
+            .any(|command| command.get_name() == contribution.command_name)
+        {
+            root =
+                root.mut_subcommand(&contribution.command_name, |_| contribution.command.clone());
+        } else {
+            root = root.subcommand(contribution.command.clone());
+        }
+    }
+    root
+}
+
+fn plugin_cli_match<'a>(
+    matches: &clap::ArgMatches,
+    contributions: &'a [StaticCliContribution],
+) -> Option<&'a StaticCliContribution> {
+    let (name, _) = matches.subcommand()?;
+    contributions
+        .iter()
+        .find(|contribution| contribution.command_name == name)
 }
 
 /// Return the root `bcode` CLI command definition.

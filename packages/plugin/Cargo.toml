@@ -17,6 +17,7 @@ bcode_plugin_sdk = { workspace = true }
 bcode_tool       = { workspace = true }
 bmux_plugin      = { workspace = true }
 bmux_plugin_sdk  = { workspace = true }
+clap             = { workspace = true, features = ["std"] }
 libloading       = { workspace = true }
 semver           = { workspace = true, features = ["serde"] }
 serde            = { workspace = true, features = ["derive", "std"] }
