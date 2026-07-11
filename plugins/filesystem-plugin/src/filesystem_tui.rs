@@ -202,47 +202,65 @@ fn find_rows(payload: &Value) -> Vec<Line> {
 }
 
 fn grep_rows(payload: &Value, width: u16) -> Vec<Line> {
-    let matches = payload
+    let values = payload
         .get("matches")
         .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let mut rows = card_header(&format!("Text matches ({matches})"));
-    push_kv(&mut rows, "backend", text(payload, "backend"));
-    push_kv(&mut rows, "partial", bool_text(payload, "partial"));
-    if let Some(message) = text(payload, "message") {
-        push_kv(&mut rows, "note", Some(message));
-    }
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let visible = &values[..values.len().min(25)];
+    let line_number_width = visible
+        .iter()
+        .filter_map(|value| number(value, "line_number"))
+        .map(|number| number.len())
+        .max()
+        .unwrap_or(1);
+
+    let mut rows = card_header(&format!("Text matches ({})", values.len()));
     rows.push(Line::raw(""));
-    if let Some(values) = payload.get("matches").and_then(Value::as_array) {
-        for value in values.iter().take(25) {
-            let location = format!(
-                "{}:{}",
-                text(value, "path").unwrap_or_default(),
-                number(value, "line_number").unwrap_or_default()
-            );
-            let path = text(value, "path").unwrap_or_default();
+    let mut previous_path: Option<&str> = None;
+    for value in visible {
+        let path = text(value, "path").unwrap_or_default();
+        if previous_path != Some(path) {
+            if previous_path.is_some() {
+                rows.push(Line::raw(""));
+            }
             rows.push(Line::from_spans(vec![
                 path_icon_span(path, None, "  "),
-                Span::styled(location, path_style()),
+                Span::styled(path.to_owned(), path_style()),
             ]));
-            if let Some(line) = text(value, "line") {
-                let syntax_hint = text(value, "path")
-                    .or_else(|| text(payload, "path"))
-                    .unwrap_or_default();
-                rows.extend(preview_lines_with_options(
-                    line,
-                    &SourcePreviewOptions::new(syntax_hint, width)
-                        .max_lines(1)
-                        .line_prefix("    │ ", muted())
-                        .truncated_message("    … preview truncated", muted()),
-                ));
-            }
+            previous_path = Some(path);
         }
-        if values.len() > 25 {
-            rows.push(Line::from_spans(vec![Span::styled(
-                format!("  … {} more matches", values.len() - 25),
-                muted(),
-            )]));
+
+        let line_number = number(value, "line_number").unwrap_or_default();
+        if let Some(line) = text(value, "line") {
+            let prefix = format!("  {line_number:>line_number_width$} │ ");
+            rows.extend(preview_lines_with_options(
+                line,
+                &SourcePreviewOptions::new(path, width)
+                    .max_lines(1)
+                    .line_prefix(&prefix, muted())
+                    .truncated_message("    … preview truncated", muted()),
+            ));
+        }
+    }
+    if values.len() > 25 {
+        rows.push(Line::from_spans(vec![Span::styled(
+            format!("  … {} more matches", values.len() - 25),
+            muted(),
+        )]));
+    }
+
+    let has_status = text(payload, "backend").is_some()
+        || payload.get("partial").and_then(Value::as_bool) == Some(true)
+        || text(payload, "message").is_some();
+    if has_status {
+        rows.push(Line::raw(""));
+        push_kv(&mut rows, "backend", text(payload, "backend"));
+        if payload.get("partial").and_then(Value::as_bool) == Some(true) {
+            push_kv(&mut rows, "partial", Some("yes".to_owned()));
+        }
+        if let Some(message) = text(payload, "message") {
+            push_kv(&mut rows, "note", Some(message));
         }
     }
     rows
@@ -516,8 +534,8 @@ mod tests {
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("Text matches (1)"), "{rendered}");
-        assert!(rendered.contains("src/lib.rs:7"), "{rendered}");
-        assert!(rendered.contains("needle here"), "{rendered}");
+        assert!(rendered.contains("src/lib.rs"), "{rendered}");
+        assert!(rendered.contains("  7 │ needle here"), "{rendered}");
     }
 
     #[test]
@@ -563,6 +581,36 @@ mod tests {
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("partial bytes"), "{rendered}");
         assert!(!rendered.contains("1 │ partial bytes"), "{rendered}");
+    }
+
+    #[test]
+    fn groups_consecutive_grep_matches_and_aligns_line_numbers() {
+        let payload = serde_json::json!({
+            "matches": [
+                {"path": "src/lib.rs", "line_number": 7, "line": "pub fn first() {}"},
+                {"path": "src/lib.rs", "line_number": 123, "line": "pub fn second() {}"},
+                {"path": "src/main.rs", "line_number": 9, "line": "fn main() {}"}
+            ],
+            "backend": "rust",
+            "partial": false
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FilesystemTuiVisualAdapter,
+            "bcode.filesystem.grep",
+            &payload,
+            80,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert_eq!(rendered.matches("src/lib.rs").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("src/main.rs").count(), 1, "{rendered}");
+        assert!(rendered.contains("    7 │ pub fn first() {}"), "{rendered}");
+        assert!(
+            rendered.contains("  123 │ pub fn second() {}"),
+            "{rendered}"
+        );
+        assert!(rendered.find("backend").unwrap() > rendered.find("fn main").unwrap());
+        assert!(!rendered.contains("partial:"), "{rendered}");
     }
 
     #[test]
