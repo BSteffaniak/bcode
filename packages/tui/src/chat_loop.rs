@@ -218,15 +218,11 @@ impl DaemonConnectionMonitor {
 #[derive(Debug)]
 struct PermissionPollSchedule {
     next_poll_at: Instant,
-    last_error_status: Option<String>,
 }
 
 impl PermissionPollSchedule {
     const fn new(now: Instant) -> Self {
-        Self {
-            next_poll_at: now,
-            last_error_status: None,
-        }
+        Self { next_poll_at: now }
     }
 }
 
@@ -795,13 +791,12 @@ fn apply_newer_history_result(
 }
 
 fn apply_permission_list_result(
-    chat: &mut ActiveChat,
+    chat: &ActiveChat,
     loop_state: &mut ChatLoopState,
     result: Result<Vec<bcode_ipc::PermissionSummary>, ClientError>,
 ) {
     match result {
         Ok(permissions) => {
-            loop_state.permission_poll.last_error_status = None;
             if loop_state.permission_dialog.is_none()
                 && let Some(permission) = permissions
                     .into_iter()
@@ -811,18 +806,10 @@ fn apply_permission_list_result(
             }
         }
         Err(error) => {
-            let label = if error.is_daemon_unavailable() {
+            if error.is_daemon_unavailable() {
                 loop_state.permission_poll.next_poll_at =
                     Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;
-                "Permissions unavailable"
-            } else {
-                "Permission check failed"
-            };
-            let status = daemon_issue::client_issue_status(label, &error);
-            if loop_state.permission_poll.last_error_status.as_deref() != Some(&status) {
-                chat.app.set_status(status.clone());
             }
-            loop_state.permission_poll.last_error_status = Some(status);
         }
     }
 }
