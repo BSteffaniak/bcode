@@ -14,8 +14,17 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bcode_client                = { workspace = true }
+bcode_daemon_lifecycle      = { workspace = true }
+bcode_ipc                   = { workspace = true }
 bcode_plugin_sdk            = { workspace = true }
+bcode_session_models        = { workspace = true }
+bcode_worktree_models       = { workspace = true }
 bmux_codec                  = { workspace = true }
+bmux_keyboard               = { workspace = true }
+bmux_tui                    = { workspace = true, features = ["crossterm"] }
+clap                        = { workspace = true, features = ["derive", "std"] }
+crossterm                   = { workspace = true }
 serde                       = { workspace = true, features = ["derive", "std"] }
 serde_json                  = { workspace = true }
 switchy_database            = { workspace = true }
