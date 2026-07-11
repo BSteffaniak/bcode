@@ -2117,7 +2117,12 @@ fn auth_prime_plan(
     let provider_plugin_id = declared_pool
         .and_then(|pool| pool.provider_plugin_id.clone())
         .or_else(|| runtime_pool.and_then(|pool| pool.provider_plugin_id.clone()))
-        .unwrap_or_else(|| "bcode.openai-compatible".to_string());
+        .or_else(|| resolved_selection.provider_plugin_id.clone())
+        .ok_or_else(|| {
+            CliError::LoginProfile(format!(
+                "Auth pool '{pool}' does not declare a provider and no model provider is configured."
+            ))
+        })?;
     let required_windows = required_prime_windows(pool, declared_pool);
     let include_primary = include_primary || profile.is_some();
     let mut targets = Vec::new();
@@ -5198,10 +5203,9 @@ fn verify_models(
     let config = bcode_config::load_config()?;
     let context = configured_provider_context(&config);
     let selection = config.resolved_model_selection();
-    let provider_plugin_id = selection
-        .provider_plugin_id
-        .clone()
-        .unwrap_or_else(|| "bcode.openai-compatible".to_string());
+    let provider_plugin_id = selection.provider_plugin_id.clone().ok_or_else(|| {
+        CliError::PluginCli("no model provider is configured; pass --provider".to_string())
+    })?;
     let mut host = load_cli_plugin_host()?;
     let list_request = bcode_model::ModelListRequest {
         provider_context: context,

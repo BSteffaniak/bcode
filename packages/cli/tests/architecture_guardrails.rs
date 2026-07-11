@@ -29,6 +29,7 @@ const PLUGIN_OWNED_CORE_CLI_NEEDLES: &[&str] = &[
     "handle_eval_command",
     "handle_review_command",
     "handle_blims_command",
+    "bcode.openai-compatible",
     "run_metrics_dashboard(repo, path)",
 ];
 
