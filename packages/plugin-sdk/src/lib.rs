@@ -877,6 +877,11 @@ pub enum StaticCliHostAction {
         /// Plugin-defined string options for the surface.
         options: std::collections::BTreeMap<String, String>,
     },
+    /// Attach the host terminal to a session selected by the plugin.
+    AttachSession {
+        /// Session to attach.
+        session_id: bcode_session_models::SessionId,
+    },
 }
 
 /// Result of a statically linked plugin CLI invocation.

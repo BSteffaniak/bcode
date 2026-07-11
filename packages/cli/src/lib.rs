@@ -141,14 +141,20 @@ pub async fn run_with_static_bundled(
             .invoke(subcommand_matches.clone())
             .await
             .map_err(CliError::PluginCli)?;
-        if let Some(bcode_plugin_sdk::StaticCliHostAction::OpenTuiSurface {
-            surface_kind,
-            repo_path,
-            options,
-        }) = outcome.host_action
-        {
-            ensure_server_running().await?;
-            bcode_tui::run_plugin_surface(surface_kind, repo_path, options).await?;
+        match outcome.host_action {
+            Some(bcode_plugin_sdk::StaticCliHostAction::OpenTuiSurface {
+                surface_kind,
+                repo_path,
+                options,
+            }) => {
+                ensure_server_running().await?;
+                bcode_tui::run_plugin_surface(surface_kind, repo_path, options).await?;
+            }
+            Some(bcode_plugin_sdk::StaticCliHostAction::AttachSession { session_id }) => {
+                ensure_server_running().await?;
+                attach_session(session_id).await?;
+            }
+            None => {}
         }
         return Ok(());
     }
