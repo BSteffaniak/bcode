@@ -10,6 +10,7 @@ use crate::eval_data::{
 use bcode_eval_models::{
     EvalImprovementGeneration, EvalImprovementObjective, EvalRepetitionResult,
 };
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
@@ -117,9 +118,9 @@ impl EvalRunPickerSurface {
         self.status = format!(
             "{} runs in {}; {} campaigns in {}",
             self.runs.len(),
-            self.runs_root.display(),
+            display_from_current_dir(&self.runs_root),
             self.campaigns.len(),
-            self.campaigns_root.display()
+            display_from_current_dir(&self.campaigns_root)
         );
     }
 
@@ -1079,7 +1080,10 @@ impl RunSuiteWizard {
         let choice = &self.suite_choices[self.suite_index];
         let mut body = vec![
             Line::from(format!("Suite: {}", choice.suite_id)),
-            Line::from(format!("Path: {}", choice.suite_path.display())),
+            Line::from(format!(
+                "Path: {}",
+                display_from_current_dir(&choice.suite_path)
+            )),
             Line::from("Use arrows or click Suite to cycle choices."),
         ];
         if let Some(error) = &self.error {
@@ -1306,7 +1310,7 @@ impl StartCampaignWizard {
         if output_path.exists() {
             return Err(format!(
                 "campaign already exists: {}",
-                output_path.display()
+                display_from_current_dir(&output_path)
             ));
         }
         Ok(())
@@ -1516,7 +1520,10 @@ impl RecordGenerationWizard {
         }
         for overlay in comma_paths(&input_text(&self.overlays)) {
             if !overlay.is_file() {
-                return Err(format!("overlay path is not a file: {}", overlay.display()));
+                return Err(format!(
+                    "overlay path is not a file: {}",
+                    display_from_current_dir(&overlay)
+                ));
             }
         }
         Ok(())
@@ -2704,12 +2711,15 @@ impl EvalGenerationDetailSurface {
                     .delta
                     .affected_files
                     .iter()
-                    .map(|path| Line::from(format!("  * {}", path.display()))),
+                    .map(|path| Line::from(format!("  * {}", display_from_current_dir(path)))),
             );
         }
         if let Some(patch_path) = &generation.delta.patch_path {
             lines.push(Line::from(""));
-            lines.push(Line::from(format!("Patch: {}", patch_path.display())));
+            lines.push(Line::from(format!(
+                "Patch: {}",
+                display_from_current_dir(patch_path)
+            )));
         }
         if !generation.delta.overlay_paths.is_empty() {
             lines.push(Line::from(""));
@@ -2719,7 +2729,7 @@ impl EvalGenerationDetailSurface {
                     .delta
                     .overlay_paths
                     .iter()
-                    .map(|path| Line::from(format!("  * {}", path.display()))),
+                    .map(|path| Line::from(format!("  * {}", display_from_current_dir(path)))),
             );
         }
         render_lines(area, frame, &lines);
@@ -2954,7 +2964,7 @@ impl EvalRunViewerSurface {
             "{}  winner={}  {}",
             pass_label(data.result.passed),
             winner,
-            data.run_dir.display()
+            display_from_current_dir(&data.run_dir)
         );
         Ok(Self {
             data,

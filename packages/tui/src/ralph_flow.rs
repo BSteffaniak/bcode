@@ -9,6 +9,7 @@ use bcode_ipc::{
     RalphListRunsRequest, RalphResumeRequest, RalphRunRequest, RalphRunStatusRequest,
     RalphRunSummary, RalphStatusSummary,
 };
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
 use bcode_worktree_models::WorktreeCreateRequest;
@@ -178,13 +179,13 @@ fn view_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         draft
             .target_state_dir
             .as_ref()
-            .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string()),
+            .map_or_else(|| "<none>".to_owned(), |path| display_from_current_dir(path).to_string()),
         draft.loop_name,
         draft.branch.as_deref().unwrap_or("<default>"),
         draft
             .work_area_path
             .as_ref()
-            .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string()),
+            .map_or_else(|| "<default>".to_owned(), |path| display_from_current_dir(path).to_string()),
         if draft.validation_commands.is_empty() {
             "<none>".to_owned()
         } else {
@@ -193,11 +194,11 @@ fn view_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         readiness.has_charter,
         readiness.has_progress,
         readiness.approved,
-        draft.draft_path.display(),
+        display_from_current_dir(&draft.draft_path),
         draft
             .setup_transcript_path
             .as_ref()
-            .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string()),
+            .map_or_else(|| "<none>".to_owned(), |path| display_from_current_dir(path).to_string()),
         markdown_preview(draft.charter_draft.as_deref()),
         markdown_preview(draft.progress_draft.as_deref())
     ));
@@ -233,10 +234,10 @@ fn revision_prompt(draft: &ralph_state::RalphSetupDraft) -> String {
         status = draft.status,
         loop_name = draft.loop_name,
         branch = draft.branch.as_deref().unwrap_or("<default>"),
-        worktree = draft
-            .work_area_path
-            .as_ref()
-            .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string()),
+        worktree = draft.work_area_path.as_ref().map_or_else(
+            || "<default>".to_owned(),
+            |path| display_from_current_dir(path).to_string()
+        ),
         validation = if draft.validation_commands.is_empty() {
             "<none>".to_owned()
         } else {
@@ -317,7 +318,7 @@ fn approve_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     chat.app.push_system_note(format!(
         "Ralph setup draft approved\n* Draft: {}\n* Path: {}\n* Next: {}",
         updated.draft_id,
-        updated.draft_path.display(),
+        display_from_current_dir(&updated.draft_path),
         if updated.mode == ralph_state::RalphSetupDraftMode::RebuildExistingLoop {
             "apply draft to loop"
         } else {
@@ -391,10 +392,10 @@ async fn create_loop_from_draft(
         "Ralph loop created from setup draft\n* Draft: {}\n* Loop: {}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: prepare a run, then approve/start it",
         draft.draft_id,
         draft.loop_name,
-        state.charter_doc_path.display(),
-        state.progress_doc_path.display(),
-        state.state_dir.display(),
-        work_area.path.display(),
+        display_from_current_dir(&state.charter_doc_path),
+        display_from_current_dir(&state.progress_doc_path),
+        display_from_current_dir(&state.state_dir),
+        display_from_current_dir(&work_area.path),
         work_area_session_id.as_deref().unwrap_or("<none>")
     ));
     chat.app
@@ -542,10 +543,10 @@ fn save_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         updated
             .work_area_path
             .as_ref()
-            .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string()),
+            .map_or_else(|| "<default>".to_owned(), |path| display_from_current_dir(path).to_string()),
         readiness.has_charter,
         readiness.has_progress,
-        updated.draft_path.display(),
+        display_from_current_dir(&updated.draft_path),
         if readiness.has_charter && readiness.has_progress {
             "review the saved draft, then approve setup draft"
         } else {
@@ -582,9 +583,9 @@ fn rebuild_setup_prompt(
          RALPH_SETUP_DRAFT_END\n\n\
          Initial context pack:\n\n{source_context}",
         loop_name = loop_summary.loop_name,
-        state_dir = loop_summary.state_dir.display(),
-        charter_path = loop_summary.charter_doc_path.display(),
-        progress_path = loop_summary.progress_doc_path.display(),
+        state_dir = display_from_current_dir(&loop_summary.state_dir),
+        charter_path = display_from_current_dir(&loop_summary.charter_doc_path),
+        progress_path = display_from_current_dir(&loop_summary.progress_doc_path),
         draft_loop_name = draft.loop_name,
         source_context = draft.source_context
     )
@@ -704,7 +705,10 @@ fn render_rebuild_dialog(
         content,
         &mut row,
         frame,
-        &format!("State: {}", loop_summary.state_dir.display()),
+        &format!(
+            "State: {}",
+            display_from_current_dir(&loop_summary.state_dir)
+        ),
     );
     row = row.saturating_add(1);
     render_rebuild_input(
@@ -904,11 +908,11 @@ pub async fn rebuild_loop_context<W: Write>(
     source_context.push_str("\n\n");
     source_context.push_str(&dialog.user_context());
     source_context.push_str("\nExisting Ralph loop files:\n* charter: ");
-    source_context.push_str(&loop_summary.charter_doc_path.display().to_string());
+    source_context.push_str(&display_from_current_dir(&loop_summary.charter_doc_path).to_string());
     source_context.push_str("\n* progress: ");
-    source_context.push_str(&loop_summary.progress_doc_path.display().to_string());
+    source_context.push_str(&display_from_current_dir(&loop_summary.progress_doc_path).to_string());
     source_context.push_str("\n* state dir: ");
-    source_context.push_str(&loop_summary.state_dir.display().to_string());
+    source_context.push_str(&display_from_current_dir(&loop_summary.state_dir).to_string());
     source_context.push('\n');
     let draft = ralph_state::create_setup_draft(ralph_state::RalphSetupDraftCreateRequest {
         repo_root: repo_root.clone(),
@@ -924,7 +928,7 @@ pub async fn rebuild_loop_context<W: Write>(
         &draft,
         &format!(
             "## Created rebuild setup draft\n\nTarget state dir: {}\n\n{}",
-            loop_summary.state_dir.display(),
+            display_from_current_dir(&loop_summary.state_dir),
             prompt
         ),
     )?;
@@ -942,11 +946,11 @@ pub async fn rebuild_loop_context<W: Write>(
         "Ralph rebuild conversation started\n* Draft: {}\n* Target loop: {}\n* Target state: {}\n* Transcript: {}\n* Assistant turn: started automatically from the guided rebuild context\n* Next: answer Ralph's questions here, then Save/View/Approve/Apply the setup draft from Ralph UI",
         draft.draft_id,
         loop_summary.loop_name,
-        loop_summary.state_dir.display(),
+        display_from_current_dir(&loop_summary.state_dir),
         draft
             .setup_transcript_path
             .as_ref()
-            .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string())
+            .map_or_else(|| "<none>".to_owned(), |path| display_from_current_dir(path).to_string())
     ));
     chat.app
         .set_status("Ralph rebuild conversation started".to_owned());
@@ -981,10 +985,10 @@ fn apply_draft_to_existing_loop(chat: &mut ActiveChat) -> Result<(), TuiError> {
     let result = ralph_state::apply_setup_draft_to_existing_loop(&draft.draft_id, &repo_root)?;
     chat.app.push_system_note(format!(
         "Ralph loop context rebuilt\n* State dir: {}\n* Backups: {}\n* Charter: {}\n* Progress: {}\n* Run history was preserved",
-        result.state_dir.display(),
-        result.backup_dir.display(),
-        result.charter_doc_path.display(),
-        result.progress_doc_path.display()
+        display_from_current_dir(&result.state_dir),
+        display_from_current_dir(&result.backup_dir),
+        display_from_current_dir(&result.charter_doc_path),
+        display_from_current_dir(&result.progress_doc_path)
     ));
     chat.app
         .set_status("Ralph loop context rebuilt from draft".to_owned());
@@ -1014,7 +1018,7 @@ pub async fn plan_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Res
         &draft,
         &format!(
             "## Created setup draft\n\nRepo: {}\n\nInitial context:\n\n{}",
-            repo_root.display(),
+            display_from_current_dir(&repo_root),
             draft.source_context
         ),
     )?;
@@ -1022,7 +1026,7 @@ pub async fn plan_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Res
         "Ralph guided setup draft created\n* Draft: {}\n* Status: {}\n* Repo: {}\n* Next: answer the assistant's clarifying questions; approve only after charter/progress are meaningful",
         draft.draft_id,
         draft.status,
-        repo_root.display()
+        display_from_current_dir(&repo_root)
     ));
     chat.app.composer_mut().clear();
     chat.app.composer_mut().insert_str(&prompt);
@@ -1196,7 +1200,7 @@ pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Resu
         "Ralph run prepared\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}\n* Next: /ralph approve",
         response.run.run_id,
         response.run.status,
-        response.run.state_dir.display(),
+        display_from_current_dir(&response.run.state_dir),
         response.run.session_id.as_deref().unwrap_or("<none>")
     ));
     chat.app
@@ -1222,7 +1226,7 @@ pub async fn approve_run(
         "Ralph run approved\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}",
         response.run.run_id,
         response.run.status,
-        response.run.state_dir.display(),
+        display_from_current_dir(&response.run.state_dir),
         response.run.session_id.as_deref().unwrap_or("<none>")
     ));
     chat.app.set_status("Ralph run approved".to_owned());
@@ -1489,12 +1493,12 @@ fn format_status_note(
         summary.unchecked_count,
         validation_commands,
         summary.next_action,
-        summary.progress_doc_path.display(),
-        summary.state_dir.display(),
-        summary
-            .work_area_path
-            .as_ref()
-            .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string()),
+        display_from_current_dir(&summary.progress_doc_path),
+        display_from_current_dir(&summary.state_dir),
+        summary.work_area_path.as_ref().map_or_else(
+            || "<none>".to_owned(),
+            |path| display_from_current_dir(path).to_string()
+        ),
         summary.session_id.as_deref().unwrap_or("<none>")
     )
 }
@@ -1519,7 +1523,7 @@ pub fn show_prompt(
     chat.app.push_system_note(format!(
         "Ralph prompt prepared\n* Loop: {}\n* Progress doc: {}\n\n{}",
         summary.loop_name,
-        summary.progress_doc_path.display(),
+        display_from_current_dir(&summary.progress_doc_path),
         prompt
     ));
     chat.app
@@ -1543,7 +1547,7 @@ pub fn open_progress(chat: &mut ActiveChat) -> Result<(), TuiError> {
     chat.app.push_system_note(format!(
         "Ralph progress doc\n* Loop: {}\n* Path: {}",
         summary.loop_name,
-        summary.progress_doc_path.display()
+        display_from_current_dir(&summary.progress_doc_path)
     ));
     chat.app
         .set_status("Ralph progress doc path shown".to_owned());
@@ -1697,10 +1701,10 @@ async fn confirm_start_loop(
     };
     chat.app.push_system_note(format!(
         "Ralph loop created\n* Loop: {loop_name}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: review docs if desired, then prepare a run and approve/start it",
-        state.charter_doc_path.display(),
-        state.progress_doc_path.display(),
-        state.state_dir.display(),
-        work_area.path.display(),
+        display_from_current_dir(&state.charter_doc_path),
+        display_from_current_dir(&state.progress_doc_path),
+        display_from_current_dir(&state.state_dir),
+        display_from_current_dir(&work_area.path),
         work_area_session_id.as_deref().unwrap_or("<none>"),
         validation_summary
     ));

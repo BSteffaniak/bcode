@@ -1,6 +1,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use bcode_client::BcodeClient;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{
     StaticCliFuture, StaticCliHostAction, StaticCliOutcome, StaticCliRegistration,
 };
@@ -3550,7 +3551,7 @@ async fn start_blims_task_work(task_id: String) -> Result<(), CliError> {
         "task work session for {} as {}: {}",
         prompt.task_id, prompt.agent_id, session.id
     );
-    println!("sandbox\t{}", worktree.path.display());
+    println!("sandbox\t{}", display_from_current_dir(&worktree.path));
     if let Some(branch) = &worktree.branch {
         println!("branch\t{branch}");
         let proposal =
@@ -3844,10 +3845,19 @@ async fn print_blims_status(json: bool) -> Result<(), CliError> {
         println!("{}", status.message);
         println!("daemon connected: {}", status.daemon_connected);
         println!("lifecycle: {}", status.lifecycle_status);
-        println!("state root: {}", status.state_root.display());
-        println!("database: {}", status.database_path.display());
+        println!(
+            "state root: {}",
+            display_from_current_dir(&status.state_root)
+        );
+        println!(
+            "database: {}",
+            display_from_current_dir(&status.database_path)
+        );
         println!("daemon namespace: {}", status.daemon_namespace);
-        println!("daemon metadata: {}", status.daemon_metadata_path.display());
+        println!(
+            "daemon metadata: {}",
+            display_from_current_dir(&status.daemon_metadata_path)
+        );
         println!("compatibility: {}", status.compatibility);
     }
     Ok(())
@@ -3860,10 +3870,19 @@ async fn create_blims_company(json: bool) -> Result<(), CliError> {
     } else {
         let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
         println!("Blims company created");
-        println!("state root: {}", status.state_root.display());
-        println!("database: {}", status.database_path.display());
+        println!(
+            "state root: {}",
+            display_from_current_dir(&status.state_root)
+        );
+        println!(
+            "database: {}",
+            display_from_current_dir(&status.database_path)
+        );
         println!("daemon namespace: {}", status.daemon_namespace);
-        println!("daemon metadata: {}", status.daemon_metadata_path.display());
+        println!(
+            "daemon metadata: {}",
+            display_from_current_dir(&status.daemon_metadata_path)
+        );
     }
     Ok(())
 }
@@ -3926,7 +3945,10 @@ async fn print_company_lifecycle_update(
         let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
         println!("{message}");
         println!("lifecycle: {}", status.lifecycle_status);
-        println!("state root: {}", status.state_root.display());
+        println!(
+            "state root: {}",
+            display_from_current_dir(&status.state_root)
+        );
     }
     Ok(())
 }
@@ -4360,7 +4382,7 @@ fn confirm_patch_apply(artifact: &BlimsArtifactDetail) -> Result<bool, CliError>
     );
     println!(
         "This can modify files under {}.",
-        std::env::current_dir()?.display()
+        display_from_current_dir(std::env::current_dir()?)
     );
     print!("Type `apply` to continue: ");
     std::io::stdout().flush()?;

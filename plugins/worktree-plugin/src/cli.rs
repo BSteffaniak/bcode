@@ -1,5 +1,6 @@
 //! Statically bundled Worktree CLI contribution.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{StaticCliFuture, StaticCliRegistration};
 use bcode_worktree_models::{
     WorktreeBaseRef, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
@@ -105,7 +106,11 @@ async fn run(command: WorktreeCliCommand) -> Result<(), String> {
                 .change_session_working_directory(session_id, path)
                 .await
                 .map_err(|error| error.to_string())?;
-            println!("{}\t{}", session.id, session.working_directory.display());
+            println!(
+                "{}\t{}",
+                session.id,
+                display_from_current_dir(&session.working_directory)
+            );
         }
         WorktreeCliCommand::Remove(args) => remove(&client, args).await?,
     }
@@ -120,7 +125,7 @@ async fn list(client: &bcode_client::BcodeClient, args: WorktreeListArgs) -> Res
     if args.json {
         println!("{}", json(&response)?);
     } else {
-        println!("repo\t{}", response.repo_root.display());
+        println!("repo\t{}", display_from_current_dir(&response.repo_root));
         for worktree in response.worktrees {
             let marker = if worktree.is_main { "main" } else { "linked" };
             let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_owned());
@@ -130,7 +135,7 @@ async fn list(client: &bcode_client::BcodeClient, args: WorktreeListArgs) -> Res
                 marker,
                 branch,
                 commit,
-                worktree.path.display()
+                display_from_current_dir(&worktree.path)
             );
         }
     }
@@ -160,7 +165,7 @@ async fn create(
     if args.json {
         println!("{}", json(&response)?);
     } else {
-        println!("created\t{}", response.path.display());
+        println!("created\t{}", display_from_current_dir(&response.path));
         if let Some(branch) = response.branch {
             println!("branch\t{branch}");
         }
@@ -186,7 +191,7 @@ async fn remove(
     if args.json {
         println!("{}", json(&response)?);
     } else {
-        println!("removed\t{}", response.path.display());
+        println!("removed\t{}", display_from_current_dir(&response.path));
     }
     Ok(())
 }
