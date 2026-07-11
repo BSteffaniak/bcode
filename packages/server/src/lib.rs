@@ -11956,6 +11956,29 @@ const fn plugin_scope_kind(scope: &PluginInvocationScope) -> &'static str {
     }
 }
 
+fn provider_managed_context_request(
+    decision: CompactionDecision,
+    context_window: Option<u32>,
+    proactive_threshold_percent: u8,
+    requested_max_output_tokens: Option<u32>,
+    provider_max_output_tokens: Option<u32>,
+) -> bcode_model::ContextManagementRequest {
+    if decision.strategy != AutomaticCompactionStrategy::ProviderManaged {
+        return bcode_model::ContextManagementRequest::default();
+    }
+    bcode_model::ContextManagementRequest {
+        compact_threshold: context_window.map(|window| {
+            compaction_capacity_tokens(
+                window,
+                proactive_threshold_percent,
+                requested_max_output_tokens,
+                provider_max_output_tokens,
+            )
+            .threshold_tokens
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_model_turn_request(
     state: &ServerState,
@@ -12247,17 +12270,13 @@ async fn build_model_turn_request(
         == AutomaticCompactionStrategy::ProviderManaged
     {
         let status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
-        bcode_model::ContextManagementRequest {
-            compact_threshold: status.context_window.map(|window| {
-                compaction_capacity_tokens(
-                    window,
-                    state.auto_compaction.proactive_threshold_percent,
-                    parameters.max_output_tokens,
-                    status.max_output_tokens,
-                )
-                .threshold_tokens
-            }),
-        }
+        provider_managed_context_request(
+            compaction_policy.decision,
+            status.context_window,
+            state.auto_compaction.proactive_threshold_percent,
+            parameters.max_output_tokens,
+            status.max_output_tokens,
+        )
     } else {
         bcode_model::ContextManagementRequest::default()
     };
@@ -17049,6 +17068,30 @@ mod tests {
         assert_eq!(
             resolve_compaction_decision(bcode_config::CompactionMode::Off, None).strategy,
             AutomaticCompactionStrategy::Disabled
+        );
+    }
+
+    #[test]
+    fn provider_managed_policy_projects_context_instructions_only_for_managed_strategy() {
+        let managed = CompactionDecision {
+            strategy: AutomaticCompactionStrategy::ProviderManaged,
+            overflow_recovery: true,
+            reason: "test",
+        };
+        let overflow_only = CompactionDecision {
+            strategy: AutomaticCompactionStrategy::OverflowOnly,
+            overflow_recovery: true,
+            reason: "test",
+        };
+
+        assert_eq!(
+            provider_managed_context_request(managed, Some(128_000), 90, None, Some(100_000))
+                .compact_threshold,
+            Some(109_440)
+        );
+        assert_eq!(
+            provider_managed_context_request(overflow_only, Some(128_000), 90, None, Some(100_000),),
+            bcode_model::ContextManagementRequest::default()
         );
     }
 
