@@ -22,6 +22,7 @@ use bcode_eval_models::{
     EvalRegressionReport, EvalRepetitionResult, EvalRunManifest, EvalRunResult, EvalSuite,
     EvalVariant, EvalVariantRunResult,
 };
+use bcode_plugin_sdk::path::display_from_current_dir;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -249,7 +250,7 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
         "eval run finished: {} — passed={} summary={}",
         result.manifest.run_id,
         result.passed,
-        output_dir.join("summary.md").display()
+        display_from_current_dir(output_dir.join("summary.md"))
     ));
     Ok(result)
 }
@@ -277,7 +278,7 @@ fn run_case_variant(
             case.id,
             repetition,
             suite.run.repetitions,
-            rep_dir.display()
+            display_from_current_dir(&rep_dir)
         ));
         let result = run_repetition(
             suite, suite_dir, output_dir, &rep_dir, case, variant, repetition,
@@ -1479,7 +1480,7 @@ fn run_judge(
                 measurements: EvalMeasurementSet::new(),
                 diagnostics: diagnostic_if_failed(
                     passed,
-                    &format!("snapshot mismatch for {}", path.display()),
+                    &format!("snapshot mismatch for {}", display_from_current_dir(path)),
                 ),
                 artifacts: Vec::new(),
             }
@@ -1601,7 +1602,7 @@ pub fn start_improvement_campaign(
     if output_dir.exists() {
         return Err(EvalError::Validation(format!(
             "campaign already exists: {}",
-            output_dir.display()
+            display_from_current_dir(&output_dir)
         )));
     }
     fs::create_dir_all(output_dir.join("generations/0000-baseline/delta"))?;
@@ -1691,7 +1692,7 @@ pub fn record_improvement_generation(
         if !overlay.is_file() {
             return Err(EvalError::Validation(format!(
                 "overlay is not a file: {}",
-                overlay.display()
+                display_from_current_dir(overlay)
             )));
         }
         let extension = overlay
@@ -2104,7 +2105,7 @@ pub fn init_suite(directory: impl AsRef<Path>, id: &str, name: &str) -> Result<(
     if suite_path.exists() {
         return Err(EvalError::Validation(format!(
             "suite already exists: {}",
-            suite_path.display()
+            display_from_current_dir(&suite_path)
         )));
     }
     let suite = format!(
@@ -2349,7 +2350,7 @@ pub fn add_case(
     if case_dir.exists() {
         return Err(EvalError::Validation(format!(
             "case already exists: {}",
-            case_dir.display()
+            display_from_current_dir(&case_dir)
         )));
     }
     let input = case_dir.join("input");
@@ -2508,7 +2509,7 @@ pub fn render_runs_comparison_markdown(runs: &[EvalRunResult]) -> String {
         out.push_str(&format!(
             "* `{}`: `{}`\n",
             run.manifest.run_id,
-            run.manifest.output_dir.display()
+            display_from_current_dir(&run.manifest.output_dir)
         ));
     }
     out.push_str("\n## Repetition Artifacts\n\n");
@@ -2559,7 +2560,7 @@ fn artifact_links(repetition: &EvalRepetitionResult) -> String {
         .iter()
         .map(|artifact| {
             let path = report_artifact_path(repetition, artifact);
-            format!("[{}]({})", artifact.kind, path.display())
+            format!("[{}]({})", artifact.kind, display_from_current_dir(path))
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -2919,7 +2920,7 @@ fn collect_file_snapshot(root: &Path, current: &Path, text: &mut String) -> Resu
             collect_file_snapshot(root, &path, text)?;
         } else if entry.file_type()?.is_file() {
             let relative = path.strip_prefix(root).unwrap_or(&path);
-            text.push_str(&format!("--- {}\n", relative.display()));
+            text.push_str(&format!("--- {}\n", display_from_current_dir(relative)));
             let mut file = File::open(&path)?;
             let mut contents = String::new();
             let _ = file.read_to_string(&mut contents);

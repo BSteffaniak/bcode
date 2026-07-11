@@ -15,6 +15,7 @@ bcode_client         = { workspace = true }
 bcode_config         = { workspace = true }
 bcode_eval_models    = { workspace = true }
 bcode_ipc            = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool           = { workspace = true }
 regex                = { workspace = true, features = ["std"] }

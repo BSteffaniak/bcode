@@ -43,6 +43,7 @@ use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
 };
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1201,7 +1202,7 @@ fn write_file_publish(
         publisher_id,
         submitted: true,
         output: Some(path.display().to_string()),
-        message: format!("wrote review export to {}", path.display()),
+        message: format!("wrote review export to {}", display_from_current_dir(&path)),
     })
 }
 
@@ -1234,7 +1235,11 @@ fn publish_local_markdown(bundle: &ReviewBundle) -> String {
     let mut output = String::new();
     let _ = write!(output, "# Local review: {}\n\n", bundle.title);
     let _ = writeln!(output, "* Review id: `{}`", bundle.review_id);
-    let _ = writeln!(output, "* Repository: `{}`", bundle.repo_root.display());
+    let _ = writeln!(
+        output,
+        "* Repository: `{}`",
+        display_from_current_dir(&bundle.repo_root)
+    );
     let _ = writeln!(output, "* Generated: `{}`", bundle.generated_at_ms);
     let _ = writeln!(output, "* Files: `{}`", bundle.files.len());
     let open_threads = bundle
@@ -1337,7 +1342,11 @@ fn publish_markdown(bundle: &ReviewBundle) -> String {
     let mut output = String::new();
     let _ = write!(output, "# {}\n\n", bundle.title);
     let _ = writeln!(output, "* Review id: `{}`", bundle.review_id);
-    let _ = writeln!(output, "* Repository: `{}`", bundle.repo_root.display());
+    let _ = writeln!(
+        output,
+        "* Repository: `{}`",
+        display_from_current_dir(&bundle.repo_root)
+    );
     let _ = writeln!(output, "* Generated: `{}`", bundle.generated_at_ms);
     if !bundle.surfaces.is_empty() {
         let _ = writeln!(output, "* Surfaces: `{}`", bundle.surfaces.len());
@@ -2190,7 +2199,7 @@ fn resolve_repo_root(repo_path: &Path) -> Result<PathBuf, ReviewError> {
     if !repo_path.is_dir() {
         return Err(ReviewError::InvalidRequest(format!(
             "repo_path is not a directory: {}",
-            repo_path.display()
+            display_from_current_dir(repo_path)
         )));
     }
     let repo_root = git_output(repo_path, &["rev-parse", "--show-toplevel"])?;

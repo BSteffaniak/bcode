@@ -1657,6 +1657,7 @@ dependencies = [
  "bcode_config",
  "bcode_eval_models",
  "bcode_ipc",
+ "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_tool",
  "regex",

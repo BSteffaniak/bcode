@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_config::{TuiAccentTransitionCurve, TuiConfig, TuiThemeConfig, TuiThinkingConfig};
-use bcode_plugin_sdk::path::display;
+use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus,
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
@@ -2391,7 +2391,10 @@ impl BmuxApp {
             } => {
                 self.push_system_message(&format!(
                     "Ralph {kind}\n* Loop: {loop_name}\n* {message}\n* State: {}",
-                    state_dir.display()
+                    self.working_directory().map_or_else(
+                        || display_from_current_dir(state_dir),
+                        |working_directory| display(state_dir, working_directory),
+                    )
                 ));
             }
             _ => {}
