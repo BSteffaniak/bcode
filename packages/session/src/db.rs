@@ -1001,27 +1001,20 @@ impl SessionDb {
         let rows = self
             .db
             .select("events")
-            .columns(&["payload"])
+            .columns(&["event_type", "payload"])
             .where_gt("event_seq", seq_to_value(compacted_through_sequence))
             .sort("event_seq", SortDirection::Asc)
             .execute(&**self.db)
             .await?;
-        let mut events = Vec::with_capacity(rows.len().saturating_add(1));
-        events.push(compaction_event.clone());
+        let mut candidates = Vec::with_capacity(rows.len().saturating_add(1));
+        candidates.push(compaction_event);
         for row in rows {
             let payload = required_string(&row, "payload")?;
-            if let Some(event) = decode_session_event_degraded(&payload)
-                && event.sequence != compaction_event.sequence
-                && !matches!(
-                    event.kind,
-                    SessionEventKind::ContextCompacted { .. }
-                        | SessionEventKind::ProviderContextCompacted { .. }
-                )
-            {
-                events.push(event);
+            if let Some(event) = decode_session_event_degraded(&payload) {
+                candidates.push(event);
             }
         }
-        Ok(events)
+        Ok(canonical_model_context_from_events(candidates))
     }
 
     async fn latest_model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
@@ -1991,6 +1984,73 @@ const fn is_model_context_event_type(event_type: &str) -> bool {
     )
 }
 
+fn canonical_model_context_from_events(
+    events: impl IntoIterator<Item = SessionEvent>,
+) -> Vec<SessionEvent> {
+    let events = events.into_iter().collect::<Vec<_>>();
+    let Some(marker) = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                SessionEventKind::ContextCompacted { .. }
+                    | SessionEventKind::ProviderContextCompacted { .. }
+            )
+        })
+        .max_by_key(|event| event.sequence)
+        .cloned()
+    else {
+        return events
+            .into_iter()
+            .filter(|event| is_model_context_event_type(model_context_event_kind_name(&event.kind)))
+            .collect();
+    };
+    let boundary = match &marker.kind {
+        SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        }
+        | SessionEventKind::ProviderContextCompacted {
+            compacted_through_sequence,
+            ..
+        } => *compacted_through_sequence,
+        _ => unreachable!("marker selection accepts only compaction events"),
+    };
+    let mut retained = events
+        .into_iter()
+        .filter(|event| {
+            event.sequence > boundary
+                && event.sequence != marker.sequence
+                && is_model_context_event_type(model_context_event_kind_name(&event.kind))
+                && !matches!(
+                    event.kind,
+                    SessionEventKind::ContextCompacted { .. }
+                        | SessionEventKind::ProviderContextCompacted { .. }
+                )
+        })
+        .collect::<Vec<_>>();
+    retained.sort_by_key(|event| event.sequence);
+    let mut context = Vec::with_capacity(retained.len().saturating_add(1));
+    context.push(marker);
+    context.extend(retained);
+    context
+}
+
+const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static str {
+    match kind {
+        SessionEventKind::UserMessage { .. } => "user_message",
+        SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
+        SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEventKind::SystemMessage { .. } => "system_message",
+        SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
+        SessionEventKind::ContextCompacted { .. } => "context_compacted",
+        SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
+        SessionEventKind::ContextUsageObserved { .. } => "context_usage_observed",
+        _ => "non_model_context",
+    }
+}
+
 fn required_string(row: &switchy::database::Row, column: &str) -> SessionDbResult<String> {
     row.get(column)
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
@@ -2097,6 +2157,192 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    fn local_marker(session_id: SessionId, sequence: u64, boundary: u64) -> SessionEvent {
+        event(
+            session_id,
+            sequence,
+            SessionEventKind::ContextCompacted {
+                summary: format!("local-{sequence}"),
+                compacted_through_sequence: boundary,
+            },
+        )
+    }
+
+    fn provider_marker(session_id: SessionId, sequence: u64, boundary: u64) -> SessionEvent {
+        event(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderContextCompacted {
+                snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    provider_plugin_id: "provider".to_string(),
+                    model_id: "model".to_string(),
+                    compatibility_key: "surface".to_string(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: "[]".to_string(),
+                    portable_summary: format!("provider-{sequence}"),
+                },
+                compacted_through_sequence: boundary,
+            },
+        )
+    }
+
+    fn message(session_id: SessionId, sequence: u64, text: &str) -> SessionEvent {
+        event(
+            session_id,
+            sequence,
+            SessionEventKind::AssistantMessage {
+                text: text.to_string(),
+            },
+        )
+    }
+
+    fn assert_marker_transition(first: SessionEvent, second: SessionEvent) {
+        let session_id = first.session_id;
+        let events = canonical_model_context_from_events(vec![
+            message(session_id, 1, "old"),
+            first,
+            message(session_id, 4, "retained-before-marker"),
+            second,
+            message(session_id, 7, "retained-after-marker"),
+        ]);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![6, 4, 7]
+        );
+    }
+
+    #[test]
+    fn local_to_local_uses_newest_marker_boundary() {
+        let id = SessionId::new();
+        assert_marker_transition(local_marker(id, 3, 1), local_marker(id, 6, 2));
+    }
+
+    #[test]
+    fn local_to_provider_uses_newest_marker_boundary() {
+        let id = SessionId::new();
+        assert_marker_transition(local_marker(id, 3, 1), provider_marker(id, 6, 2));
+    }
+
+    #[test]
+    fn provider_to_local_uses_newest_marker_boundary() {
+        let id = SessionId::new();
+        assert_marker_transition(provider_marker(id, 3, 1), local_marker(id, 6, 2));
+    }
+
+    #[test]
+    fn provider_to_provider_uses_newest_marker_boundary() {
+        let id = SessionId::new();
+        assert_marker_transition(provider_marker(id, 3, 1), provider_marker(id, 6, 2));
+    }
+
+    #[test]
+    fn retained_event_before_marker_sequence_survives_boundary() {
+        let id = SessionId::new();
+        let events = canonical_model_context_from_events(vec![
+            message(id, 4, "retained"),
+            local_marker(id, 10, 2),
+        ]);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![10, 4]
+        );
+    }
+
+    #[test]
+    fn retained_event_after_marker_insertion_survives_boundary() {
+        let id = SessionId::new();
+        let events = canonical_model_context_from_events(vec![
+            local_marker(id, 3, 2),
+            message(id, 4, "after"),
+        ]);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn older_markers_are_excluded_from_canonical_context() {
+        let id = SessionId::new();
+        let events = canonical_model_context_from_events(vec![
+            local_marker(id, 3, 1),
+            provider_marker(id, 5, 2),
+            local_marker(id, 7, 4),
+        ]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 7);
+    }
+
+    #[tokio::test]
+    async fn db_projection_matches_in_memory_boundary_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp_dir.path())
+            .await
+            .expect("db");
+        let source = vec![
+            message(id, 1, "old"),
+            local_marker(id, 3, 1),
+            message(id, 4, "retained"),
+            provider_marker(id, 6, 2),
+            message(id, 7, "after"),
+        ];
+        for item in &source {
+            db.append_event(item).await.expect("append");
+        }
+        assert_eq!(
+            db.model_context_events().await.expect("db context"),
+            canonical_model_context_from_events(source)
+        );
+    }
+
+    #[test]
+    fn legacy_local_compaction_fixture_decodes() {
+        let id = SessionId::new();
+        let payload = serde_json::json!({
+            "schema_version": 1, "sequence": 3, "timestamp_ms": 1, "session_id": id,
+            "kind": {"context_compacted": {"summary": "legacy", "compacted_through_sequence": 2}}
+        });
+        let decoded = decode_session_event_degraded(&payload.to_string()).expect("legacy local");
+        assert!(matches!(
+            decoded.kind,
+            SessionEventKind::ContextCompacted { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_provider_snapshot_fixture_defaults_new_identity_fields() {
+        let id = SessionId::new();
+        let payload = serde_json::json!({
+            "schema_version": 1, "sequence": 3, "timestamp_ms": 1, "session_id": id,
+            "kind": {"provider_context_compacted": {
+                "snapshot": {"provider_plugin_id": "p", "model_id": "m", "messages_json": "[]", "portable_summary": "portable"},
+                "compacted_through_sequence": 2
+            }}
+        });
+        let decoded = decode_session_event_degraded(&payload.to_string()).expect("legacy provider");
+        let SessionEventKind::ProviderContextCompacted { snapshot, .. } = decoded.kind else {
+            panic!("provider marker")
+        };
+        assert_eq!(snapshot.format_version, 1);
+        assert!(snapshot.compatibility_key.is_empty());
+        assert_eq!(
+            snapshot.origin,
+            bcode_session_models::ProviderContextSnapshotOrigin::Explicit
+        );
     }
 
     #[test]
