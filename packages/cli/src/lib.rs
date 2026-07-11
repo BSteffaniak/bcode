@@ -8633,6 +8633,15 @@ async fn send_message(session_id: SessionId, message: String) -> Result<(), CliE
     Ok(())
 }
 
+const fn provider_compaction_origin_label(
+    origin: bcode_session_models::ProviderContextSnapshotOrigin,
+) -> &'static str {
+    match origin {
+        bcode_session_models::ProviderContextSnapshotOrigin::Explicit => "explicit provider-native",
+        bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged => "provider-managed",
+    }
+}
+
 fn print_session_event(event: &SessionEvent) {
     match &event.kind {
         SessionEventKind::TraceEvent { trace } => print_trace_session_event(event, trace),
@@ -8789,8 +8798,11 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             snapshot,
             compacted_through_sequence,
         } => println!(
-            "#{} provider context compacted through #{compacted_through_sequence}: {} {}",
-            event.sequence, snapshot.provider_plugin_id, snapshot.model_id
+            "#{} {} context compacted through #{compacted_through_sequence}: {} {}",
+            event.sequence,
+            provider_compaction_origin_label(snapshot.origin),
+            snapshot.provider_plugin_id,
+            snapshot.model_id
         ),
         SessionEventKind::ContextUsageObserved { snapshot } => println!(
             "#{} context usage: {} tokens for {} through #{} ({:?})",

@@ -2253,7 +2253,7 @@ impl BmuxApp {
             }
             SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
             SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
-                self.push_provider_compaction(&snapshot.provider_plugin_id);
+                self.push_provider_compaction(snapshot);
             }
             SessionEventKind::ContextUsageObserved { snapshot } => {
                 let active_provider = self
@@ -3365,24 +3365,25 @@ impl BmuxApp {
     }
 
     fn push_compaction(&mut self, summary: &str) {
-        self.token_usage.latest_context_input_tokens = None;
-        self.token_usage.context_usage_estimated = false;
-        self.token_usage.latest_cached_input_tokens = None;
-        self.token_usage.latest_cache_write_input_tokens = None;
+        self.token_usage.clear_context_occupancy();
         self.transcript.push(TranscriptItem::new(
             "Compaction",
-            format!("context compacted: {summary}"),
+            format!("local context compaction: {summary}"),
         ));
     }
 
-    fn push_provider_compaction(&mut self, provider_plugin_id: &str) {
-        self.token_usage.latest_context_input_tokens = None;
-        self.token_usage.context_usage_estimated = false;
-        self.token_usage.latest_cached_input_tokens = None;
-        self.token_usage.latest_cache_write_input_tokens = None;
+    fn push_provider_compaction(
+        &mut self,
+        snapshot: &bcode_session_models::ProviderContextSnapshot,
+    ) {
+        self.token_usage.clear_context_occupancy();
+        let origin = provider_compaction_origin_label(snapshot.origin);
         self.transcript.push(TranscriptItem::new(
             "Compaction",
-            format!("provider compacted context ({provider_plugin_id})"),
+            format!(
+                "{origin} context compaction ({})",
+                snapshot.provider_plugin_id
+            ),
         ));
     }
 
@@ -3896,6 +3897,13 @@ impl TokenUsageMeter {
         self.context_usage_estimated = estimated;
     }
 
+    const fn clear_context_occupancy(&mut self) {
+        self.latest_context_input_tokens = None;
+        self.context_usage_estimated = false;
+        self.latest_cached_input_tokens = None;
+        self.latest_cache_write_input_tokens = None;
+    }
+
     fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
         if let Some(model) = model {
             self.context_window = model.context_window;
@@ -3980,6 +3988,15 @@ impl TokenUsageMeter {
             }
             _ => "—/— —%".to_owned(),
         }
+    }
+}
+
+const fn provider_compaction_origin_label(
+    origin: bcode_session_models::ProviderContextSnapshotOrigin,
+) -> &'static str {
+    match origin {
+        bcode_session_models::ProviderContextSnapshotOrigin::Explicit => "explicit provider-native",
+        bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged => "provider-managed",
     }
 }
 
@@ -4275,6 +4292,42 @@ fn derive_session_title_from_prompt(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimated_context_usage_is_visibly_approximate_and_exact_is_not() {
+        let mut meter = TokenUsageMeter {
+            context_window: Some(10_000),
+            ..TokenUsageMeter::default()
+        };
+        meter.observe_context_usage(2_500, true);
+        assert!(meter.context_summary().starts_with('~'));
+        meter.observe_context_usage(2_500, false);
+        assert!(!meter.context_summary().starts_with('~'));
+    }
+
+    #[test]
+    fn every_compaction_origin_clears_context_occupancy() {
+        let mut meter = TokenUsageMeter::default();
+        meter.observe_context_usage(2_500, true);
+        meter.latest_cached_input_tokens = Some(10);
+        meter.latest_cache_write_input_tokens = Some(20);
+        meter.clear_context_occupancy();
+        assert_eq!(meter.latest_context_input_tokens, None);
+        assert!(!meter.context_usage_estimated);
+        assert_eq!(meter.latest_cached_input_tokens, None);
+        assert_eq!(meter.latest_cache_write_input_tokens, None);
+    }
+
+    #[test]
+    fn provider_compaction_origins_have_distinct_visible_labels() {
+        let explicit = provider_compaction_origin_label(
+            bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+        );
+        let managed = provider_compaction_origin_label(
+            bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
+        );
+        assert_ne!(explicit, managed);
+    }
 
     #[test]
     fn visual_status_template_omits_unresolved_placeholders() {
