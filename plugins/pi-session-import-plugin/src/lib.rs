@@ -5,6 +5,7 @@
 //! Pi JSONL session import provider plugin.
 
 use bcode_config::SessionImportPathMode;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse, ImportSourceInfo,
@@ -99,7 +100,10 @@ fn discover_pi_sessions(
                 sessions.push(diagnostic_summary(
                     &root,
                     "missing_path",
-                    format!("Pi sessions path does not exist: {}", root.display()),
+                    format!(
+                        "Pi sessions path does not exist: {}",
+                        display_from_current_dir(&root)
+                    ),
                 ));
             }
             continue;
@@ -111,7 +115,7 @@ fn discover_pi_sessions(
                     "scan_failed",
                     format!(
                         "failed to scan Pi sessions path {}: {error}",
-                        root.display()
+                        display_from_current_dir(&root)
                     ),
                 ));
                 continue;

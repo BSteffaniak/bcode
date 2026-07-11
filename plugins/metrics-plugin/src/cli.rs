@@ -1,5 +1,6 @@
 //! Statically bundled metrics CLI contribution.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{
     StaticCliFuture, StaticCliHostAction, StaticCliOutcome, StaticCliRegistration,
 };
@@ -55,7 +56,7 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
                 let payload = serde_json::to_string_pretty(&status.metrics_report)
                     .map_err(|error| error.to_string())?;
                 std::fs::write(&path, payload).map_err(|error| error.to_string())?;
-                println!("metrics report: {}", path.display());
+                println!("metrics report: {}", display_from_current_dir(&path));
             } else if cli.analyze {
                 let analysis = bcode_metrics::analyze_metrics_report(&status.metrics_report);
                 println!(

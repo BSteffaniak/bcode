@@ -34,6 +34,7 @@ use bcode_model::{
 use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
 };
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
 use bcode_provider_auth::auth_pool_state;
 use reqwest::Client;
@@ -5775,14 +5776,14 @@ fn semantic_chatgpt_auth_settings(
             detail: match (&profile, &vault) {
                 (Some(profile), Some(vault)) => format!(
                     "runtime semantic ChatGPT/Codex auth from profile '{profile}' in vault {}",
-                    vault.display()
+                    display_from_current_dir(vault)
                 ),
                 (Some(profile), None) => {
                     format!("runtime semantic ChatGPT/Codex auth from profile '{profile}'")
                 }
                 (None, Some(vault)) => format!(
                     "runtime semantic ChatGPT/Codex auth from vault {}",
-                    vault.display()
+                    display_from_current_dir(vault)
                 ),
                 (None, None) => "runtime semantic ChatGPT/Codex auth".to_string(),
             },
@@ -5838,14 +5839,14 @@ fn context_chatgpt_auth_settings(
             detail: match (&profile, &vault) {
                 (Some(profile), Some(vault)) => format!(
                     "runtime sshenv ChatGPT/Codex auth from profile '{profile}' in vault {}",
-                    vault.display()
+                    display_from_current_dir(vault)
                 ),
                 (Some(profile), None) => {
                     format!("runtime sshenv ChatGPT/Codex auth from profile '{profile}'")
                 }
                 (None, Some(vault)) => format!(
                     "runtime sshenv ChatGPT/Codex auth from vault {}",
-                    vault.display()
+                    display_from_current_dir(vault)
                 ),
                 (None, None) => "runtime ChatGPT/Codex auth".to_string(),
             },
@@ -5886,12 +5887,15 @@ fn saved_auth_diagnostics(
     let location = match (&saved.profile, &saved.vault) {
         (Some(profile), Some(vault)) => format!(
             "{credential_description} from profile '{profile}' in vault {}",
-            vault.display()
+            display_from_current_dir(vault)
         ),
         (Some(profile), None) => {
             format!("{credential_description} from profile '{profile}'")
         }
-        (None, Some(vault)) => format!("{credential_description} from vault {}", vault.display()),
+        (None, Some(vault)) => format!(
+            "{credential_description} from vault {}",
+            display_from_current_dir(vault)
+        ),
         (None, None) => credential_description.to_string(),
     };
     AuthDiagnostics {

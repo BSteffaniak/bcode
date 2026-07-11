@@ -5,6 +5,7 @@
 //! `OpenCode` `SQLite` session import provider plugin.
 
 use bcode_config::SessionImportPathMode;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse, ImportSourceInfo,
@@ -100,7 +101,10 @@ fn discover_opencode_sessions(
             if include_diagnostics {
                 sessions.push(diagnostic_summary(
                     format!("opencode:{}", path.display()),
-                    format!("OpenCode database not found: {}", path.display()),
+                    format!(
+                        "OpenCode database not found: {}",
+                        display_from_current_dir(&path)
+                    ),
                 ));
             }
             continue;
@@ -113,7 +117,7 @@ fn discover_opencode_sessions(
                         format!("opencode:{}", path.display()),
                         format!(
                             "Could not scan OpenCode database {}: {error}",
-                            path.display()
+                            display_from_current_dir(&path)
                         ),
                     ));
                 }

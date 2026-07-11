@@ -1,5 +1,6 @@
 //! Statically bundled provider configuration CLI contribution.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{StaticCliFuture, StaticCliOutcome, StaticCliRegistration};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
@@ -79,7 +80,7 @@ fn run(command: ProviderCommand) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     println!(
         "Bedrock provider profile '{profile}' configured; config updated: {}",
-        config_path.display()
+        display_from_current_dir(&config_path)
     );
     Ok(())
 }

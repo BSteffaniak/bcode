@@ -6,6 +6,7 @@ use bcode_metrics::dashboard::{
     MetricsDashboardQuery, MetricsHealth, query_dashboard_report,
 };
 use bcode_metrics::{MetricsEventLogConfig, MetricsRegistry, MetricsReport};
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseEventKind};
@@ -572,7 +573,7 @@ fn load_report(
         query.filters.len(),
         group_label(&query.group_by),
         sort_label(&query.sort),
-        path.display()
+        display_from_current_dir(path)
     );
     (report, query_result, status)
 }
