@@ -713,9 +713,14 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
     ]));
 
     let preview = inline_preview(&visible_lines, MAX_INLINE_DIFF_ROWS);
-    let card_width = card_width(&preview, width.saturating_sub(2));
+    let resolved_layout = input.layout.resolve(width);
+    let card_width = if resolved_layout == DiffViewerLayout::SideBySide {
+        side_by_side_card_width(&preview, width.saturating_sub(2))
+    } else {
+        card_width(&preview, width.saturating_sub(2))
+    };
     rows.push(card_border('┌', '─', '┐', card_width));
-    if input.layout.resolve(width) == DiffViewerLayout::SideBySide {
+    if resolved_layout == DiffViewerLayout::SideBySide {
         rows.extend(render_side_by_side_preview(&preview, card_width));
     } else {
         for row in preview {
@@ -757,11 +762,56 @@ fn inline_preview(lines: &[DiffLine], max_rows: usize) -> Vec<PreviewRow<'_>> {
         .collect()
 }
 
+const SPLIT_CELL_CHROME_WIDTH: usize = 9;
+const SPLIT_CELL_MIN_WIDTH: usize = SPLIT_CELL_CHROME_WIDTH + 1;
+
+fn side_by_side_content_widths(preview: &[PreviewRow<'_>]) -> (usize, usize) {
+    preview.iter().fold((0, 0), |(old, new), row| match row {
+        PreviewRow::Line(line) => {
+            let width = UnicodeWidthStr::width(line.content.as_str());
+            match line.kind {
+                DiffLineKind::Removed => (old.max(width), new),
+                DiffLineKind::Added => (old, new.max(width)),
+                DiffLineKind::Context | DiffLineKind::HunkHeader | DiffLineKind::FileHeader => {
+                    (old.max(width), new.max(width))
+                }
+            }
+        }
+        PreviewRow::Hidden(_) => (old, new),
+    })
+}
+
+fn side_by_side_card_width(preview: &[PreviewRow<'_>], available_width: u16) -> u16 {
+    let available = usize::from(available_width.max(1));
+    let (old, new) = side_by_side_content_widths(preview);
+    let desired = old
+        .saturating_add(new)
+        .saturating_add(SPLIT_CELL_CHROME_WIDTH.saturating_mul(2))
+        .saturating_add(3);
+    u16::try_from(desired.clamp(INLINE_DIFF_CARD_MIN_WIDTH.min(available), available))
+        .unwrap_or(u16::MAX)
+}
+
+fn side_by_side_column_widths(preview: &[PreviewRow<'_>], width: u16) -> (usize, usize) {
+    let cells_width = usize::from(width).saturating_sub(3);
+    let (old_content, new_content) = side_by_side_content_widths(preview);
+    let old_desired = old_content.saturating_add(SPLIT_CELL_CHROME_WIDTH);
+    let new_desired = new_content.saturating_add(SPLIT_CELL_CHROME_WIDTH);
+    let desired_total = old_desired.saturating_add(new_desired);
+    if desired_total <= cells_width {
+        return (old_desired, cells_width.saturating_sub(old_desired));
+    }
+
+    let distributable = cells_width.saturating_sub(SPLIT_CELL_MIN_WIDTH.saturating_mul(2));
+    let content_total = old_content.saturating_add(new_content).max(1);
+    let old_extra = distributable.saturating_mul(old_content) / content_total;
+    let old_width = SPLIT_CELL_MIN_WIDTH.saturating_add(old_extra);
+    (old_width, cells_width.saturating_sub(old_width))
+}
+
 fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Line> {
     let mut rows = Vec::new();
-    let inner = usize::from(width).saturating_sub(2);
-    let left_width = inner.saturating_sub(1) / 2;
-    let right_width = inner.saturating_sub(1).saturating_sub(left_width);
+    let (left_width, right_width) = side_by_side_column_widths(preview, width);
     let mut index = 0;
     while index < preview.len() {
         match preview[index] {
@@ -1327,6 +1377,26 @@ mod tests {
             assert_eq!(line_width(&row), usize::from(card_width) + 2, "{row:?}");
             assert_eq!(row.spans[0].content, "  ");
         }
+    }
+
+    #[test]
+    fn side_by_side_width_expands_and_favors_longer_content() {
+        let removed = DiffLine::new(DiffLineKind::Removed, Some(1), None, "old");
+        let added = DiffLine::new(
+            DiffLineKind::Added,
+            None,
+            Some(1),
+            "a substantially longer replacement line that needs more room",
+        );
+        let preview = [PreviewRow::Line(&removed), PreviewRow::Line(&added)];
+
+        let narrow_card = side_by_side_card_width(&preview, 60);
+        let wide_card = side_by_side_card_width(&preview, 120);
+        let (old_width, new_width) = side_by_side_column_widths(&preview, wide_card);
+
+        assert_eq!(narrow_card, 60);
+        assert!(wide_card > narrow_card);
+        assert!(new_width > old_width, "{old_width} {new_width}");
     }
 
     #[test]
