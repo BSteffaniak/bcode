@@ -1809,6 +1809,10 @@ pub struct ToolsConfig {
     /// Tool ids disabled even if exposed by the default posture.
     #[serde(default)]
     pub disabled: BTreeSet<String>,
+    /// Tool execution scheduling configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub execution: ToolExecutionConfig,
     /// Shell tool configuration.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1825,8 +1829,38 @@ impl Default for ToolsConfig {
             default: ToolDefaultMode::Agent,
             enabled: BTreeSet::new(),
             disabled: BTreeSet::new(),
+            execution: ToolExecutionConfig::default(),
             shell: ShellToolConfig::default(),
             question: QuestionToolConfig::default(),
+        }
+    }
+}
+
+const fn default_tool_execution_parallel() -> bool {
+    true
+}
+
+const fn default_tool_execution_max_concurrency() -> usize {
+    4
+}
+
+/// Tool invocation scheduler configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "execution")]
+pub struct ToolExecutionConfig {
+    /// Whether independent read-only tool calls may execute concurrently.
+    #[serde(default = "default_tool_execution_parallel")]
+    pub parallel: bool,
+    /// Maximum number of read-only tool calls executing concurrently. Zero is normalized to one.
+    #[serde(default = "default_tool_execution_max_concurrency")]
+    pub max_concurrency: usize,
+}
+
+impl Default for ToolExecutionConfig {
+    fn default() -> Self {
+        Self {
+            parallel: default_tool_execution_parallel(),
+            max_concurrency: default_tool_execution_max_concurrency(),
         }
     }
 }

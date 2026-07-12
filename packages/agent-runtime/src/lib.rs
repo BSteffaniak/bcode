@@ -19,6 +19,7 @@ use bcode_tool::{
     ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolResultContent as InvocationToolResultContent,
 };
+use futures::{StreamExt, stream};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -377,6 +378,13 @@ pub struct ToolExecutionOutput {
     pub events: Vec<AgentRuntimeEvent>,
 }
 
+/// Ordered outputs from one provider tool-call round.
+#[derive(Debug)]
+pub struct ToolBatchExecutionOutput {
+    /// Per-call execution results in the same order as the requested calls.
+    pub results: Vec<Result<ToolExecutionOutput>>,
+}
+
 /// Mutable state that enforces a maximum number of tool rounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRoundState {
@@ -648,6 +656,96 @@ impl AgentRuntime {
             context,
         )
         .await
+    }
+
+    /// Execute an ordered tool-call batch with bounded read-only concurrency.
+    ///
+    /// The batch consumes one tool round. Calls with side effects execute as ordering barriers;
+    /// adjacent read-only calls may overlap. Results retain input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tool-round budget is exhausted before the batch starts.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_tool_batch_with_round_state_and_context<C, P, E>(
+        &self,
+        catalog: &C,
+        policy: &P,
+        executor: &E,
+        calls: &[ToolCall],
+        rounds: &mut ToolRoundState,
+        context: &RuntimePermissionContext,
+        max_concurrency: usize,
+    ) -> Result<ToolBatchExecutionOutput>
+    where
+        C: ToolCatalog + Sync,
+        P: PermissionPolicy + ?Sized,
+        E: ToolExecutor + Sync,
+    {
+        if calls.is_empty() {
+            return Ok(ToolBatchExecutionOutput {
+                results: Vec::new(),
+            });
+        }
+        rounds.begin_round()?;
+        let mut results = Vec::with_capacity(calls.len());
+        let mut offset = 0;
+        while offset < calls.len() {
+            let read_only = catalog.find_tool(&calls[offset].name).is_some_and(|tool| {
+                tool.definition.side_effect == bcode_tool::ToolSideEffect::ReadOnly
+            });
+            let end = if read_only {
+                calls[offset..]
+                    .iter()
+                    .position(|call| {
+                        catalog.find_tool(&call.name).is_none_or(|tool| {
+                            tool.definition.side_effect != bcode_tool::ToolSideEffect::ReadOnly
+                        })
+                    })
+                    .map_or(calls.len(), |length| offset.saturating_add(length))
+            } else {
+                offset.saturating_add(1)
+            };
+            if read_only {
+                let mut group = stream::iter(calls[offset..end].iter().enumerate().map(
+                    |(index, call)| async move {
+                        let mut local_round = ToolRoundState::new(1);
+                        (
+                            index,
+                            self.execute_tool_call_with_round_state_and_context(
+                                catalog,
+                                policy,
+                                executor,
+                                call,
+                                &mut local_round,
+                                context,
+                            )
+                            .await,
+                        )
+                    },
+                ))
+                .buffer_unordered(max_concurrency.max(1))
+                .collect::<Vec<_>>()
+                .await;
+                group.sort_by_key(|(index, _)| *index);
+                results.extend(group.into_iter().map(|(_, result)| result));
+            } else {
+                let mut local_round = ToolRoundState::new(1);
+                results.push(
+                    self.execute_tool_call_with_round_state_and_context(
+                        catalog,
+                        policy,
+                        executor,
+                        &calls[offset],
+                        &mut local_round,
+                        context,
+                    )
+                    .await,
+                );
+            }
+            offset = end;
+        }
+        Ok(ToolBatchExecutionOutput { results })
     }
 
     /// Execute a tool call and enforce a mutable tool-round budget.
@@ -1220,6 +1318,57 @@ mod tests {
             policy: ToolPolicyMetadata::default(),
             ui: ToolUiMetadata::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn tool_batch_preserves_order_and_consumes_one_round() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"));
+        let calls = vec![
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let mut rounds = ToolRoundState::new(1);
+        let output = AgentRuntime::new()
+            .execute_tool_batch_with_round_state_and_context(
+                &catalog,
+                &AllowAllPolicy,
+                &FakeToolExecutor,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                2,
+            )
+            .await
+            .expect("batch should execute");
+
+        assert_eq!(rounds.completed_rounds(), 1);
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(
+            output.results[0]
+                .as_ref()
+                .expect("first call should succeed")
+                .model_result
+                .call_id,
+            "call-1"
+        );
+        assert_eq!(
+            output.results[1]
+                .as_ref()
+                .expect("second call should succeed")
+                .model_result
+                .call_id,
+            "call-2"
+        );
     }
 
     #[tokio::test]

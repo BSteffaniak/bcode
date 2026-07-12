@@ -3697,7 +3697,12 @@ fn build_responses_request(
             .dialect
             .uses_codex_request_shape()
             .then_some("auto"),
-        parallel_tool_calls: settings.dialect.uses_codex_request_shape().then_some(true),
+        parallel_tool_calls: settings.dialect.uses_codex_request_shape().then(|| {
+            request
+                .metadata
+                .get("bcode_parallel_tool_calls")
+                .is_some_and(|value| value == "true")
+        }),
         text: responses_text_options(settings, request),
         reasoning: responses_reasoning_options(settings, request),
         include: responses_include(settings.dialect.reasoning_request_shape(), request),
@@ -6751,6 +6756,8 @@ mod tests {
     }
 
     fn test_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("bcode_parallel_tool_calls".to_string(), "true".to_string());
         ModelTurnRequest {
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
@@ -6766,7 +6773,7 @@ mod tests {
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
-            metadata: BTreeMap::new(),
+            metadata,
         }
     }
 
@@ -7438,6 +7445,22 @@ mod tests {
                 .get("parallel_tool_calls")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn responses_api_request_disables_parallel_calls_without_host_capability() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.metadata.remove("bcode_parallel_tool_calls");
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let body =
+            build_responses_request(&settings, &request, "model").expect("request should build");
+
+        assert_eq!(
+            body.get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
     }
 

@@ -1373,6 +1373,7 @@ dependencies = [
  "bcode_model",
  "bcode_session_models",
  "bcode_tool",
+ "futures 0.3.32",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

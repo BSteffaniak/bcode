@@ -53,12 +53,12 @@ use bcode_ipc::{
 };
 use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
-    ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata, ImageRefContent,
-    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage, ModelParameters,
-    ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse, OP_AUTH_USAGE,
-    OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
-    PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent, ReasoningEffort,
-    StartTurnResponse, TokenUsage,
+    CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
+    ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
+    ModelParameters, ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse,
+    OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH,
+    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
 use bcode_plugin_sdk::path::{display, display_from_current_dir};
@@ -177,6 +177,7 @@ pub struct ServerState {
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
+    tool_execution: bcode_config::ToolExecutionConfig,
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
@@ -976,6 +977,7 @@ struct ServerStateInit {
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
+    tool_execution: bcode_config::ToolExecutionConfig,
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
@@ -1016,6 +1018,7 @@ impl ServerState {
             observability: init.observability,
             trace_store: init.trace_store,
             max_tool_rounds: init.max_tool_rounds,
+            tool_execution: init.tool_execution,
             tool_output_context_chars: init.tool_output_context_chars,
             model_streaming: init.model_streaming,
             model_retry: init.model_retry,
@@ -1814,6 +1817,7 @@ pub async fn run_with_static_bundled(
             observability: config.observability,
             trace_store: TraceStore::new(default_trace_store_dir()),
             max_tool_rounds: config.model.effective_max_tool_rounds(),
+            tool_execution: config.tools.execution,
             tool_output_context_chars: config.model.tool_output.context_chars,
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
@@ -7967,6 +7971,37 @@ async fn request_session_turn_cancellation(
     };
 
     current_turn.cancel_state.cancel().await;
+    if current_turn.kind == RuntimeOperationKind::ModelTurn
+        && let Some(model) = current_turn.model.as_ref()
+    {
+        let provider_plugin_id = model.provider_plugin_id.clone().or_else(|| {
+            state
+                .plugins
+                .registry()
+                .service_registry()
+                .unique_provider(MODEL_PROVIDER_INTERFACE_ID)
+                .ok()
+                .map(ToString::to_string)
+        });
+        if let Some(provider_plugin_id) = provider_plugin_id {
+            let plugins = state.plugins.clone();
+            let request = CancelTurnRequest {
+                provider_turn_id: model.provider_turn_id.clone(),
+            };
+            let scope = current_turn.plugin_scope_for_model(session_id);
+            tokio::spawn(async move {
+                let _ = plugins
+                    .invoke_service_json_scoped::<_, bcode_model::AckResponse>(
+                        &provider_plugin_id,
+                        MODEL_PROVIDER_INTERFACE_ID,
+                        OP_CANCEL_TURN,
+                        &request,
+                        scope,
+                    )
+                    .await;
+            });
+        }
+    }
     let turn_id = current_turn.turn_id;
     if current_turn.kind == RuntimeOperationKind::ModelTurn {
         append_model_turn_cancel_requested_event(state, session_id, turn_id.clone(), requested_by)
@@ -8521,7 +8556,6 @@ const MODEL_STREAM_FLUSH_BYTES: usize = 512;
 const TOOL_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const TOOL_OUTPUT_FLUSH_BYTES: usize = 4096;
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
-const MAX_PARALLEL_TOOL_CALLS: usize = 4;
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
 
 #[derive(Debug, Clone, Default)]
@@ -12356,6 +12390,9 @@ async fn build_model_turn_request(
     } else {
         bcode_model::ContextManagementRequest::default()
     };
+    if state.tool_execution.parallel {
+        metadata.insert("bcode_parallel_tool_calls".to_string(), "true".to_string());
+    }
     let request = ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
@@ -13489,16 +13526,33 @@ async fn execute_model_tool_batch(
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> bool {
+    let active_skills = state
+        .active_skills
+        .lock()
+        .await
+        .get(&session_id)
+        .is_some_and(|skills| !skills.is_empty());
     let mut groups: Vec<(bool, Vec<bcode_model::ToolCall>)> = Vec::new();
     for call in calls {
         if cancel_state.is_cancelled() {
             return false;
         }
-        let parallel = find_tool_provider(state, &call.name)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|(_, definition)| definition.side_effect == ToolSideEffect::ReadOnly);
+        let provider = find_tool_provider(state, &call.name).await.ok().flatten();
+        let parallel = state.tool_execution.parallel
+            && !active_skills
+            && provider.as_ref().is_some_and(|(_, definition)| {
+                definition.side_effect == ToolSideEffect::ReadOnly
+                    && !definition.requires_permission
+            });
+        append_tool_request_event(
+            state,
+            session_id,
+            call.id.clone(),
+            call.name.clone(),
+            serde_json::to_string(&call.arguments).unwrap_or_default(),
+            provider.map(|(plugin_id, _)| plugin_id),
+        )
+        .await;
         if let Some((group_parallel, group)) = groups.last_mut()
             && *group_parallel == parallel
             && parallel
@@ -13523,7 +13577,7 @@ async fn execute_model_tool_batch(
                     )
                 }
             }))
-            .buffer_unordered(MAX_PARALLEL_TOOL_CALLS)
+            .buffer_unordered(state.tool_execution.max_concurrency.max(1))
             .collect::<Vec<_>>();
             let ProviderCallWait::Completed(mut results) = wait_for_provider_call(
                 state,
@@ -13579,15 +13633,6 @@ async fn execute_model_tool(
         .ok()
         .flatten()
         .map(|(plugin_id, _definition)| plugin_id);
-    append_tool_request_event(
-        state,
-        session_id,
-        call.id.clone(),
-        call.name.clone(),
-        serde_json::to_string(&call.arguments).unwrap_or_default(),
-        producer_plugin_id.clone(),
-    )
-    .await;
     if cancel_state.is_cancelled() {
         cancel_registered_runtime_work(
             state,
@@ -14113,6 +14158,12 @@ async fn append_tool_stream_event(
     session_id: SessionId,
     event: ToolInvocationStreamEvent,
 ) {
+    if active_turn_cancel_state(state, session_id)
+        .await
+        .is_some_and(|cancel_state| cancel_state.is_cancelled())
+    {
+        return;
+    }
     let progress = runtime_work_progress_from_tool_stream_event(&event);
     if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
         let _ = state
@@ -19739,6 +19790,7 @@ mod tests {
                 observability: bcode_config::ObservabilityConfig::default(),
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
+                tool_execution: bcode_config::ToolExecutionConfig::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
@@ -20855,6 +20907,7 @@ mod tests {
                 observability: bcode_config::ObservabilityConfig::default(),
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
+                tool_execution: bcode_config::ToolExecutionConfig::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
@@ -21244,6 +21297,7 @@ mod tests {
                 observability: bcode_config::ObservabilityConfig::default(),
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
+                tool_execution: bcode_config::ToolExecutionConfig::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),

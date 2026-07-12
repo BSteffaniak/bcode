@@ -78,6 +78,16 @@ impl RuntimeWorkViewState {
     }
 
     pub fn status_label(&self) -> Option<String> {
+        let running_tools = self
+            .active
+            .values()
+            .filter(|item| {
+                item.kind == RuntimeWorkKind::Tool && item.status == RuntimeWorkStatus::Running
+            })
+            .count();
+        if running_tools > 1 {
+            return Some(format!("running {running_tools} tools"));
+        }
         let item = self.active.values().next()?;
         let prefix = match item.status {
             RuntimeWorkStatus::Queued => "queued",
@@ -94,5 +104,27 @@ impl RuntimeWorkViewState {
             | RuntimeWorkStatus::TimedOut => return None,
         };
         Some(format!("{prefix}: {}", item.label))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_label_aggregates_parallel_tools() {
+        let mut state = RuntimeWorkViewState::default();
+        for index in 0..2 {
+            state.apply_snapshot(&RuntimeWorkSnapshot {
+                work_id: RuntimeWorkId::new(format!("tool-{index}")),
+                kind: RuntimeWorkKind::Tool,
+                label: format!("tool {index}"),
+                tool_call_id: Some(format!("call-{index}")),
+                status: RuntimeWorkStatus::Running,
+                cancellable: true,
+            });
+        }
+
+        assert_eq!(state.status_label().as_deref(), Some("running 2 tools"));
     }
 }
