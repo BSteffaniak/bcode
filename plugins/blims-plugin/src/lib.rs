@@ -7,6 +7,7 @@
 #[cfg(feature = "static-bundled")]
 mod cli;
 
+use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -3257,7 +3258,7 @@ fn write_daemon_metadata(paths: &StatePaths) -> Result<(), std::io::Error> {
         paths.state_root.join("daemon.json"),
         format!(
             "{{\n  \"transport\": \"bmux-ipc-local-placeholder\",\n  \"protocol_version\": {BLIMS_PROTOCOL_VERSION},\n  \"database\": \"{}\",\n  \"background\": true\n}}\n",
-            paths.database_path.display()
+            display(&paths.database_path, &paths.state_root)
         ),
     )
 }

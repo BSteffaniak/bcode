@@ -217,7 +217,9 @@ fn promote_draft_clipboard_images_in_state(
             .to_str()
             .and_then(|value| Uuid::parse_str(value).ok())
             .ok_or_else(|| {
-                ClipboardImageError::InvalidDraftPath(entry.path().display().to_string())
+                ClipboardImageError::InvalidDraftPath(
+                    display_from_current_dir(entry.path()).to_string(),
+                )
             })?;
         let draft = ClipboardImageArtifact {
             source: entry.path().join("source.png"),
