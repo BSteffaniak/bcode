@@ -19942,6 +19942,127 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn context_overflow_compacts_and_retries_once_inside_owning_turn() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
+        let summary = sessions
+            .create_session(
+                Some("overflow runtime".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        sessions
+            .append_model_changed(
+                session_id,
+                "bcode.fake-provider".to_string(),
+                "fake-echo".to_string(),
+            )
+            .await
+            .expect("select fake provider");
+        for index in 0..8 {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("overflow history user {index} {}", "x".repeat(500)),
+                    },
+                )
+                .await
+                .expect("append user history");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("overflow history assistant {index} {}", "y".repeat(500)),
+                    },
+                )
+                .await
+                .expect("append assistant history");
+        }
+        let trigger_event = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "retry after overflow".to_string(),
+                },
+            )
+            .await
+            .expect("append trigger event");
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.mode = bcode_config::CompactionMode::OnOverflow;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
+        state.auto_compaction.keep_recent_tokens = 1;
+        state
+            .selected_provider_context
+            .settings
+            .insert("fake_context_overflow_once".to_string(), "true".to_string());
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                model_id: Some("fake-echo".to_string()),
+                provider_context: state.selected_provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        let mut permit = SessionTurnPermit::new(session_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            current_turn,
+        );
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+
+        let completion = run_model_turn(
+            &state,
+            &mut permit,
+            &trigger_event,
+            ClientId::new(),
+            None,
+            &mut command_context,
+            &phase,
+        )
+        .await;
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::TraceEvent { trace }
+                        if trace.phase == SessionTracePhase::ModelProviderRoundStarted
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(permit.turn_entries, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn proactive_local_compaction_runs_inside_owning_model_turn() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
@@ -20280,6 +20401,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn provider_native_compaction_persists_compatible_snapshot_and_portable_fallback() {
         let sessions = SessionManager::default();
         let summary = sessions
@@ -20318,6 +20440,7 @@ mod tests {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             model_id: Some("fake-model".to_string()),
             provider_context: bcode_model::ProviderRequestContext {
+                auth_profile: Some("profile-a".to_string()),
                 settings: BTreeMap::from([(
                     "fake_native_compaction".to_string(),
                     "true".to_string(),
@@ -20351,6 +20474,7 @@ mod tests {
         let snapshot = snapshot.expect("provider snapshot should persist");
         assert_eq!(snapshot.provider_plugin_id, "bcode.fake-provider");
         assert_eq!(snapshot.model_id, "fake-model");
+        assert_eq!(snapshot.auth_profile.as_deref(), Some("profile-a"));
         assert_eq!(snapshot.format_version, 1);
         assert_eq!(snapshot.compatibility_key, "bcode.fake-provider/context-v1");
         assert!(!snapshot.messages_json.is_empty());
@@ -20370,7 +20494,37 @@ mod tests {
                 matches!(block, ContentBlock::Text { text } if text.contains(&snapshot.portable_summary))
             })
         }));
-        assert!(!incompatible_messages.iter().any(|message| {
+        let incompatible_auth_messages = session_events_to_model_messages_for_target(
+            &history,
+            state.tool_output_context_chars,
+            Some("bcode.fake-provider"),
+            Some("fake-model"),
+            Some("profile-b"),
+            Some(1),
+            Some("bcode.fake-provider/context-v1"),
+        );
+        assert!(incompatible_auth_messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains(&snapshot.portable_summary))
+            })
+        }));
+        assert!(!incompatible_auth_messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ProviderExtension { .. }))
+        }));
+
+        let incompatible_format_messages = session_events_to_model_messages_for_target(
+            &history,
+            state.tool_output_context_chars,
+            Some("bcode.fake-provider"),
+            Some("fake-model"),
+            Some("profile-a"),
+            Some(2),
+            Some("bcode.fake-provider/context-v2"),
+        );
+        assert!(!incompatible_format_messages.iter().any(|message| {
             message
                 .content
                 .iter()

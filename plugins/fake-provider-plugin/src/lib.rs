@@ -11,8 +11,9 @@ use bcode_model::{
     ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_COMPACT_CONTEXT,
     OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS,
     OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderCapabilities, ProviderCapability, ProviderContextFormat, ProviderTurnEvent,
-    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    ProviderCapabilities, ProviderCapability, ProviderContextFormat, ProviderError,
+    ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
+    ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -30,6 +31,7 @@ pub struct FakeProviderPlugin {
 struct FakeProviderState {
     next_turn: u64,
     turns: BTreeMap<String, FakeTurn>,
+    overflow_emitted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,9 +169,32 @@ impl FakeProviderPlugin {
         );
         let turn = FakeTurn::default();
         turn.push(ProviderTurnEvent::TurnStarted);
+        let emit_overflow = request
+            .provider_context
+            .settings
+            .get("fake_context_overflow_once")
+            .is_some_and(|value| value == "true")
+            && !state.overflow_emitted;
+        if emit_overflow {
+            state.overflow_emitted = true;
+        }
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
-        if let Some(tool_call) = tool_call {
+        if emit_overflow {
+            turn.push(ProviderTurnEvent::Error {
+                error: ProviderError {
+                    code: "context_length_exceeded".to_string(),
+                    category: ProviderErrorCategory::ContextLength,
+                    message: "fake context overflow".to_string(),
+                    retryable: false,
+                    provider_message: None,
+                    retry: None,
+                },
+            });
+            turn.push(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Error,
+            });
+        } else if let Some(tool_call) = tool_call {
             finish_fake_tool_turn(&turn, tool_call);
         } else if let Some(delay) = fake_delay() {
             std::thread::spawn(move || FakeTurnWorker { turn, text, delay }.run());
