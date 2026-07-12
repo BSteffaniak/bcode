@@ -303,6 +303,8 @@ pub enum DatabaseOperation {
     TableColumns,
     /// Schema column-existence lookup.
     ColumnExists,
+    /// Connection open initialization.
+    Open,
     /// Connection close trigger or completion.
     Close,
     /// Connection-cache clearing.
@@ -343,6 +345,7 @@ impl DatabaseOperation {
             Self::TableInfo => "table_info",
             Self::TableColumns => "table_columns",
             Self::ColumnExists => "column_exists",
+            Self::Open => "open",
             Self::Close => "close",
             Self::ClearConnectionCache => "clear_connection_cache",
             Self::RawQuery => "raw_query",

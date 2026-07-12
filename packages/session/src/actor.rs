@@ -639,13 +639,20 @@ impl SessionActor {
                 .map(crate::safe_catalog_namespace)
             {
                 Some(namespace) => {
-                    crate::db::GlobalSessionDb::open_turso_in_root_namespace(
+                    crate::db::GlobalSessionDb::open_turso_in_root_namespace_observed(
                         &store.root_path(),
                         &namespace,
+                        store.metrics(),
                     )
                     .await
                 }
-                None => crate::db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await,
+                None => {
+                    crate::db::GlobalSessionDb::open_turso_in_root_observed(
+                        &store.root_path(),
+                        store.metrics(),
+                    )
+                    .await
+                }
             };
             match catalog {
                 Ok(catalog) => {

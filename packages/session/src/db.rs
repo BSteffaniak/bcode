@@ -14,7 +14,7 @@ use crate::persisted::{
 };
 
 use bcode_database_observability::ObservedDatabase;
-use bcode_metrics::MetricsRegistry;
+use bcode_metrics::{DatabaseMetrics, DatabaseOperation, MetricsRegistry};
 use bcode_session_models::{
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
@@ -291,8 +291,22 @@ impl GlobalSessionDb {
         root: &Path,
         namespace: &str,
     ) -> SessionDbResult<Self> {
+        Self::open_turso_in_root_namespace_observed(root, namespace, MetricsRegistry::disabled())
+            .await
+    }
+
+    /// Open a build-scoped global catalog with centralized observability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog DB cannot be opened or migrated.
+    pub async fn open_turso_in_root_namespace_observed(
+        root: &Path,
+        namespace: &str,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
         let path = namespaced_catalog_db_path(root, namespace);
-        Self::open_turso(&path).await
+        Self::open_turso_observed(&path, metrics).await
     }
 
     /// Open the global session catalog database at `path` and apply cheap schema migrations.
@@ -319,7 +333,16 @@ impl GlobalSessionDb {
         let root = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(root)?;
         let catalog_lock = crate::lease::acquire_catalog_lock(root)?;
-        let db = init_turso_local_with_retry(path).await?;
+        let open_started = std::time::Instant::now();
+        let db = init_turso_local_with_retry(path).await;
+        DatabaseMetrics::new(metrics.clone(), "session_catalog", "turso").record(
+            DatabaseOperation::Open,
+            None,
+            "none",
+            db.is_ok(),
+            u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        let db = db?;
         let db: Box<dyn Database> = Box::new(ObservedDatabase::new(
             db,
             metrics,
@@ -580,7 +603,16 @@ impl SessionDb {
         path: &Path,
         metrics: MetricsRegistry,
     ) -> SessionDbResult<Self> {
-        let db = init_turso_local_with_retry(path).await?;
+        let open_started = std::time::Instant::now();
+        let db = init_turso_local_with_retry(path).await;
+        DatabaseMetrics::new(metrics.clone(), "session", "turso").record(
+            DatabaseOperation::Open,
+            None,
+            "none",
+            db.is_ok(),
+            u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        let db = db?;
         let db: Box<dyn Database> =
             Box::new(ObservedDatabase::new(db, metrics, "session", "turso"));
         run_session_migrations(&*db).await?;
@@ -2664,6 +2696,32 @@ mod tests {
         assert_eq!(
             snapshot.origin,
             bcode_session_models::ProviderContextSnapshotOrigin::Explicit
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_session_open_records_initialization_and_migrations() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metrics = MetricsRegistry::in_memory();
+        let session_id = SessionId::new();
+        let db =
+            SessionDb::open_turso_in_root_observed(session_id, temp_dir.path(), metrics.clone())
+                .await
+                .expect("observed session database should open");
+        drop(db);
+
+        let report = metrics.report();
+        assert!(
+            report
+                .snapshot
+                .counters
+                .get("database.operation.total")
+                .is_some_and(|count| *count > 1)
+        );
+        assert!(
+            report.descriptors["database.operation.total"]
+                .label_keys
+                .contains(&"database_role".to_owned())
         );
     }
 
