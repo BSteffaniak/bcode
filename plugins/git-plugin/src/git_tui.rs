@@ -68,7 +68,8 @@ fn clone_result_rows(
     let existed = payload.get("already_exists").and_then(Value::as_bool) == Some(true);
     let metadata = [
         repo_name(payload).map(|value| Span::styled(value, value_style())),
-        text(payload, "path").map(|value| Span::styled(format!("→ {value}"), value_style())),
+        text(payload, "path")
+            .map(|value| Span::styled(format!("→ {}", context.display_path(value)), value_style())),
         text(payload, "git_ref").map(|value| Span::styled(value.to_owned(), value_style())),
         text(payload, "artifact_scope").map(|value| Span::styled(value.to_owned(), value_style())),
     ]
