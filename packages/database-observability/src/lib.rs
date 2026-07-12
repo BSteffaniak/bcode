@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation};
 use std::sync::Arc;
 use std::time::Instant;
-use switchy_database::query::{
+use switchy::database::query::{
     DeleteStatement, InsertStatement, SelectQuery, UpdateStatement, UpsertMultiStatement,
     UpsertStatement,
 };
-use switchy_database::schema;
-use switchy_database::{
+use switchy::database::schema;
+use switchy::database::{
     Database, DatabaseError, DatabaseTransaction, DatabaseValue, Row, Savepoint,
 };
 
@@ -818,46 +818,23 @@ impl DatabaseTransaction for ObservedTransaction {
             }) as Box<dyn Savepoint>
         })
     }
+
     async fn find_cascade_targets(
         &self,
         table_name: &str,
     ) -> Result<schema::DropPlan, DatabaseError> {
-        let started = Instant::now();
-        let result = self.inner.find_cascade_targets(table_name).await;
-        self.record(
-            DatabaseOperation::CascadeTargets,
-            Some(table_name),
-            started,
-            &result,
-        );
-        result
+        self.inner.find_cascade_targets(table_name).await
     }
 
     async fn has_any_dependents(&self, table_name: &str) -> Result<bool, DatabaseError> {
-        let started = Instant::now();
-        let result = self.inner.has_any_dependents(table_name).await;
-        self.record(
-            DatabaseOperation::CascadeHasDependents,
-            Some(table_name),
-            started,
-            &result,
-        );
-        result
+        self.inner.has_any_dependents(table_name).await
     }
 
     async fn get_direct_dependents(
         &self,
         table_name: &str,
     ) -> Result<std::collections::BTreeSet<String>, DatabaseError> {
-        let started = Instant::now();
-        let result = self.inner.get_direct_dependents(table_name).await;
-        self.record(
-            DatabaseOperation::CascadeDirectDependents,
-            Some(table_name),
-            started,
-            &result,
-        );
-        result
+        self.inner.get_direct_dependents(table_name).await
     }
 }
 
@@ -900,14 +877,15 @@ impl Savepoint for ObservedSavepoint {
 mod tests {
     use super::*;
     use bcode_metrics::MetricsRegistry;
-    use switchy_database::query::{insert, select};
-    use switchy_database::rusqlite::RusqliteDatabase;
-    use switchy_database::schema::{Column, DataType, create_table};
+    use switchy::database::query::{insert, select};
+    use switchy::database::rusqlite::RusqliteDatabase;
+    use switchy::database::schema::{Column, DataType, create_table};
 
     fn observed(metrics: &MetricsRegistry) -> ObservedDatabase {
         let connection = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
-        let database =
-            RusqliteDatabase::new(vec![Arc::new(switchy_async::sync::Mutex::new(connection))]);
+        let database = RusqliteDatabase::new(vec![Arc::new(switchy::unsync::sync::Mutex::new(
+            connection,
+        ))]);
         ObservedDatabase::new(Box::new(database), metrics.clone(), "test", "sqlite")
     }
 

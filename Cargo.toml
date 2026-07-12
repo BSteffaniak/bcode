@@ -280,7 +280,6 @@ sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", branch = "ma
     "windows-dpapi",
 ] }
 switchy = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
-switchy_async = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 switchy_database = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
     "schema",
     "sqlite-rusqlite",

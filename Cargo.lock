@@ -1601,7 +1601,7 @@ dependencies = [
  "bcode_metrics",
  "rusqlite",
  "serde_json",
- "switchy_async",
+ "switchy",
  "switchy_database",
  "tokio",
 ]
