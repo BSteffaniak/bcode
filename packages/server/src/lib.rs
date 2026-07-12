@@ -20494,6 +20494,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_malformed_opaque_context_uses_portable_fallback_without_extension() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("malformed opaque".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "old context".to_string(),
+                },
+            )
+            .await
+            .expect("append old context");
+        sessions
+            .append_provider_context_compacted(
+                session_id,
+                bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    request_fingerprint: Some("request-fingerprint".to_string()),
+                    request_id: Some("request-id".to_string()),
+                    provider_plugin_id: "bcode.fake-provider".to_string(),
+                    model_id: "fake-model".to_string(),
+                    compatibility_key: "bcode.fake-provider/context-v1".to_string(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: "{malformed".to_string(),
+                    portable_summary: "portable malformed fallback".to_string(),
+                },
+                0,
+            )
+            .await
+            .expect("persist malformed provider snapshot fixture");
+
+        let history = sessions
+            .model_context_events(session_id)
+            .await
+            .expect("model context");
+        let messages = session_events_to_model_messages_for_target(
+            &history,
+            1_000,
+            Some("bcode.fake-provider"),
+            Some("fake-model"),
+            None,
+            Some(1),
+            Some("bcode.fake-provider/context-v1"),
+        );
+        assert!(messages.iter().any(|message| message.content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text.contains("portable malformed fallback"))
+        )));
+        assert!(!messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ProviderExtension { .. }))
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_provider_native_work_persists_no_marker() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("cancel native".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        for text in ["first turn", "second turn", "active turn"] {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.to_string(),
+                    },
+                )
+                .await
+                .expect("append user turn");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("response to {text}"),
+                    },
+                )
+                .await
+                .expect("append assistant turn");
+        }
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-model".to_string()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([
+                    ("fake_native_compaction".to_string(), "true".to_string()),
+                    ("fake_compaction_delay_ms".to_string(), "100".to_string()),
+                ]),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+        let cancel_state = TurnCancelState::default();
+        bcode_fake_provider_plugin::reset_fake_compaction_started();
+
+        let compaction = compact_session_context_with_limit(
+            &state,
+            session_id,
+            &selection,
+            None,
+            None,
+            &cancel_state,
+            None,
+        );
+        let cancellation = async {
+            while !bcode_fake_provider_plugin::fake_compaction_started() {
+                tokio::task::yield_now().await;
+            }
+            cancel_state.cancel().await;
+        };
+        let (result, ()) = tokio::join!(compaction, cancellation);
+        assert!(matches!(result, Err(CompactionError::Cancelled)));
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[tokio::test]
     async fn unavailable_provider_native_compaction_uses_local_marker() {
         let sessions = SessionManager::default();
         let summary = sessions

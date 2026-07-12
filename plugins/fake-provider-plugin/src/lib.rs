@@ -21,6 +21,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+static FAKE_COMPACTION_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Reset the provider-compaction start signal used by static runtime tests.
+#[cfg(feature = "static-bundled")]
+pub fn reset_fake_compaction_started() {
+    FAKE_COMPACTION_STARTED.store(false, Ordering::Release);
+}
+
+/// Return whether a fake provider-native compaction call has started.
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn fake_compaction_started() -> bool {
+    FAKE_COMPACTION_STARTED.load(Ordering::Acquire)
+}
+
 /// Deterministic fake model provider.
 #[derive(Default)]
 pub struct FakeProviderPlugin {
@@ -132,10 +147,19 @@ impl FakeProviderPlugin {
     }
 
     fn compact_context(request: &ServiceRequest) -> ServiceResponse {
+        FAKE_COMPACTION_STARTED.store(true, Ordering::Release);
         let request = match request.payload_json::<CompactContextRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
+        if let Some(delay_ms) = request
+            .provider_context
+            .settings
+            .get("fake_compaction_delay_ms")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
         if request
             .provider_context
             .settings
