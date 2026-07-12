@@ -18704,6 +18704,134 @@ mod tests {
         assert_eq!(plan.portable_fallback, "portable provider summary");
     }
 
+    #[tokio::test]
+    async fn manual_compaction_registers_exclusive_runtime_work_and_clears_it() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("manual compaction".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        for text in ["first turn", "second turn", "active turn"] {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.to_string(),
+                    },
+                )
+                .await
+                .expect("append user turn");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("response to {text}"),
+                    },
+                )
+                .await
+                .expect("append assistant turn");
+        }
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+
+        process_compact_session_command(
+            &state,
+            session_id,
+            Arc::clone(&phase),
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::clone(&current_turn),
+            ClientId::new(),
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                model_id: Some("fake-model".to_string()),
+                ..SessionModelSelection::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("manual compaction failed: {error}"));
+
+        assert!(current_turn.lock().await.is_none());
+        assert_eq!(*phase.lock().await, SessionRuntimePhase::Idle);
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_active_turn_that_exceeds_capacity_is_explicitly_uncompactable() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("uncompactable turn".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "x".repeat(4_000),
+                },
+            )
+            .await
+            .expect("append active turn");
+        let persisted_before = sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        let history = sessions
+            .model_context_events(session_id)
+            .await
+            .expect("model context");
+
+        let error = ensure_compactable_current_turn(&history, 1_000, 10)
+            .expect_err("active turn must not be split or discarded");
+        assert!(matches!(
+            error,
+            CompactionError::UncompactableCurrentTurn {
+                available_input_tokens: 10,
+                ..
+            }
+        ));
+        let persisted_after = sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert_eq!(persisted_after, persisted_before);
+        assert!(!persisted_after.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
     #[test]
     fn oversized_active_unit_is_explicitly_uncompactable() {
         let session_id = SessionId::new();
