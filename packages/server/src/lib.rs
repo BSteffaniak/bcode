@@ -1866,6 +1866,15 @@ pub async fn run_with_static_bundled(
     }
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
     state.plugins.deactivate_all().await?;
+    let metrics_status = state.metrics.shutdown_persistence();
+    if metrics_status.dropped_events > 0 || metrics_status.writer_failed {
+        tracing::warn!(
+            target: "bcode_server::shutdown",
+            dropped_events = metrics_status.dropped_events,
+            writer_failed = metrics_status.writer_failed,
+            "metrics persistence stopped with degraded telemetry"
+        );
+    }
     if let Some(path) = &state.daemon_record_path {
         bcode_daemon_lifecycle::remove_record_if_instance(path, &state.daemon_status.instance_id)?;
     }
