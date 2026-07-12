@@ -19957,6 +19957,124 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn proactive_local_compaction_runs_inside_owning_model_turn() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
+        let summary = sessions
+            .create_session(
+                Some("proactive runtime".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        sessions
+            .append_model_changed(
+                session_id,
+                "bcode.fake-provider".to_string(),
+                "fake-echo".to_string(),
+            )
+            .await
+            .expect("select fake provider");
+        for index in 0..14 {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("historical user turn {index} {}", "x".repeat(1_000)),
+                    },
+                )
+                .await
+                .expect("append historical user turn");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("historical response {index} {}", "y".repeat(1_000)),
+                    },
+                )
+                .await
+                .expect("append historical assistant turn");
+        }
+        let trigger_event = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "continue after proactive compaction".to_string(),
+                },
+            )
+            .await
+            .expect("append trigger event");
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
+        state.auto_compaction.proactive_threshold_percent = 90;
+        state.auto_compaction.keep_recent_tokens = 1;
+
+        let mut permit = SessionTurnPermit::new(session_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            current_turn,
+        );
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+
+        let completion = run_model_turn(
+            &state,
+            &mut permit,
+            &trigger_event,
+            ClientId::new(),
+            None,
+            &mut command_context,
+            &phase,
+        )
+        .await;
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. })),
+            "compaction traces: {:#?}",
+            history
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    SessionEventKind::TraceEvent { trace }
+                        if matches!(
+                            trace.payload,
+                            SessionTracePayload::ContextCompaction { .. }
+                        ) =>
+                    {
+                        Some(&trace.payload)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
+        );
+        assert_eq!(permit.turn_entries, 1);
+    }
+
+    #[tokio::test]
     async fn strict_provider_native_failure_preserves_exact_uncompacted_context() {
         let sessions = SessionManager::default();
         let summary = sessions
