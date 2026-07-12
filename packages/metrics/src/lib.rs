@@ -298,6 +298,7 @@ struct MetricsState {
 
 #[derive(Debug, Clone)]
 struct MetricsEventLog {
+    root_dir: PathBuf,
     writer: Arc<MetricsEventWriter>,
 }
 
@@ -305,6 +306,7 @@ struct MetricsEventLog {
 enum MetricsWriterCommand {
     Event(MetricEvent),
     Flush(mpsc::Sender<()>),
+    Shutdown(mpsc::Sender<()>),
 }
 
 #[derive(Debug)]
@@ -419,7 +421,7 @@ impl MetricsRegistry {
         max_events: usize,
     ) -> MetricsReport {
         let root = metrics_event_log_root(event_log_path.as_ref());
-        let _ = MetricsEventLog::new(root.clone(), config).flush();
+        let _ = MetricsEventLog::new(&root, config).flush();
         let log = SynchronousMetricsEventLog::new(root, config);
         let events = log.read_recent_events(max_events);
         MetricsReport {
@@ -468,7 +470,7 @@ impl MetricsRegistry {
         let root_dir = metrics_event_log_root(&path);
         Self {
             inner: MetricsRegistryInner::Enabled(Arc::new(Mutex::new(MetricsState {
-                event_log: Some(MetricsEventLog::new(root_dir, config)),
+                event_log: Some(MetricsEventLog::new(&root_dir, config)),
                 max_events: DEFAULT_MAX_EVENTS,
                 ..MetricsState::default()
             }))),
@@ -709,6 +711,27 @@ impl MetricsRegistry {
             .event_log
             .as_ref()
             .map_or_else(MetricsPersistenceStatus::default, MetricsEventLog::flush)
+    }
+
+    /// Flush accepted events, stop the process-local writer for this root, and return its health.
+    ///
+    /// Callers must quiesce all registries targeting the same root before shutdown. Recording through
+    /// an older registry after this method returns is rejected and counted as dropped telemetry.
+    #[must_use]
+    pub fn shutdown_persistence(&self) -> MetricsPersistenceStatus {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return MetricsPersistenceStatus::default();
+        };
+        let Ok(state) = inner.lock() else {
+            return MetricsPersistenceStatus {
+                writer_failed: true,
+                ..MetricsPersistenceStatus::default()
+            };
+        };
+        state
+            .event_log
+            .as_ref()
+            .map_or_else(MetricsPersistenceStatus::default, MetricsEventLog::shutdown)
     }
 
     /// Return a rich metrics report with aggregate snapshots and recent events.
@@ -999,14 +1022,15 @@ impl MetricsState {
 }
 
 impl MetricsEventLog {
-    fn new(root_dir: PathBuf, config: MetricsEventLogConfig) -> Self {
+    fn new(root_dir: &Path, config: MetricsEventLogConfig) -> Self {
         let writers = METRICS_EVENT_WRITERS.get_or_init(|| Mutex::new(BTreeMap::new()));
-        let normalized_root = normalize_metrics_root(&root_dir);
+        let normalized_root = normalize_metrics_root(root_dir);
         let mut writers = writers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(writer) = writers.get(&normalized_root) {
             return Self {
+                root_dir: normalized_root,
                 writer: Arc::clone(writer),
             };
         }
@@ -1018,49 +1042,66 @@ impl MetricsEventLog {
             dropped_events: AtomicU64::new(0),
             failed,
         });
-        writers.insert(normalized_root, Arc::clone(&writer));
+        writers.insert(normalized_root.clone(), Arc::clone(&writer));
+        let writer_root = normalized_root.clone();
         thread::Builder::new()
             .name("bcode-metrics-writer".to_string())
             .spawn(move || {
-                let log = SynchronousMetricsEventLog::new(root_dir, config);
-                while let Ok(command) = receiver.recv() {
+                let log = SynchronousMetricsEventLog::new(writer_root, config);
+                'writer: while let Ok(command) = receiver.recv() {
                     match command {
                         MetricsWriterCommand::Event(first) => {
                             let mut events = vec![first];
-                            let mut pending_flush = None;
+                            let mut pending_barrier = None;
+                            let mut shutdown = false;
                             while events.len() < 256 {
                                 match receiver.try_recv() {
                                     Ok(MetricsWriterCommand::Event(event)) => events.push(event),
                                     Ok(MetricsWriterCommand::Flush(acknowledge)) => {
-                                        pending_flush = Some(acknowledge);
+                                        pending_barrier = Some(acknowledge);
+                                        break;
+                                    }
+                                    Ok(MetricsWriterCommand::Shutdown(acknowledge)) => {
+                                        pending_barrier = Some(acknowledge);
+                                        shutdown = true;
                                         break;
                                     }
                                     Err(
                                         mpsc::TryRecvError::Empty
                                         | mpsc::TryRecvError::Disconnected,
-                                    ) => {
-                                        break;
-                                    }
+                                    ) => break,
                                 }
                             }
                             if log.try_append_events(&events).is_err() {
                                 writer_failed.store(true, Ordering::Release);
                             }
-                            if let Some(acknowledge) = pending_flush {
+                            if let Some(acknowledge) = pending_barrier {
                                 let _ = acknowledge.send(());
+                            }
+                            if shutdown {
+                                break 'writer;
                             }
                         }
                         MetricsWriterCommand::Flush(acknowledge) => {
                             let _ = acknowledge.send(());
                         }
+                        MetricsWriterCommand::Shutdown(acknowledge) => {
+                            let _ = acknowledge.send(());
+                            break 'writer;
+                        }
                     }
                 }
             })
             .expect("metrics writer thread should start");
-        Self { writer }
+        Self {
+            root_dir: normalized_root,
+            writer,
+        }
     }
 
     fn append_event(&self, event: &MetricEvent) {
+        // Preserve already accepted telemetry under pressure: reject the newest event rather than
+        // blocking the caller or displacing an event whose persistence was previously promised.
         if self
             .writer
             .sender
@@ -1077,6 +1118,33 @@ impl MetricsEventLog {
             .writer
             .sender
             .send(MetricsWriterCommand::Flush(sender))
+            .is_ok()
+        {
+            let _ = receiver.recv();
+        }
+        MetricsPersistenceStatus {
+            dropped_events: self.writer.dropped_events.load(Ordering::Acquire),
+            writer_failed: self.writer.failed.load(Ordering::Acquire),
+        }
+    }
+
+    fn shutdown(&self) -> MetricsPersistenceStatus {
+        let writers = METRICS_EVENT_WRITERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut writers = writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if writers
+            .get(&self.root_dir)
+            .is_some_and(|writer| Arc::ptr_eq(writer, &self.writer))
+        {
+            writers.remove(&self.root_dir);
+        }
+        drop(writers);
+        let (sender, receiver) = mpsc::channel();
+        if self
+            .writer
+            .sender
+            .send(MetricsWriterCommand::Shutdown(sender))
             .is_ok()
         {
             let _ = receiver.recv();
@@ -1661,6 +1729,92 @@ mod tests {
                     .expect("line should be valid event JSON");
             }
         }
+    }
+
+    #[test]
+    fn full_queue_drops_newest_event_without_blocking() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(MetricsWriterCommand::Event(MetricEvent {
+                unix_ms: 1,
+                name: "accepted.event".to_owned(),
+                kind: MetricKind::Event,
+                value: 1,
+                labels: MetricLabels::new(),
+            }))
+            .expect("first event should fill queue");
+        let event_log = MetricsEventLog {
+            root_dir: PathBuf::from("unused"),
+            writer: Arc::new(MetricsEventWriter {
+                sender,
+                dropped_events: AtomicU64::new(0),
+                failed: Arc::new(AtomicBool::new(false)),
+            }),
+        };
+
+        event_log.append_event(&MetricEvent {
+            unix_ms: 2,
+            name: "rejected.event".to_owned(),
+            kind: MetricKind::Event,
+            value: 2,
+            labels: MetricLabels::new(),
+        });
+
+        assert_eq!(event_log.writer.dropped_events.load(Ordering::Acquire), 1);
+        let MetricsWriterCommand::Event(accepted) = receiver.try_recv().expect("accepted event")
+        else {
+            panic!("queue should retain first event");
+        };
+        assert_eq!(accepted.name, "accepted.event");
+    }
+
+    #[test]
+    fn shutdown_flushes_accepted_events_and_rejects_stale_registries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("events.jsonl");
+        let metrics = MetricsRegistry::with_event_log(&path);
+        for index in 0..20 {
+            metrics.record_event("shutdown.event", index, MetricLabels::new());
+        }
+
+        assert_eq!(
+            metrics.shutdown_persistence(),
+            MetricsPersistenceStatus::default()
+        );
+        metrics.record_event("shutdown.rejected", 1, MetricLabels::new());
+        let stale_status = metrics.flush_persistence();
+        assert_eq!(stale_status.dropped_events, 1);
+        assert!(!stale_status.writer_failed);
+
+        let report = MetricsRegistry::report_from_event_log_path(
+            &path,
+            MetricsEventLogConfig::default(),
+            100,
+        );
+        assert_eq!(report.events.len(), 20);
+        assert!(
+            report
+                .events
+                .iter()
+                .all(|event| event.name == "shutdown.event")
+        );
+
+        let reopened = MetricsRegistry::with_event_log(&path);
+        reopened.record_event("shutdown.reopened", 1, MetricLabels::new());
+        assert_eq!(
+            reopened.shutdown_persistence(),
+            MetricsPersistenceStatus::default()
+        );
+        let report = MetricsRegistry::report_from_event_log_path(
+            &path,
+            MetricsEventLogConfig::default(),
+            100,
+        );
+        assert_eq!(report.events.len(), 21);
+        assert_eq!(
+            report.events.last().map(|event| event.name.as_str()),
+            Some("shutdown.reopened")
+        );
     }
 
     #[test]
