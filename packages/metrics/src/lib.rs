@@ -269,6 +269,65 @@ pub struct HistogramBucketSnapshot {
     pub count: u64,
 }
 
+/// Stable database operation categories. Variants intentionally contain no SQL or query values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseOperation {
+    /// Typed select query.
+    Select,
+    /// Typed insert statement.
+    Insert,
+    /// Typed update statement.
+    Update,
+    /// Typed upsert statement.
+    Upsert,
+    /// Typed delete statement.
+    Delete,
+    /// Raw query without retaining its SQL.
+    RawQuery,
+    /// Raw execution without retaining its SQL.
+    RawExec,
+    /// Transaction begin.
+    Begin,
+    /// Transaction commit.
+    Commit,
+    /// Transaction rollback.
+    Rollback,
+    /// Savepoint creation.
+    Savepoint,
+    /// Savepoint release.
+    SavepointRelease,
+    /// Savepoint rollback.
+    SavepointRollback,
+}
+
+impl DatabaseOperation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Select => "select",
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Upsert => "upsert",
+            Self::Delete => "delete",
+            Self::RawQuery => "raw_query",
+            Self::RawExec => "raw_exec",
+            Self::Begin => "begin",
+            Self::Commit => "commit",
+            Self::Rollback => "rollback",
+            Self::Savepoint => "savepoint",
+            Self::SavepointRelease => "savepoint_release",
+            Self::SavepointRollback => "savepoint_rollback",
+        }
+    }
+}
+
+/// Stable labels and recording policy for centralized database instrumentation.
+#[derive(Debug, Clone)]
+pub struct DatabaseMetrics {
+    metrics: MetricsRegistry,
+    role: String,
+    backend: String,
+}
+
 /// RAII timer that records elapsed milliseconds when explicitly observed.
 #[derive(Debug)]
 pub struct MetricsTimer {
@@ -357,6 +416,57 @@ impl Default for Histogram {
             max: None,
             buckets: vec![0; HISTOGRAM_BUCKETS_MS.len()],
         }
+    }
+}
+
+impl DatabaseMetrics {
+    /// Create a database recorder with stable construction-time role and backend labels.
+    #[must_use]
+    pub fn new(
+        metrics: MetricsRegistry,
+        role: impl Into<String>,
+        backend: impl Into<String>,
+    ) -> Self {
+        Self {
+            metrics,
+            role: role.into(),
+            backend: backend.into(),
+        }
+    }
+
+    /// Record one completed database operation.
+    ///
+    /// `table` and `transaction` must be low-cardinality identifiers selected by code. Operation
+    /// names are closed enum variants; callers must not pass SQL, query values, paths, IDs, or
+    /// user-bearing content in the remaining labels.
+    pub fn record(
+        &self,
+        operation: DatabaseOperation,
+        table: Option<&str>,
+        transaction: &str,
+        succeeded: bool,
+        elapsed_ms: u64,
+    ) {
+        let mut labels = MetricLabels::from([
+            ("database_role".to_owned(), self.role.clone()),
+            ("database_backend".to_owned(), self.backend.clone()),
+            ("operation".to_owned(), operation.label().to_owned()),
+            ("transaction".to_owned(), transaction.to_owned()),
+            (
+                "outcome".to_owned(),
+                if succeeded { "ok" } else { "error" }.to_owned(),
+            ),
+        ]);
+        if let Some(table) = table {
+            labels.insert("table".to_owned(), table.to_owned());
+        }
+        self.metrics
+            .add_counter_with_labels("database.operation.total", 1, labels.clone());
+        self.metrics.record_histogram_with_labels(
+            "database.operation.duration_ms",
+            elapsed_ms,
+            labels,
+        );
     }
 }
 
@@ -1554,6 +1664,62 @@ mod tests {
     use std::process::Command;
 
     const ABRUPT_CHILD_ENV: &str = "BCODE_METRICS_ABRUPT_CHILD_ROOT";
+
+    #[test]
+    fn database_metrics_emit_only_stable_operation_metadata() {
+        let metrics = MetricsRegistry::default();
+        let database = DatabaseMetrics::new(metrics.clone(), "session", "turso");
+        database.record(
+            DatabaseOperation::Select,
+            Some("session_events"),
+            "none",
+            true,
+            7,
+        );
+        database.record(DatabaseOperation::RawExec, None, "active", false, 11);
+
+        let report = metrics.report();
+        assert_eq!(report.events.len(), 4);
+        for event in &report.events {
+            assert_eq!(
+                event.labels.get("database_role").map(String::as_str),
+                Some("session")
+            );
+            assert_eq!(
+                event.labels.get("database_backend").map(String::as_str),
+                Some("turso")
+            );
+            assert!(event.labels.contains_key("operation"));
+            assert!(event.labels.contains_key("transaction"));
+            assert!(event.labels.contains_key("outcome"));
+            assert_eq!(
+                event.labels.keys().cloned().collect::<Vec<_>>(),
+                if event.labels.contains_key("table") {
+                    vec![
+                        "database_backend".to_owned(),
+                        "database_role".to_owned(),
+                        "operation".to_owned(),
+                        "outcome".to_owned(),
+                        "table".to_owned(),
+                        "transaction".to_owned(),
+                    ]
+                } else {
+                    vec![
+                        "database_backend".to_owned(),
+                        "database_role".to_owned(),
+                        "operation".to_owned(),
+                        "outcome".to_owned(),
+                        "transaction".to_owned(),
+                    ]
+                }
+            );
+        }
+        assert_eq!(
+            report.events[0].labels.get("table").map(String::as_str),
+            Some("session_events")
+        );
+        assert!(!report.events[2].labels.contains_key("table"));
+    }
 
     #[tokio::test]
     async fn database_operation_scope_is_task_local_and_nestable() {
