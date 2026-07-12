@@ -600,9 +600,8 @@ mod tests {
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacyToolPresentationEvent,
         ProjectionWindowLimits, ProjectionWindowRequest, ProjectionWindowTarget, SessionId,
-        ToolInvocationProjectionStatus, ToolInvocationProjectionTerminalOutput,
-        ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
-        build_tool_invocation_projections,
+        ToolInvocationProjectionStatus, ToolInvocationProjectionStreamOutput, ToolInvocationResult,
+        ToolInvocationStreamEvent, ToolOutputStream, build_tool_invocation_projections,
     };
 
     fn tool_invocation_projection_replay_events(session_id: SessionId) -> Vec<SessionEvent> {
@@ -710,8 +709,8 @@ mod tests {
             })
         );
         assert_eq!(
-            projection.terminal_output,
-            Some(ToolInvocationProjectionTerminalOutput {
+            projection.stream_output,
+            Some(ToolInvocationProjectionStreamOutput {
                 output: "hi\n".to_owned(),
                 columns: Some(120),
                 rows: Some(30),
@@ -757,7 +756,7 @@ mod tests {
 
         assert_eq!(projection.result_text.as_deref(), Some("raw result only"));
         assert!(projection.raw_result.is_none());
-        assert!(projection.terminal_output.is_none());
+        assert!(projection.stream_output.is_none());
         assert!(projection.legacy_presentations.is_empty());
     }
     #[test]

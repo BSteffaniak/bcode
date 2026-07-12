@@ -530,7 +530,7 @@ fn tool_invocation_view_from_projection(
         result_text: projection.result_text,
         is_error: projection.is_error,
         result: projection.raw_result.map(ToolResultView::from),
-        output: projection.terminal_output.map(|output| ToolOutputView {
+        output: projection.stream_output.map(|output| ToolOutputView {
             text: output.output,
             columns: output.columns,
             rows: output.rows,

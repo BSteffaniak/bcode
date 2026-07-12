@@ -11,6 +11,7 @@
 //! scrollback semantics. Live presentation continues through generic transient tool-stream events;
 //! durable replay is provided by shell-owned artifact references.
 
+pub mod recording;
 #[cfg(feature = "static-bundled")]
 mod shell_run_tui;
 mod terminal_clean;
@@ -78,6 +79,8 @@ const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
 const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
 const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str =
     "application/x-bcode-terminal-pty-stream; charset=utf-8";
+const SHELL_RECORDING_REF_KEY: &str = "shell_recording";
+const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=1";
 
 const fn default_format_commands() -> bool {
     true
@@ -353,7 +356,6 @@ struct LimitedOutput {
     truncated: bool,
 }
 
-#[derive(Debug, Clone)]
 struct TerminalStreamOutput {
     raw: LimitedOutput,
     replay: LimitedOutput,
@@ -361,6 +363,8 @@ struct TerminalStreamOutput {
     raw_artifact_path: Option<PathBuf>,
     replay_artifact_path: Option<PathBuf>,
     clean_artifact_path: Option<PathBuf>,
+    recording_path: Option<PathBuf>,
+    recording_writer: Option<recording::ShellRecordingWriter>,
     prelude_suppressed: bool,
 }
 
@@ -691,6 +695,7 @@ fn encode_terminal_output(
     Ok((encoded, full_encoded, inline_output))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_terminal_shell_command_inner(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
@@ -753,6 +758,7 @@ fn run_terminal_shell_command_inner(
     let clean_artifact_path = clean_artifact_path(paths.artifact_dir, tool_call_id)?;
     let raw_artifact_path = raw_artifact_path(paths.artifact_dir, tool_call_id)?;
     let replay_artifact_path = replay_artifact_path(paths.artifact_dir, tool_call_id)?;
+    let recording_path = recording_artifact_path(paths.artifact_dir, tool_call_id)?;
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
@@ -773,6 +779,7 @@ fn run_terminal_shell_command_inner(
                     clean: clean_artifact_path,
                     raw: raw_artifact_path,
                     replay: replay_artifact_path,
+                    recording: recording_path,
                 },
             )
         }
@@ -788,7 +795,8 @@ fn run_terminal_shell_command_inner(
         events,
     )?;
     drop(pair.master);
-    let stream_output = join_reader(reader_thread)?;
+    let mut stream_output = join_reader(reader_thread)?;
+    let recording_ref = finalize_recording(&mut stream_output, started, status, columns, rows)?;
     terminal_shell_response(
         tool_call_id,
         TerminalShellResponseInput {
@@ -797,6 +805,7 @@ fn run_terminal_shell_command_inner(
             status,
             started,
             stream_output: &stream_output,
+            recording_ref,
             columns,
             rows,
             format_commands,
@@ -804,13 +813,14 @@ fn run_terminal_shell_command_inner(
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TerminalShellResponseInput<'a> {
     arguments: &'a ShellRunArguments,
     cwd: Option<&'a Path>,
     status: TerminalShellStatus,
     started: Instant,
     stream_output: &'a TerminalStreamOutput,
+    recording_ref: Option<ToolArtifactRef>,
     columns: u16,
     rows: u16,
     format_commands: bool,
@@ -845,8 +855,9 @@ fn terminal_shell_response(
     } else {
         input.stream_output.raw_artifact_path.as_deref()
     };
-    let replay_ref =
-        replay_path.map(|path| raw_artifact_ref(path, replay_output, input.columns, input.rows));
+    let replay_ref = input.recording_ref.or_else(|| {
+        replay_path.map(|path| raw_artifact_ref(path, replay_output, input.columns, input.rows))
+    });
     Ok(ToolInvocationResponse {
         output: encoded,
         is_error: input.status.timed_out || input.status.cancelled || !input.status.success,
@@ -934,6 +945,7 @@ struct TerminalStreamPaths {
     clean: Option<PathBuf>,
     raw: Option<PathBuf>,
     replay: Option<PathBuf>,
+    recording: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -1102,6 +1114,7 @@ impl RetainedStream {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn read_limited_streaming<R>(
     mut reader: R,
     events: ServiceEventEmitter,
@@ -1117,6 +1130,18 @@ where
     let mut raw_writer = raw_artifact_writer(paths.raw.as_deref())?;
     let mut replay_writer = raw_artifact_writer(paths.replay.as_deref())?;
     let mut clean_writer = clean_artifact_writer(paths.clean.as_deref())?;
+    let mut recording_writer = paths
+        .recording
+        .as_deref()
+        .map(|path| {
+            recording::ShellRecordingWriter::create(
+                path,
+                visual_context.columns,
+                visual_context.rows,
+            )
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let mut cleaner = terminal_clean::TerminalCleanWriter::new(
         &mut clean_writer,
         visual_context.columns,
@@ -1126,6 +1151,7 @@ where
     let mut buffer = [0_u8; 4096];
     let mut sequence = 0_u64;
     let mut visual_output = String::new();
+    let recording_started = Instant::now();
     let mut live_gate = PreludeGate::new(visual_context.prelude_markers.live.clone());
     let mut replay_gate = PreludeGate::new(visual_context.prelude_markers.replay.clone());
     let mut clean_gate = PreludeGate::new(visual_context.prelude_markers.clean.clone());
@@ -1143,6 +1169,14 @@ where
         }
         sequence = sequence.saturating_add(1);
         let chunk = &buffer[..read];
+        if let Some(writer) = &mut recording_writer {
+            writer
+                .write_output(
+                    u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    chunk,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         raw.write_chunk(&mut *raw_writer, chunk, DEFAULT_MAX_OUTPUT_BYTES)?;
         let live = live_gate.write(chunk);
         let replay_chunk = replay_gate.write(chunk);
@@ -1195,6 +1229,8 @@ where
         raw_artifact_path: paths.raw,
         replay_artifact_path: paths.replay,
         clean_artifact_path: paths.clean,
+        recording_path: paths.recording,
+        recording_writer,
         prelude_suppressed,
     })
 }
@@ -1276,6 +1312,15 @@ fn replay_artifact_path(
 ) -> Result<Option<PathBuf>, String> {
     artifact_path(artifact_dir, tool_call_id, |safe_tool_call_id| {
         format!("tool-output-{safe_tool_call_id}-replay-pty.txt")
+    })
+}
+
+fn recording_artifact_path(
+    artifact_dir: Option<&Path>,
+    tool_call_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    artifact_path(artifact_dir, tool_call_id, |safe_tool_call_id| {
+        format!("tool-output-{safe_tool_call_id}.bcsr")
     })
 }
 
@@ -1453,6 +1498,47 @@ fn shell_run_artifact(
             refs: clean_ref.into_iter().chain(raw_ref).collect(),
         }),
     }
+}
+
+fn finalize_recording(
+    output: &mut TerminalStreamOutput,
+    started: Instant,
+    status: TerminalShellStatus,
+    columns: u16,
+    rows: u16,
+) -> Result<Option<ToolArtifactRef>, String> {
+    let Some(writer) = output.recording_writer.take() else {
+        return Ok(None);
+    };
+    let summary = writer
+        .finish(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Some(status.exit_code),
+            status.timed_out,
+            status.cancelled,
+        )
+        .map_err(|error| error.to_string())?;
+    let path = output
+        .recording_path
+        .as_deref()
+        .ok_or_else(|| "recording writer had no final path".to_owned())?;
+    Ok(Some(ToolArtifactRef {
+        key: SHELL_RECORDING_REF_KEY.to_owned(),
+        content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
+        storage_uri: file_storage_uri(path),
+        byte_len: std::fs::metadata(path).ok().map(|metadata| metadata.len()),
+        metadata: Some(json!({
+            "format": "bcode.shell.recording",
+            "format_version": 1,
+            "authoritative_replay": true,
+            "columns": columns,
+            "rows": rows,
+            "frame_count": summary.frame_count,
+            "output_bytes": summary.output_bytes,
+            "checksum_sha256": summary.checksum_sha256,
+            "complete": true,
+        })),
+    }))
 }
 
 fn clean_artifact_ref(path: &Path, output: &LimitedOutput) -> ToolArtifactRef {
@@ -1946,6 +2032,7 @@ mod tests {
                 clean: None,
                 raw: None,
                 replay: None,
+                recording: None,
             },
         )
         .expect("stream should read");
@@ -1976,6 +2063,7 @@ mod tests {
                 clean: None,
                 raw: None,
                 replay: None,
+                recording: None,
             },
         )
         .expect("stream should read");
@@ -2031,11 +2119,14 @@ mod tests {
                     raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
                     replay_artifact_path: Some(PathBuf::from("/tmp/replay.txt")),
                     clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
+                    recording_path: None,
+                    recording_writer: None,
                     prelude_suppressed: true,
                 },
                 columns: 80,
                 rows: 24,
                 format_commands: true,
+                recording_ref: None,
             },
         )
         .expect("terminal response should encode");
@@ -2104,11 +2195,14 @@ mod tests {
                     raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
                     replay_artifact_path: Some(PathBuf::from("/tmp/replay.txt")),
                     clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
+                    recording_path: None,
+                    recording_writer: None,
                     prelude_suppressed: false,
                 },
                 columns: 80,
                 rows: 24,
                 format_commands: true,
+                recording_ref: None,
             },
         )
         .expect("terminal response should encode");

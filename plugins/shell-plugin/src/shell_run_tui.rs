@@ -17,6 +17,8 @@ const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
 const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str = "application/x-bcode-terminal-pty-stream";
+const SHELL_RECORDING_REF_KEY: &str = "shell_recording";
+const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording";
 
 /// Native TUI visual adapter for shell run artifacts.
 #[derive(Default)]
@@ -333,11 +335,26 @@ fn terminal_replay_output(payload: &serde_json::Value) -> Option<String> {
     if url.scheme() != "file" {
         return None;
     }
-    fs::read_to_string(url.to_file_path().ok()?).ok()
+    let path = url.to_file_path().ok()?;
+    if reference.get("key").and_then(serde_json::Value::as_str) == Some(SHELL_RECORDING_REF_KEY) {
+        let (_, frames) = crate::recording::read_recording(&path).ok()?;
+        let bytes = frames.into_iter().fold(Vec::new(), |mut bytes, frame| {
+            if let crate::recording::ShellRecordingFrame::Output { bytes: output, .. } = frame {
+                bytes.extend(output);
+            }
+            bytes
+        });
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    fs::read_to_string(path).ok()
 }
 
 fn terminal_replay_truncated(payload: &serde_json::Value) -> Option<bool> {
-    terminal_replay_ref(payload)?
+    let reference = terminal_replay_ref(payload)?;
+    if reference.get("key").and_then(serde_json::Value::as_str) == Some(SHELL_RECORDING_REF_KEY) {
+        return Some(false);
+    }
+    reference
         .get("metadata")
         .and_then(|metadata| metadata.get("tail_truncated"))
         .and_then(serde_json::Value::as_bool)
@@ -350,7 +367,15 @@ fn terminal_replay_ref(payload: &serde_json::Value) -> Option<&serde_json::Value
         .iter()
         .find(|reference| {
             reference.get("key").and_then(serde_json::Value::as_str)
-                == Some(TERMINAL_PTY_STREAM_REF_KEY)
+                == Some(SHELL_RECORDING_REF_KEY)
+                || reference
+                    .get("content_type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|content_type| {
+                        content_type.starts_with(SHELL_RECORDING_CONTENT_TYPE)
+                    })
+                || reference.get("key").and_then(serde_json::Value::as_str)
+                    == Some(TERMINAL_PTY_STREAM_REF_KEY)
                 || reference
                     .get("content_type")
                     .and_then(serde_json::Value::as_str)
@@ -475,6 +500,46 @@ mod tests {
 
         assert!(rendered.contains("hello"), "{rendered}");
         assert!(rendered.contains("world"), "{rendered}");
+    }
+
+    #[test]
+    fn fresh_adapter_renders_complete_shell_recording() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("recording.bcsr");
+        let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
+            .expect("recording writer");
+        writer
+            .write_output(1, b"first\rsecond\n")
+            .expect("record output");
+        writer
+            .finish(2, Some(0), false, false)
+            .expect("finish recording");
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "output_tail": "fallback\n",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [{
+                "key": SHELL_RECORDING_REF_KEY,
+                "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                "storage_uri": url::Url::from_file_path(&path).ok().map(|url| url.to_string()),
+                "metadata": {"complete": true}
+            }]
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter::default(),
+            "bcode.shell.run",
+            &payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("second"), "{rendered}");
+        assert!(!rendered.contains("first"), "{rendered}");
+        assert!(!rendered.contains("fallback"), "{rendered}");
     }
 
     #[test]

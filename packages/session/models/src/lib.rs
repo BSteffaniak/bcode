@@ -49,7 +49,7 @@ pub struct ToolInvocationProjection {
     /// Raw semantic result returned by the tool.
     pub raw_result: Option<ToolInvocationResult>,
     /// Raw terminal/text stream output observed for the tool.
-    pub terminal_output: Option<ToolInvocationProjectionTerminalOutput>,
+    pub stream_output: Option<ToolInvocationProjectionStreamOutput>,
     /// Legacy persisted presentation events, retained only as compatibility facts.
     pub legacy_presentations: Vec<LegacyToolPresentationEvent>,
     /// Tool start time as UNIX epoch milliseconds, when known.
@@ -72,7 +72,7 @@ pub enum ToolInvocationProjectionStatus {
 
 /// Renderer-neutral raw stream output captured for a tool invocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ToolInvocationProjectionTerminalOutput {
+pub struct ToolInvocationProjectionStreamOutput {
     /// Raw stream output text.
     pub output: String,
     /// Terminal columns reported by the producer.
@@ -168,16 +168,16 @@ fn apply_tool_invocation_stream_projection_event(
         } => {
             projection.status = ToolInvocationProjectionStatus::Running;
             projection.started_at_ms = *started_at_ms;
-            let terminal_output = projection
-                .terminal_output
+            let stream_output = projection
+                .stream_output
                 .get_or_insert_with(Default::default);
-            terminal_output.columns = *columns;
-            terminal_output.rows = *rows;
+            stream_output.columns = *columns;
+            stream_output.rows = *rows;
         }
         ToolInvocationStreamEvent::OutputDelta { text, .. } => {
             projection.status = ToolInvocationProjectionStatus::Running;
             projection
-                .terminal_output
+                .stream_output
                 .get_or_insert_with(Default::default)
                 .output
                 .push_str(text);
