@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Centralized Switchy database observability for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "database", "metrics"]
+license     = { workspace = true }
+name        = "bcode_database_observability"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+async-trait      = { workspace = true }
+bcode_metrics    = { workspace = true }
+switchy_database = { workspace = true, features = ["schema"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -37,6 +37,7 @@ members = [
     "packages/client",
     "packages/command",
     "packages/config",
+    "packages/database-observability",
     "packages/docs-site",
     "packages/docs-site/ui",
     "packages/daemon-lifecycle",
@@ -106,6 +107,7 @@ bcode_code_review_plugin                = { version = "0.0.1-alpha.0", default-f
 bcode_command                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }
 bcode_config                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bcode_daemon_lifecycle                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/daemon-lifecycle" }
+bcode_database_observability            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/database-observability" }
 bcode_default_agents_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/default-agents-plugin" }
 bcode_docs_site_ui                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/docs-site/ui" }
 bcode_document_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/document-plugin" }
@@ -187,6 +189,7 @@ bmux_tui_components = { default-features = false, git = "https://github.com/BSte
 arboard = { version = "3.6.1", default-features = false, features = [
     "image-data",
 ] }
+async-trait = { version = "0.1.89", default-features = false }
 aws-config = { version = "1.8.16", default-features = false, features = [
     "credentials-process",
     "rt-tokio",
