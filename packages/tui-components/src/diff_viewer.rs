@@ -572,6 +572,35 @@ fn format_preview_bytes(bytes: usize) -> String {
     }
 }
 
+/// Diff viewer layout policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffViewerLayout {
+    /// Render one full-width stream.
+    Unified,
+    /// Render old and new content in adjacent columns.
+    SideBySide,
+    /// Select side-by-side at or above the supplied component width.
+    Auto { breakpoint: u16 },
+}
+
+impl Default for DiffViewerLayout {
+    fn default() -> Self {
+        Self::Auto { breakpoint: 120 }
+    }
+}
+
+impl DiffViewerLayout {
+    /// Resolve an automatic policy for the actual component width.
+    #[must_use]
+    pub const fn resolve(self, width: u16) -> Self {
+        match self {
+            Self::Auto { breakpoint } if width >= breakpoint => Self::SideBySide,
+            Self::Auto { .. } => Self::Unified,
+            fixed => fixed,
+        }
+    }
+}
+
 /// Input used to render diff viewer rows.
 #[derive(Debug, Clone, Copy)]
 pub struct DiffViewerInput<'a> {
@@ -593,6 +622,8 @@ pub struct DiffViewerInput<'a> {
     pub argument_bytes: Option<usize>,
     /// Whether input text was truncated before diffing.
     pub truncated: bool,
+    /// Layout policy for this rendering.
+    pub layout: DiffViewerLayout,
 }
 
 /// Render diff viewer rows.
@@ -684,10 +715,14 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
     let preview = inline_preview(&visible_lines, MAX_INLINE_DIFF_ROWS);
     let card_width = card_width(&preview, width.saturating_sub(2));
     rows.push(card_border('┌', '─', '┐', card_width));
-    for row in preview {
-        match row {
-            PreviewRow::Line(line) => rows.extend(render_diff_line(line, card_width)),
-            PreviewRow::Hidden(count) => rows.push(hidden_row(count, card_width)),
+    if input.layout.resolve(width) == DiffViewerLayout::SideBySide {
+        rows.extend(render_side_by_side_preview(&preview, card_width));
+    } else {
+        for row in preview {
+            match row {
+                PreviewRow::Line(line) => rows.extend(render_diff_line(line, card_width)),
+                PreviewRow::Hidden(count) => rows.push(hidden_row(count, card_width)),
+            }
         }
     }
     rows.push(card_border('└', '─', '┘', card_width));
@@ -720,6 +755,96 @@ fn inline_preview(lines: &[DiffLine], max_rows: usize) -> Vec<PreviewRow<'_>> {
                 .map(PreviewRow::Line),
         )
         .collect()
+}
+
+fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Line> {
+    let mut rows = Vec::new();
+    let inner = usize::from(width).saturating_sub(2);
+    let left_width = inner.saturating_sub(1) / 2;
+    let right_width = inner.saturating_sub(1).saturating_sub(left_width);
+    let mut index = 0;
+    while index < preview.len() {
+        match preview[index] {
+            PreviewRow::Hidden(count) => {
+                rows.push(hidden_row(count, width));
+                index += 1;
+            }
+            PreviewRow::Line(line) if line.kind == DiffLineKind::Removed => {
+                let left = Some(line);
+                let right = preview.get(index + 1).and_then(|row| match row {
+                    PreviewRow::Line(next) if next.kind == DiffLineKind::Added => Some(*next),
+                    _ => None,
+                });
+                rows.push(render_split_row(left, right, left_width, right_width));
+                index += usize::from(right.is_some()) + 1;
+            }
+            PreviewRow::Line(line) if line.kind == DiffLineKind::Added => {
+                rows.push(render_split_row(None, Some(line), left_width, right_width));
+                index += 1;
+            }
+            PreviewRow::Line(line) => {
+                rows.push(render_split_row(
+                    Some(line),
+                    Some(line),
+                    left_width,
+                    right_width,
+                ));
+                index += 1;
+            }
+        }
+    }
+    rows
+}
+
+fn render_split_row(
+    old: Option<&DiffLine>,
+    new: Option<&DiffLine>,
+    old_width: usize,
+    new_width: usize,
+) -> Line {
+    let mut spans = vec![Span::styled("│", muted_style())];
+    split_cell(&mut spans, old, true, old_width);
+    spans.push(Span::styled("│", muted_style()));
+    split_cell(&mut spans, new, false, new_width);
+    spans.push(Span::styled("│", muted_style()));
+    Line::from_spans(spans)
+}
+
+fn split_cell(spans: &mut Vec<Span>, line: Option<&DiffLine>, old: bool, width: usize) {
+    let (marker, number, content, style) = line.map_or((" ", None, "", muted_style()), |line| {
+        let marker = match line.kind {
+            DiffLineKind::Removed => "-",
+            DiffLineKind::Added => "+",
+            _ => " ",
+        };
+        let number = if old { line.old_line } else { line.new_line };
+        let (_, _, style) = line_styles(line.kind);
+        (marker, number, line.content.as_str(), style)
+    });
+    let prefix = format!(
+        "{marker}{:>4} ",
+        number.map_or(String::new(), |n| n.to_string())
+    );
+    let available = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    let clipped = content
+        .graphemes(true)
+        .scan(0usize, |used, g| {
+            let next = used.saturating_add(UnicodeWidthStr::width(g));
+            (next <= available).then(|| {
+                *used = next;
+                g
+            })
+        })
+        .collect::<String>();
+    spans.push(Span::styled(prefix, style));
+    spans.push(Span::styled(clipped, style));
+    let used = spans
+        .iter()
+        .rev()
+        .take(2)
+        .map(|span| UnicodeWidthStr::width(span.content.as_str()))
+        .sum::<usize>();
+    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
 }
 
 fn render_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
@@ -1035,6 +1160,7 @@ mod tests {
                 subtitle: None,
                 argument_bytes: None,
                 truncated,
+                layout: DiffViewerLayout::Unified,
             },
             width,
         )

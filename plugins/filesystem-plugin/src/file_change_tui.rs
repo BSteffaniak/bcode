@@ -1,6 +1,6 @@
 //! Native TUI rendering for filesystem file-change previews.
 
-use bcode_tui_components::diff_viewer::{DiffViewerInput, diff_viewer_rows};
+use bcode_tui_components::diff_viewer::{DiffViewerInput, DiffViewerLayout, diff_viewer_rows};
 use bmux_tui::prelude::Line;
 
 /// Filesystem file-change TUI visual adapter.
@@ -70,6 +70,17 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
                 subtitle,
                 argument_bytes,
                 truncated,
+                layout: match payload.get("layout").and_then(serde_json::Value::as_str) {
+                    Some("unified") => DiffViewerLayout::Unified,
+                    Some("side_by_side") => DiffViewerLayout::SideBySide,
+                    _ => DiffViewerLayout::Auto {
+                        breakpoint: payload
+                            .get("side_by_side_breakpoint")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|value| u16::try_from(value).ok())
+                            .unwrap_or(120),
+                    },
+                },
             },
             width,
         )
