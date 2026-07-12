@@ -22,11 +22,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static FAKE_COMPACTION_STARTED: AtomicBool = AtomicBool::new(false);
+static FAKE_MANAGED_COMPACTION_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Reset the provider-compaction start signal used by static runtime tests.
 #[cfg(feature = "static-bundled")]
 pub fn reset_fake_compaction_started() {
     FAKE_COMPACTION_STARTED.store(false, Ordering::Release);
+    FAKE_MANAGED_COMPACTION_EMITTED.store(false, Ordering::Release);
+}
+
+/// Return whether fake provider-managed compaction was emitted.
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn fake_managed_compaction_emitted() -> bool {
+    FAKE_MANAGED_COMPACTION_EMITTED.load(Ordering::Acquire)
 }
 
 /// Return whether a fake provider-native compaction call has started.
@@ -207,6 +216,21 @@ impl FakeProviderPlugin {
         );
         let turn = FakeTurn::default();
         turn.push(ProviderTurnEvent::TurnStarted);
+        if request.context_management.compact_threshold.is_some() {
+            FAKE_MANAGED_COMPACTION_EMITTED.store(true, Ordering::Release);
+            turn.push(ProviderTurnEvent::ContextCompacted {
+                messages: vec![ModelMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ProviderExtension {
+                        value: serde_json::json!({
+                            "type": "fake_managed_compaction",
+                            "message_count": request.messages.len(),
+                        }),
+                    }],
+                }],
+                context_format: fake_context_format(),
+            });
+        }
         let emit_overflow = request
             .provider_context
             .settings
@@ -460,10 +484,15 @@ fn fake_context_capabilities(
         .settings
         .get("fake_native_compaction")
         .is_some_and(|value| value == "true");
+    let provider_managed = request
+        .provider_context
+        .settings
+        .get("fake_managed_compaction")
+        .is_some_and(|value| value == "true");
     ContextManagementCapabilities {
-        provider_managed: false,
+        provider_managed,
         native_compaction: enabled,
-        context_format: enabled.then(fake_context_format),
+        context_format: (enabled || provider_managed).then(fake_context_format),
     }
 }
 

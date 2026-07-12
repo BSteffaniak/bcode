@@ -10926,6 +10926,7 @@ async fn poll_model_turn_events(
             handle_provider_turn_event(
                 state,
                 session_id,
+                provider_turn_id,
                 turn_id,
                 event,
                 &mut stream,
@@ -11099,6 +11100,7 @@ async fn poll_model_turn(
 async fn handle_provider_turn_event(
     state: &ServerState,
     session_id: SessionId,
+    provider_turn_id: &str,
     turn_id: &str,
     event: ProviderTurnEvent,
     stream: &mut ModelStreamAccumulator,
@@ -11214,7 +11216,8 @@ async fn handle_provider_turn_event(
                 .await;
                 return;
             };
-            let active_turn = take_managed_compaction_attempt(command_context, turn_id).await;
+            let active_turn =
+                take_managed_compaction_attempt(command_context, provider_turn_id).await;
             let Some(active_turn) = active_turn else {
                 append_provider_event_trace(
                     state,
@@ -20208,6 +20211,116 @@ mod tests {
             request_fields,
             Some((&Some("test.plugin".to_owned()), &None))
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn provider_managed_compaction_persists_after_successful_runtime_round() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
+        let summary = sessions
+            .create_session(Some("managed runtime".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        sessions
+            .append_model_changed(
+                session_id,
+                "bcode.fake-provider".to_string(),
+                "fake-echo".to_string(),
+            )
+            .await
+            .expect("select fake provider");
+        let trigger_event = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "managed context turn".to_string(),
+                },
+            )
+            .await
+            .expect("append trigger event");
+        let state = test_server_state_with_fake_provider(sessions);
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([("fake_managed_compaction".to_string(), "true".to_string())]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                model_id: Some("fake-echo".to_string()),
+                provider_context: provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        let runtime_context = ClientRuntimeContext {
+            selected_provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            selected_model_id: Some("fake-echo".to_string()),
+            provider_context,
+            ..ClientRuntimeContext::default()
+        };
+        let mut permit = SessionTurnPermit::new(session_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            current_turn,
+        );
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+
+        let effective_selection = session_model_selection_with_runtime_context(
+            &state,
+            session_id,
+            Some(runtime_context.clone()),
+        )
+        .await;
+        let policy = automatic_compaction_policy(&state, &effective_selection).await;
+        assert_eq!(
+            policy.decision.strategy,
+            AutomaticCompactionStrategy::ProviderManaged
+        );
+
+        bcode_fake_provider_plugin::reset_fake_compaction_started();
+        let completion = run_model_turn(
+            &state,
+            &mut permit,
+            &trigger_event,
+            ClientId::new(),
+            Some(runtime_context),
+            &mut command_context,
+            &phase,
+        )
+        .await;
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        assert!(bcode_fake_provider_plugin::fake_managed_compaction_emitted());
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        let snapshots = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ProviderContextCompacted { snapshot, .. } => Some(snapshot),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 1, "history: {history:#?}");
+        assert_eq!(
+            snapshots[0].origin,
+            bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged
+        );
+        assert!(snapshots[0].request_id.is_some());
+        assert!(snapshots[0].request_fingerprint.is_some());
+        assert!(!snapshots[0].portable_summary.is_empty());
     }
 
     #[tokio::test]
