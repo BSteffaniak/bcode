@@ -19938,6 +19938,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ineffective_compaction_is_rejected_before_provider_work_without_marker() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("ineffective compaction".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        for text in ["first turn", "second turn", "active turn"] {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.to_string(),
+                    },
+                )
+                .await
+                .expect("append user turn");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("response to {text}"),
+                    },
+                )
+                .await
+                .expect("append assistant turn");
+        }
+        let mut state = test_server_state(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        let cancel_state = TurnCancelState::default();
+        let Err(error) = compact_session_context_with_limit(
+            &state,
+            session_id,
+            &SessionModelSelection::default(),
+            None,
+            None,
+            &cancel_state,
+            Some(CompactionProgressRequirement {
+                minimum_reclaimable_tokens: u64::MAX,
+                previous_compacted_through_sequence: None,
+            }),
+        )
+        .await
+        else {
+            panic!("ineffective compaction must be rejected before provider work");
+        };
+        assert!(
+            matches!(error, CompactionError::InsufficientProgress { .. }),
+            "unexpected compaction error: {error:?}"
+        );
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[tokio::test]
     async fn cancelled_compaction_before_provider_work_persists_no_marker() {
         let sessions = SessionManager::default();
         let summary = sessions
