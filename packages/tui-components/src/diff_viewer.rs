@@ -770,20 +770,32 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
                 index += 1;
             }
             PreviewRow::Line(line) if line.kind == DiffLineKind::Removed => {
-                let left = Some(line);
-                let right = preview.get(index + 1).and_then(|row| match row {
-                    PreviewRow::Line(next) if next.kind == DiffLineKind::Added => Some(*next),
-                    _ => None,
-                });
-                rows.push(render_split_row(left, right, left_width, right_width));
-                index += usize::from(right.is_some()) + 1;
+                let removed_start = index;
+                while matches!(preview.get(index), Some(PreviewRow::Line(line)) if line.kind == DiffLineKind::Removed)
+                {
+                    index += 1;
+                }
+                let added_start = index;
+                while matches!(preview.get(index), Some(PreviewRow::Line(line)) if line.kind == DiffLineKind::Added)
+                {
+                    index += 1;
+                }
+                let removed_count = added_start.saturating_sub(removed_start);
+                let added_count = index.saturating_sub(added_start);
+                for offset in 0..removed_count.max(added_count) {
+                    let old = preview.get(removed_start + offset).and_then(preview_line);
+                    let new = (offset < added_count)
+                        .then(|| preview.get(added_start + offset).and_then(preview_line))
+                        .flatten();
+                    rows.extend(render_split_row(old, new, left_width, right_width));
+                }
             }
             PreviewRow::Line(line) if line.kind == DiffLineKind::Added => {
-                rows.push(render_split_row(None, Some(line), left_width, right_width));
+                rows.extend(render_split_row(None, Some(line), left_width, right_width));
                 index += 1;
             }
             PreviewRow::Line(line) => {
-                rows.push(render_split_row(
+                rows.extend(render_split_row(
                     Some(line),
                     Some(line),
                     left_width,
@@ -796,55 +808,93 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
     rows
 }
 
+const fn preview_line<'a>(row: &'a PreviewRow<'a>) -> Option<&'a DiffLine> {
+    match row {
+        PreviewRow::Line(line) => Some(line),
+        PreviewRow::Hidden(_) => None,
+    }
+}
+
 fn render_split_row(
     old: Option<&DiffLine>,
     new: Option<&DiffLine>,
     old_width: usize,
     new_width: usize,
-) -> Line {
-    let mut spans = vec![Span::styled("│", muted_style())];
-    split_cell(&mut spans, old, true, old_width);
-    spans.push(Span::styled("│", muted_style()));
-    split_cell(&mut spans, new, false, new_width);
-    spans.push(Span::styled("│", muted_style()));
-    Line::from_spans(spans)
+) -> Vec<Line> {
+    let old_chunks = split_cell_chunks(old, old_width);
+    let new_chunks = split_cell_chunks(new, new_width);
+    let height = old_chunks.len().max(new_chunks.len());
+    (0..height)
+        .map(|row| {
+            let mut spans = vec![
+                Span::styled("  ", muted_style()),
+                Span::styled("│", muted_style()),
+            ];
+            spans.extend(split_cell_row(old, old_chunks.get(row), row, old_width));
+            spans.push(Span::styled("│", muted_style()));
+            spans.extend(split_cell_row(new, new_chunks.get(row), row, new_width));
+            spans.push(Span::styled("│", muted_style()));
+            Line::from_spans(spans)
+        })
+        .collect()
 }
 
-fn split_cell(spans: &mut Vec<Span>, line: Option<&DiffLine>, old: bool, width: usize) {
-    let (marker, number, content, style) = line.map_or((" ", None, "", muted_style()), |line| {
-        let marker = match line.kind {
-            DiffLineKind::Removed => "-",
-            DiffLineKind::Added => "+",
-            _ => " ",
-        };
-        let number = if old { line.old_line } else { line.new_line };
-        let (_, _, style) = line_styles(line.kind);
-        (marker, number, line.content.as_str(), style)
-    });
-    let prefix = format!(
-        "{marker}{:>4} ",
-        number.map_or(String::new(), |n| n.to_string())
+fn split_cell_chunks(line: Option<&DiffLine>, width: usize) -> Vec<Vec<Span>> {
+    let Some(line) = line else {
+        return vec![Vec::new()];
+    };
+    let body_width = width.saturating_sub(9).max(1);
+    let (_, _, body_style) = line_styles(line.kind);
+    let chunks = wrap_spans(
+        content_spans(line, row_style(line.kind).patch(body_style)),
+        &line.changed_ranges,
+        emphasis_style(line.kind),
+        body_width,
     );
-    let available = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
-    let clipped = content
-        .graphemes(true)
-        .scan(0usize, |used, g| {
-            let next = used.saturating_add(UnicodeWidthStr::width(g));
-            (next <= available).then(|| {
-                *used = next;
-                g
-            })
+    if chunks.is_empty() {
+        vec![Vec::new()]
+    } else {
+        chunks
+    }
+}
+
+fn split_cell_row(
+    line: Option<&DiffLine>,
+    chunk: Option<&Vec<Span>>,
+    row: usize,
+    width: usize,
+) -> Vec<Span> {
+    let Some(line) = line else {
+        return vec![Span::styled(" ".repeat(width), Style::new())];
+    };
+    let (sign, sign_style, body_style) = line_styles(line.kind);
+    let background = row_style(line.kind);
+    let gutter_style = background.patch(muted_style());
+    let number = if row == 0 {
+        (if matches!(line.kind, DiffLineKind::Removed) {
+            line.old_line
+        } else {
+            line.new_line
         })
-        .collect::<String>();
-    spans.push(Span::styled(prefix, style));
-    spans.push(Span::styled(clipped, style));
-    let used = spans
-        .iter()
-        .rev()
-        .take(2)
-        .map(|span| UnicodeWidthStr::width(span.content.as_str()))
-        .sum::<usize>();
-    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
+        .or(line.old_line)
+        .map_or_else(String::new, |number| number.to_string())
+    } else {
+        String::new()
+    };
+    let mut spans = vec![
+        Span::styled(" ", gutter_style),
+        Span::styled(
+            if row == 0 { sign } else { " " },
+            background.patch(sign_style.add_modifier(Modifier::BOLD)),
+        ),
+        Span::styled(format!("{number:>4}"), gutter_style),
+        Span::styled(" │ ", gutter_style),
+    ];
+    if let Some(chunk) = chunk {
+        spans.extend(chunk.iter().cloned());
+    }
+    pad_card_spans(&mut spans, width, background.patch(body_style));
+    spans
 }
 
 fn render_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
@@ -1250,6 +1300,52 @@ mod tests {
             .map(|span| UnicodeWidthStr::width(span.content.as_ref() as &str))
             .sum();
         assert_eq!(rendered_width, usize::from(width) + 2);
+    }
+
+    #[test]
+    fn side_by_side_rows_align_with_card_borders_and_wrap() {
+        let removed = DiffLine::new(
+            DiffLineKind::Removed,
+            Some(1),
+            None,
+            "a long removed line that must wrap across rows",
+        );
+        let added = DiffLine::new(
+            DiffLineKind::Added,
+            None,
+            Some(1),
+            "a long added line that must wrap across rows",
+        );
+        let card_width = 40;
+        let rows = render_side_by_side_preview(
+            &[PreviewRow::Line(&removed), PreviewRow::Line(&added)],
+            card_width,
+        );
+
+        assert!(rows.len() > 1, "{rows:?}");
+        for row in rows {
+            assert_eq!(line_width(&row), usize::from(card_width) + 2, "{row:?}");
+            assert_eq!(row.spans[0].content, "  ");
+        }
+    }
+
+    #[test]
+    fn side_by_side_rows_preserve_unified_diff_palette() {
+        let mut removed = DiffLine::new(DiffLineKind::Removed, Some(1), None, "old value");
+        removed.changed_ranges.push(ChangedRange::new(0, 3));
+        let mut added = DiffLine::new(DiffLineKind::Added, None, Some(1), "new value");
+        added.changed_ranges.push(ChangedRange::new(0, 3));
+
+        let rows = render_side_by_side_preview(
+            &[PreviewRow::Line(&removed), PreviewRow::Line(&added)],
+            80,
+        );
+        let rendered = format!("{rows:?}");
+
+        assert!(rendered.contains("Rgb(32, 10, 10)"), "{rendered}");
+        assert!(rendered.contains("Rgb(0, 24, 16)"), "{rendered}");
+        assert!(rendered.contains("Rgb(50, 14, 14)"), "{rendered}");
+        assert!(rendered.contains("Rgb(0, 42, 26)"), "{rendered}");
     }
 
     #[test]
