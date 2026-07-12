@@ -38,9 +38,6 @@ const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const MODEL_CONTEXT_EVENT_LIMIT: usize = 512;
-const MODEL_CONTEXT_SCAN_PAGE_LIMIT: usize = 512;
-const MODEL_CONTEXT_RAW_SCAN_LIMIT: usize = 8_192;
 
 /// Errors returned by Switchy-backed session database operations.
 #[derive(Debug, Error)]
@@ -66,6 +63,9 @@ pub enum SessionDbError {
     /// Strict persisted event decode failed.
     #[error(transparent)]
     PersistedEvent(#[from] PersistedSessionEventError),
+    /// A compaction marker is malformed or internally inconsistent.
+    #[error("invalid context compaction marker at event #{sequence}: {message}")]
+    InvalidCompactionMarker { sequence: u64, message: String },
     /// A database row did not contain the expected column/type.
     #[error("invalid session database row: missing or invalid column {column}")]
     InvalidRow { column: String },
@@ -984,30 +984,44 @@ impl SessionDb {
     ///
     /// Returns an error if event queries or deserialization fail.
     pub async fn model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
-        let Some(compaction_event) = self.latest_context_compaction_event().await? else {
-            return self.latest_model_context_events().await;
-        };
-        let compacted_through_sequence = match &compaction_event.kind {
-            SessionEventKind::ContextCompacted {
-                compacted_through_sequence,
-                ..
-            }
-            | SessionEventKind::ProviderContextCompacted {
-                compacted_through_sequence,
-                ..
-            } => *compacted_through_sequence,
-            _ => return Ok(vec![compaction_event]),
-        };
-        let rows = self
+        let compaction_event = self.latest_context_compaction_event().await?;
+        let compacted_through_sequence =
+            compaction_event
+                .as_ref()
+                .and_then(|event| match &event.kind {
+                    SessionEventKind::ContextCompacted {
+                        compacted_through_sequence,
+                        ..
+                    }
+                    | SessionEventKind::ProviderContextCompacted {
+                        compacted_through_sequence,
+                        ..
+                    } => Some(*compacted_through_sequence),
+                    _ => None,
+                });
+        let mut select = self
             .db
             .select("events")
-            .columns(&["event_type", "payload"])
-            .where_gt("event_seq", seq_to_value(compacted_through_sequence))
-            .sort("event_seq", SortDirection::Asc)
-            .execute(&**self.db)
-            .await?;
-        let mut candidates = Vec::with_capacity(rows.len().saturating_add(1));
-        candidates.push(compaction_event);
+            .columns(&["payload"])
+            .where_in(
+                "event_type",
+                MODEL_CONTEXT_EVENT_TYPES
+                    .iter()
+                    .map(|event_type| DatabaseValue::String((*event_type).to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .sort("event_seq", SortDirection::Asc);
+        if let Some(boundary) = compacted_through_sequence {
+            select = select.where_gt("event_seq", seq_to_value(boundary));
+        }
+        let rows = select.execute(&**self.db).await?;
+        let mut candidates = Vec::with_capacity(
+            rows.len()
+                .saturating_add(usize::from(compaction_event.is_some())),
+        );
+        if let Some(event) = compaction_event {
+            candidates.push(event);
+        }
         for row in rows {
             let payload = required_string(&row, "payload")?;
             if let Some(event) = decode_session_event_degraded(&payload) {
@@ -1015,63 +1029,6 @@ impl SessionDb {
             }
         }
         Ok(canonical_model_context_from_events(candidates))
-    }
-
-    async fn latest_model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
-        let mut selected_newest_first = Vec::new();
-        let mut scanned = 0_usize;
-        let mut before_sequence = None;
-
-        while selected_newest_first.len() < MODEL_CONTEXT_EVENT_LIMIT
-            && scanned < MODEL_CONTEXT_RAW_SCAN_LIMIT
-        {
-            let remaining_scan = MODEL_CONTEXT_RAW_SCAN_LIMIT.saturating_sub(scanned);
-            let page_limit = MODEL_CONTEXT_SCAN_PAGE_LIMIT.min(remaining_scan).max(1);
-            let mut select = self
-                .db
-                .select("events")
-                .columns(&["event_seq", "event_type", "payload"])
-                .sort("event_seq", SortDirection::Desc)
-                .limit(page_limit);
-            if let Some(sequence) = before_sequence {
-                select = select.where_lte("event_seq", seq_to_value(sequence));
-            }
-
-            let rows = select.execute(&**self.db).await?;
-            if rows.is_empty() {
-                break;
-            }
-            scanned = scanned.saturating_add(rows.len());
-
-            let mut oldest_sequence = None;
-            for row in &rows {
-                let sequence = required_i64(row, "event_seq").map(i64_to_u64)?;
-                oldest_sequence =
-                    Some(oldest_sequence.map_or(sequence, |oldest: u64| oldest.min(sequence)));
-                let event_type = required_string(row, "event_type")?;
-                if !is_model_context_event_type(&event_type) {
-                    continue;
-                }
-                let payload = required_string(row, "payload")?;
-                if let Some(event) = decode_session_event_degraded(&payload) {
-                    selected_newest_first.push(event);
-                }
-                if selected_newest_first.len() >= MODEL_CONTEXT_EVENT_LIMIT {
-                    break;
-                }
-            }
-
-            let Some(oldest_sequence) = oldest_sequence else {
-                break;
-            };
-            if oldest_sequence == 0 || rows.len() < page_limit {
-                break;
-            }
-            before_sequence = Some(oldest_sequence.saturating_sub(1));
-        }
-
-        selected_newest_first.reverse();
-        Ok(selected_newest_first)
     }
 
     async fn latest_context_compaction_event(&self) -> SessionDbResult<Option<SessionEvent>> {
@@ -1090,10 +1047,40 @@ impl SessionDb {
                 continue;
             };
             let payload = required_string(row, "payload")?;
-            if let Some(event) = decode_session_event_degraded(&payload)
-                && latest
-                    .as_ref()
-                    .is_none_or(|current: &SessionEvent| event.sequence > current.sequence)
+            let event = decode_session_event(&payload)?;
+            let boundary = match (&event.kind, event_type) {
+                (
+                    SessionEventKind::ContextCompacted {
+                        compacted_through_sequence,
+                        ..
+                    },
+                    "context_compacted",
+                )
+                | (
+                    SessionEventKind::ProviderContextCompacted {
+                        compacted_through_sequence,
+                        ..
+                    },
+                    "provider_context_compacted",
+                ) => *compacted_through_sequence,
+                _ => {
+                    return Err(SessionDbError::InvalidCompactionMarker {
+                        sequence: event.sequence,
+                        message: format!(
+                            "event_type {event_type:?} does not match the persisted event kind"
+                        ),
+                    });
+                }
+            };
+            if boundary > event.sequence {
+                return Err(SessionDbError::InvalidCompactionMarker {
+                    sequence: event.sequence,
+                    message: format!("compacted boundary #{boundary} is later than its marker"),
+                });
+            }
+            if latest
+                .as_ref()
+                .is_none_or(|current: &SessionEvent| event.sequence > current.sequence)
             {
                 latest = Some(event);
             }
@@ -1969,6 +1956,18 @@ fn input_history_entry_from_row(
     })
 }
 
+const MODEL_CONTEXT_EVENT_TYPES: &[&str] = &[
+    "user_message",
+    "assistant_message",
+    "tool_call_requested",
+    "tool_call_finished",
+    "system_message",
+    "working_directory_changed",
+    "context_compacted",
+    "provider_context_compacted",
+    "context_usage_observed",
+];
+
 const fn is_model_context_event_type(event_type: &str) -> bool {
     matches!(
         event_type.as_bytes(),
@@ -2762,6 +2761,100 @@ mod tests {
             .expect("after");
         assert_eq!(rows_before, rows_after);
         assert_eq!(db.last_event_sequence().await.expect("last"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn uncompacted_model_context_is_not_limited_by_event_count_or_irrelevant_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let tx = db.database().begin_transaction().await.expect("begin");
+
+        for sequence in 0..513 {
+            insert_event(
+                &*tx,
+                &event(
+                    session_id,
+                    sequence,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("semantic-{sequence}"),
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect("insert semantic event");
+        }
+        for sequence in 513..8_706 {
+            insert_event(
+                &*tx,
+                &event(
+                    session_id,
+                    sequence,
+                    SessionEventKind::SessionCreated {
+                        name: Some(format!("irrelevant-{sequence}")),
+                        working_directory: temp_dir.path().to_path_buf(),
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect("insert irrelevant event");
+        }
+        insert_event(
+            &*tx,
+            &event(
+                session_id,
+                8_706,
+                SessionEventKind::AssistantMessage {
+                    text: "newest semantic event".to_string(),
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("insert newest semantic event");
+        tx.commit().await.expect("commit");
+
+        let events = db.model_context_events().await.expect("model context");
+        assert_eq!(events.len(), 514);
+        assert_eq!(events.first().map(|event| event.sequence), Some(0));
+        assert_eq!(events.last().map(|event| event.sequence), Some(8_706));
+    }
+
+    #[tokio::test]
+    async fn malformed_compaction_marker_surfaces_an_error_without_mutation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.database()
+            .insert("events")
+            .value("event_seq", seq_to_value(0))
+            .value("event_type", "context_compacted")
+            .value(
+                "schema_version",
+                DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
+            )
+            .value("created_at_ms", seq_to_value(1))
+            .value("payload", "{not valid json")
+            .execute(db.database())
+            .await
+            .expect("insert malformed marker");
+
+        let error = db
+            .model_context_events()
+            .await
+            .expect_err("malformed marker must not be ignored");
+        assert!(matches!(error, SessionDbError::PersistedEvent(_)));
+        assert_eq!(
+            db.last_event_sequence().await.expect("last sequence"),
+            Some(0)
+        );
     }
 
     #[tokio::test]
