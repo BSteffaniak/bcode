@@ -1,4 +1,8 @@
 //! Native TUI rendering for shell run artifacts.
+//!
+//! Terminal replay and emulation are shell-domain behavior. This adapter is the only component
+//! that may interpret shell artifact schemas and terminal recording references; generic TUI and
+//! transcript code routes opaque plugin visuals without understanding those values.
 
 use bcode_tui_components::terminal_viewer::{
     MAX_INLINE_TERMINAL_ROWS, TerminalViewerInput, TerminalViewerLiveState, TerminalViewerSizing,

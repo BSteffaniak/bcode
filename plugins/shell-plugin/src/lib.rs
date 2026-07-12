@@ -2,7 +2,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! shell execution tool plugin for Bcode.
+//! Shell execution tool plugin for Bcode.
+//!
+//! This plugin exclusively owns shell/terminal recording schemas, PTY byte capture, replay
+//! interpretation, terminal emulation, and shell-result rendering. Host, session, server, and
+//! generic TUI-extension code must treat shell recordings as opaque tool artifacts and must not
+//! branch on shell schema IDs, recording reference keys, MIME types, ANSI, PTY, resize, grid, or
+//! scrollback semantics. Live presentation continues through generic transient tool-stream events;
+//! durable replay is provided by shell-owned artifact references.
 
 #[cfg(feature = "static-bundled")]
 mod shell_run_tui;
