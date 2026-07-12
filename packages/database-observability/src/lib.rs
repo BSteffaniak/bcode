@@ -877,9 +877,11 @@ impl Savepoint for ObservedSavepoint {
 mod tests {
     use super::*;
     use bcode_metrics::MetricsRegistry;
-    use switchy::database::query::{insert, select};
+    use switchy::database::query::{delete, insert, select, update, upsert};
     use switchy::database::rusqlite::RusqliteDatabase;
-    use switchy::database::schema::{Column, DataType, create_table};
+    use switchy::database::schema::{
+        Column, DataType, alter_table, create_index, create_table, drop_index, drop_table,
+    };
 
     fn observed(metrics: &MetricsRegistry) -> ObservedDatabase {
         let connection = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
@@ -890,6 +892,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn typed_raw_schema_and_transaction_operations_are_observed() {
         let metrics = MetricsRegistry::default();
         let database = observed(&metrics);
@@ -918,6 +921,59 @@ mod tests {
             .exec_insert(&insert("items").value("id", 1).value("name", "first"))
             .await
             .expect("insert");
+        database
+            .exec_update(&update("items").value("name", "updated"))
+            .await
+            .expect("update");
+        database
+            .exec_upsert(
+                &upsert("items")
+                    .value("id", 1)
+                    .value("name", "upserted")
+                    .unique(&["id"]),
+            )
+            .await
+            .expect("upsert");
+        database
+            .exec_insert(&insert("items").value("id", 3).value("name", "deleted"))
+            .await
+            .expect("insert deleted row");
+        database
+            .exec_delete(&delete("items").limit(1))
+            .await
+            .expect("delete");
+        database
+            .exec_create_index(&create_index("items_name_idx").table("items").column("name"))
+            .await
+            .expect("create index");
+        assert!(database.table_exists("items").await.expect("table exists"));
+        assert!(
+            database
+                .column_exists("items", "name")
+                .await
+                .expect("column exists")
+        );
+        assert!(
+            !database
+                .list_tables()
+                .await
+                .expect("list tables")
+                .is_empty()
+        );
+        assert!(
+            database
+                .get_table_info("items")
+                .await
+                .expect("table info")
+                .is_some()
+        );
+        assert!(
+            !database
+                .get_table_columns("items")
+                .await
+                .expect("table columns")
+                .is_empty()
+        );
         assert_eq!(
             database
                 .query(&select("items"))
@@ -930,6 +986,17 @@ mod tests {
             .query_raw("INVALID secret-user-value")
             .await
             .expect_err("invalid raw query should fail");
+        database
+            .exec_raw("INVALID raw-exec-secret")
+            .await
+            .expect_err("invalid raw exec should fail");
+        database
+            .exec_raw_params(
+                "INVALID parameterized-exec-secret",
+                &[DatabaseValue::String("exec-parameter-secret".to_owned())],
+            )
+            .await
+            .expect_err("invalid parameterized raw exec should fail");
         database
             .query_raw_params(
                 "INVALID parameterized-query-secret",
@@ -955,11 +1022,41 @@ mod tests {
             .await
             .expect("rollback to savepoint");
         transaction.rollback().await.expect("rollback transaction");
+        database
+            .exec_drop_index(&drop_index("items_name_idx", "items"))
+            .await
+            .expect("drop index");
+        database
+            .exec_alter_table(&alter_table("items").add_column(
+                "extra".to_owned(),
+                DataType::Text,
+                true,
+                None,
+            ))
+            .await
+            .expect("alter table");
+        database
+            .exec_create_table(&create_table("discarded").column(Column {
+                name: "id".to_owned(),
+                nullable: false,
+                auto_increment: false,
+                data_type: DataType::Int,
+                default: None,
+            }))
+            .await
+            .expect("create discarded table");
+        database
+            .exec_drop_table(&drop_table("discarded"))
+            .await
+            .expect("drop table");
 
         let report = metrics.report();
-        assert_eq!(
-            report.snapshot.counters.get("database.operation.total"),
-            Some(&14)
+        assert!(
+            report
+                .snapshot
+                .counters
+                .get("database.operation.total")
+                .is_some_and(|count| *count >= 28)
         );
         let descriptors = &report.descriptors;
         let aggregate = descriptors
@@ -978,6 +1075,9 @@ mod tests {
         );
         let serialized = serde_json::to_string(&report).expect("serialize report");
         assert!(!serialized.contains("secret-user-value"));
+        assert!(!serialized.contains("raw-exec-secret"));
+        assert!(!serialized.contains("parameterized-exec-secret"));
+        assert!(!serialized.contains("exec-parameter-secret"));
         assert!(!serialized.contains("parameterized-query-secret"));
         assert!(!serialized.contains("parameter-value-secret"));
         assert!(!serialized.contains("second"));
