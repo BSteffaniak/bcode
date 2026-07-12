@@ -553,7 +553,11 @@ const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 #[derive(Debug, Clone, Copy)]
 enum PreviewRow<'a> {
     Line(&'a DiffLine),
-    Hidden(usize),
+    Hidden {
+        count: usize,
+        old_count: usize,
+        new_count: usize,
+    },
 }
 
 fn format_preview_bytes(bytes: usize) -> String {
@@ -726,7 +730,7 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
         for row in preview {
             match row {
                 PreviewRow::Line(line) => rows.extend(render_diff_line(line, card_width)),
-                PreviewRow::Hidden(count) => rows.push(hidden_row(count, card_width)),
+                PreviewRow::Hidden { count, .. } => rows.push(hidden_row(count, card_width)),
             }
         }
     }
@@ -752,7 +756,22 @@ fn inline_preview(lines: &[DiffLine], max_rows: usize) -> Vec<PreviewRow<'_>> {
         .iter()
         .take(head)
         .map(PreviewRow::Line)
-        .chain(std::iter::once(PreviewRow::Hidden(hidden)))
+        .chain(std::iter::once({
+            let hidden_lines = &lines[head..lines.len().saturating_sub(tail)];
+            let old_count = hidden_lines
+                .iter()
+                .filter(|line| line.old_line.is_some())
+                .count();
+            let new_count = hidden_lines
+                .iter()
+                .filter(|line| line.new_line.is_some())
+                .count();
+            PreviewRow::Hidden {
+                count: hidden,
+                old_count,
+                new_count,
+            }
+        }))
         .chain(
             lines
                 .iter()
@@ -777,7 +796,7 @@ fn side_by_side_content_widths(preview: &[PreviewRow<'_>]) -> (usize, usize) {
                 }
             }
         }
-        PreviewRow::Hidden(_) => (old, new),
+        PreviewRow::Hidden { .. } => (old, new),
     })
 }
 
@@ -815,8 +834,19 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
     let mut index = 0;
     while index < preview.len() {
         match preview[index] {
-            PreviewRow::Hidden(count) => {
-                rows.push(hidden_row(count, width));
+            PreviewRow::Hidden {
+                count,
+                old_count,
+                new_count,
+            } => {
+                rows.push(split_hidden_row(
+                    count,
+                    old_count,
+                    new_count,
+                    width,
+                    left_width,
+                    right_width,
+                ));
                 index += 1;
             }
             PreviewRow::Line(line) if line.kind == DiffLineKind::Removed => {
@@ -860,10 +890,68 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
     rows
 }
 
+fn split_hidden_row(
+    count: usize,
+    old_count: usize,
+    new_count: usize,
+    width: u16,
+    old_width: usize,
+    new_width: usize,
+) -> Line {
+    let text = format!("⋯ {count} rows omitted ⋯");
+    if old_count > 0 && new_count > 0 {
+        let inner_width = usize::from(width).saturating_sub(2);
+        let clipped = truncate_to_display_width(&text, inner_width);
+        let text_width = UnicodeWidthStr::width(clipped.as_str());
+        let left_padding = inner_width.saturating_sub(text_width) / 2;
+        let right_padding = inner_width
+            .saturating_sub(text_width)
+            .saturating_sub(left_padding);
+        return Line::from_spans(vec![
+            Span::styled("  ", muted_style()),
+            Span::styled("│", muted_style()),
+            Span::styled(" ".repeat(left_padding), muted_style()),
+            Span::styled(clipped, muted_style()),
+            Span::styled(" ".repeat(right_padding), muted_style()),
+            Span::styled("│", muted_style()),
+        ]);
+    }
+
+    let mut spans = vec![
+        Span::styled("  ", muted_style()),
+        Span::styled("│", muted_style()),
+    ];
+    spans.extend(centered_hidden_cell(
+        (old_count > 0).then_some(text.as_str()),
+        old_width,
+    ));
+    spans.push(Span::styled("│", muted_style()));
+    spans.extend(centered_hidden_cell(
+        (new_count > 0).then_some(text.as_str()),
+        new_width,
+    ));
+    spans.push(Span::styled("│", muted_style()));
+    Line::from_spans(spans)
+}
+
+fn centered_hidden_cell(text: Option<&str>, width: usize) -> Vec<Span> {
+    let clipped = truncate_to_display_width(text.unwrap_or_default(), width);
+    let text_width = UnicodeWidthStr::width(clipped.as_str());
+    let left_padding = width.saturating_sub(text_width) / 2;
+    let right_padding = width
+        .saturating_sub(text_width)
+        .saturating_sub(left_padding);
+    vec![
+        Span::styled(" ".repeat(left_padding), muted_style()),
+        Span::styled(clipped, muted_style()),
+        Span::styled(" ".repeat(right_padding), muted_style()),
+    ]
+}
+
 const fn preview_line<'a>(row: &'a PreviewRow<'a>) -> Option<&'a DiffLine> {
     match row {
         PreviewRow::Line(line) => Some(line),
-        PreviewRow::Hidden(_) => None,
+        PreviewRow::Hidden { .. } => None,
     }
 }
 
@@ -1084,7 +1172,9 @@ fn card_width(preview: &[PreviewRow<'_>], available_width: u16) -> u16 {
         .iter()
         .map(|row| match row {
             PreviewRow::Line(line) => UnicodeWidthStr::width(line.content.as_str()),
-            PreviewRow::Hidden(count) => UnicodeWidthStr::width(hidden_text(*count).as_str()),
+            PreviewRow::Hidden { count, .. } => {
+                UnicodeWidthStr::width(hidden_text(*count).as_str())
+            }
         })
         .max()
         .unwrap_or(0);
@@ -1379,6 +1469,31 @@ mod tests {
             assert_eq!(line_width(&row), usize::from(card_width) + 2, "{row:?}");
             assert_eq!(row.spans[0].content, "  ");
         }
+    }
+
+    #[test]
+    fn side_by_side_omission_marker_uses_the_owning_column() {
+        let row = split_hidden_row(19, 0, 19, 80, 38, 39);
+        let center = row
+            .spans
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find(|(_, span)| span.content == "│")
+            .map(|(index, _)| index)
+            .expect("center divider");
+        let left = row.spans[2..center]
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        let right = row.spans[center + 1..]
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+
+        assert!(left.trim().is_empty(), "{row:?}");
+        assert!(right.contains("19 rows omitted"), "{row:?}");
+        assert_eq!(line_width(&row), 82);
     }
 
     #[test]
