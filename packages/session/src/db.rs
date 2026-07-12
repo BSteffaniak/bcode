@@ -13,6 +13,8 @@ use crate::persisted::{
     encode_session_event,
 };
 
+use bcode_database_observability::ObservedDatabase;
+use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
@@ -264,8 +266,20 @@ impl GlobalSessionDb {
     ///
     /// Returns an error if the catalog DB cannot be opened or migrated.
     pub async fn open_turso_in_root(root: &Path) -> SessionDbResult<Self> {
+        Self::open_turso_in_root_observed(root, MetricsRegistry::disabled()).await
+    }
+
+    /// Open the global catalog under `root` with centralized observability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog DB cannot be opened or migrated.
+    pub async fn open_turso_in_root_observed(
+        root: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
         let path = global_catalog_db_path(root);
-        Self::open_turso(&path).await
+        Self::open_turso_observed(&path, metrics).await
     }
 
     /// Open a build/compatibility-scoped session catalog database under `root`.
@@ -290,10 +304,28 @@ impl GlobalSessionDb {
     /// * the Turso connection cannot be opened after bounded lock retries
     /// * schema migrations fail
     pub async fn open_turso(path: &Path) -> SessionDbResult<Self> {
+        Self::open_turso_observed(path, MetricsRegistry::disabled()).await
+    }
+
+    /// Open the global catalog with centralized database observability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog DB cannot be opened or migrated.
+    pub async fn open_turso_observed(
+        path: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
         let root = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(root)?;
         let catalog_lock = crate::lease::acquire_catalog_lock(root)?;
         let db = init_turso_local_with_retry(path).await?;
+        let db: Box<dyn Database> = Box::new(ObservedDatabase::new(
+            db,
+            metrics,
+            "session_catalog",
+            "turso",
+        ));
         run_global_migrations(&*db).await?;
         Ok(Self {
             db: Arc::new(db),
@@ -503,11 +535,24 @@ impl SessionDb {
     /// Returns an error if the session directory cannot be created, the database cannot be
     /// opened, or schema migrations fail.
     pub async fn open_turso_in_root(session_id: SessionId, root: &Path) -> SessionDbResult<Self> {
+        Self::open_turso_in_root_observed(session_id, root, MetricsRegistry::disabled()).await
+    }
+
+    /// Open one session database under `root` with centralized observability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or migrated.
+    pub async fn open_turso_in_root_observed(
+        session_id: SessionId,
+        root: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
         let path = session_db_path(root, session_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        Self::open_turso(session_id, &path).await
+        Self::open_turso_observed(session_id, &path, metrics).await
     }
 
     /// Open one session database at `path` and apply cheap schema migrations.
@@ -522,7 +567,22 @@ impl SessionDb {
     /// * the Turso connection cannot be opened after bounded lock retries
     /// * schema migrations fail
     pub async fn open_turso(session_id: SessionId, path: &Path) -> SessionDbResult<Self> {
+        Self::open_turso_observed(session_id, path, MetricsRegistry::disabled()).await
+    }
+
+    /// Open one session database with centralized database observability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or migrated.
+    pub async fn open_turso_observed(
+        session_id: SessionId,
+        path: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
         let db = init_turso_local_with_retry(path).await?;
+        let db: Box<dyn Database> =
+            Box::new(ObservedDatabase::new(db, metrics, "session", "turso"));
         run_session_migrations(&*db).await?;
         Ok(Self {
             session_id,

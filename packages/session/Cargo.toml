@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_database_observability = { workspace = true }
 bcode_metrics = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
