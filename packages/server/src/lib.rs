@@ -20070,6 +20070,113 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn unknown_context_window_skips_proactive_compaction_and_completes_turn() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
+        let summary = sessions
+            .create_session(Some("unknown window".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        sessions
+            .append_model_changed(
+                session_id,
+                "bcode.fake-provider".to_string(),
+                "fake-echo".to_string(),
+            )
+            .await
+            .expect("select fake provider");
+        for index in 0..4 {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("history {index} {}", "x".repeat(1_000)),
+                    },
+                )
+                .await
+                .expect("append history");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("answer {index} {}", "y".repeat(1_000)),
+                    },
+                )
+                .await
+                .expect("append answer");
+        }
+        let trigger_event = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "continue with unknown window".to_string(),
+                },
+            )
+            .await
+            .expect("append trigger event");
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.selected_provider_context.settings.insert(
+            "fake_unknown_context_window".to_string(),
+            "true".to_string(),
+        );
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                model_id: Some("fake-echo".to_string()),
+                provider_context: state.selected_provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        let mut permit = SessionTurnPermit::new(session_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            current_turn,
+        );
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+
+        let completion = run_model_turn(
+            &state,
+            &mut permit,
+            &trigger_event,
+            ClientId::new(),
+            None,
+            &mut command_context,
+            &phase,
+        )
+        .await;
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(&trace.payload, SessionTracePayload::ContextCompaction { reason, .. } if reason == "context_window_unknown")
+        )));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn context_overflow_compacts_and_retries_once_inside_owning_turn() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");

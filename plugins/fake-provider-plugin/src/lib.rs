@@ -7,13 +7,13 @@
 use bcode_model::{
     AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
     ContextManagementCapabilities, ContextManagementCapabilitiesRequest, FinishTurnRequest,
-    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage,
-    ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_COMPACT_CONTEXT,
-    OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS,
-    OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderCapabilities, ProviderCapability, ProviderContextFormat, ProviderError,
-    ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
-    ValidateConfigResponse,
+    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelInfo, ModelList,
+    ModelListRequest, ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES,
+    OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
+    OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
+    PollTurnEventsResponse, ProviderCapabilities, ProviderCapability, ProviderContextFormat,
+    ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse, StopReason,
+    TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -89,7 +89,7 @@ impl FakeProviderPlugin {
 
         match context.request.operation.as_str() {
             OP_CAPABILITIES => json_response(&capabilities()),
-            OP_MODELS => json_response(&models()),
+            OP_MODELS => Self::models(&context.request),
             OP_VALIDATE_CONFIG => json_response(&ValidateConfigResponse {
                 valid: true,
                 message: Some("fake provider is always valid".to_string()),
@@ -115,6 +115,20 @@ impl FakeProviderPlugin {
                 "unsupported model provider operation",
             ),
         }
+    }
+
+    fn models(request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<ModelListRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        json_response(&models(
+            request
+                .provider_context
+                .settings
+                .get("fake_unknown_context_window")
+                .is_none_or(|value| value != "true"),
+        ))
     }
 
     fn compact_context(request: &ServiceRequest) -> ServiceResponse {
@@ -325,13 +339,13 @@ fn capabilities() -> ProviderCapabilities {
     }
 }
 
-fn models() -> ModelList {
+fn models(has_context_window: bool) -> ModelList {
     ModelList {
         models: vec![ModelInfo {
             model_id: "fake-echo".to_string(),
             display_name: "Fake Echo".to_string(),
             is_default: true,
-            context_window: Some(8_000),
+            context_window: has_context_window.then_some(8_000),
             max_output_tokens: Some(1_000),
             capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
                 .into_iter()
