@@ -1247,6 +1247,7 @@ fn file_change_artifact(
     path: Option<&Path>,
     old_text: &str,
     new_text: &str,
+    start_line: Option<u32>,
 ) -> ToolInvocationResult {
     ToolInvocationResult::Artifact {
         artifact: Box::new(ToolArtifact {
@@ -1262,6 +1263,8 @@ fn file_change_artifact(
                 "path": path.map(|path| path.display().to_string()),
                 "old_text": old_text,
                 "new_text": new_text,
+                "old_start_line": start_line,
+                "new_start_line": start_line,
             }),
             refs: Vec::new(),
         }),
@@ -1293,6 +1296,7 @@ fn tool_write(
                             Some(&request.path),
                             "",
                             &request.contents,
+                            Some(1),
                         )),
                     }
                 },
@@ -1319,7 +1323,7 @@ fn tool_edit(
                     host_action: None,
                     result: None,
                 },
-                |replacements| {
+                |(replacements, start_line)| {
                     let summary = format!("applied {replacements} replacement");
                     ToolInvocationResponse {
                         output: summary.clone(),
@@ -1334,6 +1338,7 @@ fn tool_edit(
                             Some(&request.path),
                             &request.old_text,
                             &request.new_text,
+                            Some(start_line),
                         )),
                     }
                 },
@@ -1512,7 +1517,7 @@ fn edit_file(request: &ServiceRequest) -> ServiceResponse {
         Err(error) => return invalid_request(&error),
     };
     match edit_file_inner(&request) {
-        Ok(replacements) => json_response(&EditResponse { replacements }),
+        Ok((replacements, _)) => json_response(&EditResponse { replacements }),
         Err(error) => ServiceResponse::error("edit_error", error),
     }
 }
@@ -2327,7 +2332,7 @@ fn write_file_inner(path: &std::path::Path, contents: &str) -> Result<usize, std
     Ok(contents.len())
 }
 
-fn edit_file_inner(request: &EditRequest) -> Result<usize, String> {
+fn edit_file_inner(request: &EditRequest) -> Result<(usize, u32), String> {
     let contents = std::fs::read_to_string(&request.path).map_err(|error| error.to_string())?;
     let matches = contents.matches(&request.old_text).count();
     if matches != 1 {
@@ -2335,9 +2340,20 @@ fn edit_file_inner(request: &EditRequest) -> Result<usize, String> {
             "old_text must match exactly once, found {matches} matches"
         ));
     }
+    let match_offset = contents
+        .find(&request.old_text)
+        .ok_or_else(|| "old_text match disappeared".to_string())?;
+    let start_line = u32::try_from(
+        contents[..match_offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+    .saturating_add(1);
     let updated = contents.replacen(&request.old_text, &request.new_text, 1);
     std::fs::write(&request.path, updated.as_bytes()).map_err(|error| error.to_string())?;
-    Ok(1)
+    Ok((1, start_line))
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {

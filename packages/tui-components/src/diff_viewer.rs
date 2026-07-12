@@ -100,7 +100,32 @@ pub struct DiffDocument {
 /// Build a diff document from old and new text.
 #[must_use]
 pub fn diff_from_text(label: &str, old_text: &str, new_text: &str) -> DiffDocument {
+    diff_from_text_at_lines(label, old_text, new_text, 1, 1)
+}
+
+/// Build a diff document whose input fragments begin at the given file lines.
+#[must_use]
+pub fn diff_from_text_at_lines(
+    label: &str,
+    old_text: &str,
+    new_text: &str,
+    old_start_line: u32,
+    new_start_line: u32,
+) -> DiffDocument {
+    let old_offset = old_start_line.saturating_sub(1);
+    let new_offset = new_start_line.saturating_sub(1);
     let mut lines = diff_lines_from_text(label, old_text, new_text);
+    for line in &mut lines {
+        line.old_line = line
+            .old_line
+            .map(|number| number.saturating_add(old_offset));
+        line.new_line = line
+            .new_line
+            .map(|number| number.saturating_add(new_offset));
+        if line.kind == DiffLineKind::HunkHeader {
+            line.content = offset_hunk_header(&line.content, old_offset, new_offset);
+        }
+    }
     apply_intraline_changed_ranges(&mut lines);
     apply_syntax_highlighting(label, &mut lines);
     let (added, removed) = count_changed_diff_lines(&lines);
@@ -440,6 +465,26 @@ fn hunk_header(context_start: usize, old_end: usize, new_end: usize) -> String {
     )
 }
 
+fn offset_hunk_header(header: &str, old_offset: u32, new_offset: u32) -> String {
+    let Some((old_range, new_range)) = header
+        .strip_prefix("@@ -")
+        .and_then(|value| value.strip_suffix(" @@"))
+        .and_then(|value| value.split_once(" +"))
+    else {
+        return header.to_owned();
+    };
+    let offset_range = |range: &str, offset: u32| {
+        let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+        let start = start.parse::<u32>().unwrap_or(1).saturating_add(offset);
+        format!("{start},{count}")
+    };
+    format!(
+        "@@ -{} +{} @@",
+        offset_range(old_range, old_offset),
+        offset_range(new_range, new_offset)
+    )
+}
+
 fn count_changed_diff_lines(lines: &[DiffLine]) -> (u32, u32) {
     (
         usize_to_u32(
@@ -536,6 +581,10 @@ pub struct DiffViewerInput<'a> {
     pub old_text: &'a str,
     /// Text after the change.
     pub new_text: &'a str,
+    /// First file line represented by `old_text`.
+    pub old_start_line: u32,
+    /// First file line represented by `new_text`.
+    pub new_start_line: u32,
     /// Title rendered above the diff.
     pub title: &'a str,
     /// Optional subtitle rendered above the diff.
@@ -549,7 +598,13 @@ pub struct DiffViewerInput<'a> {
 /// Render diff viewer rows.
 #[must_use]
 pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
-    let diff = diff_from_text(input.label, input.old_text, input.new_text);
+    let diff = diff_from_text_at_lines(
+        input.label,
+        input.old_text,
+        input.new_text,
+        input.old_start_line,
+        input.new_start_line,
+    );
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![
         Span::styled("  ", muted_style()),
@@ -974,6 +1029,8 @@ mod tests {
                 label,
                 old_text,
                 new_text,
+                old_start_line: 1,
+                new_start_line: 1,
                 title,
                 subtitle: None,
                 argument_bytes: None,

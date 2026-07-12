@@ -28,6 +28,16 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
             .get("new_text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let old_start_line = payload
+            .get("old_start_line")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|line| u32::try_from(line).ok())
+            .unwrap_or(1);
+        let new_start_line = payload
+            .get("new_start_line")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|line| u32::try_from(line).ok())
+            .unwrap_or(old_start_line);
         let title = payload
             .get("title")
             .and_then(serde_json::Value::as_str)
@@ -54,6 +64,8 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
                 label: path,
                 old_text,
                 new_text,
+                old_start_line,
+                new_start_line,
                 title,
                 subtitle,
                 argument_bytes,
