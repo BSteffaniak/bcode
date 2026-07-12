@@ -24,6 +24,10 @@ pub struct SourceViewerInput<'a> {
     pub line_numbers: bool,
 }
 
+const SOURCE_CARD_MIN_WIDTH: usize = 16;
+const SOURCE_CARD_UNNUMBERED_CHROME_WIDTH: usize = 4;
+const SOURCE_CARD_NUMBERED_CHROME_WIDTH: usize = 7;
+
 /// Render source text using the same card and gutter language as the diff viewer.
 #[must_use]
 pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line> {
@@ -35,10 +39,15 @@ pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line>
     } else {
         0
     };
-    let card_width = width.saturating_sub(2);
+    let available_width = width.saturating_sub(2);
+    let card_width = source_card_width(
+        &lines[..displayed],
+        (lines.len() > displayed).then_some(input.truncated_message),
+        number_width,
+        available_width,
+    );
     let body_width = usize::from(card_width)
-        .saturating_sub(number_width)
-        .saturating_sub(7)
+        .saturating_sub(source_card_chrome_width(number_width))
         .max(1);
     let highlighted = highlight_lines(input.label, &lines[..displayed]);
     let mut rows = Vec::new();
@@ -61,6 +70,32 @@ pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line>
     }
     rows.push(card_border(card_width, "└", "┘"));
     rows
+}
+
+const fn source_card_chrome_width(number_width: usize) -> usize {
+    if number_width == 0 {
+        SOURCE_CARD_UNNUMBERED_CHROME_WIDTH
+    } else {
+        number_width.saturating_add(SOURCE_CARD_NUMBERED_CHROME_WIDTH)
+    }
+}
+
+fn source_card_width(
+    lines: &[&str],
+    truncated_message: Option<&str>,
+    number_width: usize,
+    available_width: u16,
+) -> u16 {
+    let available = usize::from(available_width.max(1));
+    let content_width = lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(*line))
+        .chain(truncated_message.map(UnicodeWidthStr::width))
+        .max()
+        .unwrap_or(0);
+    let desired = content_width.saturating_add(source_card_chrome_width(number_width));
+    u16::try_from(desired.clamp(SOURCE_CARD_MIN_WIDTH.min(available), available))
+        .unwrap_or(u16::MAX)
 }
 
 fn source_card_row(
@@ -248,6 +283,68 @@ mod tests {
             assert!(UnicodeWidthStr::width(text.as_str()) <= usize::from(width));
             assert!(text.ends_with('│') || text.ends_with('┐') || text.ends_with('┘'));
         }
+    }
+
+    #[test]
+    fn short_source_uses_content_sized_card() {
+        let rows = source_viewer_rows(
+            SourceViewerInput {
+                label: "file.rs",
+                contents: "let x = 1;",
+                start_line: 1,
+                max_lines: 30,
+                truncated_message: "truncated",
+                line_numbers: true,
+            },
+            100,
+        );
+
+        assert!(line_width(&rows[0]) < 100, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| line_width(row) == line_width(&rows[0]))
+        );
+    }
+
+    #[test]
+    fn omitted_long_lines_do_not_expand_source_card() {
+        let rows = source_viewer_rows(
+            SourceViewerInput {
+                label: "file.rs",
+                contents: "short\nthis omitted line is intentionally extremely long and should not size the card",
+                start_line: 1,
+                max_lines: 1,
+                truncated_message: "truncated",
+                line_numbers: true,
+            },
+            100,
+        );
+
+        assert!(line_width(&rows[0]) < 40, "{rows:?}");
+    }
+
+    #[test]
+    fn unicode_source_width_uses_terminal_cells() {
+        let rows = source_viewer_rows(
+            SourceViewerInput {
+                label: "file.txt",
+                contents: "界界",
+                start_line: 1,
+                max_lines: 30,
+                truncated_message: "truncated",
+                line_numbers: false,
+            },
+            100,
+        );
+
+        assert_eq!(line_width(&rows[0]), SOURCE_CARD_MIN_WIDTH + 2);
+    }
+
+    fn line_width(line: &Line) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_str()))
+            .sum()
     }
 
     #[test]
