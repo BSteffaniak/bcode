@@ -234,7 +234,15 @@ impl FakeProviderPlugin {
             });
         } else if let Some(tool_call) = tool_call {
             finish_fake_tool_turn(&turn, tool_call);
-        } else if let Some(delay) = fake_delay() {
+        } else if let Some(delay) = request
+            .provider_context
+            .settings
+            .get("fake_turn_delay_ms")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .map(Duration::from_millis)
+            .or_else(fake_delay)
+        {
             std::thread::spawn(move || FakeTurnWorker { turn, text, delay }.run());
         } else {
             finish_fake_turn(&turn, text);

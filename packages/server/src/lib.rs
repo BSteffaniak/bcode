@@ -546,12 +546,15 @@ struct RuntimeCurrentTurn {
 }
 
 impl RuntimeCurrentTurn {
-    fn plugin_scope_for_model(&self, session_id: SessionId) -> PluginInvocationScope {
-        debug_assert_eq!(self.kind, RuntimeOperationKind::ModelTurn);
+    fn plugin_scope_for_provider(&self, session_id: SessionId) -> PluginInvocationScope {
+        let work_id = match self.kind {
+            RuntimeOperationKind::ModelTurn => format!("model_{}", self.turn_id),
+            RuntimeOperationKind::ManualCompaction => format!("compact_{}", self.turn_id),
+        };
         PluginInvocationScope::session(session_id.to_string())
             .with_client_id(self.client_id.to_string())
             .with_turn_id(self.turn_id.clone())
-            .with_work_id(format!("model_{}", self.turn_id))
+            .with_work_id(work_id)
     }
 
     fn plugin_scope_for_tool_call(
@@ -7988,7 +7991,7 @@ async fn request_session_turn_cancellation(
             let request = CancelTurnRequest {
                 provider_turn_id: model.provider_turn_id.clone(),
             };
-            let scope = current_turn.plugin_scope_for_model(session_id);
+            let scope = current_turn.plugin_scope_for_provider(session_id);
             tokio::spawn(async move {
                 let _ = plugins
                     .invoke_service_json_scoped::<_, bcode_model::AckResponse>(
@@ -10491,7 +10494,7 @@ async fn active_plugin_scope_for_session(
         .session_current_turn(session_id)
         .await
         .map_or_else(PluginInvocationScope::default, |turn| {
-            turn.plugin_scope_for_model(session_id)
+            turn.plugin_scope_for_provider(session_id)
         })
 }
 
@@ -18702,6 +18705,145 @@ mod tests {
         let plan = structural_compaction_plan(&history, 1_000, 0).expect("plan");
         assert_eq!(plan.prior_boundary, Some(7));
         assert_eq!(plan.portable_fallback, "portable provider summary");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn manual_compaction_queues_behind_unrelated_active_turn() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
+        let summary = sessions
+            .create_session(Some("manual queue".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        sessions
+            .append_model_changed(
+                session_id,
+                "bcode.fake-provider".to_string(),
+                "fake-echo".to_string(),
+            )
+            .await
+            .expect("select fake provider");
+        for index in 0..3 {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("history user {index}"),
+                    },
+                )
+                .await
+                .expect("append history user");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("history assistant {index}"),
+                    },
+                )
+                .await
+                .expect("append history assistant");
+        }
+        let trigger_event = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active delayed turn".to_string(),
+                },
+            )
+            .await
+            .expect("append trigger event");
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
+        state
+            .selected_provider_context
+            .settings
+            .insert("fake_turn_delay_ms".to_string(), "100".to_string());
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                model_id: Some("fake-echo".to_string()),
+                provider_context: state.selected_provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        let state = Arc::new(state);
+        let client_id = ClientId::new();
+        let (turn_tx, turn_rx) = oneshot::channel();
+        enqueue_followup_command(
+            &state,
+            session_id,
+            FollowupCommand::ContinueFromUserEvent {
+                client_id,
+                runtime_context: None,
+                user_event: Box::new(trigger_event),
+                completion: Some(turn_tx),
+            },
+        )
+        .await
+        .expect("enqueue model turn");
+        let handle = session_runtime_handle(&state, session_id).await;
+        loop {
+            if handle.current_turn.lock().await.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(handle.phase.lock().await.has_active_work());
+
+        let selection = state
+            .session_model_selections
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("selection");
+        let (compact_tx, compact_rx) = oneshot::channel();
+        let status = enqueue_followup_command(
+            &state,
+            session_id,
+            FollowupCommand::CompactSession {
+                client_id,
+                selection,
+                response: compact_tx,
+            },
+        )
+        .await
+        .expect("queue manual compaction");
+        assert!(status.queued);
+        assert!(
+            handle
+                .current_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|turn| { turn.kind == RuntimeOperationKind::ModelTurn })
+        );
+
+        let turn = turn_rx.await.expect("turn completion");
+        assert_eq!(turn.outcome, ModelTurnOutcome::Completed);
+        compact_rx
+            .await
+            .expect("manual response")
+            .unwrap_or_else(|error| panic!("manual compaction failed: {error}"));
+        assert!(handle.current_turn.lock().await.is_none());
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
