@@ -15,11 +15,9 @@ mod model_ignores;
 mod runtime_work;
 
 use context_accounting::{
-    context_occupancy_tokens, estimated_model_messages_tokens, estimated_tokens_from_chars,
-    model_message_context_chars, projected_model_context_chars,
+    estimated_model_messages_tokens, estimated_tokens_from_chars, model_message_context_chars,
+    projected_model_context_chars,
 };
-#[cfg(test)]
-use context_compaction::compaction_event_is_progress;
 use context_compaction::{
     AutomaticCompactionPolicy, AutomaticCompactionStrategy, COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
     CompactionDecision, CompactionError, ProactiveCompactionEvaluation,
@@ -28,6 +26,8 @@ use context_compaction::{
     compaction_capacity_tokens, maybe_auto_compact_session_context,
     provider_context_management_capabilities, request_exceeds_compaction_capacity,
 };
+#[cfg(test)]
+use context_compaction::{candidate_requires_proactive_compaction, compaction_event_is_progress};
 pub mod session_catalog;
 mod session_import;
 
@@ -9604,7 +9604,7 @@ async fn run_model_turn_inner(
                 cancel_state.as_ref(),
                 command_context,
                 ProactiveCompactionEvaluation {
-                    candidate_input_tokens: Some(estimated_model_request_tokens(&request)),
+                    candidate_input_tokens: estimated_model_request_tokens(&request),
                     requested_max_output_tokens: request.parameters.max_output_tokens,
                     decision: compaction_decision,
                     previous_compacted_through_sequence: last_proactive_attempt_boundary,
@@ -17148,6 +17148,23 @@ mod tests {
         assert!(baseline_tokens < extension_tokens);
         let extension_threshold = baseline_tokens + (extension_tokens - baseline_tokens) / 2;
         assert!(baseline_tokens <= extension_threshold && extension_tokens > extension_threshold);
+    }
+
+    #[test]
+    fn proactive_policy_uses_complete_candidate_estimate_at_capacity_threshold() {
+        let capacity = compaction_capacity_tokens(10_000, 90, Some(1_000), Some(4_000));
+        assert!(!candidate_requires_proactive_compaction(
+            capacity.threshold_tokens.saturating_sub(1),
+            capacity
+        ));
+        assert!(candidate_requires_proactive_compaction(
+            capacity.threshold_tokens,
+            capacity
+        ));
+        assert!(candidate_requires_proactive_compaction(
+            capacity.threshold_tokens.saturating_add(1),
+            capacity
+        ));
     }
 
     #[test]

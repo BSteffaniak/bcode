@@ -556,7 +556,12 @@ pub fn compaction_capacity_tokens(
 }
 
 pub struct ProactiveCompactionEvaluation {
-    pub candidate_input_tokens: Option<u64>,
+    /// Conservative estimate of the complete candidate request assembled for this round.
+    ///
+    /// Proactive policy intentionally uses this value instead of a prior provider observation:
+    /// system context, tools, provider extensions, parameters, and continuation state can change
+    /// between requests and must be budgeted together.
+    pub candidate_input_tokens: u64,
     pub requested_max_output_tokens: Option<u32>,
     pub decision: CompactionDecision,
     pub previous_compacted_through_sequence: Option<u64>,
@@ -598,6 +603,13 @@ pub fn ensure_compactable_current_turn(
     Ok(())
 }
 
+pub const fn candidate_requires_proactive_compaction(
+    candidate_input_tokens: u64,
+    capacity: CompactionCapacity,
+) -> bool {
+    candidate_input_tokens >= capacity.threshold_tokens
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn maybe_auto_compact_session_context(
     state: &ServerState,
@@ -614,14 +626,7 @@ pub async fn maybe_auto_compact_session_context(
     let history = state.sessions.model_context_events(session_id).await?;
     let projected_context_chars =
         projected_model_context_chars(&history, state.tool_output_context_chars);
-    let projected_context_tokens = evaluation.candidate_input_tokens.unwrap_or_else(|| {
-        context_occupancy_tokens(
-            &history,
-            selection,
-            projected_context_chars,
-            state.tool_output_context_chars,
-        )
-    });
+    let projected_context_tokens = evaluation.candidate_input_tokens;
     let model_status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
     let Some(context_window_tokens) = model_status.context_window else {
         append_context_compaction_trace(
@@ -651,7 +656,7 @@ pub async fn maybe_auto_compact_session_context(
         capacity.available_input_tokens,
     )?;
     let threshold_tokens = capacity.threshold_tokens;
-    if projected_context_tokens < threshold_tokens {
+    if !candidate_requires_proactive_compaction(projected_context_tokens, capacity) {
         append_context_compaction_trace(
             state,
             session_id,

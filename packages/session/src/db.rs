@@ -73,6 +73,9 @@ pub enum SessionDbError {
     /// The durable model-context projection schema is unsupported.
     #[error("unsupported model-context projection schema version {actual}; expected {expected}")]
     ModelContextProjectionVersion { actual: u64, expected: u64 },
+    /// Canonical event sequences cannot produce a trustworthy incremental projection.
+    #[error("invalid canonical event sequence for reindex: expected #{expected}, found #{actual}")]
+    InvalidCanonicalSequence { expected: u64, actual: u64 },
     /// A compaction marker is malformed or internally inconsistent.
     #[error("invalid context compaction marker at event #{sequence}: {message}")]
     InvalidCompactionMarker { sequence: u64, message: String },
@@ -1059,6 +1062,15 @@ impl SessionDb {
     /// Returns an error if canonical history is invalid or projection replacement fails.
     pub async fn reindex_model_context(&self) -> SessionDbResult<usize> {
         let events = self.all_events_strict().await?;
+        for (index, event) in events.iter().enumerate() {
+            let expected = u64::try_from(index).unwrap_or(u64::MAX);
+            if event.sequence != expected {
+                return Err(SessionDbError::InvalidCanonicalSequence {
+                    expected,
+                    actual: event.sequence,
+                });
+            }
+        }
         let tx = self.db.begin_transaction().await?;
         tx.delete("model_context_entries").execute(&*tx).await?;
         tx.delete("model_context_projection_state")
@@ -3069,16 +3081,201 @@ mod tests {
             .model_context_events()
             .await
             .expect("warm projected context");
-        let projected_started_at = std::time::Instant::now();
-        let projected = db.model_context_events().await.expect("projected context");
-        let projected_elapsed_ms = projected_started_at.elapsed().as_millis();
+        let mut projected_samples_ms = Vec::with_capacity(20);
+        let mut projected = Vec::new();
+        for _ in 0..20 {
+            let projected_started_at = std::time::Instant::now();
+            projected = db.model_context_events().await.expect("projected context");
+            projected_samples_ms.push(projected_started_at.elapsed().as_millis());
+        }
+        projected_samples_ms.sort_unstable();
+        let projected_p95_ms = projected_samples_ms[18];
         eprintln!(
-            "model_context_events: events={}, compatibility_elapsed_ms={}, projected_elapsed_ms={}",
+            "model_context_events: events={}, compatibility_elapsed_ms={}, projected_samples_ms={:?}, projected_p95_ms={}",
             projected.len(),
             compatibility_elapsed_ms,
-            projected_elapsed_ms
+            projected_samples_ms,
+            projected_p95_ms
         );
         assert_eq!(projected, compatibility);
+    }
+
+    #[tokio::test]
+    async fn reopening_legacy_database_keeps_projection_missing_until_explicit_reindex() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        {
+            let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("open session db");
+            insert_event(
+                db.database(),
+                &event(
+                    session_id,
+                    0,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: "legacy".to_string(),
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect("insert legacy canonical event");
+        }
+
+        let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("reopen migrated session db");
+        assert_eq!(
+            reopened
+                .model_context_projection_status()
+                .await
+                .expect("projection status"),
+            ModelContextProjectionStatus::Missing
+        );
+        let context = reopened
+            .model_context_events()
+            .await
+            .expect("exact compatibility context");
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn projected_context_matches_canonical_across_compaction_transitions() {
+        let scenarios = [
+            (
+                "uncompacted",
+                vec![
+                    message(SessionId::new(), 0, "first"),
+                    message(SessionId::new(), 1, "second"),
+                ],
+            ),
+            (
+                "local-to-local",
+                vec![
+                    message(SessionId::new(), 0, "old"),
+                    local_marker(SessionId::new(), 1, 0),
+                    message(SessionId::new(), 2, "middle"),
+                    local_marker(SessionId::new(), 3, 2),
+                    message(SessionId::new(), 4, "new"),
+                ],
+            ),
+            (
+                "local-to-provider",
+                vec![
+                    message(SessionId::new(), 0, "old"),
+                    local_marker(SessionId::new(), 1, 0),
+                    message(SessionId::new(), 2, "middle"),
+                    provider_marker(SessionId::new(), 3, 2),
+                    message(SessionId::new(), 4, "new"),
+                ],
+            ),
+            (
+                "provider-to-local",
+                vec![
+                    message(SessionId::new(), 0, "old"),
+                    provider_marker(SessionId::new(), 1, 0),
+                    message(SessionId::new(), 2, "middle"),
+                    local_marker(SessionId::new(), 3, 2),
+                    message(SessionId::new(), 4, "new"),
+                ],
+            ),
+            (
+                "provider-to-provider",
+                vec![
+                    message(SessionId::new(), 0, "old"),
+                    provider_marker(SessionId::new(), 1, 0),
+                    message(SessionId::new(), 2, "middle"),
+                    provider_marker(SessionId::new(), 3, 2),
+                    message(SessionId::new(), 4, "new"),
+                ],
+            ),
+        ];
+
+        for (name, template) in scenarios {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let session_id = SessionId::new();
+            let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("open session db");
+            let events = template
+                .into_iter()
+                .map(|mut event| {
+                    event.session_id = session_id;
+                    event
+                })
+                .collect::<Vec<_>>();
+            for event in &events {
+                insert_event(db.database(), event, None)
+                    .await
+                    .unwrap_or_else(|error| panic!("insert {name} canonical event: {error}"));
+            }
+            let compatibility = db
+                .model_context_events()
+                .await
+                .unwrap_or_else(|error| panic!("load {name} compatibility context: {error}"));
+            db.reindex_model_context()
+                .await
+                .unwrap_or_else(|error| panic!("reindex {name}: {error}"));
+            let projected = db
+                .model_context_events()
+                .await
+                .unwrap_or_else(|error| panic!("load {name} projected context: {error}"));
+            assert_eq!(projected, compatibility, "scenario {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_rejects_canonical_sequence_gaps_without_replacing_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "projected".to_string(),
+            },
+        ))
+        .await
+        .expect("append projected event");
+        insert_event(
+            db.database(),
+            &event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "gap".to_string(),
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("insert gapped canonical event");
+
+        assert!(matches!(
+            db.reindex_model_context()
+                .await
+                .expect_err("gap must reject reindex"),
+            SessionDbError::InvalidCanonicalSequence {
+                expected: 1,
+                actual: 2
+            }
+        ));
+        let rows = db
+            .database()
+            .select("model_context_entries")
+            .columns(&["event_seq"])
+            .execute(db.database())
+            .await
+            .expect("existing projection entries");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(required_i64(&rows[0], "event_seq").expect("event seq"), 0);
     }
 
     #[tokio::test]

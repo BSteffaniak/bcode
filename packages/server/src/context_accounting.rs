@@ -1,48 +1,10 @@
-//! Context occupancy accounting for model requests and compaction policy.
+//! Context accounting helpers for model requests and structural compaction.
 //!
-//! Provider observations are exact only through their attributed canonical sequence. Newer events
-//! are conservatively estimated and added to that observation. If no compatible observation
-//! exists, accounting estimates the entire model-visible projection. Structural retention uses
-//! canonical serialized model-message accounting so cuts include protocol overhead rather than raw
-//! content character counts; occupancy fallback remains a conservative character estimate when no
-//! exact provider observation exists.
+//! Proactive compaction uses a conservative estimate of the complete candidate request assembled
+//! for the current round. Structural retention uses canonical serialized model-message accounting
+//! so cuts include protocol overhead rather than raw content character counts.
 
-use super::{
-    ContentBlock, ModelMessage, SessionEventKind, SessionModelSelection,
-    model_id_for_provider_request, session_events_to_model_messages_with_limit,
-};
-
-pub fn context_occupancy_tokens(
-    history: &[bcode_session_models::SessionEvent],
-    selection: &SessionModelSelection,
-    projected_context_chars: usize,
-    tool_output_context_chars: usize,
-) -> u64 {
-    let provider = selection.provider_plugin_id.as_deref().unwrap_or("<auto>");
-    let model = model_id_for_provider_request(selection.model_id.as_deref());
-    let Some(snapshot) = history.iter().rev().find_map(|event| match &event.kind {
-        SessionEventKind::ContextUsageObserved { snapshot }
-            if snapshot.provider_plugin_id == provider && snapshot.model_id == model =>
-        {
-            Some(snapshot)
-        }
-        _ => None,
-    }) else {
-        return estimated_tokens_from_chars(projected_context_chars);
-    };
-    let delta_events = history
-        .iter()
-        .filter(|event| {
-            event.sequence > snapshot.context_through_sequence
-                && !matches!(event.kind, SessionEventKind::ContextUsageObserved { .. })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let delta_chars = projected_model_context_chars(&delta_events, tool_output_context_chars);
-    snapshot
-        .input_tokens
-        .saturating_add(estimated_tokens_from_chars(delta_chars))
-}
+use super::{ContentBlock, ModelMessage, session_events_to_model_messages_with_limit};
 
 pub fn projected_model_context_chars(
     history: &[bcode_session_models::SessionEvent],
