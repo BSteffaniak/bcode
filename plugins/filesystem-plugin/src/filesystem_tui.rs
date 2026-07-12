@@ -39,35 +39,40 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         &self,
         kind: &str,
         payload: &Value,
-        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        let width = context.width;
+        let width = context.width();
         match kind {
-            "bcode.filesystem.request" => request_rows(payload),
+            "bcode.filesystem.request" => request_rows(payload, context),
             "bcode.filesystem.read" | "bcode.filesystem.artifact.read" => {
-                read_rows(kind, payload, width)
+                read_rows(kind, payload, width, context)
             }
-            "bcode.filesystem.image" => image_rows(payload),
-            "bcode.filesystem.exists" => exists_rows(payload),
-            "bcode.filesystem.list" => list_rows(payload),
-            "bcode.filesystem.find" => find_rows(payload),
-            "bcode.filesystem.grep" | "bcode.filesystem.artifact.grep" => grep_rows(payload, width),
+            "bcode.filesystem.image" => image_rows(payload, context),
+            "bcode.filesystem.exists" => exists_rows(payload, context),
+            "bcode.filesystem.list" => list_rows(payload, context),
+            "bcode.filesystem.find" => find_rows(payload, context),
+            "bcode.filesystem.grep" | "bcode.filesystem.artifact.grep" => {
+                grep_rows(payload, width, context)
+            }
             "bcode.filesystem.stat" | "bcode.filesystem.artifact.metadata" => {
-                metadata_rows(kind, payload)
+                metadata_rows(kind, payload, context)
             }
             _ => Vec::new(),
         }
     }
 }
 
-fn request_rows(payload: &Value) -> Vec<Line> {
+fn request_rows(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let operation = text(payload, "operation").unwrap_or("filesystem tool");
     let mut rows = vec![Line::from_spans(vec![
         Span::styled("◆ ", accent()),
         Span::styled(operation.to_owned(), title()),
     ])];
-    push_path_kv(&mut rows, "path", text(arguments, "path"));
+    push_path_kv(&mut rows, "path", text(arguments, "path"), context);
     push_kv(&mut rows, "pattern", text(arguments, "pattern"));
     push_kv(&mut rows, "glob", text(arguments, "glob"));
     push_kv(&mut rows, "offset", number(arguments, "offset"));
@@ -82,13 +87,18 @@ fn request_rows(payload: &Value) -> Vec<Line> {
     rows
 }
 
-fn read_rows(kind: &str, payload: &Value, width: u16) -> Vec<Line> {
+fn read_rows(
+    kind: &str,
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let mut rows = card_header(if kind.contains("artifact") {
         "Artifact bytes"
     } else {
         "File contents"
     });
-    push_path_kv(&mut rows, "path", text(payload, "path"));
+    push_path_kv(&mut rows, "path", text(payload, "path"), context);
     push_kv(
         &mut rows,
         "lines",
@@ -120,16 +130,22 @@ fn read_rows(kind: &str, payload: &Value, width: u16) -> Vec<Line> {
     rows
 }
 
-fn image_rows(payload: &Value) -> Vec<Line> {
+fn image_rows(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let mut rows = card_header("Image file");
-    push_path_kv(&mut rows, "path", text(payload, "path"));
+    push_path_kv(&mut rows, "path", text(payload, "path"), context);
     push_kv(&mut rows, "type", text(payload, "mime_type"));
     push_kv(&mut rows, "dimensions", dimensions(payload));
     push_kv(&mut rows, "size", number(payload, "byte_len"));
     rows
 }
 
-fn exists_rows(payload: &Value) -> Vec<Line> {
+fn exists_rows(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let exists = payload
         .get("exists")
         .and_then(Value::as_bool)
@@ -139,7 +155,7 @@ fn exists_rows(payload: &Value) -> Vec<Line> {
     } else {
         "Path missing"
     });
-    push_path_kv(&mut rows, "path", text(payload, "path"));
+    push_path_kv(&mut rows, "path", text(payload, "path"), context);
     push_kv(
         &mut rows,
         "exists",
@@ -148,7 +164,10 @@ fn exists_rows(payload: &Value) -> Vec<Line> {
     rows
 }
 
-fn list_rows(payload: &Value) -> Vec<Line> {
+fn list_rows(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let entries = payload
         .get("entries")
         .and_then(Value::as_array)
@@ -168,7 +187,7 @@ fn list_rows(payload: &Value) -> Vec<Line> {
             let (icon, icon_style) = path_icon(path, Some(kind));
             rows.push(Line::from_spans(vec![
                 Span::styled(format!("  {icon} "), icon_style),
-                Span::styled(path, path_style()),
+                Span::styled(context.display_path(path).to_string(), path_style()),
                 Span::styled(
                     if kind == "file" {
                         String::new()
@@ -189,7 +208,10 @@ fn list_rows(payload: &Value) -> Vec<Line> {
     rows
 }
 
-fn find_rows(payload: &Value) -> Vec<Line> {
+fn find_rows(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let paths = payload
         .get("paths")
         .and_then(Value::as_array)
@@ -200,7 +222,7 @@ fn find_rows(payload: &Value) -> Vec<Line> {
         for path in values.iter().filter_map(Value::as_str).take(30) {
             rows.push(Line::from_spans(vec![
                 path_icon_span(path, None, "  "),
-                Span::styled(path.to_owned(), path_style()),
+                Span::styled(context.display_path(path).to_string(), path_style()),
             ]));
         }
         if values.len() > 30 {
@@ -224,7 +246,11 @@ fn find_rows(payload: &Value) -> Vec<Line> {
     rows
 }
 
-fn grep_rows(payload: &Value, width: u16) -> Vec<Line> {
+fn grep_rows(
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let values = payload
         .get("matches")
         .and_then(Value::as_array)
@@ -249,7 +275,7 @@ fn grep_rows(payload: &Value, width: u16) -> Vec<Line> {
             }
             rows.push(Line::from_spans(vec![
                 path_icon_span(path, None, "  "),
-                Span::styled(path.to_owned(), path_style()),
+                Span::styled(context.display_path(path).to_string(), path_style()),
             ]));
             previous_path = Some(path);
         }
@@ -289,7 +315,11 @@ fn grep_rows(payload: &Value, width: u16) -> Vec<Line> {
     rows
 }
 
-fn metadata_rows(kind: &str, payload: &Value) -> Vec<Line> {
+fn metadata_rows(
+    kind: &str,
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let mut rows = card_header(if kind.contains("artifact") {
         "Artifact metadata"
     } else {
@@ -300,6 +330,7 @@ fn metadata_rows(kind: &str, payload: &Value) -> Vec<Line> {
         "path",
         text(payload, "path"),
         text(payload, "kind"),
+        context,
     );
     push_kv(&mut rows, "kind", text(payload, "kind"));
     push_kv(&mut rows, "exists", bool_text(payload, "exists"));
@@ -323,16 +354,27 @@ fn preview_lines_with_options(contents: &str, options: &SourcePreviewOptions<'_>
     source_preview_lines(contents, options)
 }
 
-fn push_path_kv(rows: &mut Vec<Line>, key: &str, path: Option<&str>) {
-    push_path_kv_with_kind(rows, key, path, None);
+fn push_path_kv(
+    rows: &mut Vec<Line>,
+    key: &str,
+    path: Option<&str>,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) {
+    push_path_kv_with_kind(rows, key, path, None, context);
 }
 
-fn push_path_kv_with_kind(rows: &mut Vec<Line>, key: &str, path: Option<&str>, kind: Option<&str>) {
+fn push_path_kv_with_kind(
+    rows: &mut Vec<Line>,
+    key: &str,
+    path: Option<&str>,
+    kind: Option<&str>,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) {
     if let Some(path) = path.filter(|path| !path.is_empty()) {
         rows.push(Line::from_spans(vec![
             Span::styled(format!("  {key}: "), label()),
             path_icon_span(path, kind, ""),
-            Span::styled(path.to_owned(), value_style()),
+            Span::styled(context.display_path(path).to_string(), value_style()),
         ]));
     }
 }
@@ -470,7 +512,11 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.find",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
 
         assert!(
@@ -502,7 +548,11 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.list",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -535,7 +585,11 @@ mod tests {
                 &FilesystemTuiVisualAdapter,
                 kind,
                 &payload,
-                bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+                &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                    80,
+                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                    None,
+                ),
             );
             let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
             assert!(rendered.contains(icon), "{kind}: {rendered}");
@@ -553,7 +607,11 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.grep",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("Text matches (1)"), "{rendered}");
@@ -573,7 +631,11 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.read",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("9 │ pub fn main() {}"), "{rendered}");
@@ -599,7 +661,11 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.artifact.read",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("partial bytes"), "{rendered}");
@@ -621,7 +687,11 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.grep",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -647,7 +717,11 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.grep",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
 
         assert!(
@@ -673,7 +747,11 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.read",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 

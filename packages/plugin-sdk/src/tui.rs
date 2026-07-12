@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use crate::interaction::{InteractionInput, InteractionOutput, PluginInteraction};
@@ -183,22 +183,47 @@ pub enum PluginTuiDiffLayout {
 }
 
 /// Host-owned presentation context for visual adapters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginTuiVisualRenderContext {
-    /// Actual width assigned to the visual.
-    pub width: u16,
-    /// Effective diff viewer policy.
-    pub diff_layout: PluginTuiDiffLayout,
+    width: u16,
+    diff_layout: PluginTuiDiffLayout,
+    working_directory: Option<PathBuf>,
 }
 
 impl PluginTuiVisualRenderContext {
-    /// Construct the default responsive context.
+    /// Construct a complete visual presentation context.
     #[must_use]
-    pub const fn new(width: u16) -> Self {
+    pub const fn new(
+        width: u16,
+        diff_layout: PluginTuiDiffLayout,
+        working_directory: Option<PathBuf>,
+    ) -> Self {
         Self {
             width,
-            diff_layout: PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            diff_layout,
+            working_directory,
         }
+    }
+
+    /// Return the width assigned to the visual.
+    #[must_use]
+    pub const fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Return the effective diff viewer policy.
+    #[must_use]
+    pub const fn diff_layout(&self) -> PluginTuiDiffLayout {
+        self.diff_layout
+    }
+
+    /// Format a path against the invocation working directory when known.
+    #[must_use]
+    pub fn display_path(&self, path: impl AsRef<Path>) -> crate::path::DisplayPath {
+        self.working_directory.as_deref().map_or_else(
+            || crate::path::display_without_base(path.as_ref()),
+            |working_directory| crate::path::display(path.as_ref(), working_directory),
+        )
     }
 }
 
@@ -217,7 +242,7 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         &self,
         kind: &str,
         payload: &serde_json::Value,
-        context: PluginTuiVisualRenderContext,
+        context: &PluginTuiVisualRenderContext,
     ) -> Vec<Line>;
 }
 
@@ -492,27 +517,16 @@ impl PluginTuiRegistry {
 
     /// Build transcript rows with host-owned presentation preferences.
     #[must_use]
-    pub fn visual_rows_with_context(
+    pub fn visual_rows(
         &self,
         kind: &str,
         payload: &serde_json::Value,
-        context: PluginTuiVisualRenderContext,
+        context: &PluginTuiVisualRenderContext,
     ) -> Option<Vec<Line>> {
         self.visual_adapters
             .iter()
             .find(|adapter| adapter.supports(kind))
             .map(|adapter| adapter.rows(kind, payload, context))
-    }
-
-    /// Build transcript rows for a plugin-owned artifact/view payload.
-    #[must_use]
-    pub fn visual_rows(
-        &self,
-        kind: &str,
-        payload: &serde_json::Value,
-        width: u16,
-    ) -> Option<Vec<Line>> {
-        self.visual_rows_with_context(kind, payload, PluginTuiVisualRenderContext::new(width))
     }
 
     /// Open a registered surface.

@@ -34,9 +34,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for WebSearchTuiVisualAdapter
         &self,
         kind: &str,
         payload: &Value,
-        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        let width = context.width;
+        let width = context.width();
         match kind {
             "bcode.web-search.search_request" => search_request_rows(payload),
             "bcode.web-search.fetch_request" => fetch_request_rows(payload),
@@ -369,7 +369,11 @@ mod tests {
             &WebSearchTuiVisualAdapter,
             "bcode.web-search.search_results",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("Search results (1)"), "{rendered}");

@@ -24,9 +24,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for GitTuiVisualAdapter {
         &self,
         kind: &str,
         payload: &Value,
-        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        let width = context.width;
+        let width = context.width();
         match kind {
             "bcode.git.clone_request" => clone_request_rows(payload, width),
             "bcode.git.clone_result" => clone_result_rows(payload, width),
@@ -132,7 +132,11 @@ mod tests {
             &GitTuiVisualAdapter,
             "bcode.git.clone_result",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("Repository clone"), "{rendered}");

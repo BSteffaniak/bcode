@@ -41,9 +41,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         &self,
         kind: &str,
         payload: &serde_json::Value,
-        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        let width = context.width;
+        let width = context.width();
         if kind == "bcode.tool.request.shell.run" {
             return self.shell_request_rows(payload, width);
         }
@@ -382,7 +382,11 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(64),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                64,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -402,7 +406,11 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(48),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                48,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -419,7 +427,11 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(32),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                32,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -441,7 +453,11 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.shell.run",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(100),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -471,7 +487,11 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.shell.run",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(100),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 

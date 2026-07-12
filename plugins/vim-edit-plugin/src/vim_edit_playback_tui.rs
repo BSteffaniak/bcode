@@ -42,9 +42,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for VimEditPlaybackTuiVisualA
         &self,
         kind: &str,
         payload: &Value,
-        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        let width = context.width;
+        let width = context.width();
         match kind {
             VIM_EDIT_REQUEST_PREVIEW_SCHEMA => request_rows("Vim edit preview", payload),
             VIM_EDIT_REQUEST_APPLY_SCHEMA => request_rows("Vim edit apply", payload),

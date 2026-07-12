@@ -26,9 +26,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for OcrTuiVisualAdapter {
         &self,
         kind: &str,
         payload: &Value,
-        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        let width = context.width;
+        let width = context.width();
         match kind {
             "bcode.ocr.request" => request_rows(payload),
             "bcode.ocr.extract_result" => extract_rows(payload, width),

@@ -48,6 +48,15 @@ pub fn display(path: impl AsRef<Path>, working_directory: impl AsRef<Path>) -> D
     DisplayPath(path)
 }
 
+/// Format a path without assuming a working-directory base.
+///
+/// Relative paths remain relative and absolute paths remain absolute. Both are normalized
+/// lexically without filesystem access.
+#[must_use]
+pub fn display_without_base(path: impl AsRef<Path>) -> DisplayPath {
+    DisplayPath(normalize(path.as_ref()))
+}
+
 /// Format `path` relative to the process working directory when it remains concise.
 ///
 /// If the process working directory is unavailable, relative paths are formatted against `.` and

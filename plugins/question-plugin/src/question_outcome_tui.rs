@@ -14,7 +14,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for QuestionOutcomeTuiVisualA
         &self,
         _kind: &str,
         payload: &serde_json::Value,
-        _context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
         let Ok(outcome) = serde_json::from_value::<super::QuestionToolOutcome>(payload.clone())
         else {
@@ -83,7 +83,11 @@ mod tests {
             &QuestionOutcomeTuiVisualAdapter,
             "bcode.question.outcome",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(100),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 

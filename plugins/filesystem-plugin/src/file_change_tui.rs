@@ -19,9 +19,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         &self,
         _kind: &str,
         payload: &serde_json::Value,
-        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        let width = context.width;
+        let width = context.width();
         let path = payload
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -67,7 +67,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
 
         diff_viewer_rows(
             DiffViewerInput {
-                label: path,
+                label: &context.display_path(path).to_string(),
                 old_text,
                 new_text,
                 old_start_line,
@@ -76,7 +76,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
                 subtitle,
                 argument_bytes,
                 truncated,
-                layout: match context.diff_layout {
+                layout: match context.diff_layout() {
                     bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint } => {
                         DiffViewerLayout::Auto { breakpoint }
                     }
@@ -121,7 +121,11 @@ mod tests {
             &FileChangeTuiVisualAdapter,
             "bcode.filesystem.change",
             &payload,
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 

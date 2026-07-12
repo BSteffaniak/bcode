@@ -539,7 +539,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for WorktreeTuiVisualAdapter 
         &self,
         kind: &str,
         payload: &serde_json::Value,
-        _context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
         match kind {
             WORKTREE_REQUEST_SCHEMA => worktree_request_rows(payload),

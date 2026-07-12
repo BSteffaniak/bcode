@@ -312,8 +312,13 @@ mod tests {
             "old_text": "before\n",
             "new_text": "after\n"
         });
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            None,
+        );
         let rows = registry
-            .visual_rows(&route.schema, &payload, 80)
+            .visual_rows(&route.schema, &payload, &context)
             .expect("filesystem TUI visual adapter renders file change payload");
         assert!(!rows.is_empty());
     }

@@ -21,7 +21,7 @@ fn plugin_visual_context(width: u16) -> PluginTuiVisualRenderContext {
             TuiDiffViewerLayout::Unified => PluginTuiDiffLayout::Unified,
             TuiDiffViewerLayout::SideBySide => PluginTuiDiffLayout::SideBySide,
         };
-        PluginTuiVisualRenderContext { width, diff_layout }
+        PluginTuiVisualRenderContext::new(width, diff_layout, std::env::current_dir().ok())
     })
 }
 
@@ -1011,10 +1011,10 @@ fn push_canonical_plugin_visual_rows(
         );
         return;
     };
-    if let Some(native_rows) = registry.visual_rows_with_context(
+    if let Some(native_rows) = registry.visual_rows(
         &route.schema,
         &visual.payload,
-        plugin_visual_context(width),
+        &plugin_visual_context(width),
     ) {
         rows.extend(native_rows);
         return;
