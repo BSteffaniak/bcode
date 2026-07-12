@@ -20395,6 +20395,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_provider_native_compactions_advance_persisted_boundary() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("multiple compactions".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-model".to_string()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([(
+                    "fake_native_compaction".to_string(),
+                    "true".to_string(),
+                )]),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+
+        for round in 0..2 {
+            for turn in 0..3 {
+                state
+                    .sessions
+                    .append_event(
+                        session_id,
+                        SessionEventKind::UserMessage {
+                            client_id: ClientId::new(),
+                            text: format!("round {round} user {turn}"),
+                        },
+                    )
+                    .await
+                    .expect("append user turn");
+                state
+                    .sessions
+                    .append_event(
+                        session_id,
+                        SessionEventKind::AssistantMessage {
+                            text: format!("round {round} assistant {turn}"),
+                        },
+                    )
+                    .await
+                    .expect("append assistant turn");
+            }
+            compact_session_context_with_limit(
+                &state,
+                session_id,
+                &selection,
+                None,
+                None,
+                &TurnCancelState::default(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("compaction round {round} failed: {error}"));
+        }
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        let boundaries = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ProviderContextCompacted {
+                    compacted_through_sequence,
+                    ..
+                } => Some(*compacted_through_sequence),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(boundaries.len(), 2);
+        assert!(boundaries[1] > boundaries[0]);
+
+        let context = state
+            .sessions
+            .model_context_events(session_id)
+            .await
+            .expect("model context");
+        assert!(matches!(
+            context.first().map(|event| &event.kind),
+            Some(SessionEventKind::ProviderContextCompacted { .. })
+        ));
+        assert_eq!(
+            context.first().map(|event| event.sequence),
+            history
+                .iter()
+                .rev()
+                .find(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ProviderContextCompacted { .. }
+                ))
+                .map(|event| event.sequence)
+        );
+    }
+
+    #[tokio::test]
     async fn ineffective_compaction_is_rejected_before_provider_work_without_marker() {
         let sessions = SessionManager::default();
         let summary = sessions
