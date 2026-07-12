@@ -5825,6 +5825,7 @@ fn plugin_visual_degrades_without_rendering_raw_payload() {
         "call-1",
         None,
         None,
+        None,
         &ToolInvocationResult::Artifact {
             artifact: Box::new(artifact),
         },

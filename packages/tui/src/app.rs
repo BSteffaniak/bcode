@@ -415,6 +415,7 @@ impl AssistantScrollAnchorState {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
+    working_directory: Option<std::path::PathBuf>,
     request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 }
 
@@ -2171,6 +2172,7 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                working_directory,
                 request_visual,
                 legacy_request_presentation: _legacy_legacy_request_presentation,
                 ..
@@ -2181,6 +2183,7 @@ impl BmuxApp {
                     tool_call_id,
                     tool_name,
                     arguments_json,
+                    working_directory.clone(),
                     request_visual.as_ref(),
                 );
             }
@@ -2752,6 +2755,7 @@ impl BmuxApp {
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
+        working_directory: Option<std::path::PathBuf>,
         request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
     ) {
         self.tool_call_contexts.insert(
@@ -2759,6 +2763,7 @@ impl BmuxApp {
             ToolCallContext {
                 tool_name: tool_name.to_owned(),
                 arguments_json: arguments_json.to_owned(),
+                working_directory: working_directory.clone(),
                 request_visual: request_visual.cloned(),
             },
         );
@@ -2784,7 +2789,7 @@ impl BmuxApp {
                         tool_call_id: tool_call_id.to_owned(),
                         tool_name: Some(tool_name.to_owned()),
                         arguments_json: Some(arguments_json.to_owned()),
-                        working_directory: None,
+                        working_directory,
                         request_visual: request_visual.cloned(),
                         ..ToolInvocationProjection::default()
                     })
@@ -3069,6 +3074,9 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name.as_deref(),
                 arguments_json.as_deref(),
+                self.tool_call_contexts
+                    .get(tool_call_id)
+                    .and_then(|context| context.working_directory.as_deref()),
                 semantic_result,
                 is_error,
             )

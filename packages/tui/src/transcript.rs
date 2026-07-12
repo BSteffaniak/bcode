@@ -38,6 +38,8 @@ pub enum TranscriptItemKind {
         producer_plugin_id: Option<String>,
         /// Tool name.
         tool_name: String,
+        /// Working directory captured for this invocation.
+        working_directory: Option<std::path::PathBuf>,
         /// Plugin-owned request visual.
         request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
         /// Whether this item was derived from live-only partial tool arguments.
@@ -58,6 +60,8 @@ pub enum TranscriptItemKind {
         tool_name: Option<String>,
         /// Raw tool arguments JSON, when the matching request is known.
         arguments_json: Option<String>,
+        /// Working directory captured for this invocation.
+        working_directory: Option<std::path::PathBuf>,
         /// Raw tool result.
         result: String,
         /// Raw artifact result, when the result is artifact-backed.
@@ -132,6 +136,7 @@ pub enum TranscriptItemKind {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
+    working_directory: Option<std::path::PathBuf>,
     request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 }
 
@@ -471,6 +476,7 @@ pub fn tool_request_item_from_projection(projection: &ToolInvocationProjection) 
         projection.producer_plugin_id.as_deref(),
         tool_name,
         arguments_json,
+        projection.working_directory.clone(),
         projection.request_visual.clone(),
     )
 }
@@ -499,6 +505,7 @@ pub fn tool_request_item(
     producer_plugin_id: Option<&str>,
     tool_name: &str,
     arguments_json: &str,
+    working_directory: Option<std::path::PathBuf>,
     request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 ) -> TranscriptItem {
     TranscriptItem::with_kind(
@@ -509,6 +516,7 @@ pub fn tool_request_item(
             tool_call_id: tool_call_id.to_owned(),
             producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
             tool_name: tool_name.to_owned(),
+            working_directory,
             request_visual,
             live_preview: false,
         },
@@ -561,6 +569,7 @@ pub fn streaming_tool_visual_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: None,
+            working_directory: None,
             result: artifact_summary_text(&artifact),
             artifact: Some(Box::new(artifact)),
             is_error: false,
@@ -632,6 +641,7 @@ pub fn streaming_tool_output_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: arguments_json.map(ToOwned::to_owned),
+            working_directory: None,
             result: text.to_owned(),
             artifact: None,
             is_error: false,
@@ -657,6 +667,7 @@ pub fn tool_result_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: arguments_json.map(ToOwned::to_owned),
+            working_directory: None,
             result: result.to_owned(),
             artifact: None,
             is_error,
@@ -691,6 +702,7 @@ pub fn artifact_tool_result_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: arguments_json.map(ToOwned::to_owned),
+            working_directory: None,
             result,
             artifact: Some(Box::new(artifact.clone())),
             is_error,
@@ -1091,6 +1103,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
+            working_directory,
             request_visual,
             legacy_request_presentation: _legacy_request_presentation,
             ..
@@ -1100,6 +1113,7 @@ fn non_streaming_transcript_item_from_event(
                 ToolCallContext {
                     tool_name: tool_name.clone(),
                     arguments_json: arguments_json.clone(),
+                    working_directory: working_directory.clone(),
                     request_visual: request_visual.clone(),
                 },
             );
@@ -1272,6 +1286,7 @@ fn semantic_tool_result_item(
         tool_call_id,
         context.map(|context| context.tool_name.as_str()),
         context.map(|context| context.arguments_json.as_str()),
+        context.and_then(|context| context.working_directory.as_deref()),
         result,
         is_error,
     )
@@ -1283,10 +1298,11 @@ pub fn semantic_tool_result_item_from_raw(
     tool_call_id: &str,
     tool_name: Option<&str>,
     arguments_json: Option<&str>,
+    working_directory: Option<&std::path::Path>,
     result: &ToolInvocationResult,
     is_error: bool,
 ) -> TranscriptItem {
-    match result {
+    let mut item = match result {
         ToolInvocationResult::Text { text } => {
             tool_result_item(tool_call_id, tool_name, arguments_json, text, is_error)
         }
@@ -1296,7 +1312,15 @@ pub fn semantic_tool_result_item_from_raw(
         ToolInvocationResult::Artifact { artifact } => {
             artifact_tool_result_item(tool_call_id, tool_name, arguments_json, artifact, is_error)
         }
+    };
+    if let TranscriptItemKind::ToolResult {
+        working_directory: item_cwd,
+        ..
+    } = &mut item.kind
+    {
+        *item_cwd = working_directory.map(std::path::Path::to_path_buf);
     }
+    item
 }
 
 pub fn display_tool_result_text(result: &str) -> String {

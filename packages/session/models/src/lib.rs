@@ -85,8 +85,28 @@ pub struct ToolInvocationProjectionTerminalOutput {
 #[must_use]
 pub fn build_tool_invocation_projections(events: &[SessionEvent]) -> Vec<ToolInvocationProjection> {
     let mut projections = BTreeMap::new();
+    let mut working_directory = None;
     for event in events {
+        match &event.kind {
+            SessionEventKind::SessionCreated {
+                working_directory: created_working_directory,
+                ..
+            } if !created_working_directory.as_os_str().is_empty() => {
+                working_directory = Some(created_working_directory.clone());
+            }
+            SessionEventKind::WorkingDirectoryChanged {
+                new_working_directory,
+                ..
+            } => working_directory = Some(new_working_directory.clone()),
+            _ => {}
+        }
         apply_tool_invocation_projection_event(&mut projections, event);
+        if let SessionEventKind::ToolCallRequested { tool_call_id, .. } = &event.kind
+            && let Some(projection) = projections.get_mut(tool_call_id)
+            && projection.working_directory.is_none()
+        {
+            projection.working_directory.clone_from(&working_directory);
+        }
     }
     projections.into_values().collect()
 }

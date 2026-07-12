@@ -11,7 +11,10 @@ thread_local! {
     }) };
 }
 
-fn plugin_visual_context(width: u16) -> PluginTuiVisualRenderContext {
+fn plugin_visual_context(
+    width: u16,
+    working_directory: Option<&std::path::Path>,
+) -> PluginTuiVisualRenderContext {
     DIFF_VIEWER_CONFIG.with(|config| {
         let config = config.get();
         let diff_layout = match config.layout {
@@ -21,7 +24,11 @@ fn plugin_visual_context(width: u16) -> PluginTuiVisualRenderContext {
             TuiDiffViewerLayout::Unified => PluginTuiDiffLayout::Unified,
             TuiDiffViewerLayout::SideBySide => PluginTuiDiffLayout::SideBySide,
         };
-        PluginTuiVisualRenderContext::new(width, diff_layout, std::env::current_dir().ok())
+        PluginTuiVisualRenderContext::new(
+            width,
+            diff_layout,
+            working_directory.map(std::path::Path::to_path_buf),
+        )
     })
 }
 
@@ -641,12 +648,14 @@ fn push_transcript_item_rows(
             tool_call_id,
             producer_plugin_id: _,
             tool_name,
+            working_directory,
             request_visual,
             live_preview,
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
                 tool_name,
+                working_directory: working_directory.as_deref(),
                 request_visual: request_visual.as_ref(),
                 _live_preview: *live_preview,
                 plugin_host,
@@ -669,6 +678,7 @@ fn push_transcript_item_rows(
             tool_call_id,
             tool_name,
             arguments_json: _,
+            working_directory,
             result,
             artifact,
             is_error,
@@ -682,6 +692,7 @@ fn push_transcript_item_rows(
                     tool_name: tool_name.as_deref(),
                     result,
                     artifact: artifact.as_deref(),
+                    working_directory: working_directory.as_deref(),
                     is_error: *is_error,
                     has_file_preview: false,
                 },
@@ -839,6 +850,7 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
 struct ToolRequestRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: &'a str,
+    working_directory: Option<&'a std::path::Path>,
     request_visual: Option<&'a bcode_session_models::PluginVisualDescriptor>,
     _live_preview: bool,
     plugin_host: Option<&'a bcode_plugin::PluginHost>,
@@ -862,6 +874,7 @@ fn push_tool_request_rows(
                     PluginTranscriptBlockContext {
                         title: request_visual.title.as_deref().unwrap_or(context.tool_name),
                         visual: plugin_visual,
+                        working_directory: context.working_directory,
                         plugin_host: context.plugin_host,
                         streaming: item.streaming(),
                         is_error: false,
@@ -871,7 +884,13 @@ fn push_tool_request_rows(
                 );
                 return;
             }
-            push_canonical_tool_visual_rows(rows, &visual, width, context.plugin_host);
+            push_canonical_tool_visual_rows(
+                rows,
+                &visual,
+                context.working_directory,
+                width,
+                context.plugin_host,
+            );
             rows.push(Line::default());
             return;
         }
@@ -933,7 +952,7 @@ fn push_live_tool_preview_anchor_rows(
         return;
     };
     let visual = CanonicalToolVisual::from_live_preview(&state.tool_name, &state.preview);
-    push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
+    push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
     rows.push(Line::default());
 }
 
@@ -979,16 +998,18 @@ fn canonical_plugin_visual_available(
 fn push_canonical_tool_visual_rows(
     rows: &mut Vec<Line>,
     visual: &CanonicalToolVisual,
+    working_directory: Option<&std::path::Path>,
     width: u16,
     plugin_host: Option<&bcode_plugin::PluginHost>,
 ) {
     let CanonicalToolVisual::Plugin(plugin_visual) = visual;
-    push_canonical_plugin_visual_rows(rows, plugin_visual, width, plugin_host);
+    push_canonical_plugin_visual_rows(rows, plugin_visual, working_directory, width, plugin_host);
 }
 
 fn push_canonical_plugin_visual_rows(
     rows: &mut Vec<Line>,
     visual: &CanonicalPluginVisual,
+    working_directory: Option<&std::path::Path>,
     width: u16,
     plugin_host: Option<&bcode_plugin::PluginHost>,
 ) {
@@ -1014,7 +1035,7 @@ fn push_canonical_plugin_visual_rows(
     if let Some(native_rows) = registry.visual_rows(
         &route.schema,
         &visual.payload,
-        &plugin_visual_context(width),
+        &plugin_visual_context(width, working_directory),
     ) {
         rows.extend(native_rows);
         return;
@@ -1031,6 +1052,7 @@ fn push_canonical_plugin_visual_rows(
 struct PluginTranscriptBlockContext<'a> {
     title: &'a str,
     visual: &'a CanonicalPluginVisual,
+    working_directory: Option<&'a std::path::Path>,
     plugin_host: Option<&'a bcode_plugin::PluginHost>,
     streaming: bool,
     is_error: bool,
@@ -1058,7 +1080,13 @@ fn push_plugin_transcript_block_rows(
         Style::new().fg(color),
         muted_style(),
     );
-    push_canonical_plugin_visual_rows(rows, context.visual, width, context.plugin_host);
+    push_canonical_plugin_visual_rows(
+        rows,
+        context.visual,
+        context.working_directory,
+        width,
+        context.plugin_host,
+    );
     rows.push(Line::default());
 }
 
@@ -1164,6 +1192,7 @@ struct ToolResultRenderContext<'a> {
     tool_name: Option<&'a str>,
     result: &'a str,
     artifact: Option<&'a bcode_session_models::ToolArtifact>,
+    working_directory: Option<&'a std::path::Path>,
     is_error: bool,
     has_file_preview: bool,
 }
@@ -1181,7 +1210,13 @@ fn push_tool_result_rows(
             && canonical_plugin_visual_render_mode(plugin_visual, plugin_host)
                 == Some(PluginTuiVisualRenderMode::FullBlock)
         {
-            push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
+            push_canonical_tool_visual_rows(
+                rows,
+                &visual,
+                context.working_directory,
+                width,
+                plugin_host,
+            );
             rows.push(Line::default());
             return;
         }
@@ -1194,6 +1229,7 @@ fn push_tool_result_rows(
                 PluginTranscriptBlockContext {
                     title: artifact.title.as_deref().unwrap_or("Tool result"),
                     visual: plugin_visual,
+                    working_directory: context.working_directory,
                     plugin_host,
                     streaming: item.streaming(),
                     is_error: context.is_error,
@@ -1223,7 +1259,13 @@ fn push_tool_result_rows(
     );
     if let Some(artifact) = context.artifact {
         let visual = CanonicalToolVisual::from_artifact(artifact);
-        push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
+        push_canonical_tool_visual_rows(
+            rows,
+            &visual,
+            context.working_directory,
+            width,
+            plugin_host,
+        );
         rows.push(Line::default());
         return;
     }
