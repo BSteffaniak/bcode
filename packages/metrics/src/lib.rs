@@ -474,6 +474,18 @@ impl DatabaseMetrics {
         }
     }
 
+    /// Start timing only when the underlying registry records metrics.
+    #[must_use]
+    pub fn started_at(&self) -> Option<Instant> {
+        self.metrics.is_enabled().then(Instant::now)
+    }
+
+    /// Return whether this recorder currently records metrics.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.metrics.is_enabled()
+    }
+
     /// Record one completed database operation.
     ///
     /// `table` and `transaction` must be low-cardinality identifiers selected by code. Operation
@@ -487,6 +499,9 @@ impl DatabaseMetrics {
         succeeded: bool,
         elapsed_ms: u64,
     ) {
+        if !self.metrics.is_enabled() {
+            return;
+        }
         let mut labels = MetricLabels::from([
             ("database_role".to_owned(), self.role.clone()),
             ("database_backend".to_owned(), self.backend.clone()),

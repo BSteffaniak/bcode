@@ -17,6 +17,12 @@ use switchy::database::{
     Database, DatabaseError, DatabaseTransaction, DatabaseValue, Row, Savepoint,
 };
 
+fn elapsed_ms(started: Option<Instant>) -> u64 {
+    started.map_or(0, |started| {
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
 /// A database decorator that records stable operation metadata without SQL or values.
 #[derive(Debug)]
 pub struct ObservedDatabase {
@@ -35,7 +41,7 @@ impl ObservedTransaction {
         &self,
         operation: DatabaseOperation,
         table: Option<&str>,
-        started: Instant,
+        started: Option<Instant>,
         result: &Result<T, DatabaseError>,
     ) {
         self.metrics.record(
@@ -43,7 +49,7 @@ impl ObservedTransaction {
             table,
             "active",
             result.is_ok(),
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms(started),
         );
     }
 }
@@ -72,7 +78,7 @@ impl ObservedDatabase {
         &self,
         operation: DatabaseOperation,
         table: Option<&str>,
-        started: Instant,
+        started: Option<Instant>,
         result: &Result<T, DatabaseError>,
     ) {
         self.metrics.record(
@@ -80,7 +86,7 @@ impl ObservedDatabase {
             table,
             "none",
             result.is_ok(),
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms(started),
         );
     }
 }
@@ -88,7 +94,7 @@ impl ObservedDatabase {
 #[async_trait]
 impl Database for ObservedDatabase {
     async fn query(&self, query: &SelectQuery<'_>) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.query(query).await;
         self.record(
             DatabaseOperation::Select,
@@ -100,7 +106,7 @@ impl Database for ObservedDatabase {
     }
 
     async fn query_first(&self, query: &SelectQuery<'_>) -> Result<Option<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.query_first(query).await;
         self.record(
             DatabaseOperation::Select,
@@ -115,7 +121,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &UpdateStatement<'_>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_update(statement).await;
         self.record(
             DatabaseOperation::Update,
@@ -130,7 +136,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &UpdateStatement<'_>,
     ) -> Result<Option<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_update_first(statement).await;
         self.record(
             DatabaseOperation::Update,
@@ -142,7 +148,7 @@ impl Database for ObservedDatabase {
     }
 
     async fn exec_insert(&self, statement: &InsertStatement<'_>) -> Result<Row, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_insert(statement).await;
         self.record(
             DatabaseOperation::Insert,
@@ -157,7 +163,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &UpsertStatement<'_>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_upsert(statement).await;
         self.record(
             DatabaseOperation::Upsert,
@@ -172,7 +178,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &UpsertStatement<'_>,
     ) -> Result<Row, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_upsert_first(statement).await;
         self.record(
             DatabaseOperation::Upsert,
@@ -187,7 +193,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &UpsertMultiStatement<'_>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_upsert_multi(statement).await;
         self.record(
             DatabaseOperation::Upsert,
@@ -202,7 +208,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &DeleteStatement<'_>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_delete(statement).await;
         self.record(
             DatabaseOperation::Delete,
@@ -217,7 +223,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &DeleteStatement<'_>,
     ) -> Result<Option<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_delete_first(statement).await;
         self.record(
             DatabaseOperation::Delete,
@@ -229,14 +235,14 @@ impl Database for ObservedDatabase {
     }
 
     async fn exec_raw(&self, statement: &str) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_raw(statement).await;
         self.record(DatabaseOperation::RawExec, None, started, &result);
         result
     }
 
     async fn query_raw(&self, query: &str) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.query_raw(query).await;
         self.record(DatabaseOperation::RawQuery, None, started, &result);
         result
@@ -247,7 +253,7 @@ impl Database for ObservedDatabase {
         query: &str,
         params: &[DatabaseValue],
     ) -> Result<u64, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_raw_params(query, params).await;
         self.record(DatabaseOperation::RawExec, None, started, &result);
         result
@@ -258,14 +264,14 @@ impl Database for ObservedDatabase {
         query: &str,
         params: &[DatabaseValue],
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.query_raw_params(query, params).await;
         self.record(DatabaseOperation::RawQuery, None, started, &result);
         result
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn DatabaseTransaction>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.begin_transaction().await;
         self.record(DatabaseOperation::Begin, None, started, &result);
         result.map(|inner| {
@@ -280,7 +286,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &schema::CreateTableStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_create_table(statement).await;
         self.record(
             DatabaseOperation::CreateTable,
@@ -294,7 +300,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &schema::DropTableStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_drop_table(statement).await;
         self.record(
             DatabaseOperation::DropTable,
@@ -308,7 +314,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &schema::CreateIndexStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_create_index(statement).await;
         self.record(
             DatabaseOperation::CreateIndex,
@@ -322,7 +328,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &schema::DropIndexStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_drop_index(statement).await;
         self.record(
             DatabaseOperation::DropIndex,
@@ -336,7 +342,7 @@ impl Database for ObservedDatabase {
         &self,
         statement: &schema::AlterTableStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_alter_table(statement).await;
         self.record(
             DatabaseOperation::AlterTable,
@@ -347,7 +353,7 @@ impl Database for ObservedDatabase {
         result
     }
     async fn table_exists(&self, table_name: &str) -> Result<bool, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.table_exists(table_name).await;
         self.record(
             DatabaseOperation::TableExists,
@@ -358,7 +364,7 @@ impl Database for ObservedDatabase {
         result
     }
     async fn list_tables(&self) -> Result<Vec<String>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.list_tables().await;
         self.record(DatabaseOperation::ListTables, None, started, &result);
         result
@@ -367,7 +373,7 @@ impl Database for ObservedDatabase {
         &self,
         table_name: &str,
     ) -> Result<Option<schema::TableInfo>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.get_table_info(table_name).await;
         self.record(
             DatabaseOperation::TableInfo,
@@ -381,7 +387,7 @@ impl Database for ObservedDatabase {
         &self,
         table_name: &str,
     ) -> Result<Vec<schema::ColumnInfo>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.get_table_columns(table_name).await;
         self.record(
             DatabaseOperation::TableColumns,
@@ -396,7 +402,7 @@ impl Database for ObservedDatabase {
         table_name: &str,
         column_name: &str,
     ) -> Result<bool, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.column_exists(table_name, column_name).await;
         self.record(
             DatabaseOperation::ColumnExists,
@@ -407,26 +413,26 @@ impl Database for ObservedDatabase {
         result
     }
     fn trigger_close(&self) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.trigger_close();
         self.record(DatabaseOperation::Close, None, started, &result);
         result
     }
     async fn close(&self) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.close().await;
         self.record(DatabaseOperation::Close, None, started, &result);
         result
     }
     async fn clear_connection_cache(&self) {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         self.inner.clear_connection_cache().await;
         self.metrics.record(
             DatabaseOperation::ClearConnectionCache,
             None,
             "none",
             true,
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms(started),
         );
     }
 }
@@ -434,7 +440,7 @@ impl Database for ObservedDatabase {
 #[async_trait]
 impl Database for ObservedTransaction {
     async fn query(&self, query: &SelectQuery<'_>) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.query(query).await;
         self.record(
             DatabaseOperation::Select,
@@ -446,7 +452,7 @@ impl Database for ObservedTransaction {
     }
 
     async fn query_first(&self, query: &SelectQuery<'_>) -> Result<Option<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.query_first(query).await;
         self.record(
             DatabaseOperation::Select,
@@ -461,7 +467,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &UpdateStatement<'_>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_update(statement).await;
         self.record(
             DatabaseOperation::Update,
@@ -476,7 +482,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &UpdateStatement<'_>,
     ) -> Result<Option<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_update_first(statement).await;
         self.record(
             DatabaseOperation::Update,
@@ -488,7 +494,7 @@ impl Database for ObservedTransaction {
     }
 
     async fn exec_insert(&self, statement: &InsertStatement<'_>) -> Result<Row, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_insert(statement).await;
         self.record(
             DatabaseOperation::Insert,
@@ -503,7 +509,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &UpsertStatement<'_>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_upsert(statement).await;
         self.record(
             DatabaseOperation::Upsert,
@@ -518,7 +524,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &UpsertStatement<'_>,
     ) -> Result<Row, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_upsert_first(statement).await;
         self.record(
             DatabaseOperation::Upsert,
@@ -533,7 +539,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &UpsertMultiStatement<'_>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_upsert_multi(statement).await;
         self.record(
             DatabaseOperation::Upsert,
@@ -548,7 +554,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &DeleteStatement<'_>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_delete(statement).await;
         self.record(
             DatabaseOperation::Delete,
@@ -563,7 +569,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &DeleteStatement<'_>,
     ) -> Result<Option<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_delete_first(statement).await;
         self.record(
             DatabaseOperation::Delete,
@@ -575,14 +581,14 @@ impl Database for ObservedTransaction {
     }
 
     async fn exec_raw(&self, statement: &str) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_raw(statement).await;
         self.record(DatabaseOperation::RawExec, None, started, &result);
         result
     }
 
     async fn query_raw(&self, query: &str) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.query_raw(query).await;
         self.record(DatabaseOperation::RawQuery, None, started, &result);
         result
@@ -593,7 +599,7 @@ impl Database for ObservedTransaction {
         query: &str,
         params: &[DatabaseValue],
     ) -> Result<u64, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_raw_params(query, params).await;
         self.record(DatabaseOperation::RawExec, None, started, &result);
         result
@@ -604,14 +610,14 @@ impl Database for ObservedTransaction {
         query: &str,
         params: &[DatabaseValue],
     ) -> Result<Vec<Row>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.query_raw_params(query, params).await;
         self.record(DatabaseOperation::RawQuery, None, started, &result);
         result
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn DatabaseTransaction>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.begin_transaction().await;
         self.record(DatabaseOperation::Begin, None, started, &result);
         result.map(|inner| {
@@ -626,7 +632,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &schema::CreateTableStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_create_table(statement).await;
         self.record(
             DatabaseOperation::CreateTable,
@@ -640,7 +646,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &schema::DropTableStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_drop_table(statement).await;
         self.record(
             DatabaseOperation::DropTable,
@@ -654,7 +660,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &schema::CreateIndexStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_create_index(statement).await;
         self.record(
             DatabaseOperation::CreateIndex,
@@ -668,7 +674,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &schema::DropIndexStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_drop_index(statement).await;
         self.record(
             DatabaseOperation::DropIndex,
@@ -682,7 +688,7 @@ impl Database for ObservedTransaction {
         &self,
         statement: &schema::AlterTableStatement<'_>,
     ) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.exec_alter_table(statement).await;
         self.record(
             DatabaseOperation::AlterTable,
@@ -693,7 +699,7 @@ impl Database for ObservedTransaction {
         result
     }
     async fn table_exists(&self, table_name: &str) -> Result<bool, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.table_exists(table_name).await;
         self.record(
             DatabaseOperation::TableExists,
@@ -704,7 +710,7 @@ impl Database for ObservedTransaction {
         result
     }
     async fn list_tables(&self) -> Result<Vec<String>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.list_tables().await;
         self.record(DatabaseOperation::ListTables, None, started, &result);
         result
@@ -713,7 +719,7 @@ impl Database for ObservedTransaction {
         &self,
         table_name: &str,
     ) -> Result<Option<schema::TableInfo>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.get_table_info(table_name).await;
         self.record(
             DatabaseOperation::TableInfo,
@@ -727,7 +733,7 @@ impl Database for ObservedTransaction {
         &self,
         table_name: &str,
     ) -> Result<Vec<schema::ColumnInfo>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.get_table_columns(table_name).await;
         self.record(
             DatabaseOperation::TableColumns,
@@ -742,7 +748,7 @@ impl Database for ObservedTransaction {
         table_name: &str,
         column_name: &str,
     ) -> Result<bool, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.column_exists(table_name, column_name).await;
         self.record(
             DatabaseOperation::ColumnExists,
@@ -753,26 +759,26 @@ impl Database for ObservedTransaction {
         result
     }
     fn trigger_close(&self) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.trigger_close();
         self.record(DatabaseOperation::Close, None, started, &result);
         result
     }
     async fn close(&self) -> Result<(), DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.close().await;
         self.record(DatabaseOperation::Close, None, started, &result);
         result
     }
     async fn clear_connection_cache(&self) {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         self.inner.clear_connection_cache().await;
         self.metrics.record(
             DatabaseOperation::ClearConnectionCache,
             None,
             "active",
             true,
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms(started),
         );
     }
 }
@@ -781,34 +787,34 @@ impl Database for ObservedTransaction {
 impl DatabaseTransaction for ObservedTransaction {
     async fn commit(self: Box<Self>) -> Result<(), DatabaseError> {
         let Self { inner, metrics } = *self;
-        let started = Instant::now();
+        let started = metrics.started_at();
         let result = inner.commit().await;
         metrics.record(
             DatabaseOperation::Commit,
             None,
             "active",
             result.is_ok(),
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms(started),
         );
         result
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), DatabaseError> {
         let Self { inner, metrics } = *self;
-        let started = Instant::now();
+        let started = metrics.started_at();
         let result = inner.rollback().await;
         metrics.record(
             DatabaseOperation::Rollback,
             None,
             "active",
             result.is_ok(),
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms(started),
         );
         result
     }
 
     async fn savepoint(&self, name: &str) -> Result<Box<dyn Savepoint>, DatabaseError> {
-        let started = Instant::now();
+        let started = self.metrics.started_at();
         let result = self.inner.savepoint(name).await;
         self.record(DatabaseOperation::Savepoint, None, started, &result);
         result.map(|inner| {
@@ -842,28 +848,28 @@ impl DatabaseTransaction for ObservedTransaction {
 impl Savepoint for ObservedSavepoint {
     async fn release(self: Box<Self>) -> Result<(), DatabaseError> {
         let Self { inner, metrics } = *self;
-        let started = Instant::now();
+        let started = metrics.started_at();
         let result = inner.release().await;
         metrics.record(
             DatabaseOperation::SavepointRelease,
             None,
             "active",
             result.is_ok(),
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms(started),
         );
         result
     }
 
     async fn rollback_to(self: Box<Self>) -> Result<(), DatabaseError> {
         let Self { inner, metrics } = *self;
-        let started = Instant::now();
+        let started = metrics.started_at();
         let result = inner.rollback_to().await;
         metrics.record(
             DatabaseOperation::SavepointRollback,
             None,
             "active",
             result.is_ok(),
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms(started),
         );
         result
     }
@@ -883,12 +889,77 @@ mod tests {
         Column, DataType, alter_table, create_index, create_table, drop_index, drop_table,
     };
 
-    fn observed(metrics: &MetricsRegistry) -> ObservedDatabase {
+    fn observed_with_registry(metrics: MetricsRegistry) -> ObservedDatabase {
         let connection = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
         let database = RusqliteDatabase::new(vec![Arc::new(switchy::unsync::sync::Mutex::new(
             connection,
         ))]);
-        ObservedDatabase::new(Box::new(database), metrics.clone(), "test", "sqlite")
+        ObservedDatabase::new(Box::new(database), metrics, "test", "sqlite")
+    }
+
+    fn observed(metrics: &MetricsRegistry) -> ObservedDatabase {
+        observed_with_registry(metrics.clone())
+    }
+
+    #[tokio::test]
+    #[ignore = "manual release benchmark"]
+    async fn benchmark_instrumentation_overhead() {
+        const SAMPLES: u32 = 20_000;
+
+        let direct_connection = rusqlite::Connection::open_in_memory().expect("direct sqlite");
+        let direct = RusqliteDatabase::new(vec![Arc::new(switchy::unsync::sync::Mutex::new(
+            direct_connection,
+        ))]);
+        let observed_disabled = observed_with_registry(MetricsRegistry::disabled());
+        let observed_enabled = observed_with_registry(MetricsRegistry::in_memory());
+        let query = select("sqlite_master").columns(&["name"]).limit(1);
+
+        // Warm all implementations before measuring.
+        for _ in 0..1_000 {
+            direct.query(&query).await.expect("direct warmup");
+            observed_disabled
+                .query(&query)
+                .await
+                .expect("disabled warmup");
+            observed_enabled
+                .query(&query)
+                .await
+                .expect("enabled warmup");
+        }
+
+        let started = Instant::now();
+        for _ in 0..SAMPLES {
+            direct.query(&query).await.expect("direct query");
+        }
+        let direct_ns = started.elapsed().as_nanos();
+
+        let started = Instant::now();
+        for _ in 0..SAMPLES {
+            observed_disabled
+                .query(&query)
+                .await
+                .expect("disabled query");
+        }
+        let disabled_ns = started.elapsed().as_nanos();
+
+        let started = Instant::now();
+        for _ in 0..SAMPLES {
+            observed_enabled.query(&query).await.expect("enabled query");
+        }
+        let enabled_ns = started.elapsed().as_nanos();
+
+        let overhead_percent =
+            |observed: u128| observed.saturating_sub(direct_ns).saturating_mul(10_000) / direct_ns;
+        eprintln!(
+            "database observability benchmark ({SAMPLES} selects): direct={} ns/op, disabled={} ns/op ({}.{:02}%), enabled={} ns/op ({}.{:02}%)",
+            direct_ns / u128::from(SAMPLES),
+            disabled_ns / u128::from(SAMPLES),
+            overhead_percent(disabled_ns) / 100,
+            overhead_percent(disabled_ns) % 100,
+            enabled_ns / u128::from(SAMPLES),
+            overhead_percent(enabled_ns) / 100,
+            overhead_percent(enabled_ns) % 100,
+        );
     }
 
     #[tokio::test]
