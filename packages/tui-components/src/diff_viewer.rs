@@ -1202,14 +1202,17 @@ fn hidden_row(count: usize, width: u16) -> Line {
     let inner_width = usize::from(width.saturating_sub(4));
     let clipped = truncate_to_display_width(&text, inner_width);
     let clipped_width = UnicodeWidthStr::width(clipped.as_str());
+    let padding = inner_width.saturating_sub(clipped_width);
+    let left_padding = padding / 2;
+    let right_padding = padding.saturating_sub(left_padding);
     let mut spans = vec![
         Span::styled("  ", muted_style()),
         Span::styled("│ ", muted_style()),
+        Span::styled(" ".repeat(left_padding), muted_style()),
         Span::styled(clipped, muted_style()),
     ];
-    let padding = inner_width.saturating_sub(clipped_width);
-    if padding > 0 {
-        spans.push(Span::styled(" ".repeat(padding), muted_style()));
+    if right_padding > 0 {
+        spans.push(Span::styled(" ".repeat(right_padding), muted_style()));
     }
     spans.push(Span::styled(" │", muted_style()));
     Line::from_spans(spans)
@@ -1230,7 +1233,7 @@ fn truncate_to_display_width(text: &str, width: usize) -> String {
 }
 
 fn hidden_text(count: usize) -> String {
-    format!("… {count} diff rows hidden …")
+    format!("⋯ {count} rows omitted ⋯")
 }
 
 const fn mode_label(old_text_is_empty: bool) -> &'static str {
@@ -1367,7 +1370,7 @@ mod tests {
         let rows = test_diff_viewer_rows("src/lib.rs", "", &new_text, "Applying", false, 80);
         let rendered = format!("{rows:?}");
         assert!(rendered.contains("src/lib.rs  +40 -0"));
-        assert!(rendered.contains("diff rows hidden"));
+        assert!(rendered.contains("rows omitted"));
     }
 
     #[test]
@@ -1442,6 +1445,14 @@ mod tests {
             .map(|span| UnicodeWidthStr::width(span.content.as_ref() as &str))
             .sum();
         assert_eq!(rendered_width, usize::from(width) + 2);
+        let text_index = row
+            .spans
+            .iter()
+            .position(|span| span.content.contains("rows omitted"))
+            .expect("omission text");
+        let left_padding = UnicodeWidthStr::width(row.spans[text_index - 1].content.as_str());
+        let right_padding = UnicodeWidthStr::width(row.spans[text_index + 1].content.as_str());
+        assert!(left_padding.abs_diff(right_padding) <= 1);
     }
 
     #[test]
