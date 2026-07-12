@@ -1006,6 +1006,10 @@ mod tests {
             .expect_err("invalid parameterized raw query should fail");
         let transaction = database.begin_transaction().await.expect("begin");
         transaction
+            .query(&select("missing_table"))
+            .await
+            .expect_err("missing transaction table should fail");
+        transaction
             .exec_insert(&insert("items").value("id", 2).value("name", "second"))
             .await
             .expect("transaction insert");
@@ -1083,5 +1087,48 @@ mod tests {
         assert!(!serialized.contains("second"));
         assert!(!serialized.contains("SELECT *"));
         assert!(serialized.contains("raw_query"));
+
+        let timeline_events = report
+            .events
+            .iter()
+            .filter(|event| event.name == "database.operation.timeline")
+            .collect::<Vec<_>>();
+        assert!(!timeline_events.is_empty());
+        for event in &timeline_events {
+            assert_eq!(
+                event.labels.get("database_role").map(String::as_str),
+                Some("test")
+            );
+            assert_eq!(
+                event.labels.get("database_backend").map(String::as_str),
+                Some("sqlite")
+            );
+            assert_eq!(
+                event.labels.get("outcome").map(String::as_str),
+                Some("error")
+            );
+            assert!(event.labels.contains_key("operation"));
+            assert!(event.labels.contains_key("transaction"));
+        }
+        let raw = timeline_events
+            .iter()
+            .find(|event| event.labels.get("operation").map(String::as_str) == Some("raw_query"))
+            .expect("raw query timeline event");
+        assert_eq!(
+            raw.labels.get("transaction").map(String::as_str),
+            Some("none")
+        );
+        assert!(!raw.labels.contains_key("table"));
+        let transaction_select = timeline_events
+            .iter()
+            .find(|event| {
+                event.labels.get("operation").map(String::as_str) == Some("select")
+                    && event.labels.get("transaction").map(String::as_str) == Some("active")
+            })
+            .expect("transaction select timeline event");
+        assert_eq!(
+            transaction_select.labels.get("table").map(String::as_str),
+            Some("missing_table")
+        );
     }
 }

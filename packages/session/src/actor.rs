@@ -616,6 +616,7 @@ impl SessionActor {
                     "session.actor.append_event.db_append_duration_ms",
                     elapsed_ms(db_append_started_at),
                 );
+                crate::record_session_event_domain_metrics(metrics, &event);
             }
             event
         } else {

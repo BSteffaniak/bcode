@@ -50,6 +50,42 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::spawn_blocking;
 
+fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &SessionEvent) {
+    if let Ok(payload) = serde_json::to_vec(event) {
+        metrics.record_histogram("session.event.payload_bytes", payload.len() as u64);
+    }
+    if matches!(
+        event.kind,
+        SessionEventKind::UserMessage { .. }
+            | SessionEventKind::AssistantMessage { .. }
+            | SessionEventKind::ToolCallRequested { .. }
+            | SessionEventKind::ToolCallFinished { .. }
+            | SessionEventKind::SystemMessage { .. }
+            | SessionEventKind::WorkingDirectoryChanged { .. }
+            | SessionEventKind::ContextCompacted { .. }
+            | SessionEventKind::ProviderContextCompacted { .. }
+            | SessionEventKind::ContextUsageObserved { .. }
+    ) {
+        metrics.increment_counter("session.event.semantic_rows");
+    }
+    match &event.kind {
+        SessionEventKind::ToolCallFinished {
+            semantic_result: Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }),
+            ..
+        } => {
+            metrics.add_counter(
+                "session.event.artifact_references",
+                u64::try_from(artifact.refs.len()).unwrap_or(u64::MAX),
+            );
+        }
+        SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::ProviderContextCompacted { .. } => {
+            metrics.increment_counter("session.event.compaction_boundaries");
+        }
+        _ => {}
+    }
+}
+
 fn ensure_loaded_metric_labels(result: &str) -> MetricLabels {
     let mut labels = MetricLabels::new();
     labels.insert("result".to_owned(), result.to_owned());
@@ -3047,6 +3083,82 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{SessionLeaseOwnerContext, SessionManager, db};
     use bcode_metrics::MetricsRegistry;
+
+    #[test]
+    fn domain_metrics_count_payload_semantics_artifacts_and_compaction_boundaries() {
+        let metrics = MetricsRegistry::in_memory();
+        let session_id = SessionId::new();
+        let artifact = bcode_session_models::ToolArtifact {
+            artifact_id: "artifact".to_owned(),
+            producer_plugin_id: "plugin".to_owned(),
+            schema: "schema".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some("call".to_owned()),
+            title: None,
+            metadata: serde_json::Value::Null,
+            refs: vec![bcode_session_models::ToolArtifactRef {
+                key: "recording".to_owned(),
+                content_type: None,
+                storage_uri: Some("artifact://recording".to_owned()),
+                byte_len: Some(12),
+                metadata: None,
+            }],
+        };
+        let events = [
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call".to_owned(),
+                    result: "done".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(artifact),
+                    }),
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ContextCompacted {
+                    summary: "summary".to_owned(),
+                    compacted_through_sequence: 1,
+                },
+            },
+        ];
+        for event in &events {
+            super::record_session_event_domain_metrics(&metrics, event);
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.counters.get("session.event.semantic_rows"),
+            Some(&2)
+        );
+        assert_eq!(
+            snapshot.counters.get("session.event.artifact_references"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot.counters.get("session.event.compaction_boundaries"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .histograms
+                .get("session.event.payload_bytes")
+                .map(|histogram| histogram.count),
+            Some(2)
+        );
+    }
+
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderContextSnapshot,
         ProviderContextSnapshotOrigin, ProviderStreamEvent, RuntimeWorkId, RuntimeWorkKind,
