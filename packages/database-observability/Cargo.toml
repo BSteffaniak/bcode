@@ -13,7 +13,7 @@ version     = { workspace = true }
 [dependencies]
 async-trait      = { workspace = true }
 bcode_metrics    = { workspace = true }
-switchy_database = { workspace = true, features = ["schema"] }
+switchy_database = { workspace = true, features = ["cascade", "schema"] }
 
 [features]
 default          = []

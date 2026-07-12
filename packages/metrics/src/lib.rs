@@ -283,6 +283,30 @@ pub enum DatabaseOperation {
     Upsert,
     /// Typed delete statement.
     Delete,
+    /// Typed schema create-table statement.
+    CreateTable,
+    /// Typed schema drop-table statement.
+    DropTable,
+    /// Typed schema create-index statement.
+    CreateIndex,
+    /// Typed schema drop-index statement.
+    DropIndex,
+    /// Typed schema alter-table statement.
+    AlterTable,
+    /// Schema table-existence lookup.
+    TableExists,
+    /// Schema table listing.
+    ListTables,
+    /// Schema table-info lookup.
+    TableInfo,
+    /// Schema column-info lookup.
+    TableColumns,
+    /// Schema column-existence lookup.
+    ColumnExists,
+    /// Connection close trigger or completion.
+    Close,
+    /// Connection-cache clearing.
+    ClearConnectionCache,
     /// Raw query without retaining its SQL.
     RawQuery,
     /// Raw execution without retaining its SQL.
@@ -309,6 +333,18 @@ impl DatabaseOperation {
             Self::Update => "update",
             Self::Upsert => "upsert",
             Self::Delete => "delete",
+            Self::CreateTable => "create_table",
+            Self::DropTable => "drop_table",
+            Self::CreateIndex => "create_index",
+            Self::DropIndex => "drop_index",
+            Self::AlterTable => "alter_table",
+            Self::TableExists => "table_exists",
+            Self::ListTables => "list_tables",
+            Self::TableInfo => "table_info",
+            Self::TableColumns => "table_columns",
+            Self::ColumnExists => "column_exists",
+            Self::Close => "close",
+            Self::ClearConnectionCache => "clear_connection_cache",
             Self::RawQuery => "raw_query",
             Self::RawExec => "raw_exec",
             Self::Begin => "begin",
