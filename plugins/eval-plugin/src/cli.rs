@@ -1,6 +1,5 @@
 //! Statically bundled eval CLI contribution.
 
-use bcode_client::BcodeClient;
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{
     StaticCliFuture, StaticCliHostAction, StaticCliOutcome, StaticCliRegistration,
