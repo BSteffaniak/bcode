@@ -19938,6 +19938,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_compaction_before_provider_work_persists_no_marker() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("cancel compaction".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+        let cancel_state = TurnCancelState::default();
+        cancel_state.cancel().await;
+
+        let Err(error) = compact_session_context_with_limit(
+            &state,
+            session_id,
+            &SessionModelSelection::default(),
+            None,
+            None,
+            &cancel_state,
+            None,
+        )
+        .await
+        else {
+            panic!("cancelled compaction must stop before provider work");
+        };
+        assert!(matches!(error, CompactionError::Cancelled));
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[tokio::test]
     async fn permission_request_events_do_not_persist_legacy_request_presentation() {
         let sessions = SessionManager::default();
         let summary = sessions
