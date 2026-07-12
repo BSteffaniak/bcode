@@ -1,6 +1,7 @@
 use bcode_ipc::RuntimeWorkSnapshot;
 use bcode_plugin::PluginInvocationCancelHandle;
 use bcode_session_models::{RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionId};
+use futures::{StreamExt, stream};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -177,9 +178,11 @@ impl RuntimeWorkManager {
             pending.extend(children);
         }
         drop(active);
-        for cancellation in cancellations {
-            cancellation.cancel().await;
-        }
+        stream::iter(cancellations)
+            .for_each_concurrent(None, |cancellation| async move {
+                cancellation.cancel().await;
+            })
+            .await;
         cancelled_work_ids
     }
 

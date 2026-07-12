@@ -208,6 +208,7 @@ clap = { version = "4.5.40", default-features = false }
 cmake = { version = "0.1.54", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 devicons = { version = "0.6.12", default-features = false }
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
 git2 = { version = "0.20.3", default-features = false }
 globset = { version = "0.4.18", default-features = false }
 httpdate = { version = "1.0.3", default-features = false }

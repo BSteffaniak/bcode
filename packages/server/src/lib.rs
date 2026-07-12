@@ -53,12 +53,12 @@ use bcode_ipc::{
 };
 use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
-    CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
-    ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
-    ModelParameters, ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse,
-    OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
+    ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata, ImageRefContent,
+    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage, ModelParameters,
+    ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse, OP_AUTH_USAGE,
+    OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
+    PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent, ReasoningEffort,
+    StartTurnResponse, TokenUsage,
 };
 use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
 use bcode_plugin_sdk::path::{display, display_from_current_dir};
@@ -91,8 +91,9 @@ use bcode_tool::{
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
-    ToolResultContent,
+    ToolResultContent, ToolSideEffect,
 };
+use futures::{StreamExt, stream};
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -6056,7 +6057,7 @@ async fn run_session_runtime(
                 selection,
                 response,
             } => {
-                let result = process_compact_session_command(
+                let result = Box::pin(process_compact_session_command(
                     &state,
                     permit.session_id(),
                     Arc::clone(&phase),
@@ -6067,7 +6068,7 @@ async fn run_session_runtime(
                     Arc::clone(&current_turn),
                     client_id,
                     selection,
-                )
+                ))
                 .await;
                 let _sent = response.send(result);
             }
@@ -7966,42 +7967,15 @@ async fn request_session_turn_cancellation(
     };
 
     current_turn.cancel_state.cancel().await;
+    let turn_id = current_turn.turn_id;
     if current_turn.kind == RuntimeOperationKind::ModelTurn {
-        append_model_turn_cancel_requested_event(
-            state,
-            session_id,
-            current_turn.turn_id.clone(),
-            requested_by,
-        )
-        .await;
+        append_model_turn_cancel_requested_event(state, session_id, turn_id.clone(), requested_by)
+            .await;
         cancel_registered_runtime_work(
             state,
             session_id,
-            RuntimeWorkId::new(format!("model_{}", current_turn.turn_id)),
+            RuntimeWorkId::new(format!("model_{turn_id}")),
             requested_by,
-        )
-        .await;
-    }
-
-    let active_turn = state.active_model_turn_snapshot(session_id).await;
-    let Some(active_turn) = active_turn else {
-        return true;
-    };
-    let request = CancelTurnRequest {
-        provider_turn_id: active_turn.provider_turn_id,
-    };
-    let cancel_result = invoke_model_provider_json_blocking::<_, bcode_model::AckResponse>(
-        state,
-        active_turn.provider_plugin_id,
-        OP_CANCEL_TURN,
-        request,
-    )
-    .await;
-    if let Err(error) = cancel_result {
-        append_system_event(
-            state,
-            session_id,
-            format!("provider turn cancellation failed: {error}"),
         )
         .await;
     }
@@ -8547,6 +8521,7 @@ const MODEL_STREAM_FLUSH_BYTES: usize = 512;
 const TOOL_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const TOOL_OUTPUT_FLUSH_BYTES: usize = 4096;
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
+const MAX_PARALLEL_TOOL_CALLS: usize = 4;
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
 
 #[derive(Debug, Clone, Default)]
@@ -8556,6 +8531,7 @@ struct ModelPollOutcome {
     provider_error: Option<bcode_model::ProviderError>,
     pending_managed_compaction: Option<PendingManagedCompaction>,
     pending_provider_response_id: Option<String>,
+    pending_tool_calls: Vec<bcode_model::ToolCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -8815,10 +8791,11 @@ struct ModelStreamAccumulator {
     pending_text: String,
     pending_reasoning: String,
     last_flush: Instant,
+    cancel_state: Arc<TurnCancelState>,
 }
 
 impl ModelStreamAccumulator {
-    fn new(session_id: SessionId, turn_id: &str) -> Self {
+    fn new(session_id: SessionId, turn_id: &str, cancel_state: Arc<TurnCancelState>) -> Self {
         Self {
             session_id,
             turn_id: turn_id.to_owned(),
@@ -8826,15 +8803,22 @@ impl ModelStreamAccumulator {
             pending_text: String::new(),
             pending_reasoning: String::new(),
             last_flush: Instant::now(),
+            cancel_state,
         }
     }
 
     fn push_text(&mut self, text: &str) {
+        if self.cancel_state.is_cancelled() {
+            return;
+        }
         self.assistant_text.push_str(text);
         self.pending_text.push_str(text);
     }
 
     fn push_reasoning(&mut self, text: &str) {
+        if self.cancel_state.is_cancelled() {
+            return;
+        }
         self.pending_reasoning.push_str(text);
     }
 
@@ -8853,6 +8837,12 @@ impl ModelStreamAccumulator {
     }
 
     async fn flush(&mut self, state: &ServerState) {
+        if self.cancel_state.is_cancelled() {
+            self.assistant_text.clear();
+            self.pending_text.clear();
+            self.pending_reasoning.clear();
+            return;
+        }
         let text = std::mem::take(&mut self.pending_text);
         if !text.is_empty() {
             let _ = state
@@ -9512,7 +9502,7 @@ async fn run_model_turn(
     completion
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
 async fn run_model_turn_inner(
     state: &ServerState,
     session_id: SessionId,
@@ -9783,7 +9773,29 @@ async fn run_model_turn_inner(
             return completion;
         }
         match outcome.stop_reason {
-            Some(bcode_model::StopReason::ToolCall) => {}
+            Some(bcode_model::StopReason::ToolCall) => {
+                if outcome.pending_tool_calls.is_empty() {
+                    let message =
+                        "model stopped for tool calls without emitting a complete tool call"
+                            .to_string();
+                    append_system_event(state, session_id, message.clone()).await;
+                    return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+                }
+                if !execute_model_tool_batch(
+                    state,
+                    session_id,
+                    outcome.pending_tool_calls,
+                    Arc::clone(&cancel_state),
+                    command_context,
+                )
+                .await
+                {
+                    return ModelTurnCompletion::with_message(
+                        ModelTurnOutcome::Cancelled,
+                        "model turn cancelled",
+                    );
+                }
+            }
             Some(_) => return ModelTurnCompletion::completed(),
             None => {
                 let message = "model provider polling ended without a terminal event".to_string();
@@ -10639,7 +10651,7 @@ async fn run_model_turn_round(
     }
     drop(marker_commit);
 
-    if !assistant_text.is_empty() {
+    if !assistant_text.is_empty() && !cancel_state.is_cancelled() {
         append_assistant_message_event(state, session_id, assistant_text).await;
     }
 
@@ -10790,7 +10802,7 @@ async fn poll_model_turn_events(
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> (String, ModelPollOutcome) {
-    let mut stream = ModelStreamAccumulator::new(session_id, turn_id);
+    let mut stream = ModelStreamAccumulator::new(session_id, turn_id, Arc::clone(&cancel_state));
     let mut outcome = ModelPollOutcome::default();
     let mut stream_progress = ModelStreamProgress::default();
     let mut idle_for = Duration::ZERO;
@@ -11055,7 +11067,7 @@ async fn handle_provider_turn_event(
     stream: &mut ModelStreamAccumulator,
     outcome: &mut ModelPollOutcome,
     stream_progress: &mut ModelStreamProgress,
-    command_context: &mut RuntimeCommandContext<'_>,
+    command_context: &RuntimeCommandContext<'_>,
 ) {
     if state
         .session_current_turn(session_id)
@@ -11094,15 +11106,9 @@ async fn handle_provider_turn_event(
         ProviderTurnEvent::ToolCallFinished { call } => {
             let call_id = call.id.clone();
             stream_progress.record_completed_tool_call(&call);
-            handle_provider_tool_call_finished_event(
-                state,
-                session_id,
-                turn_id,
-                call,
-                stream,
-                command_context,
-            )
-            .await;
+            handle_provider_tool_call_finished_event(state, session_id, turn_id, &call, stream)
+                .await;
+            outcome.pending_tool_calls.push(call);
             stream_progress.finish_tool_call(&call_id);
         }
         ProviderTurnEvent::Warning { message } => {
@@ -11411,9 +11417,8 @@ async fn handle_provider_tool_call_finished_event(
     state: &ServerState,
     session_id: SessionId,
     turn_id: &str,
-    call: bcode_model::ToolCall,
+    call: &bcode_model::ToolCall,
     stream: &mut ModelStreamAccumulator,
-    command_context: &mut RuntimeCommandContext<'_>,
 ) {
     publish_provider_stream_progress_live(
         state,
@@ -11462,23 +11467,13 @@ async fn handle_provider_tool_call_finished_event(
     .await;
     stream.flush(state).await;
     let assistant_text = stream.take_assistant_text();
-    if !assistant_text.is_empty() {
+    if !assistant_text.is_empty()
+        && active_turn_cancel_state(state, session_id)
+            .await
+            .is_some_and(|cancel_state| !cancel_state.is_cancelled())
+    {
         append_assistant_message_event(state, session_id, assistant_text).await;
     }
-    let Some(cancel_state) = active_turn_cancel_state(state, session_id).await else {
-        return;
-    };
-    if cancel_state.is_cancelled() {
-        return;
-    }
-    execute_model_tool(
-        state,
-        session_id,
-        call,
-        Arc::clone(&cancel_state),
-        command_context,
-    )
-    .await;
 }
 
 async fn active_turn_cancel_state(
@@ -13487,14 +13482,98 @@ fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
     }
 }
 
+async fn execute_model_tool_batch(
+    state: &ServerState,
+    session_id: SessionId,
+    calls: Vec<bcode_model::ToolCall>,
+    cancel_state: Arc<TurnCancelState>,
+    command_context: &mut RuntimeCommandContext<'_>,
+) -> bool {
+    let mut groups: Vec<(bool, Vec<bcode_model::ToolCall>)> = Vec::new();
+    for call in calls {
+        if cancel_state.is_cancelled() {
+            return false;
+        }
+        let parallel = find_tool_provider(state, &call.name)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|(_, definition)| definition.side_effect == ToolSideEffect::ReadOnly);
+        if let Some((group_parallel, group)) = groups.last_mut()
+            && *group_parallel == parallel
+            && parallel
+        {
+            group.push(call);
+        } else {
+            groups.push((parallel, vec![call]));
+        }
+    }
+
+    for (parallel, group) in groups {
+        if cancel_state.is_cancelled() {
+            return false;
+        }
+        if parallel {
+            let executions = stream::iter(group.into_iter().enumerate().map(|(index, call)| {
+                let cancel_state = Arc::clone(&cancel_state);
+                async move {
+                    (
+                        index,
+                        execute_model_tool(state, session_id, call, cancel_state).await,
+                    )
+                }
+            }))
+            .buffer_unordered(MAX_PARALLEL_TOOL_CALLS)
+            .collect::<Vec<_>>();
+            let ProviderCallWait::Completed(mut results) = wait_for_provider_call(
+                state,
+                session_id,
+                command_context,
+                cancel_state.as_ref(),
+                Box::pin(executions),
+            )
+            .await
+            else {
+                return false;
+            };
+            results.sort_by_key(|(index, _)| *index);
+            for (_, result) in results {
+                if let Some(result) = result {
+                    append_tool_finished_event(state, session_id, result).await;
+                }
+            }
+        } else {
+            for call in group {
+                let execution =
+                    execute_model_tool(state, session_id, call, Arc::clone(&cancel_state));
+                match wait_for_provider_call(
+                    state,
+                    session_id,
+                    command_context,
+                    cancel_state.as_ref(),
+                    Box::pin(execution),
+                )
+                .await
+                {
+                    ProviderCallWait::Completed(Some(result)) => {
+                        append_tool_finished_event(state, session_id, result).await;
+                    }
+                    ProviderCallWait::Completed(None) => {}
+                    ProviderCallWait::Cancelled => return false,
+                }
+            }
+        }
+    }
+    !cancel_state.is_cancelled()
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_model_tool(
     state: &ServerState,
     session_id: SessionId,
     call: bcode_model::ToolCall,
     cancel_state: Arc<TurnCancelState>,
-    command_context: &mut RuntimeCommandContext<'_>,
-) {
+) -> Option<ToolFinishedEventInput> {
     let producer_plugin_id = find_tool_provider(state, &call.name)
         .await
         .ok()
@@ -13517,20 +13596,7 @@ async fn execute_model_tool(
             None,
         )
         .await;
-        append_tool_finished_event(
-            state,
-            session_id,
-            ToolFinishedEventInput {
-                tool_call_id: call.id,
-                result: "tool skipped because model turn was cancelled".to_string(),
-                is_error: true,
-                content: Vec::new(),
-                output: None,
-                semantic_result: None,
-            },
-        )
-        .await;
-        return;
+        return None;
     }
     let tool_labels = tool_invocation_metric_labels(
         session_id,
@@ -13543,22 +13609,20 @@ async fn execute_model_tool(
         .span("tool.invocation")
         .labels(tool_labels.clone());
     let tool_start = Instant::now();
-    let result = invoke_model_tool(
-        state,
-        session_id,
-        &call,
-        cancel_state.as_ref(),
-        command_context,
-    )
-    .await
-    .unwrap_or_else(|error| ToolInvocationResponse {
-        output: error,
-        is_error: true,
-        content: Vec::new(),
-        full_output: None,
-        host_action: None,
-        result: None,
-    });
+    let result = invoke_model_tool(state, session_id, &call, cancel_state.as_ref())
+        .await
+        .unwrap_or_else(|error| ToolInvocationResponse {
+            output: error,
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            host_action: None,
+            result: None,
+        });
+    if cancel_state.is_cancelled() {
+        tool_span.finish_err();
+        return None;
+    }
     let semantic_result = result.result.clone().map(service_tool_result_to_session);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_bytes = artifact_output.len();
@@ -13601,19 +13665,14 @@ async fn execute_model_tool(
         },
     )
     .await;
-    append_tool_finished_event(
-        state,
-        session_id,
-        ToolFinishedEventInput {
-            tool_call_id: call.id,
-            result: result.output,
-            is_error: result.is_error,
-            content: result.content,
-            output: output_blob,
-            semantic_result,
-        },
-    )
-    .await;
+    Some(ToolFinishedEventInput {
+        tool_call_id: call.id,
+        result: result.output,
+        is_error: result.is_error,
+        content: result.content,
+        output: output_blob,
+        semantic_result,
+    })
 }
 
 fn tool_invocation_metric_labels(
@@ -13638,7 +13697,6 @@ async fn invoke_model_tool(
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     cancel_state: &TurnCancelState,
-    command_context: &mut RuntimeCommandContext<'_>,
 ) -> Result<ToolInvocationResponse, String> {
     let (plugin_id, definition) = find_tool_provider(state, &call.name)
         .await?
@@ -13884,88 +13942,11 @@ async fn invoke_model_tool(
     let mut stream_sequences: BTreeMap<String, u64> = BTreeMap::new();
     let response = loop {
         tokio::select! {
-            cancel_command = command_context.cancel_commands.recv() => {
-                if let Some(command) = cancel_command {
-                    let cancelled = process_cancel_turn_command(
-                        state,
-                        session_id,
-                        command_context.followup_commands,
-                        command_context.queued_followups,
-                        command.clear_queue,
-                        command.requested_by,
-                    )
-                    .await;
-                    let _sent = command.response.send(cancelled);
-                }
-                if cancel_state.is_cancelled() {
-                    invocation.cancel.cancel();
-                    let _ = std::fs::write(&cancellation_path, b"cancelled\n");
-                    cancel_registered_runtime_work(
-                        state,
-                        session_id,
-                        RuntimeWorkId::new(format!("tool_{}", call.id)),
-                        None,
-                    )
-                    .await;
-                    return Ok(ToolInvocationResponse {
-                        output: "tool invocation cancelled".to_string(),
-                        is_error: true,
-                        content: Vec::new(),
-                        full_output: None,
-                        host_action: None,
-                        result: None,
-                    });
-                }
-            }
-            steering_command = command_context.steering_commands.recv() => {
-                if let Some(command) = steering_command {
-                    process_steering_message_command(
-                        state,
-                        session_id,
-                        command.client_id,
-                        command.text,
-                        command.completion,
-                    )
-                    .await;
-                }
-                if cancel_state.is_cancelled() {
-                    invocation.cancel.cancel();
-                    let _ = std::fs::write(&cancellation_path, b"cancelled\n");
-                    cancel_registered_runtime_work(
-                        state,
-                        session_id,
-                        RuntimeWorkId::new(format!("tool_{}", call.id)),
-                        None,
-                    )
-                    .await;
-                    return Ok(ToolInvocationResponse {
-                        output: "tool invocation cancelled".to_string(),
-                        is_error: true,
-                        content: Vec::new(),
-                        full_output: None,
-                        host_action: None,
-                        result: None,
-                    });
-                }
-            }
+            biased;
             () = cancel_state.cancelled() => {
                 invocation.cancel.cancel();
                 let _ = std::fs::write(&cancellation_path, b"cancelled\n");
-                cancel_registered_runtime_work(
-                    state,
-                    session_id,
-                    RuntimeWorkId::new(format!("tool_{}", call.id)),
-                    None,
-                )
-                .await;
-                return Ok(ToolInvocationResponse {
-                    output: "tool invocation cancelled".to_string(),
-                    is_error: true,
-                    content: Vec::new(),
-                    full_output: None,
-            host_action: None,
-            result: None,
-                });
+                return Ok(tool_error("tool invocation cancelled"));
             }
             publisher_event = tool_output_publisher.next_event() => {
                 if let Some(publisher_event) = publisher_event {
@@ -13975,14 +13956,11 @@ async fn invoke_model_tool(
             event = invocation.next_event() => {
                 match event.map_err(|error| error.to_string())? {
                     StreamingServiceInvocationEvent::Event(payload) => {
-                        if let Ok(event) =
-                            serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
+                        if !cancel_state.is_cancelled()
+                            && let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
                         {
-                            let event =
-                                normalize_tool_stream_event_sequence(event, &mut stream_sequences);
-                            tool_output_publisher
-                                .push_stream_event(state, session_id, event)
-                                .await;
+                            let event = normalize_tool_stream_event_sequence(event, &mut stream_sequences);
+                            tool_output_publisher.push_stream_event(state, session_id, event).await;
                         }
                     }
                     StreamingServiceInvocationEvent::Response(response) => {
@@ -13992,7 +13970,9 @@ async fn invoke_model_tool(
             }
         }
     };
-    while let Some(payload) = invocation.try_recv_event() {
+    while !cancel_state.is_cancelled()
+        && let Some(payload) = invocation.try_recv_event()
+    {
         if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
             let event = normalize_tool_stream_event_sequence(event, &mut stream_sequences);
             tool_output_publisher
@@ -14017,7 +13997,6 @@ async fn invoke_model_tool(
                     &plugin_id,
                     request,
                     cancel_state,
-                    command_context,
                 )
                 .await;
             }
@@ -14033,7 +14012,6 @@ async fn handle_interactive_tool_request(
     plugin_id: &str,
     request: bcode_tool::InteractiveToolRequest,
     cancel_state: &TurnCancelState,
-    command_context: &mut RuntimeCommandContext<'_>,
 ) -> Result<ToolInvocationResponse, String> {
     if request.interaction_id.is_empty() {
         return Ok(tool_error(
@@ -14100,7 +14078,6 @@ async fn handle_interactive_tool_request(
         &resolution_slot,
         &notify,
         cancel_state,
-        command_context,
     )
     .await;
     let resume = InteractiveToolResumeRequest {
@@ -15423,7 +15400,6 @@ async fn wait_for_interactive_tool_resolution(
     resolution_slot: &Arc<Mutex<Option<InteractiveToolResolution>>>,
     notify: &Arc<Notify>,
     cancel_state: &TurnCancelState,
-    command_context: &mut RuntimeCommandContext<'_>,
 ) -> InteractiveToolResolution {
     loop {
         let value = resolution_slot.lock().await.clone();
@@ -15432,50 +15408,6 @@ async fn wait_for_interactive_tool_resolution(
         }
         tokio::select! {
             () = notify.notified() => {}
-            cancel_command = command_context.cancel_commands.recv() => {
-                if let Some(command) = cancel_command {
-                    let cancelled = process_cancel_turn_command(
-                        state,
-                        session_id,
-                        command_context.followup_commands,
-                        command_context.queued_followups,
-                        command.clear_queue,
-                        command.requested_by,
-                    ).await;
-                    let _sent = command.response.send(cancelled);
-                }
-                if cancel_state.is_cancelled() {
-                    return abort_interactive_tool_request(
-                        state,
-                        session_id,
-                        interaction_id,
-                        &call.id,
-                        bcode_tool::InteractiveToolAbortReason::TurnCancelled,
-                        Some("model turn cancelled".to_string()),
-                    ).await;
-                }
-            }
-            steering_command = command_context.steering_commands.recv() => {
-                if let Some(command) = steering_command {
-                    process_steering_message_command(
-                        state,
-                        session_id,
-                        command.client_id,
-                        command.text,
-                        command.completion,
-                    ).await;
-                }
-                if cancel_state.is_cancelled() {
-                    return abort_interactive_tool_request(
-                        state,
-                        session_id,
-                        interaction_id,
-                        &call.id,
-                        bcode_tool::InteractiveToolAbortReason::TurnCancelled,
-                        Some("model turn cancelled".to_string()),
-                    ).await;
-                }
-            }
             () = cancel_state.cancelled() => {
                 return abort_interactive_tool_request(
                     state,
