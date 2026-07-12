@@ -15,7 +15,7 @@ use std::future::Future;
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -313,6 +313,9 @@ struct MetricsEventWriter {
     dropped_events: AtomicU64,
     failed: Arc<AtomicBool>,
 }
+
+static METRICS_EVENT_WRITERS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<MetricsEventWriter>>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetricsEventLogManifest {
@@ -997,14 +1000,15 @@ impl MetricsState {
 
 impl MetricsEventLog {
     fn new(root_dir: PathBuf, config: MetricsEventLogConfig) -> Self {
-        static WRITERS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<MetricsEventWriter>>>> =
-            OnceLock::new();
-        let writers = WRITERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let writers = METRICS_EVENT_WRITERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let normalized_root = normalize_metrics_root(&root_dir);
         let mut writers = writers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(writer) = writers.get(&root_dir).and_then(Weak::upgrade) {
-            return Self { writer };
+        if let Some(writer) = writers.get(&normalized_root) {
+            return Self {
+                writer: Arc::clone(writer),
+            };
         }
         let (sender, receiver) = mpsc::sync_channel(METRICS_EVENT_QUEUE_CAPACITY);
         let failed = Arc::new(AtomicBool::new(false));
@@ -1014,16 +1018,36 @@ impl MetricsEventLog {
             dropped_events: AtomicU64::new(0),
             failed,
         });
-        writers.insert(root_dir.clone(), Arc::downgrade(&writer));
+        writers.insert(normalized_root, Arc::clone(&writer));
         thread::Builder::new()
             .name("bcode-metrics-writer".to_string())
             .spawn(move || {
                 let log = SynchronousMetricsEventLog::new(root_dir, config);
                 while let Ok(command) = receiver.recv() {
                     match command {
-                        MetricsWriterCommand::Event(event) => {
-                            if log.try_append_event(&event).is_err() {
+                        MetricsWriterCommand::Event(first) => {
+                            let mut events = vec![first];
+                            let mut pending_flush = None;
+                            while events.len() < 256 {
+                                match receiver.try_recv() {
+                                    Ok(MetricsWriterCommand::Event(event)) => events.push(event),
+                                    Ok(MetricsWriterCommand::Flush(acknowledge)) => {
+                                        pending_flush = Some(acknowledge);
+                                        break;
+                                    }
+                                    Err(
+                                        mpsc::TryRecvError::Empty
+                                        | mpsc::TryRecvError::Disconnected,
+                                    ) => {
+                                        break;
+                                    }
+                                }
+                            }
+                            if log.try_append_events(&events).is_err() {
                                 writer_failed.store(true, Ordering::Release);
+                            }
+                            if let Some(acknowledge) = pending_flush {
+                                let _ = acknowledge.send(());
                             }
                         }
                         MetricsWriterCommand::Flush(acknowledge) => {
@@ -1080,30 +1104,42 @@ impl SynchronousMetricsEventLog {
         }
     }
 
-    fn try_append_event(&self, event: &MetricEvent) -> std::io::Result<()> {
+    fn try_append_events(&self, events: &[MetricEvent]) -> std::io::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
         fs::create_dir_all(&self.root_dir)?;
         let now_ms = current_unix_millis();
         let mut manifest = self.load_or_initialize_manifest(now_ms);
-        let line = serde_json::to_string(event).unwrap_or_default();
-        let line_bytes = u64::try_from(line.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
+        let lines = events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(std::io::Error::other)?;
+        let line_bytes = lines.iter().fold(0_u64, |total, line| {
+            total
+                .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
+                .saturating_add(1)
+        });
         let active_path = self.root_dir.join(&manifest.active_segment);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&active_path)?;
-        writeln!(file, "{line}")?;
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
         let active_bytes = fs::metadata(&active_path).map_or(line_bytes, |metadata| metadata.len());
+        let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
         if let Some(segment) = manifest
             .segments
             .iter_mut()
             .find(|segment| segment.name == manifest.active_segment)
         {
-            segment.event_count = segment.event_count.saturating_add(1);
+            segment.event_count = segment.event_count.saturating_add(event_count);
             segment.bytes = active_bytes;
         }
-        manifest.event_count = manifest.event_count.saturating_add(1);
+        manifest.event_count = manifest.event_count.saturating_add(event_count);
         manifest.updated_unix_ms = now_ms;
         manifest.total_segment_bytes = compute_total_segment_bytes(&self.root_dir, &manifest);
         if active_bytes >= self.config.segment_max_bytes.max(1) {
@@ -1299,6 +1335,14 @@ pub fn descriptors_from_events(events: &[MetricEvent]) -> BTreeMap<String, Metri
         }
     }
     descriptors
+}
+
+fn normalize_metrics_root(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    }
 }
 
 fn metrics_event_log_root(path: &Path) -> PathBuf {
@@ -1572,6 +1616,64 @@ mod tests {
                     && event.labels.get("session_id") == Some(&"session-a".to_owned())
                     && event.labels.get("outcome") == Some(&"ok".to_owned()))
         );
+    }
+
+    #[test]
+    fn concurrent_registries_share_one_writer_without_malformed_lines() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("events.jsonl");
+        let mut workers = Vec::new();
+        for worker in 0..8 {
+            let path = path.clone();
+            workers.push(thread::spawn(move || {
+                let metrics = MetricsRegistry::with_event_log(path);
+                for index in 0..100 {
+                    let mut labels = MetricLabels::new();
+                    labels.insert("worker".to_owned(), worker.to_string());
+                    metrics.record_event("concurrent.event", index, labels);
+                }
+                metrics.flush_persistence()
+            }));
+        }
+        for worker in workers {
+            assert_eq!(
+                worker.join().expect("worker should join"),
+                MetricsPersistenceStatus::default()
+            );
+        }
+
+        let report = MetricsRegistry::report_from_event_log_path(
+            &path,
+            MetricsEventLogConfig::default(),
+            1_000,
+        );
+        assert_eq!(report.events.len(), 800);
+        let manifest: MetricsEventLogManifest = serde_json::from_slice(
+            &fs::read(dir.path().join(METRICS_MANIFEST_FILE_NAME)).expect("manifest should exist"),
+        )
+        .expect("manifest should parse");
+        assert_eq!(manifest.event_count, 800);
+        for segment in manifest.segments {
+            let file = fs::File::open(dir.path().join(segment.name)).expect("segment should open");
+            for line in BufReader::new(file).lines() {
+                let line = line.expect("line should read");
+                serde_json::from_str::<MetricEvent>(&line)
+                    .expect("line should be valid event JSON");
+            }
+        }
+    }
+
+    #[test]
+    fn writer_failure_is_visible_after_flush() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let blocked_root = dir.path().join("blocked");
+        fs::write(&blocked_root, b"not a directory").expect("blocking file");
+        let metrics = MetricsRegistry::with_event_log(&blocked_root);
+        metrics.record_event("failed.event", 1, MetricLabels::new());
+
+        let status = metrics.flush_persistence();
+        assert!(status.writer_failed);
+        assert_eq!(status.dropped_events, 0);
     }
 
     #[test]
