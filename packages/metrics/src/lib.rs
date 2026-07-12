@@ -14,7 +14,9 @@ use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
+use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const HISTOGRAM_BUCKETS_MS: &[u64] = &[
@@ -26,6 +28,7 @@ const DEFAULT_METRICS_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_METRICS_TOTAL_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_METRICS_RECENT_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const METRICS_MANIFEST_FILE_NAME: &str = "manifest.json";
+const METRICS_EVENT_QUEUE_CAPACITY: usize = 8_192;
 
 /// Metric labels used for filtering and grouping dashboard views.
 pub type MetricLabels = BTreeMap<String, String>;
@@ -96,6 +99,15 @@ impl Default for MetricsEventLogConfig {
             recent_read_max_bytes: DEFAULT_METRICS_RECENT_READ_MAX_BYTES,
         }
     }
+}
+
+/// Health counters for queued persistent metric events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsPersistenceStatus {
+    /// Number of events rejected because the bounded queue was full or disconnected.
+    pub dropped_events: u64,
+    /// Whether the background writer observed a persistence failure.
+    pub writer_failed: bool,
 }
 
 /// Point-in-time metrics snapshot suitable for IPC/status responses.
@@ -286,9 +298,20 @@ struct MetricsState {
 
 #[derive(Debug, Clone)]
 struct MetricsEventLog {
-    root_dir: PathBuf,
-    manifest_path: PathBuf,
-    config: MetricsEventLogConfig,
+    writer: Arc<MetricsEventWriter>,
+}
+
+#[derive(Debug)]
+enum MetricsWriterCommand {
+    Event(MetricEvent),
+    Flush(mpsc::Sender<()>),
+}
+
+#[derive(Debug)]
+struct MetricsEventWriter {
+    sender: mpsc::SyncSender<MetricsWriterCommand>,
+    dropped_events: AtomicU64,
+    failed: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,7 +415,9 @@ impl MetricsRegistry {
         config: MetricsEventLogConfig,
         max_events: usize,
     ) -> MetricsReport {
-        let log = MetricsEventLog::new(metrics_event_log_root(event_log_path.as_ref()), config);
+        let root = metrics_event_log_root(event_log_path.as_ref());
+        let _ = MetricsEventLog::new(root.clone(), config).flush();
+        let log = SynchronousMetricsEventLog::new(root, config);
         let events = log.read_recent_events(max_events);
         MetricsReport {
             generated_at_unix_ms: current_unix_millis(),
@@ -661,6 +686,26 @@ impl MetricsRegistry {
             return MetricsSnapshot::default();
         };
         state.snapshot()
+    }
+
+    /// Flush queued persistent events and return writer health.
+    ///
+    /// In-memory and disabled registries return immediately.
+    #[must_use]
+    pub fn flush_persistence(&self) -> MetricsPersistenceStatus {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return MetricsPersistenceStatus::default();
+        };
+        let Ok(state) = inner.lock() else {
+            return MetricsPersistenceStatus {
+                writer_failed: true,
+                ..MetricsPersistenceStatus::default()
+            };
+        };
+        state
+            .event_log
+            .as_ref()
+            .map_or_else(MetricsPersistenceStatus::default, MetricsEventLog::flush)
     }
 
     /// Return a rich metrics report with aggregate snapshots and recent events.
@@ -946,24 +991,93 @@ impl MetricsState {
     }
 
     fn report_events(&self) -> Vec<MetricEvent> {
-        self.event_log.as_ref().map_or_else(
-            || self.events.clone(),
-            |log| log.read_recent_events(self.max_events.max(DEFAULT_MAX_EVENTS)),
-        )
+        self.events.clone()
     }
 }
 
 impl MetricsEventLog {
+    fn new(root_dir: PathBuf, config: MetricsEventLogConfig) -> Self {
+        static WRITERS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<MetricsEventWriter>>>> =
+            OnceLock::new();
+        let writers = WRITERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut writers = writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(writer) = writers.get(&root_dir).and_then(Weak::upgrade) {
+            return Self { writer };
+        }
+        let (sender, receiver) = mpsc::sync_channel(METRICS_EVENT_QUEUE_CAPACITY);
+        let failed = Arc::new(AtomicBool::new(false));
+        let writer_failed = Arc::clone(&failed);
+        let writer = Arc::new(MetricsEventWriter {
+            sender,
+            dropped_events: AtomicU64::new(0),
+            failed,
+        });
+        writers.insert(root_dir.clone(), Arc::downgrade(&writer));
+        thread::Builder::new()
+            .name("bcode-metrics-writer".to_string())
+            .spawn(move || {
+                let log = SynchronousMetricsEventLog::new(root_dir, config);
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        MetricsWriterCommand::Event(event) => {
+                            if log.try_append_event(&event).is_err() {
+                                writer_failed.store(true, Ordering::Release);
+                            }
+                        }
+                        MetricsWriterCommand::Flush(acknowledge) => {
+                            let _ = acknowledge.send(());
+                        }
+                    }
+                }
+            })
+            .expect("metrics writer thread should start");
+        Self { writer }
+    }
+
+    fn append_event(&self, event: &MetricEvent) {
+        if self
+            .writer
+            .sender
+            .try_send(MetricsWriterCommand::Event(event.clone()))
+            .is_err()
+        {
+            self.writer.dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn flush(&self) -> MetricsPersistenceStatus {
+        let (sender, receiver) = mpsc::channel();
+        if self
+            .writer
+            .sender
+            .send(MetricsWriterCommand::Flush(sender))
+            .is_ok()
+        {
+            let _ = receiver.recv();
+        }
+        MetricsPersistenceStatus {
+            dropped_events: self.writer.dropped_events.load(Ordering::Acquire),
+            writer_failed: self.writer.failed.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SynchronousMetricsEventLog {
+    root_dir: PathBuf,
+    manifest_path: PathBuf,
+    config: MetricsEventLogConfig,
+}
+
+impl SynchronousMetricsEventLog {
     fn new(root_dir: PathBuf, config: MetricsEventLogConfig) -> Self {
         Self {
             manifest_path: root_dir.join(METRICS_MANIFEST_FILE_NAME),
             root_dir,
             config,
         }
-    }
-
-    fn append_event(&self, event: &MetricEvent) {
-        let _ = self.try_append_event(event);
     }
 
     fn try_append_event(&self, event: &MetricEvent) -> std::io::Result<()> {
@@ -1373,6 +1487,8 @@ mod tests {
             metrics.record_event("test.event", index, labels);
         }
 
+        let status = metrics.flush_persistence();
+        assert_eq!(status, MetricsPersistenceStatus::default());
         let manifest_path = dir.path().join(METRICS_MANIFEST_FILE_NAME);
         let manifest: MetricsEventLogManifest =
             serde_json::from_slice(&fs::read(manifest_path).expect("manifest should exist"))
@@ -1474,6 +1590,8 @@ mod tests {
             metrics.record_event("test.event", index, MetricLabels::new());
         }
 
+        let status = metrics.flush_persistence();
+        assert_eq!(status, MetricsPersistenceStatus::default());
         let manifest: MetricsEventLogManifest = serde_json::from_slice(
             &fs::read(dir.path().join(METRICS_MANIFEST_FILE_NAME)).expect("manifest should exist"),
         )
