@@ -22,6 +22,7 @@ pub struct LiveToolPreviewState {
     pub tool_name: String,
     pub argument_bytes: usize,
     pub preview: LiveToolArgumentPreview,
+    pub working_directory: Option<std::path::PathBuf>,
     pub revision: u64,
     pub snapshots_received: u64,
     pub duplicates_skipped: u64,
@@ -2953,6 +2954,10 @@ impl BmuxApp {
                     tool_name: tool_name.to_owned(),
                     argument_bytes,
                     preview: preview.clone(),
+                    working_directory: self
+                        .tool_call_contexts
+                        .get(tool_call_id)
+                        .and_then(|context| context.working_directory.clone()),
                     revision: 1,
                     snapshots_received: 1,
                     duplicates_skipped: 0,
@@ -3170,7 +3175,17 @@ impl BmuxApp {
             .tool_call_contexts
             .get(tool_call_id)
             .map(|context| context.tool_name.as_str());
-        let mut item = streaming_tool_visual_item(tool_call_id, tool_name, visual, streaming);
+        let working_directory = self
+            .tool_call_contexts
+            .get(tool_call_id)
+            .and_then(|context| context.working_directory.as_deref());
+        let mut item = streaming_tool_visual_item(
+            tool_call_id,
+            tool_name,
+            working_directory,
+            visual,
+            streaming,
+        );
         if let Some(context) = self.streamed_tool_results.get(tool_call_id) {
             item.set_tool_started_at_ms(context.started_at_ms);
         }

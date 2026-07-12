@@ -13534,6 +13534,7 @@ fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_model_tool_batch(
     state: &ServerState,
     session_id: SessionId,
@@ -13547,7 +13548,7 @@ async fn execute_model_tool_batch(
         .await
         .get(&session_id)
         .is_some_and(|skills| !skills.is_empty());
-    let mut groups: Vec<(bool, Vec<bcode_model::ToolCall>)> = Vec::new();
+    let mut groups: Vec<(bool, Vec<(bcode_model::ToolCall, std::path::PathBuf)>)> = Vec::new();
     for call in calls {
         if cancel_state.is_cancelled() {
             return false;
@@ -13559,6 +13560,10 @@ async fn execute_model_tool_batch(
                 definition.side_effect == ToolSideEffect::ReadOnly
                     && !definition.requires_permission
             });
+        let Ok(working_directory) = state.sessions.session_working_directory(session_id).await
+        else {
+            return false;
+        };
         append_tool_request_event(
             state,
             session_id,
@@ -13566,15 +13571,16 @@ async fn execute_model_tool_batch(
             call.name.clone(),
             serde_json::to_string(&call.arguments).unwrap_or_default(),
             provider.map(|(plugin_id, _)| plugin_id),
+            &working_directory,
         )
         .await;
         if let Some((group_parallel, group)) = groups.last_mut()
             && *group_parallel == parallel
             && parallel
         {
-            group.push(call);
+            group.push((call, working_directory));
         } else {
-            groups.push((parallel, vec![call]));
+            groups.push((parallel, vec![(call, working_directory)]));
         }
     }
 
@@ -13583,15 +13589,24 @@ async fn execute_model_tool_batch(
             return false;
         }
         if parallel {
-            let executions = stream::iter(group.into_iter().enumerate().map(|(index, call)| {
-                let cancel_state = Arc::clone(&cancel_state);
-                async move {
-                    (
-                        index,
-                        execute_model_tool(state, session_id, call, cancel_state).await,
-                    )
-                }
-            }))
+            let executions = stream::iter(group.into_iter().enumerate().map(
+                |(index, (call, working_directory))| {
+                    let cancel_state = Arc::clone(&cancel_state);
+                    async move {
+                        (
+                            index,
+                            execute_model_tool(
+                                state,
+                                session_id,
+                                call,
+                                working_directory,
+                                cancel_state,
+                            )
+                            .await,
+                        )
+                    }
+                },
+            ))
             .buffer_unordered(state.tool_execution.max_concurrency.max(1))
             .collect::<Vec<_>>();
             let ProviderCallWait::Completed(mut results) = wait_for_provider_call(
@@ -13612,9 +13627,14 @@ async fn execute_model_tool_batch(
                 }
             }
         } else {
-            for call in group {
-                let execution =
-                    execute_model_tool(state, session_id, call, Arc::clone(&cancel_state));
+            for (call, working_directory) in group {
+                let execution = execute_model_tool(
+                    state,
+                    session_id,
+                    call,
+                    working_directory,
+                    Arc::clone(&cancel_state),
+                );
                 match wait_for_provider_call(
                     state,
                     session_id,
@@ -13641,6 +13661,7 @@ async fn execute_model_tool(
     state: &ServerState,
     session_id: SessionId,
     call: bcode_model::ToolCall,
+    working_directory: std::path::PathBuf,
     cancel_state: Arc<TurnCancelState>,
 ) -> Option<ToolFinishedEventInput> {
     let producer_plugin_id = find_tool_provider(state, &call.name)
@@ -13669,16 +13690,22 @@ async fn execute_model_tool(
         .span("tool.invocation")
         .labels(tool_labels.clone());
     let tool_start = Instant::now();
-    let result = invoke_model_tool(state, session_id, &call, cancel_state.as_ref())
-        .await
-        .unwrap_or_else(|error| ToolInvocationResponse {
-            output: error,
-            is_error: true,
-            content: Vec::new(),
-            full_output: None,
-            host_action: None,
-            result: None,
-        });
+    let result = invoke_model_tool(
+        state,
+        session_id,
+        &call,
+        &working_directory,
+        cancel_state.as_ref(),
+    )
+    .await
+    .unwrap_or_else(|error| ToolInvocationResponse {
+        output: error,
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+        host_action: None,
+        result: None,
+    });
     if cancel_state.is_cancelled() {
         tool_span.finish_err();
         return None;
@@ -13756,6 +13783,7 @@ async fn invoke_model_tool(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
+    working_directory: &std::path::Path,
     cancel_state: &TurnCancelState,
 ) -> Result<ToolInvocationResponse, String> {
     let (plugin_id, definition) = find_tool_provider(state, &call.name)
@@ -13956,11 +13984,7 @@ async fn invoke_model_tool(
             }
         }
     }
-    let working_directory = state
-        .sessions
-        .session_working_directory(session_id)
-        .await
-        .map_err(|error| error.to_string())?;
+    let working_directory = working_directory.to_path_buf();
     let cancellation_path = default_session_artifact_dir(session_id).join(format!(
         "tool-cancel-{}",
         call.id
@@ -15356,13 +15380,9 @@ async fn append_tool_request_event(
     tool_name: String,
     arguments_json: String,
     producer_plugin_id: Option<String>,
+    working_directory: &std::path::Path,
 ) {
     let request_visual = tool_request_visual_descriptor(state, &tool_name, &arguments_json).await;
-    let working_directory = state
-        .sessions
-        .session_working_directory(session_id)
-        .await
-        .ok();
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_label = tool_name.clone();
     let runtime_tool_call_id = tool_call_id.clone();
@@ -15375,7 +15395,7 @@ async fn append_tool_request_event(
                 tool_name,
                 arguments_json,
                 producer_plugin_id,
-                working_directory,
+                working_directory: Some(working_directory.to_path_buf()),
                 request_visual,
                 legacy_request_presentation: None,
             },
@@ -20208,6 +20228,7 @@ mod tests {
             "example.tool".to_owned(),
             "{}".to_owned(),
             Some("test.plugin".to_owned()),
+            &test_working_directory(),
         )
         .await;
 

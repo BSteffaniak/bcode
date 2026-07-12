@@ -952,7 +952,13 @@ fn push_live_tool_preview_anchor_rows(
         return;
     };
     let visual = CanonicalToolVisual::from_live_preview(&state.tool_name, &state.preview);
-    push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
+    push_canonical_tool_visual_rows(
+        rows,
+        &visual,
+        state.working_directory.as_deref(),
+        width,
+        plugin_host,
+    );
     rows.push(Line::default());
 }
 

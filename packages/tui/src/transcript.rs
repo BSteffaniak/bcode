@@ -542,6 +542,7 @@ pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> Tra
 pub fn streaming_tool_visual_item(
     tool_call_id: &str,
     tool_name: Option<&str>,
+    working_directory: Option<&std::path::Path>,
     visual: &bcode_session_models::PluginVisualDescriptor,
     streaming: bool,
 ) -> TranscriptItem {
@@ -569,7 +570,7 @@ pub fn streaming_tool_visual_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: None,
-            working_directory: None,
+            working_directory: working_directory.map(std::path::Path::to_path_buf),
             result: artifact_summary_text(&artifact),
             artifact: Some(Box::new(artifact)),
             is_error: false,
@@ -1385,6 +1386,7 @@ fn apply_tool_invocation_stream_event(
             let mut item = streaming_tool_visual_item(
                 tool_call_id,
                 context.map(|context| context.tool_name.as_str()),
+                context.and_then(|context| context.working_directory.as_deref()),
                 visual,
                 *streaming,
             );
