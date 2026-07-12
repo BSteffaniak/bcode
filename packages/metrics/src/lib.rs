@@ -1514,6 +1514,9 @@ fn current_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    const ABRUPT_CHILD_ENV: &str = "BCODE_METRICS_ABRUPT_CHILD_ROOT";
 
     #[test]
     fn disabled_registry_is_empty_and_noops() {
@@ -1729,6 +1732,115 @@ mod tests {
                     .expect("line should be valid event JSON");
             }
         }
+    }
+
+    #[test]
+    #[ignore = "manual performance benchmark"]
+    fn benchmark_recording_modes() {
+        const SAMPLES: u32 = 5_000;
+        fn record_samples(metrics: &MetricsRegistry) -> u128 {
+            let started = Instant::now();
+            for value in 0..SAMPLES {
+                metrics.record_event("benchmark.event", i64::from(value), MetricLabels::new());
+            }
+            started.elapsed().as_nanos()
+        }
+        fn per_sample(total_ns: u128) -> u128 {
+            total_ns / u128::from(SAMPLES)
+        }
+
+        let disabled_ns = record_samples(&MetricsRegistry::disabled());
+        let aggregate_ns = record_samples(&MetricsRegistry::in_memory());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let queued = MetricsRegistry::with_event_log(dir.path().join("events.jsonl"));
+        let queued_ns = record_samples(&queued);
+        let persistence_started = Instant::now();
+        let status = queued.shutdown_persistence();
+        let persisted_ns = queued_ns.saturating_add(persistence_started.elapsed().as_nanos());
+        assert_eq!(status, MetricsPersistenceStatus::default());
+        let report = MetricsRegistry::report_from_event_log_path(
+            dir.path().join("events.jsonl"),
+            MetricsEventLogConfig::default(),
+            usize::try_from(SAMPLES).expect("sample count"),
+        );
+        assert_eq!(
+            report.events.len(),
+            usize::try_from(SAMPLES).expect("sample count")
+        );
+        eprintln!(
+            "metrics benchmark ({SAMPLES} samples): disabled={} ns/sample, aggregate={} ns/sample, queued={} ns/sample, persisted={} ns/sample",
+            per_sample(disabled_ns),
+            per_sample(aggregate_ns),
+            per_sample(queued_ns),
+            per_sample(persisted_ns),
+        );
+    }
+
+    #[test]
+    fn abrupt_process_exit_keeps_log_parseable_and_recoverable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let executable = std::env::current_exe().expect("current test executable");
+        let status = Command::new(executable)
+            .arg("--exact")
+            .arg("tests::abrupt_process_exit_child")
+            .arg("--nocapture")
+            .env(ABRUPT_CHILD_ENV, dir.path())
+            .status()
+            .expect("abrupt child should run");
+        assert!(status.success());
+
+        let manifest_path = dir.path().join(METRICS_MANIFEST_FILE_NAME);
+        let manifest: MetricsEventLogManifest = serde_json::from_slice(
+            &fs::read(&manifest_path).expect("manifest should survive abrupt exit"),
+        )
+        .expect("manifest should remain valid JSON");
+        assert!(manifest.event_count >= 20);
+        for segment in &manifest.segments {
+            let file = fs::File::open(dir.path().join(&segment.name)).expect("segment should open");
+            for line in BufReader::new(file).lines() {
+                let line = line.expect("line should read");
+                serde_json::from_str::<MetricEvent>(&line)
+                    .expect("line should remain complete JSON");
+            }
+        }
+
+        let path = dir.path().join("events.jsonl");
+        let recovered = MetricsRegistry::with_event_log(&path);
+        recovered.record_event("recovered.event", 1, MetricLabels::new());
+        assert_eq!(
+            recovered.shutdown_persistence(),
+            MetricsPersistenceStatus::default()
+        );
+        let report = MetricsRegistry::report_from_event_log_path(
+            path,
+            MetricsEventLogConfig::default(),
+            1_000,
+        );
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| event.name == "recovered.event")
+        );
+    }
+
+    #[test]
+    fn abrupt_process_exit_child() {
+        let Ok(root) = std::env::var(ABRUPT_CHILD_ENV) else {
+            return;
+        };
+        let metrics = MetricsRegistry::with_event_log(PathBuf::from(root).join("events.jsonl"));
+        for index in 0..20 {
+            metrics.record_event("durable.before.exit", index, MetricLabels::new());
+        }
+        assert_eq!(
+            metrics.flush_persistence(),
+            MetricsPersistenceStatus::default()
+        );
+        for index in 0..1_000 {
+            metrics.record_event("queued.at.exit", index, MetricLabels::new());
+        }
+        std::process::exit(0);
     }
 
     #[test]
