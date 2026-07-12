@@ -46,15 +46,23 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for VimEditPlaybackTuiVisualA
     ) -> Vec<Line> {
         let width = context.width();
         match kind {
-            VIM_EDIT_REQUEST_PREVIEW_SCHEMA => request_rows("Vim edit preview", payload),
-            VIM_EDIT_REQUEST_APPLY_SCHEMA => request_rows("Vim edit apply", payload),
-            VIM_EDIT_LIVE_SCHEMA => live_rows(payload, width),
+            VIM_EDIT_REQUEST_PREVIEW_SCHEMA => request_rows("Vim edit preview", payload, context),
+            VIM_EDIT_REQUEST_APPLY_SCHEMA => request_rows("Vim edit apply", payload, context),
+            VIM_EDIT_LIVE_SCHEMA => live_rows(payload, width, context),
             VIM_EDIT_PLAYBACK_SCHEMA | "bcode.vim-edit.change" => {
-                playback_rows(payload, None, true, true, width)
+                playback_rows(payload, None, true, true, width, context)
             }
             _ => Vec::new(),
         }
     }
+}
+
+fn unknown_visual_context() -> bcode_plugin_sdk::tui::PluginTuiVisualRenderContext {
+    bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+        u16::MAX,
+        bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+        None,
+    )
 }
 
 /// Terminal renderer for interactive Vim edit playback.
@@ -131,6 +139,7 @@ impl VimEditPlaybackTerminalRenderer {
             playback,
             selected_context(playback),
             u16::MAX,
+            &unknown_visual_context(),
         )
         .len()
         .saturating_add(2)
@@ -168,6 +177,7 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
                 snapshot.show_timeline,
                 snapshot.show_diff,
                 width,
+                &unknown_visual_context(),
             )
             .len()
             .saturating_add(1),
@@ -183,6 +193,7 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
             snapshot.show_timeline,
             snapshot.show_diff,
             area.width,
+            &unknown_visual_context(),
         );
         for (offset, line) in rows.iter().enumerate() {
             let Ok(offset) = u16::try_from(offset) else {
@@ -281,11 +292,21 @@ fn request_rows(
     rows
 }
 
-fn live_rows(payload: &Value, width: u16) -> Vec<Line> {
+fn live_rows(
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     if selected_context(payload).is_none() && payload.get("cursor").is_none() {
         return live_lifecycle_rows(payload, width, context);
     }
-    let mut rows = vim_screen_rows("nvim live", payload, selected_context(payload), width);
+    let mut rows = vim_screen_rows(
+        "nvim live",
+        payload,
+        selected_context(payload),
+        width,
+        context,
+    );
     rows.push(Line::from_spans(vec![
         Span::styled("  step ", muted()),
         Span::styled(step_summary(payload), accent()),
@@ -331,10 +352,17 @@ fn playback_rows(
     show_timeline: bool,
     show_diff: bool,
     width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
     let frame = selected_frame.and_then(|index| event(payload, index));
     let source = frame.unwrap_or(payload);
-    let mut rows = vim_screen_rows("nvim playback", payload, selected_context(source), width);
+    let mut rows = vim_screen_rows(
+        "nvim playback",
+        payload,
+        selected_context(source),
+        width,
+        context,
+    );
     if show_timeline {
         rows.push(Line::raw(""));
         rows.push(Line::from_spans(vec![Span::styled("Timeline", accent())]));
@@ -382,7 +410,13 @@ fn playback_control_row(payload: &Value) -> Line {
     Line::from_spans(spans)
 }
 
-fn vim_screen_rows(title: &str, payload: &Value, context: Option<&Value>, width: u16) -> Vec<Line> {
+fn vim_screen_rows(
+    title: &str,
+    payload: &Value,
+    selected: Option<&Value>,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let path = context
         .display_path(text(payload, "path").unwrap_or("<file>"))
         .to_string();
@@ -398,7 +432,7 @@ fn vim_screen_rows(title: &str, payload: &Value, context: Option<&Value>, width:
         pad_rule(&heading, width, '─', '╮'),
         border(),
     )])];
-    if let Some(context) = context {
+    if let Some(context) = selected {
         let start_line = context
             .get("start_line")
             .and_then(Value::as_u64)
@@ -603,7 +637,7 @@ mod tests {
             "path": "/tmp/demo.txt",
             "error": null,
         });
-        let text = row_text(&live_rows(&payload, 80));
+        let text = row_text(&live_rows(&payload, 80, &unknown_visual_context()));
         assert!(text.contains("phase"));
         assert!(text.contains("started"));
         assert!(text.contains("starting Neovim"));
@@ -619,7 +653,7 @@ mod tests {
             "path": "/tmp/demo.txt",
             "error": "nvim not found",
         });
-        let text = row_text(&live_rows(&payload, 80));
+        let text = row_text(&live_rows(&payload, 80, &unknown_visual_context()));
         assert!(text.contains("error"));
         assert!(text.contains("nvim not found"));
         assert!(!text.contains("?:?"), "{text}");
@@ -642,7 +676,7 @@ mod tests {
                 "lines": ["hello"]
             }
         });
-        let text = row_text(&live_rows(&payload, 80));
+        let text = row_text(&live_rows(&payload, 80, &unknown_visual_context()));
         assert!(text.contains("hello"));
         assert!(text.contains("1:6"));
         assert!(text.contains("step"));
