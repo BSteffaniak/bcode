@@ -398,6 +398,27 @@ impl MetricsContext {
         self.with_label("client_id", client_id)
     }
 
+    /// Return a copy of this context with the logical database operation set.
+    ///
+    /// This label identifies a stable application operation (for example `session.append`) rather
+    /// than SQL text, query values, session IDs, or other user-bearing data.
+    #[must_use]
+    pub fn with_database_operation(self, operation: &impl ToString) -> Self {
+        self.with_label("database_operation", operation)
+    }
+
+    /// Return a copy of this context with the database role set.
+    #[must_use]
+    pub fn with_database_role(self, role: &impl ToString) -> Self {
+        self.with_label("database_role", role)
+    }
+
+    /// Return a copy of this context with the database backend set.
+    #[must_use]
+    pub fn with_database_backend(self, backend: &impl ToString) -> Self {
+        self.with_label("database_backend", backend)
+    }
+
     /// Merge explicit labels with this context, preserving explicit values on conflicts.
     #[must_use]
     pub fn merged_labels(&self, explicit: MetricLabels) -> MetricLabels {
@@ -507,6 +528,22 @@ impl MetricsRegistry {
     {
         let _ = self;
         scope_metrics_context(context, future).await
+    }
+
+    /// Run a future in a stable logical database-operation scope.
+    ///
+    /// The operation must be a low-cardinality application name and must not contain SQL, query
+    /// values, paths, session identifiers, or other user-bearing data. Nested metric recording
+    /// inherits the scope while explicit per-event labels continue to take precedence.
+    pub async fn in_database_operation<F, T>(&self, operation: &str, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        self.in_context(
+            MetricsContext::new().with_database_operation(&operation),
+            future,
+        )
+        .await
     }
 
     /// Start a named metrics span that records duration and count when finished or dropped.
@@ -1518,6 +1555,62 @@ mod tests {
 
     const ABRUPT_CHILD_ENV: &str = "BCODE_METRICS_ABRUPT_CHILD_ROOT";
 
+    #[tokio::test]
+    async fn database_operation_scope_is_task_local_and_nestable() {
+        let metrics = MetricsRegistry::default();
+        metrics
+            .in_database_operation("session.append", async {
+                metrics.increment_counter("database.operation.total");
+                metrics
+                    .in_database_operation("session.projection.update", async {
+                        metrics.record_event(
+                            "database.operation.duration_ms",
+                            3,
+                            MetricLabels::new(),
+                        );
+                    })
+                    .await;
+                metrics.increment_counter("database.operation.total");
+            })
+            .await;
+        metrics.increment_counter("outside.total");
+
+        let report = metrics.report();
+        let database_events = report
+            .events
+            .iter()
+            .filter(|event| event.name.starts_with("database.operation"))
+            .collect::<Vec<_>>();
+        assert_eq!(database_events.len(), 3);
+        assert_eq!(
+            database_events[0]
+                .labels
+                .get("database_operation")
+                .map(String::as_str),
+            Some("session.append")
+        );
+        assert_eq!(
+            database_events[1]
+                .labels
+                .get("database_operation")
+                .map(String::as_str),
+            Some("session.projection.update")
+        );
+        assert_eq!(
+            database_events[2]
+                .labels
+                .get("database_operation")
+                .map(String::as_str),
+            Some("session.append")
+        );
+        let outside = report
+            .events
+            .iter()
+            .find(|event| event.name == "outside.total")
+            .expect("outside event");
+        assert!(!outside.labels.contains_key("database_operation"));
+    }
+
     #[test]
     fn disabled_registry_is_empty_and_noops() {
         let metrics = MetricsRegistry::disabled();
@@ -1814,13 +1907,15 @@ mod tests {
         let report = MetricsRegistry::report_from_event_log_path(
             path,
             MetricsEventLogConfig::default(),
-            1_000,
+            5_000,
         );
         assert!(
             report
                 .events
                 .iter()
-                .any(|event| event.name == "recovered.event")
+                .any(|event| event.name == "recovered.event"),
+            "recovered event missing from {} persisted events",
+            report.events.len()
         );
     }
 
