@@ -717,7 +717,7 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
     ]));
 
     let preview = inline_preview(&visible_lines, MAX_INLINE_DIFF_ROWS);
-    let resolved_layout = input.layout.resolve(width);
+    let resolved_layout = resolved_layout(input.layout, width, input.old_text, input.new_text);
     let card_width = if resolved_layout == DiffViewerLayout::SideBySide {
         side_by_side_card_width(&preview, width.saturating_sub(2))
     } else {
@@ -736,6 +736,19 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
     }
     rows.push(card_border('└', '─', '┘', card_width));
     rows
+}
+
+const fn resolved_layout(
+    layout: DiffViewerLayout,
+    width: u16,
+    old_text: &str,
+    new_text: &str,
+) -> DiffViewerLayout {
+    if old_text.is_empty() || new_text.is_empty() {
+        DiffViewerLayout::Unified
+    } else {
+        layout.resolve(width)
+    }
 }
 
 const fn is_preview_content_line(kind: DiffLineKind) -> bool {
@@ -1336,13 +1349,14 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
 mod tests {
     use super::*;
 
-    fn test_diff_viewer_rows(
+    fn test_diff_viewer_rows_with_layout(
         label: &str,
         old_text: &str,
         new_text: &str,
         title: &str,
         truncated: bool,
         width: u16,
+        layout: DiffViewerLayout,
     ) -> Vec<Line> {
         diff_viewer_rows(
             DiffViewerInput {
@@ -1355,10 +1369,62 @@ mod tests {
                 subtitle: None,
                 argument_bytes: None,
                 truncated,
-                layout: DiffViewerLayout::Unified,
+                layout,
             },
             width,
         )
+    }
+
+    fn test_diff_viewer_rows(
+        label: &str,
+        old_text: &str,
+        new_text: &str,
+        title: &str,
+        truncated: bool,
+        width: u16,
+    ) -> Vec<Line> {
+        test_diff_viewer_rows_with_layout(
+            label,
+            old_text,
+            new_text,
+            title,
+            truncated,
+            width,
+            DiffViewerLayout::Unified,
+        )
+    }
+
+    #[test]
+    fn one_sided_diffs_fall_back_to_unified_layout() {
+        for (old_text, new_text) in [("", "new line\n"), ("old line\n", "")] {
+            let rows = test_diff_viewer_rows_with_layout(
+                "src/lib.rs",
+                old_text,
+                new_text,
+                "Diff",
+                false,
+                120,
+                DiffViewerLayout::SideBySide,
+            );
+            let card_rows = rows
+                .iter()
+                .filter(|row| {
+                    let text = line_text(row);
+                    text.starts_with("  │")
+                })
+                .collect::<Vec<_>>();
+
+            assert!(!card_rows.is_empty(), "{rows:?}");
+            for row in card_rows {
+                let divider_count = row
+                    .spans
+                    .iter()
+                    .filter(|span| span.content.contains('│'))
+                    .map(|span| span.content.matches('│').count())
+                    .sum::<usize>();
+                assert_eq!(divider_count, 3, "{row:?}");
+            }
+        }
     }
 
     #[test]
