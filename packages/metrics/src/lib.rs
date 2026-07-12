@@ -29,6 +29,7 @@ const DEFAULT_METRICS_TOTAL_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_METRICS_RECENT_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const METRICS_MANIFEST_FILE_NAME: &str = "manifest.json";
 const METRICS_EVENT_QUEUE_CAPACITY: usize = 8_192;
+const DATABASE_SLOW_OPERATION_MS: u64 = 100;
 
 /// Metric labels used for filtering and grouping dashboard views.
 pub type MetricLabels = BTreeMap<String, String>;
@@ -461,12 +462,7 @@ impl DatabaseMetrics {
             labels.insert("table".to_owned(), table.to_owned());
         }
         self.metrics
-            .add_counter_with_labels("database.operation.total", 1, labels.clone());
-        self.metrics.record_histogram_with_labels(
-            "database.operation.duration_ms",
-            elapsed_ms,
-            labels,
-        );
+            .record_database_operation(labels, succeeded, elapsed_ms);
     }
 }
 
@@ -739,6 +735,44 @@ impl MetricsRegistry {
             value: i64::try_from(value).unwrap_or(i64::MAX),
             labels,
         });
+    }
+
+    fn record_database_operation(
+        &self,
+        stable_labels: MetricLabels,
+        succeeded: bool,
+        elapsed_ms: u64,
+    ) {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return;
+        };
+        let Ok(mut state) = inner.lock() else {
+            return;
+        };
+        let counter_key = "database.operation.total";
+        let counter = state.counters.entry(counter_key.to_owned()).or_default();
+        *counter = counter.saturating_add(1);
+        state.observe_descriptor(counter_key, MetricKind::Counter, &stable_labels);
+        let histogram_key = "database.operation.duration_ms";
+        state
+            .histograms
+            .entry(histogram_key.to_owned())
+            .or_default()
+            .record(elapsed_ms);
+        state.observe_descriptor(histogram_key, MetricKind::Histogram, &stable_labels);
+
+        if !succeeded || elapsed_ms >= DATABASE_SLOW_OPERATION_MS {
+            let labels = current_metrics_context().merged_labels(stable_labels);
+            let event_key = "database.operation.timeline";
+            state.observe_descriptor(event_key, MetricKind::Event, &labels);
+            state.push_event(MetricEvent {
+                unix_ms: current_unix_millis(),
+                name: event_key.to_owned(),
+                kind: MetricKind::Event,
+                value: i64::try_from(elapsed_ms).unwrap_or(i64::MAX),
+                labels,
+            });
+        }
     }
 
     /// Set a gauge value.
@@ -1679,46 +1713,106 @@ mod tests {
         database.record(DatabaseOperation::RawExec, None, "active", false, 11);
 
         let report = metrics.report();
-        assert_eq!(report.events.len(), 4);
-        for event in &report.events {
-            assert_eq!(
-                event.labels.get("database_role").map(String::as_str),
-                Some("session")
-            );
-            assert_eq!(
-                event.labels.get("database_backend").map(String::as_str),
-                Some("turso")
-            );
-            assert!(event.labels.contains_key("operation"));
-            assert!(event.labels.contains_key("transaction"));
-            assert!(event.labels.contains_key("outcome"));
-            assert_eq!(
-                event.labels.keys().cloned().collect::<Vec<_>>(),
-                if event.labels.contains_key("table") {
-                    vec![
-                        "database_backend".to_owned(),
-                        "database_role".to_owned(),
-                        "operation".to_owned(),
-                        "outcome".to_owned(),
-                        "table".to_owned(),
-                        "transaction".to_owned(),
-                    ]
-                } else {
-                    vec![
-                        "database_backend".to_owned(),
-                        "database_role".to_owned(),
-                        "operation".to_owned(),
-                        "outcome".to_owned(),
-                        "transaction".to_owned(),
-                    ]
-                }
+        assert_eq!(
+            report.snapshot.counters.get("database.operation.total"),
+            Some(&2)
+        );
+        assert_eq!(
+            report
+                .snapshot
+                .histograms
+                .get("database.operation.duration_ms")
+                .map(|histogram| histogram.count),
+            Some(2)
+        );
+        assert_eq!(report.events.len(), 1);
+        let event = &report.events[0];
+        assert_eq!(event.name, "database.operation.timeline");
+        assert_eq!(
+            event.labels.get("database_role").map(String::as_str),
+            Some("session")
+        );
+        assert_eq!(
+            event.labels.get("database_backend").map(String::as_str),
+            Some("turso")
+        );
+        assert_eq!(
+            event.labels.get("operation").map(String::as_str),
+            Some("raw_exec")
+        );
+        assert_eq!(
+            event.labels.get("transaction").map(String::as_str),
+            Some("active")
+        );
+        assert_eq!(
+            event.labels.get("outcome").map(String::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            event.labels.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "database_backend".to_owned(),
+                "database_role".to_owned(),
+                "operation".to_owned(),
+                "outcome".to_owned(),
+                "transaction".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn database_high_cardinality_context_is_timeline_only() {
+        let metrics = MetricsRegistry::default();
+        let database = DatabaseMetrics::new(metrics.clone(), "session", "turso");
+        metrics
+            .in_context(
+                MetricsContext::new()
+                    .with_session_id(&"session-sensitive")
+                    .with_database_operation(&"session.append"),
+                async {
+                    database.record(
+                        DatabaseOperation::Insert,
+                        Some("session_events"),
+                        "active",
+                        true,
+                        5,
+                    );
+                    database.record(
+                        DatabaseOperation::Insert,
+                        Some("session_events"),
+                        "active",
+                        true,
+                        DATABASE_SLOW_OPERATION_MS,
+                    );
+                },
+            )
+            .await;
+
+        let report = metrics.report();
+        assert_eq!(report.events.len(), 1);
+        let timeline = &report.events[0];
+        assert_eq!(
+            timeline.labels.get("session_id").map(String::as_str),
+            Some("session-sensitive")
+        );
+        assert_eq!(
+            timeline
+                .labels
+                .get("database_operation")
+                .map(String::as_str),
+            Some("session.append")
+        );
+        for descriptor in report.descriptors.values().filter(|descriptor| {
+            descriptor.name == "database.operation.total"
+                || descriptor.name == "database.operation.duration_ms"
+        }) {
+            assert!(!descriptor.label_keys.contains(&"session_id".to_owned()));
+            assert!(
+                !descriptor
+                    .label_keys
+                    .contains(&"database_operation".to_owned())
             );
         }
-        assert_eq!(
-            report.events[0].labels.get("table").map(String::as_str),
-            Some("session_events")
-        );
-        assert!(!report.events[2].labels.contains_key("table"));
     }
 
     #[tokio::test]
