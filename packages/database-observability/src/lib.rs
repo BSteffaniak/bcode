@@ -901,57 +901,94 @@ mod tests {
         observed_with_registry(metrics.clone())
     }
 
+    async fn run_benchmark_workload(database: &dyn Database, samples: u32) {
+        database
+            .exec_create_table(
+                &create_table("benchmark_items")
+                    .column(Column {
+                        name: "id".to_owned(),
+                        nullable: false,
+                        auto_increment: false,
+                        data_type: DataType::Int,
+                        default: None,
+                    })
+                    .primary_key("id"),
+            )
+            .await
+            .expect("benchmark table");
+        for value in 0..samples {
+            database
+                .exec_insert(&insert("benchmark_items").value("id", i64::from(value)))
+                .await
+                .expect("benchmark insert");
+            database
+                .query(&select("benchmark_items").columns(&["id"]).limit(1))
+                .await
+                .expect("benchmark select");
+            database
+                .exec_delete(&delete("benchmark_items"))
+                .await
+                .expect("benchmark delete");
+        }
+    }
+
+    fn direct_database() -> RusqliteDatabase {
+        let connection = rusqlite::Connection::open_in_memory().expect("direct sqlite");
+        RusqliteDatabase::new(vec![Arc::new(switchy::unsync::sync::Mutex::new(
+            connection,
+        ))])
+    }
+
+    async fn benchmark_elapsed(database: &dyn Database, samples: u32) -> u128 {
+        let started = Instant::now();
+        run_benchmark_workload(database, samples).await;
+        started.elapsed().as_nanos()
+    }
+
+    fn median(values: &mut [u128]) -> u128 {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
     #[tokio::test]
     #[ignore = "manual release benchmark"]
     async fn benchmark_instrumentation_overhead() {
-        const SAMPLES: u32 = 20_000;
+        const SAMPLES: u32 = 2_000;
+        const ROUNDS: usize = 9;
+        let mut direct_rounds = Vec::with_capacity(ROUNDS);
+        let mut disabled_rounds = Vec::with_capacity(ROUNDS);
+        let mut enabled_rounds = Vec::with_capacity(ROUNDS);
 
-        let direct_connection = rusqlite::Connection::open_in_memory().expect("direct sqlite");
-        let direct = RusqliteDatabase::new(vec![Arc::new(switchy::unsync::sync::Mutex::new(
-            direct_connection,
-        ))]);
-        let observed_disabled = observed_with_registry(MetricsRegistry::disabled());
-        let observed_enabled = observed_with_registry(MetricsRegistry::in_memory());
-        let query = select("sqlite_master").columns(&["name"]).limit(1);
-
-        // Warm all implementations before measuring.
-        for _ in 0..1_000 {
-            direct.query(&query).await.expect("direct warmup");
-            observed_disabled
-                .query(&query)
-                .await
-                .expect("disabled warmup");
-            observed_enabled
-                .query(&query)
-                .await
-                .expect("enabled warmup");
+        for round in 0..ROUNDS {
+            let direct = direct_database();
+            let disabled = observed_with_registry(MetricsRegistry::disabled());
+            let enabled = observed_with_registry(MetricsRegistry::in_memory());
+            match round % 3 {
+                0 => {
+                    direct_rounds.push(benchmark_elapsed(&direct, SAMPLES).await);
+                    disabled_rounds.push(benchmark_elapsed(&disabled, SAMPLES).await);
+                    enabled_rounds.push(benchmark_elapsed(&enabled, SAMPLES).await);
+                }
+                1 => {
+                    enabled_rounds.push(benchmark_elapsed(&enabled, SAMPLES).await);
+                    direct_rounds.push(benchmark_elapsed(&direct, SAMPLES).await);
+                    disabled_rounds.push(benchmark_elapsed(&disabled, SAMPLES).await);
+                }
+                _ => {
+                    disabled_rounds.push(benchmark_elapsed(&disabled, SAMPLES).await);
+                    enabled_rounds.push(benchmark_elapsed(&enabled, SAMPLES).await);
+                    direct_rounds.push(benchmark_elapsed(&direct, SAMPLES).await);
+                }
+            }
         }
-
-        let started = Instant::now();
-        for _ in 0..SAMPLES {
-            direct.query(&query).await.expect("direct query");
-        }
-        let direct_ns = started.elapsed().as_nanos();
-
-        let started = Instant::now();
-        for _ in 0..SAMPLES {
-            observed_disabled
-                .query(&query)
-                .await
-                .expect("disabled query");
-        }
-        let disabled_ns = started.elapsed().as_nanos();
-
-        let started = Instant::now();
-        for _ in 0..SAMPLES {
-            observed_enabled.query(&query).await.expect("enabled query");
-        }
-        let enabled_ns = started.elapsed().as_nanos();
+        let direct_ns = median(&mut direct_rounds);
+        let disabled_ns = median(&mut disabled_rounds);
+        let enabled_ns = median(&mut enabled_rounds);
 
         let overhead_percent =
             |observed: u128| observed.saturating_sub(direct_ns).saturating_mul(10_000) / direct_ns;
         eprintln!(
-            "database observability benchmark ({SAMPLES} selects): direct={} ns/op, disabled={} ns/op ({}.{:02}%), enabled={} ns/op ({}.{:02}%)",
+            "database observability benchmark ({ROUNDS} median rounds x {SAMPLES} insert/select/delete cycles): direct={} ns/cycle, disabled={} ns/cycle ({}.{:02}%), enabled={} ns/cycle ({}.{:02}%)",
             direct_ns / u128::from(SAMPLES),
             disabled_ns / u128::from(SAMPLES),
             overhead_percent(disabled_ns) / 100,

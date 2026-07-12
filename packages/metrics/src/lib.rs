@@ -270,6 +270,17 @@ pub struct HistogramBucketSnapshot {
     pub count: u64,
 }
 
+#[derive(Clone, Copy)]
+struct DatabaseMetricObservation<'a> {
+    role: &'a str,
+    backend: &'a str,
+    operation: &'a str,
+    table: Option<&'a str>,
+    transaction: &'a str,
+    succeeded: bool,
+    elapsed_ms: u64,
+}
+
 /// Stable database operation categories. Variants intentionally contain no SQL or query values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseOperation {
@@ -390,6 +401,9 @@ struct MetricsState {
     gauges: BTreeMap<String, i64>,
     histograms: BTreeMap<String, Histogram>,
     descriptors: BTreeMap<String, MetricDescriptor>,
+    database_descriptors_initialized: bool,
+    database_operation_total: u64,
+    database_operation_duration: Histogram,
     events: Vec<MetricEvent>,
     event_log: Option<MetricsEventLog>,
     max_events: usize,
@@ -502,21 +516,16 @@ impl DatabaseMetrics {
         if !self.metrics.is_enabled() {
             return;
         }
-        let mut labels = MetricLabels::from([
-            ("database_role".to_owned(), self.role.clone()),
-            ("database_backend".to_owned(), self.backend.clone()),
-            ("operation".to_owned(), operation.label().to_owned()),
-            ("transaction".to_owned(), transaction.to_owned()),
-            (
-                "outcome".to_owned(),
-                if succeeded { "ok" } else { "error" }.to_owned(),
-            ),
-        ]);
-        if let Some(table) = table {
-            labels.insert("table".to_owned(), table.to_owned());
-        }
         self.metrics
-            .record_database_operation(labels, succeeded, elapsed_ms);
+            .record_database_operation(DatabaseMetricObservation {
+                role: &self.role,
+                backend: &self.backend,
+                operation: operation.label(),
+                table,
+                transaction,
+                succeeded,
+                elapsed_ms,
+            });
     }
 }
 
@@ -791,31 +800,40 @@ impl MetricsRegistry {
         });
     }
 
-    fn record_database_operation(
-        &self,
-        stable_labels: MetricLabels,
-        succeeded: bool,
-        elapsed_ms: u64,
-    ) {
+    fn record_database_operation(&self, observation: DatabaseMetricObservation<'_>) {
+        let DatabaseMetricObservation {
+            role,
+            backend,
+            operation,
+            table,
+            transaction,
+            succeeded,
+            elapsed_ms,
+        } = observation;
         let MetricsRegistryInner::Enabled(inner) = &self.inner else {
             return;
         };
         let Ok(mut state) = inner.lock() else {
             return;
         };
-        let counter_key = "database.operation.total";
-        let counter = state.counters.entry(counter_key.to_owned()).or_default();
-        *counter = counter.saturating_add(1);
-        state.observe_descriptor(counter_key, MetricKind::Counter, &stable_labels);
-        let histogram_key = "database.operation.duration_ms";
-        state
-            .histograms
-            .entry(histogram_key.to_owned())
-            .or_default()
-            .record(elapsed_ms);
-        state.observe_descriptor(histogram_key, MetricKind::Histogram, &stable_labels);
+        state.ensure_database_descriptors();
+        state.database_operation_total = state.database_operation_total.saturating_add(1);
+        state.database_operation_duration.record(elapsed_ms);
 
         if !succeeded || elapsed_ms >= DATABASE_SLOW_OPERATION_MS {
+            let mut stable_labels = MetricLabels::from([
+                ("database_role".to_owned(), role.to_owned()),
+                ("database_backend".to_owned(), backend.to_owned()),
+                ("operation".to_owned(), operation.to_owned()),
+                ("transaction".to_owned(), transaction.to_owned()),
+                (
+                    "outcome".to_owned(),
+                    if succeeded { "ok" } else { "error" }.to_owned(),
+                ),
+            ]);
+            if let Some(table) = table {
+                stable_labels.insert("table".to_owned(), table.to_owned());
+            }
             let labels = current_metrics_context().merged_labels(stable_labels);
             let event_key = "database.operation.timeline";
             state.observe_descriptor(event_key, MetricKind::Event, &labels);
@@ -1205,15 +1223,57 @@ impl MetricsRegistry {
 }
 
 impl MetricsState {
+    fn ensure_database_descriptors(&mut self) {
+        if self.database_descriptors_initialized {
+            return;
+        }
+        let label_keys = vec![
+            "database_backend".to_owned(),
+            "database_role".to_owned(),
+            "operation".to_owned(),
+            "outcome".to_owned(),
+            "table".to_owned(),
+            "transaction".to_owned(),
+        ];
+        for (name, kind) in [
+            ("database.operation.total", MetricKind::Counter),
+            ("database.operation.duration_ms", MetricKind::Histogram),
+        ] {
+            self.descriptors.insert(
+                name.to_owned(),
+                MetricDescriptor {
+                    name: name.to_owned(),
+                    kind,
+                    unit: infer_unit(name),
+                    description: None,
+                    label_keys: label_keys.clone(),
+                },
+            );
+        }
+        self.database_descriptors_initialized = true;
+    }
+
     fn snapshot(&self) -> MetricsSnapshot {
+        let mut counters = self.counters.clone();
+        let mut histograms = self
+            .histograms
+            .iter()
+            .map(|(key, histogram)| (key.clone(), histogram.snapshot()))
+            .collect::<BTreeMap<_, _>>();
+        if self.database_operation_total > 0 {
+            counters.insert(
+                "database.operation.total".to_owned(),
+                self.database_operation_total,
+            );
+            histograms.insert(
+                "database.operation.duration_ms".to_owned(),
+                self.database_operation_duration.snapshot(),
+            );
+        }
         MetricsSnapshot {
-            counters: self.counters.clone(),
+            counters,
             gauges: self.gauges.clone(),
-            histograms: self
-                .histograms
-                .iter()
-                .map(|(key, histogram)| (key.clone(), histogram.snapshot()))
-                .collect(),
+            histograms,
         }
     }
 
@@ -1554,10 +1614,9 @@ impl Histogram {
         self.sum = self.sum.saturating_add(value);
         self.min = Some(self.min.map_or(value, |min| min.min(value)));
         self.max = Some(self.max.map_or(value, |max| max.max(value)));
-        for (index, bucket) in HISTOGRAM_BUCKETS_MS.iter().enumerate() {
-            if value <= *bucket {
-                self.buckets[index] = self.buckets[index].saturating_add(1);
-            }
+        let bucket_index = HISTOGRAM_BUCKETS_MS.partition_point(|bucket| *bucket < value);
+        if let Some(bucket) = self.buckets.get_mut(bucket_index) {
+            *bucket = bucket.saturating_add(1);
         }
     }
 
@@ -1567,14 +1626,20 @@ impl Histogram {
             sum: self.sum,
             min: self.min,
             max: self.max,
-            buckets: HISTOGRAM_BUCKETS_MS
-                .iter()
-                .zip(self.buckets.iter())
-                .map(|(le, count)| HistogramBucketSnapshot {
-                    le: *le,
-                    count: *count,
-                })
-                .collect(),
+            buckets: {
+                let mut cumulative = 0_u64;
+                HISTOGRAM_BUCKETS_MS
+                    .iter()
+                    .zip(self.buckets.iter())
+                    .map(|(le, count)| {
+                        cumulative = cumulative.saturating_add(*count);
+                        HistogramBucketSnapshot {
+                            le: *le,
+                            count: cumulative,
+                        }
+                    })
+                    .collect()
+            },
         }
     }
 }
