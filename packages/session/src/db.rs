@@ -22,7 +22,7 @@ use bcode_session_models::{
 use switchy::{
     database::{
         Database, DatabaseError, DatabaseValue,
-        query::{FilterableQuery, SortDirection},
+        query::{FilterableQuery, SelectQuery, SortDirection},
     },
     schema::{
         MigrationError,
@@ -38,6 +38,8 @@ const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 1;
+const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
 
 /// Errors returned by Switchy-backed session database operations.
 #[derive(Debug, Error)]
@@ -63,6 +65,14 @@ pub enum SessionDbError {
     /// Strict persisted event decode failed.
     #[error(transparent)]
     PersistedEvent(#[from] PersistedSessionEventError),
+    /// The durable model-context projection exists but is not current.
+    #[error(
+        "model-context projection is stale: checkpoint #{checkpoint}, canonical history ends at #{expected}"
+    )]
+    ModelContextProjectionStale { checkpoint: u64, expected: u64 },
+    /// The durable model-context projection schema is unsupported.
+    #[error("unsupported model-context projection schema version {actual}; expected {expected}")]
+    ModelContextProjectionVersion { actual: u64, expected: u64 },
     /// A compaction marker is malformed or internally inconsistent.
     #[error("invalid context compaction marker at event #{sequence}: {message}")]
     InvalidCompactionMarker { sequence: u64, message: String },
@@ -789,6 +799,7 @@ impl SessionDb {
         let tx = self.db.begin_transaction().await?;
         insert_event(&*tx, event, activity_timestamp_ms).await?;
         project_event(&*tx, event).await?;
+        project_model_context_event(&*tx, event).await?;
         update_projection_checkpoints(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
@@ -984,6 +995,65 @@ impl SessionDb {
     ///
     /// Returns an error if event queries or deserialization fail.
     pub async fn model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
+        if let Some(events) = self.projected_model_context_events().await? {
+            return Ok(events);
+        }
+        self.compatibility_model_context_events().await
+    }
+
+    async fn projected_model_context_events(&self) -> SessionDbResult<Option<Vec<SessionEvent>>> {
+        let Some(state) = self
+            .db
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+            .execute_first(&**self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let schema_version = required_i64(&state, "schema_version").map(i64_to_u64)?;
+        if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
+            return Err(SessionDbError::ModelContextProjectionVersion {
+                actual: schema_version,
+                expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
+            });
+        }
+        let checkpoint = required_i64(&state, "last_event_seq").map(i64_to_u64)?;
+        let expected = self.last_event_sequence().await?.unwrap_or_default();
+        if checkpoint != expected {
+            return Err(SessionDbError::ModelContextProjectionStale {
+                checkpoint,
+                expected,
+            });
+        }
+        let rows = self
+            .db
+            .select("model_context_entries")
+            .columns(&["event_seq", "event_type", "payload"])
+            .sort("event_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_seq = required_i64(&row, "event_seq").map(i64_to_u64)?;
+            let event_type = required_string(&row, "event_type")?;
+            let payload = required_string(&row, "payload")?;
+            let event = decode_session_event(&payload)?;
+            if event.sequence != event_seq
+                || model_context_event_kind_name(&event.kind) != event_type
+                || !is_model_context_event_type(&event_type)
+            {
+                return Err(SessionDbError::InvalidRow {
+                    column: "model_context_entries".to_string(),
+                });
+            }
+            events.push(event);
+        }
+        Ok(Some(canonical_model_context_from_events(events)))
+    }
+
+    async fn compatibility_model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
         let compaction_event = self.latest_context_compaction_event().await?;
         let compacted_through_sequence =
             compaction_event
@@ -999,22 +1069,9 @@ impl SessionDb {
                     } => Some(*compacted_through_sequence),
                     _ => None,
                 });
-        let mut select = self
-            .db
-            .select("events")
-            .columns(&["payload"])
-            .where_in(
-                "event_type",
-                MODEL_CONTEXT_EVENT_TYPES
-                    .iter()
-                    .map(|event_type| DatabaseValue::String((*event_type).to_string()))
-                    .collect::<Vec<_>>(),
-            )
-            .sort("event_seq", SortDirection::Asc);
-        if let Some(boundary) = compacted_through_sequence {
-            select = select.where_gt("event_seq", seq_to_value(boundary));
-        }
-        let rows = select.execute(&**self.db).await?;
+        let rows = model_context_events_query(&**self.db, compacted_through_sequence)
+            .execute(&**self.db)
+            .await?;
         let mut candidates = Vec::with_capacity(
             rows.len()
                 .saturating_add(usize::from(compaction_event.is_some())),
@@ -1427,6 +1484,24 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "ALTER TABLE session_state ADD COLUMN reasoning_summary TEXT",
         "ALTER TABLE session_state DROP COLUMN reasoning_summary",
     );
+    add_sql_migration(
+        source,
+        "018_model_context_projection_state_table",
+        "CREATE TABLE IF NOT EXISTS model_context_projection_state (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    last_event_seq INTEGER NOT NULL\n)",
+        "DROP TABLE IF EXISTS model_context_projection_state",
+    );
+    add_sql_migration(
+        source,
+        "019_model_context_entries_table",
+        "CREATE TABLE IF NOT EXISTS model_context_entries (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_type TEXT NOT NULL,\n    payload TEXT NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS model_context_entries",
+    );
+    add_sql_migration(
+        source,
+        "020_model_context_entries_event_type_index",
+        "CREATE INDEX IF NOT EXISTS idx_model_context_entries_event_type ON model_context_entries(event_type)",
+        "DROP INDEX IF EXISTS idx_model_context_entries_event_type",
+    );
 }
 
 fn add_sql_migration(
@@ -1459,6 +1534,89 @@ async fn insert_event(
             seq_to_value(activity_timestamp_ms.unwrap_or_else(|| event_created_at_ms(event))),
         )
         .value("payload", encode_session_event(event)?)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+fn compaction_boundary(event: &SessionEvent) -> SessionDbResult<Option<u64>> {
+    let boundary = match &event.kind {
+        SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        }
+        | SessionEventKind::ProviderContextCompacted {
+            compacted_through_sequence,
+            ..
+        } => *compacted_through_sequence,
+        _ => return Ok(None),
+    };
+    if boundary > event.sequence {
+        return Err(SessionDbError::InvalidCompactionMarker {
+            sequence: event.sequence,
+            message: format!("compacted boundary #{boundary} is later than its marker"),
+        });
+    }
+    Ok(Some(boundary))
+}
+
+async fn project_model_context_event(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    let state = db
+        .select("model_context_projection_state")
+        .columns(&["schema_version", "last_event_seq"])
+        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+        .execute_first(db)
+        .await?;
+    match state.as_ref() {
+        None if event.sequence == 0 => {}
+        None => return Ok(()),
+        Some(row) => {
+            let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
+            let last_event_seq = required_i64(row, "last_event_seq").map(i64_to_u64)?;
+            if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)
+                || event.sequence != last_event_seq.saturating_add(1)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    let event_type = model_context_event_kind_name(&event.kind);
+    if is_model_context_event_type(event_type) {
+        if let Some(boundary) = compaction_boundary(event)? {
+            db.delete("model_context_entries")
+                .where_lte("event_seq", seq_to_value(boundary))
+                .execute(db)
+                .await?;
+            db.delete("model_context_entries")
+                .where_in(
+                    "event_type",
+                    vec![
+                        DatabaseValue::String("context_compacted".to_string()),
+                        DatabaseValue::String("provider_context_compacted".to_string()),
+                    ],
+                )
+                .execute(db)
+                .await?;
+        }
+        db.insert("model_context_entries")
+            .value("event_seq", seq_to_value(event.sequence))
+            .value("event_type", event_type)
+            .value("payload", encode_session_event(event)?)
+            .execute(db)
+            .await?;
+    }
+
+    db.upsert("model_context_projection_state")
+        .value("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+        .value(
+            "schema_version",
+            DatabaseValue::Int64(i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)),
+        )
+        .value("last_event_seq", seq_to_value(event.sequence))
         .execute(db)
         .await?;
     Ok(())
@@ -1954,6 +2112,27 @@ fn input_history_entry_from_row(
         timestamp_ms: optional_i64(row, "created_at_ms").map_or(0, i64_to_u64),
         text: required_string(row, "text")?,
     })
+}
+
+fn model_context_events_query(
+    db: &dyn Database,
+    compacted_through_sequence: Option<u64>,
+) -> SelectQuery<'static> {
+    let mut select = db
+        .select("events")
+        .columns(&["payload"])
+        .where_in(
+            "event_type",
+            MODEL_CONTEXT_EVENT_TYPES
+                .iter()
+                .map(|event_type| DatabaseValue::String((*event_type).to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .sort("event_seq", SortDirection::Asc);
+    if let Some(boundary) = compacted_through_sequence {
+        select = select.where_gt("event_seq", seq_to_value(boundary));
+    }
+    select
 }
 
 const MODEL_CONTEXT_EVENT_TYPES: &[&str] = &[
@@ -2761,6 +2940,282 @@ mod tests {
             .expect("after");
         assert_eq!(rows_before, rows_after);
         assert_eq!(db.last_event_sequence().await.expect("last"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn model_context_query_selects_only_payload_after_filtering_semantic_types() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let query = model_context_events_query(db.database(), Some(42));
+
+        assert_eq!(query.columns, &["payload"]);
+        assert_eq!(query.sorts.as_ref().map(Vec::len), Some(1));
+        assert_eq!(query.filters.as_ref().map(Vec::len), Some(2));
+        let values = query
+            .filters
+            .as_ref()
+            .expect("semantic and boundary filters")
+            .iter()
+            .flat_map(|filter| filter.values().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), MODEL_CONTEXT_EVENT_TYPES.len() + 1);
+        for event_type in MODEL_CONTEXT_EVENT_TYPES {
+            assert!(values.contains(&&DatabaseValue::String((*event_type).to_string())));
+        }
+        assert!(values.contains(&&seq_to_value(42)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BCODE_MODEL_CONTEXT_BENCHMARK_DB and BCODE_MODEL_CONTEXT_BENCHMARK_SESSION_ID"]
+    async fn benchmark_model_context_events_from_database_copy() {
+        let path = std::env::var_os("BCODE_MODEL_CONTEXT_BENCHMARK_DB")
+            .map(std::path::PathBuf::from)
+            .expect("BCODE_MODEL_CONTEXT_BENCHMARK_DB must name a disposable database copy");
+        let session_id = std::env::var("BCODE_MODEL_CONTEXT_BENCHMARK_SESSION_ID")
+            .expect("BCODE_MODEL_CONTEXT_BENCHMARK_SESSION_ID must be set")
+            .parse::<SessionId>()
+            .expect("benchmark session ID must be valid");
+        let db = SessionDb::open_turso(session_id, &path)
+            .await
+            .expect("open benchmark database copy");
+        let started_at = std::time::Instant::now();
+        let events = db.model_context_events().await.expect("model context");
+        eprintln!(
+            "model_context_events: events={}, elapsed_ms={}",
+            events.len(),
+            started_at.elapsed().as_millis()
+        );
+        assert!(!events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fresh_model_context_projection_tracks_semantic_entries_and_compaction() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        for (sequence, kind) in [
+            (
+                0,
+                SessionEventKind::SessionCreated {
+                    name: Some("projection".to_string()),
+                    working_directory: temp_dir.path().to_path_buf(),
+                },
+            ),
+            (
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "old".to_string(),
+                },
+            ),
+            (
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "old response".to_string(),
+                },
+            ),
+            (
+                3,
+                SessionEventKind::ContextCompacted {
+                    summary: "summary".to_string(),
+                    compacted_through_sequence: 2,
+                },
+            ),
+            (
+                4,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "new".to_string(),
+                },
+            ),
+        ] {
+            db.append_event(&event(session_id, sequence, kind))
+                .await
+                .expect("append projected event");
+        }
+
+        let state = db
+            .database()
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .execute_first(db.database())
+            .await
+            .expect("projection state")
+            .expect("fresh projection state");
+        assert_eq!(
+            required_i64(&state, "schema_version").expect("version"),
+            i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)
+        );
+        assert_eq!(required_i64(&state, "last_event_seq").expect("last"), 4);
+
+        let context = db.model_context_events().await.expect("projected context");
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].sequence, 3);
+        assert_eq!(context[1].sequence, 4);
+
+        db.database()
+            .delete("model_context_projection_state")
+            .execute(db.database())
+            .await
+            .expect("remove projection state for compatibility comparison");
+        let compatibility = db
+            .model_context_events()
+            .await
+            .expect("compatibility context");
+        assert_eq!(context, compatibility);
+    }
+
+    #[tokio::test]
+    async fn invalid_compaction_does_not_advance_canonical_or_projected_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("projection".to_string()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append projected event");
+        let error = db
+            .append_event(&event(
+                session_id,
+                1,
+                SessionEventKind::ContextCompacted {
+                    summary: "invalid".to_string(),
+                    compacted_through_sequence: 2,
+                },
+            ))
+            .await
+            .expect_err("invalid compaction must roll back");
+        assert!(matches!(
+            error,
+            SessionDbError::InvalidCompactionMarker { sequence: 1, .. }
+        ));
+        assert_eq!(db.last_event_sequence().await.expect("last"), Some(0));
+        let state = db
+            .database()
+            .select("model_context_projection_state")
+            .columns(&["last_event_seq"])
+            .execute_first(db.database())
+            .await
+            .expect("projection state")
+            .expect("projection state row");
+        assert_eq!(required_i64(&state, "last_event_seq").expect("last"), 0);
+    }
+
+    #[tokio::test]
+    async fn incompatible_or_corrupt_model_context_projection_is_visible() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "projected".to_string(),
+            },
+        ))
+        .await
+        .expect("append projected event");
+
+        db.database()
+            .update("model_context_projection_state")
+            .value(
+                "schema_version",
+                DatabaseValue::Int64(i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION + 1)),
+            )
+            .execute(db.database())
+            .await
+            .expect("set incompatible version");
+        assert!(matches!(
+            db.model_context_events()
+                .await
+                .expect_err("incompatible version must surface"),
+            SessionDbError::ModelContextProjectionVersion { .. }
+        ));
+
+        db.database()
+            .update("model_context_projection_state")
+            .value(
+                "schema_version",
+                DatabaseValue::Int64(i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)),
+            )
+            .execute(db.database())
+            .await
+            .expect("restore version");
+        db.database()
+            .update("model_context_entries")
+            .value("event_type", "assistant_message")
+            .where_eq("event_seq", seq_to_value(0))
+            .execute(db.database())
+            .await
+            .expect("corrupt entry identity");
+        assert!(matches!(
+            db.model_context_events()
+                .await
+                .expect_err("corrupt entry must surface"),
+            SessionDbError::InvalidRow { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_model_context_projection_is_visible_and_never_falls_back() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("projection".to_string()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append projected event");
+        insert_event(
+            db.database(),
+            &event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "unprojected tail".to_string(),
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("append canonical tail only");
+
+        let error = db
+            .model_context_events()
+            .await
+            .expect_err("stale projection must be visible");
+        assert!(matches!(
+            error,
+            SessionDbError::ModelContextProjectionStale {
+                checkpoint: 0,
+                expected: 1
+            }
+        ));
     }
 
     #[tokio::test]
