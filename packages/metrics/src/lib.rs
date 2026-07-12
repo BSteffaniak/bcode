@@ -307,6 +307,12 @@ pub enum DatabaseOperation {
     Close,
     /// Connection-cache clearing.
     ClearConnectionCache,
+    /// Cascade target discovery.
+    CascadeTargets,
+    /// Cascade dependent existence lookup.
+    CascadeHasDependents,
+    /// Direct cascade dependent lookup.
+    CascadeDirectDependents,
     /// Raw query without retaining its SQL.
     RawQuery,
     /// Raw execution without retaining its SQL.
@@ -345,6 +351,9 @@ impl DatabaseOperation {
             Self::ColumnExists => "column_exists",
             Self::Close => "close",
             Self::ClearConnectionCache => "clear_connection_cache",
+            Self::CascadeTargets => "cascade_targets",
+            Self::CascadeHasDependents => "cascade_has_dependents",
+            Self::CascadeDirectDependents => "cascade_direct_dependents",
             Self::RawQuery => "raw_query",
             Self::RawExec => "raw_exec",
             Self::Begin => "begin",

@@ -822,18 +822,42 @@ impl DatabaseTransaction for ObservedTransaction {
         &self,
         table_name: &str,
     ) -> Result<schema::DropPlan, DatabaseError> {
-        self.inner.find_cascade_targets(table_name).await
+        let started = Instant::now();
+        let result = self.inner.find_cascade_targets(table_name).await;
+        self.record(
+            DatabaseOperation::CascadeTargets,
+            Some(table_name),
+            started,
+            &result,
+        );
+        result
     }
 
     async fn has_any_dependents(&self, table_name: &str) -> Result<bool, DatabaseError> {
-        self.inner.has_any_dependents(table_name).await
+        let started = Instant::now();
+        let result = self.inner.has_any_dependents(table_name).await;
+        self.record(
+            DatabaseOperation::CascadeHasDependents,
+            Some(table_name),
+            started,
+            &result,
+        );
+        result
     }
 
     async fn get_direct_dependents(
         &self,
         table_name: &str,
     ) -> Result<std::collections::BTreeSet<String>, DatabaseError> {
-        self.inner.get_direct_dependents(table_name).await
+        let started = Instant::now();
+        let result = self.inner.get_direct_dependents(table_name).await;
+        self.record(
+            DatabaseOperation::CascadeDirectDependents,
+            Some(table_name),
+            started,
+            &result,
+        );
+        result
     }
 }
 
@@ -869,5 +893,117 @@ impl Savepoint for ObservedSavepoint {
 
     fn name(&self) -> &str {
         self.inner.name()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_metrics::MetricsRegistry;
+    use switchy_database::query::{insert, select};
+    use switchy_database::rusqlite::RusqliteDatabase;
+    use switchy_database::schema::{Column, DataType, create_table};
+
+    fn observed(metrics: &MetricsRegistry) -> ObservedDatabase {
+        let connection = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        let database =
+            RusqliteDatabase::new(vec![Arc::new(switchy_async::sync::Mutex::new(connection))]);
+        ObservedDatabase::new(Box::new(database), metrics.clone(), "test", "sqlite")
+    }
+
+    #[tokio::test]
+    async fn typed_raw_schema_and_transaction_operations_are_observed() {
+        let metrics = MetricsRegistry::default();
+        let database = observed(&metrics);
+        database
+            .exec_create_table(
+                &create_table("items")
+                    .column(Column {
+                        name: "id".to_owned(),
+                        nullable: false,
+                        auto_increment: false,
+                        data_type: DataType::Int,
+                        default: None,
+                    })
+                    .column(Column {
+                        name: "name".to_owned(),
+                        nullable: false,
+                        auto_increment: false,
+                        data_type: DataType::Text,
+                        default: None,
+                    })
+                    .primary_key("id"),
+            )
+            .await
+            .expect("create table");
+        database
+            .exec_insert(&insert("items").value("id", 1).value("name", "first"))
+            .await
+            .expect("insert");
+        assert_eq!(
+            database
+                .query(&select("items"))
+                .await
+                .expect("select")
+                .len(),
+            1
+        );
+        database
+            .query_raw("INVALID secret-user-value")
+            .await
+            .expect_err("invalid raw query should fail");
+        database
+            .query_raw_params(
+                "INVALID parameterized-query-secret",
+                &[DatabaseValue::String("parameter-value-secret".to_owned())],
+            )
+            .await
+            .expect_err("invalid parameterized raw query should fail");
+        let transaction = database.begin_transaction().await.expect("begin");
+        transaction
+            .exec_insert(&insert("items").value("id", 2).value("name", "second"))
+            .await
+            .expect("transaction insert");
+        let savepoint = transaction.savepoint("safe_name").await.expect("savepoint");
+        savepoint.release().await.expect("release savepoint");
+        transaction.commit().await.expect("commit");
+        let transaction = database.begin_transaction().await.expect("begin rollback");
+        let savepoint = transaction
+            .savepoint("rollback_name")
+            .await
+            .expect("rollback savepoint");
+        savepoint
+            .rollback_to()
+            .await
+            .expect("rollback to savepoint");
+        transaction.rollback().await.expect("rollback transaction");
+
+        let report = metrics.report();
+        assert_eq!(
+            report.snapshot.counters.get("database.operation.total"),
+            Some(&14)
+        );
+        let descriptors = &report.descriptors;
+        let aggregate = descriptors
+            .get("database.operation.total")
+            .expect("aggregate descriptor");
+        assert_eq!(
+            aggregate.label_keys,
+            vec![
+                "database_backend".to_owned(),
+                "database_role".to_owned(),
+                "operation".to_owned(),
+                "outcome".to_owned(),
+                "table".to_owned(),
+                "transaction".to_owned(),
+            ]
+        );
+        let serialized = serde_json::to_string(&report).expect("serialize report");
+        assert!(!serialized.contains("secret-user-value"));
+        assert!(!serialized.contains("parameterized-query-secret"));
+        assert!(!serialized.contains("parameter-value-secret"));
+        assert!(!serialized.contains("second"));
+        assert!(!serialized.contains("SELECT *"));
+        assert!(serialized.contains("raw_query"));
     }
 }

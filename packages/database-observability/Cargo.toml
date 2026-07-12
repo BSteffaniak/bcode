@@ -15,6 +15,13 @@ async-trait      = { workspace = true }
 bcode_metrics    = { workspace = true }
 switchy_database = { workspace = true, features = ["cascade", "schema"] }
 
+[dev-dependencies]
+rusqlite         = { workspace = true }
+serde_json       = { workspace = true }
+switchy_async    = { workspace = true, features = ["sync", "tokio"] }
+switchy_database = { workspace = true, features = ["cascade", "schema"] }
+tokio            = { workspace = true, features = ["macros", "rt"] }
+
 [features]
 default          = []
 fail-on-warnings = []
