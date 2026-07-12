@@ -55,6 +55,10 @@ pub enum CliError {
     Config(#[from] bcode_config::ConfigError),
     #[error("server error: {0}")]
     Server(#[from] bcode_server::ServerError),
+    #[error("session database error: {0}")]
+    SessionDb(#[from] bcode_session::db::SessionDbError),
+    #[error("session lease error: {0}")]
+    SessionLease(#[from] bcode_session::lease::SessionLeaseError),
     #[error("session store error: {0}")]
     SessionStore(#[from] bcode_session::SessionStoreError),
     #[error("session repair error: {0}")]
@@ -828,6 +832,9 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    Reindex {
+        session_id: SessionId,
+    },
     /// Audit local sessions for semantic-result migration readiness without writing changes.
     MigrateSemanticResults {
         /// Session store root to audit. Defaults to Bcode's local session store.
@@ -1328,6 +1335,9 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
                 output: repair_cli_output(json),
             })
             .await?;
+        }
+        SessionCommand::Reindex { session_id } => {
+            reindex_session_model_context(session_id).await?;
         }
         SessionCommand::MigrateSemanticResults { root, json } => {
             audit_semantic_result_migration(root, json).await?;
@@ -6417,6 +6427,21 @@ const fn repair_cli_output(json: bool) -> SessionRepairCliOutput {
     } else {
         SessionRepairCliOutput::Text
     }
+}
+
+async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliError> {
+    let root = bcode_config::default_state_dir().join("sessions");
+    let _lease = bcode_session::lease::acquire_session_lease(
+        &root,
+        session_id,
+        &bcode_session::lease::SessionLeaseOwnerContext::default(),
+    )?;
+    let db = bcode_session::db::SessionDb::open_turso_in_root(session_id, &root).await?;
+    let event_count = db.reindex_model_context().await?;
+    println!(
+        "Reindexed model context for session {session_id} from {event_count} canonical events"
+    );
+    Ok(())
 }
 
 async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<(), CliError> {

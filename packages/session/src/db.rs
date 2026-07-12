@@ -84,7 +84,19 @@ pub enum SessionDbError {
 /// Result type for session DB operations.
 pub type SessionDbResult<T> = Result<T, SessionDbError>;
 
-/// Incrementally materialized session DB projections that maintain freshness checkpoints.
+/// Diagnostic state for the durable model-context projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelContextProjectionStatus {
+    /// No projection state exists, so exact compatibility reads remain active.
+    Missing,
+    /// Projection state matches canonical history and the current schema.
+    Fresh { checkpoint: u64 },
+    /// Projection state trails or exceeds canonical history.
+    Stale { checkpoint: u64, expected: u64 },
+    /// Projection state uses an unsupported schema.
+    Incompatible { actual: u64, expected: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializedProjection {
     /// Projected current session state.
@@ -999,6 +1011,64 @@ impl SessionDb {
             return Ok(events);
         }
         self.compatibility_model_context_events().await
+    }
+
+    /// Inspect model-context projection freshness without rebuilding or mutating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if projection state or canonical sequence queries fail.
+    pub async fn model_context_projection_status(
+        &self,
+    ) -> SessionDbResult<ModelContextProjectionStatus> {
+        let Some(state) = self
+            .db
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+            .execute_first(&**self.db)
+            .await?
+        else {
+            return Ok(ModelContextProjectionStatus::Missing);
+        };
+        let schema_version = required_i64(&state, "schema_version").map(i64_to_u64)?;
+        if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
+            return Ok(ModelContextProjectionStatus::Incompatible {
+                actual: schema_version,
+                expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
+            });
+        }
+        let checkpoint = required_i64(&state, "last_event_seq").map(i64_to_u64)?;
+        let expected = self.last_event_sequence().await?.unwrap_or_default();
+        if checkpoint == expected {
+            Ok(ModelContextProjectionStatus::Fresh { checkpoint })
+        } else {
+            Ok(ModelContextProjectionStatus::Stale {
+                checkpoint,
+                expected,
+            })
+        }
+    }
+
+    /// Explicitly rebuild the model-context projection from strict canonical history.
+    ///
+    /// This maintenance operation is never called by normal read or append paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonical history is invalid or projection replacement fails.
+    pub async fn reindex_model_context(&self) -> SessionDbResult<usize> {
+        let events = self.all_events_strict().await?;
+        let tx = self.db.begin_transaction().await?;
+        tx.delete("model_context_entries").execute(&*tx).await?;
+        tx.delete("model_context_projection_state")
+            .execute(&*tx)
+            .await?;
+        for event in &events {
+            project_model_context_event(&*tx, event).await?;
+        }
+        tx.commit().await?;
+        Ok(events.len())
     }
 
     async fn projected_model_context_events(&self) -> SessionDbResult<Option<Vec<SessionEvent>>> {
@@ -2981,14 +3051,91 @@ mod tests {
         let db = SessionDb::open_turso(session_id, &path)
             .await
             .expect("open benchmark database copy");
-        let started_at = std::time::Instant::now();
-        let events = db.model_context_events().await.expect("model context");
+        let compatibility_started_at = std::time::Instant::now();
+        let compatibility = db
+            .model_context_events()
+            .await
+            .expect("compatibility context");
+        let compatibility_elapsed_ms = compatibility_started_at.elapsed().as_millis();
+        if matches!(
+            db.model_context_projection_status()
+                .await
+                .expect("projection status"),
+            ModelContextProjectionStatus::Missing
+        ) {
+            db.reindex_model_context().await.expect("explicit reindex");
+        }
+        let _ = db
+            .model_context_events()
+            .await
+            .expect("warm projected context");
+        let projected_started_at = std::time::Instant::now();
+        let projected = db.model_context_events().await.expect("projected context");
+        let projected_elapsed_ms = projected_started_at.elapsed().as_millis();
         eprintln!(
-            "model_context_events: events={}, elapsed_ms={}",
-            events.len(),
-            started_at.elapsed().as_millis()
+            "model_context_events: events={}, compatibility_elapsed_ms={}, projected_elapsed_ms={}",
+            projected.len(),
+            compatibility_elapsed_ms,
+            projected_elapsed_ms
         );
-        assert!(!events.is_empty());
+        assert_eq!(projected, compatibility);
+    }
+
+    #[tokio::test]
+    async fn explicit_reindex_builds_missing_projection_from_canonical_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        for (sequence, kind) in [
+            (
+                0,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "old".to_string(),
+                },
+            ),
+            (
+                1,
+                SessionEventKind::ContextCompacted {
+                    summary: "summary".to_string(),
+                    compacted_through_sequence: 0,
+                },
+            ),
+            (
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "new".to_string(),
+                },
+            ),
+        ] {
+            insert_event(db.database(), &event(session_id, sequence, kind), None)
+                .await
+                .expect("insert canonical event");
+        }
+        assert_eq!(
+            db.model_context_projection_status()
+                .await
+                .expect("missing status"),
+            ModelContextProjectionStatus::Missing
+        );
+        let compatibility = db
+            .model_context_events()
+            .await
+            .expect("compatibility context");
+
+        assert_eq!(db.reindex_model_context().await.expect("reindex"), 3);
+        assert_eq!(
+            db.model_context_projection_status()
+                .await
+                .expect("fresh status"),
+            ModelContextProjectionStatus::Fresh { checkpoint: 2 }
+        );
+        assert_eq!(
+            db.model_context_events().await.expect("projected context"),
+            compatibility
+        );
     }
 
     #[tokio::test]

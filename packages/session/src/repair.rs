@@ -166,6 +166,9 @@ pub async fn repair_session(
     let initial_error = match validate_session_db(root, session_id).await {
         Ok(()) => {
             report.status = RepairStatus::Ok;
+            report
+                .notes
+                .push(model_context_projection_note(root, session_id).await?);
             return Ok(report);
         }
         Err(error) => error.to_string(),
@@ -329,10 +332,30 @@ where
     }
 }
 
+async fn model_context_projection_note(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<String, db::SessionDbError> {
+    let session_db = db::SessionDb::open_turso_in_root(session_id, root).await?;
+    Ok(match session_db.model_context_projection_status().await? {
+        db::ModelContextProjectionStatus::Missing =>
+            "model-context projection is missing; exact compatibility reads are active until explicit reindex".to_string(),
+        db::ModelContextProjectionStatus::Fresh { checkpoint } =>
+            format!("model-context projection is fresh through event #{checkpoint}"),
+        db::ModelContextProjectionStatus::Stale { checkpoint, expected } => format!(
+            "model-context projection is stale at event #{checkpoint}; canonical history ends at #{expected}; explicit reindex is required"
+        ),
+        db::ModelContextProjectionStatus::Incompatible { actual, expected } => format!(
+            "model-context projection schema {actual} is incompatible with expected schema {expected}; explicit reindex is required"
+        ),
+    })
+}
+
 async fn validate_session_db(root: &Path, session_id: SessionId) -> Result<(), db::SessionDbError> {
     let session_db = db::SessionDb::open_turso_in_root(session_id, root).await?;
     let _ = session_db.last_event_sequence().await?;
     let _ = session_db.all_events_strict().await?;
+    let _ = session_db.model_context_events().await?;
     Ok(())
 }
 
@@ -561,6 +584,83 @@ fn unix_time_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn doctor_session_reports_stale_model_context_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let session_db = db::SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        session_db
+            .append_event(&session_event(
+                session_id,
+                0,
+                bcode_session_models::SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "projected".to_string(),
+                },
+            ))
+            .await
+            .expect("append projected event");
+        insert_raw_event(
+            &session_db,
+            session_id,
+            1,
+            "assistant_message",
+            serde_json::json!({
+                "schema_version": bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                "sequence": 1,
+                "timestamp_ms": 1,
+                "session_id": session_id,
+                "provenance": null,
+                "kind": { "assistant_message": { "text": "unprojected" } }
+            }),
+        )
+        .await;
+
+        let report = doctor_session(temp_dir.path(), session_id)
+            .await
+            .expect("doctor should report");
+        assert_eq!(report.status, RepairStatus::ManualRequired);
+        assert!(report.initial_error.as_deref().is_some_and(|error| {
+            error.contains("model-context projection is stale")
+                && error.contains("checkpoint #0")
+                && error.contains("ends at #1")
+        }));
+        assert!(report.actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn doctor_session_reports_fresh_model_context_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let session_db = db::SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        session_db
+            .append_event(&session_event(
+                session_id,
+                0,
+                bcode_session_models::SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "hello".to_string(),
+                },
+            ))
+            .await
+            .expect("append projected event");
+
+        let report = doctor_session(temp_dir.path(), session_id)
+            .await
+            .expect("doctor should report");
+        assert_eq!(report.status, RepairStatus::Ok);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| { note == "model-context projection is fresh through event #0" })
+        );
+    }
 
     #[tokio::test]
     async fn doctor_session_reports_future_and_corrupt_persisted_events_without_mutation() {
