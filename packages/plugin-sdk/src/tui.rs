@@ -82,6 +82,7 @@ pub struct PluginSessionEventSubscriptionRequest {
 
 /// Session events delivered to plugin-owned TUI surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum PluginSessionEvent {
     /// The session was attached and optional persisted history is available.
     Attached {

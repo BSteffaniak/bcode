@@ -751,6 +751,7 @@ mod tests {
                     producer_plugin_id: Some("shell".to_owned()),
                     tool_name: "shell.run".to_owned(),
                     arguments_json: "{}".to_owned(),
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },

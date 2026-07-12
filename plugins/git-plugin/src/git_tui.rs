@@ -28,14 +28,18 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for GitTuiVisualAdapter {
     ) -> Vec<Line> {
         let width = context.width();
         match kind {
-            "bcode.git.clone_request" => clone_request_rows(payload, width),
-            "bcode.git.clone_result" => clone_result_rows(payload, width),
+            "bcode.git.clone_request" => clone_request_rows(payload, width, context),
+            "bcode.git.clone_result" => clone_result_rows(payload, width, context),
             _ => Vec::new(),
         }
     }
 }
 
-fn clone_request_rows(payload: &Value, width: u16) -> Vec<Line> {
+fn clone_request_rows(
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let metadata = [
         text(arguments, "url").map(|value| Span::styled(value.to_owned(), value_style())),
@@ -43,7 +47,7 @@ fn clone_request_rows(payload: &Value, width: u16) -> Vec<Line> {
             .or_else(|| text(arguments, "branch"))
             .map(|value| Span::styled(value.to_owned(), value_style())),
         text(arguments, "destination")
-            .map(|value| Span::styled(format!("→ {value}"), value_style())),
+            .map(|value| Span::styled(format!("→ {}", context.display_path(value)), value_style())),
     ]
     .into_iter()
     .flatten();
@@ -56,7 +60,11 @@ fn clone_request_rows(payload: &Value, width: u16) -> Vec<Line> {
     )
 }
 
-fn clone_result_rows(payload: &Value, width: u16) -> Vec<Line> {
+fn clone_result_rows(
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let existed = payload.get("already_exists").and_then(Value::as_bool) == Some(true);
     let metadata = [
         repo_name(payload).map(|value| Span::styled(value, value_style())),

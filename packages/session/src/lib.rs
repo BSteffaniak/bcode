@@ -441,6 +441,8 @@ pub struct AppendToolCallRequestedInput {
     pub arguments_json: String,
     /// Producer plugin id, when known.
     pub producer_plugin_id: Option<String>,
+    /// Working directory captured for this invocation.
+    pub working_directory: Option<std::path::PathBuf>,
     /// Plugin-owned request visual captured at request time.
     pub request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
     /// Legacy request presentation metadata retained for old sessions/imports.
@@ -2153,6 +2155,7 @@ impl SessionManager {
                 tool_name: input.tool_name,
                 arguments_json: input.arguments_json,
                 producer_plugin_id: input.producer_plugin_id,
+                working_directory: input.working_directory,
                 request_visual: input.request_visual,
                 legacy_request_presentation: input.legacy_request_presentation,
             },
@@ -5105,6 +5108,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },

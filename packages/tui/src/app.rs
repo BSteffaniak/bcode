@@ -2784,6 +2784,7 @@ impl BmuxApp {
                         tool_call_id: tool_call_id.to_owned(),
                         tool_name: Some(tool_name.to_owned()),
                         arguments_json: Some(arguments_json.to_owned()),
+                        working_directory: None,
                         request_visual: request_visual.cloned(),
                         ..ToolInvocationProjection::default()
                     })

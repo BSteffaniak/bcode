@@ -36,6 +36,8 @@ pub struct ToolInvocationProjection {
     pub tool_name: Option<String>,
     /// Raw JSON arguments requested by the model.
     pub arguments_json: Option<String>,
+    /// Working directory captured for this invocation.
+    pub working_directory: Option<PathBuf>,
     /// Plugin-owned request visual reconstructed at request time.
     pub request_visual: Option<PluginVisualDescriptor>,
     /// Current lifecycle status.
@@ -100,6 +102,7 @@ pub fn apply_tool_invocation_projection_event(
             producer_plugin_id,
             tool_name,
             arguments_json,
+            working_directory,
             request_visual,
             ..
         } => {
@@ -107,6 +110,7 @@ pub fn apply_tool_invocation_projection_event(
             projection.producer_plugin_id.clone_from(producer_plugin_id);
             projection.tool_name = Some(tool_name.clone());
             projection.arguments_json = Some(arguments_json.clone());
+            projection.working_directory.clone_from(working_directory);
             projection.request_visual.clone_from(request_visual);
         }
         SessionEventKind::ToolInvocationStream { event } => {
@@ -1550,6 +1554,8 @@ pub enum SessionEventKind {
         producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_directory: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_visual: Option<PluginVisualDescriptor>,
         #[serde(

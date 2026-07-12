@@ -250,11 +250,15 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
     }
 }
 
-fn request_rows(title: &str, payload: &Value) -> Vec<Line> {
+fn request_rows(
+    title: &str,
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let mut rows = vec![header(title)];
     if let Some(path) = text(arguments, "path") {
-        push_kv(&mut rows, "file", path);
+        push_kv(&mut rows, "file", context.display_path(path).to_string());
         push_kv(&mut rows, "steps", count(arguments, "steps").to_string());
     }
     if let Some(files) = arguments.get("files").and_then(Value::as_array) {
@@ -264,7 +268,7 @@ fn request_rows(title: &str, payload: &Value) -> Vec<Line> {
             let steps = count(file, "steps");
             rows.push(Line::from_spans(vec![
                 Span::styled("  ◆ ", accent()),
-                Span::styled(path.to_owned(), value_style()),
+                Span::styled(context.display_path(path).to_string(), value_style()),
                 Span::styled(format!("  {steps} steps"), muted()),
             ]));
         }
@@ -279,7 +283,7 @@ fn request_rows(title: &str, payload: &Value) -> Vec<Line> {
 
 fn live_rows(payload: &Value, width: u16) -> Vec<Line> {
     if selected_context(payload).is_none() && payload.get("cursor").is_none() {
-        return live_lifecycle_rows(payload, width);
+        return live_lifecycle_rows(payload, width, context);
     }
     let mut rows = vim_screen_rows("nvim live", payload, selected_context(payload), width);
     rows.push(Line::from_spans(vec![
@@ -291,9 +295,15 @@ fn live_rows(payload: &Value, width: u16) -> Vec<Line> {
     rows
 }
 
-fn live_lifecycle_rows(payload: &Value, width: u16) -> Vec<Line> {
+fn live_lifecycle_rows(
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let phase = text(payload, "phase").unwrap_or("running");
-    let path = text(payload, "path").unwrap_or("<file>");
+    let path = context
+        .display_path(text(payload, "path").unwrap_or("<file>"))
+        .to_string();
     let title = format!("╭─ nvim live: {path} ── {phase} ");
     let mut rows = vec![Line::from_spans(vec![Span::styled(
         pad_rule(&title, width, '─', '╮'),
@@ -373,7 +383,9 @@ fn playback_control_row(payload: &Value) -> Line {
 }
 
 fn vim_screen_rows(title: &str, payload: &Value, context: Option<&Value>, width: u16) -> Vec<Line> {
-    let path = text(payload, "path").unwrap_or("<file>");
+    let path = context
+        .display_path(text(payload, "path").unwrap_or("<file>"))
+        .to_string();
     let mode = text(payload, "nvim_mode")
         .or_else(|| text(payload, "mode"))
         .unwrap_or("normal");

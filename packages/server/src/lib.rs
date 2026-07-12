@@ -15358,6 +15358,11 @@ async fn append_tool_request_event(
     producer_plugin_id: Option<String>,
 ) {
     let request_visual = tool_request_visual_descriptor(state, &tool_name, &arguments_json).await;
+    let working_directory = state
+        .sessions
+        .session_working_directory(session_id)
+        .await
+        .ok();
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_label = tool_name.clone();
     let runtime_tool_call_id = tool_call_id.clone();
@@ -15370,6 +15375,7 @@ async fn append_tool_request_event(
                 tool_name,
                 arguments_json,
                 producer_plugin_id,
+                working_directory,
                 request_visual,
                 legacy_request_presentation: None,
             },
@@ -18425,6 +18431,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },
@@ -18464,6 +18471,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },
@@ -18531,6 +18539,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{not-json".to_string(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: None,
             },
@@ -18638,6 +18647,7 @@ mod tests {
                     tool_name: "tool".into(),
                     arguments_json: "{}".into(),
                     producer_plugin_id: None,
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },
@@ -19082,6 +19092,7 @@ mod tests {
                     tool_name: "read".to_string(),
                     arguments_json: "{}".to_string(),
                     producer_plugin_id: None,
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },
@@ -19146,6 +19157,7 @@ mod tests {
                     tool_name: "shell".to_string(),
                     arguments_json: "{}".to_string(),
                     producer_plugin_id: None,
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },
@@ -21757,6 +21769,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "filesystem.read".to_string(),
                     arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },
@@ -21930,6 +21943,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "shell".to_string(),
                     arguments_json: r#"{"command":"pwd"}"#.to_string(),
+                    working_directory: None,
                     request_visual: None,
                     legacy_request_presentation: None,
                 },

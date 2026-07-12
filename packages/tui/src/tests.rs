@@ -2054,6 +2054,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"cargo check","cwd":"/tmp/project"}"#.to_owned(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
@@ -2103,6 +2104,7 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
                 "contents": "fn main() {}\n",
             })
             .to_string(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
@@ -2141,6 +2143,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
@@ -2218,6 +2221,7 @@ fn denied_file_permission_marks_preview_failed() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
@@ -2269,6 +2273,7 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
                 "new_text": "fn answer() -> i32 {\n    42\n}\n",
             })
             .to_string(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
@@ -2382,6 +2387,7 @@ fn streamed_terminal_output_renders_running_until_final_result() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
@@ -2438,6 +2444,7 @@ fn streamed_terminal_output_updates_header_after_final_result() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
@@ -2919,6 +2926,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
@@ -3100,6 +3108,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: None,
         },
@@ -3185,6 +3194,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
@@ -3352,6 +3362,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
             producer_plugin_id: None,
             tool_name: "filesystem.shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
@@ -3476,6 +3487,7 @@ fn file_change_semantic_result_events(
                 producer_plugin_id: None,
                 tool_name: "example.write".to_owned(),
                 arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             },
@@ -3511,6 +3523,7 @@ fn streamed_tool_without_output_renders_final_result() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                working_directory: None,
                 request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
@@ -3560,6 +3573,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                working_directory: None,
                 request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
@@ -3636,6 +3650,7 @@ fn live_shell_result_preserves_request_block() {
                     "terminal": false,
                 })
                 .to_string(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
@@ -3768,6 +3783,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                working_directory: None,
                 request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
@@ -3819,6 +3835,7 @@ fn presentation_events_replay_ignores_legacy_presentation_events() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: "{}".to_owned(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: None,
             },
@@ -3867,6 +3884,7 @@ fn legacy_presentation_card_does_not_replace_tool_request_surface() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: None,
             },
@@ -3921,6 +3939,7 @@ fn legacy_result_presentation_does_not_suppress_generic_tool_result() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: None,
             },
@@ -4026,6 +4045,7 @@ fn legacy_live_presentation_card_is_ignored_by_normal_transcript() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: None,
             },
@@ -4171,6 +4191,7 @@ fn transcript_resident_window_does_not_trim_with_active_tool() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
@@ -4212,6 +4233,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                working_directory: None,
                 request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
@@ -4776,6 +4798,7 @@ fn filesystem_write_request_preview_renders_from_plugin_visual_metadata() {
                 "contents": "created from raw args\n"
             })
             .to_string(),
+            working_directory: None,
             request_visual: Some(file_change_visual(
                 "Write preview",
                 Some("/tmp/raw-preview.txt"),
@@ -4812,6 +4835,7 @@ fn filesystem_edit_request_preview_renders_from_plugin_visual_metadata() {
                 "new_text": "new raw args\n"
             })
             .to_string(),
+            working_directory: None,
             request_visual: Some(file_change_visual(
                 "Edit preview",
                 Some("/tmp/raw-edit.txt"),
@@ -4850,6 +4874,7 @@ fn same_raw_filesystem_events_render_same_live_and_replayed_tool_ui() {
                     "new_text": "after\n"
                 })
                 .to_string(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: None,
             },
@@ -4906,6 +4931,7 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
                 "new_text": "after\n"
             })
             .to_string(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: None,
         },
@@ -5328,6 +5354,7 @@ fn live_tool_invocation_projection_matches_replayed_projection() {
                 producer_plugin_id: Some("plugin.shell".to_owned()),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: None,
             },
@@ -5859,6 +5886,7 @@ fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
                 "cwd": "/repo",
             })
             .to_string(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
@@ -5917,6 +5945,7 @@ fn replayed_shell_request_uses_shell_plugin_request_renderer_without_legacy_meta
                 "timeout_ms": 120_000,
             })
             .to_string(),
+            working_directory: None,
             request_visual: Some(shell_request_visual(
                 "cargo check --workspace",
                 Some("/Users/braden/GitHub/bcode"),
@@ -5931,7 +5960,10 @@ fn replayed_shell_request_uses_shell_plugin_request_renderer_without_legacy_meta
 
     assert!(rendered.contains("Shell command"), "{rendered}");
     assert!(rendered.contains("❯ cargo check --workspace"), "{rendered}");
-    assert!(rendered.contains("…/GitHub/bcode"), "{rendered}");
+    assert!(
+        rendered.contains("/Users/braden/GitHub/bcode ❯"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("Tool · shell.run"), "{rendered}");
     assert!(!rendered.contains("arguments"), "{rendered}");
 }
@@ -5982,6 +6014,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
                 "contents": "fn main() {\n    println!(\"hi\");\n}",
             })
             .to_string(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
@@ -6028,6 +6061,7 @@ fn live_file_preview_is_removed_when_final_filesystem_artifact_arrives() {
                 "contents": "fn main() {}",
             })
             .to_string(),
+            working_directory: None,
             request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },

@@ -539,19 +539,22 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for WorktreeTuiVisualAdapter 
         &self,
         kind: &str,
         payload: &serde_json::Value,
-        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
         match kind {
-            WORKTREE_REQUEST_SCHEMA => worktree_request_rows(payload),
-            WORKTREE_LIST_SCHEMA => worktree_list_rows(payload),
-            WORKTREE_CREATE_SCHEMA => worktree_result_rows("Worktree created", payload),
-            WORKTREE_REMOVE_SCHEMA => worktree_result_rows("Worktree removed", payload),
+            WORKTREE_REQUEST_SCHEMA => worktree_request_rows(payload, context),
+            WORKTREE_LIST_SCHEMA => worktree_list_rows(payload, context),
+            WORKTREE_CREATE_SCHEMA => worktree_result_rows("Worktree created", payload, context),
+            WORKTREE_REMOVE_SCHEMA => worktree_result_rows("Worktree removed", payload, context),
             _ => Vec::new(),
         }
     }
 }
 
-fn worktree_request_rows(payload: &serde_json::Value) -> Vec<Line> {
+fn worktree_request_rows(
+    payload: &serde_json::Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let mut rows = worktree_header("Worktree request");
     for key in [
@@ -566,12 +569,23 @@ fn worktree_request_rows(payload: &serde_json::Value) -> Vec<Line> {
         "force",
         "no_setup",
     ] {
-        push_visual_kv(&mut rows, key, visual_value(arguments, key));
+        push_visual_kv(
+            &mut rows,
+            key,
+            if matches!(key, "cwd" | "path") {
+                visual_text(arguments, key).map(|path| context.display_path(path).to_string())
+            } else {
+                visual_value(arguments, key)
+            },
+        );
     }
     rows
 }
 
-fn worktree_list_rows(payload: &serde_json::Value) -> Vec<Line> {
+fn worktree_list_rows(
+    payload: &serde_json::Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let values = payload
         .get("worktrees")
         .or_else(|| payload.get("entries"))
@@ -584,7 +598,10 @@ fn worktree_list_rows(payload: &serde_json::Value) -> Vec<Line> {
             let branch = visual_text(value, "branch").or_else(|| visual_text(value, "name"));
             rows.push(Line::from_spans(vec![
                 Span::styled("  ◆ ", Style::new().fg(Color::Cyan)),
-                Span::styled(path.to_string(), Style::new().fg(Color::White)),
+                Span::styled(
+                    context.display_path(path).to_string(),
+                    Style::new().fg(Color::White),
+                ),
                 Span::styled(
                     branch.map_or_else(String::new, |branch| format!("  {branch}")),
                     Style::new().fg(Color::BrightBlack),
@@ -601,10 +618,22 @@ fn worktree_list_rows(payload: &serde_json::Value) -> Vec<Line> {
     rows
 }
 
-fn worktree_result_rows(title: &str, payload: &serde_json::Value) -> Vec<Line> {
+fn worktree_result_rows(
+    title: &str,
+    payload: &serde_json::Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let mut rows = worktree_header(title);
     for key in ["path", "branch", "name", "session_id", "removed", "force"] {
-        push_visual_kv(&mut rows, key, visual_value(payload, key));
+        push_visual_kv(
+            &mut rows,
+            key,
+            if key == "path" {
+                visual_text(payload, key).map(|path| context.display_path(path).to_string())
+            } else {
+                visual_value(payload, key)
+            },
+        );
     }
     rows
 }

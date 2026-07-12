@@ -138,6 +138,7 @@ pub async fn import_external_session(
                         producer_plugin_id: None,
                         tool_name,
                         arguments_json,
+                        working_directory: None,
                         request_visual: None,
                         legacy_request_presentation: None,
                     },

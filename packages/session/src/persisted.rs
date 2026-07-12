@@ -186,6 +186,8 @@ enum PersistedSessionEventKind {
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_directory: Option<std::path::PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
         #[serde(
             default,
@@ -477,6 +479,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
+                working_directory,
                 request_visual,
                 legacy_request_presentation,
             } => Self::ToolCallRequested {
@@ -484,6 +487,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 producer_plugin_id: producer_plugin_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
+                working_directory: working_directory.clone(),
                 request_visual: request_visual.clone(),
                 legacy_request_presentation: legacy_request_presentation.clone(),
             },
@@ -818,6 +822,7 @@ impl PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
+                working_directory,
                 request_visual,
                 legacy_request_presentation,
             } => SessionEventKind::ToolCallRequested {
@@ -825,6 +830,7 @@ impl PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
+                working_directory,
                 request_visual,
                 legacy_request_presentation,
             },
@@ -1266,6 +1272,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
+                working_directory: None,
                 request_visual: None,
                 legacy_request_presentation: None,
             },

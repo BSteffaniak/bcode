@@ -45,7 +45,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
     ) -> Vec<Line> {
         let width = context.width();
         if kind == "bcode.tool.request.shell.run" {
-            return self.shell_request_rows(payload, width);
+            return self.shell_request_rows(payload, width, context);
         }
         let mode = payload
             .get("mode")
@@ -62,7 +62,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
         });
 
-        let mut lines = shell_terminal_prompt_rows(payload, width);
+        let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(shell_status_rows(payload));
         lines.extend(terminal_viewer_rows(
             TerminalViewerInput {
@@ -96,9 +96,14 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
 }
 
 impl ShellRunTuiVisualAdapter {
-    fn shell_request_rows(&self, payload: &serde_json::Value, width: u16) -> Vec<Line> {
+    fn shell_request_rows(
+        &self,
+        payload: &serde_json::Value,
+        width: u16,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
         let Some(runtime) = payload.get("_bcode_runtime") else {
-            return shell_terminal_prompt_rows(payload, width);
+            return shell_terminal_prompt_rows(payload, width, context);
         };
         let output = runtime
             .get("output")
@@ -142,7 +147,7 @@ impl ShellRunTuiVisualAdapter {
                 max_rows: MAX_INLINE_TERMINAL_ROWS,
             };
         }
-        let mut lines = shell_terminal_prompt_rows(payload, width);
+        let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(shell_status_rows(runtime));
         lines.extend(terminal_viewer_rows(input, width));
         lines
@@ -179,7 +184,11 @@ fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
     ])]
 }
 
-fn shell_terminal_prompt_rows(payload: &serde_json::Value, _width: u16) -> Vec<Line> {
+fn shell_terminal_prompt_rows(
+    payload: &serde_json::Value,
+    _width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let command = arguments
         .get("command")
@@ -204,7 +213,7 @@ fn shell_terminal_prompt_rows(payload: &serde_json::Value, _width: u16) -> Vec<L
         .enumerate()
         .map(|(index, line)| {
             let mut spans = if index == 0 {
-                prompt_spans(cwd)
+                prompt_spans(cwd, context)
             } else {
                 vec![Span::styled("    ", muted_style())]
             };
@@ -214,10 +223,16 @@ fn shell_terminal_prompt_rows(payload: &serde_json::Value, _width: u16) -> Vec<L
         .collect()
 }
 
-fn prompt_spans(cwd: Option<&str>) -> Vec<Span> {
+fn prompt_spans(
+    cwd: Option<&str>,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Span> {
     let mut spans = vec![Span::styled("  ", muted_style())];
     if let Some(cwd) = cwd {
-        spans.push(Span::styled(short_cwd(cwd), path_style()));
+        spans.push(Span::styled(
+            context.display_path(cwd).to_string(),
+            path_style(),
+        ));
         spans.push(Span::styled(" ❯ ", prompt_style()));
     } else {
         spans.push(Span::styled("❯ ", prompt_style()));
@@ -242,13 +257,6 @@ fn format_shell_command_for_display(command: &str) -> String {
 
 fn trim_formatted_shell_command(command: &str) -> String {
     command.trim_end_matches(['\r', '\n']).to_owned()
-}
-
-fn short_cwd(cwd: &str) -> String {
-    let mut components = cwd.rsplit('/').filter(|part| !part.is_empty());
-    let leaf = components.next().unwrap_or(cwd);
-    let parent = components.next();
-    parent.map_or_else(|| cwd.to_owned(), |parent| format!("…/{parent}/{leaf}"))
 }
 
 fn shell_command_spans(command: &str) -> Vec<Span> {

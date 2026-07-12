@@ -31,24 +31,37 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for DocumentTuiVisualAdapter 
     ) -> Vec<Line> {
         let width = context.width();
         match kind {
-            "bcode.document.request" => request_rows(payload),
-            "bcode.document.extract_result" => extract_rows(payload, width),
+            "bcode.document.request" => request_rows(payload, context),
+            "bcode.document.extract_result" => extract_rows(payload, width, context),
             "bcode.document.status" => status_rows(payload),
             _ => Vec::new(),
         }
     }
 }
 
-fn request_rows(payload: &Value) -> Vec<Line> {
+fn request_rows(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let mut rows = header("Document request");
-    for key in ["operation", "path", "url", "max_bytes", "timeout_ms"] {
+    push_kv(&mut rows, "operation", value(arguments, "operation"));
+    push_kv(
+        &mut rows,
+        "path",
+        text(arguments, "path").map(|path| context.display_path(path).to_string()),
+    );
+    for key in ["url", "max_bytes", "timeout_ms"] {
         push_kv(&mut rows, key, value(arguments, key));
     }
     rows
 }
 
-fn extract_rows(payload: &Value, width: u16) -> Vec<Line> {
+fn extract_rows(
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let metadata = [
         text(payload, "source").map(|value| Span::styled(value.to_owned(), value_style())),
         text(payload, "content_type").map(|value| Span::styled(value.to_owned(), muted())),
@@ -66,8 +79,16 @@ fn extract_rows(payload: &Value, width: u16) -> Vec<Line> {
     if text(payload, "fallback_used").is_some_and(|value| value != "false") {
         push_kv(&mut rows, "fallback", text(payload, "fallback_used"));
     }
-    push_kv(&mut rows, "document", text(payload, "document_path"));
-    push_kv(&mut rows, "text path", text(payload, "text_path"));
+    push_kv(
+        &mut rows,
+        "document",
+        text(payload, "document_path").map(|path| context.display_path(path).to_string()),
+    );
+    push_kv(
+        &mut rows,
+        "text path",
+        text(payload, "text_path").map(|path| context.display_path(path).to_string()),
+    );
     if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
         push_kv(&mut rows, "truncated", Some("yes"));
     }

@@ -30,33 +30,49 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for OcrTuiVisualAdapter {
     ) -> Vec<Line> {
         let width = context.width();
         match kind {
-            "bcode.ocr.request" => request_rows(payload),
-            "bcode.ocr.extract_result" => extract_rows(payload, width),
+            "bcode.ocr.request" => request_rows(payload, context),
+            "bcode.ocr.extract_result" => extract_rows(payload, width, context),
             "bcode.ocr.status" => status_rows(payload),
             _ => Vec::new(),
         }
     }
 }
 
-fn request_rows(payload: &Value) -> Vec<Line> {
+fn request_rows(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let mut rows = header("OCR request");
-    for key in [
-        "operation",
+    push_kv(&mut rows, "operation", value(arguments, "operation"));
+    push_kv(
+        &mut rows,
         "path",
-        "url",
-        "language",
-        "engine",
-        "max_bytes",
-    ] {
+        text(arguments, "path").map(|path| context.display_path(path).to_string()),
+    );
+    for key in ["url", "language", "engine", "max_bytes"] {
         push_kv(&mut rows, key, value(arguments, key));
     }
     rows
 }
 
-fn extract_rows(payload: &Value, width: u16) -> Vec<Line> {
+fn extract_rows(
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
     let mut rows = header("OCR text");
-    push_kv(&mut rows, "source", source_text(payload));
+    push_kv(
+        &mut rows,
+        "source",
+        source_text(payload).map(|source| {
+            if payload.get("source").and_then(|v| v.get("path")).is_some() {
+                context.display_path(source).to_string()
+            } else {
+                source
+            }
+        }),
+    );
     push_kv(&mut rows, "engine", text(payload, "engine"));
     push_kv(&mut rows, "language", text(payload, "language"));
     push_kv(&mut rows, "bytes", byte_summary(payload));
