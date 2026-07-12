@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use bcode_config::{TuiAccentTransitionCurve, TuiConfig, TuiThemeConfig, TuiThinkingConfig};
+use bcode_config::{
+    TuiAccentTransitionCurve, TuiConfig, TuiDiffViewerConfig, TuiDiffViewerLayout, TuiThemeConfig,
+    TuiThinkingConfig,
+};
 use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus,
@@ -318,6 +321,7 @@ pub struct BmuxApp {
     key_hints: String,
     jump_to_latest_key_label: String,
     tui_config: TuiConfig,
+    diff_viewer_layout_override: Option<TuiDiffViewerLayout>,
     exit: ExitState,
     cursor: CursorBlink,
     live_preview_frame: LivePreviewFrameState,
@@ -530,6 +534,7 @@ impl BmuxApp {
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
             tui_config: TuiConfig::default(),
+            diff_viewer_layout_override: None,
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
             live_preview_frame: LivePreviewFrameState::new(),
@@ -673,6 +678,36 @@ impl BmuxApp {
     #[must_use]
     pub const fn tui_config(&self) -> &TuiConfig {
         &self.tui_config
+    }
+
+    /// Return the effective diff viewer configuration.
+    #[must_use]
+    pub fn effective_diff_viewer_config(&self) -> TuiDiffViewerConfig {
+        TuiDiffViewerConfig {
+            layout: self
+                .diff_viewer_layout_override
+                .unwrap_or(self.tui_config.diff_viewer.layout),
+            side_by_side_breakpoint: self.tui_config.diff_viewer.side_by_side_breakpoint,
+        }
+    }
+
+    /// Cycle the session-local diff layout override.
+    pub fn cycle_diff_viewer_layout(&mut self) {
+        let next = match self
+            .diff_viewer_layout_override
+            .unwrap_or(self.tui_config.diff_viewer.layout)
+        {
+            TuiDiffViewerLayout::Auto => TuiDiffViewerLayout::Unified,
+            TuiDiffViewerLayout::Unified => TuiDiffViewerLayout::SideBySide,
+            TuiDiffViewerLayout::SideBySide => TuiDiffViewerLayout::Auto,
+        };
+        self.diff_viewer_layout_override = Some(next);
+        let label = match next {
+            TuiDiffViewerLayout::Auto => "automatic",
+            TuiDiffViewerLayout::Unified => "unified",
+            TuiDiffViewerLayout::SideBySide => "side-by-side",
+        };
+        self.set_status(format!("Diff layout: {label}"));
     }
 
     /// Return the currently selected provider plugin id, if explicit.

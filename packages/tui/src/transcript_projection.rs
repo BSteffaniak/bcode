@@ -9,6 +9,7 @@ use super::transcript::TranscriptItem;
 use super::transcript_layout::{
     TranscriptLayoutFingerprint, TranscriptLayoutSignature, TranscriptLayoutSpec,
 };
+use bcode_config::TuiDiffViewerConfig;
 use bcode_plugin::PluginHost;
 
 /// Prepare transcript layout and viewport projections for a frame body.
@@ -76,6 +77,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
                 index,
                 input.width,
                 input.plugin_host,
+                input.diff_viewer_config,
             )
         },
         pending_signature: |index| {
@@ -99,6 +101,7 @@ struct TranscriptLayoutInput<'a> {
     transcript: &'a [TranscriptItem],
     live_tool_previews: &'a std::collections::BTreeMap<String, LiveToolPreviewState>,
     plugin_host: Option<&'a PluginHost>,
+    diff_viewer_config: TuiDiffViewerConfig,
     pending: &'a [PendingSubmission],
     transcript_projection_revision: u64,
     pending_submissions_projection_revision: u64,
@@ -113,6 +116,7 @@ impl<'a> TranscriptLayoutInput<'a> {
             transcript: app.transcript(),
             live_tool_previews: app.live_tool_previews(),
             plugin_host: app.plugin_host(),
+            diff_viewer_config: app.effective_diff_viewer_config(),
             pending: app.pending_submissions(),
             transcript_projection_revision: app.transcript_projection_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
@@ -155,8 +159,9 @@ impl<'a> TranscriptLayoutInput<'a> {
             .plugin_host
             .map_or(0, |host| std::ptr::from_ref(host).addr());
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};history:{}:{};plugin-host:{plugin_host_revision};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
+            "width:{};diff:{:?};history:{}:{};plugin-host:{plugin_host_revision};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
             self.width,
+            self.diff_viewer_config,
             self.has_older_history,
             self.loading_older_history,
             self.transcript_projection_revision,

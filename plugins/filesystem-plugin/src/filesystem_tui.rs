@@ -35,7 +35,13 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
     }
 
-    fn rows(&self, kind: &str, payload: &Value, width: u16) -> Vec<Line> {
+    fn rows(
+        &self,
+        kind: &str,
+        payload: &Value,
+        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
+        let width = context.width;
         match kind {
             "bcode.filesystem.request" => request_rows(payload),
             "bcode.filesystem.read" | "bcode.filesystem.artifact.read" => {
@@ -464,7 +470,7 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.find",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
 
         assert!(
@@ -496,7 +502,7 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.list",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -529,7 +535,7 @@ mod tests {
                 &FilesystemTuiVisualAdapter,
                 kind,
                 &payload,
-                80,
+                bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
             );
             let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
             assert!(rendered.contains(icon), "{kind}: {rendered}");
@@ -547,7 +553,7 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.grep",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("Text matches (1)"), "{rendered}");
@@ -567,7 +573,7 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.read",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("9 │ pub fn main() {}"), "{rendered}");
@@ -593,7 +599,7 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.artifact.read",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("partial bytes"), "{rendered}");
@@ -615,7 +621,7 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.grep",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -641,7 +647,7 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.grep",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
 
         assert!(
@@ -667,7 +673,7 @@ mod tests {
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.read",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 

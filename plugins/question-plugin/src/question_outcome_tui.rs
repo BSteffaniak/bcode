@@ -10,7 +10,12 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for QuestionOutcomeTuiVisualA
         kind == "bcode.question.outcome"
     }
 
-    fn rows(&self, _kind: &str, payload: &serde_json::Value, _width: u16) -> Vec<Line> {
+    fn rows(
+        &self,
+        _kind: &str,
+        payload: &serde_json::Value,
+        _context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
         let Ok(outcome) = serde_json::from_value::<super::QuestionToolOutcome>(payload.clone())
         else {
             return vec![
@@ -78,7 +83,7 @@ mod tests {
             &QuestionOutcomeTuiVisualAdapter,
             "bcode.question.outcome",
             &payload,
-            100,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(100),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 

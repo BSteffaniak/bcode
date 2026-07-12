@@ -37,7 +37,13 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         }
     }
 
-    fn rows(&self, kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line> {
+    fn rows(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
+        let width = context.width;
         if kind == "bcode.tool.request.shell.run" {
             return self.shell_request_rows(payload, width);
         }
@@ -376,7 +382,7 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
-            64,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(64),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -396,7 +402,7 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
-            48,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(48),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -413,7 +419,7 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
-            32,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(32),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -435,7 +441,7 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.shell.run",
             &payload,
-            100,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(100),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
@@ -465,7 +471,7 @@ mod tests {
             &ShellRunTuiVisualAdapter::default(),
             "bcode.shell.run",
             &payload,
-            100,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(100),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 

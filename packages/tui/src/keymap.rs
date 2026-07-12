@@ -31,6 +31,7 @@ pub enum BmuxAction {
     CommandPaletteOpen,
     AgentCycle,
     ThinkingEffortCycle,
+    DiffViewerLayoutCycle,
     TranscriptPageUp,
     TranscriptPageDown,
     TranscriptTop,
@@ -84,6 +85,7 @@ impl BmuxAction {
             "app.command_palette" => Self::CommandPaletteOpen,
             "tui.agent.cycle" => Self::AgentCycle,
             "tui.thinking.effort.cycle" => Self::ThinkingEffortCycle,
+            "tui.diff_viewer.layout_cycle" => Self::DiffViewerLayoutCycle,
             "transcript.pageUp" => Self::TranscriptPageUp,
             "transcript.pageDown" => Self::TranscriptPageDown,
             "transcript.top" => Self::TranscriptTop,
@@ -304,6 +306,7 @@ impl BmuxKeyMap {
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::AgentCycle
             | BmuxAction::ThinkingEffortCycle
+            | BmuxAction::DiffViewerLayoutCycle
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
@@ -357,6 +360,7 @@ impl BmuxKeyMap {
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::AgentCycle
             | BmuxAction::ThinkingEffortCycle
+            | BmuxAction::DiffViewerLayoutCycle
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop

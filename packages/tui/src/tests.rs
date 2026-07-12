@@ -5804,7 +5804,14 @@ fn plugin_visual_degrades_without_rendering_raw_payload() {
         false,
     );
 
-    let rows = render::transcript_item_rows(&[item], &BTreeMap::new(), 0, 90, None);
+    let rows = render::transcript_item_rows(
+        &[item],
+        &BTreeMap::new(),
+        0,
+        90,
+        None,
+        bcode_config::TuiDiffViewerConfig::default(),
+    );
     let output = format!("{rows:?}");
 
     assert!(output.contains("File change"), "{output}");

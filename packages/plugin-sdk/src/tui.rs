@@ -174,6 +174,34 @@ pub enum PluginTuiVisualRenderMode {
     FullBlock,
 }
 
+/// Diff layout preference supplied by the TUI host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginTuiDiffLayout {
+    Auto { breakpoint: u16 },
+    Unified,
+    SideBySide,
+}
+
+/// Host-owned presentation context for visual adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginTuiVisualRenderContext {
+    /// Actual width assigned to the visual.
+    pub width: u16,
+    /// Effective diff viewer policy.
+    pub diff_layout: PluginTuiDiffLayout,
+}
+
+impl PluginTuiVisualRenderContext {
+    /// Construct the default responsive context.
+    #[must_use]
+    pub const fn new(width: u16) -> Self {
+        Self {
+            width,
+            diff_layout: PluginTuiDiffLayout::Auto { breakpoint: 120 },
+        }
+    }
+}
+
 /// Native Rust plugin artifact/view renderer for inline transcript content.
 pub trait PluginTuiVisualAdapter: Send + Sync {
     /// Return whether this adapter can render the artifact/view kind.
@@ -185,7 +213,12 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
     }
 
     /// Build transcript rows for the artifact/view payload at the given width.
-    fn rows(&self, kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line>;
+    fn rows(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: PluginTuiVisualRenderContext,
+    ) -> Vec<Line>;
 }
 
 /// Native Rust plugin surface rendered directly with `bmux_tui`.
@@ -457,6 +490,20 @@ impl PluginTuiRegistry {
             .map(|adapter| adapter.render_mode(kind, payload))
     }
 
+    /// Build transcript rows with host-owned presentation preferences.
+    #[must_use]
+    pub fn visual_rows_with_context(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: PluginTuiVisualRenderContext,
+    ) -> Option<Vec<Line>> {
+        self.visual_adapters
+            .iter()
+            .find(|adapter| adapter.supports(kind))
+            .map(|adapter| adapter.rows(kind, payload, context))
+    }
+
     /// Build transcript rows for a plugin-owned artifact/view payload.
     #[must_use]
     pub fn visual_rows(
@@ -465,10 +512,7 @@ impl PluginTuiRegistry {
         payload: &serde_json::Value,
         width: u16,
     ) -> Option<Vec<Line>> {
-        self.visual_adapters
-            .iter()
-            .find(|adapter| adapter.supports(kind))
-            .map(|adapter| adapter.rows(kind, payload, width))
+        self.visual_rows_with_context(kind, payload, PluginTuiVisualRenderContext::new(width))
     }
 
     /// Open a registered surface.

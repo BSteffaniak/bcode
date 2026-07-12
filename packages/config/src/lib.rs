@@ -1638,6 +1638,10 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub keybindings: TuiKeyBindingConfig,
+    /// Diff viewer rendering configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub diff_viewer: TuiDiffViewerConfig,
     /// Mouse interaction configuration.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1650,6 +1654,44 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub theme: TuiThemeConfig,
+}
+
+/// Terminal diff viewer rendering configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "diff_viewer")]
+pub struct TuiDiffViewerConfig {
+    /// Responsive or fixed diff layout.
+    #[serde(default)]
+    pub layout: TuiDiffViewerLayout,
+    /// Component width at which automatic layout becomes side-by-side.
+    #[serde(default = "default_diff_viewer_breakpoint")]
+    pub side_by_side_breakpoint: u16,
+}
+
+impl Default for TuiDiffViewerConfig {
+    fn default() -> Self {
+        Self {
+            layout: TuiDiffViewerLayout::Auto,
+            side_by_side_breakpoint: default_diff_viewer_breakpoint(),
+        }
+    }
+}
+
+const fn default_diff_viewer_breakpoint() -> u16 {
+    120
+}
+
+/// Diff viewer layout selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiDiffViewerLayout {
+    /// Unified at narrow widths and side-by-side at wide widths.
+    #[default]
+    Auto,
+    /// Always render a unified diff.
+    Unified,
+    /// Always render old and new content side-by-side.
+    SideBySide,
 }
 
 /// Duration/easing curve for terminal UI accent color transitions.

@@ -535,7 +535,12 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for WorktreeTuiVisualAdapter 
         bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
     }
 
-    fn rows(&self, kind: &str, payload: &serde_json::Value, _width: u16) -> Vec<Line> {
+    fn rows(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        _context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
         match kind {
             WORKTREE_REQUEST_SCHEMA => worktree_request_rows(payload),
             WORKTREE_LIST_SCHEMA => worktree_list_rows(payload),

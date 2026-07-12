@@ -126,6 +126,13 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
             redraw: true,
             request: KeyRequest::CycleThinkingEffort,
         },
+        BmuxAction::DiffViewerLayoutCycle => {
+            app.cycle_diff_viewer_layout();
+            KeyOutcome {
+                redraw: true,
+                request: KeyRequest::None,
+            }
+        }
         BmuxAction::InputHistoryPrevious => history_previous(app),
         BmuxAction::InputHistoryNext => history_next(app),
         BmuxAction::TranscriptPageUp => KeyOutcome {

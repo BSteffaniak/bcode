@@ -57,6 +57,7 @@ pub async fn handle_permission_key(
         | BmuxAction::ClipboardPasteImage
         | BmuxAction::CommandPaletteOpen
         | BmuxAction::AgentCycle
+        | BmuxAction::DiffViewerLayoutCycle
         | BmuxAction::ThinkingEffortCycle
         | BmuxAction::TranscriptPageUp
         | BmuxAction::TranscriptPageDown

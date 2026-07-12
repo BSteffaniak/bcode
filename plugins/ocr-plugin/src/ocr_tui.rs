@@ -22,7 +22,13 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for OcrTuiVisualAdapter {
         bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
     }
 
-    fn rows(&self, kind: &str, payload: &Value, width: u16) -> Vec<Line> {
+    fn rows(
+        &self,
+        kind: &str,
+        payload: &Value,
+        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
+        let width = context.width;
         match kind {
             "bcode.ocr.request" => request_rows(payload),
             "bcode.ocr.extract_result" => extract_rows(payload, width),

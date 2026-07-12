@@ -1,5 +1,30 @@
 //! TUI rendering.
 
+use bcode_config::{TuiDiffViewerConfig, TuiDiffViewerLayout};
+use bcode_plugin_sdk::tui::{PluginTuiDiffLayout, PluginTuiVisualRenderContext};
+use std::cell::Cell;
+
+thread_local! {
+    static DIFF_VIEWER_CONFIG: Cell<TuiDiffViewerConfig> = const { Cell::new(TuiDiffViewerConfig {
+        layout: TuiDiffViewerLayout::Auto,
+        side_by_side_breakpoint: 120,
+    }) };
+}
+
+fn plugin_visual_context(width: u16) -> PluginTuiVisualRenderContext {
+    DIFF_VIEWER_CONFIG.with(|config| {
+        let config = config.get();
+        let diff_layout = match config.layout {
+            TuiDiffViewerLayout::Auto => PluginTuiDiffLayout::Auto {
+                breakpoint: config.side_by_side_breakpoint,
+            },
+            TuiDiffViewerLayout::Unified => PluginTuiDiffLayout::Unified,
+            TuiDiffViewerLayout::SideBySide => PluginTuiDiffLayout::SideBySide,
+        };
+        PluginTuiVisualRenderContext { width, diff_layout }
+    })
+}
+
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -504,7 +529,9 @@ pub fn transcript_item_rows(
     index: usize,
     width: u16,
     plugin_host: Option<&bcode_plugin::PluginHost>,
+    diff_viewer_config: TuiDiffViewerConfig,
 ) -> Vec<Line> {
+    DIFF_VIEWER_CONFIG.with(|config| config.set(diff_viewer_config));
     let mut rows = Vec::new();
     push_transcript_item_rows(
         &mut rows,
@@ -984,7 +1011,11 @@ fn push_canonical_plugin_visual_rows(
         );
         return;
     };
-    if let Some(native_rows) = registry.visual_rows(&route.schema, &visual.payload, width) {
+    if let Some(native_rows) = registry.visual_rows_with_context(
+        &route.schema,
+        &visual.payload,
+        plugin_visual_context(width),
+    ) {
         rows.extend(native_rows);
         return;
     }

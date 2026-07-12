@@ -15,7 +15,13 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         )
     }
 
-    fn rows(&self, _kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line> {
+    fn rows(
+        &self,
+        _kind: &str,
+        payload: &serde_json::Value,
+        context: bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
+        let width = context.width;
         let path = payload
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -70,16 +76,16 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
                 subtitle,
                 argument_bytes,
                 truncated,
-                layout: match payload.get("layout").and_then(serde_json::Value::as_str) {
-                    Some("unified") => DiffViewerLayout::Unified,
-                    Some("side_by_side") => DiffViewerLayout::SideBySide,
-                    _ => DiffViewerLayout::Auto {
-                        breakpoint: payload
-                            .get("side_by_side_breakpoint")
-                            .and_then(serde_json::Value::as_u64)
-                            .and_then(|value| u16::try_from(value).ok())
-                            .unwrap_or(120),
-                    },
+                layout: match context.diff_layout {
+                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint } => {
+                        DiffViewerLayout::Auto { breakpoint }
+                    }
+                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified => {
+                        DiffViewerLayout::Unified
+                    }
+                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::SideBySide => {
+                        DiffViewerLayout::SideBySide
+                    }
                 },
             },
             width,
@@ -115,7 +121,7 @@ mod tests {
             &FileChangeTuiVisualAdapter,
             "bcode.filesystem.change",
             &payload,
-            80,
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(80),
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
