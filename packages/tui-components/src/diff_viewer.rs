@@ -833,7 +833,9 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
                 let removed_count = added_start.saturating_sub(removed_start);
                 let added_count = index.saturating_sub(added_start);
                 for offset in 0..removed_count.max(added_count) {
-                    let old = preview.get(removed_start + offset).and_then(preview_line);
+                    let old = (offset < removed_count)
+                        .then(|| preview.get(removed_start + offset).and_then(preview_line))
+                        .flatten();
                     let new = (offset < added_count)
                         .then(|| preview.get(added_start + offset).and_then(preview_line))
                         .flatten();
@@ -1377,6 +1379,46 @@ mod tests {
             assert_eq!(line_width(&row), usize::from(card_width) + 2, "{row:?}");
             assert_eq!(row.spans[0].content, "  ");
         }
+    }
+
+    #[test]
+    fn side_by_side_does_not_put_extra_added_lines_on_old_side() {
+        let removed = DiffLine::new(DiffLineKind::Removed, Some(1), None, "old");
+        let added_one = DiffLine::new(DiffLineKind::Added, None, Some(1), "new one");
+        let added_two = DiffLine::new(DiffLineKind::Added, None, Some(2), "new two");
+        let rows = render_side_by_side_preview(
+            &[
+                PreviewRow::Line(&removed),
+                PreviewRow::Line(&added_one),
+                PreviewRow::Line(&added_two),
+            ],
+            80,
+        );
+        let second = &rows[1];
+        let divider = second
+            .spans
+            .iter()
+            .position(|span| span.content == "│")
+            .expect("outer border");
+        let center = second
+            .spans
+            .iter()
+            .enumerate()
+            .skip(divider + 1)
+            .find(|(_, span)| span.content == "│")
+            .map(|(index, _)| index)
+            .expect("center divider");
+        let left = second.spans[divider + 1..center]
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        let right = second.spans[center + 1..]
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+
+        assert!(!left.contains("new two"), "{second:?}");
+        assert!(right.contains("new two"), "{second:?}");
     }
 
     #[test]
