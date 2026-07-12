@@ -19768,6 +19768,25 @@ mod tests {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
 
+    fn test_server_state_with_fake_provider(sessions: SessionManager) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+            bcode_fake_provider_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.fake-provider".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load fake provider");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state
+    }
+
     fn test_server_state_with_ralph_store(
         sessions: SessionManager,
         ralph_store: bcode_ralph::RalphStateStore,
@@ -19935,6 +19954,226 @@ mod tests {
             request_fields,
             Some((&Some("test.plugin".to_owned()), &None))
         );
+    }
+
+    #[tokio::test]
+    async fn unavailable_provider_native_compaction_uses_local_marker() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("native unavailable".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        for text in ["first turn", "second turn", "active turn"] {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.to_string(),
+                    },
+                )
+                .await
+                .expect("append user turn");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("response to {text}"),
+                    },
+                )
+                .await
+                .expect("append assistant turn");
+        }
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::Auto;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-model".to_string()),
+            ..SessionModelSelection::default()
+        };
+
+        compact_session_context_with_limit(
+            &state,
+            session_id,
+            &selection,
+            None,
+            None,
+            &TurnCancelState::default(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("local fallback failed: {error}"));
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+        );
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn provider_native_failure_falls_back_to_local_compaction_without_provider_marker() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("native fallback".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        for text in ["first turn", "second turn", "active turn"] {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.to_string(),
+                    },
+                )
+                .await
+                .expect("append user turn");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("response to {text}"),
+                    },
+                )
+                .await
+                .expect("append assistant turn");
+        }
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::Auto;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-model".to_string()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([
+                    ("fake_native_compaction".to_string(), "true".to_string()),
+                    ("fake_compaction_failure".to_string(), "true".to_string()),
+                ]),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+
+        compact_session_context_with_limit(
+            &state,
+            session_id,
+            &selection,
+            None,
+            None,
+            &TurnCancelState::default(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("local fallback failed: {error}"));
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+        );
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn provider_native_compaction_persists_compatible_snapshot_and_portable_fallback() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("native compaction".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        for text in ["first turn", "second turn", "active turn"] {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.to_string(),
+                    },
+                )
+                .await
+                .expect("append user turn");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("response to {text}"),
+                    },
+                )
+                .await
+                .expect("append assistant turn");
+        }
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-model".to_string()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([(
+                    "fake_native_compaction".to_string(),
+                    "true".to_string(),
+                )]),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+
+        compact_session_context_with_limit(
+            &state,
+            session_id,
+            &selection,
+            None,
+            None,
+            &TurnCancelState::default(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("provider-native compaction failed: {error}"));
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        let snapshot = history.iter().find_map(|event| match &event.kind {
+            SessionEventKind::ProviderContextCompacted { snapshot, .. } => Some(snapshot),
+            _ => None,
+        });
+        let snapshot = snapshot.expect("provider snapshot should persist");
+        assert_eq!(snapshot.provider_plugin_id, "bcode.fake-provider");
+        assert_eq!(snapshot.model_id, "fake-model");
+        assert_eq!(snapshot.format_version, 1);
+        assert_eq!(snapshot.compatibility_key, "bcode.fake-provider/context-v1");
+        assert!(!snapshot.messages_json.is_empty());
+        assert!(!snapshot.portable_summary.is_empty());
     }
 
     #[tokio::test]

@@ -2093,6 +2093,7 @@ dependencies = [
  "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",
+ "bcode_fake_provider_plugin",
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",

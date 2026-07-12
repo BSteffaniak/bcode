@@ -5,12 +5,14 @@
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
 use bcode_model::{
-    AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
-    OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
-    OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
-    ProviderCapability, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
-    ValidateConfigResponse,
+    AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
+    ContextManagementCapabilities, ContextManagementCapabilitiesRequest, FinishTurnRequest,
+    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage,
+    ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_COMPACT_CONTEXT,
+    OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS,
+    OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderCapabilities, ProviderCapability, ProviderContextFormat, ProviderTurnEvent,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -91,6 +93,17 @@ impl FakeProviderPlugin {
                 message: Some("fake provider is always valid".to_string()),
                 metadata: std::collections::BTreeMap::new(),
             }),
+            OP_CONTEXT_MANAGEMENT_CAPABILITIES => {
+                let request = match context
+                    .request
+                    .payload_json::<ContextManagementCapabilitiesRequest>()
+                {
+                    Ok(request) => request,
+                    Err(error) => return invalid_request(&error),
+                };
+                json_response(&fake_context_capabilities(&request))
+            }
+            OP_COMPACT_CONTEXT => Self::compact_context(&context.request),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
@@ -100,6 +113,34 @@ impl FakeProviderPlugin {
                 "unsupported model provider operation",
             ),
         }
+    }
+
+    fn compact_context(request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<CompactContextRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        if request
+            .provider_context
+            .settings
+            .get("fake_compaction_failure")
+            .is_some_and(|value| value == "true")
+        {
+            return ServiceResponse::error("fake_compaction_failed", "requested fake failure");
+        }
+        let opaque = ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ProviderExtension {
+                value: serde_json::json!({
+                    "type": "fake_compaction",
+                    "message_count": request.messages.len(),
+                }),
+            }],
+        };
+        json_response(&CompactContextResponse {
+            messages: vec![opaque],
+            context_format: fake_context_format(),
+        })
     }
 
     fn start_turn(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -331,6 +372,28 @@ fn last_tool_result(messages: &[ModelMessage]) -> Option<String> {
             _ => None,
         })
     })
+}
+
+fn fake_context_format() -> ProviderContextFormat {
+    ProviderContextFormat {
+        version: 1,
+        compatibility_key: "bcode.fake-provider/context-v1".to_string(),
+    }
+}
+
+fn fake_context_capabilities(
+    request: &ContextManagementCapabilitiesRequest,
+) -> ContextManagementCapabilities {
+    let enabled = request
+        .provider_context
+        .settings
+        .get("fake_native_compaction")
+        .is_some_and(|value| value == "true");
+    ContextManagementCapabilities {
+        provider_managed: false,
+        native_compaction: enabled,
+        context_format: enabled.then(fake_context_format),
+    }
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
