@@ -23788,6 +23788,83 @@ mod tests {
         assert!(active.load(Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn multiple_steering_messages_during_active_work_preserve_acceptance_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp.path()).expect("persistent sessions");
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions));
+        let (followup_tx, mut followup_rx) = mpsc::channel(4);
+        let (steering_tx, _steering_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let handle = SessionRuntimeHandle {
+            followup_commands: followup_tx,
+            steering_commands: steering_tx,
+            cancel_commands: cancel_tx,
+            queued_followups: Arc::clone(&queued),
+            phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+            current_turn: Arc::new(Mutex::new(None)),
+            plugin_automation_active: Arc::clone(&active),
+        };
+        let client_id = ClientId::new();
+
+        let first = enqueue_steering_message_command(
+            &state,
+            &handle,
+            summary.id,
+            client_id,
+            None,
+            "first".to_owned(),
+            SteeringWindow::ProviderInFlight,
+        )
+        .await
+        .expect("first steering");
+        let second = enqueue_steering_message_command(
+            &state,
+            &handle,
+            summary.id,
+            client_id,
+            None,
+            "second".to_owned(),
+            SteeringWindow::ProviderInFlight,
+        )
+        .await
+        .expect("second steering");
+
+        assert_eq!(first.queue_position, Some(1));
+        assert_eq!(second.queue_position, Some(2));
+        assert_eq!(queued.load(Ordering::Acquire), 2);
+        for expected in ["first", "second"] {
+            let command = followup_rx.recv().await.expect("queued steering");
+            let FollowupCommand::ContinueFromUserEvent { user_event, .. } = command else {
+                panic!("expected persisted steering continuation");
+            };
+            let SessionEventKind::UserMessage { text, .. } = &user_event.kind else {
+                panic!("expected steering user event");
+            };
+            assert_eq!(text, expected);
+        }
+        let history = state
+            .sessions
+            .session_history(summary.id)
+            .await
+            .expect("history");
+        let messages = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["first", "second"]);
+        assert!(active.load(Ordering::Acquire));
+    }
+
     #[test]
     fn automation_preflight_enforces_manual_hold_busy_and_generation_priority() {
         assert!(matches!(

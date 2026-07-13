@@ -1932,6 +1932,26 @@ mod tests {
     }
 
     #[test]
+    fn active_iteration_cannot_submit_a_second_iteration_before_terminal_transition() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            3,
+        );
+        transition(&mut state, RunState::SubmittingIteration).expect("submit first");
+        transition(&mut state, RunState::RunningIteration).expect("run first");
+
+        assert!(transition(&mut state, RunState::SubmittingIteration).is_err());
+        assert_eq!(state.state, RunState::RunningIteration);
+
+        transition(&mut state, RunState::Evaluating).expect("first terminal completion advances");
+        transition(&mut state, RunState::Ready).expect("incomplete evaluation allows next work");
+        transition(&mut state, RunState::SubmittingIteration)
+            .expect("submit second after terminal");
+    }
+
+    #[test]
     fn cancellation_outcomes_pause_and_never_continue_automatically() {
         assert_eq!(
             decide_turn_outcome(ModelTurnOutcome::Completed),
