@@ -20,7 +20,9 @@ bcode_ipc            = { workspace = true }
 bcode_plugin_sdk     = { workspace = true }
 bcode_session_models = { workspace = true }
 bmux_keyboard        = { workspace = true }
+bmux_text_edit       = { workspace = true }
 bmux_tui             = { workspace = true }
+bmux_tui_components  = { workspace = true, features = ["text-input"] }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true }
 tokio                = { workspace = true, features = ["time"] }

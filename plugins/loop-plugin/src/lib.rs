@@ -21,11 +21,15 @@ use bcode_plugin_sdk::tui::{
 };
 use bcode_session_models::{ModelTurnOutcome, SessionEventKind, SessionId};
 use bmux_keyboard::KeyCode;
-use bmux_tui::event::Event;
+use bmux_text_edit::TextEditBuffer;
+use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
-use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text::{Line, Span};
+use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::style::Color;
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
 use serde::{Deserialize, Serialize};
 
 const PLUGIN_ID: &str = "bcode.loop";
@@ -233,7 +237,6 @@ fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
     state.cancel_requested = false;
     state.state = RunState::Running;
     state.stop_reason = None;
-    state.owner_pid = std::process::id();
     if let Err(error) = save_state(&state) {
         return status_response(&format!("failed to resume loop: {error}"));
     }
@@ -278,35 +281,59 @@ impl PluginTuiSurfaceFactory for LoopSurfaceFactory {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Prompt,
     Condition,
     Limit,
 }
 
+impl Field {
+    const fn next(self) -> Self {
+        match self {
+            Self::Prompt => Self::Condition,
+            Self::Condition => Self::Limit,
+            Self::Limit => Self::Prompt,
+        }
+    }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::Prompt => Self::Limit,
+            Self::Condition => Self::Prompt,
+            Self::Limit => Self::Condition,
+        }
+    }
+}
+
 struct LoopSurface {
     session_id: Option<SessionId>,
-    prompt: String,
-    condition: String,
-    limit: String,
+    prompt: TextInputState,
+    condition: TextInputState,
+    limit: TextInputState,
     field: Field,
     status: String,
+    prompt_area: Rect,
+    condition_area: Rect,
+    limit_area: Rect,
 }
 
 impl LoopSurface {
     fn new(session_id: Option<SessionId>) -> Self {
         Self {
             session_id,
-            prompt: String::new(),
-            condition: String::new(),
-            limit: DEFAULT_MAX_ITERATIONS.to_string(),
+            prompt: text_state(""),
+            condition: text_state(""),
+            limit: text_state(&DEFAULT_MAX_ITERATIONS.to_string()),
             field: Field::Prompt,
             status: "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
+            prompt_area: Rect::new(0, 0, 0, 0),
+            condition_area: Rect::new(0, 0, 0, 0),
+            limit_area: Rect::new(0, 0, 0, 0),
         }
     }
 
-    const fn active_text_mut(&mut self) -> &mut String {
+    const fn active_state_mut(&mut self) -> &mut TextInputState {
         match self.field {
             Field::Prompt => &mut self.prompt,
             Field::Condition => &mut self.condition,
@@ -314,12 +341,22 @@ impl LoopSurface {
         }
     }
 
-    const fn next_field(&mut self) {
-        self.field = match self.field {
-            Field::Prompt => Field::Condition,
-            Field::Condition => Field::Limit,
-            Field::Limit => Field::Prompt,
-        };
+    const fn active_area(&self) -> Rect {
+        match self.field {
+            Field::Prompt => self.prompt_area,
+            Field::Condition => self.condition_area,
+            Field::Limit => self.limit_area,
+        }
+    }
+
+    const fn focus_from_click(&mut self, event: &Event) {
+        if event_click_in(event, self.prompt_area) {
+            self.field = Field::Prompt;
+        } else if event_click_in(event, self.condition_area) {
+            self.field = Field::Condition;
+        } else if event_click_in(event, self.limit_area) {
+            self.field = Field::Limit;
+        }
     }
 
     fn start(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -327,17 +364,26 @@ impl LoopSurface {
             "an active persisted session is required".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         };
-        let prompt = self.prompt.trim().to_owned();
-        let condition = self.condition.trim().to_owned();
-        let Ok(max_iterations) = self.limit.trim().parse::<u64>() else {
+        let prompt = input_text(&self.prompt);
+        let condition = input_text(&self.condition);
+        let limit = input_text(&self.limit);
+        let Ok(max_iterations) = limit.parse::<u64>() else {
+            self.field = Field::Limit;
             "maximum iterations must be a number".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         };
-        if prompt.is_empty() || condition.is_empty() {
-            "prompt and stop condition are required".clone_into(&mut self.status);
+        if prompt.is_empty() {
+            self.field = Field::Prompt;
+            "iteration prompt is required".clone_into(&mut self.status);
+            return PluginTuiAction::Redraw;
+        }
+        if condition.is_empty() {
+            self.field = Field::Condition;
+            "stop condition is required".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         }
         if !(1..=HARD_MAX_ITERATIONS).contains(&max_iterations) {
+            self.field = Field::Limit;
             self.status = format!("maximum iterations must be 1..={HARD_MAX_ITERATIONS}");
             return PluginTuiAction::Redraw;
         }
@@ -365,6 +411,29 @@ impl LoopSurface {
             })),
         }
     }
+
+    fn render_input(
+        area: Rect,
+        frame: &mut Frame<'_>,
+        label: &'static str,
+        state: &mut TextInputState,
+        focused: bool,
+        rows: u16,
+    ) {
+        TextInputBox::new(TextInputPolicy::chat_composer())
+            .label(label)
+            .policy(TextInputBoxPolicy {
+                field_chrome: true,
+                panel_chrome: true,
+                background: true,
+                cursor: true,
+                focused,
+                disabled: false,
+                min_rows: rows,
+                max_rows: Some(rows),
+            })
+            .render(area, state, frame);
+    }
 }
 
 impl PluginTuiSurface for LoopSurface {
@@ -377,125 +446,141 @@ impl PluginTuiSurface for LoopSurface {
     }
 
     fn preferred_height(&mut self, _width: u16) -> u16 {
-        18
+        24
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-        write_line(
-            frame,
-            area,
-            area.y,
-            &Line::from_spans(vec![Span::styled(
-                "Start deterministic loop",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )]),
+        let modal = ModalFrame::new(
+            ModalSizing::new(Size::new(64, 22), Size::new(100, 32), Insets::all(2)),
+            ModalTheme::dark(Color::Cyan),
+        )
+        .title(" Start deterministic loop ")
+        .padding(Insets::new(1, 2, 1, 2))
+        .placement(ModalPlacement::Centered);
+        modal.render(area, frame);
+        let content = modal.content_area(area);
+        let available = content.height.saturating_sub(7);
+        let prompt_rows = available.saturating_mul(3) / 5;
+        let condition_rows = available.saturating_sub(prompt_rows).max(3);
+        self.prompt_area = Rect::new(content.x, content.y, content.width, prompt_rows.max(4));
+        self.condition_area = Rect::new(
+            content.x,
+            self.prompt_area.bottom().saturating_add(1),
+            content.width,
+            condition_rows,
         );
-        let mut y = area.y.saturating_add(2);
-        render_field(
+        self.limit_area = Rect::new(
+            content.x,
+            self.condition_area.bottom().saturating_add(1),
+            content.width.min(36),
+            3,
+        );
+        Self::render_input(
+            self.prompt_area,
             frame,
-            area,
-            &mut y,
             "Iteration prompt",
-            &self.prompt,
+            &mut self.prompt,
             self.field == Field::Prompt,
-            5,
+            self.prompt_area.height.saturating_sub(2).max(2),
         );
-        render_field(
+        Self::render_input(
+            self.condition_area,
             frame,
-            area,
-            &mut y,
             "Stop condition",
-            &self.condition,
+            &mut self.condition,
             self.field == Field::Condition,
-            4,
+            self.condition_area.height.saturating_sub(2).max(2),
         );
-        render_field(
+        Self::render_input(
+            self.limit_area,
             frame,
-            area,
-            &mut y,
             "Maximum iterations",
-            &self.limit,
+            &mut self.limit,
             self.field == Field::Limit,
             1,
         );
-        write_line(
-            frame,
-            area,
-            y.saturating_add(1),
-            &Line::from(self.status.clone()),
-        );
+        let status_y = self.limit_area.bottom().saturating_add(1);
+        if status_y < content.bottom() {
+            modal.render_line(
+                Rect::new(content.x, status_y, content.width, 1),
+                &Line::from_spans(vec![Span::styled(
+                    self.status.clone(),
+                    Style::new().fg(Color::BrightBlack).bg(Color::Black),
+                )]),
+                frame,
+            );
+        }
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        match event {
-            Event::Key(stroke) if stroke.key == KeyCode::Escape => {
-                PluginTuiAction::Close { outcome: None }
+        if let Event::Key(stroke) = event {
+            if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
+                return PluginTuiAction::Close { outcome: None };
             }
-            Event::Key(stroke) if stroke.key == KeyCode::Tab => {
-                self.next_field();
-                PluginTuiAction::Redraw
+            if stroke.key == KeyCode::Tab && stroke.modifiers.shift {
+                self.field = self.field.previous();
+                return PluginTuiAction::Redraw;
             }
-            Event::Key(stroke) if stroke.key == KeyCode::Enter && stroke.modifiers.ctrl => {
-                self.start(host)
+            if stroke.key == KeyCode::Tab && stroke.modifiers.is_empty() {
+                self.field = self.field.next();
+                return PluginTuiAction::Redraw;
             }
-            Event::Key(stroke) if stroke.key == KeyCode::Enter => {
-                if self.field == Field::Limit {
-                    self.start(host)
-                } else {
-                    self.active_text_mut().push('\n');
-                    PluginTuiAction::Redraw
-                }
+            if stroke.key == KeyCode::Enter && stroke.modifiers.ctrl {
+                return self.start(host);
             }
-            Event::Key(stroke) if stroke.key == KeyCode::Backspace => {
-                self.active_text_mut().pop();
-                PluginTuiAction::Redraw
+            if stroke.key == KeyCode::Enter && self.field != Field::Limit {
+                self.active_state_mut().buffer_mut().insert_char('\n');
+                return PluginTuiAction::Redraw;
             }
-            Event::Key(stroke) if let KeyCode::Char(value) = stroke.key => {
-                self.active_text_mut().push(value);
-                PluginTuiAction::Redraw
+            if stroke.key == KeyCode::Enter && self.field == Field::Limit {
+                return self.start(host);
             }
-            Event::Paste(text) => {
-                self.active_text_mut().push_str(text);
-                PluginTuiAction::Redraw
+            if self.field == Field::Limit
+                && matches!(stroke.key, KeyCode::Char(value) if !value.is_ascii_digit())
+            {
+                return PluginTuiAction::None;
             }
-            _ => PluginTuiAction::None,
+        }
+        if self.field == Field::Limit
+            && matches!(event, Event::Paste(text) if !text.chars().all(|value| value.is_ascii_digit()))
+        {
+            return PluginTuiAction::None;
+        }
+        self.focus_from_click(event);
+        let area = self.active_area();
+        let state = self.active_state_mut();
+        match TextInputBox::new(TextInputPolicy::chat_composer())
+            .label("")
+            .policy(TextInputBoxPolicy::labeled_field())
+            .handle_event(area, state, event)
+        {
+            TextInputBoxOutcome::Edited | TextInputBoxOutcome::Redraw => PluginTuiAction::Redraw,
+            TextInputBoxOutcome::Submitted
+            | TextInputBoxOutcome::Ignored
+            | TextInputBoxOutcome::EdgeUp
+            | TextInputBoxOutcome::EdgeDown => PluginTuiAction::None,
         }
     }
 }
 
-fn render_field(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    y: &mut u16,
-    label: &str,
-    value: &str,
-    focused: bool,
-    height: u16,
-) {
-    let color = if focused { Color::Yellow } else { Color::White };
-    write_line(
-        frame,
-        area,
-        *y,
-        &Line::from_spans(vec![Span::styled(
-            label.to_owned(),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
-        )]),
-    );
-    *y = y.saturating_add(1);
-    let lines = value.lines().collect::<Vec<_>>();
-    for index in 0..height {
-        let text = lines.get(usize::from(index)).copied().unwrap_or("");
-        write_line(frame, area, *y, &Line::from(format!("  {text}")));
-        *y = y.saturating_add(1);
-    }
+fn text_state(value: &str) -> TextInputState {
+    TextInputState::new(TextEditBuffer::from_text(value.to_owned()))
 }
 
-fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: &Line) {
-    if y < area.bottom() {
-        frame.write_line(Rect::new(area.x, y, area.width, 1), line);
-    }
+fn input_text(state: &TextInputState) -> String {
+    state.buffer().text().trim().to_owned()
+}
+
+const fn event_click_in(event: &Event, area: Rect) -> bool {
+    matches!(
+        event,
+        Event::Mouse(mouse)
+            if matches!(mouse.kind, MouseEventKind::Down(_))
+                && mouse.position.x >= area.x
+                && mouse.position.x < area.right()
+                && mouse.position.y >= area.y
+                && mouse.position.y < area.bottom()
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,8 +665,6 @@ struct LoopState {
     #[serde(default)]
     cancel_requested: bool,
     #[serde(default)]
-    owner_pid: u32,
-    #[serde(default)]
     pending_operation: Option<PendingOperation>,
     #[serde(default)]
     last_completed_operation: Option<PendingOperation>,
@@ -606,7 +689,6 @@ impl LoopState {
             latest_evaluation: None,
             stop_reason: None,
             cancel_requested: false,
-            owner_pid: std::process::id(),
             pending_operation: None,
             last_completed_operation: None,
         }
@@ -1148,14 +1230,9 @@ fn load_state_result(session_id: SessionId) -> Result<Option<LoopState>, String>
         ));
     }
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let mut state: LoopState =
+    let state: LoopState =
         serde_json::from_slice(&bytes).map_err(|error| format!("corrupt loop state: {error}"))?;
     validate_state(&state)?;
-    if !state.state.is_terminal() && state.owner_pid != std::process::id() {
-        state.state = RunState::Paused;
-        state.stop_reason =
-            Some("daemon or TUI restarted; explicit /loop resume required".to_owned());
-    }
     Ok(Some(state))
 }
 
@@ -1177,6 +1254,78 @@ fn save_state(state: &LoopState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct TestHost;
+
+    impl PluginTuiHost for TestHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+    }
+
+    fn key(key: KeyCode) -> Event {
+        Event::Key(bmux_keyboard::KeyStroke {
+            key,
+            modifiers: bmux_keyboard::Modifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn modal_multiline_and_field_navigation_preserve_text() {
+        let host = TestHost;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        assert_eq!(surface.field, Field::Prompt);
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('a')), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Enter), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(
+            surface.handle_event(&Event::Paste("line two".to_owned()), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.prompt.buffer().text(), "a\nline two");
+
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Tab), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.field, Field::Condition);
+    }
+
+    #[test]
+    fn modal_validation_focuses_first_invalid_field() {
+        let host = TestHost;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
+        assert_eq!(surface.field, Field::Prompt);
+
+        surface.prompt = text_state("do work");
+        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
+        assert_eq!(surface.field, Field::Condition);
+
+        surface.condition = text_state("done");
+        surface.limit = text_state("invalid");
+        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
+        assert_eq!(surface.field, Field::Limit);
+    }
+
+    #[test]
+    fn numeric_field_rejects_non_digit_input() {
+        let host = TestHost;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.field = Field::Limit;
+        let before = surface.limit.buffer().text().to_owned();
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('x')), &host),
+            PluginTuiAction::None
+        );
+        assert_eq!(surface.limit.buffer().text(), before);
+    }
 
     #[test]
     fn terminal_loop_states_cannot_be_resumed() {
