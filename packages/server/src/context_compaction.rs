@@ -486,9 +486,9 @@ pub fn resolve_compaction_decision(
             reason: "active provider surface advertises managed compaction",
         },
         bcode_config::CompactionMode::Auto => CompactionDecision {
-            strategy: AutomaticCompactionStrategy::OverflowOnly,
+            strategy: AutomaticCompactionStrategy::LocalProactive,
             overflow_recovery: true,
-            reason: "active provider surface does not advertise managed compaction",
+            reason: "active provider surface does not advertise managed compaction; using local proactive compaction with overflow recovery",
         },
     }
 }
@@ -1351,6 +1351,12 @@ pub fn conversational_units(
             }
             SessionEventKind::ToolCallFinished { tool_call_id, .. } => {
                 pending_tool_calls.remove(tool_call_id);
+            }
+            SessionEventKind::ModelTurnFinished { .. } => {
+                // A terminal model turn abandons any tool calls for which no result was
+                // persisted. They remain represented in canonical history, but must not
+                // make every later turn part of one permanently indivisible unit.
+                pending_tool_calls.clear();
             }
             _ => {}
         }

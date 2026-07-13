@@ -10509,28 +10509,6 @@ async fn run_model_turn_inner(
                         return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
                     }
                 };
-                if let Some((estimated_tokens, capacity)) =
-                    request_exceeds_compaction_capacity(state, session_id, &selection, &request)
-                        .await
-                {
-                    let error = CompactionError::RequestStillTooLarge {
-                        estimated_tokens,
-                        threshold_tokens: capacity.available_input_tokens,
-                    };
-                    append_context_compaction_trace(
-                        state,
-                        session_id,
-                        "request_still_too_large",
-                        0,
-                        false,
-                        Some(error.to_string()),
-                    )
-                    .await;
-                    return ModelTurnCompletion::with_message(
-                        ModelTurnOutcome::Error,
-                        error.to_string(),
-                    );
-                }
             }
             Ok(None) => {}
             Err(CompactionError::Cancelled) => {
@@ -10573,6 +10551,27 @@ async fn run_model_turn_inner(
                 )
                 .await;
             }
+        }
+        if should_evaluate_proactive
+            && let Some((estimated_tokens, capacity)) =
+                request_exceeds_compaction_capacity(state, session_id, &selection, &request).await
+        {
+            let error = CompactionError::RequestStillTooLarge {
+                estimated_tokens,
+                threshold_tokens: capacity.available_input_tokens,
+            };
+            let message = error.to_string();
+            append_context_compaction_trace(
+                state,
+                session_id,
+                "request_still_too_large",
+                0,
+                false,
+                Some(message.clone()),
+            )
+            .await;
+            append_system_event(state, session_id, message.clone()).await;
+            return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
         }
         if cancel_state.is_cancelled() {
             return ModelTurnCompletion::with_message(
@@ -18245,7 +18244,7 @@ mod tests {
         );
         assert_eq!(
             resolve_compaction_decision(bcode_config::CompactionMode::Auto, None).strategy,
-            AutomaticCompactionStrategy::OverflowOnly
+            AutomaticCompactionStrategy::LocalProactive
         );
         assert_eq!(
             resolve_compaction_decision(
@@ -18253,7 +18252,7 @@ mod tests {
                 Some(&invalid_capabilities),
             )
             .strategy,
-            AutomaticCompactionStrategy::OverflowOnly
+            AutomaticCompactionStrategy::LocalProactive
         );
         assert_eq!(
             resolve_compaction_decision(bcode_config::CompactionMode::Proactive, None).strategy,
@@ -20204,6 +20203,75 @@ mod tests {
         assert_eq!(plan.retained_tail[0].sequence, 3);
         let units = conversational_units(&history, 1_000);
         assert!(units.last().expect("active unit").interrupted_tool_chain);
+    }
+
+    #[test]
+    fn terminal_turn_abandons_unfinished_tool_calls_before_later_turns() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "first".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "abandoned".to_string(),
+                    tool_name: "shell.run".to_string(),
+                    arguments_json: "{}".to_string(),
+                    producer_plugin_id: None,
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: "turn-1".to_string(),
+                    outcome: ModelTurnOutcome::Cancelled,
+                    message: Some("cancelled".to_string()),
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "second".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                5,
+                SessionEventKind::AssistantMessage {
+                    text: "done".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                6,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active".to_string(),
+                },
+            ),
+        ];
+
+        let units = conversational_units(&history, 1_000);
+        assert_eq!(units.len(), 3);
+        assert!(!units[0].interrupted_tool_chain);
+        assert_eq!(units[1].events[0].sequence, 4);
+
+        let plan = structural_compaction_plan(&history, 1_000, 0).expect("structural plan");
+        assert_eq!(plan.compacted_through_sequence, 5);
+        assert_eq!(plan.retained_tail[0].sequence, 6);
     }
 
     #[test]
