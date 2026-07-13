@@ -34,6 +34,17 @@ const CLIENT_IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_DAEMON_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+/// Bounded generic session artifact byte range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionArtifactRange {
+    pub artifact_id: String,
+    pub reference_key: String,
+    pub content_type: Option<String>,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub bytes: Vec<u8>,
+}
+
 /// Grouped runtime-work lifecycle span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeWorkSpan {
@@ -1255,6 +1266,49 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionDeleted { session } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read a bounded generic artifact range from canonical session metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, rejects the reference/range, or returns
+    /// an unexpected payload.
+    pub async fn session_artifact_range(
+        &self,
+        session_id: SessionId,
+        artifact_id: String,
+        reference_key: String,
+        offset: u64,
+        length: u32,
+    ) -> Result<SessionArtifactRange, ClientError> {
+        match self
+            .send_request(Request::ReadSessionArtifact {
+                session_id,
+                artifact_id,
+                reference_key,
+                offset,
+                length,
+            })
+            .await?
+        {
+            ResponsePayload::SessionArtifactRange {
+                artifact_id,
+                reference_key,
+                content_type,
+                offset,
+                total_bytes,
+                bytes,
+            } => Ok(SessionArtifactRange {
+                artifact_id,
+                reference_key,
+                content_type,
+                offset,
+                total_bytes,
+                bytes,
+            }),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
