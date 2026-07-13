@@ -827,6 +827,48 @@ async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String
     save_state(state)
 }
 
+struct IterationSubmission {
+    operation_id: String,
+    display_label: String,
+    prompt: String,
+}
+
+fn iteration_submission(state: &LoopState, iteration: u64) -> IterationSubmission {
+    IterationSubmission {
+        operation_id: format!("{}:iteration:{iteration}", state.run_id),
+        display_label: format!("Loop iteration {iteration}"),
+        prompt: state.iteration_prompt.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvaluationDecision {
+    Reevaluate { generation: u64 },
+    Complete,
+    Continue,
+}
+
+fn next_iteration(state: &LoopState) -> Option<u64> {
+    (state.current_iteration < state.max_iterations)
+        .then(|| state.current_iteration.saturating_add(1))
+}
+
+const fn decide_evaluation(
+    source_generation: u64,
+    current_generation: u64,
+    condition_met: bool,
+) -> EvaluationDecision {
+    if current_generation != source_generation {
+        EvaluationDecision::Reevaluate {
+            generation: current_generation,
+        }
+    } else if condition_met {
+        EvaluationDecision::Complete
+    } else {
+        EvaluationDecision::Continue
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_loop(mut state: LoopState) {
     if let Err(reason) = reconcile_pending_operation(&mut state).await {
@@ -838,19 +880,18 @@ async fn run_loop(mut state: LoopState) {
             return;
         }
         if state.state != RunState::Evaluating {
-            if state.current_iteration >= state.max_iterations {
+            let Some(iteration_number) = next_iteration(&state) else {
                 if !transition_or_fail(&mut state, RunState::LimitReached) {
                     return;
                 }
                 state.stop_reason = Some("maximum iterations reached".to_owned());
                 let _saved = save_state(&state);
                 return;
-            }
+            };
             if !transition_or_fail(&mut state, RunState::SubmittingIteration) {
                 return;
             }
             let _saved = save_state(&state);
-            let iteration_number = state.current_iteration.saturating_add(1);
             if !transition_or_fail(&mut state, RunState::RunningIteration) {
                 return;
             }
@@ -870,17 +911,16 @@ async fn run_loop(mut state: LoopState) {
                     return;
                 }
                 let session_id = state.session_id;
-                let operation_id = format!("{}:iteration:{iteration_number}", state.run_id);
-                let iteration_prompt = state.iteration_prompt.clone();
+                let submission = iteration_submission(&state, iteration_number);
                 let result = run_automation_turn(
                     &mut state,
                     session_id,
                     OperationKind::Iteration {
                         iteration: iteration_number,
                     },
-                    operation_id,
-                    format!("Loop iteration {iteration_number}"),
-                    iteration_prompt,
+                    submission.operation_id,
+                    submission.display_label,
+                    submission.prompt,
                     generation,
                     bcode_ipc::PluginAutomationExecutionPolicy::Normal,
                 )
@@ -992,26 +1032,34 @@ async fn run_loop(mut state: LoopState) {
                     return;
                 }
             };
-            if current_generation != source_generation {
-                if !transition_or_fail(&mut state, RunState::DrainingSteering) {
+            match decide_evaluation(
+                source_generation,
+                current_generation,
+                evaluation.condition_met,
+            ) {
+                EvaluationDecision::Reevaluate { generation } => {
+                    if !transition_or_fail(&mut state, RunState::DrainingSteering) {
+                        return;
+                    }
+                    state.latest_evaluation = None;
+                    let _saved = save_state(&state);
+                    source_generation = generation;
+                }
+                EvaluationDecision::Complete => {
+                    state.latest_evaluation = Some(evaluation.clone());
+                    if !transition_or_fail(&mut state, RunState::Completed) {
+                        return;
+                    }
+                    state.stop_reason = Some(evaluation.summary);
+                    let _saved = save_state(&state);
                     return;
                 }
-                state.latest_evaluation = None;
-                let _saved = save_state(&state);
-                source_generation = current_generation;
-                continue;
-            }
-            state.latest_evaluation = Some(evaluation.clone());
-            if evaluation.condition_met {
-                if !transition_or_fail(&mut state, RunState::Completed) {
-                    return;
+                EvaluationDecision::Continue => {
+                    state.latest_evaluation = Some(evaluation);
+                    let _saved = save_state(&state);
+                    break;
                 }
-                state.stop_reason = Some(evaluation.summary);
-                let _saved = save_state(&state);
-                return;
             }
-            let _saved = save_state(&state);
-            break;
         }
     }
 }
@@ -1780,6 +1828,103 @@ mod tests {
         state.schema_version = STATE_SCHEMA_VERSION;
         state.current_iteration = 21;
         assert!(validate_state(&state).is_err());
+    }
+
+    #[test]
+    fn command_status_and_transition_errors_are_actionable() {
+        assert_eq!(format_status(None), "no loop found for this session");
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            3,
+        );
+        state.run_id = "run-1".to_owned();
+        state.current_iteration = 2;
+        state.state = RunState::Paused;
+        state.stop_reason = Some("iteration cancelled".to_owned());
+        assert_eq!(
+            format_status(Some(&state)),
+            "loop run-1 · Paused · iteration 2/3 · reason: iteration cancelled"
+        );
+
+        state.state = RunState::Completed;
+        let error = transition(&mut state, RunState::Ready)
+            .expect_err("terminal state must reject continuation");
+        assert_eq!(error, "invalid loop phase transition: Completed -> Ready");
+    }
+
+    #[test]
+    fn iteration_submission_reuses_exact_configured_prompt() {
+        let prompt = "line one\n\n  preserve spacing exactly  \nline four";
+        let state = LoopState::new(
+            SessionId::new(),
+            prompt.to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+
+        for iteration in 1..=3 {
+            let submission = iteration_submission(&state, iteration);
+            assert_eq!(submission.prompt, prompt);
+            assert_eq!(
+                submission.operation_id,
+                format!("{}:iteration:{iteration}", state.run_id)
+            );
+            assert_eq!(
+                submission.display_label,
+                format!("Loop iteration {iteration}")
+            );
+        }
+    }
+
+    #[test]
+    fn iteration_budget_is_exact_and_only_completed_iterations_advance_it() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            3,
+        );
+        assert_eq!(next_iteration(&state), Some(1));
+
+        // Evaluation and steering decisions do not alter the automated iteration budget.
+        assert_eq!(
+            decide_evaluation(7, 8, false),
+            EvaluationDecision::Reevaluate { generation: 8 }
+        );
+        assert_eq!(state.current_iteration, 0);
+        assert_eq!(next_iteration(&state), Some(1));
+
+        for expected in 1..=3 {
+            state.current_iteration = expected;
+            assert_eq!(
+                next_iteration(&state),
+                (expected < 3).then_some(expected + 1)
+            );
+        }
+        assert_eq!(state.current_iteration, state.max_iterations);
+        assert_eq!(next_iteration(&state), None);
+    }
+
+    #[test]
+    fn stale_evaluation_always_reevaluates_before_more_work() {
+        assert_eq!(
+            decide_evaluation(10, 11, false),
+            EvaluationDecision::Reevaluate { generation: 11 }
+        );
+        assert_eq!(
+            decide_evaluation(10, 11, true),
+            EvaluationDecision::Reevaluate { generation: 11 }
+        );
+        assert_eq!(
+            decide_evaluation(10, 10, true),
+            EvaluationDecision::Complete
+        );
+        assert_eq!(
+            decide_evaluation(10, 10, false),
+            EvaluationDecision::Continue
+        );
     }
 
     #[test]
