@@ -3088,6 +3088,77 @@ mod tests {
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
 
+    fn session_database_files(
+        root: &std::path::Path,
+        session_id: SessionId,
+    ) -> Vec<(String, Vec<u8>)> {
+        let path = db::session_db_path(root, session_id);
+        let file_name = path
+            .file_name()
+            .expect("database filename")
+            .to_string_lossy();
+        let mut files = std::fs::read_dir(path.parent().expect("database parent"))
+            .expect("database directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(file_name.as_ref())
+            })
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).expect("database bytes"),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[tokio::test]
+    async fn reading_legacy_stream_events_does_not_rewrite_session_storage() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should create");
+        let session = manager
+            .create_session(Some("legacy-stream".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        manager
+            .append_event(
+                session.id,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "legacy-call".to_owned(),
+                        stream: bcode_session_models::ToolOutputStream::Pty,
+                        sequence: 1,
+                        text: "legacy persisted bytes".to_owned(),
+                        byte_len: 22,
+                    },
+                },
+            )
+            .await
+            .expect("legacy stream event should append");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = session_database_files(&root, session.id);
+
+        let history = manager
+            .session_history(session.id)
+            .await
+            .expect("history should read");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta { text, .. }
+            } if text == "legacy persisted bytes"
+        )));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = session_database_files(&root, session.id);
+
+        assert_eq!(after, before);
+    }
+
     async fn persistent_artifact_session_bytes(
         root: &std::path::Path,
         artifact_bytes: u64,
