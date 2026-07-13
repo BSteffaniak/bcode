@@ -101,7 +101,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
@@ -2032,6 +2032,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
     match request {
         Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
+        | Request::ReadSessionArtifact { session_id, .. }
         | Request::SessionHistory { session_id }
         | Request::SessionHistoryPage { session_id, .. }
         | Request::AttachSession { session_id }
@@ -2076,6 +2077,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListSessions { .. } => "list_sessions",
         Request::RenameSession { .. } => "rename_session",
         Request::DeleteSession { .. } => "delete_session",
+        Request::ReadSessionArtifact { .. } => "read_session_artifact",
         Request::SessionHistory { .. } => "session_history",
         Request::SessionHistoryPage { .. } => "session_history_page",
         Request::AttachSession { .. } => "attach_session",
@@ -2285,6 +2287,25 @@ async fn handle_request_inner(
         }
         Request::DeleteSession { session_id } => {
             handle_delete_session(request_id, state, writer, session_id).await
+        }
+        Request::ReadSessionArtifact {
+            session_id,
+            artifact_id,
+            reference_key,
+            offset,
+            length,
+        } => {
+            handle_read_session_artifact(
+                request_id,
+                state,
+                writer,
+                session_id,
+                artifact_id,
+                reference_key,
+                offset,
+                length,
+            )
+            .await
         }
         Request::ForkSession {
             source_session_id,
@@ -4968,6 +4989,127 @@ async fn handle_rename_session(
             .await
         }
     }
+}
+
+const MAX_ARTIFACT_RANGE_BYTES: u32 = 1024 * 1024;
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_read_session_artifact(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    artifact_id: String,
+    reference_key: String,
+    offset: u64,
+    length: u32,
+) -> Result<(), ServerError> {
+    let result = read_session_artifact_range(
+        state,
+        session_id,
+        &artifact_id,
+        &reference_key,
+        offset,
+        length,
+    )
+    .await;
+    match result {
+        Ok(payload) => send_response(writer, request_id, Response::Ok(payload)).await,
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("artifact_read_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
+fn read_artifact_file_range(
+    path: &Path,
+    artifact_root: &Path,
+    offset: u64,
+    length: u32,
+) -> Result<(u64, Vec<u8>), String> {
+    let artifact_root = artifact_root
+        .canonicalize()
+        .map_err(|error| format!("artifact root is unavailable: {error}"))?;
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("artifact is unavailable: {error}"))?;
+    if !path.starts_with(&artifact_root) {
+        return Err("artifact path is outside the session artifact root".to_owned());
+    }
+    let mut file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+    let total_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    let read_len = u64::from(length).min(total_bytes.saturating_sub(offset));
+    let mut bytes = vec![0; usize::try_from(read_len).unwrap_or(usize::MAX)];
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| error.to_string())?;
+    file.read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok((total_bytes, bytes))
+}
+
+async fn read_session_artifact_range(
+    state: &ServerState,
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+    offset: u64,
+    length: u32,
+) -> Result<ResponsePayload, String> {
+    if length == 0 || length > MAX_ARTIFACT_RANGE_BYTES {
+        return Err(format!(
+            "artifact range length must be between 1 and {MAX_ARTIFACT_RANGE_BYTES} bytes"
+        ));
+    }
+    let history = state
+        .sessions
+        .session_history(session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let reference = history
+        .iter()
+        .find_map(|event| match &event.kind {
+            SessionEventKind::ToolCallFinished {
+                semantic_result: Some(ToolInvocationResult::Artifact { artifact }),
+                ..
+            } if artifact.artifact_id == artifact_id => artifact
+                .refs
+                .iter()
+                .find(|reference| reference.key == reference_key),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            "artifact reference was not found in canonical session history".to_owned()
+        })?;
+    let uri = reference
+        .storage_uri
+        .as_deref()
+        .ok_or_else(|| "artifact reference has no storage URI".to_owned())?;
+    let url = url::Url::parse(uri).map_err(|_| "artifact storage URI is invalid".to_owned())?;
+    if url.scheme() != "file" {
+        return Err("artifact storage URI is not locally readable".to_owned());
+    }
+    let path = url
+        .to_file_path()
+        .map_err(|()| "artifact file path is invalid".to_owned())?;
+    let (total_bytes, bytes) = read_artifact_file_range(
+        &path,
+        &default_session_artifact_dir(session_id),
+        offset,
+        length,
+    )?;
+    Ok(ResponsePayload::SessionArtifactRange {
+        artifact_id: artifact_id.to_owned(),
+        reference_key: reference_key.to_owned(),
+        content_type: reference.content_type.clone(),
+        offset,
+        total_bytes,
+        bytes,
+    })
 }
 
 async fn handle_delete_session(
@@ -16998,6 +17140,26 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolCardPresentation,
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
+
+    #[test]
+    fn generic_artifact_range_reads_are_bounded_and_root_confined() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("artifacts");
+        std::fs::create_dir_all(&root).expect("artifact root");
+        let path = root.join("artifact.bin");
+        std::fs::write(&path, b"0123456789").expect("artifact");
+        let (total, bytes) = read_artifact_file_range(&path, &root, 3, 4).expect("range");
+        assert_eq!(total, 10);
+        assert_eq!(bytes, b"3456");
+        let (_, tail) = read_artifact_file_range(&path, &root, 8, 100).expect("tail");
+        assert_eq!(tail, b"89");
+
+        let outside = temp_dir.path().join("outside.bin");
+        std::fs::write(&outside, b"secret").expect("outside artifact");
+        let error = read_artifact_file_range(&outside, &root, 0, 6)
+            .expect_err("outside artifact must be rejected");
+        assert!(error.contains("outside the session artifact root"));
+    }
 
     #[test]
     fn session_artifacts_are_retained_until_explicit_session_deletion() {

@@ -414,6 +414,15 @@ pub enum Request {
     },
     /// Inspect effective model catalog and refresh state.
     ModelCatalogDiagnostics,
+    /// Read a bounded byte range from a generic session artifact reference.
+    ReadSessionArtifact {
+        session_id: SessionId,
+        artifact_id: String,
+        reference_key: String,
+        #[serde(default)]
+        offset: u64,
+        length: u32,
+    },
 }
 
 /// Server stop request policy.
@@ -1182,6 +1191,14 @@ pub enum ResponsePayload {
         last_refresh_attempt_ms: Option<u64>,
         last_refresh_success_ms: Option<u64>,
         last_refresh_error: Option<String>,
+    },
+    SessionArtifactRange {
+        artifact_id: String,
+        reference_key: String,
+        content_type: Option<String>,
+        offset: u64,
+        total_bytes: u64,
+        bytes: Vec<u8>,
     },
 }
 
