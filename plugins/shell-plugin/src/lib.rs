@@ -80,7 +80,7 @@ const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
 const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str =
     "application/x-bcode-terminal-pty-stream; charset=utf-8";
 const SHELL_RECORDING_REF_KEY: &str = "shell_recording";
-const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=1";
+const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=3";
 
 const fn default_format_commands() -> bool {
     true
@@ -1851,6 +1851,18 @@ mod tests {
             .filter(|reference| reference.key == SHELL_RECORDING_REF_KEY)
             .collect::<Vec<_>>();
         assert_eq!(recordings.len(), 1);
+        assert_eq!(
+            recordings[0].content_type.as_deref(),
+            Some(SHELL_RECORDING_CONTENT_TYPE)
+        );
+        assert_eq!(
+            recordings[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("format_version"))
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
         let uri = recordings[0].storage_uri.as_deref().expect("recording URI");
         let path = url::Url::parse(uri)
             .expect("recording URL")

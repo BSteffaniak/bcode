@@ -743,6 +743,51 @@ mod tests {
     }
 
     #[test]
+    fn version_two_signal_recording_remains_readable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("version-two.bcsr");
+        let output = b"version two bytes";
+        let signal = b"SIGTERM";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&SIGNAL_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&80_u16.to_le_bytes());
+        bytes.extend_from_slice(&24_u16.to_le_bytes());
+        bytes.push(FRAME_OUTPUT);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(output.len()).expect("length").to_le_bytes());
+        bytes.extend_from_slice(output);
+        let mut finish = Vec::new();
+        finish.push(1);
+        finish.extend_from_slice(&1_i32.to_le_bytes());
+        finish.push(0);
+        finish.extend_from_slice(
+            &u16::try_from(signal.len())
+                .expect("signal length")
+                .to_le_bytes(),
+        );
+        finish.extend_from_slice(signal);
+        finish.extend_from_slice(&Sha256::digest(output));
+        bytes.push(FRAME_FINISH);
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(finish.len()).expect("length").to_le_bytes());
+        bytes.extend_from_slice(&finish);
+        fs::write(&path, bytes).expect("version two recording");
+
+        let (_, frames) = read_recording(&path).expect("version two recording readable");
+        assert!(matches!(
+            frames.last(),
+            Some(ShellRecordingFrame::Finish {
+                exit_code: Some(1),
+                signal: Some(signal),
+                timed_out: false,
+                cancelled: false,
+                ..
+            }) if signal == "SIGTERM"
+        ));
+    }
+
+    #[test]
     fn malformed_lifecycle_frames_are_rejected() {
         let dir = tempfile::tempdir().expect("temp dir");
         for (name, mutation, expected) in [
