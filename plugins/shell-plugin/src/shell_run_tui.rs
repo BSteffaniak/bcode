@@ -522,9 +522,10 @@ fn terminal_replay_truncated(payload: &serde_json::Value) -> Option<bool> {
 }
 
 fn terminal_replay_ref(payload: &serde_json::Value) -> Option<&serde_json::Value> {
-    payload
+    let references = payload
         .get("_artifact_refs")
-        .and_then(serde_json::Value::as_array)?
+        .and_then(serde_json::Value::as_array)?;
+    references
         .iter()
         .find(|reference| {
             reference.get("key").and_then(serde_json::Value::as_str)
@@ -535,19 +536,23 @@ fn terminal_replay_ref(payload: &serde_json::Value) -> Option<&serde_json::Value
                     .is_some_and(|content_type| {
                         content_type.starts_with(SHELL_RECORDING_CONTENT_TYPE)
                     })
-                || reference.get("key").and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            references.iter().find(|reference| {
+                reference.get("key").and_then(serde_json::Value::as_str)
                     == Some(TERMINAL_PTY_STREAM_REF_KEY)
-                || reference
-                    .get("content_type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|content_type| {
-                        content_type.starts_with(TERMINAL_PTY_STREAM_CONTENT_TYPE)
-                    })
-                || reference
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("stream"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("pty")
+                    || reference
+                        .get("content_type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|content_type| {
+                            content_type.starts_with(TERMINAL_PTY_STREAM_CONTENT_TYPE)
+                        })
+                    || reference
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("stream"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("pty")
+            })
         })
 }
 
@@ -965,6 +970,52 @@ mod tests {
             !rendered.contains("forbidden fallback sentinel"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn authoritative_recording_is_preferred_over_earlier_legacy_stream() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let legacy_path = temp_dir.path().join("legacy.txt");
+        fs::write(&legacy_path, "forbidden legacy stream").expect("legacy stream");
+        let recording_path = temp_dir.path().join("recording.bcsr");
+        let mut writer = crate::recording::ShellRecordingWriter::create(&recording_path, 80, 24)
+            .expect("recording writer");
+        writer
+            .write_output(1, b"authoritative recording sentinel\n")
+            .expect("record output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish recording");
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [
+                {
+                    "key": TERMINAL_PTY_STREAM_REF_KEY,
+                    "content_type": TERMINAL_PTY_STREAM_CONTENT_TYPE,
+                    "storage_uri": url::Url::from_file_path(&legacy_path).ok().map(|url| url.to_string()),
+                    "metadata": {"stream": "pty"}
+                },
+                {
+                    "key": SHELL_RECORDING_REF_KEY,
+                    "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                    "storage_uri": url::Url::from_file_path(&recording_path).ok().map(|url| url.to_string()),
+                    "metadata": {"complete": true}
+                }
+            ]
+        });
+        let rendered = render_rows(&payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("authoritative recording sentinel"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("forbidden legacy stream"), "{rendered}");
     }
 
     #[test]
