@@ -641,6 +641,71 @@ mod tests {
     }
 
     #[test]
+    fn very_large_plain_recording_replays_every_byte_beyond_legacy_tail_limit() {
+        const OUTPUT_BYTES: usize = 11 * 1024 * 1024;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("large-recording.bcsr");
+        let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
+            .expect("recording writer");
+        let mut expected = Vec::with_capacity(OUTPUT_BYTES);
+        let chunk = b"plain terminal output line 0123456789\n";
+        let mut offset = 1_u64;
+        while expected.len() < OUTPUT_BYTES {
+            let remaining = OUTPUT_BYTES.saturating_sub(expected.len());
+            let bytes = &chunk[..remaining.min(chunk.len())];
+            writer.write_output(offset, bytes).expect("record output");
+            expected.extend_from_slice(bytes);
+            offset = offset.saturating_add(1);
+        }
+        writer
+            .finish(offset, Some(0), None, false, false)
+            .expect("finish recording");
+        let payload = authoritative_recording_payload(&path);
+        let TerminalReplayOutput::Ready(replayed) = terminal_replay_output(&payload) else {
+            panic!("large recording should replay");
+        };
+
+        assert_eq!(replayed.as_bytes(), expected);
+        assert!(replayed.len() > 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn recording_replay_handles_invalid_and_split_utf8_deterministically() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("recording.bcsr");
+        let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
+            .expect("recording writer");
+        writer.write_output(1, b"valid ").expect("first output");
+        writer.write_output(2, &[0xe7]).expect("split UTF-8 byte 1");
+        writer
+            .write_output(3, &[0x95, 0x8c])
+            .expect("split UTF-8 bytes 2 and 3");
+        writer
+            .write_output(4, &[b' ', 0xff, b' ', b'e', 0xcc])
+            .expect("invalid and combining prefix");
+        writer
+            .write_output(5, &[0x81, b'\n'])
+            .expect("combining suffix");
+        writer
+            .finish(6, Some(0), None, false, false)
+            .expect("finish recording");
+        let payload = authoritative_recording_payload(&path);
+        let rendered = render_rows(&payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("valid 界"), "{rendered}");
+        assert!(rendered.contains('\u{fffd}'), "{rendered}");
+        assert!(rendered.contains("e\u{301}"), "{rendered}");
+        assert!(
+            !rendered.contains("forbidden fallback sentinel"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn recording_migration_preserves_exact_rendered_grid_and_styles() {
         let fixtures: &[(&str, &[u8])] = &[
             ("plain", b"first line\nsecond line\n"),
