@@ -40,7 +40,7 @@ const RESUME_COMMAND: &str = "loop.resume";
 const SURFACE_KIND: &str = "loop.start";
 const DEFAULT_MAX_ITERATIONS: u64 = 20;
 const HARD_MAX_ITERATIONS: u64 = 1_000;
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_STATE_BYTES: u64 = 1_048_576;
 const MAX_PROMPT_BYTES: usize = 262_144;
 
@@ -200,7 +200,9 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
         return status_response(&format_status(Some(&state)));
     }
     state.cancel_requested = true;
-    state.state = RunState::Canceled;
+    if let Err(error) = transition(&mut state, RunState::Canceled) {
+        return status_response(&error);
+    }
     state.stop_reason = Some("stopped by user".to_owned());
     let cancel_session_id = state
         .pending_operation
@@ -235,7 +237,9 @@ fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
         return status_response("only paused or failed loops can be resumed");
     }
     state.cancel_requested = false;
-    state.state = RunState::Running;
+    if let Err(error) = transition(&mut state, RunState::Ready) {
+        return status_response(&error);
+    }
     state.stop_reason = None;
     if let Err(error) = save_state(&state) {
         return status_response(&format!("failed to resume loop: {error}"));
@@ -586,8 +590,10 @@ const fn event_click_in(event: &Event, area: Rect) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RunState {
-    Running,
-    Steering,
+    Ready,
+    SubmittingIteration,
+    RunningIteration,
+    DrainingSteering,
     Evaluating,
     Completed,
     LimitReached,
@@ -602,6 +608,57 @@ impl RunState {
             self,
             Self::Completed | Self::LimitReached | Self::Paused | Self::Canceled | Self::Failed
         )
+    }
+
+    fn can_transition_to(self, next: Self) -> bool {
+        self == next
+            || (!self.is_terminal() && next == Self::Canceled)
+            || matches!(
+                (self, next),
+                (
+                    Self::Ready,
+                    Self::SubmittingIteration | Self::Evaluating | Self::LimitReached
+                ) | (
+                    Self::SubmittingIteration,
+                    Self::RunningIteration | Self::Paused | Self::Failed
+                ) | (
+                    Self::RunningIteration,
+                    Self::DrainingSteering | Self::Evaluating | Self::Paused | Self::Failed
+                ) | (
+                    Self::DrainingSteering,
+                    Self::Evaluating | Self::Paused | Self::Failed
+                ) | (
+                    Self::Evaluating,
+                    Self::DrainingSteering
+                        | Self::Ready
+                        | Self::Completed
+                        | Self::Paused
+                        | Self::Failed
+                ) | (Self::Paused | Self::Failed, Self::Ready | Self::Evaluating)
+            )
+    }
+}
+
+fn transition(state: &mut LoopState, next: RunState) -> Result<(), String> {
+    if !state.state.can_transition_to(next) {
+        return Err(format!(
+            "invalid loop phase transition: {:?} -> {:?}",
+            state.state, next
+        ));
+    }
+    state.state = next;
+    Ok(())
+}
+
+fn transition_or_fail(state: &mut LoopState, next: RunState) -> bool {
+    match transition(state, next) {
+        Ok(()) => true,
+        Err(error) => {
+            state.state = RunState::Failed;
+            state.stop_reason = Some(error);
+            let _saved = save_state(state);
+            false
+        }
     }
 }
 
@@ -685,7 +742,7 @@ impl LoopState {
             stop_condition,
             max_iterations,
             current_iteration: 0,
-            state: RunState::Running,
+            state: RunState::Ready,
             latest_evaluation: None,
             stop_reason: None,
             cancel_requested: false,
@@ -737,7 +794,7 @@ async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String
                 }
                 OperationKind::Evaluation { .. } => {
                     state.pending_operation = None;
-                    state.state = RunState::Evaluating;
+                    transition(state, RunState::Evaluating)?;
                     state.latest_evaluation = None;
                     save_state(state)
                 }
@@ -758,13 +815,21 @@ async fn run_loop(mut state: LoopState) {
         }
         if state.state != RunState::Evaluating {
             if state.current_iteration >= state.max_iterations {
-                state.state = RunState::LimitReached;
+                if !transition_or_fail(&mut state, RunState::LimitReached) {
+                    return;
+                }
                 state.stop_reason = Some("maximum iterations reached".to_owned());
                 let _saved = save_state(&state);
                 return;
             }
+            if !transition_or_fail(&mut state, RunState::SubmittingIteration) {
+                return;
+            }
+            let _saved = save_state(&state);
             let iteration_number = state.current_iteration.saturating_add(1);
-            state.state = RunState::Running;
+            if !transition_or_fail(&mut state, RunState::RunningIteration) {
+                return;
+            }
             let _saved = save_state(&state);
             let completion = loop {
                 let generation = match wait_until_automation_ready(state.session_id).await {
@@ -829,7 +894,9 @@ async fn run_loop(mut state: LoopState) {
             }
         };
         loop {
-            state.state = RunState::Evaluating;
+            if !transition_or_fail(&mut state, RunState::Evaluating) {
+                return;
+            }
             let _saved = save_state(&state);
             let operation_id = format!(
                 "{}:evaluation:{}:{source_generation}",
@@ -886,7 +953,9 @@ async fn run_loop(mut state: LoopState) {
                 }
             };
             if current_generation != source_generation {
-                state.state = RunState::Steering;
+                if !transition_or_fail(&mut state, RunState::DrainingSteering) {
+                    return;
+                }
                 state.latest_evaluation = None;
                 let _saved = save_state(&state);
                 source_generation = current_generation;
@@ -894,7 +963,9 @@ async fn run_loop(mut state: LoopState) {
             }
             state.latest_evaluation = Some(evaluation.clone());
             if evaluation.condition_met {
-                state.state = RunState::Completed;
+                if !transition_or_fail(&mut state, RunState::Completed) {
+                    return;
+                }
                 state.stop_reason = Some(evaluation.summary);
                 let _saved = save_state(&state);
                 return;
@@ -965,13 +1036,17 @@ async fn resume_after_steering_settles(state: LoopState) -> Result<(), String> {
 }
 
 fn pause_run(state: &mut LoopState, reason: String) {
-    state.state = RunState::Paused;
+    if transition(state, RunState::Paused).is_err() {
+        state.state = RunState::Failed;
+    }
     state.stop_reason = Some(reason);
     let _saved = save_state(state);
 }
 
 fn fail_run(state: &mut LoopState, reason: String) {
-    state.state = RunState::Failed;
+    if transition(state, RunState::Failed).is_err() {
+        state.state = RunState::Failed;
+    }
     state.stop_reason = Some(reason);
     let _saved = save_state(state);
 }
@@ -1227,7 +1302,12 @@ fn refresh_cancel(state: &mut LoopState) -> bool {
         .is_some_and(|saved| saved.run_id == state.run_id && saved.cancel_requested);
     if cancelled {
         state.cancel_requested = true;
-        state.state = RunState::Canceled;
+        if transition(state, RunState::Canceled).is_err() {
+            state.state = RunState::Failed;
+            state.stop_reason = Some("invalid transition while applying cancellation".to_owned());
+            let _saved = save_state(state);
+            return true;
+        }
         state.stop_reason = Some("stopped by user".to_owned());
         let _saved = save_state(state);
     }
