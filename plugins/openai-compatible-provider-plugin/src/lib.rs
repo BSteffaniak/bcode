@@ -2085,14 +2085,22 @@ fn record_selected_auth_profile_success(request: &ModelTurnRequest) {
     };
     let pool = request.provider_context.auth_pool.as_deref();
     auth_pool_state::clear_profile_quota_limited(pool, Some(profile));
-    auth_pool_state::mark_pool_selected(pool, Some(profile));
-    match request
+    if request
         .provider_context
         .auth_pool_selection_reason
         .as_deref()
+        == Some("priming")
     {
-        Some("priming") => {}
-        _ => auth_pool_state::mark_profile_success(pool, Some(profile)),
+        if !request
+            .provider_context
+            .auth_pool_routing
+            .priming_provider_windows
+        {
+            auth_pool_state::mark_profile_primed(pool, Some(profile));
+        }
+    } else {
+        auth_pool_state::mark_pool_selected(pool, Some(profile));
+        auth_pool_state::mark_profile_success(pool, Some(profile));
     }
 }
 
@@ -2299,10 +2307,18 @@ fn record_auth_candidate_success(
     };
     let pool = request.provider_context.auth_pool.as_deref();
     auth_pool_state::clear_profile_quota_limited(pool, Some(profile));
-    auth_pool_state::mark_pool_selected(pool, Some(profile));
     match reason {
-        CandidateSelectionReason::Priming => {}
+        CandidateSelectionReason::Priming => {
+            if !request
+                .provider_context
+                .auth_pool_routing
+                .priming_provider_windows
+            {
+                auth_pool_state::mark_profile_primed(pool, Some(profile));
+            }
+        }
         CandidateSelectionReason::Strategy => {
+            auth_pool_state::mark_pool_selected(pool, Some(profile));
             auth_pool_state::mark_profile_success(pool, Some(profile));
         }
     }
@@ -2400,25 +2416,51 @@ fn order_candidate_selections<'a>(
     available_candidates: &[&'a ProviderAuthCandidate],
     cooldown_candidates: &[&'a ProviderAuthCandidate],
 ) -> Vec<CandidateSelection<'a>> {
-    strategy_ordered_candidates(request, available_candidates)
-        .into_iter()
-        .map(|candidate| CandidateSelection {
+    order_candidate_selections_by(
+        request,
+        available_candidates,
+        cooldown_candidates,
+        |candidate| candidate_needs_priming(request, candidate),
+    )
+}
+
+fn order_candidate_selections_by<'a>(
+    request: &ModelTurnRequest,
+    available_candidates: &[&'a ProviderAuthCandidate],
+    cooldown_candidates: &[&'a ProviderAuthCandidate],
+    mut needs_priming: impl FnMut(&ProviderAuthCandidate) -> bool,
+) -> Vec<CandidateSelection<'a>> {
+    let priming_candidate = available_candidates
+        .iter()
+        .copied()
+        .find(|candidate| needs_priming(candidate));
+    let mut selections = Vec::new();
+    if let Some(candidate) = priming_candidate {
+        selections.push(CandidateSelection {
             candidate,
-            reason: if candidate_needs_priming(request, candidate) {
-                CandidateSelectionReason::Priming
-            } else {
-                CandidateSelectionReason::Strategy
-            },
-        })
-        .chain(
-            cooldown_candidates
-                .iter()
-                .map(|candidate| CandidateSelection {
-                    candidate,
-                    reason: CandidateSelectionReason::Strategy,
-                }),
-        )
-        .collect()
+            reason: CandidateSelectionReason::Priming,
+        });
+    }
+    selections.extend(
+        strategy_ordered_candidates(request, available_candidates)
+            .into_iter()
+            .filter(|candidate| {
+                priming_candidate.is_none_or(|priming| !std::ptr::eq(*candidate, priming))
+            })
+            .map(|candidate| CandidateSelection {
+                candidate,
+                reason: CandidateSelectionReason::Strategy,
+            }),
+    );
+    selections.extend(
+        cooldown_candidates
+            .iter()
+            .map(|candidate| CandidateSelection {
+                candidate,
+                reason: CandidateSelectionReason::Strategy,
+            }),
+    );
+    selections
 }
 
 fn candidate_needs_priming(request: &ModelTurnRequest, candidate: &ProviderAuthCandidate) -> bool {
@@ -6775,6 +6817,54 @@ mod tests {
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
             metadata,
         }
+    }
+
+    fn auth_candidate(profile: &str) -> ProviderAuthCandidate {
+        ProviderAuthCandidate {
+            profile: Some(profile.to_string()),
+            ..ProviderAuthCandidate::default()
+        }
+    }
+
+    #[test]
+    fn provider_fallback_orders_priming_candidate_before_failover_primary() {
+        let request = test_request(Vec::new());
+        let candidates = [auth_candidate("openai"), auth_candidate("openai-2")];
+        let available = candidates.iter().collect::<Vec<_>>();
+
+        let selections = order_candidate_selections_by(&request, &available, &[], |candidate| {
+            candidate.profile.as_deref() == Some("openai-2")
+        });
+
+        assert_eq!(selections.len(), 2);
+        assert_eq!(selections[0].candidate.profile.as_deref(), Some("openai-2"));
+        assert_eq!(selections[0].reason, CandidateSelectionReason::Priming);
+        assert_eq!(selections[1].candidate.profile.as_deref(), Some("openai"));
+        assert_eq!(selections[1].reason, CandidateSelectionReason::Strategy);
+    }
+
+    #[test]
+    fn provider_fallback_keeps_cooldown_candidates_last() {
+        let request = test_request(Vec::new());
+        let available_candidates = [auth_candidate("openai"), auth_candidate("openai-2")];
+        let cooldown_candidates = [auth_candidate("openai-3")];
+        let available = available_candidates.iter().collect::<Vec<_>>();
+        let cooldown = cooldown_candidates.iter().collect::<Vec<_>>();
+
+        let selections =
+            order_candidate_selections_by(&request, &available, &cooldown, |candidate| {
+                candidate.profile.as_deref() == Some("openai-2")
+            });
+
+        let profiles = selections
+            .iter()
+            .map(|selection| selection.candidate.profile.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            profiles,
+            vec![Some("openai-2"), Some("openai"), Some("openai-3")]
+        );
+        assert_eq!(selections[2].reason, CandidateSelectionReason::Strategy);
     }
 
     #[test]

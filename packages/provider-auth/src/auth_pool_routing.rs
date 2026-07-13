@@ -50,14 +50,14 @@ pub fn select_auth_pool_candidate_with_state(
     now: u64,
 ) -> Option<AuthPoolSelection> {
     let available = available_candidates(input, state, now);
-    let candidate = strategy_ordered_candidates(input, state, &available)
-        .into_iter()
-        .next()?;
-    let reason = if candidate_needs_priming(input, state, candidate, now) {
-        AuthPoolSelectionReason::Priming
-    } else {
-        AuthPoolSelectionReason::Strategy
-    };
+    let (candidate, reason) = priming_candidate(input, state, &available, now)
+        .map(|candidate| (candidate, AuthPoolSelectionReason::Priming))
+        .or_else(|| {
+            strategy_ordered_candidates(input, state, &available)
+                .into_iter()
+                .next()
+                .map(|candidate| (candidate, AuthPoolSelectionReason::Strategy))
+        })?;
     Some(AuthPoolSelection {
         profile: candidate.profile.clone(),
         reason,
@@ -92,6 +92,18 @@ fn is_available(
         .entries
         .get(&format!("{pool}/{profile}"))
         .is_none_or(|entry| entry.cooldown_until_unix <= now)
+}
+
+fn priming_candidate<'a>(
+    input: &AuthPoolSelectionInput<'a>,
+    state: &AuthPoolState,
+    available: &[&'a ProviderAuthCandidate],
+    now: u64,
+) -> Option<&'a ProviderAuthCandidate> {
+    available
+        .iter()
+        .copied()
+        .find(|candidate| candidate_needs_priming(input, state, candidate, now))
 }
 
 fn candidate_needs_priming(
@@ -277,12 +289,28 @@ mod tests {
     }
 
     #[test]
-    fn priming_does_not_preempt_failover_strategy() {
-        let candidates = vec![
-            candidate("openai"),
-            candidate("openai-2"),
-            candidate("openai-3"),
-        ];
+    fn priming_preempts_failover_strategy_for_unprimed_secondary() {
+        let candidates = vec![candidate("openai"), candidate("openai-2")];
+        let routing = ProviderAuthPoolRouting {
+            strategy: Some("failover".to_string()),
+            priming_enabled: true,
+            ..ProviderAuthPoolRouting::default()
+        };
+
+        let selection = select_auth_pool_candidate_with_state(
+            &input(&routing, &candidates),
+            &AuthPoolState::default(),
+            100,
+        )
+        .expect("candidate should select");
+
+        assert_eq!(selection.profile.as_deref(), Some("openai-2"));
+        assert_eq!(selection.reason, AuthPoolSelectionReason::Priming);
+    }
+
+    #[test]
+    fn failover_returns_to_primary_after_secondary_is_primed() {
+        let candidates = vec![candidate("openai"), candidate("openai-2")];
         let routing = ProviderAuthPoolRouting {
             strategy: Some("failover".to_string()),
             priming_enabled: true,
