@@ -12,11 +12,13 @@ use std::sync::mpsc;
 use std::thread;
 
 const MAGIC: &[u8; 8] = b"BCSHREC\0";
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
+const SIGNAL_FORMAT_VERSION: u16 = 2;
 const LEGACY_FORMAT_VERSION: u16 = 1;
 const FRAME_OUTPUT: u8 = 1;
 const FRAME_RESIZE: u8 = 2;
 const FRAME_FINISH: u8 = 3;
+const FRAME_START: u8 = 4;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const ASYNC_RECORDING_QUEUE_CAPACITY: usize = 256;
 
@@ -216,6 +218,8 @@ fn run_async_recording_writer(
 /// One decoded shell recording frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellRecordingFrame {
+    /// Invocation recording began. Version 3 and later require this as the first frame.
+    Start { offset_micros: u64 },
     /// Exact PTY bytes emitted at the given monotonic offset.
     Output { offset_micros: u64, bytes: Vec<u8> },
     /// Terminal dimensions changed at the given monotonic offset.
@@ -289,7 +293,7 @@ impl ShellRecordingWriter {
         writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
         writer.write_all(&columns.to_le_bytes())?;
         writer.write_all(&rows.to_le_bytes())?;
-        Ok(Self {
+        let mut recording = Self {
             final_path: path.to_path_buf(),
             partial_path,
             writer,
@@ -299,7 +303,11 @@ impl ShellRecordingWriter {
             output_bytes: 0,
             checksum: Sha256::new(),
             finished: false,
-        })
+        };
+        recording.write_frame(FRAME_START, 0, &[])?;
+        recording.writer.flush()?;
+        recording.writer.get_ref().sync_data()?;
+        Ok(recording)
     }
 
     /// Append exact PTY bytes.
@@ -418,7 +426,10 @@ pub fn read_recording(
         ));
     }
     let version = read_u16(&mut reader)?;
-    if version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION {
+    if version != FORMAT_VERSION
+        && version != SIGNAL_FORMAT_VERSION
+        && version != LEGACY_FORMAT_VERSION
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported recording version",
@@ -430,6 +441,8 @@ pub fn read_recording(
     let mut checksum = Sha256::new();
     let mut output_bytes = 0_u64;
     let mut saw_finish = false;
+    let mut saw_start = false;
+    let mut previous_offset = None;
     loop {
         let mut kind = [0_u8; 1];
         match reader.read_exact(&mut kind) {
@@ -438,6 +451,19 @@ pub fn read_recording(
             Err(error) => return Err(error),
         }
         let offset_micros = read_u64(&mut reader)?;
+        if saw_finish {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recording contains frames after finish",
+            ));
+        }
+        if previous_offset.is_some_and(|previous| offset_micros < previous) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recording frame offsets are not monotonic",
+            ));
+        }
+        previous_offset = Some(offset_micros);
         let length = usize::try_from(read_u32(&mut reader)?).unwrap_or(usize::MAX);
         if length > MAX_FRAME_BYTES {
             return Err(io::Error::new(
@@ -448,6 +474,16 @@ pub fn read_recording(
         let mut payload = vec![0_u8; length];
         reader.read_exact(&mut payload)?;
         let frame = match kind[0] {
+            FRAME_START if version == FORMAT_VERSION && payload.is_empty() && frames.is_empty() => {
+                if offset_micros != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "recording start offset must be zero",
+                    ));
+                }
+                saw_start = true;
+                ShellRecordingFrame::Start { offset_micros }
+            }
             FRAME_OUTPUT => {
                 output_bytes =
                     output_bytes.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
@@ -481,7 +517,10 @@ pub fn read_recording(
                     cancelled: payload[5] & 2 != 0,
                 }
             }
-            FRAME_FINISH if version == FORMAT_VERSION && payload.len() >= 40 => {
+            FRAME_FINISH
+                if matches!(version, FORMAT_VERSION | SIGNAL_FORMAT_VERSION)
+                    && payload.len() >= 40 =>
+            {
                 let signal_length = usize::from(u16::from_le_bytes([payload[6], payload[7]]));
                 let checksum_start = 8_usize.saturating_add(signal_length);
                 if payload.len() != checksum_start.saturating_add(32) {
@@ -518,6 +557,12 @@ pub fn read_recording(
             },
         };
         frames.push(frame);
+    }
+    if version == FORMAT_VERSION && !saw_start {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recording has no start frame",
+        ));
     }
     if !saw_finish {
         return Err(io::Error::new(
@@ -578,15 +623,16 @@ mod tests {
             u64::try_from(bytes.len()).expect("length")
         );
         assert_eq!(read.checksum_sha256, written.checksum_sha256);
+        assert_eq!(frames[0], ShellRecordingFrame::Start { offset_micros: 0 });
         assert_eq!(
-            frames[0],
+            frames[1],
             ShellRecordingFrame::Output {
                 offset_micros: 17,
                 bytes: bytes.to_vec()
             }
         );
         assert_eq!(
-            frames[1],
+            frames[2],
             ShellRecordingFrame::Resize {
                 offset_micros: 29,
                 columns: 132,
@@ -594,7 +640,7 @@ mod tests {
             }
         );
         assert_eq!(
-            frames[2],
+            frames[3],
             ShellRecordingFrame::Finish {
                 offset_micros: 41,
                 exit_code: Some(7),
@@ -620,6 +666,7 @@ mod tests {
         assert_eq!(
             frames,
             vec![
+                ShellRecordingFrame::Start { offset_micros: 0 },
                 ShellRecordingFrame::Output {
                     offset_micros: 1,
                     bytes: b"first".to_vec(),
@@ -691,7 +738,7 @@ mod tests {
             .finish(2, Some(0), None, false, false)
             .expect("finish");
         let mut bytes = fs::read(&path).expect("recording bytes");
-        let output_offset = 8 + 2 + 2 + 2 + 1 + 8 + 4;
+        let output_offset = 8 + 2 + 2 + 2 + (1 + 8 + 4) + (1 + 8 + 4);
         bytes[output_offset] ^= 0xff;
         fs::write(&path, bytes).expect("corrupt recording");
         let error = read_recording(&path).expect_err("corruption should fail");
@@ -700,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_recording_is_not_published() {
+    fn incomplete_recording_retains_durable_start_and_never_publishes() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("recording.bcsr");
         let partial = path.with_extension("shell-recording.partial");
@@ -710,6 +757,21 @@ mod tests {
         }
         assert!(!path.exists());
         assert!(partial.exists());
-        assert!(read_recording(&partial).is_err());
+        let bytes = fs::read(&partial).expect("partial bytes");
+        assert!(bytes.len() >= 8 + 2 + 2 + 2 + 1 + 8 + 4);
+        assert_eq!(&bytes[..8], MAGIC);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), FORMAT_VERSION);
+        assert_eq!(bytes[14], FRAME_START);
+        assert_eq!(
+            u64::from_le_bytes(bytes[15..23].try_into().expect("start offset")),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[23..27].try_into().expect("start length")),
+            0
+        );
+        let error = read_recording(&partial).expect_err("partial recording must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("incomplete"));
     }
 }

@@ -1530,7 +1530,7 @@ fn finalize_recording(
         byte_len: std::fs::metadata(path).ok().map(|metadata| metadata.len()),
         metadata: Some(json!({
             "format": "bcode.shell.recording",
-            "format_version": 2,
+            "format_version": 3,
             "authoritative_replay": true,
             "columns": columns,
             "rows": rows,
