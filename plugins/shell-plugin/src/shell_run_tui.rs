@@ -5,8 +5,8 @@
 //! transcript code routes opaque plugin visuals without understanding those values.
 
 use bcode_tui_components::terminal_viewer::{
-    MAX_INLINE_TERMINAL_ROWS, TerminalViewerInput, TerminalViewerLiveState, TerminalViewerSizing,
-    terminal_viewer_rows,
+    MAX_INLINE_TERMINAL_ROWS, TerminalViewerFrame, TerminalViewerInput, TerminalViewerLiveState,
+    TerminalViewerSizing, terminal_viewer_frame_rows, terminal_viewer_rows,
 };
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use std::collections::BTreeMap;
@@ -64,8 +64,11 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             TerminalReplayOutput::Unavailable(message) => (
                 TerminalReplayData {
                     output: String::new(),
+                    frames: None,
                     columns: payload_columns,
                     rows: payload_rows,
+                    initial_columns: payload_columns,
+                    initial_rows: payload_rows,
                     exit_code: payload_exit_code(payload),
                     signal: None,
                     timed_out: payload
@@ -89,8 +92,11 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                             .to_owned(),
                         _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
                     },
+                    frames: None,
                     columns: payload_columns,
                     rows: payload_rows,
+                    initial_columns: payload_columns,
+                    initial_rows: payload_rows,
                     exit_code: payload_exit_code(payload),
                     signal: None,
                     timed_out: payload
@@ -114,31 +120,29 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 Style::new().fg(Color::Red),
             )]));
         }
-        lines.extend(terminal_viewer_rows(
-            TerminalViewerInput {
-                output: &replay.output,
-                columns: replay.columns,
-                rows: replay.rows,
-                exit_code: replay.exit_code,
-                timed_out: Some(replay.timed_out),
-                elapsed: None,
-                output_truncated: terminal_replay_truncated(payload).unwrap_or_else(|| {
-                    payload
-                        .get("output_truncated")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                }),
-                output_bytes: payload
-                    .get("output_bytes")
-                    .and_then(serde_json::Value::as_u64),
-                retained_output_bytes: payload
-                    .get("retained_output_bytes")
-                    .and_then(serde_json::Value::as_u64),
-                show_status: false,
-                sizing: TerminalViewerSizing::Compact,
-            },
-            width,
-        ));
+        let input = TerminalViewerInput {
+            output: &replay.output,
+            columns: replay.initial_columns,
+            rows: replay.initial_rows,
+            exit_code: replay.exit_code,
+            timed_out: Some(replay.timed_out),
+            elapsed: None,
+            output_truncated: terminal_replay_truncated(payload).unwrap_or_else(|| {
+                payload
+                    .get("output_truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            }),
+            output_bytes: payload
+                .get("output_bytes")
+                .and_then(serde_json::Value::as_u64),
+            retained_output_bytes: payload
+                .get("retained_output_bytes")
+                .and_then(serde_json::Value::as_u64),
+            show_status: false,
+            sizing: TerminalViewerSizing::Compact,
+        };
+        append_terminal_replay_rows(&mut lines, &replay, input, width);
         lines
     }
 }
@@ -390,10 +394,41 @@ fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {
         .and_then(|value| i32::try_from(value).ok())
 }
 
+fn append_terminal_replay_rows(
+    lines: &mut Vec<Line>,
+    replay: &TerminalReplayData,
+    input: TerminalViewerInput<'_>,
+    width: u16,
+) {
+    if let Some(frames) = replay.frames.as_deref() {
+        let frames = frames
+            .iter()
+            .map(|frame| match frame {
+                TerminalReplayFrame::Output(bytes) => TerminalViewerFrame::Output(bytes),
+                TerminalReplayFrame::Resize { columns, rows } => TerminalViewerFrame::Resize {
+                    columns: *columns,
+                    rows: *rows,
+                },
+            })
+            .collect::<Vec<_>>();
+        lines.extend(terminal_viewer_frame_rows(input, &frames, width));
+    } else {
+        lines.extend(terminal_viewer_rows(input, width));
+    }
+}
+
+enum TerminalReplayFrame {
+    Output(Vec<u8>),
+    Resize { columns: u16, rows: u16 },
+}
+
 struct TerminalReplayData {
     output: String,
+    frames: Option<Vec<TerminalReplayFrame>>,
     columns: u16,
     rows: u16,
+    initial_columns: u16,
+    initial_rows: u16,
     exit_code: Option<i32>,
     signal: Option<String>,
     timed_out: bool,
@@ -411,10 +446,14 @@ fn decode_recording_replay(
     frames: Vec<crate::recording::ShellRecordingFrame>,
 ) -> TerminalReplayData {
     let mut bytes = Vec::new();
+    let mut replay_frames = Vec::new();
     let mut replay = TerminalReplayData {
         output: String::new(),
+        frames: None,
         columns: summary.columns,
         rows: summary.rows,
+        initial_columns: summary.columns,
+        initial_rows: summary.rows,
         exit_code: None,
         signal: None,
         timed_out: false,
@@ -423,11 +462,13 @@ fn decode_recording_replay(
     for frame in frames {
         match frame {
             crate::recording::ShellRecordingFrame::Output { bytes: output, .. } => {
-                bytes.extend(output);
+                bytes.extend_from_slice(&output);
+                replay_frames.push(TerminalReplayFrame::Output(output));
             }
             crate::recording::ShellRecordingFrame::Resize { columns, rows, .. } => {
                 replay.columns = columns;
                 replay.rows = rows;
+                replay_frames.push(TerminalReplayFrame::Resize { columns, rows });
             }
             crate::recording::ShellRecordingFrame::Finish {
                 exit_code,
@@ -446,6 +487,7 @@ fn decode_recording_replay(
         }
     }
     replay.output = String::from_utf8_lossy(&bytes).into_owned();
+    replay.frames = Some(replay_frames);
     replay
 }
 
@@ -504,8 +546,11 @@ fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
     fs::read_to_string(path).map_or(TerminalReplayOutput::Absent, |output| {
         TerminalReplayOutput::Ready(TerminalReplayData {
             output,
+            frames: None,
             columns: payload_u16(payload, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS),
             rows: payload_u16(payload, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS),
+            initial_columns: payload_u16(payload, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS),
+            initial_rows: payload_u16(payload, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS),
             exit_code: payload_exit_code(payload),
             signal: None,
             timed_out: payload
@@ -765,6 +810,66 @@ mod tests {
         fs::write(&path, bytes).expect("corrupt output");
         let payload = authoritative_recording_payload(&path);
         assert_recording_unavailable(&payload, "checksum mismatch");
+    }
+
+    #[test]
+    fn recording_resize_frames_are_emulated_at_their_exact_stream_position() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("resize-recording.bcsr");
+        let mut writer =
+            crate::recording::ShellRecordingWriter::create(&path, 8, 24).expect("recording writer");
+        writer.write_output(1, b"12345678").expect("output");
+        writer.write_resize(2, 4, 24).expect("resize");
+        writer.write_output(3, b"ABCD").expect("output");
+        writer
+            .finish(4, Some(0), None, false, false)
+            .expect("finish recording");
+        let payload = authoritative_recording_payload(&path);
+        let recorded_rows = render_rows(&payload);
+        let expected_rows = terminal_viewer_frame_rows(
+            TerminalViewerInput {
+                output: "12345678ABCD",
+                columns: 8,
+                rows: 24,
+                exit_code: Some(0),
+                timed_out: Some(false),
+                elapsed: None,
+                output_truncated: false,
+                output_bytes: None,
+                retained_output_bytes: None,
+                show_status: false,
+                sizing: TerminalViewerSizing::Compact,
+            },
+            &[
+                TerminalViewerFrame::Output(b"12345678"),
+                TerminalViewerFrame::Resize {
+                    columns: 4,
+                    rows: 24,
+                },
+                TerminalViewerFrame::Output(b"ABCD"),
+            ],
+            100,
+        );
+        let rendered_terminal_rows = &recorded_rows[1..];
+
+        assert_eq!(rendered_terminal_rows, expected_rows);
+        let final_size_only = terminal_viewer_rows(
+            TerminalViewerInput {
+                output: "12345678ABCD",
+                columns: 4,
+                rows: 24,
+                exit_code: Some(0),
+                timed_out: Some(false),
+                elapsed: None,
+                output_truncated: false,
+                output_bytes: None,
+                retained_output_bytes: None,
+                show_status: false,
+                sizing: TerminalViewerSizing::Compact,
+            },
+            100,
+        );
+        assert_ne!(rendered_terminal_rows, final_size_only);
     }
 
     #[test]
