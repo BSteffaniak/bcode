@@ -59,17 +59,30 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             .unwrap_or("unknown");
         let columns = payload_u16(payload, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
         let rows = payload_u16(payload, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
-        let output = terminal_replay_output(payload).unwrap_or_else(|| match mode {
-            "terminal" => payload
-                .get("output_tail")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
-        });
+        let (output, replay_error) = match terminal_replay_output(payload) {
+            TerminalReplayOutput::Ready(output) => (output, None),
+            TerminalReplayOutput::Unavailable(message) => (String::new(), Some(message)),
+            TerminalReplayOutput::Absent => (
+                match mode {
+                    "terminal" => payload
+                        .get("output_tail")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
+                },
+                None,
+            ),
+        };
 
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(shell_status_rows(payload));
+        if let Some(error) = replay_error {
+            lines.push(Line::from_spans(vec![Span::styled(
+                format!("  durable shell recording unavailable: {error}; inline output was not substituted"),
+                Style::new().fg(Color::Red),
+            )]));
+        }
         lines.extend(terminal_viewer_rows(
             TerminalViewerInput {
                 output: &output,
@@ -326,27 +339,63 @@ fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {
         .and_then(|value| i32::try_from(value).ok())
 }
 
-fn terminal_replay_output(payload: &serde_json::Value) -> Option<String> {
-    let reference = terminal_replay_ref(payload)?;
-    let uri = reference
+enum TerminalReplayOutput {
+    Ready(String),
+    Unavailable(String),
+    Absent,
+}
+
+fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
+    let Some(reference) = terminal_replay_ref(payload) else {
+        return TerminalReplayOutput::Absent;
+    };
+    let authoritative =
+        reference.get("key").and_then(serde_json::Value::as_str) == Some(SHELL_RECORDING_REF_KEY);
+    let Some(uri) = reference
         .get("storage_uri")
-        .and_then(serde_json::Value::as_str)?;
-    let url = url::Url::parse(uri).ok()?;
+        .and_then(serde_json::Value::as_str)
+    else {
+        return if authoritative {
+            TerminalReplayOutput::Unavailable(
+                "recording reference has no storage location".to_owned(),
+            )
+        } else {
+            TerminalReplayOutput::Absent
+        };
+    };
+    let Ok(url) = url::Url::parse(uri) else {
+        return TerminalReplayOutput::Unavailable(
+            "recording storage location is invalid".to_owned(),
+        );
+    };
     if url.scheme() != "file" {
-        return None;
+        return TerminalReplayOutput::Unavailable(format!(
+            "recording storage scheme '{}' is not available locally",
+            url.scheme()
+        ));
     }
-    let path = url.to_file_path().ok()?;
-    if reference.get("key").and_then(serde_json::Value::as_str) == Some(SHELL_RECORDING_REF_KEY) {
-        let (_, frames) = crate::recording::read_recording(&path).ok()?;
-        let bytes = frames.into_iter().fold(Vec::new(), |mut bytes, frame| {
-            if let crate::recording::ShellRecordingFrame::Output { bytes: output, .. } = frame {
-                bytes.extend(output);
+    let Ok(path) = url.to_file_path() else {
+        return TerminalReplayOutput::Unavailable("recording file location is invalid".to_owned());
+    };
+    if authoritative {
+        return match crate::recording::read_recording(&path) {
+            Ok((_, frames)) => {
+                let bytes = frames.into_iter().fold(Vec::new(), |mut bytes, frame| {
+                    if let crate::recording::ShellRecordingFrame::Output { bytes: output, .. } =
+                        frame
+                    {
+                        bytes.extend(output);
+                    }
+                    bytes
+                });
+                TerminalReplayOutput::Ready(String::from_utf8_lossy(&bytes).into_owned())
             }
-            bytes
-        });
-        return Some(String::from_utf8_lossy(&bytes).into_owned());
+            Err(error) => TerminalReplayOutput::Unavailable(format!(
+                "recording could not be validated: {error}"
+            )),
+        };
     }
-    fs::read_to_string(path).ok()
+    fs::read_to_string(path).map_or(TerminalReplayOutput::Absent, TerminalReplayOutput::Ready)
 }
 
 fn terminal_replay_truncated(payload: &serde_json::Value) -> Option<bool> {
@@ -500,6 +549,45 @@ mod tests {
 
         assert!(rendered.contains("hello"), "{rendered}");
         assert!(rendered.contains("world"), "{rendered}");
+    }
+
+    #[test]
+    fn corrupt_authoritative_recording_is_explicit_and_never_falls_back() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("recording.bcsr");
+        fs::write(&path, b"corrupt").expect("write corrupt recording");
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "output_tail": "forbidden fallback sentinel",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [{
+                "key": SHELL_RECORDING_REF_KEY,
+                "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                "storage_uri": url::Url::from_file_path(&path).ok().map(|url| url.to_string()),
+                "metadata": {"complete": true}
+            }]
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter::default(),
+            "bcode.shell.run",
+            &payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("durable shell recording unavailable"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("could not be validated"), "{rendered}");
+        assert!(
+            !rendered.contains("forbidden fallback sentinel"),
+            "{rendered}"
+        );
     }
 
     #[test]

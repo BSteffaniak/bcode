@@ -1802,6 +1802,62 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn terminal_invocation_publishes_one_valid_authoritative_recording() {
+        let environment = isolated_config_environment("recording-integration");
+        let artifact_dir = tempfile::tempdir().expect("artifact dir");
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            "test-recording",
+            &ShellRunArguments {
+                command: "printf 'recorded output\\n'".to_owned(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(artifact_dir.path()),
+                cancellation_path: None,
+            },
+            &environment,
+        );
+        assert!(!response.is_error, "{}", response.output);
+        let Some(ToolInvocationResult::Artifact { artifact }) = &response.result else {
+            panic!("expected artifact");
+        };
+        let recordings = artifact
+            .refs
+            .iter()
+            .filter(|reference| reference.key == SHELL_RECORDING_REF_KEY)
+            .collect::<Vec<_>>();
+        assert_eq!(recordings.len(), 1);
+        let uri = recordings[0].storage_uri.as_deref().expect("recording URI");
+        let path = url::Url::parse(uri)
+            .expect("recording URL")
+            .to_file_path()
+            .expect("recording path");
+        let (summary, frames) = recording::read_recording(&path).expect("valid recording");
+        assert_eq!(summary.columns, 80);
+        assert_eq!(summary.rows, 24);
+        assert!(summary.output_bytes >= 16);
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            recording::ShellRecordingFrame::Finish {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                ..
+            }
+        )));
+        assert!(!path.with_extension("shell-recording.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminal_mode_returns_semantic_terminal_result() {
         let environment = isolated_config_environment("terminal");
         let response = run_terminal_shell_command_with_environment(
