@@ -31,7 +31,6 @@ impl From<bcode_syntax_render::SyntaxSpan> for DiffSyntaxSpan {
 
 const DIFF_CONTEXT_LINES: usize = 3;
 const MAX_LCS_CELLS: usize = 40_000;
-const MAX_INTRALINE_PAIR_CELLS: usize = 10_000;
 const MAX_INTRALINE_LINE_GRAPHEMES: usize = 2_000;
 
 /// Kind of a rendered diff line.
@@ -353,7 +352,6 @@ fn changed_ranges_for_pair(old: &str, new: &str) -> Option<(Vec<ChangedRange>, V
     let new_graphemes = grapheme_bounds(new);
     if old_graphemes.len() > MAX_INTRALINE_LINE_GRAPHEMES
         || new_graphemes.len() > MAX_INTRALINE_LINE_GRAPHEMES
-        || old_graphemes.len().saturating_mul(new_graphemes.len()) > MAX_INTRALINE_PAIR_CELLS
     {
         return None;
     }
@@ -522,6 +520,27 @@ mod diff_tests {
                 .iter()
                 .any(|line| line.kind == DiffLineKind::HunkHeader)
         );
+    }
+
+    #[test]
+    fn long_changed_lines_receive_intraline_highlighting() {
+        let prefix = "a".repeat(120);
+        let old = format!("{prefix}old suffix");
+        let new = format!("{prefix}new suffix");
+        let diff = diff_from_text("src/lib.rs", &old, &new);
+        let removed = diff
+            .lines
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Removed)
+            .expect("removed line");
+        let added = diff
+            .lines
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Added)
+            .expect("added line");
+
+        assert!(!removed.changed_ranges.is_empty());
+        assert!(!added.changed_ranges.is_empty());
     }
 
     #[test]
