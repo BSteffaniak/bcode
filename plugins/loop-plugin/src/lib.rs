@@ -578,6 +578,24 @@ impl PluginTuiSurface for LoopSurface {
             return PluginTuiAction::None;
         }
         self.focus_from_click(event);
+        if self.field != Field::Limit
+            && matches!(event, Event::Mouse(mouse) if mouse.position.x >= self.active_area().x && mouse.position.x < self.active_area().right() && mouse.position.y >= self.active_area().y && mouse.position.y < self.active_area().bottom() && matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown))
+        {
+            let motion = match event {
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+                    bmux_text_edit::TextMotion::VisualUp
+                }
+                _ => bmux_text_edit::TextMotion::VisualDown,
+            };
+            let state = self.active_state_mut();
+            for _ in 0..3 {
+                state
+                    .buffer_mut()
+                    .move_cursor_with_selection(motion, bmux_text_edit::SelectionMode::Move);
+            }
+            state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
+            return PluginTuiAction::Redraw;
+        }
         let area = self.active_area();
         let state = self.active_state_mut();
         match TextInputBox::new(TextInputPolicy::chat_composer())
@@ -1675,6 +1693,42 @@ mod tests {
             &host,
         );
         assert_eq!(surface.field, Field::Limit);
+    }
+
+    #[test]
+    fn modal_mouse_wheel_scrolls_multiline_input() {
+        let host = TestHost;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.prompt = text_state(
+            &(0..20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        surface.prompt_area = Rect::new(2, 2, 30, 5);
+        surface
+            .prompt
+            .set_content_area(Rect::new(3, 3, 28, 3), &TextInputPolicy::chat_composer());
+        surface.prompt.buffer_mut().move_cursor_with_selection(
+            bmux_text_edit::TextMotion::Start,
+            bmux_text_edit::SelectionMode::Move,
+        );
+        surface
+            .prompt
+            .sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
+        assert_eq!(surface.prompt.vertical_scroll(), 0);
+
+        assert_eq!(
+            surface.handle_event(&mouse(MouseEventKind::ScrollDown, 4, 4), &host),
+            PluginTuiAction::Redraw
+        );
+        assert!(surface.prompt.vertical_scroll() > 0);
+
+        assert_eq!(
+            surface.handle_event(&mouse(MouseEventKind::ScrollUp, 4, 4), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.prompt.vertical_scroll(), 0);
     }
 
     #[test]
