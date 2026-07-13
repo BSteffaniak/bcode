@@ -597,9 +597,10 @@ fn run_terminal_shell_command_with_environment(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TerminalShellStatus {
     exit_code: i32,
+    signal: Option<String>,
     success: bool,
     timed_out: bool,
     cancelled: bool,
@@ -646,6 +647,7 @@ fn wait_for_terminal_shell_status(
     };
     Ok(TerminalShellStatus {
         exit_code: i32::try_from(status.exit_code()).unwrap_or(i32::MAX),
+        signal: status.signal().map(ToOwned::to_owned),
         success: status.success(),
         timed_out,
         cancelled,
@@ -655,7 +657,7 @@ fn wait_for_terminal_shell_status(
 fn encode_terminal_output(
     command: &str,
     cwd: Option<&Path>,
-    status: TerminalShellStatus,
+    status: &TerminalShellStatus,
     output: &LimitedOutput,
     columns: u16,
     rows: u16,
@@ -796,7 +798,7 @@ fn run_terminal_shell_command_inner(
     )?;
     drop(pair.master);
     let mut stream_output = join_reader(reader_thread)?;
-    let recording_ref = finalize_recording(&mut stream_output, started, status, columns, rows)?;
+    let recording_ref = finalize_recording(&mut stream_output, started, &status, columns, rows)?;
     terminal_shell_response(
         tool_call_id,
         TerminalShellResponseInput {
@@ -833,7 +835,7 @@ fn terminal_shell_response(
     let (encoded, full_encoded, _clean_inline_output) = encode_terminal_output(
         &input.arguments.command,
         input.cwd,
-        input.status,
+        &input.status,
         &input.stream_output.clean,
         input.columns,
         input.rows,
@@ -1501,7 +1503,7 @@ fn shell_run_artifact(
 fn finalize_recording(
     output: &mut TerminalStreamOutput,
     started: Instant,
-    status: TerminalShellStatus,
+    status: &TerminalShellStatus,
     columns: u16,
     rows: u16,
 ) -> Result<Option<ToolArtifactRef>, String> {
@@ -1512,6 +1514,7 @@ fn finalize_recording(
         .finish(
             u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             Some(status.exit_code),
+            status.signal.clone(),
             status.timed_out,
             status.cancelled,
         )
@@ -1527,7 +1530,7 @@ fn finalize_recording(
         byte_len: std::fs::metadata(path).ok().map(|metadata| metadata.len()),
         metadata: Some(json!({
             "format": "bcode.shell.recording",
-            "format_version": 1,
+            "format_version": 2,
             "authoritative_replay": true,
             "columns": columns,
             "rows": rows,
@@ -1871,12 +1874,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)] // One lifecycle matrix shares the full invocation/reopen path.
     fn terminal_recordings_preserve_timeout_cancellation_and_nonzero_status() {
         let environment = isolated_config_environment("recording-terminal-status");
-        for (name, command, timeout_ms, cancel, expected_exit, timed_out, cancelled) in [
-            ("nonzero", "exit 7", 5_000, false, Some(7), false, false),
-            ("timeout", "sleep 10", 0, false, Some(1), true, false),
-            ("cancel", "sleep 10", 5_000, true, Some(1), false, true),
+        for (
+            name,
+            command,
+            timeout_ms,
+            cancel,
+            expected_exit,
+            expected_signal,
+            timed_out,
+            cancelled,
+        ) in [
+            (
+                "nonzero",
+                "exit 7",
+                5_000,
+                false,
+                Some(7),
+                None,
+                false,
+                false,
+            ),
+            (
+                "signal",
+                "kill -TERM $$",
+                5_000,
+                false,
+                Some(1),
+                Some("Terminated: 15"),
+                false,
+                false,
+            ),
+            (
+                "timeout",
+                "sleep 10",
+                0,
+                false,
+                Some(1),
+                Some("Hangup: 1"),
+                true,
+                false,
+            ),
+            (
+                "cancel",
+                "sleep 10",
+                5_000,
+                true,
+                Some(1),
+                Some("Hangup: 1"),
+                false,
+                true,
+            ),
         ] {
             let artifact_dir = tempfile::tempdir().expect("artifact dir");
             let cancellation_path = artifact_dir.path().join("cancel");
@@ -1926,10 +1976,12 @@ mod tests {
                     frame,
                     recording::ShellRecordingFrame::Finish {
                         exit_code,
+                        signal,
                         timed_out: actual_timed_out,
                         cancelled: actual_cancelled,
                         ..
                     } if *exit_code == expected_exit
+                        && signal.as_deref() == expected_signal
                         && *actual_timed_out == timed_out
                         && *actual_cancelled == cancelled
                 )),
@@ -2027,8 +2079,9 @@ mod tests {
         let (_encoded, full_encoded, inline_output) = encode_terminal_output(
             "printf hello",
             None,
-            TerminalShellStatus {
+            &TerminalShellStatus {
                 exit_code: 0,
+                signal: None,
                 success: true,
                 timed_out: false,
                 cancelled: false,
@@ -2185,7 +2238,7 @@ mod tests {
                 let elapsed = started.elapsed().as_nanos();
                 if let Some(writer) = output.recording_writer.take() {
                     writer
-                        .finish(1, Some(0), false, false)
+                        .finish(1, Some(0), None, false, false)
                         .expect("recording finalization");
                 }
                 elapsed
@@ -2450,6 +2503,7 @@ mod tests {
                 cwd: None,
                 status: TerminalShellStatus {
                     exit_code: 0,
+                    signal: None,
                     success: true,
                     timed_out: false,
                     cancelled: false,
@@ -2526,6 +2580,7 @@ mod tests {
                 cwd: None,
                 status: TerminalShellStatus {
                     exit_code: 1,
+                    signal: None,
                     success: false,
                     timed_out: false,
                     cancelled: false,

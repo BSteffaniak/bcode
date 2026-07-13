@@ -600,7 +600,7 @@ mod tests {
             .write_output(1, b"first\rsecond\n")
             .expect("record output");
         writer
-            .finish(2, Some(0), false, false)
+            .finish(2, Some(0), None, false, false)
             .expect("finish recording");
         let payload = serde_json::json!({
             "mode": "terminal",

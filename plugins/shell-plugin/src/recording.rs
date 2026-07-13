@@ -12,7 +12,8 @@ use std::sync::mpsc;
 use std::thread;
 
 const MAGIC: &[u8; 8] = b"BCSHREC\0";
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
+const LEGACY_FORMAT_VERSION: u16 = 1;
 const FRAME_OUTPUT: u8 = 1;
 const FRAME_RESIZE: u8 = 2;
 const FRAME_FINISH: u8 = 3;
@@ -32,6 +33,7 @@ enum AsyncRecordingCommand {
     Finish {
         offset_micros: u64,
         exit_code: Option<i32>,
+        signal: Option<String>,
         timed_out: bool,
         cancelled: bool,
         response: mpsc::Sender<io::Result<ShellRecordingSummary>>,
@@ -115,6 +117,7 @@ impl AsyncShellRecordingWriter {
         mut self,
         offset_micros: u64,
         exit_code: Option<i32>,
+        signal: Option<String>,
         timed_out: bool,
         cancelled: bool,
     ) -> io::Result<ShellRecordingSummary> {
@@ -128,6 +131,7 @@ impl AsyncShellRecordingWriter {
             .send(AsyncRecordingCommand::Finish {
                 offset_micros,
                 exit_code,
+                signal,
                 timed_out,
                 cancelled,
                 response,
@@ -185,12 +189,21 @@ fn run_async_recording_writer(
             AsyncRecordingCommand::Finish {
                 offset_micros,
                 exit_code,
+                signal,
                 timed_out,
                 cancelled,
                 response,
             } => {
                 let result = failure.map_or_else(
-                    || writer.finish(offset_micros, exit_code, timed_out, cancelled),
+                    || {
+                        writer.finish(
+                            offset_micros,
+                            exit_code,
+                            signal.as_deref(),
+                            timed_out,
+                            cancelled,
+                        )
+                    },
                     Err,
                 );
                 let _ = response.send(result);
@@ -215,6 +228,7 @@ pub enum ShellRecordingFrame {
     Finish {
         offset_micros: u64,
         exit_code: Option<i32>,
+        signal: Option<String>,
         timed_out: bool,
         cancelled: bool,
     },
@@ -323,15 +337,24 @@ impl ShellRecordingWriter {
         mut self,
         offset_micros: u64,
         exit_code: Option<i32>,
+        signal: Option<&str>,
         timed_out: bool,
         cancelled: bool,
     ) -> io::Result<ShellRecordingSummary> {
-        let mut payload = [0_u8; 38];
-        payload[0] = u8::from(exit_code.is_some());
-        payload[1..5].copy_from_slice(&exit_code.unwrap_or_default().to_le_bytes());
-        payload[5] = u8::from(timed_out) | (u8::from(cancelled) << 1);
-        let checksum = self.checksum.clone().finalize();
-        payload[6..].copy_from_slice(&checksum);
+        let signal = signal.unwrap_or_default().as_bytes();
+        let signal_length = u16::try_from(signal.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recording signal name too long",
+            )
+        })?;
+        let mut payload = Vec::with_capacity(40_usize.saturating_add(signal.len()));
+        payload.push(u8::from(exit_code.is_some()));
+        payload.extend_from_slice(&exit_code.unwrap_or_default().to_le_bytes());
+        payload.push(u8::from(timed_out) | (u8::from(cancelled) << 1));
+        payload.extend_from_slice(&signal_length.to_le_bytes());
+        payload.extend_from_slice(signal);
+        payload.extend_from_slice(&self.checksum.clone().finalize());
         self.write_frame(FRAME_FINISH, offset_micros, &payload)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
@@ -395,7 +418,7 @@ pub fn read_recording(
         ));
     }
     let version = read_u16(&mut reader)?;
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported recording version",
@@ -439,7 +462,7 @@ pub fn read_recording(
                 columns: u16::from_le_bytes([payload[0], payload[1]]),
                 rows: u16::from_le_bytes([payload[2], payload[3]]),
             },
-            FRAME_FINISH if payload.len() == 38 => {
+            FRAME_FINISH if version == LEGACY_FORMAT_VERSION && payload.len() == 38 => {
                 let actual = checksum.clone().finalize();
                 if actual.as_slice() != &payload[6..] {
                     return Err(io::Error::new(
@@ -453,6 +476,37 @@ pub fn read_recording(
                     exit_code: (payload[0] != 0).then(|| {
                         i32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
                     }),
+                    signal: None,
+                    timed_out: payload[5] & 1 != 0,
+                    cancelled: payload[5] & 2 != 0,
+                }
+            }
+            FRAME_FINISH if version == FORMAT_VERSION && payload.len() >= 40 => {
+                let signal_length = usize::from(u16::from_le_bytes([payload[6], payload[7]]));
+                let checksum_start = 8_usize.saturating_add(signal_length);
+                if payload.len() != checksum_start.saturating_add(32) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid recording finish frame length",
+                    ));
+                }
+                let actual = checksum.clone().finalize();
+                if actual.as_slice() != &payload[checksum_start..] {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "recording checksum mismatch",
+                    ));
+                }
+                let signal = std::str::from_utf8(&payload[8..checksum_start]).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid signal name")
+                })?;
+                saw_finish = true;
+                ShellRecordingFrame::Finish {
+                    offset_micros,
+                    exit_code: (payload[0] != 0).then(|| {
+                        i32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
+                    }),
+                    signal: (!signal.is_empty()).then(|| signal.to_owned()),
                     timed_out: payload[5] & 1 != 0,
                     cancelled: payload[5] & 2 != 0,
                 }
@@ -513,7 +567,9 @@ mod tests {
         let bytes = b"\xffhello\r\x1b[2Kworld\0";
         writer.write_output(17, bytes).expect("output");
         writer.write_resize(29, 132, 40).expect("resize");
-        let written = writer.finish(41, Some(7), true, false).expect("finish");
+        let written = writer
+            .finish(41, Some(7), Some("SIGTERM"), true, false)
+            .expect("finish");
         let (read, frames) = read_recording(&path).expect("read");
         assert_eq!(read.columns, 80);
         assert_eq!(read.rows, 24);
@@ -542,6 +598,7 @@ mod tests {
             ShellRecordingFrame::Finish {
                 offset_micros: 41,
                 exit_code: Some(7),
+                signal: Some("SIGTERM".to_owned()),
                 timed_out: true,
                 cancelled: false
             }
@@ -556,7 +613,9 @@ mod tests {
         assert!(writer.try_write_output(1, b"first"));
         assert!(writer.try_write_output(2, b"second"));
         assert!(writer.try_write_resize(3, 100, 30));
-        writer.finish(4, Some(0), false, false).expect("finish");
+        writer
+            .finish(4, Some(0), None, false, false)
+            .expect("finish");
         let (_, frames) = read_recording(&path).expect("recording");
         assert_eq!(
             frames,
@@ -577,6 +636,7 @@ mod tests {
                 ShellRecordingFrame::Finish {
                     offset_micros: 4,
                     exit_code: Some(0),
+                    signal: None,
                     timed_out: false,
                     cancelled: false,
                 },
@@ -585,12 +645,51 @@ mod tests {
     }
 
     #[test]
+    fn legacy_version_one_recording_remains_readable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("legacy.bcsr");
+        let output = b"legacy bytes";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&LEGACY_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&80_u16.to_le_bytes());
+        bytes.extend_from_slice(&24_u16.to_le_bytes());
+        bytes.push(FRAME_OUTPUT);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(output.len()).expect("length").to_le_bytes());
+        bytes.extend_from_slice(output);
+        let mut finish = [0_u8; 38];
+        finish[0] = 1;
+        finish[1..5].copy_from_slice(&0_i32.to_le_bytes());
+        finish[6..].copy_from_slice(&Sha256::digest(output));
+        bytes.push(FRAME_FINISH);
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&38_u32.to_le_bytes());
+        bytes.extend_from_slice(&finish);
+        fs::write(&path, bytes).expect("legacy recording");
+
+        let (_, frames) = read_recording(&path).expect("legacy recording readable");
+        assert!(matches!(
+            frames.last(),
+            Some(ShellRecordingFrame::Finish {
+                exit_code: Some(0),
+                signal: None,
+                timed_out: false,
+                cancelled: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn checksum_mismatch_is_rejected() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("recording.bcsr");
         let mut writer = ShellRecordingWriter::create(&path, 80, 24).expect("writer");
         writer.write_output(1, b"hello").expect("output");
-        writer.finish(2, Some(0), false, false).expect("finish");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
         let mut bytes = fs::read(&path).expect("recording bytes");
         let output_offset = 8 + 2 + 2 + 2 + 1 + 8 + 4;
         bytes[output_offset] ^= 0xff;
