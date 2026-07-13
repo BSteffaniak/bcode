@@ -198,11 +198,15 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
     state.cancel_requested = true;
     state.state = RunState::Canceled;
     state.stop_reason = Some("stopped by user".to_owned());
+    let cancel_session_id = state
+        .pending_operation
+        .as_ref()
+        .map_or(session_id, |operation| operation.target_session_id);
     let message = match save_state(&state) {
         Ok(()) => {
             let client = BcodeClient::default_endpoint();
             tokio::spawn(async move {
-                let _cancelled = client.cancel_session_turn(session_id).await;
+                let _cancelled = client.cancel_session_turn(cancel_session_id).await;
             });
             "loop stopped".to_owned()
         }
@@ -217,6 +221,12 @@ fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
         Ok(None) => return status_response("no loop found for this session"),
         Err(error) => return status_response(&format!("loop state unavailable: {error}")),
     };
+    if matches!(
+        state.state,
+        RunState::Completed | RunState::LimitReached | RunState::Canceled
+    ) {
+        return status_response("this loop is terminal and cannot be resumed");
+    }
     if !matches!(state.state, RunState::Paused | RunState::Failed) {
         return status_response("only paused or failed loops can be resumed");
     }
@@ -702,6 +712,9 @@ async fn run_loop(mut state: LoopState) {
                     Ok(completion) => break completion,
                     Err(AutomationTurnError::Retry) => {}
                     Err(AutomationTurnError::Fatal(error)) => {
+                        if refresh_cancel(&mut state) {
+                            return;
+                        }
                         fail_run(&mut state, error);
                         return;
                     }
@@ -709,6 +722,9 @@ async fn run_loop(mut state: LoopState) {
             };
             state.current_iteration = iteration_number;
             if completion.outcome != ModelTurnOutcome::Completed {
+                if refresh_cancel(&mut state) {
+                    return;
+                }
                 pause_run(
                     &mut state,
                     format!("iteration ended with {:?}", completion.outcome),
@@ -746,12 +762,18 @@ async fn run_loop(mut state: LoopState) {
                     match parse_evaluation(&completion.assistant_text) {
                         Ok(evaluation) => evaluation,
                         Err(error) => {
+                            if refresh_cancel(&mut state) {
+                                return;
+                            }
                             pause_run(&mut state, error);
                             return;
                         }
                     }
                 }
                 Ok(completion) => {
+                    if refresh_cancel(&mut state) {
+                        return;
+                    }
                     pause_run(
                         &mut state,
                         format!("evaluation ended with {:?}", completion.outcome),
@@ -759,6 +781,9 @@ async fn run_loop(mut state: LoopState) {
                     return;
                 }
                 Err(error) => {
+                    if refresh_cancel(&mut state) {
+                        return;
+                    }
                     pause_run(&mut state, error);
                     return;
                 }
@@ -1152,6 +1177,18 @@ fn save_state(state: &LoopState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_loop_states_cannot_be_resumed() {
+        for terminal in [
+            RunState::Completed,
+            RunState::LimitReached,
+            RunState::Canceled,
+        ] {
+            assert!(terminal.is_terminal());
+            assert!(!matches!(terminal, RunState::Paused | RunState::Failed));
+        }
+    }
 
     #[test]
     fn loop_state_round_trip_preserves_pending_operation_journal() {
