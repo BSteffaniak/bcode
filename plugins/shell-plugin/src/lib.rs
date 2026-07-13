@@ -1538,6 +1538,8 @@ fn finalize_recording(
             "output_bytes": summary.output_bytes,
             "checksum_sha256": summary.checksum_sha256,
             "complete": true,
+            "retention": "session_lifetime",
+            "eviction": "none",
         })),
     }))
 }

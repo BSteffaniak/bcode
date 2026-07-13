@@ -5003,6 +5003,15 @@ async fn handle_delete_session(
                 .session_catalog
                 .remove_native_session(session_id)
                 .await;
+            if let Err(error) =
+                remove_session_artifact_dir(&default_session_artifact_dir(session_id))
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "session deleted but its retained artifacts could not be removed"
+                );
+            }
             send_response(
                 writer,
                 request_id,
@@ -16965,6 +16974,14 @@ fn default_trace_store_dir() -> PathBuf {
     bcode_config::default_state_dir().join("traces")
 }
 
+fn remove_session_artifact_dir(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
     bcode_config::default_state_dir()
         .join("artifacts")
@@ -16981,6 +16998,20 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolCardPresentation,
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
+
+    #[test]
+    fn session_artifacts_are_retained_until_explicit_session_deletion() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let artifact_dir = temp_dir.path().join("session-artifacts");
+        std::fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let recording = artifact_dir.join("recording.bcsr");
+        std::fs::write(&recording, b"retained recording").expect("recording");
+
+        assert!(recording.exists());
+        remove_session_artifact_dir(&artifact_dir).expect("explicit deletion cleanup");
+        assert!(!artifact_dir.exists());
+        remove_session_artifact_dir(&artifact_dir).expect("idempotent cleanup");
+    }
 
     fn session_event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {

@@ -517,6 +517,17 @@ fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
     };
     let authoritative =
         reference.get("key").and_then(serde_json::Value::as_str) == Some(SHELL_RECORDING_REF_KEY);
+    if authoritative
+        && reference
+            .get("metadata")
+            .and_then(|metadata| metadata.get("availability"))
+            .and_then(serde_json::Value::as_str)
+            == Some("evicted")
+    {
+        return TerminalReplayOutput::Unavailable(
+            "recording was explicitly evicted by artifact retention policy".to_owned(),
+        );
+    }
     let Some(uri) = reference
         .get("storage_uri")
         .and_then(serde_json::Value::as_str)
@@ -772,6 +783,22 @@ mod tests {
             !rendered.contains("forbidden fallback sentinel"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn explicitly_evicted_recording_is_unavailable_without_fallback() {
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "output_tail": "forbidden fallback sentinel",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [{
+                "key": SHELL_RECORDING_REF_KEY,
+                "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                "metadata": {"availability": "evicted", "complete": false}
+            }]
+        });
+        assert_recording_unavailable(&payload, "explicitly evicted");
     }
 
     #[test]
