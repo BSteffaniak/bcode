@@ -1270,6 +1270,32 @@ impl BcodeClient {
         }
     }
 
+    /// Resize an active terminal-capable tool invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the dimensions/invocation.
+    pub async fn resize_tool_invocation(
+        &self,
+        session_id: SessionId,
+        tool_call_id: String,
+        columns: u16,
+        rows: u16,
+    ) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::ResizeToolInvocation {
+                session_id,
+                tool_call_id,
+                columns,
+                rows,
+            })
+            .await?
+        {
+            ResponsePayload::ToolInvocationResized => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Read a bounded generic artifact range from canonical session metadata.
     ///
     /// # Errors

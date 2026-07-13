@@ -2033,6 +2033,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
         | Request::ReadSessionArtifact { session_id, .. }
+        | Request::ResizeToolInvocation { session_id, .. }
         | Request::SessionHistory { session_id }
         | Request::SessionHistoryPage { session_id, .. }
         | Request::AttachSession { session_id }
@@ -2078,6 +2079,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RenameSession { .. } => "rename_session",
         Request::DeleteSession { .. } => "delete_session",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
+        Request::ResizeToolInvocation { .. } => "resize_tool_invocation",
         Request::SessionHistory { .. } => "session_history",
         Request::SessionHistoryPage { .. } => "session_history_page",
         Request::AttachSession { .. } => "attach_session",
@@ -2304,6 +2306,22 @@ async fn handle_request_inner(
                 reference_key,
                 offset,
                 length,
+            )
+            .await
+        }
+        Request::ResizeToolInvocation {
+            session_id,
+            tool_call_id,
+            columns,
+            rows,
+        } => {
+            handle_resize_tool_invocation(
+                request_id,
+                writer,
+                session_id,
+                &tool_call_id,
+                columns,
+                rows,
             )
             .await
         }
@@ -4985,6 +5003,59 @@ async fn handle_rename_session(
                     "session_rename_failed",
                     error.to_string(),
                 )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_resize_tool_invocation(
+    request_id: u64,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    tool_call_id: &str,
+    columns: u16,
+    rows: u16,
+) -> Result<(), ServerError> {
+    let result = if columns == 0 || rows == 0 {
+        Err("terminal resize dimensions must be positive".to_owned())
+    } else {
+        let safe_call_id = tool_call_id
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect::<String>();
+        let path =
+            default_session_artifact_dir(session_id).join(format!("tool-control-{safe_call_id}"));
+        let event = serde_json::json!({
+            "type": "resize",
+            "columns": columns,
+            "rows": rows,
+        });
+        (|| -> Result<(), String> {
+            std::fs::create_dir_all(path.parent().ok_or("control path has no parent")?)
+                .map_err(|error| error.to_string())?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|error| error.to_string())?;
+            writeln!(file, "{event}").map_err(|error| error.to_string())
+        })()
+    };
+    match result {
+        Ok(()) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::ToolInvocationResized),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("tool_resize_failed", error)),
             )
             .await
         }
@@ -13929,6 +14000,18 @@ fn tool_invocation_metric_labels(
     labels
 }
 
+struct ToolInvocationControlFiles {
+    cancellation_path: PathBuf,
+    control_path: PathBuf,
+}
+
+impl Drop for ToolInvocationControlFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.cancellation_path);
+        let _ = std::fs::remove_file(&self.control_path);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn invoke_model_tool(
     state: &ServerState,
@@ -14143,6 +14226,18 @@ async fn invoke_model_tool(
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
             .collect::<String>()
     ));
+    let control_path = default_session_artifact_dir(session_id).join(format!(
+        "tool-control-{}",
+        call.id
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect::<String>()
+    ));
+    let _ = std::fs::remove_file(&control_path);
+    let _control_files = ToolInvocationControlFiles {
+        cancellation_path: cancellation_path.clone(),
+        control_path: control_path.clone(),
+    };
     let request = ToolInvocationRequest {
         tool_call_id: call.id.clone(),
         name: call.name.clone(),
@@ -14150,6 +14245,7 @@ async fn invoke_model_tool(
         cwd: Some(working_directory),
         artifact_dir: Some(default_session_artifact_dir(session_id)),
         cancellation_path: Some(cancellation_path.clone()),
+        control_path: Some(control_path.clone()),
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let scope = active_plugin_scope_for_tool_call(state, session_id, &call.id).await;

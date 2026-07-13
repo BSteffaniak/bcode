@@ -42,6 +42,26 @@ enum AsyncRecordingCommand {
     },
 }
 
+/// Cloneable non-blocking resize producer for an active recording.
+#[derive(Clone)]
+pub struct AsyncShellRecordingResizeSender {
+    sender: mpsc::SyncSender<AsyncRecordingCommand>,
+}
+
+impl AsyncShellRecordingResizeSender {
+    /// Queue a resize without waiting for filesystem I/O.
+    #[must_use]
+    pub fn try_write_resize(&self, offset_micros: u64, columns: u16, rows: u16) -> bool {
+        self.sender
+            .try_send(AsyncRecordingCommand::Resize {
+                offset_micros,
+                columns,
+                rows,
+            })
+            .is_ok()
+    }
+}
+
 /// Non-blocking producer for a shell recording writer thread.
 pub struct AsyncShellRecordingWriter {
     sender: mpsc::SyncSender<AsyncRecordingCommand>,
@@ -66,6 +86,14 @@ impl AsyncShellRecordingWriter {
             worker: Some(worker),
             queue_failed: false,
         })
+    }
+
+    /// Return a cloneable non-blocking resize producer.
+    #[must_use]
+    pub fn resize_sender(&self) -> AsyncShellRecordingResizeSender {
+        AsyncShellRecordingResizeSender {
+            sender: self.sender.clone(),
+        }
     }
 
     /// Queue exact PTY bytes without waiting for filesystem I/O.

@@ -1547,6 +1547,18 @@ async fn handle_event<W: Write>(
             context
                 .terminal
                 .resize(Rect::new(0, 0, size.width, size.height));
+            if let Some(session_id) = chat.session_id {
+                for tool_call_id in chat.app.active_terminal_tool_call_ids() {
+                    if let Err(error) = context
+                        .services
+                        .client
+                        .resize_tool_invocation(session_id, tool_call_id, size.width, size.height)
+                        .await
+                    {
+                        tracing::debug!(%error, "active tool invocation did not accept terminal resize");
+                    }
+                }
+            }
             Ok(true)
         }
         Event::Key(stroke)

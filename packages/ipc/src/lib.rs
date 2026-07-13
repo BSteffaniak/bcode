@@ -423,6 +423,13 @@ pub enum Request {
         offset: u64,
         length: u32,
     },
+    /// Resize an active terminal-capable tool invocation.
+    ResizeToolInvocation {
+        session_id: SessionId,
+        tool_call_id: String,
+        columns: u16,
+        rows: u16,
+    },
 }
 
 /// Server stop request policy.
@@ -1200,6 +1207,7 @@ pub enum ResponsePayload {
         total_bytes: u64,
         bytes: Vec<u8>,
     },
+    ToolInvocationResized,
 }
 
 /// Structured error response.

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -243,6 +243,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
                 session_cwd: request.cwd.as_deref(),
                 artifact_dir: request.artifact_dir.as_deref(),
                 cancellation_path: request.cancellation_path.as_deref(),
+                control_path: request.control_path.as_deref(),
             },
         ),
         _ => ToolInvocationResponse {
@@ -546,6 +547,7 @@ struct TerminalRunPaths<'a> {
     session_cwd: Option<&'a Path>,
     artifact_dir: Option<&'a Path>,
     cancellation_path: Option<&'a Path>,
+    control_path: Option<&'a Path>,
 }
 
 fn run_terminal_shell_command(
@@ -597,6 +599,67 @@ fn run_terminal_shell_command_with_environment(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TerminalControlEvent {
+    Resize { columns: u16, rows: u16 },
+}
+
+struct TerminalControlReader<'a> {
+    path: &'a Path,
+    offset: u64,
+    pending: String,
+    started: Instant,
+    recording: Option<recording::AsyncShellRecordingResizeSender>,
+}
+
+impl TerminalControlReader<'_> {
+    fn poll(&mut self, master: &dyn portable_pty::MasterPty) -> Result<(), String> {
+        let Ok(mut file) = File::open(self.path) else {
+            return Ok(());
+        };
+        file.seek(std::io::SeekFrom::Start(self.offset))
+            .map_err(|error| error.to_string())?;
+        let mut appended = String::new();
+        file.read_to_string(&mut appended)
+            .map_err(|error| error.to_string())?;
+        self.offset = file.stream_position().map_err(|error| error.to_string())?;
+        self.pending.push_str(&appended);
+        while let Some(newline) = self.pending.find('\n') {
+            let line = self.pending[..newline].trim().to_owned();
+            self.pending.drain(..=newline);
+            if line.is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<TerminalControlEvent>(&line)
+                .map_err(|error| format!("invalid terminal control event: {error}"))?;
+            match event {
+                TerminalControlEvent::Resize { columns, rows } => {
+                    if columns == 0 || rows == 0 {
+                        return Err("terminal resize dimensions must be positive".to_owned());
+                    }
+                    master
+                        .resize(portable_pty::PtySize {
+                            rows,
+                            cols: columns,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    if let Some(recording) = &self.recording {
+                        let _ = recording.try_write_resize(
+                            u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                            columns,
+                            rows,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TerminalShellStatus {
     exit_code: i32,
@@ -606,6 +669,7 @@ struct TerminalShellStatus {
     cancelled: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_for_terminal_shell_status(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
@@ -613,11 +677,16 @@ fn wait_for_terminal_shell_status(
     timeout: Duration,
     tool_call_id: &str,
     events: ServiceEventEmitter,
+    mut control: Option<&mut TerminalControlReader<'_>>,
+    master: Option<&dyn portable_pty::MasterPty>,
 ) -> Result<TerminalShellStatus, String> {
     let started = Instant::now();
     let mut timed_out = false;
     let mut cancelled = false;
     let status = loop {
+        if let (Some(control), Some(master)) = (control.as_deref_mut(), master) {
+            control.poll(master)?;
+        }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
         }
@@ -762,6 +831,8 @@ fn run_terminal_shell_command_inner(
     let replay_artifact_path = replay_artifact_path(paths.artifact_dir, tool_call_id)?;
     let recording_path = recording_artifact_path(paths.artifact_dir, tool_call_id)?;
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let (recording_ready_tx, recording_ready_rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
         move || {
@@ -782,12 +853,22 @@ fn run_terminal_shell_command_inner(
                     raw: raw_artifact_path,
                     replay: replay_artifact_path,
                     recording: recording_path,
+                    recording_ready: Some(recording_ready_tx),
                 },
             )
         }
     });
 
-    let started = Instant::now();
+    let recording = recording_ready_rx
+        .recv()
+        .map_err(|_| "recording reader did not initialize".to_owned())?;
+    let mut control = paths.control_path.map(|path| TerminalControlReader {
+        path,
+        offset: 0,
+        pending: String::new(),
+        started,
+        recording,
+    });
     let status = wait_for_terminal_shell_status(
         &mut child,
         cancellation,
@@ -795,6 +876,8 @@ fn run_terminal_shell_command_inner(
         timeout,
         tool_call_id,
         events,
+        control.as_mut(),
+        Some(&*pair.master),
     )?;
     drop(pair.master);
     let mut stream_output = join_reader(reader_thread)?;
@@ -948,6 +1031,8 @@ struct TerminalStreamPaths {
     raw: Option<PathBuf>,
     replay: Option<PathBuf>,
     recording: Option<PathBuf>,
+    recording_ready:
+        Option<std::sync::mpsc::Sender<Option<recording::AsyncShellRecordingResizeSender>>>,
 }
 
 #[derive(Clone, Default)]
@@ -1144,6 +1229,12 @@ where
         })
         .transpose()
         .map_err(|error| error.to_string())?;
+    let recording_resize_sender = recording_writer
+        .as_ref()
+        .map(recording::AsyncShellRecordingWriter::resize_sender);
+    if let Some(ready) = paths.recording_ready.as_ref() {
+        let _ = ready.send(recording_resize_sender);
+    }
     let mut cleaner = terminal_clean::TerminalCleanWriter::new(
         &mut clean_writer,
         visual_context.columns,
@@ -1770,6 +1861,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 cancellation_path: None,
+                control_path: None,
             },
             &environment,
         );
@@ -1810,12 +1902,76 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 cancellation_path: None,
+                control_path: None,
             },
             &environment,
         );
 
         assert!(response.is_error);
         assert!(response.output.contains("\"exit_code\":1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_terminal_control_resize_reaches_pty_and_recording() {
+        let environment = isolated_config_environment("active-resize-recording");
+        let artifact_dir = tempfile::tempdir().expect("artifact dir");
+        let control_path = artifact_dir.path().join("control.jsonl");
+        let resize_path = control_path.clone();
+        let resize = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            std::fs::write(
+                resize_path,
+                b"{\"type\":\"resize\",\"columns\":100,\"rows\":30}\n{\"type\":\"resize\",\"columns\":132,\"rows\":40}\n",
+            )
+            .expect("resize control");
+        });
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            "test-active-resize",
+            &ShellRunArguments {
+                command: "sleep 0.15; printf 'resized\\n'".to_owned(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(artifact_dir.path()),
+                cancellation_path: None,
+                control_path: Some(&control_path),
+            },
+            &environment,
+        );
+        resize.join().expect("resize writer");
+        assert!(!response.is_error, "{}", response.output);
+        let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
+            panic!("expected artifact");
+        };
+        let recording = artifact
+            .refs
+            .iter()
+            .find(|reference| reference.key == SHELL_RECORDING_REF_KEY)
+            .expect("recording reference");
+        let path = url::Url::parse(recording.storage_uri.as_deref().expect("recording URI"))
+            .expect("recording URL")
+            .to_file_path()
+            .expect("recording path");
+        let (_, frames) = recording::read_recording(&path).expect("valid recording");
+        let recorded_resizes = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                recording::ShellRecordingFrame::Resize { columns, rows, .. } => {
+                    Some((*columns, *rows))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recorded_resizes, vec![(100, 30), (132, 40)]);
     }
 
     #[cfg(unix)]
@@ -1841,6 +1997,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 cancellation_path: None,
+                control_path: None,
             },
             &environment,
         );
@@ -1898,6 +2055,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 cancellation_path: None,
+                control_path: None,
             },
             &environment,
         );
@@ -2022,6 +2180,7 @@ mod tests {
                     session_cwd: None,
                     artifact_dir: Some(artifact_dir.path()),
                     cancellation_path: cancel.then_some(cancellation_path.as_path()),
+                    control_path: None,
                 },
                 &environment,
             );
@@ -2083,6 +2242,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 cancellation_path: None,
+                control_path: None,
             },
             &environment,
         );
@@ -2128,6 +2288,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 cancellation_path: None,
+                control_path: None,
             },
         );
 
@@ -2304,6 +2465,7 @@ mod tests {
                         raw: None,
                         replay: None,
                         recording,
+                        recording_ready: None,
                     },
                 )
                 .expect("stream benchmark");
@@ -2391,6 +2553,8 @@ mod tests {
             Duration::from_secs(10),
             "cancel-test",
             ServiceEventEmitter::default(),
+            None,
+            None,
         )
         .expect("cancelled child status");
 
@@ -2412,6 +2576,8 @@ mod tests {
             Duration::ZERO,
             "timeout-test",
             ServiceEventEmitter::default(),
+            None,
+            None,
         )
         .expect("timed-out child status");
 
@@ -2448,6 +2614,7 @@ mod tests {
                 raw: None,
                 replay: None,
                 recording: None,
+                recording_ready: None,
             },
         )
         .expect("baseline stream");
@@ -2468,6 +2635,7 @@ mod tests {
                 raw: None,
                 replay: None,
                 recording: Some(dir.path().join("recording.bcsr")),
+                recording_ready: None,
             },
         )
         .expect("recorded stream");
@@ -2501,6 +2669,7 @@ mod tests {
                 raw: None,
                 replay: None,
                 recording: None,
+                recording_ready: None,
             },
         )
         .expect("stream should read");
@@ -2532,6 +2701,7 @@ mod tests {
                 raw: None,
                 replay: None,
                 recording: None,
+                recording_ready: None,
             },
         )
         .expect("stream should read");
