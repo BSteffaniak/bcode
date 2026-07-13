@@ -191,6 +191,9 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     plugin_automation_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
+    plugin_automation_holds: Mutex<BTreeMap<SessionId, BTreeSet<String>>>,
+    plugin_automation_policies:
+        Mutex<BTreeMap<SessionId, bcode_ipc::PluginAutomationExecutionPolicy>>,
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
@@ -1046,6 +1049,8 @@ impl ServerState {
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
             plugin_automation_locks: Mutex::default(),
+            plugin_automation_holds: Mutex::default(),
+            plugin_automation_policies: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
@@ -2075,6 +2080,10 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::LookupPluginAutomationOperation(
             bcode_ipc::PluginAutomationOperationLookupRequest { session_id, .. },
         )
+        | Request::SetPluginAutomationHold(bcode_ipc::PluginAutomationHoldRequest {
+            session_id,
+            ..
+        })
         | Request::ListRuntimeWork { session_id }
         | Request::RuntimeWorkHistory { session_id, .. }
         | Request::SubscribeRuntimeWork { session_id }
@@ -2122,6 +2131,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::PluginAutomationSnapshot(_) => "plugin_automation_snapshot",
         Request::SubmitPluginAutomationTurn(_) => "submit_plugin_automation_turn",
         Request::LookupPluginAutomationOperation(_) => "lookup_plugin_automation_operation",
+        Request::SetPluginAutomationHold(_) => "set_plugin_automation_hold",
         Request::UpdateClientRuntimeContext { .. } => "update_client_runtime_context",
         Request::ChangeSessionWorkingDirectory { .. } => "change_session_working_directory",
         Request::ListWorktrees(_) => "list_worktrees",
@@ -2319,6 +2329,9 @@ async fn handle_request_inner(
         }
         Request::LookupPluginAutomationOperation(request) => {
             handle_lookup_plugin_automation_operation(request_id, state, writer, request).await
+        }
+        Request::SetPluginAutomationHold(request) => {
+            handle_set_plugin_automation_hold(request_id, state, writer, request).await
         }
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
@@ -2665,7 +2678,8 @@ async fn handle_agent_permission_plugin_request(
         | Request::RecordRalphLifecycle(_)
         | Request::PluginAutomationSnapshot(_)
         | Request::SubmitPluginAutomationTurn(_)
-        | Request::LookupPluginAutomationOperation(_) => {
+        | Request::LookupPluginAutomationOperation(_)
+        | Request::SetPluginAutomationHold(_) => {
             unreachable!("primary request routed to primary handler")
         }
         _ => unreachable!("primary request routed to agent/permission/plugin handler"),
@@ -6398,7 +6412,6 @@ async fn run_session_runtime(
                 turn_id,
                 completion,
             } => {
-                plugin_automation_active.store(true, Ordering::Release);
                 Box::pin(process_plugin_automation_command(
                     &state,
                     &mut permit,
@@ -6414,9 +6427,9 @@ async fn run_session_runtime(
                     *user_event,
                     turn_id,
                     completion,
+                    plugin_automation_active.as_ref(),
                 ))
                 .await;
-                plugin_automation_active.store(false, Ordering::Release);
             }
             FollowupCommand::CompactSession {
                 client_id,
@@ -6870,6 +6883,55 @@ async fn process_plugin_automation_command(
     user_event: bcode_session_models::SessionEvent,
     turn_id: String,
     completion_sender: oneshot::Sender<ModelTurnCompletion>,
+    plugin_automation_active: &std::sync::atomic::AtomicBool,
+) {
+    plugin_automation_active.store(true, Ordering::Release);
+    state
+        .plugin_automation_policies
+        .lock()
+        .await
+        .insert(permit.session_id(), request.execution_policy);
+    Box::pin(process_plugin_automation_command_inner(
+        state,
+        permit,
+        phase,
+        followup_commands,
+        steering_commands,
+        cancel_commands,
+        queued_followups,
+        current_turn,
+        client_id,
+        runtime_context,
+        request,
+        user_event,
+        turn_id,
+        completion_sender,
+    ))
+    .await;
+    state
+        .plugin_automation_policies
+        .lock()
+        .await
+        .remove(&permit.session_id());
+    plugin_automation_active.store(false, Ordering::Release);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_plugin_automation_command_inner(
+    state: &ServerState,
+    permit: &mut SessionTurnPermit,
+    phase: Arc<Mutex<SessionRuntimePhase>>,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
+    queued_followups: &AtomicUsize,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+    client_id: ClientId,
+    runtime_context: Option<ClientRuntimeContext>,
+    request: bcode_ipc::PluginAutomationTurnRequest,
+    user_event: bcode_session_models::SessionEvent,
+    turn_id: String,
+    completion_sender: oneshot::Sender<ModelTurnCompletion>,
 ) {
     set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
     suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
@@ -7277,6 +7339,47 @@ async fn lookup_plugin_automation_operation(
     ))
 }
 
+async fn handle_set_plugin_automation_hold(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: bcode_ipc::PluginAutomationHoldRequest,
+) -> Result<(), ServerError> {
+    state.sessions.session_summary(request.session_id).await?;
+    if request.holder_id.trim().is_empty() {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "invalid_automation_hold",
+                "automation hold holder_id must not be empty",
+            )),
+        )
+        .await;
+    }
+    let mut holds = state.plugin_automation_holds.lock().await;
+    let session_holds = holds.entry(request.session_id).or_default();
+    if request.held {
+        session_holds.insert(request.holder_id);
+    } else {
+        session_holds.remove(&request.holder_id);
+    }
+    let active_holds = usize_to_u32_saturating(session_holds.len());
+    let held = active_holds > 0;
+    if !held {
+        holds.remove(&request.session_id);
+    }
+    drop(holds);
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PluginAutomationHold {
+            response: bcode_ipc::PluginAutomationHoldResponse { held, active_holds },
+        }),
+    )
+    .await
+}
+
 async fn handle_plugin_automation_snapshot(
     request_id: u64,
     state: &Arc<ServerState>,
@@ -7293,7 +7396,12 @@ async fn handle_plugin_automation_snapshot(
         ),
         session_busy: handle.phase.lock().await.has_active_work(),
         plugin_automation_active: handle.plugin_automation_active.load(Ordering::Acquire),
-        automation_held: false,
+        automation_held: state
+            .plugin_automation_holds
+            .lock()
+            .await
+            .get(&request.session_id)
+            .is_some_and(|holds| !holds.is_empty()),
     };
     send_response(
         writer,
@@ -7339,6 +7447,22 @@ async fn handle_submit_plugin_automation_turn(
             request_id,
             Response::Ok(ResponsePayload::PluginAutomationTurn {
                 result: bcode_ipc::PluginAutomationTurnDisposition::AlreadyAccepted { operation },
+            }),
+        )
+        .await;
+    }
+    if state
+        .plugin_automation_holds
+        .lock()
+        .await
+        .get(&request.session_id)
+        .is_some_and(|holds| !holds.is_empty())
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::PluginAutomationTurn {
+                result: bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld,
             }),
         )
         .await;
@@ -12858,7 +12982,7 @@ async fn prepare_static_model_turn_context(
     let enabled_tools = agent_context
         .as_ref()
         .and_then(|context| context.enabled_tools.clone());
-    let tools = collect_model_tools(state, enabled_tools).await;
+    let tools = collect_model_tools(state, session_id, enabled_tools).await;
     Ok(StaticModelTurnContext {
         system_prompt,
         system_messages,
@@ -14106,14 +14230,30 @@ fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
     }
 }
 
+fn automation_policy_allows_tool(
+    policy: Option<bcode_ipc::PluginAutomationExecutionPolicy>,
+    side_effect: ToolSideEffect,
+) -> bool {
+    policy != Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection)
+        || side_effect == ToolSideEffect::ReadOnly
+}
+
 async fn collect_model_tools(
     state: &ServerState,
+    session_id: SessionId,
     enabled_tools: Option<Vec<String>>,
 ) -> Vec<bcode_model::ToolDefinition> {
     let enabled_tools = enabled_tools.map(|tools| tools.into_iter().collect::<BTreeSet<_>>());
+    let policy = state
+        .plugin_automation_policies
+        .lock()
+        .await
+        .get(&session_id)
+        .copied();
     collect_tool_definitions(state)
         .await
         .into_iter()
+        .filter(|tool| automation_policy_allows_tool(policy, tool.side_effect))
         .filter(|tool| {
             enabled_tools
                 .as_ref()
@@ -14220,6 +14360,28 @@ async fn execute_model_tool_batch(
             return false;
         }
         let provider = find_tool_provider(state, &call.name).await.ok().flatten();
+        let policy = state
+            .plugin_automation_policies
+            .lock()
+            .await
+            .get(&session_id)
+            .copied();
+        if policy == Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection)
+            && !provider.as_ref().is_some_and(|(_, definition)| {
+                automation_policy_allows_tool(policy, definition.side_effect)
+            })
+        {
+            let result = ToolFinishedEventInput {
+                tool_call_id: call.id,
+                result: "tool denied by read-only inspection policy".to_owned(),
+                is_error: true,
+                content: Vec::new(),
+                output: None,
+                semantic_result: None,
+            };
+            append_tool_finished_event(state, session_id, result).await;
+            continue;
+        }
         let parallel = state.tool_execution.parallel
             && !active_skills
             && provider.as_ref().is_some_and(|(_, definition)| {
@@ -23315,6 +23477,31 @@ mod tests {
 
         finish_current_turn(&context).await;
         assert!(current_turn.lock().await.is_none());
+    }
+
+    #[test]
+    fn read_only_automation_policy_allows_only_declared_read_only_tools() {
+        let read_only = Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection);
+        assert!(automation_policy_allows_tool(
+            read_only,
+            ToolSideEffect::ReadOnly
+        ));
+        assert!(!automation_policy_allows_tool(
+            read_only,
+            ToolSideEffect::WriteFiles
+        ));
+        assert!(!automation_policy_allows_tool(
+            read_only,
+            ToolSideEffect::ExecuteProcess
+        ));
+        assert!(automation_policy_allows_tool(
+            Some(bcode_ipc::PluginAutomationExecutionPolicy::Normal),
+            ToolSideEffect::WriteFiles
+        ));
+        assert!(automation_policy_allows_tool(
+            None,
+            ToolSideEffect::ExecuteProcess
+        ));
     }
 
     #[test]

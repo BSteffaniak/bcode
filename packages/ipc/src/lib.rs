@@ -435,6 +435,8 @@ pub enum Request {
     SubmitPluginAutomationTurn(PluginAutomationTurnRequest),
     /// Look up a previously submitted plugin automation operation.
     LookupPluginAutomationOperation(PluginAutomationOperationLookupRequest),
+    /// Acquire or release one generic interactive automation hold.
+    SetPluginAutomationHold(PluginAutomationHoldRequest),
 }
 
 /// Server stop request policy.
@@ -616,6 +618,22 @@ pub enum PluginAutomationTurnDisposition {
     },
     SessionBusy,
     AutomationHeld,
+}
+
+/// Request to acquire or release a generic interactive automation hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationHoldRequest {
+    pub session_id: SessionId,
+    /// Stable holder identity; repeated acquire/release operations are idempotent.
+    pub holder_id: String,
+    pub held: bool,
+}
+
+/// Result of updating one generic interactive automation hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationHoldResponse {
+    pub held: bool,
+    pub active_holds: u32,
 }
 
 /// Server process identity and lifecycle metadata.
@@ -1322,6 +1340,9 @@ pub enum ResponsePayload {
     PluginAutomationOperation {
         #[serde(default)]
         operation: Option<PluginAutomationOperation>,
+    },
+    PluginAutomationHold {
+        response: PluginAutomationHoldResponse,
     },
 }
 

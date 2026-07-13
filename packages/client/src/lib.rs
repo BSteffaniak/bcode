@@ -1434,6 +1434,24 @@ impl BcodeClient {
         }
     }
 
+    /// Update one generic plugin automation hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn set_plugin_automation_hold(
+        &self,
+        request: bcode_ipc::PluginAutomationHoldRequest,
+    ) -> Result<bcode_ipc::PluginAutomationHoldResponse, ClientError> {
+        match self
+            .send_request(Request::SetPluginAutomationHold(request))
+            .await?
+        {
+            ResponsePayload::PluginAutomationHold { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Send a user message to a session.
     ///
     /// # Errors
