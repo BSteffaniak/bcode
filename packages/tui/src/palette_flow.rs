@@ -110,6 +110,34 @@ async fn execute_palette_command<W: Write>(
     }
 }
 
+pub async fn execute_plugin_slash_command<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    command: CommandAction,
+    arguments: String,
+) -> Result<(), TuiError> {
+    match command {
+        CommandAction::Plugin {
+            plugin_id,
+            command_id,
+        } => {
+            dispatch_plugin_command_with_arguments(
+                io,
+                services,
+                chat,
+                plugin_id,
+                command_id,
+                Some(arguments),
+            )
+            .await
+        }
+        CommandAction::Host { route } => {
+            dispatch_host_palette_route(io, services, chat, &route).await
+        }
+    }
+}
+
 async fn dispatch_plugin_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
@@ -117,12 +145,26 @@ async fn dispatch_plugin_command<W: Write>(
     plugin_id: String,
     command_id: String,
 ) -> Result<(), TuiError> {
+    dispatch_plugin_command_with_arguments(io, services, chat, plugin_id, command_id, None).await
+}
+
+async fn dispatch_plugin_command_with_arguments<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    plugin_id: String,
+    command_id: String,
+    arguments: Option<String>,
+) -> Result<(), TuiError> {
     let mut args = BTreeMap::new();
     if let Some(cwd) = chat.app.working_directory() {
         args.insert("cwd".to_string(), cwd.display().to_string());
     }
     if let Some(session_id) = chat.app.session_id() {
         args.insert("session_id".to_string(), session_id.to_string());
+    }
+    if let Some(arguments) = arguments.filter(|value| !value.is_empty()) {
+        args.insert("arguments".to_string(), arguments);
     }
     let payload = serde_json::to_vec(&InvokeCommandRequest { command_id, args })?;
     let response = services

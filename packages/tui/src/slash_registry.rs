@@ -1,6 +1,7 @@
 //! Slash command registry metadata for the TUI.
 
 use bcode_client::BcodeClient;
+use bcode_command::{CommandContribution, CommandSurface};
 use bcode_skill_models::SkillId;
 
 /// Static metadata for a builtin slash command name.
@@ -349,6 +350,8 @@ pub enum SlashResolution {
         skill_id: SkillId,
         arguments: String,
     },
+    /// Command resolved to a plugin-owned slash contribution.
+    PluginCommand(CommandContribution),
     /// Command did not resolve to any known slash command.
     Unknown,
 }
@@ -357,7 +360,10 @@ impl SlashResolution {
     /// Return true when the resolution is a known slash command.
     #[must_use]
     pub const fn is_known(&self) -> bool {
-        matches!(self, Self::Builtin(_) | Self::SkillAlias { .. })
+        matches!(
+            self,
+            Self::Builtin(_) | Self::SkillAlias { .. } | Self::PluginCommand(_)
+        )
     }
 
     /// Return true when the command can run before a persisted session exists.
@@ -366,7 +372,7 @@ impl SlashResolution {
         match self {
             Self::Builtin(command) => command.draft_safe(),
             Self::SkillAlias { .. } => true,
-            Self::Unknown => false,
+            Self::PluginCommand(_) | Self::Unknown => false,
         }
     }
 }
@@ -435,6 +441,16 @@ pub async fn resolve(
     };
     if let Some(builtin) = builtin_command(command) {
         return Ok(SlashResolution::Builtin(builtin));
+    }
+    let contributions = client.plugin_contributions().await?;
+    if let Some(contribution) = contributions
+        .command_contributions
+        .into_iter()
+        .find(|candidate| {
+            candidate.supports_surface(&CommandSurface::Slash) && candidate.id == command
+        })
+    {
+        return Ok(SlashResolution::PluginCommand(contribution));
     }
     let skills = client.list_skills().await?;
     let Some(skill) = skills

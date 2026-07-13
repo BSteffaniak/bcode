@@ -1,0 +1,24 @@
+id      = "bcode.loop"
+name    = "Bcode Loop Plugin"
+version = "0.0.1"
+
+[[services]]
+class        = "interactive"
+description  = "Prompt loop commands"
+interface_id = "bcode.command/v1"
+name         = "Loop Commands"
+
+[[tui_surfaces]]
+description = "Configure and start a deterministic prompt loop"
+kind        = "loop.start"
+title       = "Start Loop"
+
+[concurrency]
+max  = 1
+type = "limited"
+
+[runtime]
+abi_version  = 1
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_loop_plugin.dylib"
+type         = "native"

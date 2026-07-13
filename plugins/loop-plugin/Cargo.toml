@@ -1,0 +1,32 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Deterministic prompt loop plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "automation", "loop", "plugin"]
+license     = { workspace = true }
+name        = "bcode_loop_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_client         = { workspace = true }
+bcode_command        = { workspace = true }
+bcode_ipc            = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
+bcode_session_models = { workspace = true }
+bmux_keyboard        = { workspace = true }
+bmux_tui             = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+tokio                = { workspace = true, features = ["time"] }
+uuid                 = { workspace = true, features = ["v4"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

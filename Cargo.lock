@@ -1438,6 +1438,7 @@ dependencies = [
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_github_review_publisher_plugin",
+ "bcode_loop_plugin",
  "bcode_metrics_plugin",
  "bcode_model_plugin",
  "bcode_ocr_plugin",
@@ -1794,6 +1795,23 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "bcode_loop_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_client",
+ "bcode_command",
+ "bcode_ipc",
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bmux_keyboard",
+ "bmux_tui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

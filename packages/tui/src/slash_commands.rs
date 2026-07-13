@@ -12,6 +12,11 @@ use std::path::PathBuf;
 pub enum SlashCommandOutcome {
     /// Command was handled in-place.
     Handled(String),
+    /// Execute a plugin-owned slash command.
+    PluginCommand {
+        action: bcode_command::CommandAction,
+        arguments: String,
+    },
     /// Open timeline message browser.
     OpenTimeline,
     /// Switch to a new unpersisted draft session.
@@ -596,6 +601,12 @@ pub async fn execute_resolved(
             skill_id,
             arguments,
         }),
+        slash_registry::SlashResolution::PluginCommand(contribution) => {
+            Ok(SlashCommandOutcome::PluginCommand {
+                action: contribution.action,
+                arguments: parts.iter().skip(1).copied().collect::<Vec<_>>().join(" "),
+            })
+        }
         slash_registry::SlashResolution::Unknown => {
             Ok(SlashCommandOutcome::Unknown(message.to_owned()))
         }

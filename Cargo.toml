@@ -8,6 +8,7 @@ members = [
     "plugins/eval-plugin",
     "plugins/metrics-plugin",
     "plugins/ralph-plugin",
+    "plugins/loop-plugin",
     "plugins/github-review-publisher-plugin",
     "plugins/document-plugin",
     "plugins/ocr-plugin",
@@ -119,6 +120,7 @@ bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-f
 bcode_git_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/git-plugin" }
 bcode_github_review_publisher_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/github-review-publisher-plugin" }
 bcode_ipc                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
+bcode_loop_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/loop-plugin" }
 bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/markdown-render" }
 bcode_metrics                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/metrics" }
 bcode_metrics_plugin                    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/metrics-plugin" }

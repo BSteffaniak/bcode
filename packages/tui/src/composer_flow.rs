@@ -165,6 +165,13 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             apply_draft_agent_selection(chat, agent_id, &agent_name, agent_accent);
         }
+        slash_commands::SlashCommandOutcome::PluginCommand { action, arguments } => {
+            chat.app.clear_pending_submission(message);
+            super::palette_flow::execute_plugin_slash_command(
+                io, services, chat, action, arguments,
+            )
+            .await?;
+        }
         slash_commands::SlashCommandOutcome::PickSession => {
             chat.app.clear_pending_submission(message);
             match session_flow::pick_session(io, services, chat).await? {
