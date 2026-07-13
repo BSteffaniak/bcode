@@ -13,9 +13,10 @@
 
 pub mod recording;
 #[cfg(feature = "static-bundled")]
-mod shell_run_tui;
+pub mod shell_run_tui;
 mod terminal_clean;
 
+use base64::Engine as _;
 use bcode_config::{
     ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
     ShellToolOutputConfig, ShellToolPreludeGateTarget, default_config_paths_from_with_environment,
@@ -36,6 +37,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -605,12 +607,26 @@ enum ShellInvocationAction {
     Resize { columns: u16, rows: u16 },
 }
 
+#[derive(Debug, Clone)]
+enum ShellLiveFrame {
+    Output(Vec<u8>),
+    Resize { columns: u16, rows: u16 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShellAppliedResize {
+    columns: u16,
+    rows: u16,
+}
+
 struct ShellInvocationActionReader<'a> {
     path: &'a Path,
     offset: u64,
     pending: String,
     started: Instant,
     recording: Option<recording::AsyncShellRecordingResizeSender>,
+    applied_resizes: Arc<StdMutex<Vec<ShellAppliedResize>>>,
+    live_frames: Arc<StdMutex<Vec<ShellLiveFrame>>>,
 }
 
 impl ShellInvocationActionReader<'_> {
@@ -653,6 +669,7 @@ impl ShellInvocationActionReader<'_> {
                         pixel_height: 0,
                     };
                     if let Some(recording) = &self.recording {
+                        let live_frames = Arc::clone(&self.live_frames);
                         recording
                             .write_resize_with(
                                 u64::try_from(self.started.elapsed().as_micros())
@@ -662,13 +679,29 @@ impl ShellInvocationActionReader<'_> {
                                 || {
                                     master
                                         .resize(size)
-                                        .map_err(|error| io::Error::other(error.to_string()))
+                                        .map_err(|error| io::Error::other(error.to_string()))?;
+                                    live_frames
+                                        .lock()
+                                        .map_err(|_| {
+                                            io::Error::other("shell live frame state poisoned")
+                                        })?
+                                        .push(ShellLiveFrame::Resize { columns, rows });
+                                    Ok(())
                                 },
                             )
                             .map_err(|error| error.to_string())?;
                     } else {
+                        let mut live_frames = self
+                            .live_frames
+                            .lock()
+                            .map_err(|_| "shell live frame state poisoned".to_owned())?;
                         master.resize(size).map_err(|error| error.to_string())?;
+                        live_frames.push(ShellLiveFrame::Resize { columns, rows });
                     }
+                    self.applied_resizes
+                        .lock()
+                        .map_err(|_| "shell applied resize state poisoned".to_owned())?
+                        .push(ShellAppliedResize { columns, rows });
                 }
             }
         }
@@ -848,9 +881,11 @@ fn run_terminal_shell_command_inner(
     let recording_path = recording_artifact_path(paths.artifact_dir, tool_call_id)?;
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let (recording_ready_tx, recording_ready_rx) = std::sync::mpsc::channel();
+    let live_frames = Arc::new(StdMutex::new(Vec::new()));
     let started = Instant::now();
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
+        let live_frames = Arc::clone(&live_frames);
         move || {
             read_limited_streaming(
                 &mut reader,
@@ -863,6 +898,7 @@ fn run_terminal_shell_command_inner(
                     rows,
                     timeout_ms: Some(timeout_ms),
                     prelude_markers,
+                    live_frames: Some(live_frames),
                 },
                 TerminalStreamPaths {
                     clean: clean_artifact_path,
@@ -878,6 +914,7 @@ fn run_terminal_shell_command_inner(
     let recording = recording_ready_rx
         .recv()
         .map_err(|_| "recording reader did not initialize".to_owned())?;
+    let applied_resizes = Arc::new(StdMutex::new(Vec::new()));
     let mut control = paths
         .invocation_action_path
         .map(|path| ShellInvocationActionReader {
@@ -886,6 +923,8 @@ fn run_terminal_shell_command_inner(
             pending: String::new(),
             started,
             recording,
+            applied_resizes: Arc::clone(&applied_resizes),
+            live_frames: Arc::clone(&live_frames),
         });
     let status = wait_for_terminal_shell_status(
         &mut child,
@@ -900,6 +939,11 @@ fn run_terminal_shell_command_inner(
     drop(pair.master);
     let mut stream_output = join_reader(reader_thread)?;
     let recording_ref = finalize_recording(&mut stream_output, started, &status, columns, rows)?;
+    let (final_columns, final_rows) = applied_resizes
+        .lock()
+        .map_err(|_| "shell applied resize state poisoned".to_owned())?
+        .last()
+        .map_or((columns, rows), |resize| (resize.columns, resize.rows));
     terminal_shell_response(
         tool_call_id,
         TerminalShellResponseInput {
@@ -909,8 +953,8 @@ fn run_terminal_shell_command_inner(
             started,
             stream_output: &stream_output,
             recording_ref,
-            columns,
-            rows,
+            columns: final_columns,
+            rows: final_rows,
             format_commands,
         },
     )
@@ -1068,6 +1112,7 @@ struct ShellVisualStreamContext<'a> {
     rows: u16,
     timeout_ms: Option<u64>,
     prelude_markers: PreludeGateMarkers,
+    live_frames: Option<Arc<StdMutex<Vec<ShellLiveFrame>>>>,
 }
 
 const PRELUDE_GATE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
@@ -1262,7 +1307,7 @@ where
     );
     let mut buffer = [0_u8; STREAM_READ_BUFFER_BYTES];
     let mut sequence = 0_u64;
-    let mut visual_output = String::new();
+    let mut visual_output = Vec::new();
     let recording_started = Instant::now();
     let mut live_gate = PreludeGate::new(visual_context.prelude_markers.live.clone());
     let mut replay_gate = PreludeGate::new(visual_context.prelude_markers.replay.clone());
@@ -1285,6 +1330,34 @@ where
         let live = live_gate.write(chunk);
         let replay_chunk = replay_gate.write(chunk);
         let clean = clean_gate.write(chunk);
+        if let Some(writer) = &mut recording_writer {
+            let live_frames = visual_context.live_frames.as_ref().map(Arc::clone);
+            let queued = writer.try_write_output_with(
+                u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                chunk,
+                Some(&live),
+                || {
+                    if let Some(live_frames) = live_frames
+                        && let Ok(mut frames) = live_frames.lock()
+                        && !live.is_empty()
+                    {
+                        frames.push(ShellLiveFrame::Output(live.clone()));
+                    }
+                },
+            );
+            if !queued
+                && let Some(live_frames) = &visual_context.live_frames
+                && let Ok(mut frames) = live_frames.lock()
+                && !live.is_empty()
+            {
+                frames.push(ShellLiveFrame::Output(live.clone()));
+            }
+        } else if let Some(live_frames) = &visual_context.live_frames
+            && let Ok(mut frames) = live_frames.lock()
+            && !live.is_empty()
+        {
+            frames.push(ShellLiveFrame::Output(live.clone()));
+        }
         write_stream_outputs(
             StreamOutputs {
                 live: &live,
@@ -1297,12 +1370,6 @@ where
             &mut visual_output,
             emit.with_sequence(sequence),
         )?;
-        if let Some(writer) = &mut recording_writer {
-            let _ = writer.try_write_output(
-                u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                chunk,
-            );
-        }
     }
     sequence = sequence.saturating_add(1);
     let live = live_gate.finish();
@@ -1320,6 +1387,27 @@ where
         &mut visual_output,
         emit.with_sequence(sequence),
     )?;
+    if !live.is_empty() {
+        if let Some(writer) = &mut recording_writer {
+            let live_frames = visual_context.live_frames.as_ref().map(Arc::clone);
+            let _ = writer.try_write_output_with(
+                u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                &[],
+                Some(&live),
+                || {
+                    if let Some(live_frames) = live_frames
+                        && let Ok(mut frames) = live_frames.lock()
+                    {
+                        frames.push(ShellLiveFrame::Output(live.clone()));
+                    }
+                },
+            );
+        } else if let Some(live_frames) = &visual_context.live_frames
+            && let Ok(mut frames) = live_frames.lock()
+        {
+            frames.push(ShellLiveFrame::Output(live));
+        }
+    }
     let prelude_suppressed = live_gate.suppressed_prelude()
         || replay_gate.suppressed_prelude()
         || clean_gate.suppressed_prelude();
@@ -1383,17 +1471,17 @@ fn write_stream_outputs<W: Write>(
     replay: &mut RetainedStream,
     replay_writer: &mut dyn Write,
     cleaner: &mut terminal_clean::TerminalCleanWriter<&mut W>,
-    visual_output: &mut String,
+    visual_output: &mut Vec<u8>,
     emit: SequencedStreamChunkEmit<'_, '_>,
 ) -> Result<(), String> {
     if !outputs.live.is_empty() {
-        visual_output.push_str(&String::from_utf8_lossy(outputs.live));
+        visual_output.extend_from_slice(outputs.live);
         emit_tool_output_delta(
             emit.events,
             emit.tool_call_id,
             emit.visual_context,
             emit.sequence,
-            visual_output.as_bytes(),
+            visual_output,
         );
     }
     if !outputs.replay.is_empty() {
@@ -1486,6 +1574,28 @@ fn current_unix_millis() -> u64 {
         })
 }
 
+fn shell_live_frames_json(frames: &StdMutex<Vec<ShellLiveFrame>>) -> serde_json::Value {
+    let Ok(frames) = frames.lock() else {
+        return serde_json::Value::Array(Vec::new());
+    };
+    serde_json::Value::Array(
+        frames
+            .iter()
+            .map(|frame| match frame {
+                ShellLiveFrame::Output(bytes) => json!({
+                    "type": "output",
+                    "bytes_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }),
+                ShellLiveFrame::Resize { columns, rows } => json!({
+                    "type": "resize",
+                    "columns": columns,
+                    "rows": rows,
+                }),
+            })
+            .collect(),
+    )
+}
+
 fn emit_tool_output_delta(
     events: ServiceEventEmitter,
     tool_call_id: &str,
@@ -1494,6 +1604,10 @@ fn emit_tool_output_delta(
     bytes: &[u8],
 ) {
     let text = String::from_utf8_lossy(bytes).into_owned();
+    let live_frames = visual_context.live_frames.as_deref().map_or_else(
+        || serde_json::Value::Array(Vec::new()),
+        shell_live_frames_json,
+    );
     emit_tool_stream_event(
         events,
         &ToolInvocationStreamEvent::VisualUpdate {
@@ -1510,6 +1624,7 @@ fn emit_tool_output_delta(
                     "arguments": visual_context.arguments,
                     "_bcode_runtime": {
                         "output": text,
+                        "frames": live_frames,
                         "columns": visual_context.columns,
                         "rows": visual_context.rows,
                         "timeout_ms": visual_context.timeout_ms,
@@ -1930,6 +2045,40 @@ mod tests {
         assert!(response.output.contains("\"exit_code\":1"));
     }
 
+    #[cfg(feature = "static-bundled")]
+    #[test]
+    fn live_frame_payload_preserves_non_utf8_bytes_and_order() {
+        let frames = StdMutex::new(vec![
+            ShellLiveFrame::Output(vec![0xff, b'A']),
+            ShellLiveFrame::Resize {
+                columns: 90,
+                rows: 35,
+            },
+            ShellLiveFrame::Output(vec![0xc3]),
+        ]);
+        let runtime = json!({"frames": shell_live_frames_json(&frames)});
+        assert_eq!(
+            crate::shell_run_tui::decode_live_frames(&runtime),
+            Some(vec![
+                (
+                    1,
+                    crate::shell_run_tui::TerminalReplayFrame::Output(vec![0xff, b'A'])
+                ),
+                (
+                    2,
+                    crate::shell_run_tui::TerminalReplayFrame::Resize {
+                        columns: 90,
+                        rows: 35,
+                    },
+                ),
+                (
+                    3,
+                    crate::shell_run_tui::TerminalReplayFrame::Output(vec![0xc3])
+                ),
+            ])
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn active_terminal_control_resize_reaches_pty_and_recording() {
@@ -1939,11 +2088,26 @@ mod tests {
         let resize_path = invocation_action_path.clone();
         let resize = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(40));
-            std::fs::write(
-                resize_path,
-                b"{\"type\":\"resize\",\"columns\":100,\"rows\":30}\n{\"type\":\"resize\",\"columns\":132,\"rows\":40}\n",
-            )
-            .expect("resize control");
+            let actions = [
+                bcode_tool::PluginInvocationAction {
+                    producer_plugin_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.invocation-action".to_owned(),
+                    schema_version: 1,
+                    payload: json!({"type":"resize","columns":100,"rows":30}),
+                },
+                bcode_tool::PluginInvocationAction {
+                    producer_plugin_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.invocation-action".to_owned(),
+                    schema_version: 1,
+                    payload: json!({"type":"resize","columns":132,"rows":40}),
+                },
+            ];
+            let encoded = actions
+                .iter()
+                .map(|action| serde_json::to_string(action).expect("encode resize action"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(resize_path, format!("{encoded}\n")).expect("resize control");
         });
         let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
@@ -1991,6 +2155,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(recorded_resizes, vec![(100, 30), (132, 40)]);
+        let final_output: serde_json::Value =
+            serde_json::from_str(&response.output).expect("terminal response JSON");
+        assert_eq!(final_output["columns"], 132);
+        assert_eq!(final_output["rows"], 40);
     }
 
     #[cfg(unix)]
@@ -2467,6 +2635,7 @@ mod tests {
             rows: 30,
             timeout_ms: None,
             prelude_markers: PreludeGateMarkers::default(),
+            live_frames: None,
         };
         let mut baseline = Vec::with_capacity(ROUNDS);
         let mut recorded = Vec::with_capacity(ROUNDS);
@@ -2617,6 +2786,7 @@ mod tests {
             rows: 24,
             timeout_ms: None,
             prelude_markers: PreludeGateMarkers::default(),
+            live_frames: None,
         };
         let baseline_events = Mutex::new(Vec::<Vec<u8>>::new());
         let baseline_emitter = ServiceEventEmitter::new(
@@ -2665,6 +2835,50 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "static-bundled")]
+    #[test]
+    fn authoritative_recording_replays_the_same_prelude_filtered_bytes_as_live() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("filtered.bcsr");
+        let mut output = read_limited_streaming(
+            std::io::Cursor::new(b"hidden prelude\n__MARK__\nvisible\n"),
+            ServiceEventEmitter::default(),
+            "call",
+            &ShellVisualStreamContext {
+                arguments: &json!({}),
+                stream: ToolOutputStream::Pty,
+                columns: 80,
+                rows: 24,
+                timeout_ms: None,
+                prelude_markers: PreludeGateMarkers {
+                    live: vec!["__MARK__".to_owned()],
+                    replay: vec!["__MARK__".to_owned()],
+                    clean: vec!["__MARK__".to_owned()],
+                },
+                live_frames: None,
+            },
+            TerminalStreamPaths {
+                clean: None,
+                raw: None,
+                replay: None,
+                recording: Some(path.clone()),
+                recording_ready: None,
+            },
+        )
+        .expect("stream output");
+        output
+            .recording_writer
+            .take()
+            .expect("recording writer")
+            .finish(u64::MAX, Some(0), None, false, false)
+            .expect("finish recording");
+        let (summary, frames) = recording::read_recording(&path).expect("read recording");
+        let replay = crate::shell_run_tui::decode_recording_replay(&summary, frames);
+
+        assert_eq!(output.replay.text, "visible\n");
+        assert_eq!(replay.output, "visible\n");
+    }
+
     #[test]
     fn prelude_gate_config_can_keep_prelude_in_clean_output() {
         let output = read_limited_streaming(
@@ -2682,6 +2896,7 @@ mod tests {
                     replay: vec!["__MARK__".to_string()],
                     clean: Vec::new(),
                 },
+                live_frames: None,
             },
             TerminalStreamPaths {
                 clean: None,
@@ -2714,6 +2929,7 @@ mod tests {
                     replay: Vec::new(),
                     clean: vec!["__MARK__".to_string()],
                 },
+                live_frames: None,
             },
             TerminalStreamPaths {
                 clean: None,

@@ -23,6 +23,7 @@ const FRAME_OUTPUT: u8 = 1;
 const FRAME_RESIZE: u8 = 2;
 const FRAME_FINISH: u8 = 3;
 const FRAME_START: u8 = 4;
+const FRAME_REPLAY_OUTPUT: u8 = 5;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const ASYNC_RECORDING_QUEUE_CAPACITY: usize = 256;
 
@@ -30,6 +31,7 @@ enum AsyncRecordingCommand {
     Output {
         offset_micros: u64,
         bytes: Vec<u8>,
+        replay_bytes: Option<Vec<u8>>,
     },
     Resize {
         offset_micros: u64,
@@ -133,11 +135,18 @@ impl AsyncShellRecordingWriter {
     /// Returns `false` if ordering is contended or the bounded writer queue cannot accept the
     /// frame. This method never waits for recording ordering or filesystem I/O. Once false is
     /// returned, finalization fails explicitly and no authoritative recording is published.
-    pub fn try_write_output(&mut self, offset_micros: u64, bytes: &[u8]) -> bool {
+    pub fn try_write_output_with(
+        &mut self,
+        offset_micros: u64,
+        bytes: &[u8],
+        replay_bytes: Option<&[u8]>,
+        queued: impl FnOnce(),
+    ) -> bool {
         if self.failed.load(Ordering::SeqCst) {
             return false;
         }
         let bytes = bytes.to_vec();
+        let replay_bytes = replay_bytes.map(<[u8]>::to_vec);
         let Ok(_sequence) = self.sequence.try_lock() else {
             self.failed.store(true, Ordering::SeqCst);
             return false;
@@ -147,13 +156,20 @@ impl AsyncShellRecordingWriter {
             .try_send(AsyncRecordingCommand::Output {
                 offset_micros,
                 bytes,
+                replay_bytes,
             })
             .is_err()
         {
             self.failed.store(true, Ordering::SeqCst);
             return false;
         }
+        queued();
         true
+    }
+
+    /// Queue exact PTY bytes without waiting for filesystem I/O.
+    pub fn try_write_output(&mut self, offset_micros: u64, bytes: &[u8]) -> bool {
+        self.try_write_output_with(offset_micros, bytes, None, || {})
     }
 
     /// Queue a resize without waiting for filesystem I/O.
@@ -232,11 +248,17 @@ fn run_async_recording_writer(
             AsyncRecordingCommand::Output {
                 offset_micros,
                 bytes,
+                replay_bytes,
             } => {
-                if failure.is_none()
-                    && let Err(error) = writer.write_output(offset_micros, &bytes)
-                {
-                    failure = Some(error);
+                if failure.is_none() {
+                    if let Err(error) = writer.write_output(offset_micros, &bytes) {
+                        failure = Some(error);
+                    } else if let Some(replay_bytes) = replay_bytes
+                        && !replay_bytes.is_empty()
+                        && let Err(error) = writer.write_replay_output(offset_micros, &replay_bytes)
+                    {
+                        failure = Some(error);
+                    }
                 }
             }
             AsyncRecordingCommand::Resize {
@@ -284,6 +306,8 @@ pub enum ShellRecordingFrame {
     Start { offset_micros: u64 },
     /// Exact PTY bytes emitted at the given monotonic offset.
     Output { offset_micros: u64, bytes: Vec<u8> },
+    /// Bytes from the presentation stream consumed by live rendering.
+    ReplayOutput { offset_micros: u64, bytes: Vec<u8> },
     /// Terminal dimensions changed at the given monotonic offset.
     Resize {
         offset_micros: u64,
@@ -384,6 +408,18 @@ impl ShellRecordingWriter {
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         self.checksum.update(bytes);
         Ok(())
+    }
+
+    /// Append bytes from the presentation stream consumed by live rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame cannot be encoded or written.
+    pub fn write_replay_output(&mut self, offset_micros: u64, bytes: &[u8]) -> io::Result<()> {
+        let mut payload = Vec::with_capacity(32_usize.saturating_add(bytes.len()));
+        payload.extend_from_slice(&Sha256::digest(bytes));
+        payload.extend_from_slice(bytes);
+        self.write_frame(FRAME_REPLAY_OUTPUT, offset_micros, &payload)
     }
 
     /// Append a resize frame.
@@ -553,6 +589,25 @@ pub fn read_recording(
                 ShellRecordingFrame::Output {
                     offset_micros,
                     bytes: payload,
+                }
+            }
+            FRAME_REPLAY_OUTPUT if version == FORMAT_VERSION => {
+                if payload.len() < 32 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid recording replay-output frame length",
+                    ));
+                }
+                let (expected, bytes) = payload.split_at(32);
+                if Sha256::digest(bytes).as_slice() != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "recording replay-output checksum mismatch",
+                    ));
+                }
+                ShellRecordingFrame::ReplayOutput {
+                    offset_micros,
+                    bytes: bytes.to_vec(),
                 }
             }
             FRAME_RESIZE => {
@@ -894,6 +949,33 @@ mod tests {
             let error = read_recording(&path).expect_err("malformed lifecycle must fail");
             assert!(error.to_string().contains(expected), "{name}: {error}");
         }
+    }
+
+    #[test]
+    fn replay_output_checksum_mismatch_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("replay-checksum.bcsr");
+        let mut writer = ShellRecordingWriter::create(&path, 80, 24).expect("writer");
+        writer.write_output(1, b"raw").expect("raw output");
+        writer
+            .write_replay_output(1, b"visible")
+            .expect("replay output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
+        let mut bytes = fs::read(&path).expect("recording bytes");
+        let frame_offset = 8 + 2 + 2 + 2 + (1 + 8 + 4) + (1 + 8 + 4 + 3);
+        let replay_payload_offset = frame_offset + 1 + 8 + 4;
+        bytes[replay_payload_offset + 32] ^= 0xff;
+        fs::write(&path, bytes).expect("corrupt replay output");
+
+        let error = read_recording(&path).expect_err("replay corruption should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("replay-output checksum mismatch")
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! that may interpret shell artifact schemas and terminal recording references; generic TUI and
 //! transcript code routes opaque plugin visuals without understanding those values.
 
+use base64::Engine as _;
 use bcode_tui_components::terminal_viewer::{
     MAX_INLINE_TERMINAL_ROWS, TerminalViewerInput, TerminalViewerLiveState, TerminalViewerSizing,
     terminal_viewer_rows,
@@ -25,11 +26,23 @@ const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str = "application/x-bcode-terminal-pty
 const SHELL_RECORDING_REF_KEY: &str = "shell_recording";
 const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording";
 
+#[derive(Default)]
+struct LiveTerminalReplay {
+    output: Vec<u8>,
+    frames: Vec<TerminalReplayFrame>,
+    pending_resizes: Vec<TerminalReplayFrame>,
+    last_frame_sequence: u64,
+    initial_columns: u16,
+    initial_rows: u16,
+    columns: u16,
+    rows: u16,
+}
+
 /// Native TUI visual adapter for shell run artifacts.
 #[derive(Default)]
 pub struct ShellRunTuiVisualAdapter {
     live_states: Mutex<BTreeMap<String, TerminalViewerLiveState>>,
-    live_dimensions: Mutex<BTreeMap<String, (u16, u16)>>,
+    live_replays: Mutex<BTreeMap<String, LiveTerminalReplay>>,
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
@@ -71,9 +84,21 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                     .and_then(serde_json::Value::as_str)
             });
         if let Some(key) = key
-            && let Ok(mut dimensions) = self.live_dimensions.lock()
+            && let Ok(mut replays) = self.live_replays.lock()
         {
-            dimensions.insert(key.to_owned(), (size.width, size.height));
+            let replay = replays.entry(key.to_owned()).or_default();
+            if replay.initial_columns == 0 || replay.initial_rows == 0 {
+                let runtime = payload.get("_bcode_runtime").unwrap_or(payload);
+                replay.initial_columns =
+                    payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
+                replay.initial_rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
+            }
+            replay.columns = size.width;
+            replay.rows = size.height;
+            replay.pending_resizes.push(TerminalReplayFrame::Resize {
+                columns: size.width,
+                rows: size.height,
+            });
         }
         Some(bcode_tool::PluginInvocationAction {
             producer_plugin_id: "bcode.shell".to_owned(),
@@ -215,25 +240,38 @@ impl ShellRunTuiVisualAdapter {
                     .and_then(serde_json::Value::as_str)
             })
             .unwrap_or("shell-live-terminal");
-        let (columns, rows) = self
-            .live_dimensions
-            .lock()
-            .ok()
-            .and_then(|dimensions| dimensions.get(key).copied())
-            .unwrap_or_else(|| {
-                (
-                    payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS),
-                    payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS),
-                )
-            });
+        let initial_columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
+        let initial_rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
+        let live_frames = decode_live_frames(runtime);
+        let live_bytes = live_frames.as_deref().map_or_else(
+            || output.as_bytes().to_vec(),
+            |frames| {
+                frames
+                    .iter()
+                    .filter_map(|(_, frame)| match frame {
+                        TerminalReplayFrame::Output(bytes) => Some(bytes.as_slice()),
+                        TerminalReplayFrame::Resize { .. } => None,
+                    })
+                    .flatten()
+                    .copied()
+                    .collect()
+            },
+        );
+        let frames = self.update_live_replay(
+            key,
+            &live_bytes,
+            live_frames.as_deref(),
+            initial_columns,
+            initial_rows,
+        );
         let streaming = runtime
             .get("streaming")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let mut input = TerminalViewerInput {
             output,
-            columns,
-            rows,
+            columns: initial_columns,
+            rows: initial_rows,
             exit_code: payload_exit_code(runtime),
             timed_out: runtime
                 .get("timed_out")
@@ -254,12 +292,78 @@ impl ShellRunTuiVisualAdapter {
         }
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(shell_status_rows(runtime));
-        lines.extend(shell_terminal_frame_rows(
-            input,
-            &[TerminalReplayFrame::Output(output.as_bytes().to_vec())],
-            width,
-        ));
+        lines.extend(shell_terminal_frame_rows(input, &frames, width));
         lines
+    }
+
+    fn update_live_replay(
+        &self,
+        key: &str,
+        output: &[u8],
+        incoming_frames: Option<&[(u64, TerminalReplayFrame)]>,
+        initial_columns: u16,
+        initial_rows: u16,
+    ) -> Vec<TerminalReplayFrame> {
+        let Ok(mut replays) = self.live_replays.lock() else {
+            return vec![TerminalReplayFrame::Output(output.to_vec())];
+        };
+        let replay = replays
+            .entry(key.to_owned())
+            .or_insert_with(|| LiveTerminalReplay {
+                initial_columns,
+                initial_rows,
+                columns: initial_columns,
+                rows: initial_rows,
+                ..LiveTerminalReplay::default()
+            });
+        if replay.initial_columns == 0 || replay.initial_rows == 0 {
+            replay.initial_columns = initial_columns;
+            replay.initial_rows = initial_rows;
+            replay.columns = initial_columns;
+            replay.rows = initial_rows;
+        }
+        if let Some(incoming_frames) = incoming_frames {
+            for (sequence, frame) in incoming_frames {
+                if *sequence <= replay.last_frame_sequence {
+                    continue;
+                }
+                if let TerminalReplayFrame::Resize { columns, rows } = frame {
+                    replay.columns = *columns;
+                    replay.rows = *rows;
+                    if let Some(index) = replay
+                        .pending_resizes
+                        .iter()
+                        .position(|pending| pending == frame)
+                    {
+                        replay.pending_resizes.remove(index);
+                    }
+                }
+                replay.frames.push(frame.clone());
+                replay.last_frame_sequence = *sequence;
+            }
+        } else if output.starts_with(&replay.output) {
+            let appended = &output[replay.output.len()..];
+            if !appended.is_empty() {
+                replay
+                    .frames
+                    .push(TerminalReplayFrame::Output(appended.to_vec()));
+            }
+        } else if output != replay.output {
+            replay.frames.clear();
+            replay.pending_resizes.clear();
+            replay
+                .frames
+                .push(TerminalReplayFrame::Output(output.to_vec()));
+            replay.initial_columns = initial_columns;
+            replay.initial_rows = initial_rows;
+            replay.columns = initial_columns;
+            replay.rows = initial_rows;
+        }
+        replay.output.clear();
+        replay.output.extend_from_slice(output);
+        let mut frames = replay.frames.clone();
+        frames.extend(replay.pending_resizes.iter().cloned());
+        frames
     }
 
     fn live_visible_rows(&self, key: &str, input: TerminalViewerInput<'_>) -> usize {
@@ -444,6 +548,38 @@ const fn argument_style() -> Style {
     Style::new()
 }
 
+pub(crate) fn decode_live_frames(
+    runtime: &serde_json::Value,
+) -> Option<Vec<(u64, TerminalReplayFrame)>> {
+    let frames = runtime.get("frames")?.as_array()?;
+    let mut decoded = Vec::with_capacity(frames.len());
+    for (index, frame) in frames.iter().enumerate() {
+        let sequence = u64::try_from(index).ok()?.saturating_add(1);
+        match frame.get("type").and_then(serde_json::Value::as_str)? {
+            "output" => {
+                let bytes = frame
+                    .get("bytes_base64")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|encoded| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .ok()
+                    })?;
+                decoded.push((sequence, TerminalReplayFrame::Output(bytes)));
+            }
+            "resize" => decoded.push((
+                sequence,
+                TerminalReplayFrame::Resize {
+                    columns: payload_u16(frame, "columns")?,
+                    rows: payload_u16(frame, "rows")?,
+                },
+            )),
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
 fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {
     payload
         .get("exit_code")
@@ -464,30 +600,44 @@ fn append_terminal_replay_rows(
     }
 }
 
+fn shell_terminal_stream(
+    columns: u16,
+    rows: u16,
+    frames: &[TerminalReplayFrame],
+) -> Option<TerminalGridStream> {
+    let output_rows = frames.iter().fold(0_usize, |total, frame| match frame {
+        TerminalReplayFrame::Output(bytes) => total.saturating_add(bytes.len()),
+        TerminalReplayFrame::Resize { .. } => total,
+    });
+    let mut stream = TerminalGridStream::new(
+        columns.max(1),
+        rows.max(1),
+        GridLimits {
+            // Every retained row requires at least one output byte. This byte-derived bound keeps
+            // all possible scrollback for this complete frame set without a terminal-domain cap.
+            scrollback_rows: output_rows,
+        },
+    )
+    .ok()?;
+    for frame in frames {
+        match frame {
+            TerminalReplayFrame::Output(bytes) => stream.process(bytes),
+            TerminalReplayFrame::Resize { columns, rows } => {
+                stream.resize((*columns).max(1), (*rows).max(1)).ok()?;
+            }
+        }
+    }
+    Some(stream)
+}
+
 fn shell_terminal_frame_rows(
     input: TerminalViewerInput<'_>,
     frames: &[TerminalReplayFrame],
     width: u16,
 ) -> Vec<Line> {
-    let Ok(mut stream) = TerminalGridStream::new(
-        input.columns.max(1),
-        input.rows.max(1),
-        GridLimits {
-            scrollback_rows: MAX_INLINE_TERMINAL_ROWS.saturating_mul(8),
-        },
-    ) else {
+    let Some(stream) = shell_terminal_stream(input.columns, input.rows, frames) else {
         return terminal_viewer_rows(input, width);
     };
-    for frame in frames {
-        match frame {
-            TerminalReplayFrame::Output(bytes) => stream.process(bytes),
-            TerminalReplayFrame::Resize { columns, rows } => {
-                if stream.resize((*columns).max(1), (*rows).max(1)).is_err() {
-                    return terminal_viewer_rows(input, width);
-                }
-            }
-        }
-    }
     let grid = stream.grid();
     let max_rows = match input.sizing {
         TerminalViewerSizing::Compact => MAX_INLINE_TERMINAL_ROWS,
@@ -605,13 +755,14 @@ const fn shell_terminal_grid_color(color: GridColor) -> Color {
     }
 }
 
-enum TerminalReplayFrame {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalReplayFrame {
     Output(Vec<u8>),
     Resize { columns: u16, rows: u16 },
 }
 
-struct TerminalReplayData {
-    output: String,
+pub(crate) struct TerminalReplayData {
+    pub(crate) output: String,
     frames: Option<Vec<TerminalReplayFrame>>,
     columns: u16,
     rows: u16,
@@ -629,7 +780,7 @@ enum TerminalReplayOutput {
     Absent,
 }
 
-fn decode_recording_replay(
+pub(crate) fn decode_recording_replay(
     summary: &crate::recording::ShellRecordingSummary,
     frames: Vec<crate::recording::ShellRecordingFrame>,
 ) -> TerminalReplayData {
@@ -647,12 +798,26 @@ fn decode_recording_replay(
         timed_out: false,
         cancelled: false,
     };
+    let use_presentation_frames = frames.iter().any(|frame| {
+        matches!(
+            frame,
+            crate::recording::ShellRecordingFrame::ReplayOutput { .. }
+        )
+    });
     for frame in frames {
         match frame {
-            crate::recording::ShellRecordingFrame::Output { bytes: output, .. } => {
+            crate::recording::ShellRecordingFrame::Output { bytes: output, .. }
+            | crate::recording::ShellRecordingFrame::ReplayOutput { bytes: output, .. }
+                if matches!(frame, crate::recording::ShellRecordingFrame::Output { .. })
+                    != use_presentation_frames =>
+            {
                 bytes.extend_from_slice(&output);
                 replay_frames.push(TerminalReplayFrame::Output(output));
             }
+            crate::recording::ShellRecordingFrame::Output { .. }
+            | crate::recording::ShellRecordingFrame::ReplayOutput { .. }
+            | crate::recording::ShellRecordingFrame::Start { .. }
+            | crate::recording::ShellRecordingFrame::Unknown { .. } => {}
             crate::recording::ShellRecordingFrame::Resize { columns, rows, .. } => {
                 replay.columns = columns;
                 replay.rows = rows;
@@ -670,8 +835,6 @@ fn decode_recording_replay(
                 replay.timed_out = timed_out;
                 replay.cancelled = cancelled;
             }
-            crate::recording::ShellRecordingFrame::Start { .. }
-            | crate::recording::ShellRecordingFrame::Unknown { .. } => {}
         }
     }
     replay.output = String::from_utf8_lossy(&bytes).into_owned();
@@ -830,6 +993,84 @@ mod tests {
     }
 
     #[test]
+    fn live_and_recording_replay_share_exact_frame_and_terminal_state() {
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let key = "parity-call";
+        let mut first = b"\x1b[31mred\x1b[0m\r\nwide: \xe7\x95\x8c e\xcc\x81\r\n".to_vec();
+        for index in 0..300 {
+            first.extend_from_slice(format!("scrollback-{index:03}\r\n").as_bytes());
+        }
+        let second = b"\x1b[?1049halt\x1b[2;3H\x1b[32mZ\x1b[?25l";
+        let mut cumulative = first.clone();
+        let initial_frames = vec![(1, TerminalReplayFrame::Output(first.clone()))];
+        adapter.update_live_replay(key, &cumulative, Some(&initial_frames), 12, 3);
+        let payload = serde_json::json!({
+            "_bcode_runtime": {
+                "columns": 12,
+                "rows": 3,
+                "live_state_key": key,
+            }
+        });
+        let action = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_action(
+            &adapter,
+            "bcode.tool.request.shell.run",
+            &payload,
+            &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(9, 4)),
+        )
+        .expect("resize action");
+        cumulative.extend_from_slice(second);
+        let incoming_frames = vec![
+            (1, TerminalReplayFrame::Output(first.clone())),
+            (
+                2,
+                TerminalReplayFrame::Resize {
+                    columns: 9,
+                    rows: 4,
+                },
+            ),
+            (3, TerminalReplayFrame::Output(second.to_vec())),
+        ];
+        let live_frames =
+            adapter.update_live_replay(key, &cumulative, Some(&incoming_frames), 12, 3);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("parity.bcsr");
+        let mut writer =
+            crate::recording::ShellRecordingWriter::create(&path, 12, 3).expect("recording writer");
+        writer.write_output(1, &first).expect("first output");
+        writer.write_resize(2, 9, 4).expect("resize");
+        writer.write_output(3, second).expect("second output");
+        writer
+            .finish(4, Some(0), None, false, false)
+            .expect("finish recording");
+        let (summary, recording_frames) =
+            crate::recording::read_recording(&path).expect("read recording");
+        let reopened = decode_recording_replay(&summary, recording_frames);
+        let reopened_frames = reopened.frames.expect("recording frames");
+
+        assert_eq!(action.producer_plugin_id, "bcode.shell");
+        assert_eq!(live_frames, reopened_frames);
+        let live = shell_terminal_stream(12, 3, &live_frames).expect("live terminal stream");
+        let reopened =
+            shell_terminal_stream(12, 3, &reopened_frames).expect("reopened terminal stream");
+        let live_rows = live
+            .grid()
+            .scrollback_rows_hint()
+            .saturating_add(live.grid().height());
+        let reopened_rows = reopened
+            .grid()
+            .scrollback_rows_hint()
+            .saturating_add(reopened.grid().height());
+        assert_eq!(
+            live.snapshot(0, live_rows),
+            reopened.snapshot(0, reopened_rows)
+        );
+        assert_eq!(live.grid().mode(), bmux_terminal_grid::GridMode::Alternate);
+        assert!(!live.grid().cursor().visible);
+        assert!(live.grid().main_content_rows().len() > 300);
+    }
+
+    #[test]
     fn live_shell_visual_uses_plugin_owned_resize_dimensions() {
         let adapter = ShellRunTuiVisualAdapter::default();
         let payload = serde_json::json!({
@@ -869,7 +1110,7 @@ mod tests {
         assert!(action.is_some());
         assert_ne!(before, after);
         let rendered = after.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("1234"), "{rendered}");
+        assert!(rendered.contains("5678\n    ABCD"), "{rendered}");
     }
 
     #[test]
