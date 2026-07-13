@@ -449,6 +449,26 @@ fn decode_recording_replay(
     replay
 }
 
+fn local_recording_path(uri: &str) -> Result<std::path::PathBuf, String> {
+    if let Ok(url) = url::Url::parse(uri) {
+        if url.scheme() != "file" {
+            return Err(format!(
+                "recording storage scheme '{}' is not available locally",
+                url.scheme()
+            ));
+        }
+        return url
+            .to_file_path()
+            .map_err(|()| "recording file location is invalid".to_owned());
+    }
+    let legacy_path = std::path::PathBuf::from(uri);
+    if legacy_path.is_absolute() {
+        Ok(legacy_path)
+    } else {
+        Err("recording storage location is invalid".to_owned())
+    }
+}
+
 fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
     let Some(reference) = terminal_replay_ref(payload) else {
         return TerminalReplayOutput::Absent;
@@ -467,19 +487,9 @@ fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
             TerminalReplayOutput::Absent
         };
     };
-    let Ok(url) = url::Url::parse(uri) else {
-        return TerminalReplayOutput::Unavailable(
-            "recording storage location is invalid".to_owned(),
-        );
-    };
-    if url.scheme() != "file" {
-        return TerminalReplayOutput::Unavailable(format!(
-            "recording storage scheme '{}' is not available locally",
-            url.scheme()
-        ));
-    }
-    let Ok(path) = url.to_file_path() else {
-        return TerminalReplayOutput::Unavailable("recording file location is invalid".to_owned());
+    let path = match local_recording_path(uri) {
+        Ok(path) => path,
+        Err(error) => return TerminalReplayOutput::Unavailable(error),
     };
     if authoritative {
         return match crate::recording::read_recording(&path) {
@@ -970,6 +980,50 @@ mod tests {
             !rendered.contains("forbidden fallback sentinel"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn legacy_absolute_artifact_path_remains_replayable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("legacy-absolute.txt");
+        fs::write(&path, "legacy absolute path sentinel\n").expect("legacy artifact");
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [{
+                "key": TERMINAL_PTY_STREAM_REF_KEY,
+                "content_type": TERMINAL_PTY_STREAM_CONTENT_TYPE,
+                "storage_uri": path.to_string_lossy(),
+                "metadata": {"stream": "pty"}
+            }]
+        });
+        let rendered = render_rows(&payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("legacy absolute path sentinel"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn relative_legacy_artifact_path_is_rejected() {
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [{
+                "key": TERMINAL_PTY_STREAM_REF_KEY,
+                "content_type": TERMINAL_PTY_STREAM_CONTENT_TYPE,
+                "storage_uri": "relative/legacy.txt",
+                "metadata": {"stream": "pty"}
+            }]
+        });
+        assert_recording_unavailable(&payload, "storage location is invalid");
     }
 
     #[test]
