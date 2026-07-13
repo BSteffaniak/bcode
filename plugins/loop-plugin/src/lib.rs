@@ -121,9 +121,31 @@ fn command(id: &str, title: &str, description: &str, slash: bool) -> CommandCont
     }
 }
 
+fn automation_snapshot_blocking(
+    session_id: SessionId,
+) -> Result<bcode_ipc::PluginAutomationSnapshot, String> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?
+            .block_on(BcodeClient::default_endpoint().plugin_automation_snapshot(session_id))
+            .map_err(|error| error.to_string())
+    })
+    .join()
+    .map_err(|_panic| "automation snapshot worker panicked".to_owned())?
+}
+
 fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
     match load_state_result(session_id) {
-        Ok(state) => status_response(&format_status(state.as_ref())),
+        Ok(state) => {
+            let pending_steering = state
+                .as_ref()
+                .filter(|state| !state.state.is_terminal())
+                .and_then(|_| automation_snapshot_blocking(session_id).ok())
+                .map(|snapshot| snapshot.pending_steering_messages);
+            status_response(&format_status(state.as_ref(), pending_steering))
+        }
         Err(error) => status_response(&format!("loop state unavailable: {error}")),
     }
 }
@@ -197,7 +219,7 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
         Err(error) => return status_response(&format!("loop state unavailable: {error}")),
     };
     if state.state.is_terminal() {
-        return status_response(&format_status(Some(&state)));
+        return status_response(&format_status(Some(&state), None));
     }
     state.cancel_requested = true;
     if let Err(error) = transition(&mut state, RunState::Canceled) {
@@ -1464,13 +1486,28 @@ fn refresh_cancel(state: &mut LoopState) -> bool {
     cancelled
 }
 
-fn format_status(state: Option<&LoopState>) -> String {
+fn format_status(state: Option<&LoopState>, pending_steering: Option<u32>) -> String {
     state.map_or_else(
         || "no loop found for this session".to_owned(),
         |state| {
             let reason = state.stop_reason.as_deref().unwrap_or("none");
+            let steering = pending_steering.map_or_else(
+                || "unavailable".to_owned(),
+                |count| count.to_string(),
+            );
+            let evaluation = state.latest_evaluation.as_ref().map_or_else(
+                || "none".to_owned(),
+                |evaluation| {
+                    format!(
+                        "{} · {} evidence · {}",
+                        if evaluation.condition_met { "met" } else { "not met" },
+                        evaluation.evidence.len(),
+                        evaluation.summary
+                    )
+                },
+            );
             format!(
-                "loop {} · {:?} · iteration {}/{} · reason: {reason}",
+                "loop {} · phase {:?} · iteration {}/{} · queued steering: {steering} · evaluation: {evaluation} · reason: {reason}",
                 state.run_id, state.state, state.current_iteration, state.max_iterations
             )
         },
@@ -2032,7 +2069,7 @@ mod tests {
 
     #[test]
     fn command_status_and_transition_errors_are_actionable() {
-        assert_eq!(format_status(None), "no loop found for this session");
+        assert_eq!(format_status(None, None), "no loop found for this session");
         let mut state = LoopState::new(
             SessionId::new(),
             "iterate".to_owned(),
@@ -2043,9 +2080,14 @@ mod tests {
         state.current_iteration = 2;
         state.state = RunState::Paused;
         state.stop_reason = Some("iteration cancelled".to_owned());
+        state.latest_evaluation = Some(Evaluation {
+            condition_met: false,
+            evidence: vec!["one item remains".to_owned()],
+            summary: "not complete".to_owned(),
+        });
         assert_eq!(
-            format_status(Some(&state)),
-            "loop run-1 · Paused · iteration 2/3 · reason: iteration cancelled"
+            format_status(Some(&state), Some(2)),
+            "loop run-1 · phase Paused · iteration 2/3 · queued steering: 2 · evaluation: not met · 1 evidence · not complete · reason: iteration cancelled"
         );
 
         state.state = RunState::Completed;
