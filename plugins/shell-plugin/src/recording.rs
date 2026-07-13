@@ -474,11 +474,11 @@ pub fn read_recording(
         let mut payload = vec![0_u8; length];
         reader.read_exact(&mut payload)?;
         let frame = match kind[0] {
-            FRAME_START if version == FORMAT_VERSION && payload.is_empty() && frames.is_empty() => {
-                if offset_micros != 0 {
+            FRAME_START if version == FORMAT_VERSION => {
+                if saw_start || !frames.is_empty() || !payload.is_empty() || offset_micros != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "recording start offset must be zero",
+                        "invalid recording start frame",
                     ));
                 }
                 saw_start = true;
@@ -493,11 +493,19 @@ pub fn read_recording(
                     bytes: payload,
                 }
             }
-            FRAME_RESIZE if payload.len() == 4 => ShellRecordingFrame::Resize {
-                offset_micros,
-                columns: u16::from_le_bytes([payload[0], payload[1]]),
-                rows: u16::from_le_bytes([payload[2], payload[3]]),
-            },
+            FRAME_RESIZE => {
+                if payload.len() != 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid recording resize frame length",
+                    ));
+                }
+                ShellRecordingFrame::Resize {
+                    offset_micros,
+                    columns: u16::from_le_bytes([payload[0], payload[1]]),
+                    rows: u16::from_le_bytes([payload[2], payload[3]]),
+                }
+            }
             FRAME_FINISH if version == LEGACY_FORMAT_VERSION && payload.len() == 38 => {
                 let actual = checksum.clone().finalize();
                 if actual.as_slice() != &payload[6..] {
@@ -549,6 +557,12 @@ pub fn read_recording(
                     timed_out: payload[5] & 1 != 0,
                     cancelled: payload[5] & 2 != 0,
                 }
+            }
+            FRAME_FINISH => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid recording finish frame",
+                ));
             }
             kind => ShellRecordingFrame::Unknown {
                 kind,
@@ -726,6 +740,39 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn malformed_lifecycle_frames_are_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (name, mutation, expected) in [
+            ("non_monotonic", 1_usize, "offsets are not monotonic"),
+            ("frame_after_finish", 2_usize, "frames after finish"),
+        ] {
+            let path = dir.path().join(format!("{name}.bcsr"));
+            let mut writer = ShellRecordingWriter::create(&path, 80, 24).expect("writer");
+            writer.write_output(2, b"hello").expect("output");
+            writer
+                .finish(3, Some(0), None, false, false)
+                .expect("finish");
+            let mut bytes = fs::read(&path).expect("recording bytes");
+            match mutation {
+                1 => {
+                    let finish_offset_field = 14 + 13 + 13 + 5 + 1;
+                    bytes[finish_offset_field..finish_offset_field + 8]
+                        .copy_from_slice(&1_u64.to_le_bytes());
+                }
+                2 => {
+                    bytes.push(99);
+                    bytes.extend_from_slice(&4_u64.to_le_bytes());
+                    bytes.extend_from_slice(&0_u32.to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+            fs::write(&path, bytes).expect("mutated recording");
+            let error = read_recording(&path).expect_err("malformed lifecycle must fail");
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
     }
 
     #[test]
