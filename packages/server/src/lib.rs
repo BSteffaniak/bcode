@@ -7457,6 +7457,36 @@ async fn handle_lookup_plugin_automation_operation(
     .await
 }
 
+fn plugin_automation_preflight_disposition(
+    automation_held: bool,
+    pending_manual_messages: usize,
+    session_busy: bool,
+    current_generation: Option<u64>,
+    expected_generation: u64,
+) -> Option<bcode_ipc::PluginAutomationTurnDisposition> {
+    if automation_held {
+        return Some(bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld);
+    }
+    if pending_manual_messages > 0 {
+        return Some(
+            bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending {
+                pending_messages: usize_to_u32_saturating(pending_manual_messages),
+            },
+        );
+    }
+    if session_busy {
+        return Some(bcode_ipc::PluginAutomationTurnDisposition::SessionBusy);
+    }
+    if let Some(current_generation) = current_generation
+        && current_generation != expected_generation
+    {
+        return Some(bcode_ipc::PluginAutomationTurnDisposition::SessionChanged {
+            current_generation,
+        });
+    }
+    None
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_submit_plugin_automation_turn(
     request_id: u64,
@@ -7482,56 +7512,31 @@ async fn handle_submit_plugin_automation_turn(
         )
         .await;
     }
-    if state
+    let automation_held = state
         .plugin_automation_holds
         .lock()
         .await
         .get(&request.session_id)
-        .is_some_and(|holds| !holds.is_empty())
-    {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::PluginAutomationTurn {
-                result: bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld,
-            }),
-        )
-        .await;
-    }
+        .is_some_and(|holds| !holds.is_empty());
     let handle = session_runtime_handle(state, request.session_id).await;
     let pending = handle.queued_followups.load(Ordering::Acquire);
-    if pending > 0 {
+    let session_busy = handle.phase.lock().await.has_active_work();
+    let generation = if automation_held || pending > 0 || session_busy {
+        None
+    } else {
+        Some(plugin_automation_generation(state, request.session_id).await?)
+    };
+    if let Some(result) = plugin_automation_preflight_disposition(
+        automation_held,
+        pending,
+        session_busy,
+        generation,
+        request.expected_generation,
+    ) {
         return send_response(
             writer,
             request_id,
-            Response::Ok(ResponsePayload::PluginAutomationTurn {
-                result: bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending {
-                    pending_messages: usize_to_u32_saturating(pending),
-                },
-            }),
-        )
-        .await;
-    }
-    if handle.phase.lock().await.has_active_work() {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::PluginAutomationTurn {
-                result: bcode_ipc::PluginAutomationTurnDisposition::SessionBusy,
-            }),
-        )
-        .await;
-    }
-    let generation = plugin_automation_generation(state, request.session_id).await?;
-    if generation != request.expected_generation {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::PluginAutomationTurn {
-                result: bcode_ipc::PluginAutomationTurnDisposition::SessionChanged {
-                    current_generation: generation,
-                },
-            }),
+            Response::Ok(ResponsePayload::PluginAutomationTurn { result }),
         )
         .await;
     }
@@ -23616,6 +23621,33 @@ mod tests {
     }
 
     #[test]
+    fn automation_preflight_enforces_manual_hold_busy_and_generation_priority() {
+        assert!(matches!(
+            plugin_automation_preflight_disposition(true, 3, true, None, 7),
+            Some(bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld)
+        ));
+        assert!(matches!(
+            plugin_automation_preflight_disposition(false, 3, true, None, 7),
+            Some(
+                bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending {
+                    pending_messages: 3
+                }
+            )
+        ));
+        assert!(matches!(
+            plugin_automation_preflight_disposition(false, 0, true, None, 7),
+            Some(bcode_ipc::PluginAutomationTurnDisposition::SessionBusy)
+        ));
+        assert!(matches!(
+            plugin_automation_preflight_disposition(false, 0, false, Some(8), 7),
+            Some(bcode_ipc::PluginAutomationTurnDisposition::SessionChanged {
+                current_generation: 8
+            })
+        ));
+        assert!(plugin_automation_preflight_disposition(false, 0, false, Some(7), 7).is_none());
+    }
+
+    #[test]
     fn read_only_automation_policy_allows_only_declared_read_only_tools() {
         let read_only = Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection);
         assert!(automation_policy_allows_tool(
@@ -23672,6 +23704,10 @@ mod tests {
 
         let operation = automation_operation_from_events(&events, "bcode.test", "operation-1")
             .expect("operation should reconcile");
+        assert_eq!(operation.origin.plugin_id, "bcode.test");
+        assert_eq!(operation.origin.run_id, "run-1");
+        assert_eq!(operation.origin.operation_id, "operation-1");
+        assert_eq!(operation.origin.display_label, "Test operation");
         assert_eq!(operation.user_event_sequence, 4);
         assert_eq!(operation.turn_id, "turn-1");
         assert_eq!(

@@ -663,6 +663,7 @@ fn transition_or_fail(state: &mut LoopState, next: RunState) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Evaluation {
     condition_met: bool,
     #[serde(default)]
@@ -1291,8 +1292,14 @@ fn parse_evaluation(text: &str) -> Result<Evaluation, String> {
         .trim();
     let evaluation: Evaluation = serde_json::from_str(trimmed)
         .map_err(|error| format!("invalid loop evaluation JSON: {error}"))?;
-    if evaluation.summary.trim().is_empty() || evaluation.evidence.is_empty() {
-        return Err("loop evaluation omitted its summary or evidence".to_owned());
+    if evaluation.summary.trim().is_empty()
+        || evaluation.evidence.is_empty()
+        || evaluation
+            .evidence
+            .iter()
+            .any(|evidence| evidence.trim().is_empty())
+    {
+        return Err("loop evaluation omitted its summary or concrete evidence".to_owned());
     }
     Ok(evaluation)
 }
@@ -1364,6 +1371,18 @@ fn validate_state(state: &LoopState) -> Result<(), String> {
     Ok(())
 }
 
+fn decode_state(bytes: &[u8]) -> Result<LoopState, String> {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STATE_BYTES {
+        return Err(format!(
+            "loop state exceeds the {MAX_STATE_BYTES}-byte safety limit"
+        ));
+    }
+    let state: LoopState =
+        serde_json::from_slice(bytes).map_err(|error| format!("corrupt loop state: {error}"))?;
+    validate_state(&state)?;
+    Ok(state)
+}
+
 fn load_state_result(session_id: SessionId) -> Result<Option<LoopState>, String> {
     let path = state_path(session_id);
     let metadata = match fs::metadata(&path) {
@@ -1377,10 +1396,7 @@ fn load_state_result(session_id: SessionId) -> Result<Option<LoopState>, String>
         ));
     }
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let state: LoopState =
-        serde_json::from_slice(&bytes).map_err(|error| format!("corrupt loop state: {error}"))?;
-    validate_state(&state)?;
-    Ok(Some(state))
+    decode_state(&bytes).map(Some)
 }
 
 fn load_state(session_id: SessionId) -> Option<LoopState> {
@@ -1564,6 +1580,154 @@ mod tests {
         state.schema_version = STATE_SCHEMA_VERSION;
         state.current_iteration = 21;
         assert!(validate_state(&state).is_err());
+    }
+
+    #[test]
+    fn run_state_transition_table_is_explicit_and_complete() {
+        let states = [
+            RunState::Ready,
+            RunState::SubmittingIteration,
+            RunState::RunningIteration,
+            RunState::DrainingSteering,
+            RunState::Evaluating,
+            RunState::Completed,
+            RunState::LimitReached,
+            RunState::Paused,
+            RunState::Canceled,
+            RunState::Failed,
+        ];
+        for from in states {
+            for to in states {
+                let expected = from == to
+                    || (!from.is_terminal() && to == RunState::Canceled)
+                    || matches!(
+                        (from, to),
+                        (
+                            RunState::Ready,
+                            RunState::SubmittingIteration
+                                | RunState::Evaluating
+                                | RunState::LimitReached
+                        ) | (
+                            RunState::SubmittingIteration,
+                            RunState::RunningIteration | RunState::Paused | RunState::Failed
+                        ) | (
+                            RunState::RunningIteration,
+                            RunState::DrainingSteering
+                                | RunState::Evaluating
+                                | RunState::Paused
+                                | RunState::Failed
+                        ) | (
+                            RunState::DrainingSteering,
+                            RunState::Evaluating | RunState::Paused | RunState::Failed
+                        ) | (
+                            RunState::Evaluating,
+                            RunState::DrainingSteering
+                                | RunState::Ready
+                                | RunState::Completed
+                                | RunState::Paused
+                                | RunState::Failed
+                        ) | (
+                            RunState::Paused | RunState::Failed,
+                            RunState::Ready | RunState::Evaluating
+                        )
+                    );
+                assert_eq!(
+                    from.can_transition_to(to),
+                    expected,
+                    "unexpected transition decision for {from:?} -> {to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_decoder_rejects_corrupt_oversized_and_unsupported_state() {
+        let corrupt = decode_state(b"not json").expect_err("corrupt state must fail");
+        assert!(corrupt.contains("corrupt loop state"));
+
+        let oversized = vec![b' '; usize::try_from(MAX_STATE_BYTES).expect("limit fits") + 1];
+        let error = decode_state(&oversized).expect_err("oversized state must fail");
+        assert!(error.contains("safety limit"));
+
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.schema_version = STATE_SCHEMA_VERSION + 1;
+        let encoded = serde_json::to_vec(&state).expect("encode state");
+        let error = decode_state(&encoded).expect_err("unsupported schema must fail");
+        assert!(error.contains("unsupported loop state schema version"));
+    }
+
+    #[test]
+    fn evaluation_requires_strict_json_and_concrete_evidence() {
+        let evaluation = parse_evaluation(
+            r#"{"condition_met":false,"evidence":["one unchecked item"],"summary":"not done"}"#,
+        )
+        .expect("valid evaluation");
+        assert!(!evaluation.condition_met);
+        assert_eq!(evaluation.summary, "not done");
+
+        let completed = parse_evaluation(
+            r#"{"condition_met":true,"evidence":["all required checks passed"],"summary":"done"}"#,
+        )
+        .expect("positive evaluation with concrete evidence");
+        assert!(completed.condition_met);
+
+        for invalid in [
+            r#"{"condition_met":true,"condition_met":false,"evidence":["conflicting result"],"summary":"ambiguous"}"#,
+            r#"{"condition_met":true,"evidence":[],"summary":"done"}"#,
+            r#"{"condition_met":true,"evidence":["  "],"summary":"done"}"#,
+            r#"{"condition_met":true,"evidence":["verified"],"summary":"  "}"#,
+            r#"{"condition_met":true,"evidence":["verified"],"summary":"done","unexpected":true}"#,
+            "not json",
+        ] {
+            assert!(parse_evaluation(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn assistant_text_is_bounded_to_the_exact_operation() {
+        let session_id = SessionId::new();
+        let events = vec![
+            bcode_session_models::SessionEvent {
+                session_id,
+                sequence: 10,
+                timestamp_ms: 0,
+                provenance: None,
+                kind: SessionEventKind::AssistantMessage {
+                    text: "before".to_owned(),
+                },
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            },
+            bcode_session_models::SessionEvent {
+                session_id,
+                sequence: 12,
+                timestamp_ms: 0,
+                provenance: None,
+                kind: SessionEventKind::AssistantMessage {
+                    text: "operation result".to_owned(),
+                },
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            },
+            bcode_session_models::SessionEvent {
+                session_id,
+                sequence: 14,
+                timestamp_ms: 0,
+                provenance: None,
+                kind: SessionEventKind::AssistantMessage {
+                    text: "after".to_owned(),
+                },
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            },
+        ];
+
+        assert_eq!(
+            assistant_text_for_operation(&events, 10, Some(14)).as_deref(),
+            Some("operation result")
+        );
     }
 
     #[test]
