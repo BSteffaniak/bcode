@@ -364,7 +364,7 @@ struct TerminalStreamOutput {
     replay_artifact_path: Option<PathBuf>,
     clean_artifact_path: Option<PathBuf>,
     recording_path: Option<PathBuf>,
-    recording_writer: Option<recording::ShellRecordingWriter>,
+    recording_writer: Option<recording::AsyncShellRecordingWriter>,
     prelude_suppressed: bool,
 }
 
@@ -1134,7 +1134,7 @@ where
         .recording
         .as_deref()
         .map(|path| {
-            recording::ShellRecordingWriter::create(
+            recording::AsyncShellRecordingWriter::create(
                 path,
                 visual_context.columns,
                 visual_context.rows,
@@ -1186,12 +1186,10 @@ where
             emit.with_sequence(sequence),
         )?;
         if let Some(writer) = &mut recording_writer {
-            writer
-                .write_output(
-                    u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    chunk,
-                )
-                .map_err(|error| error.to_string())?;
+            let _ = writer.try_write_output(
+                u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                chunk,
+            );
         }
     }
     sequence = sequence.saturating_add(1);

@@ -8,6 +8,8 @@ use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 const MAGIC: &[u8; 8] = b"BCSHREC\0";
 const FORMAT_VERSION: u16 = 1;
@@ -15,6 +17,188 @@ const FRAME_OUTPUT: u8 = 1;
 const FRAME_RESIZE: u8 = 2;
 const FRAME_FINISH: u8 = 3;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const ASYNC_RECORDING_QUEUE_CAPACITY: usize = 256;
+
+enum AsyncRecordingCommand {
+    Output {
+        offset_micros: u64,
+        bytes: Vec<u8>,
+    },
+    Resize {
+        offset_micros: u64,
+        columns: u16,
+        rows: u16,
+    },
+    Finish {
+        offset_micros: u64,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        response: mpsc::Sender<io::Result<ShellRecordingSummary>>,
+    },
+}
+
+/// Non-blocking producer for a shell recording writer thread.
+pub struct AsyncShellRecordingWriter {
+    sender: mpsc::SyncSender<AsyncRecordingCommand>,
+    worker: Option<thread::JoinHandle<()>>,
+    queue_failed: bool,
+}
+
+impl AsyncShellRecordingWriter {
+    /// Start a bounded recording writer thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partial recording or writer thread cannot be created.
+    pub fn create(path: &Path, columns: u16, rows: u16) -> io::Result<Self> {
+        let writer = ShellRecordingWriter::create(path, columns, rows)?;
+        let (sender, receiver) = mpsc::sync_channel(ASYNC_RECORDING_QUEUE_CAPACITY);
+        let worker = thread::Builder::new()
+            .name("bcode-shell-recording".to_owned())
+            .spawn(move || run_async_recording_writer(writer, &receiver))?;
+        Ok(Self {
+            sender,
+            worker: Some(worker),
+            queue_failed: false,
+        })
+    }
+
+    /// Queue exact PTY bytes without waiting for filesystem I/O.
+    ///
+    /// Returns `false` if the bounded writer queue cannot accept the frame. Once false is returned,
+    /// finalization fails explicitly and no authoritative recording is published.
+    pub fn try_write_output(&mut self, offset_micros: u64, bytes: &[u8]) -> bool {
+        if self.queue_failed {
+            return false;
+        }
+        if self
+            .sender
+            .try_send(AsyncRecordingCommand::Output {
+                offset_micros,
+                bytes: bytes.to_vec(),
+            })
+            .is_err()
+        {
+            self.queue_failed = true;
+            return false;
+        }
+        true
+    }
+
+    /// Queue a resize without waiting for filesystem I/O.
+    pub fn try_write_resize(&mut self, offset_micros: u64, columns: u16, rows: u16) -> bool {
+        if self.queue_failed {
+            return false;
+        }
+        if self
+            .sender
+            .try_send(AsyncRecordingCommand::Resize {
+                offset_micros,
+                columns,
+                rows,
+            })
+            .is_err()
+        {
+            self.queue_failed = true;
+            return false;
+        }
+        true
+    }
+
+    /// Drain queued frames, finalize atomically, and join the writer thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after queue overflow/disconnection, writer I/O failure, or worker panic.
+    pub fn finish(
+        mut self,
+        offset_micros: u64,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+    ) -> io::Result<ShellRecordingSummary> {
+        if self.queue_failed {
+            return Err(io::Error::other(
+                "shell recording queue overflowed or disconnected",
+            ));
+        }
+        let (response, result) = mpsc::channel();
+        self.sender
+            .send(AsyncRecordingCommand::Finish {
+                offset_micros,
+                exit_code,
+                timed_out,
+                cancelled,
+                response,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "recording writer stopped"))?;
+        let result = result
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "recording writer stopped"))?;
+        if self
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err())
+        {
+            return Err(io::Error::other("recording writer panicked"));
+        }
+        result
+    }
+}
+
+impl Drop for AsyncShellRecordingWriter {
+    fn drop(&mut self) {
+        // Dropping the sender disconnects the worker. It then drops the synchronous writer and
+        // leaves only the explicit partial file.
+    }
+}
+
+fn run_async_recording_writer(
+    mut writer: ShellRecordingWriter,
+    receiver: &mpsc::Receiver<AsyncRecordingCommand>,
+) {
+    let mut failure = None;
+    while let Ok(command) = receiver.recv() {
+        match command {
+            AsyncRecordingCommand::Output {
+                offset_micros,
+                bytes,
+            } => {
+                if failure.is_none()
+                    && let Err(error) = writer.write_output(offset_micros, &bytes)
+                {
+                    failure = Some(error);
+                }
+            }
+            AsyncRecordingCommand::Resize {
+                offset_micros,
+                columns,
+                rows,
+            } => {
+                if failure.is_none()
+                    && let Err(error) = writer.write_resize(offset_micros, columns, rows)
+                {
+                    failure = Some(error);
+                }
+            }
+            AsyncRecordingCommand::Finish {
+                offset_micros,
+                exit_code,
+                timed_out,
+                cancelled,
+                response,
+            } => {
+                let result = failure.map_or_else(
+                    || writer.finish(offset_micros, exit_code, timed_out, cancelled),
+                    Err,
+                );
+                let _ = response.send(result);
+                break;
+            }
+        }
+    }
+}
 
 /// One decoded shell recording frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +545,42 @@ mod tests {
                 timed_out: true,
                 cancelled: false
             }
+        );
+    }
+
+    #[test]
+    fn async_writer_preserves_frames_and_finalizes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("recording.bcsr");
+        let mut writer = AsyncShellRecordingWriter::create(&path, 80, 24).expect("writer");
+        assert!(writer.try_write_output(1, b"first"));
+        assert!(writer.try_write_output(2, b"second"));
+        assert!(writer.try_write_resize(3, 100, 30));
+        writer.finish(4, Some(0), false, false).expect("finish");
+        let (_, frames) = read_recording(&path).expect("recording");
+        assert_eq!(
+            frames,
+            vec![
+                ShellRecordingFrame::Output {
+                    offset_micros: 1,
+                    bytes: b"first".to_vec(),
+                },
+                ShellRecordingFrame::Output {
+                    offset_micros: 2,
+                    bytes: b"second".to_vec(),
+                },
+                ShellRecordingFrame::Resize {
+                    offset_micros: 3,
+                    columns: 100,
+                    rows: 30,
+                },
+                ShellRecordingFrame::Finish {
+                    offset_micros: 4,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                },
+            ]
         );
     }
 
