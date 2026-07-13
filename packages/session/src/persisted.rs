@@ -445,6 +445,23 @@ enum PersistedSessionEventKind {
     ContextUsageObserved {
         snapshot: ContextUsageSnapshot,
     },
+    PluginAutomationTurnStarted {
+        plugin_id: String,
+        run_id: String,
+        operation_id: String,
+        display_label: String,
+        turn_id: String,
+        user_event_sequence: u64,
+        read_only: bool,
+    },
+    PluginAutomationTurnFinished {
+        plugin_id: String,
+        operation_id: String,
+        turn_id: String,
+        outcome: ModelTurnOutcome,
+        #[serde(default)]
+        message: Option<String>,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -795,6 +812,36 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             SessionEventKind::ContextUsageObserved { snapshot } => Self::ContextUsageObserved {
                 snapshot: snapshot.clone(),
             },
+            SessionEventKind::PluginAutomationTurnStarted {
+                plugin_id,
+                run_id,
+                operation_id,
+                display_label,
+                turn_id,
+                user_event_sequence,
+                read_only,
+            } => Self::PluginAutomationTurnStarted {
+                plugin_id: plugin_id.clone(),
+                run_id: run_id.clone(),
+                operation_id: operation_id.clone(),
+                display_label: display_label.clone(),
+                turn_id: turn_id.clone(),
+                user_event_sequence: *user_event_sequence,
+                read_only: *read_only,
+            },
+            SessionEventKind::PluginAutomationTurnFinished {
+                plugin_id,
+                operation_id,
+                turn_id,
+                outcome,
+                message,
+            } => Self::PluginAutomationTurnFinished {
+                plugin_id: plugin_id.clone(),
+                operation_id: operation_id.clone(),
+                turn_id: turn_id.clone(),
+                outcome: *outcome,
+                message: message.clone(),
+            },
         }
     }
 }
@@ -1137,6 +1184,36 @@ impl PersistedSessionEventKind {
             Self::ContextUsageObserved { snapshot } => {
                 SessionEventKind::ContextUsageObserved { snapshot }
             }
+            Self::PluginAutomationTurnStarted {
+                plugin_id,
+                run_id,
+                operation_id,
+                display_label,
+                turn_id,
+                user_event_sequence,
+                read_only,
+            } => SessionEventKind::PluginAutomationTurnStarted {
+                plugin_id,
+                run_id,
+                operation_id,
+                display_label,
+                turn_id,
+                user_event_sequence,
+                read_only,
+            },
+            Self::PluginAutomationTurnFinished {
+                plugin_id,
+                operation_id,
+                turn_id,
+                outcome,
+                message,
+            } => SessionEventKind::PluginAutomationTurnFinished {
+                plugin_id,
+                operation_id,
+                turn_id,
+                outcome,
+                message,
+            },
         }
     }
 }

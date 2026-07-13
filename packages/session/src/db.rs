@@ -1096,6 +1096,56 @@ impl SessionDb {
         })
     }
 
+    /// Return canonical generic plugin automation events for one operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event queries or deserialization fail.
+    pub async fn plugin_automation_operation_events(
+        &self,
+        plugin_id: &str,
+        operation_id: &str,
+    ) -> SessionDbResult<Vec<SessionEvent>> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .where_in(
+                "event_type",
+                vec![
+                    DatabaseValue::String("plugin_automation_turn_started".to_owned()),
+                    DatabaseValue::String("plugin_automation_turn_finished".to_owned()),
+                ],
+            )
+            .sort("event_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+        let mut events = Vec::new();
+        for row in rows {
+            let payload = required_string(&row, "payload")?;
+            let Some(event) = decode_session_event_degraded(&payload) else {
+                continue;
+            };
+            let matches_operation = match &event.kind {
+                SessionEventKind::PluginAutomationTurnStarted {
+                    plugin_id: event_plugin_id,
+                    operation_id: event_operation_id,
+                    ..
+                }
+                | SessionEventKind::PluginAutomationTurnFinished {
+                    plugin_id: event_plugin_id,
+                    operation_id: event_operation_id,
+                    ..
+                } => event_plugin_id == plugin_id && event_operation_id == operation_id,
+                _ => false,
+            };
+            if matches_operation {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
     /// Return model-context events from canonical DB events and indexed compaction metadata.
     ///
     /// # Errors
@@ -2167,6 +2217,8 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
+        SessionEventKind::PluginAutomationTurnStarted { .. } => "plugin_automation_turn_started",
+        SessionEventKind::PluginAutomationTurnFinished { .. } => "plugin_automation_turn_finished",
     }
 }
 

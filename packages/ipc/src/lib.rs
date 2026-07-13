@@ -429,6 +429,12 @@ pub enum Request {
         tool_call_id: String,
         action: bcode_tool::PluginInvocationAction,
     },
+    /// Return the current generic automation scheduling snapshot for a session.
+    PluginAutomationSnapshot(PluginAutomationSnapshotRequest),
+    /// Compare and submit one idempotent plugin-owned automation turn.
+    SubmitPluginAutomationTurn(PluginAutomationTurnRequest),
+    /// Look up a previously submitted plugin automation operation.
+    LookupPluginAutomationOperation(PluginAutomationOperationLookupRequest),
 }
 
 /// Server stop request policy.
@@ -510,6 +516,106 @@ pub struct ServerStatus {
 
 fn default_metrics_report_box() -> Box<bcode_metrics::MetricsReport> {
     Box::default()
+}
+
+/// Policy applied while executing a generic plugin automation turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginAutomationExecutionPolicy {
+    /// Execute with the session's normal tool capabilities.
+    #[default]
+    Normal,
+    /// Restrict execution to non-mutating inspection capabilities.
+    ReadOnlyInspection,
+}
+
+/// Generic plugin-owned origin for one automated session turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationOrigin {
+    pub plugin_id: String,
+    pub run_id: String,
+    pub operation_id: String,
+    pub display_label: String,
+}
+
+/// Request the current automation scheduling snapshot for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationSnapshotRequest {
+    pub session_id: SessionId,
+}
+
+/// Generic scheduling snapshot used for compare-and-submit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationSnapshot {
+    pub session_id: SessionId,
+    /// Latest durable event sequence observed while taking the snapshot.
+    pub generation: u64,
+    /// Number of accepted manual messages waiting for execution.
+    pub pending_manual_messages: u32,
+    /// Whether session work is currently active.
+    pub session_busy: bool,
+    /// Whether the active session work belongs to a plugin automation operation.
+    pub plugin_automation_active: bool,
+    /// Whether a generic interactive hold currently prevents new automation.
+    pub automation_held: bool,
+}
+
+/// Compare-and-submit request for a generic plugin automation turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationTurnRequest {
+    pub session_id: SessionId,
+    pub origin: PluginAutomationOrigin,
+    pub text: String,
+    pub expected_generation: u64,
+    #[serde(default)]
+    pub execution_policy: PluginAutomationExecutionPolicy,
+}
+
+/// Request to reconcile a plugin automation operation by stable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationOperationLookupRequest {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub operation_id: String,
+}
+
+/// Persisted identity and terminal state of a plugin automation operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationOperation {
+    pub origin: PluginAutomationOrigin,
+    pub user_event_sequence: u64,
+    pub turn_id: String,
+    #[serde(default)]
+    pub completion: Option<PluginAutomationTurnCompletion>,
+}
+
+/// Terminal completion associated with one plugin automation operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAutomationTurnCompletion {
+    pub outcome: bcode_session_models::ModelTurnOutcome,
+    #[serde(default)]
+    pub message: Option<String>,
+    pub event_sequence: u64,
+}
+
+/// Result of atomically comparing and submitting plugin automation work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case")]
+pub enum PluginAutomationTurnDisposition {
+    Accepted {
+        operation: PluginAutomationOperation,
+    },
+    AlreadyAccepted {
+        operation: PluginAutomationOperation,
+    },
+    SessionChanged {
+        current_generation: u64,
+    },
+    ManualInputPending {
+        pending_messages: u32,
+    },
+    SessionBusy,
+    AutomationHeld,
 }
 
 /// Server process identity and lifecycle metadata.
@@ -1207,6 +1313,16 @@ pub enum ResponsePayload {
         bytes: Vec<u8>,
     },
     PluginInvocationActionAccepted,
+    PluginAutomationSnapshot {
+        snapshot: PluginAutomationSnapshot,
+    },
+    PluginAutomationTurn {
+        result: PluginAutomationTurnDisposition,
+    },
+    PluginAutomationOperation {
+        #[serde(default)]
+        operation: Option<PluginAutomationOperation>,
+    },
 }
 
 /// Structured error response.

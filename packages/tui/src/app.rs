@@ -4409,7 +4409,9 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. }
-        | SessionEventKind::ModelTurnFinished { .. } => true,
+        | SessionEventKind::ModelTurnFinished { .. }
+        | SessionEventKind::PluginAutomationTurnStarted { .. }
+        | SessionEventKind::PluginAutomationTurnFinished { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
         SessionEventKind::SessionCreated { .. }
         | SessionEventKind::ClientAttached { .. }

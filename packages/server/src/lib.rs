@@ -190,6 +190,7 @@ pub struct ServerState {
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
+    plugin_automation_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
@@ -328,6 +329,7 @@ struct SessionRuntimeHandle {
     queued_followups: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+    plugin_automation_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -444,6 +446,14 @@ enum FollowupCommand {
         client_id: ClientId,
         selection: SessionModelSelection,
         response: oneshot::Sender<Result<String, CompactionError>>,
+    },
+    PluginAutomation {
+        client_id: ClientId,
+        runtime_context: Option<ClientRuntimeContext>,
+        request: bcode_ipc::PluginAutomationTurnRequest,
+        user_event: Box<bcode_session_models::SessionEvent>,
+        turn_id: String,
+        completion: oneshot::Sender<ModelTurnCompletion>,
     },
 }
 
@@ -1035,6 +1045,7 @@ impl ServerState {
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
+            plugin_automation_locks: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
@@ -2054,6 +2065,16 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::ActiveSkills { session_id }
         | Request::SetSessionAgent { session_id, .. }
         | Request::ChangeSessionWorkingDirectory { session_id, .. }
+        | Request::PluginAutomationSnapshot(bcode_ipc::PluginAutomationSnapshotRequest {
+            session_id,
+        })
+        | Request::SubmitPluginAutomationTurn(bcode_ipc::PluginAutomationTurnRequest {
+            session_id,
+            ..
+        })
+        | Request::LookupPluginAutomationOperation(
+            bcode_ipc::PluginAutomationOperationLookupRequest { session_id, .. },
+        )
         | Request::ListRuntimeWork { session_id }
         | Request::RuntimeWorkHistory { session_id, .. }
         | Request::SubscribeRuntimeWork { session_id }
@@ -2098,6 +2119,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::InvokePluginService { .. } => "invoke_plugin_service",
         Request::CallPluginService { .. } => "call_plugin_service",
         Request::PublishPluginEvent { .. } => "publish_plugin_event",
+        Request::PluginAutomationSnapshot(_) => "plugin_automation_snapshot",
+        Request::SubmitPluginAutomationTurn(_) => "submit_plugin_automation_turn",
+        Request::LookupPluginAutomationOperation(_) => "lookup_plugin_automation_operation",
         Request::UpdateClientRuntimeContext { .. } => "update_client_runtime_context",
         Request::ChangeSessionWorkingDirectory { .. } => "change_session_working_directory",
         Request::ListWorktrees(_) => "list_worktrees",
@@ -2285,6 +2309,16 @@ async fn handle_request_inner(
         }
         Request::RecordRalphLifecycle(request) => {
             handle_record_ralph_lifecycle(request_id, state, writer, request).await
+        }
+        Request::PluginAutomationSnapshot(request) => {
+            handle_plugin_automation_snapshot(request_id, state, writer, request).await
+        }
+        Request::SubmitPluginAutomationTurn(request) => {
+            handle_submit_plugin_automation_turn(request_id, client_id, state, writer, request)
+                .await
+        }
+        Request::LookupPluginAutomationOperation(request) => {
+            handle_lookup_plugin_automation_operation(request_id, state, writer, request).await
         }
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
@@ -2628,7 +2662,10 @@ async fn handle_agent_permission_plugin_request(
         | Request::ListRalphIterations(_)
         | Request::ResumeRalphRun(_)
         | Request::RalphRunStatus(_)
-        | Request::RecordRalphLifecycle(_) => {
+        | Request::RecordRalphLifecycle(_)
+        | Request::PluginAutomationSnapshot(_)
+        | Request::SubmitPluginAutomationTurn(_)
+        | Request::LookupPluginAutomationOperation(_) => {
             unreachable!("primary request routed to primary handler")
         }
         _ => unreachable!("primary request routed to agent/permission/plugin handler"),
@@ -5931,6 +5968,8 @@ async fn enqueue_user_message_command(
     text: String,
     placement: bcode_ipc::PromptPlacement,
 ) -> Result<MessageQueueStatus, ServerError> {
+    let automation_lock = plugin_automation_lock(state, session_id).await;
+    let _automation_guard = automation_lock.lock().await;
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
     let phase_snapshot = *handle.phase.lock().await;
@@ -6196,6 +6235,7 @@ async fn session_runtime_handle(
     let cancel_receiver = Arc::new(Mutex::new(Some(cancel_receiver)));
     let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
     let current_turn = Arc::new(Mutex::new(None));
+    let plugin_automation_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = SessionRuntimeHandle {
         followup_commands,
         steering_commands,
@@ -6203,6 +6243,7 @@ async fn session_runtime_handle(
         queued_followups: Arc::clone(&queued_followups),
         phase: Arc::clone(&phase),
         current_turn: Arc::clone(&current_turn),
+        plugin_automation_active: Arc::clone(&plugin_automation_active),
     };
     runtimes.insert(session_id, handle.clone());
     drop(runtimes);
@@ -6217,6 +6258,7 @@ async fn session_runtime_handle(
             queued_followups,
             phase,
             current_turn,
+            plugin_automation_active,
         ))
         .await;
     });
@@ -6233,6 +6275,7 @@ async fn run_session_runtime(
     queued_followups: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+    plugin_automation_active: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut permit = SessionTurnPermit::new(session_id);
     let mut followup_commands = followup_commands
@@ -6346,6 +6389,34 @@ async fn run_session_runtime(
                     display_text,
                 ))
                 .await;
+            }
+            FollowupCommand::PluginAutomation {
+                client_id,
+                runtime_context,
+                request,
+                user_event,
+                turn_id,
+                completion,
+            } => {
+                plugin_automation_active.store(true, Ordering::Release);
+                Box::pin(process_plugin_automation_command(
+                    &state,
+                    &mut permit,
+                    Arc::clone(&phase),
+                    &mut followup_commands,
+                    &mut steering_commands,
+                    &mut cancel_commands,
+                    queued_followups.as_ref(),
+                    Arc::clone(&current_turn),
+                    client_id,
+                    runtime_context,
+                    request,
+                    *user_event,
+                    turn_id,
+                    completion,
+                ))
+                .await;
+                plugin_automation_active.store(false, Ordering::Release);
             }
             FollowupCommand::CompactSession {
                 client_id,
@@ -6784,6 +6855,60 @@ async fn process_existing_user_event_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn process_plugin_automation_command(
+    state: &ServerState,
+    permit: &mut SessionTurnPermit,
+    phase: Arc<Mutex<SessionRuntimePhase>>,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
+    queued_followups: &AtomicUsize,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+    client_id: ClientId,
+    runtime_context: Option<ClientRuntimeContext>,
+    request: bcode_ipc::PluginAutomationTurnRequest,
+    user_event: bcode_session_models::SessionEvent,
+    turn_id: String,
+    completion_sender: oneshot::Sender<ModelTurnCompletion>,
+) {
+    set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
+    suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
+    let mut command_context = RuntimeCommandContext::new(
+        followup_commands,
+        steering_commands,
+        cancel_commands,
+        queued_followups,
+        Arc::clone(&current_turn),
+    );
+    let completion = Box::pin(run_model_turn(
+        state,
+        permit,
+        &user_event,
+        client_id,
+        runtime_context,
+        &mut command_context,
+        &phase,
+    ))
+    .await;
+    set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
+    if let Ok(event) = state
+        .sessions
+        .append_plugin_automation_turn_finished(
+            permit.session_id(),
+            request.origin.plugin_id,
+            request.origin.operation_id,
+            turn_id,
+            completion.outcome,
+            completion.message.clone(),
+        )
+        .await
+    {
+        publish_session_event(state, &event).await;
+    }
+    let _sent = completion_sender.send(completion);
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn process_skill_invocation_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
@@ -7054,6 +7179,268 @@ async fn submit_session_model_turn_and_wait(
     )
     .await?;
     receiver.await.map_err(ServerError::from)
+}
+
+async fn plugin_automation_lock(state: &ServerState, session_id: SessionId) -> Arc<Mutex<()>> {
+    let mut locks = state.plugin_automation_locks.lock().await;
+    Arc::clone(
+        locks
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+async fn plugin_automation_generation(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<u64, ServerError> {
+    let page = state
+        .sessions
+        .session_history_page(
+            session_id,
+            bcode_session_models::SessionHistoryQuery {
+                cursor: None,
+                limit: 1,
+                direction: bcode_session_models::SessionHistoryDirection::Backward,
+            },
+        )
+        .await?;
+    Ok(page.events.first().map_or(0, |event| event.sequence))
+}
+
+fn automation_operation_from_events(
+    events: &[bcode_session_models::SessionEvent],
+    plugin_id: &str,
+    operation_id: &str,
+) -> Option<bcode_ipc::PluginAutomationOperation> {
+    let started = events.iter().find_map(|event| match &event.kind {
+        SessionEventKind::PluginAutomationTurnStarted {
+            plugin_id: event_plugin_id,
+            run_id,
+            operation_id: event_operation_id,
+            display_label,
+            turn_id,
+            user_event_sequence,
+            ..
+        } if event_plugin_id == plugin_id && event_operation_id == operation_id => Some((
+            bcode_ipc::PluginAutomationOrigin {
+                plugin_id: event_plugin_id.clone(),
+                run_id: run_id.clone(),
+                operation_id: event_operation_id.clone(),
+                display_label: display_label.clone(),
+            },
+            turn_id.clone(),
+            *user_event_sequence,
+        )),
+        _ => None,
+    })?;
+    let completion = events.iter().find_map(|event| match &event.kind {
+        SessionEventKind::PluginAutomationTurnFinished {
+            plugin_id: event_plugin_id,
+            operation_id: event_operation_id,
+            outcome,
+            message,
+            ..
+        } if event_plugin_id == plugin_id && event_operation_id == operation_id => {
+            Some(bcode_ipc::PluginAutomationTurnCompletion {
+                outcome: *outcome,
+                message: message.clone(),
+                event_sequence: event.sequence,
+            })
+        }
+        _ => None,
+    });
+    Some(bcode_ipc::PluginAutomationOperation {
+        origin: started.0,
+        user_event_sequence: started.2,
+        turn_id: started.1,
+        completion,
+    })
+}
+
+async fn lookup_plugin_automation_operation(
+    state: &ServerState,
+    request: &bcode_ipc::PluginAutomationOperationLookupRequest,
+) -> Result<Option<bcode_ipc::PluginAutomationOperation>, ServerError> {
+    let events = state
+        .sessions
+        .plugin_automation_operation_events(
+            request.session_id,
+            &request.plugin_id,
+            &request.operation_id,
+        )
+        .await?;
+    Ok(automation_operation_from_events(
+        &events,
+        &request.plugin_id,
+        &request.operation_id,
+    ))
+}
+
+async fn handle_plugin_automation_snapshot(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::PluginAutomationSnapshotRequest,
+) -> Result<(), ServerError> {
+    state.sessions.session_summary(request.session_id).await?;
+    let handle = session_runtime_handle(state, request.session_id).await;
+    let snapshot = bcode_ipc::PluginAutomationSnapshot {
+        session_id: request.session_id,
+        generation: plugin_automation_generation(state, request.session_id).await?,
+        pending_manual_messages: usize_to_u32_saturating(
+            handle.queued_followups.load(Ordering::Acquire),
+        ),
+        session_busy: handle.phase.lock().await.has_active_work(),
+        plugin_automation_active: handle.plugin_automation_active.load(Ordering::Acquire),
+        automation_held: false,
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PluginAutomationSnapshot { snapshot }),
+    )
+    .await
+}
+
+async fn handle_lookup_plugin_automation_operation(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::PluginAutomationOperationLookupRequest,
+) -> Result<(), ServerError> {
+    let operation = lookup_plugin_automation_operation(state, &request).await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PluginAutomationOperation { operation }),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_submit_plugin_automation_turn(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::PluginAutomationTurnRequest,
+) -> Result<(), ServerError> {
+    let lock = plugin_automation_lock(state, request.session_id).await;
+    let _guard = lock.lock().await;
+    let lookup = bcode_ipc::PluginAutomationOperationLookupRequest {
+        session_id: request.session_id,
+        plugin_id: request.origin.plugin_id.clone(),
+        operation_id: request.origin.operation_id.clone(),
+    };
+    if let Some(operation) = lookup_plugin_automation_operation(state, &lookup).await? {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::PluginAutomationTurn {
+                result: bcode_ipc::PluginAutomationTurnDisposition::AlreadyAccepted { operation },
+            }),
+        )
+        .await;
+    }
+    let handle = session_runtime_handle(state, request.session_id).await;
+    let pending = handle.queued_followups.load(Ordering::Acquire);
+    if pending > 0 {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::PluginAutomationTurn {
+                result: bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending {
+                    pending_messages: usize_to_u32_saturating(pending),
+                },
+            }),
+        )
+        .await;
+    }
+    if handle.phase.lock().await.has_active_work() {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::PluginAutomationTurn {
+                result: bcode_ipc::PluginAutomationTurnDisposition::SessionBusy,
+            }),
+        )
+        .await;
+    }
+    let generation = plugin_automation_generation(state, request.session_id).await?;
+    if generation != request.expected_generation {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::PluginAutomationTurn {
+                result: bcode_ipc::PluginAutomationTurnDisposition::SessionChanged {
+                    current_generation: generation,
+                },
+            }),
+        )
+        .await;
+    }
+    let events = state
+        .sessions
+        .append_user_message(request.session_id, client_id, request.text.clone())
+        .await?;
+    for event in &events {
+        publish_session_event(state, event).await;
+    }
+    let user_event = events
+        .last()
+        .cloned()
+        .ok_or_else(|| bcode_session::SessionError::NotFound(request.session_id))?;
+    let turn_id = format!("{}-{}", request.session_id, user_event.sequence);
+    let started = state
+        .sessions
+        .append_plugin_automation_turn_started(
+            request.session_id,
+            request.origin.plugin_id.clone(),
+            request.origin.run_id.clone(),
+            request.origin.operation_id.clone(),
+            request.origin.display_label.clone(),
+            turn_id.clone(),
+            user_event.sequence,
+            request.execution_policy
+                == bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection,
+        )
+        .await?;
+    publish_session_event(state, &started).await;
+    let operation = bcode_ipc::PluginAutomationOperation {
+        origin: request.origin.clone(),
+        user_event_sequence: user_event.sequence,
+        turn_id: turn_id.clone(),
+        completion: None,
+    };
+    let (completion, _receiver) = oneshot::channel();
+    let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
+    debug_assert_eq!(pending_before, 0);
+    let session_id = request.session_id;
+    if handle
+        .followup_commands
+        .send(FollowupCommand::PluginAutomation {
+            client_id,
+            runtime_context: state.client_runtime_context(client_id).await,
+            request,
+            user_event: Box::new(user_event),
+            turn_id,
+            completion,
+        })
+        .await
+        .is_err()
+    {
+        handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+        return Err(bcode_session::SessionError::NotFound(session_id).into());
+    }
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PluginAutomationTurn {
+            result: bcode_ipc::PluginAutomationTurnDisposition::Accepted { operation },
+        }),
+    )
+    .await
 }
 
 async fn handle_user_message(
@@ -16696,6 +17083,8 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
+        SessionEventKind::PluginAutomationTurnStarted { .. } => "plugin_automation_turn_started",
+        SessionEventKind::PluginAutomationTurnFinished { .. } => "plugin_automation_turn_finished",
     }
 }
 
@@ -22926,5 +23315,48 @@ mod tests {
 
         finish_current_turn(&context).await;
         assert!(current_turn.lock().await.is_none());
+    }
+
+    #[test]
+    fn automation_operation_projection_reconciles_started_and_finished_events() {
+        let session_id = SessionId::new();
+        let events = vec![
+            session_event(
+                session_id,
+                5,
+                SessionEventKind::PluginAutomationTurnStarted {
+                    plugin_id: "bcode.test".to_owned(),
+                    run_id: "run-1".to_owned(),
+                    operation_id: "operation-1".to_owned(),
+                    display_label: "Test operation".to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    user_event_sequence: 4,
+                    read_only: false,
+                },
+            ),
+            session_event(
+                session_id,
+                8,
+                SessionEventKind::PluginAutomationTurnFinished {
+                    plugin_id: "bcode.test".to_owned(),
+                    operation_id: "operation-1".to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    outcome: ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            ),
+        ];
+
+        let operation = automation_operation_from_events(&events, "bcode.test", "operation-1")
+            .expect("operation should reconcile");
+        assert_eq!(operation.user_event_sequence, 4);
+        assert_eq!(operation.turn_id, "turn-1");
+        assert_eq!(
+            operation
+                .completion
+                .map(|completion| completion.event_sequence),
+            Some(8)
+        );
+        assert!(automation_operation_from_events(&events, "other", "operation-1").is_none());
     }
 }

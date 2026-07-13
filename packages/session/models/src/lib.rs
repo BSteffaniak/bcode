@@ -232,7 +232,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 28;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 29;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -1824,6 +1824,25 @@ pub enum SessionEventKind {
     /// Exact or estimated context occupancy associated with a request boundary.
     ContextUsageObserved {
         snapshot: ContextUsageSnapshot,
+    },
+    /// Durable generic origin marker for plugin-submitted automation.
+    PluginAutomationTurnStarted {
+        plugin_id: String,
+        run_id: String,
+        operation_id: String,
+        display_label: String,
+        turn_id: String,
+        user_event_sequence: u64,
+        read_only: bool,
+    },
+    /// Durable generic completion marker for plugin-submitted automation.
+    PluginAutomationTurnFinished {
+        plugin_id: String,
+        operation_id: String,
+        turn_id: String,
+        outcome: ModelTurnOutcome,
+        #[serde(default)]
+        message: Option<String>,
     },
 }
 

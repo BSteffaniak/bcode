@@ -1527,6 +1527,31 @@ impl SessionManager {
         Err(SessionError::NotFound(session_id))
     }
 
+    /// Return canonical generic plugin automation events for one operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn plugin_automation_operation_events(
+        &self,
+        session_id: SessionId,
+        plugin_id: &str,
+        operation_id: &str,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        let db_path = db::session_db_path(&store.root_path(), session_id);
+        if !db_path.exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db
+            .plugin_automation_operation_events(plugin_id, operation_id)
+            .await?)
+    }
+
     /// Return a semantic projection window for a session.
     ///
     /// # Errors
@@ -2448,6 +2473,65 @@ impl SessionManager {
                 turn_id,
                 requested_at_ms,
                 client_id,
+            },
+        )
+        .await
+    }
+
+    /// Append a generic plugin automation turn origin marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_plugin_automation_turn_started(
+        &self,
+        session_id: SessionId,
+        plugin_id: String,
+        run_id: String,
+        operation_id: String,
+        display_label: String,
+        turn_id: String,
+        user_event_sequence: u64,
+        read_only: bool,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::PluginAutomationTurnStarted {
+                plugin_id,
+                run_id,
+                operation_id,
+                display_label,
+                turn_id,
+                user_event_sequence,
+                read_only,
+            },
+        )
+        .await
+    }
+
+    /// Append a generic plugin automation turn completion marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_plugin_automation_turn_finished(
+        &self,
+        session_id: SessionId,
+        plugin_id: String,
+        operation_id: String,
+        turn_id: String,
+        outcome: ModelTurnOutcome,
+        message: Option<String>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::PluginAutomationTurnFinished {
+                plugin_id,
+                operation_id,
+                turn_id,
+                outcome,
+                message,
             },
         )
         .await

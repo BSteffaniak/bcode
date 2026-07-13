@@ -8,14 +8,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
 
 use bcode_client::{BcodeClient, SessionWatchEvent};
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
 };
-use bcode_ipc::PromptPlacement;
 use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
@@ -541,6 +539,7 @@ impl LoopState {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_loop(mut state: LoopState) {
     loop {
         if refresh_cancel(&mut state) {
@@ -552,94 +551,168 @@ async fn run_loop(mut state: LoopState) {
             let _saved = save_state(&state);
             return;
         }
-        state.current_iteration = state.current_iteration.saturating_add(1);
+        let iteration_number = state.current_iteration.saturating_add(1);
         state.state = RunState::Running;
-        if save_state(&state).is_err() {
-            return;
-        }
-        let iteration = state.iteration_prompt.clone();
-        let completion = run_turn(state.session_id, iteration).await;
-        let finished_sequence = match completion {
-            Ok(completion) if completion.outcome == ModelTurnOutcome::Completed => {
-                completion.sequence
-            }
-            Ok(completion) => {
-                state.state = RunState::Paused;
-                state.stop_reason = Some(format!("iteration ended with {:?}", completion.outcome));
-                let _saved = save_state(&state);
-                return;
-            }
-            Err(error) => {
-                state.state = RunState::Failed;
-                state.stop_reason = Some(error);
-                let _saved = save_state(&state);
-                return;
+        let _saved = save_state(&state);
+        let completion = loop {
+            let generation = match wait_until_automation_ready(state.session_id).await {
+                Ok(generation) => generation,
+                Err(error) => {
+                    fail_run(&mut state, error);
+                    return;
+                }
+            };
+            let result = run_automation_turn(
+                state.session_id,
+                &state.run_id,
+                format!("{}:iteration:{iteration_number}", state.run_id),
+                format!("Loop iteration {iteration_number}"),
+                state.iteration_prompt.clone(),
+                generation,
+                bcode_ipc::PluginAutomationExecutionPolicy::Normal,
+            )
+            .await;
+            match result {
+                Ok(completion) => break completion,
+                Err(AutomationTurnError::Retry) => {}
+                Err(AutomationTurnError::Fatal(error)) => {
+                    fail_run(&mut state, error);
+                    return;
+                }
             }
         };
+        state.current_iteration = iteration_number;
+        if completion.outcome != ModelTurnOutcome::Completed {
+            pause_run(
+                &mut state,
+                format!("iteration ended with {:?}", completion.outcome),
+            );
+            return;
+        }
         if refresh_cancel(&mut state) {
             return;
         }
-        let conversation_sequence =
-            wait_for_queued_steering(state.session_id, finished_sequence).await;
-        state.state = RunState::Evaluating;
-        let _saved = save_state(&state);
-        let evaluation_prompt = evaluator_prompt(&state.stop_condition);
-        let evaluation_completion = run_evaluation_turn(state.session_id, evaluation_prompt).await;
-        let (evaluation, _evaluation_sequence) = match evaluation_completion {
-            Ok(completion) if completion.outcome == ModelTurnOutcome::Completed => {
-                match parse_evaluation(&completion.assistant_text) {
-                    Ok(evaluation) => (evaluation, completion.sequence),
-                    Err(error) => {
-                        state.state = RunState::Paused;
-                        state.stop_reason = Some(error);
-                        let _saved = save_state(&state);
-                        return;
-                    }
-                }
-            }
-            Ok(completion) => {
-                state.state = RunState::Paused;
-                state.stop_reason = Some(format!("evaluation ended with {:?}", completion.outcome));
-                let _saved = save_state(&state);
-                return;
-            }
+        let mut source_generation = match wait_until_automation_ready(state.session_id).await {
+            Ok(generation) => generation,
             Err(error) => {
-                state.state = RunState::Paused;
-                state.stop_reason = Some(error);
-                let _saved = save_state(&state);
+                fail_run(&mut state, error);
                 return;
             }
         };
-        if latest_user_sequence_after(state.session_id, conversation_sequence)
-            .await
-            .is_some()
-        {
-            state.state = RunState::Steering;
-            state.latest_evaluation = None;
+        loop {
+            state.state = RunState::Evaluating;
             let _saved = save_state(&state);
-            let _conversation_sequence =
-                wait_for_queued_steering(state.session_id, conversation_sequence).await;
-            continue;
-        }
-        state.latest_evaluation = Some(evaluation.clone());
-        if evaluation.condition_met {
-            state.state = RunState::Completed;
-            state.stop_reason = Some(evaluation.summary);
+            let operation_id = format!(
+                "{}:evaluation:{}:{source_generation}",
+                state.run_id, state.current_iteration
+            );
+            let evaluation = run_evaluation_turn(
+                state.session_id,
+                &state.run_id,
+                operation_id,
+                evaluator_prompt(&state.stop_condition),
+            )
+            .await;
+            let evaluation = match evaluation {
+                Ok(completion) if completion.outcome == ModelTurnOutcome::Completed => {
+                    match parse_evaluation(&completion.assistant_text) {
+                        Ok(evaluation) => evaluation,
+                        Err(error) => {
+                            pause_run(&mut state, error);
+                            return;
+                        }
+                    }
+                }
+                Ok(completion) => {
+                    pause_run(
+                        &mut state,
+                        format!("evaluation ended with {:?}", completion.outcome),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    pause_run(&mut state, error);
+                    return;
+                }
+            };
+            let current_generation = match wait_until_automation_ready(state.session_id).await {
+                Ok(generation) => generation,
+                Err(error) => {
+                    fail_run(&mut state, error);
+                    return;
+                }
+            };
+            if current_generation != source_generation {
+                state.state = RunState::Steering;
+                state.latest_evaluation = None;
+                let _saved = save_state(&state);
+                source_generation = current_generation;
+                continue;
+            }
+            state.latest_evaluation = Some(evaluation.clone());
+            if evaluation.condition_met {
+                state.state = RunState::Completed;
+                state.stop_reason = Some(evaluation.summary);
+                let _saved = save_state(&state);
+                return;
+            }
             let _saved = save_state(&state);
-            return;
+            break;
         }
-        let _saved = save_state(&state);
     }
+}
+
+fn pause_run(state: &mut LoopState, reason: String) {
+    state.state = RunState::Paused;
+    state.stop_reason = Some(reason);
+    let _saved = save_state(state);
+}
+
+fn fail_run(state: &mut LoopState, reason: String) {
+    state.state = RunState::Failed;
+    state.stop_reason = Some(reason);
+    let _saved = save_state(state);
 }
 
 struct TurnCompletion {
     outcome: ModelTurnOutcome,
     assistant_text: String,
-    sequence: u64,
+}
+
+async fn wait_until_automation_ready(session_id: SessionId) -> Result<u64, String> {
+    let client = BcodeClient::default_endpoint();
+    let mut watcher = client
+        .watch_session(session_id, 1)
+        .await
+        .map_err(|error| error.to_string())?;
+    let _initial = watcher.take_initial();
+    loop {
+        let snapshot = client
+            .plugin_automation_snapshot(session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if (!snapshot.session_busy || snapshot.plugin_automation_active)
+            && snapshot.pending_manual_messages == 0
+            && !snapshot.automation_held
+        {
+            return Ok(snapshot.generation);
+        }
+        let _event = watcher
+            .next_event()
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+}
+
+enum AutomationTurnError {
+    Retry,
+    Fatal(String),
 }
 
 async fn run_evaluation_turn(
     source_session_id: SessionId,
+    run_id: &str,
+    operation_id: String,
     prompt: String,
 ) -> Result<TurnCompletion, String> {
     let client = BcodeClient::default_endpoint();
@@ -651,42 +724,106 @@ async fn run_evaluation_turn(
         .await
         .map_err(|error| format!("failed to create evaluator session: {error}"))?;
     let evaluator_session_id = clone.session.id;
-    let result = run_turn(evaluator_session_id, prompt).await;
+    let generation = wait_until_automation_ready(evaluator_session_id).await?;
+    let result = run_automation_turn(
+        evaluator_session_id,
+        run_id,
+        operation_id,
+        "Loop evaluator".to_owned(),
+        prompt,
+        generation,
+        bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection,
+    )
+    .await;
     let cleanup = client.delete_session(evaluator_session_id).await;
     match (result, cleanup) {
         (Ok(completion), Ok(_deleted)) => Ok(completion),
         (Ok(_completion), Err(error)) => {
             Err(format!("failed to remove evaluator session: {error}"))
         }
-        (Err(error), _) => Err(error),
+        (Err(AutomationTurnError::Fatal(error)), _) => Err(error),
+        (Err(AutomationTurnError::Retry), _) => {
+            Err("evaluator automation was preempted before submission".to_owned())
+        }
     }
 }
 
-async fn run_turn(session_id: SessionId, prompt: String) -> Result<TurnCompletion, String> {
+async fn run_automation_turn(
+    session_id: SessionId,
+    run_id: &str,
+    operation_id: String,
+    display_label: String,
+    text: String,
+    expected_generation: u64,
+    execution_policy: bcode_ipc::PluginAutomationExecutionPolicy,
+) -> Result<TurnCompletion, AutomationTurnError> {
     let client = BcodeClient::default_endpoint();
     let mut watcher = client
-        .watch_session(session_id, 1)
+        .watch_session(session_id, 32)
         .await
-        .map_err(|error| error.to_string())?;
-    let _initial = watcher.take_initial();
-    client
-        .send_user_message(session_id, prompt, PromptPlacement::FollowUp)
+        .map_err(|error| AutomationTurnError::Fatal(error.to_string()))?;
+    let initial = watcher.take_initial();
+    let result = client
+        .submit_plugin_automation_turn(bcode_ipc::PluginAutomationTurnRequest {
+            session_id,
+            origin: bcode_ipc::PluginAutomationOrigin {
+                plugin_id: PLUGIN_ID.to_owned(),
+                run_id: run_id.to_owned(),
+                operation_id: operation_id.clone(),
+                display_label,
+            },
+            text,
+            expected_generation,
+            execution_policy,
+        })
         .await
-        .map_err(|error| error.to_string())?;
-    let mut assistant_text = String::new();
+        .map_err(|error| AutomationTurnError::Fatal(error.to_string()))?;
+    let operation = match result {
+        bcode_ipc::PluginAutomationTurnDisposition::Accepted { operation }
+        | bcode_ipc::PluginAutomationTurnDisposition::AlreadyAccepted { operation } => operation,
+        bcode_ipc::PluginAutomationTurnDisposition::SessionChanged { .. }
+        | bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending { .. }
+        | bcode_ipc::PluginAutomationTurnDisposition::SessionBusy
+        | bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld => {
+            return Err(AutomationTurnError::Retry);
+        }
+    };
+    let mut assistant_text = initial
+        .as_ref()
+        .and_then(|attached| {
+            assistant_text_for_operation(
+                &attached.history,
+                operation.user_event_sequence,
+                operation
+                    .completion
+                    .as_ref()
+                    .map(|value| value.event_sequence),
+            )
+        })
+        .unwrap_or_default();
+    if let Some(completion) = operation.completion {
+        return Ok(TurnCompletion {
+            outcome: completion.outcome,
+            assistant_text,
+        });
+    }
     loop {
-        let event = watcher
+        if let SessionWatchEvent::Durable(event) = watcher
             .next_event()
             .await
-            .map_err(|error| error.to_string())?;
-        if let SessionWatchEvent::Durable(event) = event {
-            match event.kind {
-                SessionEventKind::AssistantMessage { text } => assistant_text = text,
-                SessionEventKind::ModelTurnFinished { outcome, .. } => {
+            .map_err(|error| AutomationTurnError::Fatal(error.to_string()))?
+        {
+            match &event.kind {
+                SessionEventKind::AssistantMessage { text } => assistant_text.clone_from(text),
+                SessionEventKind::PluginAutomationTurnFinished {
+                    plugin_id,
+                    operation_id: event_operation_id,
+                    outcome,
+                    ..
+                } if plugin_id == PLUGIN_ID && event_operation_id == &operation_id => {
                     return Ok(TurnCompletion {
-                        outcome,
+                        outcome: *outcome,
                         assistant_text,
-                        sequence: event.sequence,
                     });
                 }
                 _ => {}
@@ -695,72 +832,22 @@ async fn run_turn(session_id: SessionId, prompt: String) -> Result<TurnCompletio
     }
 }
 
-async fn wait_for_queued_steering(session_id: SessionId, mut sequence: u64) -> u64 {
-    for _ in 0..10 {
-        let Some(user_sequence) = latest_user_sequence_after(session_id, sequence).await else {
-            break;
-        };
-        sequence = wait_for_turn_after(session_id, user_sequence)
-            .await
-            .unwrap_or(user_sequence);
-    }
-    sequence
-}
-
-async fn latest_user_sequence_after(session_id: SessionId, sequence: u64) -> Option<u64> {
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    BcodeClient::default_endpoint()
-        .session_history_page(
-            session_id,
-            bcode_session_models::SessionHistoryQuery {
-                cursor: None,
-                limit: 64,
-                direction: bcode_session_models::SessionHistoryDirection::Backward,
-            },
-        )
-        .await
-        .ok()
-        .and_then(|page| {
-            page.events
-                .iter()
-                .filter(|event| {
-                    event.sequence > sequence
-                        && matches!(event.kind, SessionEventKind::UserMessage { .. })
-                })
-                .map(|event| event.sequence)
-                .max()
+fn assistant_text_for_operation(
+    events: &[bcode_session_models::SessionEvent],
+    start_sequence: u64,
+    end_sequence: Option<u64>,
+) -> Option<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event.sequence > start_sequence
+                && end_sequence.is_none_or(|end_sequence| event.sequence < end_sequence)
         })
-}
-
-async fn wait_for_turn_after(session_id: SessionId, sequence: u64) -> Option<u64> {
-    for _ in 0..300 {
-        let finished = BcodeClient::default_endpoint()
-            .session_history_page(
-                session_id,
-                bcode_session_models::SessionHistoryQuery {
-                    cursor: None,
-                    limit: 64,
-                    direction: bcode_session_models::SessionHistoryDirection::Backward,
-                },
-            )
-            .await
-            .ok()
-            .and_then(|page| {
-                page.events
-                    .iter()
-                    .filter(|event| {
-                        event.sequence > sequence
-                            && matches!(event.kind, SessionEventKind::ModelTurnFinished { .. })
-                    })
-                    .map(|event| event.sequence)
-                    .min()
-            });
-        if finished.is_some() {
-            return finished;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    None
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::AssistantMessage { text } => Some(text.clone()),
+            _ => None,
+        })
+        .next_back()
 }
 
 fn evaluator_prompt(condition: &str) -> String {
