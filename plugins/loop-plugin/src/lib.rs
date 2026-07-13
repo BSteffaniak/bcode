@@ -753,22 +753,15 @@ impl LoopState {
     }
 }
 
-async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String> {
-    let Some(pending) = state.pending_operation.clone() else {
-        return Ok(());
-    };
-    let operation = BcodeClient::default_endpoint()
-        .lookup_plugin_automation_operation(bcode_ipc::PluginAutomationOperationLookupRequest {
-            session_id: pending.target_session_id,
-            plugin_id: PLUGIN_ID.to_owned(),
-            operation_id: pending.operation_id.clone(),
-        })
-        .await
-        .map_err(|error| error.to_string())?;
+fn reconcile_observed_operation(
+    state: &mut LoopState,
+    pending: &PendingOperation,
+    operation: Option<bcode_ipc::PluginAutomationOperation>,
+) -> Result<(), String> {
     match (pending.status, operation) {
         (OperationStatus::Prepared, None) => {
             state.pending_operation = None;
-            save_state(state)
+            Ok(())
         }
         (_, None) => Err(format!(
             "automation operation {} is missing after it was recorded as accepted",
@@ -787,21 +780,51 @@ async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String
                     completion.outcome
                 ));
             }
+            let mut completed = pending.clone();
+            completed.status = OperationStatus::Completed;
+            completed.accepted_turn_id = Some(operation.turn_id);
+            completed.accepted_sequence = Some(operation.user_event_sequence);
+            completed.completion = Some(completion);
             match pending.kind {
                 OperationKind::Iteration { iteration } => {
                     state.current_iteration = state.current_iteration.max(iteration);
-                    state.pending_operation = None;
-                    save_state(state)
                 }
                 OperationKind::Evaluation { .. } => {
-                    state.pending_operation = None;
                     transition(state, RunState::Evaluating)?;
                     state.latest_evaluation = None;
-                    save_state(state)
                 }
             }
+            state.pending_operation = None;
+            state.last_completed_operation = Some(completed);
+            Ok(())
         }
     }
+}
+
+fn reconcile_observed_pending(
+    state: &mut LoopState,
+    operation: Option<bcode_ipc::PluginAutomationOperation>,
+) -> Result<(), String> {
+    let Some(pending) = state.pending_operation.clone() else {
+        return Ok(());
+    };
+    reconcile_observed_operation(state, &pending, operation)
+}
+
+async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String> {
+    let Some(pending) = state.pending_operation.clone() else {
+        return Ok(());
+    };
+    let operation = BcodeClient::default_endpoint()
+        .lookup_plugin_automation_operation(bcode_ipc::PluginAutomationOperationLookupRequest {
+            session_id: pending.target_session_id,
+            plugin_id: PLUGIN_ID.to_owned(),
+            operation_id: pending.operation_id.clone(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    reconcile_observed_pending(state, operation)?;
+    save_state(state)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -833,6 +856,9 @@ async fn run_loop(mut state: LoopState) {
             }
             let _saved = save_state(&state);
             let completion = loop {
+                if refresh_cancel(&mut state) {
+                    return;
+                }
                 let generation = match wait_until_automation_ready(state.session_id).await {
                     Ok(generation) => generation,
                     Err(error) => {
@@ -840,6 +866,9 @@ async fn run_loop(mut state: LoopState) {
                         return;
                     }
                 };
+                if refresh_cancel(&mut state) {
+                    return;
+                }
                 let session_id = state.session_id;
                 let operation_id = format!("{}:iteration:{iteration_number}", state.run_id);
                 let iteration_prompt = state.iteration_prompt.clone();
@@ -887,6 +916,9 @@ async fn run_loop(mut state: LoopState) {
                 return;
             }
         }
+        if refresh_cancel(&mut state) {
+            return;
+        }
         let mut source_generation = match wait_until_automation_ready(state.session_id).await {
             Ok(generation) => generation,
             Err(error) => {
@@ -895,6 +927,9 @@ async fn run_loop(mut state: LoopState) {
             }
         };
         loop {
+            if refresh_cancel(&mut state) {
+                return;
+            }
             if !transition_or_fail(&mut state, RunState::Evaluating) {
                 return;
             }
@@ -904,6 +939,9 @@ async fn run_loop(mut state: LoopState) {
                 state.run_id, state.current_iteration
             );
             let stop_condition = state.stop_condition.clone();
+            if refresh_cancel(&mut state) {
+                return;
+            }
             let evaluation = run_evaluation_turn(
                 &mut state,
                 source_generation,
@@ -1552,6 +1590,153 @@ mod tests {
             assert!(terminal.is_terminal());
             assert!(!matches!(terminal, RunState::Paused | RunState::Failed));
         }
+    }
+
+    fn pending_iteration(state: &LoopState, status: OperationStatus) -> PendingOperation {
+        PendingOperation {
+            operation_id: "operation-1".to_owned(),
+            kind: OperationKind::Iteration { iteration: 1 },
+            target_session_id: state.session_id,
+            expected_generation: 7,
+            status,
+            accepted_turn_id: (status != OperationStatus::Prepared).then(|| "turn-1".to_owned()),
+            accepted_sequence: (status != OperationStatus::Prepared).then_some(8),
+            completion: None,
+        }
+    }
+
+    fn observed_operation(
+        completion: Option<ModelTurnOutcome>,
+    ) -> bcode_ipc::PluginAutomationOperation {
+        bcode_ipc::PluginAutomationOperation {
+            origin: bcode_ipc::PluginAutomationOrigin {
+                plugin_id: PLUGIN_ID.to_owned(),
+                run_id: "run-1".to_owned(),
+                operation_id: "operation-1".to_owned(),
+                display_label: "Loop iteration 1".to_owned(),
+            },
+            user_event_sequence: 8,
+            turn_id: "turn-1".to_owned(),
+            completion: completion.map(|outcome| bcode_ipc::PluginAutomationTurnCompletion {
+                outcome,
+                message: None,
+                event_sequence: 12,
+            }),
+        }
+    }
+
+    #[test]
+    fn reconciliation_clears_unaccepted_prepared_operation() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Prepared));
+
+        reconcile_observed_pending(&mut state, None).expect("unaccepted preparation is safe");
+
+        assert!(state.pending_operation.is_none());
+        assert!(state.last_completed_operation.is_none());
+        assert_eq!(state.current_iteration, 0);
+    }
+
+    #[test]
+    fn reconciliation_recovers_acceptance_before_plugin_persistence() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Prepared));
+
+        let error = reconcile_observed_pending(&mut state, Some(observed_operation(None)))
+            .expect_err("accepted in-flight work must remain uncertain");
+
+        assert!(error.contains("may still be in flight"));
+        assert_eq!(
+            state
+                .pending_operation
+                .as_ref()
+                .map(|pending| pending.status),
+            Some(OperationStatus::Prepared)
+        );
+        assert_eq!(state.current_iteration, 0);
+    }
+
+    #[test]
+    fn reconciliation_recovers_terminal_completion_before_plugin_persistence() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
+
+        reconcile_observed_pending(
+            &mut state,
+            Some(observed_operation(Some(ModelTurnOutcome::Completed))),
+        )
+        .expect("completed accepted operation should reconcile");
+
+        assert!(state.pending_operation.is_none());
+        assert_eq!(state.current_iteration, 1);
+        let completed = state
+            .last_completed_operation
+            .as_ref()
+            .expect("completed journal retained");
+        assert_eq!(completed.status, OperationStatus::Completed);
+        assert_eq!(completed.accepted_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(completed.accepted_sequence, Some(8));
+        assert_eq!(
+            completed
+                .completion
+                .as_ref()
+                .map(|completion| completion.event_sequence),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn reconciliation_pauses_on_uncertain_or_failed_accepted_work() {
+        for operation in [
+            None,
+            Some(observed_operation(None)),
+            Some(observed_operation(Some(ModelTurnOutcome::Cancelled))),
+        ] {
+            let mut state = LoopState::new(
+                SessionId::new(),
+                "iterate".to_owned(),
+                "complete".to_owned(),
+                20,
+            );
+            state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
+
+            assert!(reconcile_observed_pending(&mut state, operation).is_err());
+            assert!(state.pending_operation.is_some());
+            assert_eq!(state.current_iteration, 0);
+        }
+    }
+
+    #[test]
+    fn repeated_reconciliation_cannot_count_iteration_twice() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
+        let operation = observed_operation(Some(ModelTurnOutcome::Completed));
+
+        reconcile_observed_pending(&mut state, Some(operation.clone())).expect("first resume");
+        reconcile_observed_pending(&mut state, Some(operation)).expect("duplicate resume");
+
+        assert_eq!(state.current_iteration, 1);
+        assert!(state.pending_operation.is_none());
     }
 
     #[test]
