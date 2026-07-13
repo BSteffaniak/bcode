@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 7;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 8;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -557,6 +557,9 @@ pub struct PluginAutomationSnapshot {
     pub generation: u64,
     /// Number of accepted manual messages waiting for execution.
     pub pending_manual_messages: u32,
+    /// Number of accepted steering messages waiting for execution.
+    #[serde(default)]
+    pub pending_steering_messages: u32,
     /// Whether session work is currently active.
     pub session_busy: bool,
     /// Whether the active session work belongs to a plugin automation operation.

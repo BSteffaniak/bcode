@@ -330,6 +330,7 @@ struct SessionRuntimeHandle {
     steering_commands: mpsc::Sender<SteeringCommand>,
     cancel_commands: mpsc::Sender<CancelCommand>,
     queued_followups: Arc<AtomicUsize>,
+    queued_steering: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     plugin_automation_active: Arc<std::sync::atomic::AtomicBool>,
@@ -435,6 +436,7 @@ enum FollowupCommand {
         client_id: ClientId,
         runtime_context: Option<ClientRuntimeContext>,
         user_event: Box<bcode_session_models::SessionEvent>,
+        queued_steering: Arc<AtomicUsize>,
         completion: Option<oneshot::Sender<ModelTurnCompletion>>,
     },
     SkillInvocation {
@@ -6112,6 +6114,7 @@ async fn enqueue_steering_message_command(
                 .await?
                 .ok_or_else(|| bcode_session::SessionError::NotFound(session_id))?;
             let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
+            handle.queued_steering.fetch_add(1, Ordering::AcqRel);
             let queue_position = Some(usize_to_u32_saturating(pending_before.saturating_add(1)));
             let send_result = handle
                 .followup_commands
@@ -6119,6 +6122,7 @@ async fn enqueue_steering_message_command(
                     client_id,
                     runtime_context,
                     user_event: Box::new(user_event),
+                    queued_steering: Arc::clone(&handle.queued_steering),
                     completion: None,
                 })
                 .await
@@ -6131,6 +6135,7 @@ async fn enqueue_steering_message_command(
                 });
             }
             handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+            handle.queued_steering.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -6260,6 +6265,7 @@ async fn session_runtime_handle(
     let (steering_commands, steering_receiver) = mpsc::channel(128);
     let (cancel_commands, cancel_receiver) = mpsc::channel(32);
     let queued_followups = Arc::new(AtomicUsize::new(0));
+    let queued_steering = Arc::new(AtomicUsize::new(0));
     let followup_receiver = Arc::new(Mutex::new(Some(followup_receiver)));
     let steering_receiver = Arc::new(Mutex::new(Some(steering_receiver)));
     let cancel_receiver = Arc::new(Mutex::new(Some(cancel_receiver)));
@@ -6271,6 +6277,7 @@ async fn session_runtime_handle(
         steering_commands,
         cancel_commands,
         queued_followups: Arc::clone(&queued_followups),
+        queued_steering: Arc::clone(&queued_steering),
         phase: Arc::clone(&phase),
         current_turn: Arc::clone(&current_turn),
         plugin_automation_active: Arc::clone(&plugin_automation_active),
@@ -6397,6 +6404,7 @@ async fn run_session_runtime(
                 runtime_context,
                 user_event,
                 completion,
+                ..
             } => {
                 Box::pin(process_existing_user_event_command(
                     &state,
@@ -6497,6 +6505,15 @@ enum RuntimeQueueCommand {
     Followup(Box<FollowupCommand>),
 }
 
+fn queued_steering_counter(command: &FollowupCommand) -> Option<&AtomicUsize> {
+    match command {
+        FollowupCommand::ContinueFromUserEvent {
+            queued_steering, ..
+        } => Some(queued_steering.as_ref()),
+        _ => None,
+    }
+}
+
 async fn next_runtime_queue_command(
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
@@ -6507,6 +6524,9 @@ async fn next_runtime_queue_command(
         command = cancel_commands.recv() => command.map(RuntimeQueueCommand::Cancel),
         command = followup_commands.recv() => command.map(|command| {
             queued_followups.fetch_sub(1, Ordering::AcqRel);
+            if let Some(queued_steering) = queued_steering_counter(&command) {
+                queued_steering.fetch_sub(1, Ordering::AcqRel);
+            }
             RuntimeQueueCommand::Followup(Box::new(command))
         }),
     }
@@ -6514,8 +6534,11 @@ async fn next_runtime_queue_command(
 
 fn drain_followup_commands(followup_commands: &mut mpsc::Receiver<FollowupCommand>) -> usize {
     let mut cleared = 0_usize;
-    while followup_commands.try_recv().is_ok() {
+    while let Ok(command) = followup_commands.try_recv() {
         cleared = cleared.saturating_add(1);
+        if let Some(queued_steering) = queued_steering_counter(&command) {
+            queued_steering.fetch_sub(1, Ordering::AcqRel);
+        }
     }
     cleared
 }
@@ -7447,6 +7470,9 @@ async fn handle_plugin_automation_snapshot(
         generation: plugin_automation_generation(state, request.session_id).await?,
         pending_manual_messages: usize_to_u32_saturating(
             handle.queued_followups.load(Ordering::Acquire),
+        ),
+        pending_steering_messages: usize_to_u32_saturating(
+            handle.queued_steering.load(Ordering::Acquire),
         ),
         session_busy: handle.phase.lock().await.has_active_work(),
         plugin_automation_active: handle.plugin_automation_active.load(Ordering::Acquire),
@@ -19910,6 +19936,7 @@ mod tests {
                 client_id,
                 runtime_context: None,
                 user_event: Box::new(trigger_event),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
                 completion: Some(turn_tx),
             },
         )
@@ -23799,14 +23826,16 @@ mod tests {
         let state = Arc::new(test_server_state(sessions));
         let (followup_tx, mut followup_rx) = mpsc::channel(4);
         let (steering_tx, _steering_rx) = mpsc::channel(1);
-        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         let queued = Arc::new(AtomicUsize::new(0));
+        let queued_steering = Arc::new(AtomicUsize::new(0));
         let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let handle = SessionRuntimeHandle {
             followup_commands: followup_tx,
             steering_commands: steering_tx,
             cancel_commands: cancel_tx,
             queued_followups: Arc::clone(&queued),
+            queued_steering: Arc::clone(&queued_steering),
             phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
             current_turn: Arc::new(Mutex::new(None)),
             plugin_automation_active: Arc::clone(&active),
@@ -23839,15 +23868,23 @@ mod tests {
         assert_eq!(first.queue_position, Some(1));
         assert_eq!(second.queue_position, Some(2));
         assert_eq!(queued.load(Ordering::Acquire), 2);
-        for expected in ["first", "second"] {
-            let command = followup_rx.recv().await.expect("queued steering");
-            let FollowupCommand::ContinueFromUserEvent { user_event, .. } = command else {
+        assert_eq!(queued_steering.load(Ordering::Acquire), 2);
+        for (index, expected) in ["first", "second"].into_iter().enumerate() {
+            let command =
+                next_runtime_queue_command(&mut cancel_rx, &mut followup_rx, queued.as_ref())
+                    .await
+                    .expect("queued steering");
+            let RuntimeQueueCommand::Followup(command) = command else {
+                panic!("expected followup");
+            };
+            let FollowupCommand::ContinueFromUserEvent { user_event, .. } = *command else {
                 panic!("expected persisted steering continuation");
             };
             let SessionEventKind::UserMessage { text, .. } = &user_event.kind else {
                 panic!("expected steering user event");
             };
             assert_eq!(text, expected);
+            assert_eq!(queued_steering.load(Ordering::Acquire), 1 - index);
         }
         let history = state
             .sessions
