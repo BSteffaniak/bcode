@@ -982,6 +982,113 @@ mod tests {
         );
     }
 
+    fn write_version_one_recording(path: &std::path::Path, output: &[u8]) {
+        use sha2::{Digest as _, Sha256};
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"BCSHREC\0");
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&80_u16.to_le_bytes());
+        bytes.extend_from_slice(&24_u16.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(output.len())
+                .expect("output length")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(output);
+        let mut finish = [0_u8; 38];
+        finish[0] = 1;
+        finish[1..5].copy_from_slice(&0_i32.to_le_bytes());
+        finish[6..].copy_from_slice(&Sha256::digest(output));
+        bytes.push(3);
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&38_u32.to_le_bytes());
+        bytes.extend_from_slice(&finish);
+        fs::write(path, bytes).expect("version one recording");
+    }
+
+    #[test]
+    fn mixed_version_authoritative_recording_wins_over_legacy_stream() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let legacy_path = temp_dir.path().join("legacy.txt");
+        fs::write(&legacy_path, "forbidden legacy stream").expect("legacy stream");
+        let recording_path = temp_dir.path().join("version-one.bcsr");
+        write_version_one_recording(&recording_path, b"version one recording sentinel\n");
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [
+                {
+                    "key": TERMINAL_PTY_STREAM_REF_KEY,
+                    "content_type": TERMINAL_PTY_STREAM_CONTENT_TYPE,
+                    "storage_uri": legacy_path.to_string_lossy(),
+                    "metadata": {"stream": "pty"}
+                },
+                {
+                    "key": SHELL_RECORDING_REF_KEY,
+                    "content_type": "application/x-bcode-shell-recording; version=1",
+                    "storage_uri": recording_path.to_string_lossy(),
+                    "metadata": {"complete": true}
+                }
+            ]
+        });
+        let rendered = render_rows(&payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("version one recording sentinel"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("forbidden legacy stream"), "{rendered}");
+    }
+
+    #[test]
+    fn interrupted_migration_never_falls_back_to_legacy_stream() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let legacy_path = temp_dir.path().join("legacy.txt");
+        fs::write(&legacy_path, "forbidden legacy stream").expect("legacy stream");
+        let final_path = temp_dir.path().join("recording.bcsr");
+        let partial_path = final_path.with_extension("shell-recording.partial");
+        let mut writer = crate::recording::ShellRecordingWriter::create(&final_path, 80, 24)
+            .expect("recording writer");
+        writer.write_output(1, b"partial bytes").expect("output");
+        drop(writer);
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [
+                {
+                    "key": TERMINAL_PTY_STREAM_REF_KEY,
+                    "content_type": TERMINAL_PTY_STREAM_CONTENT_TYPE,
+                    "storage_uri": legacy_path.to_string_lossy(),
+                    "metadata": {"stream": "pty"}
+                },
+                {
+                    "key": SHELL_RECORDING_REF_KEY,
+                    "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                    "storage_uri": partial_path.to_string_lossy(),
+                    "metadata": {"complete": false}
+                }
+            ]
+        });
+        let rendered = render_rows(&payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("recording is incomplete"), "{rendered}");
+        assert!(!rendered.contains("forbidden legacy stream"), "{rendered}");
+        assert!(!final_path.exists());
+    }
+
     #[test]
     fn legacy_absolute_artifact_path_remains_replayable() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
