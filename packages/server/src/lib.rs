@@ -6326,10 +6326,30 @@ async fn run_session_runtime(
             )
             .await;
         }
-        let Some(command) =
-            next_followup_command(&mut followup_commands, queued_followups.as_ref()).await
+        let Some(command) = next_runtime_queue_command(
+            &mut cancel_commands,
+            &mut followup_commands,
+            queued_followups.as_ref(),
+        )
+        .await
         else {
             break;
+        };
+        let command = match command {
+            RuntimeQueueCommand::Cancel(command) => {
+                let cancelled = process_cancel_turn_command(
+                    &state,
+                    session_id,
+                    &mut followup_commands,
+                    queued_followups.as_ref(),
+                    command.clear_queue,
+                    command.requested_by,
+                )
+                .await;
+                let _sent = command.response.send(cancelled);
+                continue;
+            }
+            RuntimeQueueCommand::Followup(command) => *command,
         };
         match command {
             FollowupCommand::UserMessage {
@@ -6456,13 +6476,24 @@ async fn run_session_runtime(
     state.session_runtimes.lock().await.remove(&session_id);
 }
 
-async fn next_followup_command(
+enum RuntimeQueueCommand {
+    Cancel(CancelCommand),
+    Followup(Box<FollowupCommand>),
+}
+
+async fn next_runtime_queue_command(
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
     queued_followups: &AtomicUsize,
-) -> Option<FollowupCommand> {
-    let command = followup_commands.recv().await?;
-    queued_followups.fetch_sub(1, Ordering::AcqRel);
-    Some(command)
+) -> Option<RuntimeQueueCommand> {
+    tokio::select! {
+        biased;
+        command = cancel_commands.recv() => command.map(RuntimeQueueCommand::Cancel),
+        command = followup_commands.recv() => command.map(|command| {
+            queued_followups.fetch_sub(1, Ordering::AcqRel);
+            RuntimeQueueCommand::Followup(Box::new(command))
+        }),
+    }
 }
 
 fn drain_followup_commands(followup_commands: &mut mpsc::Receiver<FollowupCommand>) -> usize {
@@ -23350,6 +23381,43 @@ mod tests {
         let command = fields.field(&["command"]).expect("command");
         assert_eq!(command.value, "abcdef");
         assert!(!command.truncated);
+    }
+
+    #[tokio::test]
+    async fn runtime_queue_prioritizes_cancellation_over_followup() {
+        let (followup_tx, mut followup_rx) = mpsc::channel(2);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(2);
+        let queued_followups = AtomicUsize::new(1);
+        followup_tx
+            .send(FollowupCommand::UserMessage {
+                client_id: ClientId::new(),
+                runtime_context: None,
+                text: "queued work".to_owned(),
+                placement: bcode_ipc::PromptPlacement::FollowUp,
+                completion: None,
+            })
+            .await
+            .expect("followup");
+        let (response, _receiver) = oneshot::channel();
+        cancel_tx
+            .send(CancelCommand {
+                clear_queue: false,
+                requested_by: None,
+                response,
+            })
+            .await
+            .expect("cancel");
+
+        assert!(matches!(
+            next_runtime_queue_command(&mut cancel_rx, &mut followup_rx, &queued_followups).await,
+            Some(RuntimeQueueCommand::Cancel(_))
+        ));
+        assert_eq!(queued_followups.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            next_runtime_queue_command(&mut cancel_rx, &mut followup_rx, &queued_followups).await,
+            Some(RuntimeQueueCommand::Followup(_))
+        ));
+        assert_eq!(queued_followups.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
