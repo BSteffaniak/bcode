@@ -1818,6 +1818,64 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn large_terminal_recording_keeps_semantic_response_bounded() {
+        const COMPLETE_BYTES: u64 = 128 * 1024;
+        let environment = isolated_config_environment("bounded-large-terminal");
+        let artifact_dir = tempfile::tempdir().expect("artifact dir");
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            "test-bounded-large-terminal",
+            &ShellRunArguments {
+                command: "head -c 131072 /dev/zero | tr '\\0' x".to_owned(),
+                cwd: None,
+                timeout_ms: Some(60_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(artifact_dir.path()),
+                cancellation_path: None,
+            },
+            &environment,
+        );
+        assert!(!response.is_error, "large terminal command failed");
+        assert!(response.output.len() <= MAX_INLINE_TERMINAL_OUTPUT_BYTES + 1_024);
+        assert!(
+            response
+                .full_output
+                .as_ref()
+                .is_some_and(|output| output.len() <= MAX_INLINE_TERMINAL_OUTPUT_BYTES + 1_024)
+        );
+        let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
+            panic!("expected shell artifact");
+        };
+        let recording = artifact
+            .refs
+            .iter()
+            .find(|reference| reference.key == SHELL_RECORDING_REF_KEY)
+            .expect("recording reference");
+        assert_eq!(
+            recording
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("output_bytes"))
+                .and_then(serde_json::Value::as_u64),
+            Some(COMPLETE_BYTES)
+        );
+        let path = url::Url::parse(recording.storage_uri.as_deref().expect("recording URI"))
+            .expect("recording URL")
+            .to_file_path()
+            .expect("recording path");
+        let (summary, _) = recording::read_recording(&path).expect("valid recording");
+        assert_eq!(summary.output_bytes, COMPLETE_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminal_invocation_publishes_one_valid_authoritative_recording() {
         let environment = isolated_config_environment("recording-integration");
         let artifact_dir = tempfile::tempdir().expect("artifact dir");
