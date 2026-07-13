@@ -1216,6 +1216,18 @@ mod tests {
                 .recoverable_error_patterns
                 .iter()
                 .any(|pattern| {
+                    pattern.id == "bcode.openai-compatible.server-error"
+                        && pattern.scope.provider_plugin_id.as_deref()
+                            == Some("bcode.openai-compatible")
+                        && pattern.r#match.code.as_deref() == Some("server_error")
+                })
+        );
+        assert!(
+            provider
+                .error_handling
+                .recoverable_error_patterns
+                .iter()
+                .any(|pattern| {
                     pattern.id == "bcode.openai-compatible.server-overloaded"
                         && pattern.r#match.category.as_deref() == Some("overloaded")
                         && pattern.r#match.code.as_deref() == Some("server_is_overloaded")

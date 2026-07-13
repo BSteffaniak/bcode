@@ -36,6 +36,16 @@ category = "overloaded"
 code = "server_is_overloaded"
 
 [[error_handling.recoverable_error_patterns]]
+id = "bcode.openai-compatible.server-error"
+enabled_by_default = true
+
+[error_handling.recoverable_error_patterns.scope]
+provider_plugin_id = "bcode.openai-compatible"
+
+[error_handling.recoverable_error_patterns.match]
+code = "server_error"
+
+[[error_handling.recoverable_error_patterns]]
 id = "bcode.openai-compatible.unsupported-content-type"
 enabled_by_default = true
 
