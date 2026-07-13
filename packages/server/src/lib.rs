@@ -7386,6 +7386,24 @@ async fn lookup_plugin_automation_operation(
     ))
 }
 
+fn update_plugin_automation_hold(
+    holds: &mut BTreeMap<SessionId, BTreeSet<String>>,
+    request: &bcode_ipc::PluginAutomationHoldRequest,
+) -> bcode_ipc::PluginAutomationHoldResponse {
+    let session_holds = holds.entry(request.session_id).or_default();
+    if request.held {
+        session_holds.insert(request.holder_id.clone());
+    } else {
+        session_holds.remove(&request.holder_id);
+    }
+    let active_holds = usize_to_u32_saturating(session_holds.len());
+    let held = active_holds > 0;
+    if !held {
+        holds.remove(&request.session_id);
+    }
+    bcode_ipc::PluginAutomationHoldResponse { held, active_holds }
+}
+
 async fn handle_set_plugin_automation_hold(
     request_id: u64,
     state: &ServerState,
@@ -7404,25 +7422,14 @@ async fn handle_set_plugin_automation_hold(
         )
         .await;
     }
-    let mut holds = state.plugin_automation_holds.lock().await;
-    let session_holds = holds.entry(request.session_id).or_default();
-    if request.held {
-        session_holds.insert(request.holder_id);
-    } else {
-        session_holds.remove(&request.holder_id);
-    }
-    let active_holds = usize_to_u32_saturating(session_holds.len());
-    let held = active_holds > 0;
-    if !held {
-        holds.remove(&request.session_id);
-    }
-    drop(holds);
+    let response = {
+        let mut holds = state.plugin_automation_holds.lock().await;
+        update_plugin_automation_hold(&mut holds, &request)
+    };
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::PluginAutomationHold {
-            response: bcode_ipc::PluginAutomationHoldResponse { held, active_holds },
-        }),
+        Response::Ok(ResponsePayload::PluginAutomationHold { response }),
     )
     .await
 }
@@ -7503,6 +7510,64 @@ fn plugin_automation_preflight_disposition(
     None
 }
 
+#[derive(Debug)]
+struct PersistedAutomationAcceptance {
+    operation: bcode_ipc::PluginAutomationOperation,
+    user_event: bcode_session_models::SessionEvent,
+}
+
+async fn persist_plugin_automation_acceptance(
+    state: &ServerState,
+    client_id: ClientId,
+    request: &bcode_ipc::PluginAutomationTurnRequest,
+) -> Result<Result<PersistedAutomationAcceptance, bcode_ipc::PluginAutomationOperation>, ServerError>
+{
+    let lookup = bcode_ipc::PluginAutomationOperationLookupRequest {
+        session_id: request.session_id,
+        plugin_id: request.origin.plugin_id.clone(),
+        operation_id: request.origin.operation_id.clone(),
+    };
+    if let Some(operation) = lookup_plugin_automation_operation(state, &lookup).await? {
+        return Ok(Err(operation));
+    }
+    let events = state
+        .sessions
+        .append_user_message(request.session_id, client_id, request.text.clone())
+        .await?;
+    for event in &events {
+        publish_session_event(state, event).await;
+    }
+    let user_event = events
+        .last()
+        .cloned()
+        .ok_or_else(|| bcode_session::SessionError::NotFound(request.session_id))?;
+    let turn_id = format!("{}-{}", request.session_id, user_event.sequence);
+    let started = state
+        .sessions
+        .append_plugin_automation_turn_started(
+            request.session_id,
+            request.origin.plugin_id.clone(),
+            request.origin.run_id.clone(),
+            request.origin.operation_id.clone(),
+            request.origin.display_label.clone(),
+            turn_id.clone(),
+            user_event.sequence,
+            request.execution_policy
+                == bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection,
+        )
+        .await?;
+    publish_session_event(state, &started).await;
+    Ok(Ok(PersistedAutomationAcceptance {
+        operation: bcode_ipc::PluginAutomationOperation {
+            origin: request.origin.clone(),
+            user_event_sequence: user_event.sequence,
+            turn_id,
+            completion: None,
+        },
+        user_event,
+    }))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_submit_plugin_automation_turn(
     request_id: u64,
@@ -7556,39 +7621,24 @@ async fn handle_submit_plugin_automation_turn(
         )
         .await;
     }
-    let events = state
-        .sessions
-        .append_user_message(request.session_id, client_id, request.text.clone())
-        .await?;
-    for event in &events {
-        publish_session_event(state, event).await;
-    }
-    let user_event = events
-        .last()
-        .cloned()
-        .ok_or_else(|| bcode_session::SessionError::NotFound(request.session_id))?;
-    let turn_id = format!("{}-{}", request.session_id, user_event.sequence);
-    let started = state
-        .sessions
-        .append_plugin_automation_turn_started(
-            request.session_id,
-            request.origin.plugin_id.clone(),
-            request.origin.run_id.clone(),
-            request.origin.operation_id.clone(),
-            request.origin.display_label.clone(),
-            turn_id.clone(),
-            user_event.sequence,
-            request.execution_policy
-                == bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection,
-        )
-        .await?;
-    publish_session_event(state, &started).await;
-    let operation = bcode_ipc::PluginAutomationOperation {
-        origin: request.origin.clone(),
-        user_event_sequence: user_event.sequence,
-        turn_id: turn_id.clone(),
-        completion: None,
+    let acceptance = match persist_plugin_automation_acceptance(state, client_id, &request).await? {
+        Ok(acceptance) => acceptance,
+        Err(operation) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PluginAutomationTurn {
+                    result: bcode_ipc::PluginAutomationTurnDisposition::AlreadyAccepted {
+                        operation,
+                    },
+                }),
+            )
+            .await;
+        }
     };
+    let operation = acceptance.operation;
+    let user_event = acceptance.user_event;
+    let turn_id = operation.turn_id.clone();
     let (completion, _receiver) = oneshot::channel();
     let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
     debug_assert_eq!(pending_before, 0);
@@ -23634,6 +23684,108 @@ mod tests {
 
         finish_current_turn(&context).await;
         assert!(current_turn.lock().await.is_none());
+    }
+
+    fn automation_request(
+        session_id: SessionId,
+        operation_id: &str,
+        expected_generation: u64,
+    ) -> bcode_ipc::PluginAutomationTurnRequest {
+        bcode_ipc::PluginAutomationTurnRequest {
+            session_id,
+            origin: bcode_ipc::PluginAutomationOrigin {
+                plugin_id: "bcode.test".to_owned(),
+                run_id: "run-1".to_owned(),
+                operation_id: operation_id.to_owned(),
+                display_label: "Test operation".to_owned(),
+            },
+            text: "automated prompt".to_owned(),
+            expected_generation,
+            execution_policy: bcode_ipc::PluginAutomationExecutionPolicy::Normal,
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_automation_acceptance_persists_exactly_one_user_turn() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp.path()).expect("persistent sessions");
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+        let generation = plugin_automation_generation(&state, summary.id)
+            .await
+            .expect("generation");
+        let request = automation_request(summary.id, "operation-1", generation);
+
+        let first = persist_plugin_automation_acceptance(&state, ClientId::new(), &request)
+            .await
+            .expect("first submission")
+            .expect("first submission accepted");
+        let duplicate = persist_plugin_automation_acceptance(&state, ClientId::new(), &request)
+            .await
+            .expect("duplicate submission")
+            .expect_err("duplicate must report existing operation");
+
+        assert_eq!(duplicate, first.operation);
+        let history = state
+            .sessions
+            .session_history(summary.id)
+            .await
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::PluginAutomationTurnStarted { operation_id, .. }
+                        if operation_id == "operation-1"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn automation_hold_lifecycle_is_idempotent_and_does_not_touch_in_flight_state() {
+        let session_id = SessionId::new();
+        let mut holds = BTreeMap::new();
+        let active = std::sync::atomic::AtomicBool::new(true);
+        let request = bcode_ipc::PluginAutomationHoldRequest {
+            session_id,
+            holder_id: "modal-1".to_owned(),
+            held: true,
+        };
+
+        let acquired = update_plugin_automation_hold(&mut holds, &request);
+        let reacquired = update_plugin_automation_hold(&mut holds, &request);
+        assert_eq!(acquired.active_holds, 1);
+        assert_eq!(reacquired.active_holds, 1);
+        assert!(active.load(Ordering::Acquire));
+        assert!(matches!(
+            plugin_automation_preflight_disposition(true, 0, true, None, 7),
+            Some(bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld)
+        ));
+
+        let released = update_plugin_automation_hold(
+            &mut holds,
+            &bcode_ipc::PluginAutomationHoldRequest {
+                held: false,
+                ..request
+            },
+        );
+        assert!(!released.held);
+        assert_eq!(released.active_holds, 0);
+        assert!(!holds.contains_key(&session_id));
+        assert!(active.load(Ordering::Acquire));
     }
 
     #[test]
