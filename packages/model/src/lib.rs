@@ -278,6 +278,8 @@ pub enum ModelCatalogPolicy {
     /// Enrich existing models without expanding membership.
     EnrichOnly {
         provider_id: String,
+        #[serde(default)]
+        target: Option<ModelCatalogSupportHint>,
         authority: ModelListAuthority,
     },
     /// Expand with models matching a support target.

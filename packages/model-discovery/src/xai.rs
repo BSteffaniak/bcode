@@ -146,6 +146,7 @@ fn live_model_from_language_model(model: LanguageModel) -> LiveModel {
     }));
     LiveModel {
         model_id: model.id,
+        target: None,
         display_name: model.version,
         aliases,
         status: None,

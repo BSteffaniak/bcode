@@ -1146,6 +1146,7 @@ impl BedrockProviderPlugin {
                 catalog: ModelCatalogHints {
                     policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
                         provider_id: "bedrock".to_string(),
+                        target: None,
                         authority: bcode_model::ModelListAuthority::Explicit,
                     },
                 },
@@ -1175,6 +1176,7 @@ impl BedrockProviderPlugin {
             catalog: ModelCatalogHints {
                 policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
                     provider_id: "bedrock".to_string(),
+                    target: None,
                     authority: bcode_model::ModelListAuthority::Authoritative,
                 },
             },

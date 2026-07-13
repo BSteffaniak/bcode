@@ -12,7 +12,7 @@ pub use live::{LiveCatalogSnapshot, LiveModel, LiveModelMetadata};
 mod live;
 
 /// Catalog schema version emitted by this crate.
-pub const SCHEMA_VERSION: &str = "1.0.0";
+pub const SCHEMA_VERSION: &str = "2.0.0";
 
 /// Complete model catalog document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,14 +218,43 @@ pub struct ModelCatalogEntry {
     #[serde(default)]
     pub reasoning: Option<CatalogReasoning>,
     /// Compatibility targets this model is objectively known to support.
+    ///
+    /// Deprecated for newly-authored catalog data. Use [`Self::deployments`] when operational
+    /// metadata differs by serving target.
     #[serde(default)]
     pub supported_by: BTreeSet<ModelSupportTarget>,
+    /// Serving deployments with target-specific operational metadata.
+    #[serde(default)]
+    pub deployments: Vec<ModelDeployment>,
     /// Live provider metadata overlaid from generated snapshots.
     #[serde(default)]
     pub live: Option<LiveModelMetadata>,
     /// Metadata source/verification data.
     #[serde(default)]
     pub source: CatalogSourceMetadata,
+}
+
+/// Operational metadata for one concrete model serving deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelDeployment {
+    /// Provider/authentication/API-surface identity for this deployment.
+    #[serde(flatten)]
+    pub target: ModelSupportTarget,
+    /// Effective input context window exposed by this deployment.
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    /// Maximum output tokens exposed by this deployment.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// Deployment-specific capability overrides. Empty means use model-level capabilities.
+    #[serde(default)]
+    pub capabilities: CatalogCapabilities,
+    /// Deployment-specific reasoning metadata.
+    #[serde(default)]
+    pub reasoning: Option<CatalogReasoning>,
+    /// Deployment-specific pricing metadata.
+    #[serde(default)]
+    pub pricing: Option<CatalogPricing>,
 }
 
 /// Objective compatibility target for a model.
@@ -268,6 +297,7 @@ impl ModelSupportTarget {
             && self.auth_mode == target.auth_mode
             && self.api_surface == target.api_surface
             && (self.integration == target.integration
+                || self.integration.is_none()
                 || self.integration.as_deref() == Some("provider_native"))
     }
 }
@@ -394,4 +424,53 @@ pub struct CatalogSourceMetadata {
     /// Verification timestamp, encoded as RFC 3339 text.
     #[serde(default)]
     pub last_verified_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_round_trip_preserves_target_specific_limits() {
+        let deployment = ModelDeployment {
+            target: ModelSupportTarget::new(
+                "openai",
+                "chatgpt_subscription",
+                "chatgpt_codex",
+                Some("bcode"),
+            ),
+            context_window: Some(372_000),
+            max_output_tokens: Some(128_000),
+            capabilities: CatalogCapabilities::default(),
+            reasoning: None,
+            pricing: None,
+        };
+
+        let value = serde_json::to_value(&deployment).expect("serialize deployment");
+        let decoded: ModelDeployment =
+            serde_json::from_value(value).expect("deserialize deployment");
+        assert_eq!(decoded, deployment);
+    }
+
+    #[test]
+    fn generic_integration_target_matches_specific_runtime_integration() {
+        let generic = ModelSupportTarget::new("openai", "api_key", "responses_api", None::<String>);
+        let runtime = ModelSupportTarget::new("openai", "api_key", "responses_api", Some("bcode"));
+
+        assert!(generic.matches(&runtime));
+    }
+
+    #[test]
+    fn different_api_surfaces_do_not_match() {
+        let responses =
+            ModelSupportTarget::new("openai", "api_key", "responses_api", Some("bcode"));
+        let codex = ModelSupportTarget::new(
+            "openai",
+            "chatgpt_subscription",
+            "chatgpt_codex",
+            Some("bcode"),
+        );
+
+        assert!(!responses.matches(&codex));
+    }
 }

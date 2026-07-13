@@ -12,7 +12,7 @@ use bcode_model::{
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
     CatalogProviderKind, LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogDefaults,
-    ModelCatalogEntry, ModelSupportTarget, ProviderCatalog,
+    ModelCatalogEntry, ModelDeployment, ModelSupportTarget, ProviderCatalog,
 };
 use serde_json::json;
 use std::fmt::{Display, Formatter};
@@ -307,8 +307,18 @@ impl ModelCatalogResolver {
         let catalog = self.catalog.read().await.clone();
         let mut models = match &list.catalog.policy {
             bcode_model::ModelCatalogPolicy::Unmapped => return list,
-            bcode_model::ModelCatalogPolicy::EnrichOnly { provider_id, .. } => {
-                catalog.merge_provider_models(provider_id, list.models, false)
+            bcode_model::ModelCatalogPolicy::EnrichOnly {
+                provider_id,
+                target,
+                ..
+            } => {
+                let target = target.as_ref().map(model_support_target_from_hint);
+                catalog.merge_provider_models_for_target(
+                    provider_id,
+                    list.models,
+                    false,
+                    target.as_ref(),
+                )
             }
             bcode_model::ModelCatalogPolicy::ExpandAll { provider_id } => {
                 catalog.merge_provider_models(provider_id, list.models, true)
@@ -318,17 +328,17 @@ impl ModelCatalogResolver {
                 target,
                 ..
             } => {
-                let mut resolved = catalog.merge_provider_models(provider_id, list.models, false);
+                let mut resolved = catalog.merge_provider_models_for_target(
+                    provider_id,
+                    list.models,
+                    false,
+                    Some(&model_support_target_from_hint(target)),
+                );
                 let mut seen = resolved
                     .iter()
                     .map(|model| model.model_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
-                let target = ModelSupportTarget::new(
-                    target.provider.clone(),
-                    target.auth_mode.clone(),
-                    target.api_surface.clone(),
-                    target.integration.clone(),
-                );
+                let target = model_support_target_from_hint(target);
                 resolved.extend(
                     catalog
                         .provider_models_for_support_target(provider_id, &target, false)
@@ -463,6 +473,21 @@ impl ModelCatalog {
         }
     }
 
+    /// Enrich a provider-discovered model with metadata resolved for an active serving target.
+    #[must_use]
+    pub fn enrich_model_for_target(
+        &self,
+        provider_id: &str,
+        model: ModelInfo,
+        target: &ModelSupportTarget,
+    ) -> ModelInfo {
+        if let Some(entry) = self.model(provider_id, &model.model_id) {
+            enrich_from_entry_for_target(model, entry, target)
+        } else {
+            model
+        }
+    }
+
     /// Enrich a provider-discovered model with catalog metadata and provider defaults.
     #[must_use]
     pub fn enrich_model_with_defaults(&self, provider_id: &str, model: ModelInfo) -> ModelInfo {
@@ -507,7 +532,7 @@ impl ModelCatalog {
                     .models
                     .values()
                     .filter(|entry| model_matches_support_target(entry, target, include_unknown))
-                    .map(model_info_from_catalog_entry)
+                    .map(|entry| model_info_from_catalog_entry_for_target(entry, target))
                     .collect()
             })
             .unwrap_or_default()
@@ -535,6 +560,42 @@ impl ModelCatalog {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Merge discovered models with catalog models resolved for an active serving target.
+    #[must_use]
+    pub fn merge_provider_models_for_target(
+        &self,
+        provider_id: &str,
+        discovered: Vec<ModelInfo>,
+        include_catalog_only: bool,
+        target: Option<&ModelSupportTarget>,
+    ) -> Vec<ModelInfo> {
+        let mut result = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for model in discovered {
+            let model = if let Some(target) = target {
+                self.enrich_model_for_target(provider_id, model, target)
+            } else {
+                self.enrich_model_with_defaults(provider_id, model)
+            };
+            seen.insert(model.model_id.clone());
+            result.push(model);
+        }
+
+        if include_catalog_only {
+            let catalog_models = target.map_or_else(
+                || self.provider_models_as_model_info(provider_id),
+                |target| self.provider_models_for_support_target(provider_id, target, true),
+            );
+            for model in catalog_models {
+                if seen.insert(model.model_id.clone()) {
+                    result.push(model);
+                }
+            }
+        }
+
+        result
     }
 
     /// Merge discovered provider models with catalog-only models.
@@ -603,16 +664,31 @@ async fn apply_remote_overlay_best_effort(
     apply_local_live_overlay_best_effort(document);
 }
 
+fn model_support_target_from_hint(
+    hint: &bcode_model::ModelCatalogSupportHint,
+) -> ModelSupportTarget {
+    ModelSupportTarget::new(
+        hint.provider.clone(),
+        hint.auth_mode.clone(),
+        hint.api_surface.clone(),
+        hint.integration.clone(),
+    )
+}
+
 fn model_matches_support_target(
     entry: &ModelCatalogEntry,
     target: &ModelSupportTarget,
     include_unknown: bool,
 ) -> bool {
     entry
-        .supported_by
+        .deployments
         .iter()
-        .any(|supported| supported.matches(target))
-        || (include_unknown && entry.supported_by.is_empty())
+        .any(|deployment| deployment.target.matches(target))
+        || entry
+            .supported_by
+            .iter()
+            .any(|supported| supported.matches(target))
+        || (include_unknown && entry.deployments.is_empty() && entry.supported_by.is_empty())
 }
 
 fn find_provider_model<'a>(
@@ -643,6 +719,127 @@ fn find_provider_model<'a>(
             .max_by_key(|(prefix_len, _entry)| *prefix_len)
             .map(|(_prefix_len, entry)| entry)
     })
+}
+
+fn matching_deployment<'a>(
+    entry: &'a ModelCatalogEntry,
+    target: &ModelSupportTarget,
+) -> Option<&'a ModelDeployment> {
+    entry
+        .deployments
+        .iter()
+        .filter(|deployment| deployment.target.matches(target))
+        .max_by_key(
+            |deployment| match deployment.target.integration.as_deref() {
+                Some(integration) if Some(integration) == target.integration.as_deref() => 2,
+                None => 1,
+                Some(_) => 0,
+            },
+        )
+}
+
+fn enrich_from_entry_for_target(
+    mut model: ModelInfo,
+    entry: &ModelCatalogEntry,
+    target: &ModelSupportTarget,
+) -> ModelInfo {
+    let remote = entry_is_remote(entry);
+    let catalog_source = if remote {
+        ModelMetadataSource::RemoteCatalog
+    } else {
+        ModelMetadataSource::BundledCatalog
+    };
+    model.display_name.clone_from(&entry.display_name);
+    let deployment = matching_deployment(entry, target);
+    let legacy_target_match = entry.deployments.is_empty()
+        && entry
+            .supported_by
+            .iter()
+            .any(|supported| supported.matches(target));
+    if model.context_window.is_none() {
+        model.context_window = deployment
+            .and_then(|deployment| deployment.context_window)
+            .or_else(|| {
+                legacy_target_match
+                    .then_some(entry.context_window)
+                    .flatten()
+            });
+        if model.context_window.is_some() && model.metadata_source.is_none() {
+            model.metadata_source = Some(catalog_source);
+        }
+    }
+    if model.max_output_tokens.is_none() {
+        model.max_output_tokens = deployment
+            .and_then(|deployment| deployment.max_output_tokens)
+            .or_else(|| {
+                legacy_target_match
+                    .then_some(entry.max_output_tokens)
+                    .flatten()
+            });
+        if model.max_output_tokens.is_some() && model.metadata_source.is_none() {
+            model.metadata_source = Some(catalog_source);
+        }
+    }
+    model
+        .capabilities
+        .extend(capabilities_from_catalog(&entry.capabilities));
+    if let Some(deployment) = deployment {
+        model
+            .capabilities
+            .extend(capabilities_from_catalog(&deployment.capabilities));
+    }
+    if model.cache.capabilities.is_empty() {
+        model.cache = cache_info_from_catalog(&entry.capabilities);
+    }
+    if model.pricing.is_none() {
+        model.pricing = pricing_from_catalog(
+            deployment
+                .and_then(|deployment| deployment.pricing.as_ref())
+                .or(entry.pricing.as_ref()),
+            remote,
+        );
+    }
+    if model.reasoning.is_none() {
+        model.reasoning = reasoning_from_catalog_parts(
+            deployment
+                .and_then(|deployment| deployment.reasoning.as_ref())
+                .or(entry.reasoning.as_ref()),
+        );
+    }
+    if entry.status == CatalogModelStatus::Deprecated {
+        model.visibility = bcode_model::ModelVisibility::Unsupported {
+            reason: "model is deprecated in catalog".to_string(),
+        };
+    }
+    if entry.bcode_support == BcodeSupportStatus::Unsupported {
+        model.visibility = bcode_model::ModelVisibility::Unsupported {
+            reason: "model is marked unsupported by Bcode catalog".to_string(),
+        };
+    }
+    model
+}
+
+fn model_info_from_catalog_entry_for_target(
+    entry: &ModelCatalogEntry,
+    target: &ModelSupportTarget,
+) -> ModelInfo {
+    enrich_from_entry_for_target(
+        ModelInfo {
+            model_id: entry.model_id.clone(),
+            display_name: entry.display_name.clone(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::new(),
+            reasoning: None,
+            cache: ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        },
+        entry,
+        target,
+    )
 }
 
 fn enrich_from_defaults(mut model: ModelInfo, defaults: &ModelCatalogDefaults) -> ModelInfo {
@@ -922,6 +1119,17 @@ pub fn validate_catalog(catalog: &CatalogDocument) -> Result<()> {
                     model.model_id
                 )));
             }
+            let mut deployment_targets = std::collections::BTreeSet::new();
+            for deployment in &model.deployments {
+                if !deployment_targets.insert(deployment.target.clone()) {
+                    return Err(Error::Validation(format!(
+                        "duplicate deployment target for model '{model_id}' and provider '{provider_id}': {}/{}/{:?}",
+                        deployment.target.auth_mode,
+                        deployment.target.api_surface,
+                        deployment.target.integration,
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -960,8 +1168,16 @@ pub fn build_artifacts_with_live(
         let live_output_dir = output_dir.join("live");
         fs::create_dir_all(&live_output_dir)?;
         for snapshot in &live_snapshots {
+            let target_suffix = snapshot.target.as_ref().map_or_else(String::new, |target| {
+                format!(
+                    "-{}-{}-{}",
+                    target.auth_mode,
+                    target.api_surface,
+                    target.integration.as_deref().unwrap_or("generic")
+                )
+            });
             write_json(
-                &live_output_dir.join(format!("{}.json", snapshot.provider_id)),
+                &live_output_dir.join(format!("{}{target_suffix}.json", snapshot.provider_id)),
                 snapshot,
                 format,
             )?;
@@ -1027,6 +1243,7 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
             .expect("provider was just inserted or already existed");
 
         for live_model in snapshot.models.values() {
+            let live_target = live_model.target.as_ref().or(snapshot.target.as_ref());
             let entry = provider
                 .models
                 .entry(live_model.model_id.clone())
@@ -1037,14 +1254,42 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
                 entry.display_name.clone_from(display_name);
             }
             entry.aliases.extend(live_model.aliases.iter().cloned());
-            if entry.context_window.is_none() {
-                entry.context_window = live_model.context_window;
-            }
-            if entry.max_output_tokens.is_none() {
-                entry.max_output_tokens = live_model.max_output_tokens;
-            }
-            if entry.reasoning.is_none() {
-                entry.reasoning.clone_from(&live_model.reasoning);
+            if let Some(target) = live_target {
+                let deployment = entry
+                    .deployments
+                    .iter_mut()
+                    .find(|deployment| deployment.target == *target);
+                if let Some(deployment) = deployment {
+                    deployment.context_window =
+                        live_model.context_window.or(deployment.context_window);
+                    deployment.max_output_tokens = live_model
+                        .max_output_tokens
+                        .or(deployment.max_output_tokens);
+                    if live_model.reasoning.is_some() {
+                        deployment.reasoning.clone_from(&live_model.reasoning);
+                    }
+                    deployment.capabilities =
+                        merge_capabilities(&deployment.capabilities, &live_model.capabilities);
+                } else {
+                    entry.deployments.push(ModelDeployment {
+                        target: target.clone(),
+                        context_window: live_model.context_window,
+                        max_output_tokens: live_model.max_output_tokens,
+                        capabilities: live_model.capabilities.clone(),
+                        reasoning: live_model.reasoning.clone(),
+                        pricing: None,
+                    });
+                }
+            } else {
+                if entry.context_window.is_none() {
+                    entry.context_window = live_model.context_window;
+                }
+                if entry.max_output_tokens.is_none() {
+                    entry.max_output_tokens = live_model.max_output_tokens;
+                }
+                if entry.reasoning.is_none() {
+                    entry.reasoning.clone_from(&live_model.reasoning);
+                }
             }
             entry.capabilities = merge_capabilities(&entry.capabilities, &live_model.capabilities);
             entry.live = Some(LiveModelMetadata {
@@ -1061,6 +1306,7 @@ fn live_model_entry(
     live_model: &bcode_model_catalog_models::LiveModel,
     snapshot: &LiveCatalogSnapshot,
 ) -> ModelCatalogEntry {
+    let target = live_model.target.as_ref().or(snapshot.target.as_ref());
     ModelCatalogEntry {
         model_id: live_model.model_id.clone(),
         display_name: live_model
@@ -1070,8 +1316,14 @@ fn live_model_entry(
         aliases: live_model.aliases.clone(),
         status: CatalogModelStatus::Unknown,
         bcode_support: BcodeSupportStatus::Unknown,
-        context_window: live_model.context_window,
-        max_output_tokens: live_model.max_output_tokens,
+        context_window: target
+            .is_none()
+            .then_some(live_model.context_window)
+            .flatten(),
+        max_output_tokens: target
+            .is_none()
+            .then_some(live_model.max_output_tokens)
+            .flatten(),
         family: None,
         provider_model_kind: None,
         replaced_by: None,
@@ -1080,7 +1332,19 @@ fn live_model_entry(
         pricing: None,
         capabilities: live_model.capabilities.clone(),
         reasoning: live_model.reasoning.clone(),
-        supported_by: std::collections::BTreeSet::new(),
+        supported_by: target.cloned().into_iter().collect(),
+        deployments: target
+            .cloned()
+            .map(|target| ModelDeployment {
+                target,
+                context_window: live_model.context_window,
+                max_output_tokens: live_model.max_output_tokens,
+                capabilities: live_model.capabilities.clone(),
+                reasoning: live_model.reasoning.clone(),
+                pricing: None,
+            })
+            .into_iter()
+            .collect(),
         live: Some(LiveModelMetadata {
             status: live_model.status.clone(),
             regions: live_model.regions.clone(),
@@ -1299,6 +1563,34 @@ mod tests {
     }
 
     #[test]
+    fn gpt_5_6_sol_resolves_operational_limits_for_chatgpt_codex() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let target = ModelSupportTarget::new(
+            "openai",
+            "chatgpt_subscription",
+            "chatgpt_codex",
+            Some("bcode"),
+        );
+        let model = catalog
+            .provider_models_for_support_target("openai", &target, false)
+            .into_iter()
+            .find(|model| model.model_id == "gpt-5.6-sol")
+            .expect("Sol should support ChatGPT Codex");
+
+        assert_eq!(model.context_window, Some(372_000));
+        assert_eq!(model.max_output_tokens, Some(128_000));
+
+        let public_target =
+            ModelSupportTarget::new("openai", "api_key", "responses_api", Some("bcode"));
+        let public_model = catalog
+            .provider_models_for_support_target("openai", &public_target, false)
+            .into_iter()
+            .find(|model| model.model_id == "gpt-5.6-sol")
+            .expect("Sol should support the public Responses API");
+        assert_eq!(public_model.context_window, Some(1_050_000));
+    }
+
+    #[test]
     fn gpt_5_6_sol_uses_exact_metadata_not_broad_gpt_5_alias() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let entry = catalog
@@ -1308,6 +1600,13 @@ mod tests {
         assert_eq!(entry.model_id, "gpt-5.6-sol");
         assert_eq!(entry.context_window, Some(1_050_000));
         assert_eq!(entry.max_output_tokens, Some(128_000));
+        assert_eq!(entry.deployments.len(), 2);
+        assert!(
+            entry
+                .deployments
+                .iter()
+                .any(|deployment| deployment.context_window == Some(372_000))
+        );
         assert_eq!(
             entry
                 .pricing
@@ -1420,6 +1719,202 @@ status = "stable"
             model.pricing.map(|pricing| pricing.source),
             Some(ModelPricingSource::RemoteCatalog)
         );
+    }
+
+    #[test]
+    fn resolver_applies_target_limits_to_explicit_and_expanded_lists() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let options = RemoteCatalogOptions {
+                disabled: true,
+                ..RemoteCatalogOptions::default()
+            };
+            let resolver = ModelCatalogResolver::new(options).expect("resolver");
+            let target = bcode_model::ModelCatalogSupportHint {
+                provider: "openai".to_string(),
+                auth_mode: "chatgpt_subscription".to_string(),
+                api_surface: "chatgpt_codex".to_string(),
+                integration: Some("bcode".to_string()),
+            };
+            let candidate = ModelInfo {
+                model_id: "gpt-5.6-sol".to_string(),
+                display_name: "Sol".to_string(),
+                is_default: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: std::collections::BTreeSet::new(),
+                reasoning: None,
+                cache: ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                visibility: ModelVisibility::Visible,
+            };
+            let explicit = resolver
+                .resolve(bcode_model::ModelList {
+                    models: vec![candidate],
+                    catalog: bcode_model::ModelCatalogHints {
+                        policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
+                            provider_id: "openai".to_string(),
+                            target: Some(target.clone()),
+                            authority: bcode_model::ModelListAuthority::Explicit,
+                        },
+                    },
+                })
+                .await;
+            assert_eq!(explicit.models[0].context_window, Some(372_000));
+
+            let expanded = resolver
+                .resolve(bcode_model::ModelList {
+                    models: Vec::new(),
+                    catalog: bcode_model::ModelCatalogHints {
+                        policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
+                            provider_id: "openai".to_string(),
+                            target,
+                            authority: bcode_model::ModelListAuthority::Fallback,
+                        },
+                    },
+                })
+                .await;
+            assert_eq!(
+                expanded
+                    .models
+                    .iter()
+                    .find(|model| model.model_id == "gpt-5.6-sol")
+                    .and_then(|model| model.context_window),
+                Some(372_000)
+            );
+        });
+    }
+
+    #[test]
+    fn remote_overlay_updates_only_matching_deployment() {
+        let mut local = load_embedded_catalog().expect("embedded catalog should load");
+        let mut remote = CatalogDocument::empty("remote", "2026-01-01T00:00:00Z");
+        let mut provider = local
+            .providers
+            .get("openai")
+            .expect("openai provider exists")
+            .clone();
+        let entry = provider.models.get_mut("gpt-5.6-sol").expect("Sol exists");
+        let mut chatgpt = entry
+            .deployments
+            .iter()
+            .find(|deployment| deployment.target.api_surface == "chatgpt_codex")
+            .expect("ChatGPT deployment")
+            .clone();
+        chatgpt.context_window = Some(365_000);
+        entry.deployments = vec![chatgpt];
+        remote.providers.insert("openai".to_string(), provider);
+
+        overlay_remote_catalog(&mut local, &remote);
+        let entry = local
+            .providers
+            .get("openai")
+            .and_then(|provider| provider.models.get("gpt-5.6-sol"))
+            .expect("merged Sol");
+        assert_eq!(entry.deployments.len(), 2);
+        assert_eq!(
+            entry
+                .deployments
+                .iter()
+                .find(|deployment| deployment.target.api_surface == "chatgpt_codex")
+                .and_then(|deployment| deployment.context_window),
+            Some(365_000)
+        );
+        assert_eq!(
+            entry
+                .deployments
+                .iter()
+                .find(|deployment| deployment.target.api_surface == "responses_api")
+                .and_then(|deployment| deployment.context_window),
+            Some(1_050_000)
+        );
+    }
+
+    #[test]
+    fn target_enrichment_preserves_provider_limits_and_uses_deployment_fallback() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let target = ModelSupportTarget::new(
+            "openai",
+            "chatgpt_subscription",
+            "chatgpt_codex",
+            Some("bcode"),
+        );
+        let provider_model = ModelInfo {
+            model_id: "gpt-5.6-sol".to_string(),
+            display_name: "provider Sol".to_string(),
+            is_default: false,
+            context_window: Some(360_000),
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::new(),
+            reasoning: None,
+            cache: ModelCacheInfo::default(),
+            metadata_source: Some(ModelMetadataSource::ProviderLive),
+            pricing: None,
+            visibility: ModelVisibility::Visible,
+        };
+
+        let resolved = catalog
+            .merge_provider_models_for_target("openai", vec![provider_model], false, Some(&target))
+            .pop()
+            .expect("resolved model");
+
+        assert_eq!(resolved.context_window, Some(360_000));
+        assert_eq!(resolved.max_output_tokens, Some(128_000));
+        assert_eq!(
+            resolved.metadata_source,
+            Some(ModelMetadataSource::ProviderLive)
+        );
+    }
+
+    #[test]
+    fn target_aware_live_snapshot_does_not_overwrite_documented_limit() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let target = ModelSupportTarget::new(
+            "openai",
+            "chatgpt_subscription",
+            "chatgpt_codex",
+            Some("bcode"),
+        );
+        let mut snapshot = LiveCatalogSnapshot::empty("openai", "2026-01-01T00:00:00Z");
+        snapshot.target = Some(target.clone());
+        snapshot.models.insert(
+            "gpt-5.6-sol".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "model_id": "gpt-5.6-sol",
+                "context_window": 365_000,
+                "max_output_tokens": 120_000
+            }))
+            .expect("live model"),
+        );
+
+        merge_live_snapshots(&mut document, &[snapshot]);
+        let catalog = ModelCatalog::new(document);
+        let entry = catalog.model("openai", "gpt-5.6-sol").expect("Sol entry");
+        assert_eq!(entry.context_window, Some(1_050_000));
+        let resolved = catalog
+            .provider_models_for_support_target("openai", &target, false)
+            .into_iter()
+            .find(|model| model.model_id == "gpt-5.6-sol")
+            .expect("target model");
+        assert_eq!(resolved.context_window, Some(365_000));
+        assert_eq!(resolved.max_output_tokens, Some(120_000));
+    }
+
+    #[test]
+    fn catalog_validation_rejects_duplicate_deployment_targets() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let model = document
+            .providers
+            .get_mut("openai")
+            .and_then(|provider| provider.models.get_mut("gpt-5.6-sol"))
+            .expect("Sol entry");
+        model.deployments.push(model.deployments[0].clone());
+
+        let error = validate_catalog(&document).expect_err("duplicate target must fail");
+        assert!(error.to_string().contains("duplicate deployment target"));
     }
 
     #[test]

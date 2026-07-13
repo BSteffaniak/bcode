@@ -19,6 +19,9 @@ pub struct LiveCatalogSnapshot {
     /// Optional expiry timestamp, encoded as RFC 3339 text.
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// Target identity for the provider surface that produced this snapshot.
+    #[serde(default)]
+    pub target: Option<crate::ModelSupportTarget>,
     /// Live models keyed by provider-native model id.
     #[serde(default)]
     pub models: BTreeMap<String, LiveModel>,
@@ -33,6 +36,7 @@ impl LiveCatalogSnapshot {
             provider_id: provider_id.into(),
             generated_at: generated_at.into(),
             expires_at: None,
+            target: None,
             models: BTreeMap::new(),
         }
     }
@@ -43,6 +47,9 @@ impl LiveCatalogSnapshot {
 pub struct LiveModel {
     /// Provider-native model id.
     pub model_id: String,
+    /// Optional serving target for this record. Overrides the snapshot-level target.
+    #[serde(default)]
+    pub target: Option<crate::ModelSupportTarget>,
     /// Provider display name, if returned by the provider API.
     #[serde(default)]
     pub display_name: Option<String>,

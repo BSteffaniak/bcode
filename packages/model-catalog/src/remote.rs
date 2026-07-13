@@ -342,6 +342,7 @@ fn overlay_provider(local: &mut ProviderCatalog, remote: &ProviderCatalog) {
 
 fn overlay_entry(local: &mut ModelCatalogEntry, remote: &ModelCatalogEntry) {
     let local_supported_by = local.supported_by.clone();
+    let local_deployments = local.deployments.clone();
     local.display_name.clone_from(&remote.display_name);
     local.aliases.clone_from(&remote.aliases);
     local.status = remote.status;
@@ -376,6 +377,33 @@ fn overlay_entry(local: &mut ModelCatalogEntry, remote: &ModelCatalogEntry) {
     }
     local.supported_by.clone_from(&remote.supported_by);
     local.supported_by.extend(local_supported_by);
+    local.deployments = local_deployments;
+    for deployment in &remote.deployments {
+        if let Some(existing) = local
+            .deployments
+            .iter_mut()
+            .find(|existing| existing.target == deployment.target)
+        {
+            if deployment.context_window.is_some() {
+                existing.context_window = deployment.context_window;
+            }
+            if deployment.max_output_tokens.is_some() {
+                existing.max_output_tokens = deployment.max_output_tokens;
+            }
+            if deployment.capabilities != bcode_model_catalog_models::CatalogCapabilities::default()
+            {
+                existing.capabilities.clone_from(&deployment.capabilities);
+            }
+            if deployment.reasoning.is_some() {
+                existing.reasoning.clone_from(&deployment.reasoning);
+            }
+            if deployment.pricing.is_some() {
+                existing.pricing.clone_from(&deployment.pricing);
+            }
+        } else {
+            local.deployments.push(deployment.clone());
+        }
+    }
     local.live = Some(remote_live_metadata(
         remote.live.clone().unwrap_or_default(),
     ));

@@ -396,7 +396,26 @@ bcode_support = "supported"
 family = "gpt-5.6"
 context_window = 1050000
 max_output_tokens = 128000
-supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
+supported_by = [
+  { provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" },
+  { provider = "openai", auth_mode = "api_key", api_surface = "responses_api", integration = "bcode" },
+]
+
+[[models."gpt-5.6-sol".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+context_window = 372000
+max_output_tokens = 128000
+
+[[models."gpt-5.6-sol".deployments]]
+provider = "openai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+context_window = 1050000
+max_output_tokens = 128000
 
 [models."gpt-5.6-sol".pricing]
 currency = "USD"
@@ -431,6 +450,14 @@ context_window = 1050000
 max_output_tokens = 128000
 supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
 
+[[models."gpt-5.6-terra".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+context_window = 372000
+max_output_tokens = 128000
+
 [models."gpt-5.6-terra".pricing]
 currency = "USD"
 unit = "per_million_tokens"
@@ -464,6 +491,14 @@ context_window = 1050000
 max_output_tokens = 128000
 supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
 
+[[models."gpt-5.6-luna".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+context_window = 372000
+max_output_tokens = 128000
+
 [models."gpt-5.6-luna".pricing]
 currency = "USD"
 unit = "per_million_tokens"
@@ -496,6 +531,14 @@ family = "gpt-5"
 context_window = 272000
 max_output_tokens = 100000
 supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
+
+[[models."gpt-5.5".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+context_window = 272000
+max_output_tokens = 100000
 
 [models."gpt-5.5".pricing]
 currency = "USD"
@@ -564,6 +607,14 @@ context_window = 128000
 max_output_tokens = 100000
 supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
 
+[[models."gpt-5.4".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+context_window = 272000
+max_output_tokens = 100000
+
 [models."gpt-5.4".pricing]
 currency = "USD"
 unit = "per_million_tokens"
@@ -631,6 +682,14 @@ context_window = 128000
 max_output_tokens = 100000
 supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
 
+[[models."gpt-5.4-mini".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+context_window = 272000
+max_output_tokens = 100000
+
 [models."gpt-5.4-mini".pricing]
 currency = "USD"
 unit = "per_million_tokens"
@@ -697,6 +756,14 @@ family = "gpt-5"
 context_window = 272000
 max_output_tokens = 100000
 supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
+
+[[models."gpt-5.3-codex-spark".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+context_window = 272000
+max_output_tokens = 100000
 
 [models."gpt-5.3-codex-spark".pricing]
 currency = "USD"

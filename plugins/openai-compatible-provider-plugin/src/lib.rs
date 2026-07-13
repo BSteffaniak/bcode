@@ -4716,11 +4716,30 @@ impl OpenAiCompatibleProviderPlugin {
 
 fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
     let provider_id = catalog_provider_id(settings).map(str::to_string);
+    let support = provider_id.as_deref().and_then(|provider_id| {
+        (provider_id == "openai").then(|| ModelCatalogSupportHint {
+            provider: "openai".to_string(),
+            auth_mode: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
+                "chatgpt_subscription"
+            } else {
+                "api_key"
+            }
+            .to_string(),
+            api_surface: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
+                "chatgpt_codex"
+            } else {
+                settings.dialect.metadata_value()
+            }
+            .to_string(),
+            integration: Some("bcode".to_string()),
+        })
+    });
     if settings.model_ids_are_explicit {
         return ModelCatalogHints {
             policy: provider_id.map_or(ModelCatalogPolicy::Unmapped, |provider_id| {
                 ModelCatalogPolicy::EnrichOnly {
                     provider_id,
+                    target: support,
                     authority: ModelListAuthority::Explicit,
                 }
             }),
@@ -4729,22 +4748,6 @@ fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
     let Some(provider_id) = provider_id else {
         return ModelCatalogHints::default();
     };
-    let support = (provider_id == "openai").then(|| ModelCatalogSupportHint {
-        provider: "openai".to_string(),
-        auth_mode: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
-            "chatgpt_subscription"
-        } else {
-            "api_key"
-        }
-        .to_string(),
-        api_surface: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
-            "chatgpt_codex"
-        } else {
-            settings.dialect.metadata_value()
-        }
-        .to_string(),
-        integration: Some("bcode".to_string()),
-    });
     ModelCatalogHints {
         policy: ModelCatalogPolicy::ExpandSupported {
             provider_id,
@@ -7055,6 +7058,37 @@ mod tests {
                 .any(|value| value == "reasoning.encrypted_content")
         );
         assert!(!include.iter().any(|value| value == "reasoning.summary"));
+    }
+
+    #[test]
+    fn catalog_hints_identify_chatgpt_codex_for_explicit_models() {
+        let mut settings =
+            test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+        settings.model_ids_are_explicit = true;
+
+        let ModelCatalogPolicy::EnrichOnly {
+            target: Some(target),
+            ..
+        } = catalog_hints(&settings).policy
+        else {
+            panic!("expected target-aware explicit enrichment");
+        };
+        assert_eq!(target.auth_mode, "chatgpt_subscription");
+        assert_eq!(target.api_surface, "chatgpt_codex");
+    }
+
+    #[test]
+    fn catalog_hints_distinguish_public_responses_api() {
+        let mut settings =
+            test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        settings.model_ids_are_explicit = false;
+
+        let ModelCatalogPolicy::ExpandSupported { target, .. } = catalog_hints(&settings).policy
+        else {
+            panic!("expected target-aware expansion");
+        };
+        assert_eq!(target.auth_mode, "api_key");
+        assert_eq!(target.api_surface, "responses_api");
     }
 
     #[test]

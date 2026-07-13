@@ -58,6 +58,7 @@ fn merge_summary(
 fn live_model_from_summary(summary: &FoundationModelSummary) -> LiveModel {
     LiveModel {
         model_id: summary.model_id.clone(),
+        target: None,
         display_name: summary.model_name.clone(),
         aliases: std::collections::BTreeSet::new(),
         status: summary
