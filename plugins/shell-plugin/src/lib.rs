@@ -1169,14 +1169,6 @@ where
         }
         sequence = sequence.saturating_add(1);
         let chunk = &buffer[..read];
-        if let Some(writer) = &mut recording_writer {
-            writer
-                .write_output(
-                    u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    chunk,
-                )
-                .map_err(|error| error.to_string())?;
-        }
         raw.write_chunk(&mut *raw_writer, chunk, DEFAULT_MAX_OUTPUT_BYTES)?;
         let live = live_gate.write(chunk);
         let replay_chunk = replay_gate.write(chunk);
@@ -1193,6 +1185,14 @@ where
             &mut visual_output,
             emit.with_sequence(sequence),
         )?;
+        if let Some(writer) = &mut recording_writer {
+            writer
+                .write_output(
+                    u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    chunk,
+                )
+                .map_err(|error| error.to_string())?;
+        }
     }
     sequence = sequence.saturating_add(1);
     let live = live_gate.finish();
@@ -1611,6 +1611,21 @@ bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    extern "C" fn capture_service_event(
+        payload: *const u8,
+        payload_len: usize,
+        user_data: *mut c_void,
+    ) {
+        // SAFETY: tests pass a live `Mutex<Vec<Vec<u8>>>` pointer for the entire invocation and the
+        // emitter invokes this callback synchronously.
+        let events = unsafe { &*(user_data.cast::<Mutex<Vec<Vec<u8>>>>()) };
+        // SAFETY: the emitter provides a valid payload pointer and length for this callback.
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+        events.lock().expect("event lock").push(payload.to_vec());
+    }
 
     fn isolated_config_environment(name: &str) -> bcode_config::ConfigEnvironmentSnapshot {
         let root = std::env::temp_dir().join(format!(
@@ -2064,6 +2079,63 @@ mod tests {
         assert_eq!(markers.live, vec!["__READY__".to_string()]);
         assert_eq!(markers.replay, vec!["__READY__".to_string()]);
         assert_eq!(markers.clean, vec!["__READY__".to_string()]);
+    }
+
+    #[test]
+    fn recording_does_not_change_live_output_event_payloads() {
+        let bytes = b"first\rsecond\n\x1b[31mred\x1b[0m\n";
+        let arguments = json!({});
+        let context = ShellVisualStreamContext {
+            arguments: &arguments,
+            stream: ToolOutputStream::Pty,
+            columns: 80,
+            rows: 24,
+            timeout_ms: None,
+            prelude_markers: PreludeGateMarkers::default(),
+        };
+        let baseline_events = Mutex::new(Vec::<Vec<u8>>::new());
+        let baseline_emitter = ServiceEventEmitter::new(
+            Some(capture_service_event),
+            std::ptr::from_ref(&baseline_events).cast_mut().cast(),
+        );
+        read_limited_streaming(
+            std::io::Cursor::new(bytes),
+            baseline_emitter,
+            "call",
+            &context,
+            TerminalStreamPaths {
+                clean: None,
+                raw: None,
+                replay: None,
+                recording: None,
+            },
+        )
+        .expect("baseline stream");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let recorded_events = Mutex::new(Vec::<Vec<u8>>::new());
+        let recorded_emitter = ServiceEventEmitter::new(
+            Some(capture_service_event),
+            std::ptr::from_ref(&recorded_events).cast_mut().cast(),
+        );
+        read_limited_streaming(
+            std::io::Cursor::new(bytes),
+            recorded_emitter,
+            "call",
+            &context,
+            TerminalStreamPaths {
+                clean: None,
+                raw: None,
+                replay: None,
+                recording: Some(dir.path().join("recording.bcsr")),
+            },
+        )
+        .expect("recorded stream");
+
+        assert_eq!(
+            *recorded_events.lock().expect("recorded lock"),
+            *baseline_events.lock().expect("baseline lock")
+        );
     }
 
     #[test]
