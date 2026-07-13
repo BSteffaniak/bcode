@@ -2391,7 +2391,18 @@ async fn handle_request_inner(
         Request::CloneSession {
             source_session_id,
             name,
-        } => handle_clone_session(request_id, state, writer, source_session_id, name).await,
+            expected_generation,
+        } => {
+            handle_clone_session(
+                request_id,
+                state,
+                writer,
+                source_session_id,
+                name,
+                expected_generation,
+            )
+            .await
+        }
         Request::SessionHistory { session_id } => {
             handle_session_history(request_id, client_id, state, writer, session_id).await
         }
@@ -5360,8 +5371,13 @@ async fn handle_clone_session(
     writer: &SharedWriter,
     source_session_id: SessionId,
     name: Option<String>,
+    expected_generation: Option<u64>,
 ) -> Result<(), ServerError> {
-    match state.sessions.clone_session(source_session_id, name).await {
+    match state
+        .sessions
+        .clone_session_at_generation(source_session_id, name, expected_generation)
+        .await
+    {
         Ok(result) => {
             state
                 .session_catalog

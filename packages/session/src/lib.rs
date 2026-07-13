@@ -147,6 +147,14 @@ pub enum SessionError {
         session_id: SessionId,
         sequence: u64,
     },
+    #[error(
+        "session generation changed before clone snapshot: {session_id} expected={expected} current={current}"
+    )]
+    CloneGenerationChanged {
+        session_id: SessionId,
+        expected: u64,
+        current: u64,
+    },
     /// Session is owned by another daemon or cannot be leased.
     #[error(transparent)]
     Lease(#[from] lease::SessionLeaseError),
@@ -1705,8 +1713,56 @@ impl SessionManager {
         source_session_id: SessionId,
         name: Option<String>,
     ) -> Result<SessionForkResult, SessionError> {
-        let source = self.session_summary(source_session_id).await?;
+        self.clone_session_at_generation(source_session_id, name, None)
+            .await
+    }
+
+    /// Clone a session's complete history if its snapshot matches an expected generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source session does not exist, the source generation differs
+    /// from `expected_generation`, or copied events cannot be persisted.
+    pub async fn clone_session_at_generation(
+        &self,
+        source_session_id: SessionId,
+        name: Option<String>,
+        expected_generation: Option<u64>,
+    ) -> Result<SessionForkResult, SessionError> {
         let events = self.session_history(source_session_id).await?;
+        let source_cutoff_sequence = events.last().map_or(0, |event| event.sequence);
+        if let Some(expected) = expected_generation
+            && source_cutoff_sequence != expected
+        {
+            return Err(SessionError::CloneGenerationChanged {
+                session_id: source_session_id,
+                expected,
+                current: source_cutoff_sequence,
+            });
+        }
+        let source = self.session_summary(source_session_id).await?;
+        if let Some(expected) = expected_generation {
+            let current = self
+                .session_history_page(
+                    source_session_id,
+                    SessionHistoryQuery {
+                        cursor: None,
+                        limit: 1,
+                        direction: SessionHistoryDirection::Backward,
+                    },
+                )
+                .await?
+                .events
+                .first()
+                .map_or(0, |event| event.sequence);
+            if current != expected {
+                return Err(SessionError::CloneGenerationChanged {
+                    session_id: source_session_id,
+                    expected,
+                    current,
+                });
+            }
+        }
         let source_title = Some(source.display_title().to_string());
         let source_cutoff_sequence = events.last().map(|event| event.sequence);
         let forked_at_ms = self.next_activity_timestamp_ms();
@@ -3168,7 +3224,9 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppendToolCallRequestedInput, SessionLeaseOwnerContext, SessionManager, db};
+    use super::{
+        AppendToolCallRequestedInput, SessionError, SessionLeaseOwnerContext, SessionManager, db,
+    };
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
 
@@ -4438,6 +4496,91 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn clone_session_at_generation_rejects_stale_snapshot_without_creating_clone() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let source = manager
+            .create_session(Some("source".to_owned()), test_working_directory())
+            .await
+            .expect("source session");
+        manager
+            .append_user_message(source.id, ClientId::new(), "prompt".to_owned())
+            .await
+            .expect("prompt");
+        let generation = manager
+            .session_history(source.id)
+            .await
+            .expect("history")
+            .last()
+            .expect("source event")
+            .sequence;
+        manager
+            .append_assistant_message(source.id, "changed".to_owned())
+            .await
+            .expect("source change");
+        let session_count = manager.list_sessions(&test_working_directory()).await.len();
+
+        let error = manager
+            .clone_session_at_generation(source.id, None, Some(generation))
+            .await
+            .expect_err("stale generation must fail");
+        assert!(matches!(
+            error,
+            SessionError::CloneGenerationChanged {
+                session_id,
+                expected,
+                current,
+            } if session_id == source.id && expected == generation && current > expected
+        ));
+        assert_eq!(
+            manager.list_sessions(&test_working_directory()).await.len(),
+            session_count,
+            "a rejected snapshot must not leave a clone behind"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn clone_session_at_generation_copies_exact_accepted_snapshot() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let source = manager
+            .create_session(Some("source".to_owned()), test_working_directory())
+            .await
+            .expect("source session");
+        manager
+            .append_user_message(source.id, ClientId::new(), "prompt".to_owned())
+            .await
+            .expect("prompt");
+        let source_history = manager.session_history(source.id).await.expect("history");
+        let generation = source_history.last().expect("source event").sequence;
+
+        let clone = manager
+            .clone_session_at_generation(source.id, None, Some(generation))
+            .await
+            .expect("matching generation should clone");
+        assert_eq!(
+            clone
+                .session
+                .fork
+                .as_ref()
+                .and_then(|fork| fork.source_cutoff_sequence),
+            Some(generation)
+        );
+        let clone_history = manager
+            .session_history(clone.session.id)
+            .await
+            .expect("clone history");
+        let generation_string = generation.to_string();
+        assert!(clone_history.iter().any(|event| {
+            event.provenance.as_ref().is_some_and(|provenance| {
+                provenance.source_event_id.as_deref() == Some(generation_string.as_str())
+            })
+        }));
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test]

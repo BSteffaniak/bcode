@@ -921,6 +921,37 @@ impl BcodeClient {
             .send_request(Request::CloneSession {
                 source_session_id,
                 name,
+                expected_generation: None,
+            })
+            .await?
+        {
+            ResponsePayload::SessionForked { session, draft } => {
+                Ok(SessionForkResult { session, draft })
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Clone a session's history only when its current generation matches `expected_generation`.
+    ///
+    /// The generation comparison and history snapshot are performed by the session actor as one
+    /// serialized read, so accepted clones cannot contain a different source generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, rejects the request, or the source
+    /// generation changed before the snapshot was captured.
+    pub async fn clone_session_at_generation(
+        &self,
+        source_session_id: SessionId,
+        expected_generation: u64,
+        name: Option<String>,
+    ) -> Result<SessionForkResult, ClientError> {
+        match self
+            .send_request(Request::CloneSession {
+                source_session_id,
+                name,
+                expected_generation: Some(expected_generation),
             })
             .await?
         {

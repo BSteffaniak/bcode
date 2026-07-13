@@ -906,6 +906,7 @@ async fn run_loop(mut state: LoopState) {
             let stop_condition = state.stop_condition.clone();
             let evaluation = run_evaluation_turn(
                 &mut state,
+                source_generation,
                 OperationKind::Evaluation { source_generation },
                 operation_id,
                 evaluator_prompt(&stop_condition),
@@ -1052,6 +1053,7 @@ fn fail_run(state: &mut LoopState, reason: String) {
     let _saved = save_state(state);
 }
 
+#[derive(Debug)]
 struct TurnCompletion {
     outcome: ModelTurnOutcome,
     assistant_text: String,
@@ -1089,6 +1091,7 @@ enum AutomationTurnError {
 
 async fn run_evaluation_turn(
     state: &mut LoopState,
+    source_generation: u64,
     kind: OperationKind,
     operation_id: String,
     prompt: String,
@@ -1096,8 +1099,9 @@ async fn run_evaluation_turn(
     let source_session_id = state.session_id;
     let client = BcodeClient::default_endpoint();
     let clone = client
-        .clone_session(
+        .clone_session_at_generation(
             source_session_id,
+            source_generation,
             Some(format!("loop-evaluator-{}", uuid::Uuid::new_v4())),
         )
         .await
@@ -1115,9 +1119,20 @@ async fn run_evaluation_turn(
         bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection,
     )
     .await;
-    let cleanup = client.delete_session(evaluator_session_id).await;
+    let cleanup = client
+        .delete_session(evaluator_session_id)
+        .await
+        .map(|_deleted| ())
+        .map_err(|error| error.to_string());
+    finalize_evaluation_turn(result, cleanup)
+}
+
+fn finalize_evaluation_turn(
+    result: Result<TurnCompletion, AutomationTurnError>,
+    cleanup: Result<(), String>,
+) -> Result<TurnCompletion, String> {
     match (result, cleanup) {
-        (Ok(completion), Ok(_deleted)) => Ok(completion),
+        (Ok(completion), Ok(())) => Ok(completion),
         (Ok(_completion), Err(error)) => {
             Err(format!("failed to remove evaluator session: {error}"))
         }
@@ -1728,6 +1743,18 @@ mod tests {
             assistant_text_for_operation(&events, 10, Some(14)).as_deref(),
             Some("operation result")
         );
+    }
+
+    #[test]
+    fn evaluator_cleanup_failure_cannot_become_success() {
+        let completion = TurnCompletion {
+            outcome: ModelTurnOutcome::Completed,
+            assistant_text: "valid evaluation".to_owned(),
+        };
+        let error = finalize_evaluation_turn(Ok(completion), Err("permission denied".to_owned()))
+            .expect_err("cleanup failure must fail evaluation");
+        assert!(error.contains("failed to remove evaluator session"));
+        assert!(error.contains("permission denied"));
     }
 
     #[test]

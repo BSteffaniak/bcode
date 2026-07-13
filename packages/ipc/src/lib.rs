@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 6;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 7;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -371,6 +371,9 @@ pub enum Request {
     CloneSession {
         source_session_id: SessionId,
         name: Option<String>,
+        /// Require the cloned history snapshot to end at this generation.
+        #[serde(default)]
+        expected_generation: Option<u64>,
     },
     RefreshSessionCatalog {
         #[serde(default)]
@@ -2160,6 +2163,7 @@ mod tests {
         let request = Request::CloneSession {
             source_session_id,
             name: Some("[clone] source".to_owned()),
+            expected_generation: Some(42),
         };
 
         let encoded = encode(&request).expect("request should encode");
