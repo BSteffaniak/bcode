@@ -968,6 +968,46 @@ mod tests {
     }
 
     #[test]
+    fn artifact_replay_survives_fresh_process() {
+        const CHILD_PATH_ENV: &str = "BCODE_TEST_FRESH_RECORDING_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let payload = authoritative_recording_payload(std::path::Path::new(&path));
+            let rendered = render_rows(&payload)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains("fresh process sentinel"), "{rendered}");
+            assert!(
+                !rendered.contains("forbidden fallback sentinel"),
+                "{rendered}"
+            );
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("recording.bcsr");
+        let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
+            .expect("recording writer");
+        writer
+            .write_output(1, b"fresh process sentinel\n")
+            .expect("record output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish recording");
+
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("shell_run_tui::tests::artifact_replay_survives_fresh_process")
+                .arg("--nocapture")
+                .env(CHILD_PATH_ENV, &path)
+                .status()
+                .expect("fresh test process");
+        assert!(status.success(), "fresh process replay failed: {status}");
+    }
+
+    #[test]
     fn fresh_adapter_renders_complete_shell_recording() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("recording.bcsr");
