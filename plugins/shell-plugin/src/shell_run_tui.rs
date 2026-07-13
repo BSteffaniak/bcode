@@ -57,26 +57,57 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             .get("mode")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown");
-        let columns = payload_u16(payload, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
-        let rows = payload_u16(payload, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
-        let (output, replay_error) = match terminal_replay_output(payload) {
-            TerminalReplayOutput::Ready(output) => (output, None),
-            TerminalReplayOutput::Unavailable(message) => (String::new(), Some(message)),
+        let payload_columns = payload_u16(payload, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
+        let payload_rows = payload_u16(payload, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
+        let (replay, replay_error) = match terminal_replay_output(payload) {
+            TerminalReplayOutput::Ready(replay) => (replay, None),
+            TerminalReplayOutput::Unavailable(message) => (
+                TerminalReplayData {
+                    output: String::new(),
+                    columns: payload_columns,
+                    rows: payload_rows,
+                    exit_code: payload_exit_code(payload),
+                    signal: None,
+                    timed_out: payload
+                        .get("timed_out")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    cancelled: payload
+                        .get("cancelled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                },
+                Some(message),
+            ),
             TerminalReplayOutput::Absent => (
-                match mode {
-                    "terminal" => payload
-                        .get("output_tail")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
+                TerminalReplayData {
+                    output: match mode {
+                        "terminal" => payload
+                            .get("output_tail")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
+                    },
+                    columns: payload_columns,
+                    rows: payload_rows,
+                    exit_code: payload_exit_code(payload),
+                    signal: None,
+                    timed_out: payload
+                        .get("timed_out")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    cancelled: payload
+                        .get("cancelled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 },
                 None,
             ),
         };
 
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
-        lines.extend(shell_status_rows(payload));
+        lines.extend(shell_replay_status_rows(&replay));
         if let Some(error) = replay_error {
             lines.push(Line::from_spans(vec![Span::styled(
                 format!("  durable shell recording unavailable: {error}; inline output was not substituted"),
@@ -85,13 +116,11 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         }
         lines.extend(terminal_viewer_rows(
             TerminalViewerInput {
-                output: &output,
-                columns,
-                rows,
-                exit_code: payload_exit_code(payload),
-                timed_out: payload
-                    .get("timed_out")
-                    .and_then(serde_json::Value::as_bool),
+                output: &replay.output,
+                columns: replay.columns,
+                rows: replay.rows,
+                exit_code: replay.exit_code,
+                timed_out: Some(replay.timed_out),
                 elapsed: None,
                 output_truncated: terminal_replay_truncated(payload).unwrap_or_else(|| {
                     payload
@@ -180,6 +209,28 @@ impl ShellRunTuiVisualAdapter {
         state.update(input, MAX_INLINE_TERMINAL_ROWS);
         state.visible_rows()
     }
+}
+
+fn shell_replay_status_rows(replay: &TerminalReplayData) -> Vec<Line> {
+    let mut parts = Vec::new();
+    if replay.cancelled {
+        parts.push("cancelled".to_owned());
+    } else if replay.timed_out {
+        parts.push("timed out".to_owned());
+    }
+    if let Some(signal) = replay.signal.as_deref() {
+        parts.push(format!("signal {signal}"));
+    }
+    if let Some(exit_code) = replay.exit_code {
+        parts.push(format!("exit code {exit_code}"));
+    }
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    vec![Line::from_spans(vec![
+        Span::styled("  ", muted_style()),
+        Span::styled(parts.join(" · "), muted_style()),
+    ])]
 }
 
 fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
@@ -339,10 +390,63 @@ fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {
         .and_then(|value| i32::try_from(value).ok())
 }
 
+struct TerminalReplayData {
+    output: String,
+    columns: u16,
+    rows: u16,
+    exit_code: Option<i32>,
+    signal: Option<String>,
+    timed_out: bool,
+    cancelled: bool,
+}
+
 enum TerminalReplayOutput {
-    Ready(String),
+    Ready(TerminalReplayData),
     Unavailable(String),
     Absent,
+}
+
+fn decode_recording_replay(
+    summary: &crate::recording::ShellRecordingSummary,
+    frames: Vec<crate::recording::ShellRecordingFrame>,
+) -> TerminalReplayData {
+    let mut bytes = Vec::new();
+    let mut replay = TerminalReplayData {
+        output: String::new(),
+        columns: summary.columns,
+        rows: summary.rows,
+        exit_code: None,
+        signal: None,
+        timed_out: false,
+        cancelled: false,
+    };
+    for frame in frames {
+        match frame {
+            crate::recording::ShellRecordingFrame::Output { bytes: output, .. } => {
+                bytes.extend(output);
+            }
+            crate::recording::ShellRecordingFrame::Resize { columns, rows, .. } => {
+                replay.columns = columns;
+                replay.rows = rows;
+            }
+            crate::recording::ShellRecordingFrame::Finish {
+                exit_code,
+                signal,
+                timed_out,
+                cancelled,
+                ..
+            } => {
+                replay.exit_code = exit_code;
+                replay.signal = signal;
+                replay.timed_out = timed_out;
+                replay.cancelled = cancelled;
+            }
+            crate::recording::ShellRecordingFrame::Start { .. }
+            | crate::recording::ShellRecordingFrame::Unknown { .. } => {}
+        }
+    }
+    replay.output = String::from_utf8_lossy(&bytes).into_owned();
+    replay
 }
 
 fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
@@ -379,23 +483,31 @@ fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
     };
     if authoritative {
         return match crate::recording::read_recording(&path) {
-            Ok((_, frames)) => {
-                let bytes = frames.into_iter().fold(Vec::new(), |mut bytes, frame| {
-                    if let crate::recording::ShellRecordingFrame::Output { bytes: output, .. } =
-                        frame
-                    {
-                        bytes.extend(output);
-                    }
-                    bytes
-                });
-                TerminalReplayOutput::Ready(String::from_utf8_lossy(&bytes).into_owned())
+            Ok((summary, frames)) => {
+                TerminalReplayOutput::Ready(decode_recording_replay(&summary, frames))
             }
             Err(error) => TerminalReplayOutput::Unavailable(format!(
                 "recording could not be validated: {error}"
             )),
         };
     }
-    fs::read_to_string(path).map_or(TerminalReplayOutput::Absent, TerminalReplayOutput::Ready)
+    fs::read_to_string(path).map_or(TerminalReplayOutput::Absent, |output| {
+        TerminalReplayOutput::Ready(TerminalReplayData {
+            output,
+            columns: payload_u16(payload, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS),
+            rows: payload_u16(payload, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS),
+            exit_code: payload_exit_code(payload),
+            signal: None,
+            timed_out: payload
+                .get("timed_out")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            cancelled: payload
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+    })
 }
 
 fn terminal_replay_truncated(payload: &serde_json::Value) -> Option<bool> {
@@ -641,6 +753,52 @@ mod tests {
     }
 
     #[test]
+    fn recording_replay_uses_recorded_resize_and_lifecycle_state() {
+        for (name, exit_code, signal, timed_out, cancelled) in [
+            ("nonzero", Some(7), None, false, false),
+            ("signal", Some(1), Some("SIGTERM"), false, false),
+            ("timeout", Some(1), Some("SIGHUP"), true, false),
+            ("cancelled", Some(1), Some("SIGHUP"), false, true),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let path = temp_dir.path().join(format!("{name}.bcsr"));
+            let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
+                .expect("recording writer");
+            writer.write_output(1, b"before resize\n").expect("output");
+            writer.write_resize(2, 132, 40).expect("resize");
+            writer.write_output(3, b"after resize\n").expect("output");
+            writer
+                .finish(4, exit_code, signal, timed_out, cancelled)
+                .expect("finish recording");
+            let payload = authoritative_recording_payload(&path);
+            let TerminalReplayOutput::Ready(replay) = terminal_replay_output(&payload) else {
+                panic!("{name}: recording should replay");
+            };
+
+            assert_eq!((replay.columns, replay.rows), (132, 40), "{name}");
+            assert_eq!(replay.exit_code, exit_code, "{name}");
+            assert_eq!(replay.signal.as_deref(), signal, "{name}");
+            assert_eq!(replay.timed_out, timed_out, "{name}");
+            assert_eq!(replay.cancelled, cancelled, "{name}");
+            let status = shell_replay_status_rows(&replay)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(status.contains(&format!("exit code {}", exit_code.expect("exit"))));
+            if timed_out {
+                assert!(status.contains("timed out"), "{name}: {status}");
+            }
+            if cancelled {
+                assert!(status.contains("cancelled"), "{name}: {status}");
+            }
+            if let Some(signal) = signal {
+                assert!(status.contains(signal), "{name}: {status}");
+            }
+        }
+    }
+
+    #[test]
     fn very_large_plain_recording_replays_every_byte_beyond_legacy_tail_limit() {
         const OUTPUT_BYTES: usize = 11 * 1024 * 1024;
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -665,8 +823,8 @@ mod tests {
             panic!("large recording should replay");
         };
 
-        assert_eq!(replayed.as_bytes(), expected);
-        assert!(replayed.len() > 10 * 1024 * 1024);
+        assert_eq!(replayed.output.as_bytes(), expected);
+        assert!(replayed.output.len() > 10 * 1024 * 1024);
     }
 
     #[test]
