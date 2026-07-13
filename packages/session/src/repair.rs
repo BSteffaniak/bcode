@@ -586,6 +586,73 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn destructive_repair_dry_run_is_non_mutating_and_execution_creates_backup() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("sessions").join("fixture.db");
+        std::fs::create_dir_all(db_path.parent().expect("database parent"))
+            .expect("database directory");
+        std::fs::write(&db_path, b"database-before-repair").expect("database file");
+        let shm_path = sidecar_path(&db_path, "shm");
+        let tshm_path = sidecar_path(&db_path, "tshm");
+        std::fs::write(&shm_path, b"stale-shm").expect("shm sidecar");
+        std::fs::write(&tshm_path, b"stale-tshm").expect("tshm sidecar");
+        let before = [
+            std::fs::read(&db_path).expect("database bytes"),
+            std::fs::read(&shm_path).expect("shm bytes"),
+            std::fs::read(&tshm_path).expect("tshm bytes"),
+        ];
+        let initial_error = "short read on WAL frame";
+
+        let mut dry_report = RepairReport::new(RepairTarget::Catalog, db_path.clone());
+        repair_db_files(
+            temp_dir.path(),
+            &db_path,
+            &mut dry_report,
+            RepairOptions { dry_run: true },
+            || async { Ok(()) },
+            None,
+            initial_error,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(dry_report.status, RepairStatus::WouldRepair);
+        assert_eq!(dry_report.backup_path, None);
+        assert!(!dry_report.actions.is_empty());
+        assert_eq!(std::fs::read(&db_path).expect("database bytes"), before[0]);
+        assert_eq!(std::fs::read(&shm_path).expect("shm bytes"), before[1]);
+        assert_eq!(std::fs::read(&tshm_path).expect("tshm bytes"), before[2]);
+
+        let mut repair_report = RepairReport::new(RepairTarget::Catalog, db_path.clone());
+        repair_db_files(
+            temp_dir.path(),
+            &db_path,
+            &mut repair_report,
+            RepairOptions { dry_run: false },
+            || async { Ok(()) },
+            None,
+            initial_error,
+        )
+        .await
+        .expect("repair execution");
+        assert_eq!(repair_report.status, RepairStatus::Repaired);
+        let backup = repair_report.backup_path.expect("backup path");
+        assert_eq!(
+            std::fs::read(backup.join("fixture.db")).expect("backup database"),
+            before[0]
+        );
+        assert_eq!(
+            std::fs::read(backup.join("fixture.db-shm")).expect("backup shm"),
+            before[1]
+        );
+        assert_eq!(
+            std::fs::read(backup.join("fixture.db-tshm")).expect("backup tshm"),
+            before[2]
+        );
+        assert!(!shm_path.exists());
+        assert!(!tshm_path.exists());
+    }
+
+    #[tokio::test]
     async fn doctor_session_reports_stale_model_context_projection() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
