@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -35,6 +35,9 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_CONTEXT_RADIUS: usize = 3;
 const NVIM_EXECUTABLE: &str = "nvim";
 const NVIM_MODE_KEY: &str = "mode";
+const NVIM_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Granularity for live Vim edit observations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -438,9 +441,15 @@ pub enum VimEditError {
         /// Rejection reason.
         reason: String,
     },
+    /// Neovim did not complete its embedded RPC startup handshake in time.
+    #[error("Neovim startup timed out after {timeout_ms} ms")]
+    StartupTimeout { timeout_ms: u128 },
     /// The operation timed out.
     #[error("Vim edit operation timed out after {timeout_ms} ms")]
     Timeout { timeout_ms: u128 },
+    /// Failed to terminate and reap the Neovim child process.
+    #[error("failed to terminate Neovim child: {source}")]
+    Shutdown { source: io::Error },
     /// Failed to write the final buffer back to the requested path.
     #[error("failed to write {path:?}: {source}")]
     WriteFile { path: PathBuf, source: io::Error },
@@ -533,9 +542,7 @@ impl VimEditSession {
             .nvim_executable
             .as_deref()
             .unwrap_or_else(|| Path::new(NVIM_EXECUTABLE));
-        let session = runtime.block_on(timeout_result(request.timeout, async {
-            NeovimSession::start(executable).await
-        }))?;
+        let session = runtime.block_on(start_neovim(executable))?;
         runtime.block_on(timeout_result(request.timeout, async {
             session.configure_isolation().await?;
             session.edit_path(temp_file.path()).await?;
@@ -593,7 +600,7 @@ impl VimEditSession {
                     error,
                     VimEditError::Timeout { .. } | VimEditError::UnexpectedExit(_)
                 ) {
-                    self.shutdown_session();
+                    let _ = self.shutdown_session();
                 }
                 return Err(error);
             }
@@ -627,7 +634,7 @@ impl VimEditSession {
                     error,
                     VimEditError::Timeout { .. } | VimEditError::UnexpectedExit(_)
                 ) {
-                    self.shutdown_session();
+                    let _ = self.shutdown_session();
                 }
                 Err(error)
             }
@@ -659,11 +666,11 @@ impl VimEditSession {
         let (final_text, cursor, nvim_mode, final_context, diff) = match result {
             Ok(result) => result,
             Err(error) => {
-                self.shutdown_session();
+                let _ = self.shutdown_session();
                 return Err(error);
             }
         };
-        self.shutdown_session();
+        self.shutdown_session()?;
         let changed = original != final_text;
         if apply && changed {
             fs::write(&path, final_text.as_bytes()).map_err(|source| VimEditError::WriteFile {
@@ -684,7 +691,7 @@ impl VimEditSession {
 
     /// Cancel the session without writing to the requested file.
     pub fn cancel(mut self) {
-        self.shutdown_session();
+        let _ = self.shutdown_session();
     }
 
     /// Return when the session started.
@@ -709,17 +716,28 @@ impl VimEditSession {
             .ok_or_else(|| VimEditError::UnexpectedExit("session is already closed".to_string()))
     }
 
-    fn shutdown_session(&mut self) {
+    fn shutdown_session(&mut self) -> Result<(), VimEditError> {
         if let Some(session) = self.session.take() {
-            self.runtime.block_on(session.shutdown());
+            self.runtime
+                .block_on(session.shutdown())
+                .map_err(|source| VimEditError::Shutdown { source })?;
         }
+        Ok(())
     }
 }
 
 impl Drop for VimEditSession {
     fn drop(&mut self) {
-        self.shutdown_session();
+        let _ = self.shutdown_session();
     }
+}
+
+async fn start_neovim(executable: &Path) -> Result<NeovimSession, VimEditError> {
+    time::timeout(NVIM_STARTUP_TIMEOUT, NeovimSession::start(executable))
+        .await
+        .unwrap_or(Err(VimEditError::StartupTimeout {
+            timeout_ms: NVIM_STARTUP_TIMEOUT.as_millis(),
+        }))
 }
 
 async fn timeout_result<T>(
@@ -858,7 +876,7 @@ async fn run_vim_multi_file_edit_prepare(
         }
     }
 
-    let session = NeovimSession::start(
+    let session = start_neovim(
         request
             .nvim_executable
             .as_deref()
@@ -871,7 +889,11 @@ async fn run_vim_multi_file_edit_prepare(
         .unwrap_or(Err(VimEditError::Timeout {
             timeout_ms: request.timeout.as_millis(),
         }));
-    session.shutdown().await;
+    let shutdown_result = session
+        .shutdown()
+        .await
+        .map_err(|source| VimEditError::Shutdown { source });
+    shutdown_result?;
     session_result
 }
 
@@ -1013,7 +1035,7 @@ async fn run_vim_edit_prepare(
 ) -> Result<VimEditExecution, VimEditError> {
     let original = read_text_file(&request.path)?;
     let temp_file = temp_file_with_contents(&original)?;
-    let session = NeovimSession::start(
+    let session = start_neovim(
         request
             .nvim_executable
             .as_deref()
@@ -1026,7 +1048,11 @@ async fn run_vim_edit_prepare(
         .unwrap_or(Err(VimEditError::Timeout {
             timeout_ms: request.timeout.as_millis(),
         }));
-    session.shutdown().await;
+    let shutdown_result = session
+        .shutdown()
+        .await
+        .map_err(|source| VimEditError::Shutdown { source });
+    shutdown_result?;
     let (final_text, cursor, nvim_mode, final_context, events) = session_result?;
 
     let changed = original != final_text;
@@ -1266,6 +1292,63 @@ fn temp_file_with_contents(contents: &str) -> Result<NamedTempFile, VimEditError
     Ok(file)
 }
 
+struct ProcessTermination {
+    pid: Option<u32>,
+    graceful: bool,
+    forced: bool,
+    exit_status: ExitStatus,
+}
+
+impl ProcessTermination {
+    fn verified(self) -> Self {
+        debug_assert!(!(self.graceful && self.forced));
+        let _ = (self.pid, self.exit_status);
+        self
+    }
+}
+
+async fn wait_for_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+) -> io::Result<Option<ExitStatus>> {
+    time::timeout(timeout, child.wait())
+        .await
+        .map_or(Ok(None), |status| status.map(Some))
+}
+
+async fn terminate_child(
+    child: &mut Child,
+    graceful_requested: bool,
+) -> io::Result<ProcessTermination> {
+    let pid = child.id();
+    if let Some(exit_status) = wait_for_child_exit(child, CHILD_EXIT_TIMEOUT).await? {
+        return Ok(ProcessTermination {
+            pid,
+            graceful: graceful_requested,
+            forced: false,
+            exit_status,
+        }
+        .verified());
+    }
+
+    child.start_kill()?;
+    let exit_status = wait_for_child_exit(child, CHILD_EXIT_TIMEOUT)
+        .await?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("child process {pid:?} did not exit after forced termination"),
+            )
+        })?;
+    Ok(ProcessTermination {
+        pid,
+        graceful: false,
+        forced: true,
+        exit_status,
+    }
+    .verified())
+}
+
 struct NeovimSession {
     nvim: Neovim<Compat<ChildStdin>>,
     io_handle: JoinHandle<Result<(), Box<nvim_rs::error::LoopError>>>,
@@ -1454,15 +1537,19 @@ impl NeovimSession {
         }
     }
 
-    async fn shutdown(mut self) {
-        let _ = time::timeout(Duration::from_millis(100), self.nvim.command("qa!")).await;
-        let _ = time::timeout(Duration::from_millis(500), &mut self.io_handle).await;
-        match self.child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
-                let _ = self.child.kill().await;
-            }
+    async fn shutdown(mut self) -> io::Result<ProcessTermination> {
+        let graceful = matches!(
+            time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, self.nvim.command("qa!")).await,
+            Ok(Ok(()))
+        );
+        let termination = terminate_child(&mut self.child, graceful).await;
+        if time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut self.io_handle)
+            .await
+            .is_err()
+        {
+            self.io_handle.abort();
         }
+        termination
     }
 }
 
@@ -2430,54 +2517,93 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn timeout_kills_spawned_process() {
+    fn forced_termination_reaps_ready_child() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let executable = temp_dir.path().join("fake-nvim");
-        let pid_file = temp_dir.path().join("pid");
+        let executable = temp_dir.path().join("fixture");
+        let ready_file = temp_dir.path().join("ready");
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
-                pid_file.display()
+                "#!/bin/sh\nprintf '%s' \"$$\" > {}.tmp\nmv {}.tmp {}\nexec sleep 30\n",
+                ready_file.display(),
+                ready_file.display(),
+                ready_file.display(),
             ),
         )
-        .expect("write fake nvim");
+        .expect("write fixture");
         let mut permissions = fs::metadata(&executable)
-            .expect("fake nvim metadata")
+            .expect("fixture metadata")
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&executable, permissions).expect("make fake nvim executable");
+        fs::set_permissions(&executable, permissions).expect("make fixture executable");
 
-        let file = NamedTempFile::new().expect("temp file");
-        fs::write(file.path(), "foo").expect("write original");
-        let error = run_vim_edit(VimEditRequest {
-            path: file.path().to_path_buf(),
-            nvim_executable: Some(executable),
-            steps: Vec::new(),
-            mode: VimEditMode::Preview,
-            sandbox: VimEditSandbox::Default,
-            timeout: Duration::from_millis(250),
-            observation_granularity: VimEditObservationGranularity::Step,
-        })
-        .expect_err("fake nvim should time out");
-        assert!(matches!(error, VimEditError::Timeout { .. }));
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut child = Command::new(&executable)
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn fixture");
+            let deadline = time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if ready_file.exists() {
+                    break;
+                }
+                assert!(
+                    time::Instant::now() < deadline,
+                    "fixture did not report readiness before deadline"
+                );
+                time::sleep(Duration::from_millis(10)).await;
+            }
+            let fixture_pid = fs::read_to_string(&ready_file)
+                .expect("read fixture pid")
+                .trim()
+                .parse::<u32>()
+                .expect("parse fixture pid");
+            assert_eq!(child.id(), Some(fixture_pid));
 
-        std::thread::sleep(Duration::from_millis(100));
-        let pid = fs::read_to_string(&pid_file)
-            .expect("read fake nvim pid")
-            .trim()
-            .to_string();
-        let alive = std::process::Command::new("kill")
-            .arg("-0")
-            .arg(&pid)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("run kill -0")
-            .success();
-        assert!(!alive, "fake nvim process {pid} should have been killed");
+            let termination = terminate_child(&mut child, false)
+                .await
+                .expect("terminate fixture");
+            assert_eq!(termination.pid, Some(fixture_pid));
+            assert!(!termination.graceful);
+            assert!(termination.forced);
+            assert!(!termination.exit_status.success());
+            assert!(child.try_wait().expect("inspect reaped child").is_some());
+        });
+    }
+
+    #[test]
+    fn operation_timeout_reaps_rpc_ready_neovim() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let session = NeovimSession::start(Path::new(NVIM_EXECUTABLE))
+                .await
+                .expect("start Neovim");
+            session
+                .configure_isolation()
+                .await
+                .expect("configure Neovim");
+            let pid = session.child.id();
+            let timed_out =
+                time::timeout(Duration::from_millis(10), session.nvim.command("sleep 10")).await;
+            assert!(timed_out.is_err(), "RPC operation should time out");
+
+            let termination = session.shutdown().await.expect("shutdown Neovim");
+            assert_eq!(termination.pid, pid);
+            assert!(termination.exit_status.success() || termination.forced);
+        });
     }
 
     #[test]
