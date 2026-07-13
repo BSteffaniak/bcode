@@ -21775,6 +21775,66 @@ mod tests {
     }
 
     #[test]
+    fn complete_artifact_recording_never_enters_model_prompt() {
+        let session_id = SessionId::new();
+        let secret = "recording-byte-secret-that-must-never-reach-the-model";
+        let history = vec![
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-recording".to_owned(),
+                    producer_plugin_id: Some("fixture.plugin".to_owned()),
+                    tool_name: "fixture.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-recording".to_owned(),
+                    result: "bounded useful result".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: secret.to_owned(),
+                            producer_plugin_id: "fixture.plugin".to_owned(),
+                            schema: "fixture.recording".to_owned(),
+                            schema_version: 1,
+                            tool_call_id: Some("call-recording".to_owned()),
+                            title: Some(secret.to_owned()),
+                            metadata: serde_json::json!({"complete_recording": secret}),
+                            refs: vec![bcode_session_models::ToolArtifactRef {
+                                key: "recording".to_owned(),
+                                content_type: Some("application/octet-stream".to_owned()),
+                                storage_uri: Some(format!("file:///tmp/{secret}")),
+                                byte_len: Some(100_000_000),
+                                metadata: Some(serde_json::json!({"secret": secret})),
+                            }],
+                        }),
+                    }),
+                },
+            },
+        ];
+
+        let messages = session_events_to_model_messages_with_limit(&history, 1_000);
+        let encoded = serde_json::to_string(&messages).expect("model messages serialize");
+        assert!(!encoded.contains(secret), "{encoded}");
+        assert!(encoded.contains("bounded useful result"), "{encoded}");
+    }
+
+    #[test]
     fn tool_result_model_message_uses_truncated_output() {
         let session_id = SessionId::new();
         let output = "x".repeat(4_001);

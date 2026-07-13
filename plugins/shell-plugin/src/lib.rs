@@ -2080,6 +2080,71 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release benchmark"]
+    fn benchmark_live_stream_recording_overhead() {
+        const BYTES: usize = 4 * 1024 * 1024;
+        const ROUNDS: usize = 9;
+        let input = vec![b'x'; BYTES];
+        let arguments = json!({});
+        let context = ShellVisualStreamContext {
+            arguments: &arguments,
+            stream: ToolOutputStream::Pty,
+            columns: 120,
+            rows: 30,
+            timeout_ms: None,
+            prelude_markers: PreludeGateMarkers::default(),
+        };
+        let mut baseline = Vec::with_capacity(ROUNDS);
+        let mut recorded = Vec::with_capacity(ROUNDS);
+        let dir = tempfile::tempdir().expect("temp dir");
+        for round in 0..ROUNDS {
+            let measure = |recording: Option<PathBuf>| {
+                let started = Instant::now();
+                let mut output = read_limited_streaming(
+                    std::io::Cursor::new(&input),
+                    ServiceEventEmitter::default(),
+                    "benchmark-call",
+                    &context,
+                    TerminalStreamPaths {
+                        clean: None,
+                        raw: None,
+                        replay: None,
+                        recording,
+                    },
+                )
+                .expect("stream benchmark");
+                let elapsed = started.elapsed().as_nanos();
+                if let Some(writer) = output.recording_writer.take() {
+                    writer
+                        .finish(1, Some(0), false, false)
+                        .expect("recording finalization");
+                }
+                elapsed
+            };
+            let recording = Some(dir.path().join(format!("recording-{round}.bcsr")));
+            if round % 2 == 0 {
+                baseline.push(measure(None));
+                recorded.push(measure(recording));
+            } else {
+                recorded.push(measure(recording));
+                baseline.push(measure(None));
+            }
+        }
+        baseline.sort_unstable();
+        recorded.sort_unstable();
+        let baseline = baseline[ROUNDS / 2];
+        let recorded = recorded[ROUNDS / 2];
+        let overhead = recorded.saturating_sub(baseline).saturating_mul(10_000) / baseline;
+        eprintln!(
+            "shell live stream benchmark ({ROUNDS} median rounds x {BYTES} bytes): baseline={} ns/byte, recorded={} ns/byte, overhead={}.{:02}%",
+            baseline / BYTES as u128,
+            recorded / BYTES as u128,
+            overhead / 100,
+            overhead % 100,
+        );
+    }
+
+    #[test]
     fn recording_does_not_change_live_output_event_payloads() {
         let bytes = b"first\rsecond\n\x1b[31mred\x1b[0m\n";
         let arguments = json!({});
