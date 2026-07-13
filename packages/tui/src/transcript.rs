@@ -217,6 +217,7 @@ pub struct TranscriptItem {
     pub role: &'static str,
     pub text: String,
     pub streaming: bool,
+    display_label: Option<String>,
     event_sequence: Option<u64>,
     timestamp_ms: Option<u64>,
     kind: TranscriptItemKind,
@@ -253,6 +254,7 @@ impl TranscriptItem {
             role,
             text,
             streaming,
+            display_label: None,
             event_sequence: None,
             timestamp_ms: None,
             kind,
@@ -265,6 +267,22 @@ impl TranscriptItem {
         self.event_sequence = Some(sequence);
         self.timestamp_ms = Some(timestamp_ms);
         self
+    }
+
+    /// Return a copy annotated with a generic display label.
+    #[must_use]
+    pub fn with_display_label(mut self, display_label: String) -> Self {
+        self.display_label = Some(display_label);
+        self
+    }
+
+    /// Return the rendered role, including a generic origin label when present.
+    #[must_use]
+    pub fn display_role(&self) -> String {
+        self.display_label.as_ref().map_or_else(
+            || self.role.to_owned(),
+            |label| format!("{} · {label}", self.role),
+        )
     }
 
     /// Return the source event sequence associated with this item, when known.
@@ -969,6 +987,21 @@ fn push_transcript_item_from_event(
         SessionEventKind::ToolInvocationStream { event } => {
             apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
         }
+        SessionEventKind::PluginAutomationTurnStarted {
+            display_label,
+            user_event_sequence,
+            ..
+        } => {
+            if let Some(index) = items
+                .iter()
+                .position(|item| item.event_sequence() == Some(*user_event_sequence))
+            {
+                let replacement = items[index]
+                    .clone()
+                    .with_display_label(display_label.clone());
+                items[index] = replacement;
+            }
+        }
         _ => {
             if let Some(item) =
                 non_streaming_transcript_item_from_event(event, tool_calls, streamed_tool_results)
@@ -1441,5 +1474,68 @@ fn kind_for_role(role: &str) -> TranscriptItemKind {
         "Skill error" => TranscriptItemKind::SkillError,
         "Compaction" | "Meta" => TranscriptItemKind::Meta,
         _ => TranscriptItemKind::Generic,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_automation_origin_labels_only_the_matching_user_turn() {
+        let session_id = bcode_session_models::SessionId::new();
+        let events = vec![
+            SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 5,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "automated prompt".to_owned(),
+                },
+            },
+            SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 6,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::PluginAutomationTurnStarted {
+                    plugin_id: "bcode.loop".to_owned(),
+                    run_id: "run-1".to_owned(),
+                    operation_id: "operation-1".to_owned(),
+                    display_label: "Loop iteration 4".to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    user_event_sequence: 5,
+                    read_only: false,
+                },
+            },
+            SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 7,
+                timestamp_ms: 3,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "manual steering".to_owned(),
+                },
+            },
+        ];
+
+        let items = transcript_items_from_events_with_reasoning(&events, false);
+        assert_eq!(items[0].display_role(), "You · Loop iteration 4");
+        assert_eq!(items[0].text(), "automated prompt");
+        assert_eq!(items[1].display_role(), "You");
+        assert_eq!(items[1].text(), "manual steering");
+    }
+
+    #[test]
+    fn transcript_item_display_label_is_generic() {
+        let item = TranscriptItem::new("You", "text".to_owned())
+            .with_display_label("Plugin operation".to_owned());
+        assert_eq!(item.display_role(), "You · Plugin operation");
     }
 }

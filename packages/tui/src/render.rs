@@ -636,7 +636,7 @@ fn push_transcript_item_rows(
     let item = &transcript[index];
     match item.kind() {
         TranscriptItemKind::UserMessage => {
-            push_message_block(rows, "You", item.text(), Color::Blue, width);
+            push_message_block(rows, &item.display_role(), item.text(), Color::Blue, width);
         }
         TranscriptItemKind::AssistantMessage => {
             push_assistant_rows(rows, item, width);
@@ -739,7 +739,13 @@ fn push_transcript_item_rows(
             push_detail_block(rows, "Skill error", item.text(), Color::Red, width);
         }
         TranscriptItemKind::Generic => {
-            push_detail_block(rows, item.role(), item.text(), Color::BrightBlack, width);
+            push_detail_block(
+                rows,
+                &item.display_role(),
+                item.text(),
+                Color::BrightBlack,
+                width,
+            );
         }
     }
 }
