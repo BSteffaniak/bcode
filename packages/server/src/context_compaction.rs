@@ -486,9 +486,9 @@ pub fn resolve_compaction_decision(
             reason: "active provider surface advertises managed compaction",
         },
         bcode_config::CompactionMode::Auto => CompactionDecision {
-            strategy: AutomaticCompactionStrategy::LocalProactive,
+            strategy: AutomaticCompactionStrategy::OverflowOnly,
             overflow_recovery: true,
-            reason: "active provider surface does not advertise managed compaction; using local proactive compaction with overflow recovery",
+            reason: "active provider surface does not advertise managed compaction",
         },
     }
 }

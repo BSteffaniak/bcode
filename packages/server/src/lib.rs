@@ -18244,7 +18244,7 @@ mod tests {
         );
         assert_eq!(
             resolve_compaction_decision(bcode_config::CompactionMode::Auto, None).strategy,
-            AutomaticCompactionStrategy::LocalProactive
+            AutomaticCompactionStrategy::OverflowOnly
         );
         assert_eq!(
             resolve_compaction_decision(
@@ -18252,7 +18252,7 @@ mod tests {
                 Some(&invalid_capabilities),
             )
             .strategy,
-            AutomaticCompactionStrategy::LocalProactive
+            AutomaticCompactionStrategy::OverflowOnly
         );
         assert_eq!(
             resolve_compaction_decision(bcode_config::CompactionMode::Proactive, None).strategy,
