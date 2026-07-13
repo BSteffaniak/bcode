@@ -3084,8 +3084,112 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionLeaseOwnerContext, SessionManager, db};
+    use super::{AppendToolCallRequestedInput, SessionLeaseOwnerContext, SessionManager, db};
     use bcode_metrics::MetricsRegistry;
+    use std::time::Duration;
+
+    async fn persistent_artifact_session_bytes(
+        root: &std::path::Path,
+        artifact_bytes: u64,
+        transient_updates: usize,
+    ) -> u64 {
+        let manager = SessionManager::persistent(root).expect("manager should create");
+        let session = manager
+            .create_session(Some("artifact-size".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        let _attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+        manager
+            .append_tool_call_requested(
+                session.id,
+                AppendToolCallRequestedInput {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("fixture.plugin".to_owned()),
+                    tool_name: "fixture.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            )
+            .await
+            .expect("request should append");
+        for sequence in 0..transient_updates {
+            manager
+                .publish_live_event(
+                    session.id,
+                    SessionLiveEventKind::ToolOutputDelta {
+                        event: ToolInvocationStreamEvent::OutputDelta {
+                            tool_call_id: "call-1".to_owned(),
+                            stream: bcode_session_models::ToolOutputStream::Pty,
+                            sequence: u64::try_from(sequence).expect("sequence"),
+                            text: "x".repeat(4_096),
+                            byte_len: 4_096,
+                        },
+                    },
+                )
+                .await
+                .expect("transient output should publish");
+        }
+        manager
+            .append_tool_call_finished(
+                session.id,
+                "call-1".to_owned(),
+                "bounded result".to_owned(),
+                false,
+                None,
+                Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_session_models::ToolArtifact {
+                        artifact_id: "artifact-1".to_owned(),
+                        producer_plugin_id: "fixture.plugin".to_owned(),
+                        schema: "fixture.artifact".to_owned(),
+                        schema_version: 1,
+                        tool_call_id: Some("call-1".to_owned()),
+                        title: None,
+                        metadata: serde_json::Value::Null,
+                        refs: vec![bcode_session_models::ToolArtifactRef {
+                            key: "complete_output".to_owned(),
+                            content_type: Some("application/octet-stream".to_owned()),
+                            storage_uri: Some("file:///external/artifact".to_owned()),
+                            byte_len: Some(artifact_bytes),
+                            metadata: None,
+                        }],
+                    }),
+                }),
+            )
+            .await
+            .expect("completion should append");
+        drop(manager);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let path = db::session_db_path(root, session.id);
+        let file_name = path.file_name().expect("database filename");
+        std::fs::read_dir(path.parent().expect("database parent"))
+            .expect("database directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(file_name.to_string_lossy().as_ref())
+            })
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| metadata.len())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn session_database_growth_is_independent_of_artifact_volume_and_transient_updates() {
+        let low_root = unique_temp_dir();
+        let high_root = unique_temp_dir();
+        let low = persistent_artifact_session_bytes(&low_root, 100_000, 1).await;
+        let high = persistent_artifact_session_bytes(&high_root, 900_000, 1_000).await;
+
+        assert_eq!(low, high, "low={low} high={high}");
+    }
 
     #[test]
     fn domain_metrics_count_payload_semantics_artifacts_and_compaction_boundaries() {
