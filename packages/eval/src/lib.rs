@@ -749,7 +749,7 @@ fn execute_direct_tool_variant(
             cwd: Some(workspace.to_path_buf()),
             artifact_dir: Some(rep_dir.to_path_buf()),
             cancellation_path: None,
-            control_path: None,
+            invocation_action_path: None,
         };
         let payload = serde_json::to_vec(&request)?;
         let start = Instant::now();

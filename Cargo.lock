@@ -2222,6 +2222,7 @@ dependencies = [
  "bcode_tool",
  "bcode_tool_runtime",
  "bcode_tui_components",
+ "bmux_terminal_grid",
  "bmux_tui",
  "portable-pty",
  "serde",

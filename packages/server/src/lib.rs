@@ -2033,7 +2033,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
         | Request::ReadSessionArtifact { session_id, .. }
-        | Request::ResizeToolInvocation { session_id, .. }
+        | Request::PluginInvocationAction { session_id, .. }
         | Request::SessionHistory { session_id }
         | Request::SessionHistoryPage { session_id, .. }
         | Request::AttachSession { session_id }
@@ -2079,7 +2079,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RenameSession { .. } => "rename_session",
         Request::DeleteSession { .. } => "delete_session",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
-        Request::ResizeToolInvocation { .. } => "resize_tool_invocation",
+        Request::PluginInvocationAction { .. } => "plugin_invocation_action",
         Request::SessionHistory { .. } => "session_history",
         Request::SessionHistoryPage { .. } => "session_history_page",
         Request::AttachSession { .. } => "attach_session",
@@ -2309,21 +2309,13 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::ResizeToolInvocation {
+        Request::PluginInvocationAction {
             session_id,
             tool_call_id,
-            columns,
-            rows,
+            action,
         } => {
-            handle_resize_tool_invocation(
-                request_id,
-                writer,
-                session_id,
-                &tool_call_id,
-                columns,
-                rows,
-            )
-            .await
+            handle_plugin_invocation_action(request_id, writer, session_id, &tool_call_id, &action)
+                .await
         }
         Request::ForkSession {
             source_session_id,
@@ -5009,45 +5001,46 @@ async fn handle_rename_session(
     }
 }
 
-async fn handle_resize_tool_invocation(
+fn append_plugin_invocation_action(path: &Path, action: &serde_json::Value) -> Result<(), String> {
+    if !action.is_object() {
+        return Err("plugin invocation action must be a JSON object".to_owned());
+    }
+    if serde_json::to_vec(action)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 64 * 1024
+    {
+        return Err("plugin invocation action exceeds 64 KiB".to_owned());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    writeln!(file, "{action}").map_err(|error| error.to_string())
+}
+
+async fn handle_plugin_invocation_action(
     request_id: u64,
     writer: &SharedWriter,
     session_id: SessionId,
     tool_call_id: &str,
-    columns: u16,
-    rows: u16,
+    action: &serde_json::Value,
 ) -> Result<(), ServerError> {
-    let result = if columns == 0 || rows == 0 {
-        Err("terminal resize dimensions must be positive".to_owned())
-    } else {
+    let result = {
         let safe_call_id = tool_call_id
             .chars()
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
             .collect::<String>();
         let path =
-            default_session_artifact_dir(session_id).join(format!("tool-control-{safe_call_id}"));
-        let event = serde_json::json!({
-            "type": "resize",
-            "columns": columns,
-            "rows": rows,
-        });
-        (|| -> Result<(), String> {
-            std::fs::create_dir_all(path.parent().ok_or("control path has no parent")?)
-                .map_err(|error| error.to_string())?;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|error| error.to_string())?;
-            writeln!(file, "{event}").map_err(|error| error.to_string())
-        })()
+            default_session_artifact_dir(session_id).join(format!("tool-actions-{safe_call_id}"));
+        append_plugin_invocation_action(&path, action)
     };
     match result {
         Ok(()) => {
             send_response(
                 writer,
                 request_id,
-                Response::Ok(ResponsePayload::ToolInvocationResized),
+                Response::Ok(ResponsePayload::PluginInvocationActionAccepted),
             )
             .await
         }
@@ -5055,7 +5048,7 @@ async fn handle_resize_tool_invocation(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("tool_resize_failed", error)),
+                Response::Err(ErrorResponse::new("plugin_invocation_action_failed", error)),
             )
             .await
         }
@@ -14002,13 +13995,13 @@ fn tool_invocation_metric_labels(
 
 struct ToolInvocationControlFiles {
     cancellation_path: PathBuf,
-    control_path: PathBuf,
+    invocation_action_path: PathBuf,
 }
 
 impl Drop for ToolInvocationControlFiles {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.cancellation_path);
-        let _ = std::fs::remove_file(&self.control_path);
+        let _ = std::fs::remove_file(&self.invocation_action_path);
     }
 }
 
@@ -14226,17 +14219,23 @@ async fn invoke_model_tool(
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
             .collect::<String>()
     ));
-    let control_path = default_session_artifact_dir(session_id).join(format!(
+    let invocation_action_path = default_session_artifact_dir(session_id).join(format!(
         "tool-control-{}",
         call.id
             .chars()
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
             .collect::<String>()
     ));
-    let _ = std::fs::remove_file(&control_path);
+    std::fs::create_dir_all(
+        invocation_action_path
+            .parent()
+            .ok_or_else(|| "tool control path has no parent".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::File::create(&invocation_action_path).map_err(|error| error.to_string())?;
     let _control_files = ToolInvocationControlFiles {
         cancellation_path: cancellation_path.clone(),
-        control_path: control_path.clone(),
+        invocation_action_path: invocation_action_path.clone(),
     };
     let request = ToolInvocationRequest {
         tool_call_id: call.id.clone(),
@@ -14245,7 +14244,7 @@ async fn invoke_model_tool(
         cwd: Some(working_directory),
         artifact_dir: Some(default_session_artifact_dir(session_id)),
         cancellation_path: Some(cancellation_path.clone()),
-        control_path: Some(control_path.clone()),
+        invocation_action_path: Some(invocation_action_path.clone()),
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let scope = active_plugin_scope_for_tool_call(state, session_id, &call.id).await;
@@ -17236,6 +17235,35 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolCardPresentation,
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
+
+    #[test]
+    fn generic_plugin_invocation_actions_are_opaque_bounded_and_require_active_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("active-action.jsonl");
+        std::fs::File::create(&path).expect("active action path");
+        let action = serde_json::json!({
+            "plugin_owned_type": "opaque-example",
+            "nested": {"value": 42},
+        });
+        append_plugin_invocation_action(&path, &action).expect("action append");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("action bytes"),
+            format!("{action}\n")
+        );
+
+        assert!(
+            append_plugin_invocation_action(&temp_dir.path().join("inactive.jsonl"), &action)
+                .is_err()
+        );
+        assert!(append_plugin_invocation_action(&path, &serde_json::json!("not-object")).is_err());
+        assert!(
+            append_plugin_invocation_action(
+                &path,
+                &serde_json::json!({"payload": "x".repeat(65 * 1024)})
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn generic_artifact_range_reads_are_bounded_and_root_confined() {

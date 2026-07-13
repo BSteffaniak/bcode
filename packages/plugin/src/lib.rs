@@ -2178,6 +2178,24 @@ impl PluginRuntimeHost {
         &self.configs
     }
 
+    /// Return the highest-priority compatible visual adapter route.
+    #[must_use]
+    pub fn visual_adapter(
+        &self,
+        schema: &str,
+        schema_version: u32,
+        surface: &str,
+        producer_plugin_id: Option<&str>,
+    ) -> Option<PluginVisualAdapterRoute> {
+        select_visual_adapter(
+            self.registry.manifests().iter(),
+            schema,
+            schema_version,
+            surface,
+            producer_plugin_id,
+        )
+    }
+
     /// Return native TUI registries keyed by plugin ID.
     #[must_use]
     pub fn tui_registries(&self) -> &BTreeMap<String, PluginTuiRegistry> {

@@ -1534,7 +1534,7 @@ fn refresh_invalidation_queue(chat: &ActiveChat, queue: &mut InvalidationQueue) 
     );
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_event<W: Write>(
     context: &mut ChatEventContext<'_, '_, W>,
     chat: &mut ActiveChat,
@@ -1548,14 +1548,40 @@ async fn handle_event<W: Write>(
                 .terminal
                 .resize(Rect::new(0, 0, size.width, size.height));
             if let Some(session_id) = chat.session_id {
-                for tool_call_id in chat.app.active_terminal_tool_call_ids() {
+                let runtime = loop_state.plugin_runtime.get_or_insert_with(|| {
+                    super::plugin_tui::load_default_runtime_with_static_bundled(
+                        &bcode_bundled_plugins::static_bundled_plugins(),
+                    )
+                    .expect("load plugin runtime for visual actions")
+                });
+                for (tool_call_id, visual) in chat.app.active_plugin_visuals() {
+                    let producer = visual.producer_plugin_id.as_deref();
+                    let Some(route) = runtime.visual_adapter(
+                        &visual.schema,
+                        visual.schema_version,
+                        "tui",
+                        producer,
+                    ) else {
+                        continue;
+                    };
+                    let Some(action) =
+                        runtime.tui_registry(&route.plugin_id).and_then(|registry| {
+                            registry.visual_invocation_event_action(
+                                &route.schema,
+                                &visual.payload,
+                                &Event::Resize(size),
+                            )
+                        })
+                    else {
+                        continue;
+                    };
                     if let Err(error) = context
                         .services
                         .client
-                        .resize_tool_invocation(session_id, tool_call_id, size.width, size.height)
+                        .send_plugin_invocation_action(session_id, tool_call_id, action)
                         .await
                     {
-                        tracing::debug!(%error, "active tool invocation did not accept terminal resize");
+                        tracing::debug!(%error, "active plugin invocation did not accept visual action");
                     }
                 }
             }

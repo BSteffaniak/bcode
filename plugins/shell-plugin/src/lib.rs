@@ -243,7 +243,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
                 session_cwd: request.cwd.as_deref(),
                 artifact_dir: request.artifact_dir.as_deref(),
                 cancellation_path: request.cancellation_path.as_deref(),
-                control_path: request.control_path.as_deref(),
+                invocation_action_path: request.invocation_action_path.as_deref(),
             },
         ),
         _ => ToolInvocationResponse {
@@ -547,7 +547,7 @@ struct TerminalRunPaths<'a> {
     session_cwd: Option<&'a Path>,
     artifact_dir: Option<&'a Path>,
     cancellation_path: Option<&'a Path>,
-    control_path: Option<&'a Path>,
+    invocation_action_path: Option<&'a Path>,
 }
 
 fn run_terminal_shell_command(
@@ -601,11 +601,11 @@ fn run_terminal_shell_command_with_environment(
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum TerminalControlEvent {
+enum ShellInvocationAction {
     Resize { columns: u16, rows: u16 },
 }
 
-struct TerminalControlReader<'a> {
+struct ShellInvocationActionReader<'a> {
     path: &'a Path,
     offset: u64,
     pending: String,
@@ -613,7 +613,7 @@ struct TerminalControlReader<'a> {
     recording: Option<recording::AsyncShellRecordingResizeSender>,
 }
 
-impl TerminalControlReader<'_> {
+impl ShellInvocationActionReader<'_> {
     fn poll(&mut self, master: &dyn portable_pty::MasterPty) -> Result<(), String> {
         let Ok(mut file) = File::open(self.path) else {
             return Ok(());
@@ -631,10 +631,10 @@ impl TerminalControlReader<'_> {
             if line.is_empty() {
                 continue;
             }
-            let event = serde_json::from_str::<TerminalControlEvent>(&line)
+            let event = serde_json::from_str::<ShellInvocationAction>(&line)
                 .map_err(|error| format!("invalid terminal control event: {error}"))?;
             match event {
-                TerminalControlEvent::Resize { columns, rows } => {
+                ShellInvocationAction::Resize { columns, rows } => {
                     if columns == 0 || rows == 0 {
                         return Err("terminal resize dimensions must be positive".to_owned());
                     }
@@ -677,7 +677,7 @@ fn wait_for_terminal_shell_status(
     timeout: Duration,
     tool_call_id: &str,
     events: ServiceEventEmitter,
-    mut control: Option<&mut TerminalControlReader<'_>>,
+    mut control: Option<&mut ShellInvocationActionReader<'_>>,
     master: Option<&dyn portable_pty::MasterPty>,
 ) -> Result<TerminalShellStatus, String> {
     let started = Instant::now();
@@ -862,13 +862,15 @@ fn run_terminal_shell_command_inner(
     let recording = recording_ready_rx
         .recv()
         .map_err(|_| "recording reader did not initialize".to_owned())?;
-    let mut control = paths.control_path.map(|path| TerminalControlReader {
-        path,
-        offset: 0,
-        pending: String::new(),
-        started,
-        recording,
-    });
+    let mut control = paths
+        .invocation_action_path
+        .map(|path| ShellInvocationActionReader {
+            path,
+            offset: 0,
+            pending: String::new(),
+            started,
+            recording,
+        });
     let status = wait_for_terminal_shell_status(
         &mut child,
         cancellation,
@@ -1861,7 +1863,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 cancellation_path: None,
-                control_path: None,
+                invocation_action_path: None,
             },
             &environment,
         );
@@ -1902,7 +1904,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 cancellation_path: None,
-                control_path: None,
+                invocation_action_path: None,
             },
             &environment,
         );
@@ -1916,8 +1918,8 @@ mod tests {
     fn active_terminal_control_resize_reaches_pty_and_recording() {
         let environment = isolated_config_environment("active-resize-recording");
         let artifact_dir = tempfile::tempdir().expect("artifact dir");
-        let control_path = artifact_dir.path().join("control.jsonl");
-        let resize_path = control_path.clone();
+        let invocation_action_path = artifact_dir.path().join("control.jsonl");
+        let resize_path = invocation_action_path.clone();
         let resize = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(40));
             std::fs::write(
@@ -1943,7 +1945,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 cancellation_path: None,
-                control_path: Some(&control_path),
+                invocation_action_path: Some(&invocation_action_path),
             },
             &environment,
         );
@@ -1997,7 +1999,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 cancellation_path: None,
-                control_path: None,
+                invocation_action_path: None,
             },
             &environment,
         );
@@ -2055,7 +2057,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 cancellation_path: None,
-                control_path: None,
+                invocation_action_path: None,
             },
             &environment,
         );
@@ -2180,7 +2182,7 @@ mod tests {
                     session_cwd: None,
                     artifact_dir: Some(artifact_dir.path()),
                     cancellation_path: cancel.then_some(cancellation_path.as_path()),
-                    control_path: None,
+                    invocation_action_path: None,
                 },
                 &environment,
             );
@@ -2242,7 +2244,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 cancellation_path: None,
-                control_path: None,
+                invocation_action_path: None,
             },
             &environment,
         );
@@ -2288,7 +2290,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 cancellation_path: None,
-                control_path: None,
+                invocation_action_path: None,
             },
         );
 

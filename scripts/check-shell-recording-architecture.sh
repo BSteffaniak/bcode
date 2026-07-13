@@ -8,7 +8,7 @@ cd "$root"
 # interpret shell-owned recording schemas, recording keys, or terminal MIME types. Generic UI
 # extension adapters may still register plugin-owned request visuals; durable recording semantics
 # must remain exclusively in shell-owned code.
-patterns='bcode\.shell\.recording|terminal_pty_stream|application/x-bcode-terminal'
+patterns='bcode\.shell\.recording|terminal_pty_stream|application/x-bcode-terminal|ResizeToolInvocation|ToolInvocationResized|active_terminal_tool|TerminalViewerFrame'
 violations="$({ grep -R --include='*.rs' -nE "$patterns" packages || true; } \
   | grep -v '^packages/tui/src/tests.rs:' || true)"
 if [[ -n "$violations" ]]; then

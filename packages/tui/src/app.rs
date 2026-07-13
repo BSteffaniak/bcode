@@ -311,7 +311,7 @@ pub struct BmuxApp {
     submitted_user_message_following: SubmittedUserMessageFollowing,
     assistant_scroll_anchor: AssistantScrollAnchorState,
     active_tool_calls: BTreeSet<String>,
-    active_terminal_tool_calls: BTreeSet<String>,
+    active_plugin_visuals: BTreeMap<String, bcode_session_models::PluginVisualDescriptor>,
     tool_activity_seen: bool,
     pending_assistant_stream_anchor: bool,
     pending_transcript_top_anchor_sequence: Option<u64>,
@@ -526,7 +526,7 @@ impl BmuxApp {
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
             active_tool_calls: BTreeSet::new(),
-            active_terminal_tool_calls: BTreeSet::new(),
+            active_plugin_visuals: BTreeMap::new(),
             tool_activity_seen: false,
             pending_assistant_stream_anchor: false,
             pending_transcript_top_anchor_sequence: None,
@@ -1490,7 +1490,7 @@ impl BmuxApp {
         self.scroll_mode = TranscriptScrollMode::TransitionToEntry { sticky: false };
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.active_tool_calls.clear();
-        self.active_terminal_tool_calls.clear();
+        self.active_plugin_visuals.clear();
         self.tool_activity_seen = false;
         self.pending_submissions.stage(text);
         self.input_history.reset_navigation();
@@ -1880,10 +1880,15 @@ impl BmuxApp {
         }
     }
 
-    /// Return active tool-call ids.
+    /// Return active plugin visual descriptors by invocation id.
     #[must_use]
-    pub fn active_terminal_tool_call_ids(&self) -> Vec<String> {
-        self.active_terminal_tool_calls.iter().cloned().collect()
+    pub fn active_plugin_visuals(
+        &self,
+    ) -> Vec<(String, bcode_session_models::PluginVisualDescriptor)> {
+        self.active_plugin_visuals
+            .iter()
+            .map(|(tool_call_id, visual)| (tool_call_id.clone(), visual.clone()))
+            .collect()
     }
 
     fn active_tool_loop(&self) -> bool {
@@ -1935,7 +1940,7 @@ impl BmuxApp {
         self.live_tool_previews.clear();
         self.streamed_tool_results.clear();
         self.active_tool_calls.clear();
-        self.active_terminal_tool_calls.clear();
+        self.active_plugin_visuals.clear();
         for event in &events {
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
@@ -2154,7 +2159,7 @@ impl BmuxApp {
             }
             SessionEventKind::UserMessage { text, .. } => {
                 self.active_tool_calls.clear();
-                self.active_terminal_tool_calls.clear();
+                self.active_plugin_visuals.clear();
                 self.tool_activity_seen = false;
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
                 self.pending_assistant_stream_anchor = false;
@@ -3152,7 +3157,6 @@ impl BmuxApp {
             ToolInvocationStreamEvent::Started {
                 tool_call_id,
                 tool_name,
-                terminal,
                 columns,
                 rows,
                 started_at_ms,
@@ -3160,7 +3164,6 @@ impl BmuxApp {
             } => self.apply_tool_started(
                 tool_call_id,
                 tool_name,
-                *terminal,
                 *columns,
                 *rows,
                 *started_at_ms,
@@ -3184,6 +3187,12 @@ impl BmuxApp {
         visual: &bcode_session_models::PluginVisualDescriptor,
         streaming: bool,
     ) {
+        if streaming {
+            self.active_plugin_visuals
+                .insert(tool_call_id.to_owned(), visual.clone());
+        } else {
+            self.active_plugin_visuals.remove(tool_call_id);
+        }
         let tool_name = self
             .tool_call_contexts
             .get(tool_call_id)
@@ -3220,12 +3229,10 @@ impl BmuxApp {
         context.saw_output = true;
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn apply_tool_started(
         &mut self,
         tool_call_id: &str,
         tool_name: &str,
-        terminal: bool,
         columns: Option<u16>,
         rows: Option<u16>,
         started_at_ms: Option<u64>,
@@ -3245,9 +3252,14 @@ impl BmuxApp {
         context.rows = rows.unwrap_or(context.rows);
         context.started_at_ms = started_at_ms;
         self.active_tool_calls.insert(tool_call_id.to_owned());
-        if terminal {
-            self.active_terminal_tool_calls
-                .insert(tool_call_id.to_owned());
+        if let Some(visual) = self
+            .tool_call_contexts
+            .get(tool_call_id)
+            .and_then(|context| context.request_visual.clone())
+        {
+            self.active_plugin_visuals
+                .entry(tool_call_id.to_owned())
+                .or_insert(visual);
         }
         self.tool_activity_seen = true;
         if application.live_activity() {
@@ -3268,7 +3280,7 @@ impl BmuxApp {
         application: SessionEventApplication,
     ) {
         self.active_tool_calls.remove(tool_call_id);
-        self.active_terminal_tool_calls.remove(tool_call_id);
+        self.active_plugin_visuals.remove(tool_call_id);
         if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id)
             && let Some(index) = context.index
             && let Some(item) = self.transcript.get_mut(index)

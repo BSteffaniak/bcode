@@ -19,6 +19,7 @@ bcode_plugin_sdk     = { workspace = true }
 bcode_tool           = { workspace = true }
 bcode_tool_runtime   = { workspace = true }
 bcode_tui_components = { workspace = true, optional = true }
+bmux_terminal_grid   = { workspace = true, optional = true }
 bmux_tui             = { workspace = true, optional = true }
 portable-pty         = { workspace = true }
 serde                = { workspace = true, features = ["derive", "std"] }
@@ -33,6 +34,11 @@ vte                  = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default          = []
+default = []
 fail-on-warnings = []
-static-bundled   = ["bcode_tui_components", "bmux_tui", "shuck-formatter"]
+static-bundled = [
+    "bcode_tui_components",
+    "bmux_terminal_grid",
+    "bmux_tui",
+    "shuck-formatter",
+]

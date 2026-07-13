@@ -1550,7 +1550,7 @@ mod tests {
             cwd: None,
             artifact_dir: None,
             cancellation_path: None,
-            control_path: None,
+            invocation_action_path: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert!(response.output.contains("bar"));
@@ -1578,7 +1578,7 @@ mod tests {
             cwd: None,
             artifact_dir: None,
             cancellation_path: None,
-            control_path: None,
+            invocation_action_path: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1610,7 +1610,7 @@ mod tests {
             cwd: None,
             artifact_dir: None,
             cancellation_path: None,
-            control_path: None,
+            invocation_action_path: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1648,7 +1648,7 @@ mod tests {
             cwd: None,
             artifact_dir: None,
             cancellation_path: None,
-            control_path: None,
+            invocation_action_path: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1683,7 +1683,7 @@ mod tests {
             cwd: None,
             artifact_dir: None,
             cancellation_path: None,
-            control_path: None,
+            invocation_action_path: None,
         });
         assert!(response.is_error);
         assert_eq!(

@@ -43,15 +43,6 @@ pub enum TerminalViewerSizing {
     },
 }
 
-/// Ordered terminal operations used for byte-exact replay.
-#[derive(Debug, Clone, Copy)]
-pub enum TerminalViewerFrame<'a> {
-    /// Raw terminal bytes.
-    Output(&'a [u8]),
-    /// Terminal dimensions changed at this point in the stream.
-    Resize { columns: u16, rows: u16 },
-}
-
 /// Input used to render terminal transcript rows.
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalViewerInput<'a> {
@@ -79,27 +70,9 @@ pub struct TerminalViewerInput<'a> {
     pub sizing: TerminalViewerSizing,
 }
 
-/// Render terminal transcript rows from ordered byte and resize frames.
-#[must_use]
-pub fn terminal_viewer_frame_rows(
-    input: TerminalViewerInput<'_>,
-    frames: &[TerminalViewerFrame<'_>],
-    width: u16,
-) -> Vec<Line> {
-    terminal_viewer_rows_with_source(input, width, Some(frames))
-}
-
 /// Render terminal transcript rows using terminal-grid semantics.
 #[must_use]
 pub fn terminal_viewer_rows(input: TerminalViewerInput<'_>, width: u16) -> Vec<Line> {
-    terminal_viewer_rows_with_source(input, width, None)
-}
-
-fn terminal_viewer_rows_with_source(
-    input: TerminalViewerInput<'_>,
-    width: u16,
-    frames: Option<&[TerminalViewerFrame<'_>]>,
-) -> Vec<Line> {
     let mut rows = Vec::new();
     if input.show_status {
         push_wrapped_styled_text(
@@ -121,7 +94,7 @@ fn terminal_viewer_rows_with_source(
             muted_style(),
         );
     }
-    for line in terminal_output_lines(&input, frames) {
+    for line in terminal_output_lines(&input) {
         rows.push(prefix_line(line, "    ", muted_style()));
     }
     rows
@@ -162,10 +135,7 @@ fn terminal_truncation_status(input: &TerminalViewerInput<'_>) -> String {
     }
 }
 
-fn terminal_output_lines(
-    input: &TerminalViewerInput<'_>,
-    frames: Option<&[TerminalViewerFrame<'_>]>,
-) -> Vec<Line> {
+fn terminal_output_lines(input: &TerminalViewerInput<'_>) -> Vec<Line> {
     let Ok(mut stream) = TerminalGridStream::new(
         input.columns.max(1),
         input.rows.max(1),
@@ -175,20 +145,7 @@ fn terminal_output_lines(
     ) else {
         return ansi_to_lines(input.output);
     };
-    if let Some(frames) = frames {
-        for frame in frames {
-            match frame {
-                TerminalViewerFrame::Output(bytes) => stream.process(bytes),
-                TerminalViewerFrame::Resize { columns, rows } => {
-                    if stream.resize((*columns).max(1), (*rows).max(1)).is_err() {
-                        return ansi_to_lines(input.output);
-                    }
-                }
-            }
-        }
-    } else {
-        stream.process(input.output.as_bytes());
-    }
+    stream.process(input.output.as_bytes());
     let grid = stream.grid();
     let max_rows = match input.sizing {
         TerminalViewerSizing::Compact => MAX_INLINE_TERMINAL_ROWS,
@@ -413,43 +370,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn compact_input(output: &str, columns: u16, rows: u16) -> TerminalViewerInput<'_> {
-        TerminalViewerInput {
-            output,
-            columns,
-            rows,
-            exit_code: Some(0),
-            timed_out: Some(false),
-            elapsed: None,
-            output_truncated: false,
-            output_bytes: None,
-            retained_output_bytes: None,
-            show_status: false,
-            sizing: TerminalViewerSizing::Compact,
-        }
-    }
-
-    #[test]
-    fn terminal_viewer_replays_resize_frames_in_stream_order() {
-        let frames = [
-            TerminalViewerFrame::Output(b"12345678"),
-            TerminalViewerFrame::Resize {
-                columns: 4,
-                rows: 24,
-            },
-            TerminalViewerFrame::Output(b"ABCD"),
-        ];
-        let ordered =
-            terminal_viewer_frame_rows(compact_input("12345678ABCD", 8, 24), &frames, 100);
-        let final_size_only = terminal_viewer_rows(compact_input("12345678ABCD", 4, 24), 100);
-
-        assert_ne!(ordered, final_size_only);
-        let ordered = rendered_text(&ordered);
-        assert!(ordered.contains("1234"), "{ordered}");
-        assert!(ordered.contains("567A"), "{ordered}");
-        assert!(ordered.contains("BCD"), "{ordered}");
     }
 
     #[test]

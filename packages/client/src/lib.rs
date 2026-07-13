@@ -1270,28 +1270,26 @@ impl BcodeClient {
         }
     }
 
-    /// Resize an active terminal-capable tool invocation.
+    /// Route an opaque plugin-owned action to an active tool invocation.
     ///
     /// # Errors
     ///
-    /// Returns an error when the daemon cannot be reached or rejects the dimensions/invocation.
-    pub async fn resize_tool_invocation(
+    /// Returns an error when the daemon cannot be reached or rejects the invocation/action.
+    pub async fn send_plugin_invocation_action(
         &self,
         session_id: SessionId,
         tool_call_id: String,
-        columns: u16,
-        rows: u16,
+        action: serde_json::Value,
     ) -> Result<(), ClientError> {
         match self
-            .send_request(Request::ResizeToolInvocation {
+            .send_request(Request::PluginInvocationAction {
                 session_id,
                 tool_call_id,
-                columns,
-                rows,
+                action,
             })
             .await?
         {
-            ResponsePayload::ToolInvocationResized => Ok(()),
+            ResponsePayload::PluginInvocationActionAccepted => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

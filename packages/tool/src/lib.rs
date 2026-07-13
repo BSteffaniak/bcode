@@ -385,7 +385,7 @@ pub struct ToolInvocationRequest {
     pub cancellation_path: Option<PathBuf>,
     /// Optional host-managed append-only control stream for an active invocation.
     #[serde(default)]
-    pub control_path: Option<PathBuf>,
+    pub invocation_action_path: Option<PathBuf>,
 }
 
 /// Plugin-owned visual update emitted while a tool invocation is running.

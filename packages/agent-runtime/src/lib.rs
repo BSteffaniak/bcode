@@ -817,7 +817,7 @@ impl AgentRuntime {
             cwd: None,
             artifact_dir: None,
             cancellation_path: None,
-            control_path: None,
+            invocation_action_path: None,
         };
         let invocation = executor
             .execute_tool(&tool, &request)

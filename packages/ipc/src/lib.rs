@@ -423,12 +423,11 @@ pub enum Request {
         offset: u64,
         length: u32,
     },
-    /// Resize an active terminal-capable tool invocation.
-    ResizeToolInvocation {
+    /// Route an opaque plugin-owned action to an active tool invocation.
+    PluginInvocationAction {
         session_id: SessionId,
         tool_call_id: String,
-        columns: u16,
-        rows: u16,
+        action: serde_json::Value,
     },
 }
 
@@ -1207,7 +1206,7 @@ pub enum ResponsePayload {
         total_bytes: u64,
         bytes: Vec<u8>,
     },
-    ToolInvocationResized,
+    PluginInvocationActionAccepted,
 }
 
 /// Structured error response.

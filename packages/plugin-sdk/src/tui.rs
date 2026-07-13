@@ -238,6 +238,16 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         PluginTuiVisualRenderMode::Inline
     }
 
+    /// Route a renderer event into an opaque action for an active plugin invocation.
+    fn invocation_event_action(
+        &self,
+        _kind: &str,
+        _payload: &serde_json::Value,
+        _event: &Event,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Build transcript rows for the artifact/view payload at the given width.
     fn rows(
         &self,
@@ -514,6 +524,20 @@ impl PluginTuiRegistry {
             .iter()
             .find(|adapter| adapter.supports(kind))
             .map(|adapter| adapter.render_mode(kind, payload))
+    }
+
+    /// Route a renderer event through a matching visual adapter.
+    #[must_use]
+    pub fn visual_invocation_event_action(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        event: &Event,
+    ) -> Option<serde_json::Value> {
+        self.visual_adapters
+            .iter()
+            .find(|adapter| adapter.supports(kind))
+            .and_then(|adapter| adapter.invocation_event_action(kind, payload, event))
     }
 
     /// Build transcript rows with host-owned presentation preferences.

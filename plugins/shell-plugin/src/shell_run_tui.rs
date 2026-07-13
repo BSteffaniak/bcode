@@ -5,10 +5,15 @@
 //! transcript code routes opaque plugin visuals without understanding those values.
 
 use bcode_tui_components::terminal_viewer::{
-    MAX_INLINE_TERMINAL_ROWS, TerminalViewerFrame, TerminalViewerInput, TerminalViewerLiveState,
-    TerminalViewerSizing, terminal_viewer_frame_rows, terminal_viewer_rows,
+    MAX_INLINE_TERMINAL_ROWS, TerminalViewerInput, TerminalViewerLiveState, TerminalViewerSizing,
+    terminal_viewer_rows,
+};
+use bmux_terminal_grid::{
+    Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
+    TerminalGridStream,
 };
 use bmux_tui::prelude::{Color, Line, Span, Style};
+use bmux_tui::style::Modifier;
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Mutex;
@@ -41,6 +46,25 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         } else {
             bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::Inline
         }
+    }
+
+    fn invocation_event_action(
+        &self,
+        kind: &str,
+        _payload: &serde_json::Value,
+        event: &bmux_tui::event::Event,
+    ) -> Option<serde_json::Value> {
+        if !self.supports(kind) {
+            return None;
+        }
+        let bmux_tui::event::Event::Resize(size) = event else {
+            return None;
+        };
+        Some(serde_json::json!({
+            "type": "resize",
+            "columns": size.width,
+            "rows": size.height,
+        }))
     }
 
     fn rows(
@@ -201,7 +225,11 @@ impl ShellRunTuiVisualAdapter {
         }
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(shell_status_rows(runtime));
-        lines.extend(terminal_viewer_rows(input, width));
+        lines.extend(shell_terminal_frame_rows(
+            input,
+            &[TerminalReplayFrame::Output(output.as_bytes().to_vec())],
+            width,
+        ));
         lines
     }
 
@@ -401,19 +429,150 @@ fn append_terminal_replay_rows(
     width: u16,
 ) {
     if let Some(frames) = replay.frames.as_deref() {
-        let frames = frames
-            .iter()
-            .map(|frame| match frame {
-                TerminalReplayFrame::Output(bytes) => TerminalViewerFrame::Output(bytes),
-                TerminalReplayFrame::Resize { columns, rows } => TerminalViewerFrame::Resize {
-                    columns: *columns,
-                    rows: *rows,
-                },
-            })
-            .collect::<Vec<_>>();
-        lines.extend(terminal_viewer_frame_rows(input, &frames, width));
+        lines.extend(shell_terminal_frame_rows(input, frames, width));
     } else {
         lines.extend(terminal_viewer_rows(input, width));
+    }
+}
+
+fn shell_terminal_frame_rows(
+    input: TerminalViewerInput<'_>,
+    frames: &[TerminalReplayFrame],
+    width: u16,
+) -> Vec<Line> {
+    let Ok(mut stream) = TerminalGridStream::new(
+        input.columns.max(1),
+        input.rows.max(1),
+        GridLimits {
+            scrollback_rows: MAX_INLINE_TERMINAL_ROWS.saturating_mul(8),
+        },
+    ) else {
+        return terminal_viewer_rows(input, width);
+    };
+    for frame in frames {
+        match frame {
+            TerminalReplayFrame::Output(bytes) => stream.process(bytes),
+            TerminalReplayFrame::Resize { columns, rows } => {
+                if stream.resize((*columns).max(1), (*rows).max(1)).is_err() {
+                    return terminal_viewer_rows(input, width);
+                }
+            }
+        }
+    }
+    let grid = stream.grid();
+    let max_rows = match input.sizing {
+        TerminalViewerSizing::Compact => MAX_INLINE_TERMINAL_ROWS,
+        TerminalViewerSizing::Live { max_rows, .. } => max_rows,
+    };
+    let mut output = grid
+        .main_content_tail_rows(max_rows)
+        .iter()
+        .map(|row| {
+            let mut line = shell_terminal_grid_row_to_line(grid, row);
+            line.spans
+                .insert(0, Span::styled("    ", Style::new().fg(Color::BrightBlack)));
+            line
+        })
+        .collect::<Vec<_>>();
+    if let TerminalViewerSizing::Live {
+        visible_rows,
+        max_rows,
+    } = input.sizing
+    {
+        let target_rows = visible_rows.max(1).min(max_rows);
+        if output.len() > target_rows {
+            output = output[output.len().saturating_sub(target_rows)..].to_vec();
+        }
+        while output.len() < target_rows {
+            output.push(Line::default());
+        }
+    }
+    output
+}
+
+fn shell_terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
+    let mut spans = Vec::new();
+    let mut current_style = None;
+    let mut current_text = String::new();
+    for cell in row.cells() {
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let style = shell_terminal_grid_style(grid.palette().get(cell.style()));
+        if current_style == Some(style) {
+            current_text.push_str(cell.text());
+            continue;
+        }
+        if !current_text.is_empty() {
+            spans.push(Span::styled(
+                current_text,
+                current_style.unwrap_or_default(),
+            ));
+            current_text = String::new();
+        }
+        current_style = Some(style);
+        current_text.push_str(cell.text());
+    }
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            current_style.unwrap_or_default(),
+        ));
+    }
+    Line::from_spans(spans)
+}
+
+const fn shell_terminal_grid_style(style: GridStyle) -> Style {
+    let mut output = Style::new();
+    if let Some(fg) = style.fg {
+        output = output.fg(shell_terminal_grid_color(fg));
+    }
+    if let Some(bg) = style.bg {
+        output = output.bg(shell_terminal_grid_color(bg));
+    }
+    if style.bold {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        output = output.add_modifier(Modifier::UNDERLINE);
+    }
+    if style.dim {
+        output = output.add_modifier(Modifier::DIM);
+    }
+    if style.inverse {
+        output = output.add_modifier(Modifier::REVERSED);
+    }
+    if style.strike {
+        output = output.add_modifier(Modifier::CROSSED_OUT);
+    }
+    output
+}
+
+const fn shell_terminal_grid_color(color: GridColor) -> Color {
+    match color {
+        GridColor::Indexed(index) => match index {
+            0 => Color::Black,
+            1 => Color::Red,
+            2 => Color::Green,
+            3 => Color::Yellow,
+            4 => Color::Blue,
+            5 => Color::Magenta,
+            6 => Color::Cyan,
+            7 => Color::White,
+            8 => Color::BrightBlack,
+            9 => Color::BrightRed,
+            10 => Color::BrightGreen,
+            11 => Color::BrightYellow,
+            12 => Color::BrightBlue,
+            13 => Color::BrightMagenta,
+            14 => Color::BrightCyan,
+            15 => Color::BrightWhite,
+            other => Color::Indexed(other),
+        },
+        GridColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
     }
 }
 
@@ -642,6 +801,24 @@ mod tests {
     }
 
     #[test]
+    fn shell_visual_adapter_owns_resize_action_payload() {
+        let action = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_action(
+            &ShellRunTuiVisualAdapter::default(),
+            "bcode.tool.request.shell.run",
+            &serde_json::json!({}),
+            &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(132, 40)),
+        );
+        assert_eq!(
+            action,
+            Some(serde_json::json!({
+                "type": "resize",
+                "columns": 132,
+                "rows": 40,
+            }))
+        );
+    }
+
+    #[test]
     fn adapter_formats_shell_commands_by_default() {
         let payload = serde_json::json!({
             "command": "if true;then echo 'hello world';else echo nope;fi",
@@ -853,7 +1030,7 @@ mod tests {
             .expect("finish recording");
         let payload = authoritative_recording_payload(&path);
         let recorded_rows = render_rows(&payload);
-        let expected_rows = terminal_viewer_frame_rows(
+        let expected_rows = shell_terminal_frame_rows(
             TerminalViewerInput {
                 output: "12345678ABCD",
                 columns: 8,
@@ -868,12 +1045,12 @@ mod tests {
                 sizing: TerminalViewerSizing::Compact,
             },
             &[
-                TerminalViewerFrame::Output(b"12345678"),
-                TerminalViewerFrame::Resize {
+                TerminalReplayFrame::Output(b"12345678".to_vec()),
+                TerminalReplayFrame::Resize {
                     columns: 4,
                     rows: 24,
                 },
-                TerminalViewerFrame::Output(b"ABCD"),
+                TerminalReplayFrame::Output(b"ABCD".to_vec()),
             ],
             100,
         );
