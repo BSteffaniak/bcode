@@ -551,6 +551,19 @@ mod tests {
         assert!(rendered.contains("world"), "{rendered}");
     }
 
+    fn render_rows(payload: &serde_json::Value) -> Vec<Line> {
+        bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter::default(),
+            "bcode.shell.run",
+            payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
+        )
+    }
+
     fn authoritative_recording_payload(path: &std::path::Path) -> serde_json::Value {
         serde_json::json!({
             "mode": "terminal",
@@ -625,6 +638,71 @@ mod tests {
         fs::write(&path, bytes).expect("corrupt output");
         let payload = authoritative_recording_payload(&path);
         assert_recording_unavailable(&payload, "checksum mismatch");
+    }
+
+    #[test]
+    fn recording_migration_preserves_exact_rendered_grid_and_styles() {
+        let fixtures: &[(&str, &[u8])] = &[
+            ("plain", b"first line\nsecond line\n"),
+            (
+                "ansi_cursor_and_carriage_return",
+                b"\x1b[31mred\x1b[0m plain\nprogress 10%\rprogress 100%\x1b[K\nabc\x1b[2DXY\n",
+            ),
+            (
+                "erase_and_alternate_screen",
+                b"before\n\x1b[2J\x1b[Hhome\n\x1b[?1049halt\x1b[32mgreen\x1b[0m\x1b[?1049lafter",
+            ),
+            ("wide_combining_no_newline", "界 e\u{301} fin".as_bytes()),
+        ];
+
+        for (name, output) in fixtures {
+            let output = std::str::from_utf8(output).expect("fixture UTF-8");
+            let legacy_payload = serde_json::json!({
+                "mode": "terminal",
+                "output_tail": output,
+                "columns": 80,
+                "rows": 24,
+                "exit_code": 0,
+                "timed_out": false,
+                "cancelled": false
+            });
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let path = temp_dir.path().join("recording.bcsr");
+            let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
+                .expect("recording writer");
+            for (sequence, chunk) in output.as_bytes().chunks(3).enumerate() {
+                writer
+                    .write_output(
+                        u64::try_from(sequence).expect("sequence").saturating_add(1),
+                        chunk,
+                    )
+                    .expect("record output");
+            }
+            writer
+                .finish(10_000, Some(0), None, false, false)
+                .expect("finish recording");
+            let recording_payload = serde_json::json!({
+                "mode": "terminal",
+                "output_tail": "forbidden fallback sentinel",
+                "columns": 80,
+                "rows": 24,
+                "exit_code": 0,
+                "timed_out": false,
+                "cancelled": false,
+                "_artifact_refs": [{
+                    "key": SHELL_RECORDING_REF_KEY,
+                    "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                    "storage_uri": url::Url::from_file_path(&path).ok().map(|url| url.to_string()),
+                    "metadata": {"complete": true}
+                }]
+            });
+
+            assert_eq!(
+                render_rows(&legacy_payload),
+                render_rows(&recording_payload),
+                "fixture {name}"
+            );
+        }
     }
 
     #[test]
