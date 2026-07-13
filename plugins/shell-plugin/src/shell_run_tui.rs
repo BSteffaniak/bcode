@@ -551,6 +551,82 @@ mod tests {
         assert!(rendered.contains("world"), "{rendered}");
     }
 
+    fn authoritative_recording_payload(path: &std::path::Path) -> serde_json::Value {
+        serde_json::json!({
+            "mode": "terminal",
+            "output_tail": "forbidden fallback sentinel",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [{
+                "key": SHELL_RECORDING_REF_KEY,
+                "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                "storage_uri": url::Url::from_file_path(path).ok().map(|url| url.to_string()),
+                "metadata": {"complete": true}
+            }]
+        })
+    }
+
+    fn assert_recording_unavailable(payload: &serde_json::Value, expected: &str) {
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter::default(),
+            "bcode.shell.run",
+            payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("durable shell recording unavailable"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(expected), "{rendered}");
+        assert!(
+            !rendered.contains("forbidden fallback sentinel"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn missing_authoritative_recording_is_explicit_and_never_falls_back() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let payload = authoritative_recording_payload(&temp_dir.path().join("missing.bcsr"));
+        assert_recording_unavailable(&payload, "could not be validated");
+    }
+
+    #[test]
+    fn incomplete_authoritative_recording_is_explicit_and_never_falls_back() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let final_path = temp_dir.path().join("recording.bcsr");
+        let partial_path = final_path.with_extension("shell-recording.partial");
+        let mut writer = crate::recording::ShellRecordingWriter::create(&final_path, 80, 24)
+            .expect("recording writer");
+        writer.write_output(1, b"partial").expect("output");
+        drop(writer);
+        let payload = authoritative_recording_payload(&partial_path);
+        assert_recording_unavailable(&payload, "recording is incomplete");
+    }
+
+    #[test]
+    fn checksum_mismatched_authoritative_recording_is_explicit_and_never_falls_back() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("recording.bcsr");
+        let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
+            .expect("recording writer");
+        writer.write_output(1, b"checksum").expect("output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish recording");
+        let mut bytes = fs::read(&path).expect("recording bytes");
+        let output_payload_offset = 8 + 2 + 2 + 2 + (1 + 8 + 4) + (1 + 8 + 4);
+        bytes[output_payload_offset] ^= 0xff;
+        fs::write(&path, bytes).expect("corrupt output");
+        let payload = authoritative_recording_payload(&path);
+        assert_recording_unavailable(&payload, "checksum mismatch");
+    }
+
     #[test]
     fn corrupt_authoritative_recording_is_explicit_and_never_falls_back() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
