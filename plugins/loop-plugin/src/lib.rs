@@ -2372,6 +2372,43 @@ mod tests {
     }
 
     #[test]
+    fn evaluator_tool_or_inspection_failure_cannot_produce_an_accepted_result() {
+        let error = finalize_evaluation_turn(
+            Err(AutomationTurnError::Fatal(
+                "inspection tool failed: repository unavailable".to_owned(),
+            )),
+            Ok(()),
+        )
+        .expect_err("inspection failure must fail evaluation");
+        assert_eq!(error, "inspection tool failed: repository unavailable");
+
+        let error = finalize_evaluation_turn(Err(AutomationTurnError::Retry), Ok(()))
+            .expect_err("preempted inspection must not become success");
+        assert_eq!(
+            error,
+            "evaluator automation was preempted before submission"
+        );
+    }
+
+    #[test]
+    fn source_change_while_evaluator_is_running_discards_even_positive_result() {
+        let captured_generation = 40;
+        let generation_after_evaluator = 41;
+        assert_eq!(
+            decide_evaluation(captured_generation, generation_after_evaluator, true),
+            EvaluationDecision::Reevaluate {
+                generation: generation_after_evaluator
+            }
+        );
+        assert_eq!(
+            decide_evaluation(captured_generation, generation_after_evaluator, false),
+            EvaluationDecision::Reevaluate {
+                generation: generation_after_evaluator
+            }
+        );
+    }
+
+    #[test]
     fn evaluator_cleanup_failure_cannot_become_success() {
         let completion = TurnCompletion {
             outcome: ModelTurnOutcome::Completed,
