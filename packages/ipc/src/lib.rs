@@ -427,7 +427,7 @@ pub enum Request {
     PluginInvocationAction {
         session_id: SessionId,
         tool_call_id: String,
-        action: serde_json::Value,
+        action: bcode_tool::PluginInvocationAction,
     },
 }
 

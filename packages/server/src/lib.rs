@@ -106,7 +106,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -200,6 +200,7 @@ pub struct ServerState {
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     pending_interactive_tools: Mutex<BTreeMap<String, PendingInteractiveToolRequest>>,
+    active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
@@ -1043,6 +1044,7 @@ impl ServerState {
             session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
             pending_interactive_tools: Mutex::default(),
+            active_plugin_invocations: Arc::default(),
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
             client_runtime_contexts: Mutex::default(),
@@ -2314,8 +2316,15 @@ async fn handle_request_inner(
             tool_call_id,
             action,
         } => {
-            handle_plugin_invocation_action(request_id, writer, session_id, &tool_call_id, &action)
-                .await
+            handle_plugin_invocation_action(
+                request_id,
+                state,
+                writer,
+                session_id,
+                &tool_call_id,
+                &action,
+            )
+            .await
         }
         Request::ForkSession {
             source_session_id,
@@ -5001,40 +5010,95 @@ async fn handle_rename_session(
     }
 }
 
-fn append_plugin_invocation_action(path: &Path, action: &serde_json::Value) -> Result<(), String> {
-    if !action.is_object() {
-        return Err("plugin invocation action must be a JSON object".to_owned());
+#[derive(Debug, Clone)]
+struct ActivePluginInvocation {
+    producer_plugin_id: String,
+    action_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ActivePluginInvocationRegistration {
+    invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
+    key: (SessionId, String),
+}
+
+impl ActivePluginInvocationRegistration {
+    fn register(
+        invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
+        session_id: SessionId,
+        tool_call_id: &str,
+        invocation: ActivePluginInvocation,
+    ) -> Result<Self, String> {
+        let key = (session_id, tool_call_id.to_owned());
+        let mut entries = invocations
+            .lock()
+            .map_err(|_| "active plugin invocation registry poisoned".to_owned())?;
+        if entries.contains_key(&key) {
+            return Err("plugin invocation action route is already active".to_owned());
+        }
+        entries.insert(key.clone(), invocation);
+        drop(entries);
+        Ok(Self { invocations, key })
     }
-    if serde_json::to_vec(action)
-        .map_err(|error| error.to_string())?
-        .len()
-        > 64 * 1024
-    {
+}
+
+impl Drop for ActivePluginInvocationRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut entries) = self.invocations.lock() {
+            entries.remove(&self.key);
+        }
+    }
+}
+
+fn append_plugin_invocation_action(
+    path: &Path,
+    action: &bcode_tool::PluginInvocationAction,
+) -> Result<(), String> {
+    if action.producer_plugin_id.trim().is_empty() {
+        return Err("plugin invocation action producer id must not be empty".to_owned());
+    }
+    if action.schema.trim().is_empty() || action.schema_version == 0 {
+        return Err("plugin invocation action schema and version must be valid".to_owned());
+    }
+    if !action.payload.is_object() {
+        return Err("plugin invocation action payload must be a JSON object".to_owned());
+    }
+    let encoded = serde_json::to_vec(action).map_err(|error| error.to_string())?;
+    if encoded.len() > 64 * 1024 {
         return Err("plugin invocation action exceeds 64 KiB".to_owned());
     }
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(path)
         .map_err(|error| error.to_string())?;
-    writeln!(file, "{action}").map_err(|error| error.to_string())
+    file.write_all(&encoded)
+        .map_err(|error| error.to_string())?;
+    file.write_all(b"\n").map_err(|error| error.to_string())
 }
 
 async fn handle_plugin_invocation_action(
     request_id: u64,
+    state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
     tool_call_id: &str,
-    action: &serde_json::Value,
+    action: &bcode_tool::PluginInvocationAction,
 ) -> Result<(), ServerError> {
-    let result = {
-        let safe_call_id = tool_call_id
-            .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-            .collect::<String>();
-        let path =
-            default_session_artifact_dir(session_id).join(format!("tool-actions-{safe_call_id}"));
-        append_plugin_invocation_action(&path, action)
-    };
+    let result = state
+        .active_plugin_invocations
+        .lock()
+        .map_err(|_| "active plugin invocation registry poisoned".to_owned())
+        .and_then(|invocations| {
+            let active = invocations
+                .get(&(session_id, tool_call_id.to_owned()))
+                .ok_or_else(|| "plugin invocation is not active".to_owned())?;
+            if active.producer_plugin_id != action.producer_plugin_id {
+                return Err(
+                    "plugin invocation action producer does not own the invocation".to_owned(),
+                );
+            }
+            append_plugin_invocation_action(&active.action_path, action)
+        });
     match result {
         Ok(()) => {
             send_response(
@@ -14237,6 +14301,15 @@ async fn invoke_model_tool(
         cancellation_path: cancellation_path.clone(),
         invocation_action_path: invocation_action_path.clone(),
     };
+    let _action_registration = ActivePluginInvocationRegistration::register(
+        Arc::clone(&state.active_plugin_invocations),
+        session_id,
+        &call.id,
+        ActivePluginInvocation {
+            producer_plugin_id: plugin_id.clone(),
+            action_path: invocation_action_path.clone(),
+        },
+    )?;
     let request = ToolInvocationRequest {
         tool_call_id: call.id.clone(),
         name: call.name.clone(),
@@ -17241,28 +17314,72 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("active-action.jsonl");
         std::fs::File::create(&path).expect("active action path");
-        let action = serde_json::json!({
-            "plugin_owned_type": "opaque-example",
-            "nested": {"value": 42},
-        });
+        let action = bcode_tool::PluginInvocationAction {
+            producer_plugin_id: "example.plugin".to_owned(),
+            schema: "example.invocation-action".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({
+                "plugin_owned_type": "opaque-example",
+                "nested": {"value": 42},
+            }),
+        };
         append_plugin_invocation_action(&path, &action).expect("action append");
         assert_eq!(
             std::fs::read_to_string(&path).expect("action bytes"),
-            format!("{action}\n")
+            format!(
+                "{}\n",
+                serde_json::to_string(&action).expect("encode action")
+            )
         );
 
         assert!(
             append_plugin_invocation_action(&temp_dir.path().join("inactive.jsonl"), &action)
                 .is_err()
         );
-        assert!(append_plugin_invocation_action(&path, &serde_json::json!("not-object")).is_err());
+        let mut invalid = action.clone();
+        invalid.payload = serde_json::json!("not-object");
+        assert!(append_plugin_invocation_action(&path, &invalid).is_err());
+        let mut oversized = action;
+        oversized.payload = serde_json::json!({"payload": "x".repeat(65 * 1024)});
+        assert!(append_plugin_invocation_action(&path, &oversized).is_err());
+    }
+
+    #[test]
+    fn active_plugin_invocation_registration_enforces_identity_and_lifetime() {
+        let invocations = Arc::new(StdMutex::new(BTreeMap::new()));
+        let session_id = SessionId::new();
+        let path = PathBuf::from("opaque-action-path");
+        let registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&invocations),
+            session_id,
+            "call-1",
+            ActivePluginInvocation {
+                producer_plugin_id: "example.plugin".to_owned(),
+                action_path: path.clone(),
+            },
+        )
+        .expect("register invocation");
+        let active = invocations.lock().expect("registry");
+        let route = active
+            .get(&(session_id, "call-1".to_owned()))
+            .expect("active route");
+        assert_eq!(route.producer_plugin_id, "example.plugin");
+        assert_eq!(route.action_path, path);
+        drop(active);
         assert!(
-            append_plugin_invocation_action(
-                &path,
-                &serde_json::json!({"payload": "x".repeat(65 * 1024)})
+            ActivePluginInvocationRegistration::register(
+                Arc::clone(&invocations),
+                session_id,
+                "call-1",
+                ActivePluginInvocation {
+                    producer_plugin_id: "other.plugin".to_owned(),
+                    action_path: PathBuf::from("other"),
+                },
             )
             .is_err()
         );
+        drop(registration);
+        assert!(invocations.lock().expect("registry").is_empty());
     }
 
     #[test]

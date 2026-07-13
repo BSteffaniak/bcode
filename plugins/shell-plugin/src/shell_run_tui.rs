@@ -29,6 +29,7 @@ const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording"
 #[derive(Default)]
 pub struct ShellRunTuiVisualAdapter {
     live_states: Mutex<BTreeMap<String, TerminalViewerLiveState>>,
+    live_dimensions: Mutex<BTreeMap<String, (u16, u16)>>,
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
@@ -51,20 +52,39 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
     fn invocation_event_action(
         &self,
         kind: &str,
-        _payload: &serde_json::Value,
+        payload: &serde_json::Value,
         event: &bmux_tui::event::Event,
-    ) -> Option<serde_json::Value> {
+    ) -> Option<bcode_tool::PluginInvocationAction> {
         if !self.supports(kind) {
             return None;
         }
         let bmux_tui::event::Event::Resize(size) = event else {
             return None;
         };
-        Some(serde_json::json!({
-            "type": "resize",
-            "columns": size.width,
-            "rows": size.height,
-        }))
+        let key = payload
+            .get("_bcode_runtime")
+            .and_then(|runtime| runtime.get("live_state_key"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .get("live_state_key")
+                    .and_then(serde_json::Value::as_str)
+            });
+        if let Some(key) = key
+            && let Ok(mut dimensions) = self.live_dimensions.lock()
+        {
+            dimensions.insert(key.to_owned(), (size.width, size.height));
+        }
+        Some(bcode_tool::PluginInvocationAction {
+            producer_plugin_id: "bcode.shell".to_owned(),
+            schema: "bcode.shell.invocation-action".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({
+                "type": "resize",
+                "columns": size.width,
+                "rows": size.height,
+            }),
+        })
     }
 
     fn rows(
@@ -185,8 +205,27 @@ impl ShellRunTuiVisualAdapter {
             .get("output")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
-        let rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
+        let key = runtime
+            .get("live_state_key")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .get("arguments")
+                    .and_then(|arguments| arguments.get("command"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("shell-live-terminal");
+        let (columns, rows) = self
+            .live_dimensions
+            .lock()
+            .ok()
+            .and_then(|dimensions| dimensions.get(key).copied())
+            .unwrap_or_else(|| {
+                (
+                    payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS),
+                    payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS),
+                )
+            });
         let streaming = runtime
             .get("streaming")
             .and_then(serde_json::Value::as_bool)
@@ -207,16 +246,6 @@ impl ShellRunTuiVisualAdapter {
             sizing: TerminalViewerSizing::Compact,
         };
         if streaming {
-            let key = runtime
-                .get("live_state_key")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    payload
-                        .get("arguments")
-                        .and_then(|arguments| arguments.get("command"))
-                        .and_then(serde_json::Value::as_str)
-                })
-                .unwrap_or("shell-live-terminal");
             let visible_rows = self.live_visible_rows(key, input);
             input.sizing = TerminalViewerSizing::Live {
                 visible_rows,
@@ -801,6 +830,49 @@ mod tests {
     }
 
     #[test]
+    fn live_shell_visual_uses_plugin_owned_resize_dimensions() {
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let payload = serde_json::json!({
+            "arguments": {"command": "printf test"},
+            "_bcode_runtime": {
+                "output": "12345678ABCD",
+                "columns": 8,
+                "rows": 24,
+                "live_state_key": "call-resize",
+                "streaming": true
+            }
+        });
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            100,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            None,
+        );
+        let before = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &adapter,
+            "bcode.tool.request.shell.run",
+            &payload,
+            &context,
+        );
+        let action = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_action(
+            &adapter,
+            "bcode.tool.request.shell.run",
+            &payload,
+            &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(4, 24)),
+        );
+        let after = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &adapter,
+            "bcode.tool.request.shell.run",
+            &payload,
+            &context,
+        );
+
+        assert!(action.is_some());
+        assert_ne!(before, after);
+        let rendered = after.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("1234"), "{rendered}");
+    }
+
+    #[test]
     fn shell_visual_adapter_owns_resize_action_payload() {
         let action = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_action(
             &ShellRunTuiVisualAdapter::default(),
@@ -810,11 +882,16 @@ mod tests {
         );
         assert_eq!(
             action,
-            Some(serde_json::json!({
-                "type": "resize",
-                "columns": 132,
-                "rows": 40,
-            }))
+            Some(bcode_tool::PluginInvocationAction {
+                producer_plugin_id: "bcode.shell".to_owned(),
+                schema: "bcode.shell.invocation-action".to_owned(),
+                schema_version: 1,
+                payload: serde_json::json!({
+                    "type": "resize",
+                    "columns": 132,
+                    "rows": 40,
+                }),
+            })
         );
     }
 

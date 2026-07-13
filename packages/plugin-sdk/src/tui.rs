@@ -244,7 +244,7 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         _kind: &str,
         _payload: &serde_json::Value,
         _event: &Event,
-    ) -> Option<serde_json::Value> {
+    ) -> Option<bcode_tool::PluginInvocationAction> {
         None
     }
 
@@ -533,7 +533,7 @@ impl PluginTuiRegistry {
         kind: &str,
         payload: &serde_json::Value,
         event: &Event,
-    ) -> Option<serde_json::Value> {
+    ) -> Option<bcode_tool::PluginInvocationAction> {
         self.visual_adapters
             .iter()
             .find(|adapter| adapter.supports(kind))

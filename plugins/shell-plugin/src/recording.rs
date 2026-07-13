@@ -8,7 +8,11 @@ use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 
 const MAGIC: &[u8; 8] = b"BCSHREC\0";
@@ -46,19 +50,43 @@ enum AsyncRecordingCommand {
 #[derive(Clone)]
 pub struct AsyncShellRecordingResizeSender {
     sender: mpsc::SyncSender<AsyncRecordingCommand>,
+    sequence: Arc<Mutex<()>>,
+    failed: Arc<AtomicBool>,
 }
 
 impl AsyncShellRecordingResizeSender {
-    /// Queue a resize without waiting for filesystem I/O.
-    #[must_use]
-    pub fn try_write_resize(&self, offset_micros: u64, columns: u16, rows: u16) -> bool {
+    /// Apply and record a resize as one ordered operation relative to output frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the resize operation fails, ordering state is poisoned, or the
+    /// bounded recording queue cannot accept the frame. Any error permanently prevents
+    /// publication of the authoritative recording.
+    pub fn write_resize_with(
+        &self,
+        offset_micros: u64,
+        columns: u16,
+        rows: u16,
+        resize: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let _sequence = self.sequence.lock().map_err(|_| {
+            self.failed.store(true, Ordering::SeqCst);
+            io::Error::other("shell recording sequence lock poisoned")
+        })?;
+        if let Err(error) = resize() {
+            self.failed.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
         self.sender
             .try_send(AsyncRecordingCommand::Resize {
                 offset_micros,
                 columns,
                 rows,
             })
-            .is_ok()
+            .map_err(|_| {
+                self.failed.store(true, Ordering::SeqCst);
+                io::Error::other("shell recording queue overflowed or disconnected")
+            })
     }
 }
 
@@ -66,7 +94,8 @@ impl AsyncShellRecordingResizeSender {
 pub struct AsyncShellRecordingWriter {
     sender: mpsc::SyncSender<AsyncRecordingCommand>,
     worker: Option<thread::JoinHandle<()>>,
-    queue_failed: bool,
+    sequence: Arc<Mutex<()>>,
+    failed: Arc<AtomicBool>,
 }
 
 impl AsyncShellRecordingWriter {
@@ -84,7 +113,8 @@ impl AsyncShellRecordingWriter {
         Ok(Self {
             sender,
             worker: Some(worker),
-            queue_failed: false,
+            sequence: Arc::new(Mutex::new(())),
+            failed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -93,26 +123,34 @@ impl AsyncShellRecordingWriter {
     pub fn resize_sender(&self) -> AsyncShellRecordingResizeSender {
         AsyncShellRecordingResizeSender {
             sender: self.sender.clone(),
+            sequence: Arc::clone(&self.sequence),
+            failed: Arc::clone(&self.failed),
         }
     }
 
     /// Queue exact PTY bytes without waiting for filesystem I/O.
     ///
-    /// Returns `false` if the bounded writer queue cannot accept the frame. Once false is returned,
-    /// finalization fails explicitly and no authoritative recording is published.
+    /// Returns `false` if ordering is contended or the bounded writer queue cannot accept the
+    /// frame. This method never waits for recording ordering or filesystem I/O. Once false is
+    /// returned, finalization fails explicitly and no authoritative recording is published.
     pub fn try_write_output(&mut self, offset_micros: u64, bytes: &[u8]) -> bool {
-        if self.queue_failed {
+        if self.failed.load(Ordering::SeqCst) {
             return false;
         }
+        let bytes = bytes.to_vec();
+        let Ok(_sequence) = self.sequence.try_lock() else {
+            self.failed.store(true, Ordering::SeqCst);
+            return false;
+        };
         if self
             .sender
             .try_send(AsyncRecordingCommand::Output {
                 offset_micros,
-                bytes: bytes.to_vec(),
+                bytes,
             })
             .is_err()
         {
-            self.queue_failed = true;
+            self.failed.store(true, Ordering::SeqCst);
             return false;
         }
         true
@@ -120,22 +158,9 @@ impl AsyncShellRecordingWriter {
 
     /// Queue a resize without waiting for filesystem I/O.
     pub fn try_write_resize(&mut self, offset_micros: u64, columns: u16, rows: u16) -> bool {
-        if self.queue_failed {
-            return false;
-        }
-        if self
-            .sender
-            .try_send(AsyncRecordingCommand::Resize {
-                offset_micros,
-                columns,
-                rows,
-            })
-            .is_err()
-        {
-            self.queue_failed = true;
-            return false;
-        }
-        true
+        self.resize_sender()
+            .write_resize_with(offset_micros, columns, rows, || Ok(()))
+            .is_ok()
     }
 
     /// Drain queued frames, finalize atomically, and join the writer thread.
@@ -151,9 +176,18 @@ impl AsyncShellRecordingWriter {
         timed_out: bool,
         cancelled: bool,
     ) -> io::Result<ShellRecordingSummary> {
-        if self.queue_failed {
+        if self.failed.load(Ordering::SeqCst) {
             return Err(io::Error::other(
-                "shell recording queue overflowed or disconnected",
+                "shell recording queue overflowed, disconnected, or lost an ordered frame",
+            ));
+        }
+        let _sequence = self
+            .sequence
+            .lock()
+            .map_err(|_| io::Error::other("shell recording sequence lock poisoned"))?;
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(io::Error::other(
+                "shell recording queue overflowed, disconnected, or lost an ordered frame",
             ));
         }
         let (response, result) = mpsc::channel();
@@ -691,6 +725,20 @@ mod tests {
                 cancelled: false
             }
         );
+    }
+
+    #[test]
+    fn contended_recording_sequence_never_blocks_live_output_and_prevents_publication() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("contended.bcsr");
+        let mut writer = AsyncShellRecordingWriter::create(&path, 80, 24).expect("writer");
+        let sequence = Arc::clone(&writer.sequence);
+        let held = sequence.lock().expect("sequence lock");
+
+        assert!(!writer.try_write_output(1, b"must not wait"));
+        drop(held);
+        assert!(writer.finish(2, Some(0), None, false, false).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

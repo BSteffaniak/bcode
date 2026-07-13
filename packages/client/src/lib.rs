@@ -1279,7 +1279,7 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
         tool_call_id: String,
-        action: serde_json::Value,
+        action: bcode_tool::PluginInvocationAction,
     ) -> Result<(), ClientError> {
         match self
             .send_request(Request::PluginInvocationAction {

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek as _, Write};
+use std::io::{self, Read, Seek as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -631,27 +631,43 @@ impl ShellInvocationActionReader<'_> {
             if line.is_empty() {
                 continue;
             }
-            let event = serde_json::from_str::<ShellInvocationAction>(&line)
-                .map_err(|error| format!("invalid terminal control event: {error}"))?;
+            let envelope = serde_json::from_str::<bcode_tool::PluginInvocationAction>(&line)
+                .map_err(|error| format!("invalid shell invocation action envelope: {error}"))?;
+            if envelope.producer_plugin_id != "bcode.shell"
+                || envelope.schema != "bcode.shell.invocation-action"
+                || envelope.schema_version != 1
+            {
+                return Err("unsupported shell invocation action schema".to_owned());
+            }
+            let event = serde_json::from_value::<ShellInvocationAction>(envelope.payload)
+                .map_err(|error| format!("invalid shell invocation action: {error}"))?;
             match event {
                 ShellInvocationAction::Resize { columns, rows } => {
                     if columns == 0 || rows == 0 {
                         return Err("terminal resize dimensions must be positive".to_owned());
                     }
-                    master
-                        .resize(portable_pty::PtySize {
-                            rows,
-                            cols: columns,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        })
-                        .map_err(|error| error.to_string())?;
+                    let size = portable_pty::PtySize {
+                        rows,
+                        cols: columns,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    };
                     if let Some(recording) = &self.recording {
-                        let _ = recording.try_write_resize(
-                            u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                            columns,
-                            rows,
-                        );
+                        recording
+                            .write_resize_with(
+                                u64::try_from(self.started.elapsed().as_micros())
+                                    .unwrap_or(u64::MAX),
+                                columns,
+                                rows,
+                                || {
+                                    master
+                                        .resize(size)
+                                        .map_err(|error| io::Error::other(error.to_string()))
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                    } else {
+                        master.resize(size).map_err(|error| error.to_string())?;
                     }
                 }
             }
@@ -1055,6 +1071,7 @@ struct ShellVisualStreamContext<'a> {
 }
 
 const PRELUDE_GATE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
+const STREAM_READ_BUFFER_BYTES: usize = 16 * 1024;
 
 struct PreludeGate {
     markers: Vec<Vec<u8>>,
@@ -1243,7 +1260,7 @@ where
         visual_context.rows,
         MAX_INLINE_TERMINAL_OUTPUT_BYTES,
     );
-    let mut buffer = [0_u8; 4096];
+    let mut buffer = [0_u8; STREAM_READ_BUFFER_BYTES];
     let mut sequence = 0_u64;
     let mut visual_output = String::new();
     let recording_started = Instant::now();

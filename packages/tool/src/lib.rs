@@ -368,6 +368,19 @@ pub enum ToolSideEffect {
     ExecuteProcess,
 }
 
+/// Versioned opaque action routed to an active plugin-owned invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInvocationAction {
+    /// Plugin that owns interpretation of this action.
+    pub producer_plugin_id: String,
+    /// Plugin-owned action payload schema.
+    pub schema: String,
+    /// Version of the plugin-owned payload schema.
+    pub schema_version: u32,
+    /// Opaque plugin-owned payload.
+    pub payload: serde_json::Value,
+}
+
 /// Tool invocation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationRequest {
