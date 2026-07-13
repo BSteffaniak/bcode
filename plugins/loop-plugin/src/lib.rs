@@ -221,26 +221,31 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
     status_response(&message)
 }
 
+fn prepare_resume(state: &mut LoopState) -> Result<(), String> {
+    if matches!(
+        state.state,
+        RunState::Completed | RunState::LimitReached | RunState::Canceled
+    ) {
+        return Err("this loop is terminal and cannot be resumed".to_owned());
+    }
+    if !matches!(state.state, RunState::Paused | RunState::Failed) {
+        return Err("only paused or failed loops can be resumed".to_owned());
+    }
+    state.cancel_requested = false;
+    transition(state, RunState::Ready)?;
+    state.stop_reason = None;
+    Ok(())
+}
+
 fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
     let mut state = match load_state_result(session_id) {
         Ok(Some(state)) => state,
         Ok(None) => return status_response("no loop found for this session"),
         Err(error) => return status_response(&format!("loop state unavailable: {error}")),
     };
-    if matches!(
-        state.state,
-        RunState::Completed | RunState::LimitReached | RunState::Canceled
-    ) {
-        return status_response("this loop is terminal and cannot be resumed");
-    }
-    if !matches!(state.state, RunState::Paused | RunState::Failed) {
-        return status_response("only paused or failed loops can be resumed");
-    }
-    state.cancel_requested = false;
-    if let Err(error) = transition(&mut state, RunState::Ready) {
+    if let Err(error) = prepare_resume(&mut state) {
         return status_response(&error);
     }
-    state.stop_reason = None;
     if let Err(error) = save_state(&state) {
         return status_response(&format!("failed to resume loop: {error}"));
     }
@@ -842,6 +847,24 @@ fn iteration_submission(state: &LoopState, iteration: u64) -> IterationSubmissio
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnOutcomeDecision {
+    Completed,
+    PauseForSteering,
+    Pause,
+}
+
+const fn decide_turn_outcome(outcome: ModelTurnOutcome) -> TurnOutcomeDecision {
+    match outcome {
+        ModelTurnOutcome::Completed => TurnOutcomeDecision::Completed,
+        ModelTurnOutcome::Cancelled => TurnOutcomeDecision::PauseForSteering,
+        ModelTurnOutcome::Error
+        | ModelTurnOutcome::IdleTimeout
+        | ModelTurnOutcome::ToolRoundLimitReached
+        | ModelTurnOutcome::ProviderUnavailable => TurnOutcomeDecision::Pause,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvaluationDecision {
     Reevaluate { generation: u64 },
     Complete,
@@ -938,19 +961,25 @@ async fn run_loop(mut state: LoopState) {
                 }
             };
             state.current_iteration = iteration_number;
-            if completion.outcome != ModelTurnOutcome::Completed {
-                if refresh_cancel(&mut state) {
-                    return;
-                }
-                if completion.outcome == ModelTurnOutcome::Cancelled {
+            match decide_turn_outcome(completion.outcome) {
+                TurnOutcomeDecision::Completed => {}
+                TurnOutcomeDecision::PauseForSteering => {
+                    if refresh_cancel(&mut state) {
+                        return;
+                    }
                     pause_for_steering(&mut state, "iteration cancelled".to_owned());
                     return;
                 }
-                pause_run(
-                    &mut state,
-                    format!("iteration ended with {:?}", completion.outcome),
-                );
-                return;
+                TurnOutcomeDecision::Pause => {
+                    if refresh_cancel(&mut state) {
+                        return;
+                    }
+                    pause_run(
+                        &mut state,
+                        format!("iteration ended with {:?}", completion.outcome),
+                    );
+                    return;
+                }
             }
             if refresh_cancel(&mut state) {
                 return;
@@ -991,32 +1020,37 @@ async fn run_loop(mut state: LoopState) {
             )
             .await;
             let evaluation = match evaluation {
-                Ok(completion) if completion.outcome == ModelTurnOutcome::Completed => {
-                    match parse_evaluation(&completion.assistant_text) {
-                        Ok(evaluation) => evaluation,
-                        Err(error) => {
-                            if refresh_cancel(&mut state) {
+                Ok(completion) => match decide_turn_outcome(completion.outcome) {
+                    TurnOutcomeDecision::Completed => {
+                        match parse_evaluation(&completion.assistant_text) {
+                            Ok(evaluation) => evaluation,
+                            Err(error) => {
+                                if refresh_cancel(&mut state) {
+                                    return;
+                                }
+                                pause_run(&mut state, error);
                                 return;
                             }
-                            pause_run(&mut state, error);
-                            return;
                         }
                     }
-                }
-                Ok(completion) => {
-                    if refresh_cancel(&mut state) {
-                        return;
-                    }
-                    if completion.outcome == ModelTurnOutcome::Cancelled {
+                    TurnOutcomeDecision::PauseForSteering => {
+                        if refresh_cancel(&mut state) {
+                            return;
+                        }
                         pause_for_steering(&mut state, "evaluation cancelled".to_owned());
                         return;
                     }
-                    pause_run(
-                        &mut state,
-                        format!("evaluation ended with {:?}", completion.outcome),
-                    );
-                    return;
-                }
+                    TurnOutcomeDecision::Pause => {
+                        if refresh_cancel(&mut state) {
+                            return;
+                        }
+                        pause_run(
+                            &mut state,
+                            format!("evaluation ended with {:?}", completion.outcome),
+                        );
+                        return;
+                    }
+                },
                 Err(error) => {
                     if refresh_cancel(&mut state) {
                         return;
@@ -1108,6 +1142,15 @@ async fn resume_after_manual_steering(state: LoopState) -> Result<(), String> {
     }
 }
 
+fn prepare_steering_resume(state: &mut LoopState) -> Result<(), String> {
+    if state.cancel_requested || state.state != RunState::Paused {
+        return Err("loop is not eligible for steering-assisted resume".to_owned());
+    }
+    transition(state, RunState::Evaluating)?;
+    state.stop_reason = None;
+    Ok(())
+}
+
 async fn resume_after_steering_settles(state: LoopState) -> Result<(), String> {
     let Some(mut saved) = load_state_result(state.session_id)? else {
         return Ok(());
@@ -1116,8 +1159,7 @@ async fn resume_after_steering_settles(state: LoopState) -> Result<(), String> {
         return Ok(());
     }
     let _generation = wait_until_automation_ready(saved.session_id).await?;
-    saved.state = RunState::Evaluating;
-    saved.stop_reason = None;
+    prepare_steering_resume(&mut saved)?;
     save_state(&saved)?;
     run_loop(saved).await;
     Ok(())
@@ -1518,6 +1560,8 @@ fn save_state(state: &LoopState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_tui::event::{MouseButton, MouseEvent};
+    use bmux_tui::geometry::Point;
 
     #[derive(Debug, Default)]
     struct TestHost;
@@ -1570,6 +1614,63 @@ mod tests {
             PluginTuiAction::Redraw
         );
         assert_eq!(surface.field, Field::Limit);
+    }
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent::new(kind, Point::new(x, y)))
+    }
+
+    #[test]
+    fn modal_mouse_click_focuses_the_clicked_field() {
+        let host = TestHost;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.prompt_area = Rect::new(2, 2, 30, 5);
+        surface.condition_area = Rect::new(2, 8, 30, 5);
+        surface.limit_area = Rect::new(2, 14, 20, 3);
+
+        let _outcome = surface.handle_event(
+            &mouse(MouseEventKind::Down(MouseButton::Left), 4, 10),
+            &host,
+        );
+        assert_eq!(surface.field, Field::Condition);
+        let _outcome = surface.handle_event(
+            &mouse(MouseEventKind::Down(MouseButton::Left), 4, 15),
+            &host,
+        );
+        assert_eq!(surface.field, Field::Limit);
+    }
+
+    #[test]
+    fn modal_renders_safely_across_small_and_resized_terminals() {
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.prompt = text_state("first line\nsecond line");
+        surface.condition = text_state("all work is complete");
+
+        for area in [Rect::new(0, 0, 24, 10), Rect::new(0, 0, 120, 40)] {
+            let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            surface.render(area, &mut frame);
+            assert!(surface.prompt_area.width <= area.width);
+            assert!(surface.condition_area.width <= area.width);
+            assert!(surface.limit_area.width <= area.width);
+        }
+    }
+
+    #[test]
+    fn modal_selection_replaces_selected_text() {
+        let host = TestHost;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.prompt = text_state("replace all of this");
+        surface.prompt.buffer_mut().move_cursor_with_selection(
+            bmux_text_edit::TextMotion::Start,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('x')), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.prompt.buffer().text(), "x");
     }
 
     #[test]
@@ -1828,6 +1929,85 @@ mod tests {
         state.schema_version = STATE_SCHEMA_VERSION;
         state.current_iteration = 21;
         assert!(validate_state(&state).is_err());
+    }
+
+    #[test]
+    fn cancellation_outcomes_pause_and_never_continue_automatically() {
+        assert_eq!(
+            decide_turn_outcome(ModelTurnOutcome::Completed),
+            TurnOutcomeDecision::Completed
+        );
+        assert_eq!(
+            decide_turn_outcome(ModelTurnOutcome::Cancelled),
+            TurnOutcomeDecision::PauseForSteering
+        );
+        for outcome in [
+            ModelTurnOutcome::Error,
+            ModelTurnOutcome::IdleTimeout,
+            ModelTurnOutcome::ToolRoundLimitReached,
+            ModelTurnOutcome::ProviderUnavailable,
+        ] {
+            assert_eq!(decide_turn_outcome(outcome), TurnOutcomeDecision::Pause);
+        }
+    }
+
+    #[test]
+    fn steering_resume_enters_evaluation_without_consuming_iteration() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            3,
+        );
+        state.state = RunState::Paused;
+        state.current_iteration = 1;
+        state.stop_reason = Some("iteration cancelled".to_owned());
+
+        prepare_steering_resume(&mut state).expect("steering may resume paused loop");
+
+        assert_eq!(state.state, RunState::Evaluating);
+        assert_eq!(state.current_iteration, 1);
+        assert!(state.stop_reason.is_none());
+    }
+
+    #[test]
+    fn explicit_resume_and_terminal_stop_semantics_are_strict() {
+        for resumable in [RunState::Paused, RunState::Failed] {
+            let mut state = LoopState::new(
+                SessionId::new(),
+                "iterate".to_owned(),
+                "complete".to_owned(),
+                3,
+            );
+            state.state = resumable;
+            state.cancel_requested = true;
+            state.stop_reason = Some("recoverable".to_owned());
+            prepare_resume(&mut state).expect("recoverable state should resume");
+            assert_eq!(state.state, RunState::Ready);
+            assert!(!state.cancel_requested);
+            assert!(state.stop_reason.is_none());
+        }
+
+        for terminal in [
+            RunState::Completed,
+            RunState::LimitReached,
+            RunState::Canceled,
+        ] {
+            let mut state = LoopState::new(
+                SessionId::new(),
+                "iterate".to_owned(),
+                "complete".to_owned(),
+                3,
+            );
+            state.state = terminal;
+            state.cancel_requested = terminal == RunState::Canceled;
+            assert_eq!(
+                prepare_resume(&mut state).expect_err("terminal loop must not resume"),
+                "this loop is terminal and cannot be resumed"
+            );
+            assert!(prepare_steering_resume(&mut state).is_err());
+            assert_eq!(state.state, terminal);
+        }
     }
 
     #[test]
