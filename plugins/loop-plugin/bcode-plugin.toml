@@ -3,7 +3,7 @@ name    = "Bcode Loop Plugin"
 version = "0.0.1"
 
 [[services]]
-class        = "interactive"
+class        = "service"
 description  = "Prompt loop commands"
 interface_id = "bcode.command/v1"
 name         = "Loop Commands"
