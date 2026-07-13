@@ -1871,6 +1871,75 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn terminal_recordings_preserve_timeout_cancellation_and_nonzero_status() {
+        let environment = isolated_config_environment("recording-terminal-status");
+        for (name, command, timeout_ms, cancel, expected_exit, timed_out, cancelled) in [
+            ("nonzero", "exit 7", 5_000, false, Some(7), false, false),
+            ("timeout", "sleep 10", 0, false, Some(1), true, false),
+            ("cancel", "sleep 10", 5_000, true, Some(1), false, true),
+        ] {
+            let artifact_dir = tempfile::tempdir().expect("artifact dir");
+            let cancellation_path = artifact_dir.path().join("cancel");
+            if cancel {
+                std::fs::write(&cancellation_path, b"cancel").expect("cancellation marker");
+            }
+            let response = run_terminal_shell_command_with_environment(
+                ServiceEventEmitter::default(),
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+                name,
+                &ShellRunArguments {
+                    command: command.to_owned(),
+                    cwd: None,
+                    timeout_ms: Some(timeout_ms),
+                    columns: Some(80),
+                    rows: Some(24),
+                    format_commands: None,
+                },
+                json!({}),
+                TerminalRunPaths {
+                    session_cwd: None,
+                    artifact_dir: Some(artifact_dir.path()),
+                    cancellation_path: cancel.then_some(cancellation_path.as_path()),
+                },
+                &environment,
+            );
+            let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
+                panic!("{name}: expected artifact: {}", response.output);
+            };
+            let recording = artifact
+                .refs
+                .iter()
+                .find(|reference| reference.key == SHELL_RECORDING_REF_KEY)
+                .expect("recording reference");
+            let path = url::Url::parse(
+                recording
+                    .storage_uri
+                    .as_deref()
+                    .expect("recording storage URI"),
+            )
+            .expect("recording URL")
+            .to_file_path()
+            .expect("recording path");
+            let (_, frames) = recording::read_recording(&path).expect("valid recording");
+            assert!(
+                frames.iter().any(|frame| matches!(
+                    frame,
+                    recording::ShellRecordingFrame::Finish {
+                        exit_code,
+                        timed_out: actual_timed_out,
+                        cancelled: actual_cancelled,
+                        ..
+                    } if *exit_code == expected_exit
+                        && *actual_timed_out == timed_out
+                        && *actual_cancelled == cancelled
+                )),
+                "{name}: {frames:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminal_mode_returns_semantic_terminal_result() {
         let environment = isolated_config_environment("terminal");
         let response = run_terminal_shell_command_with_environment(
@@ -2142,6 +2211,89 @@ mod tests {
             overhead / 100,
             overhead % 100,
         );
+    }
+
+    #[derive(Debug)]
+    struct PendingTerminalChild {
+        killed: bool,
+    }
+
+    impl portable_pty::ChildKiller for PendingTerminalChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed = true;
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self {
+                killed: self.killed,
+            })
+        }
+    }
+
+    impl portable_pty::Child for PendingTerminalChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(self
+                .killed
+                .then(|| portable_pty::ExitStatus::with_signal("killed")))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_signal("killed"))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[test]
+    fn terminal_wait_cancels_and_kills_promptly() {
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(PendingTerminalChild { killed: false });
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::new(cancelled);
+        let started = Instant::now();
+        let status = wait_for_terminal_shell_status(
+            &mut child,
+            &cancellation,
+            None,
+            Duration::from_secs(10),
+            "cancel-test",
+            ServiceEventEmitter::default(),
+        )
+        .expect("cancelled child status");
+
+        assert!(status.cancelled);
+        assert!(!status.timed_out);
+        assert!(!status.success);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_wait_times_out_kills_and_reports_status_promptly() {
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(PendingTerminalChild { killed: false });
+        let started = Instant::now();
+        let status = wait_for_terminal_shell_status(
+            &mut child,
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+            Duration::ZERO,
+            "timeout-test",
+            ServiceEventEmitter::default(),
+        )
+        .expect("timed-out child status");
+
+        assert!(status.timed_out);
+        assert!(!status.cancelled);
+        assert!(!status.success);
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
