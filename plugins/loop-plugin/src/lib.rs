@@ -36,6 +36,9 @@ const RESUME_COMMAND: &str = "loop.resume";
 const SURFACE_KIND: &str = "loop.start";
 const DEFAULT_MAX_ITERATIONS: u64 = 20;
 const HARD_MAX_ITERATIONS: u64 = 1_000;
+const STATE_SCHEMA_VERSION: u32 = 1;
+const MAX_STATE_BYTES: u64 = 1_048_576;
+const MAX_PROMPT_BYTES: usize = 262_144;
 
 #[derive(Default)]
 struct LoopPlugin;
@@ -114,6 +117,13 @@ fn command(id: &str, title: &str, description: &str, slash: bool) -> CommandCont
     }
 }
 
+fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
+    match load_state_result(session_id) {
+        Ok(state) => status_response(&format_status(state.as_ref())),
+        Err(error) => status_response(&format!("loop state unavailable: {error}")),
+    }
+}
+
 fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
     let session_id = request
         .args
@@ -123,7 +133,7 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
     let response = match request.command_id.as_str() {
         START_COMMAND if arguments == "status" => session_id.map_or_else(
             || status_response("/loop status requires an active session"),
-            |id| status_response(&format_status(load_state(id).as_ref())),
+            status_for_session,
         ),
         START_COMMAND if arguments == "stop" => session_id.map_or_else(
             || status_response("/loop stop requires an active session"),
@@ -147,7 +157,7 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
         },
         STATUS_COMMAND => session_id.map_or_else(
             || status_response("/loop status requires an active session"),
-            |id| status_response(&format_status(load_state(id).as_ref())),
+            status_for_session,
         ),
         STOP_COMMAND => session_id.map_or_else(
             || status_response("/loop stop requires an active session"),
@@ -177,8 +187,10 @@ fn status_response(message: &str) -> InvokeCommandResponse {
 }
 
 fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
-    let Some(mut state) = load_state(session_id) else {
-        return status_response("no loop found for this session");
+    let mut state = match load_state_result(session_id) {
+        Ok(Some(state)) => state,
+        Ok(None) => return status_response("no loop found for this session"),
+        Err(error) => return status_response(&format!("loop state unavailable: {error}")),
     };
     if state.state.is_terminal() {
         return status_response(&format_status(Some(&state)));
@@ -200,8 +212,10 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
 }
 
 fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
-    let Some(mut state) = load_state(session_id) else {
-        return status_response("no loop found for this session");
+    let mut state = match load_state_result(session_id) {
+        Ok(Some(state)) => state,
+        Ok(None) => return status_response("no loop found for this session"),
+        Err(error) => return status_response(&format!("loop state unavailable: {error}")),
     };
     if !matches!(state.state, RunState::Paused | RunState::Failed) {
         return status_response("only paused or failed loops can be resumed");
@@ -317,9 +331,16 @@ impl LoopSurface {
             self.status = format!("maximum iterations must be 1..={HARD_MAX_ITERATIONS}");
             return PluginTuiAction::Redraw;
         }
-        if load_state(session_id).is_some_and(|state| !state.state.is_terminal()) {
-            "this session already has an active loop".clone_into(&mut self.status);
-            return PluginTuiAction::Redraw;
+        match load_state_result(session_id) {
+            Ok(Some(state)) if !state.state.is_terminal() => {
+                "this session already has an active loop".clone_into(&mut self.status);
+                return PluginTuiAction::Redraw;
+            }
+            Err(error) => {
+                self.status = format!("existing loop state unavailable: {error}");
+                return PluginTuiAction::Redraw;
+            }
+            Ok(Some(_) | None) => {}
         }
         let state = LoopState::new(session_id, prompt, condition, max_iterations);
         if let Err(error) = save_state(&state) {
@@ -497,8 +518,44 @@ struct Evaluation {
     summary: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationKind {
+    Iteration { iteration: u64 },
+    Evaluation { source_generation: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationStatus {
+    Prepared,
+    Accepted,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingOperation {
+    operation_id: String,
+    kind: OperationKind,
+    target_session_id: SessionId,
+    expected_generation: u64,
+    status: OperationStatus,
+    #[serde(default)]
+    accepted_turn_id: Option<String>,
+    #[serde(default)]
+    accepted_sequence: Option<u64>,
+    #[serde(default)]
+    completion: Option<bcode_ipc::PluginAutomationTurnCompletion>,
+}
+
+const fn state_schema_version() -> u32 {
+    STATE_SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LoopState {
+    #[serde(default = "state_schema_version")]
+    schema_version: u32,
     run_id: String,
     session_id: SessionId,
     iteration_prompt: String,
@@ -514,6 +571,10 @@ struct LoopState {
     cancel_requested: bool,
     #[serde(default)]
     owner_pid: u32,
+    #[serde(default)]
+    pending_operation: Option<PendingOperation>,
+    #[serde(default)]
+    last_completed_operation: Option<PendingOperation>,
 }
 
 impl LoopState {
@@ -524,6 +585,7 @@ impl LoopState {
         max_iterations: u64,
     ) -> Self {
         Self {
+            schema_version: STATE_SCHEMA_VERSION,
             run_id: uuid::Uuid::new_v4().to_string(),
             session_id,
             iteration_prompt,
@@ -535,62 +597,127 @@ impl LoopState {
             stop_reason: None,
             cancel_requested: false,
             owner_pid: std::process::id(),
+            pending_operation: None,
+            last_completed_operation: None,
+        }
+    }
+}
+
+async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String> {
+    let Some(pending) = state.pending_operation.clone() else {
+        return Ok(());
+    };
+    let operation = BcodeClient::default_endpoint()
+        .lookup_plugin_automation_operation(bcode_ipc::PluginAutomationOperationLookupRequest {
+            session_id: pending.target_session_id,
+            plugin_id: PLUGIN_ID.to_owned(),
+            operation_id: pending.operation_id.clone(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    match (pending.status, operation) {
+        (OperationStatus::Prepared, None) => {
+            state.pending_operation = None;
+            save_state(state)
+        }
+        (_, None) => Err(format!(
+            "automation operation {} is missing after it was recorded as accepted",
+            pending.operation_id
+        )),
+        (_, Some(operation)) => {
+            let Some(completion) = operation.completion else {
+                return Err(format!(
+                    "automation operation {} may still be in flight; explicit resume is required after it settles",
+                    pending.operation_id
+                ));
+            };
+            if completion.outcome != ModelTurnOutcome::Completed {
+                return Err(format!(
+                    "reconciled automation operation ended with {:?}",
+                    completion.outcome
+                ));
+            }
+            match pending.kind {
+                OperationKind::Iteration { iteration } => {
+                    state.current_iteration = state.current_iteration.max(iteration);
+                    state.pending_operation = None;
+                    save_state(state)
+                }
+                OperationKind::Evaluation { .. } => {
+                    state.pending_operation = None;
+                    state.state = RunState::Evaluating;
+                    state.latest_evaluation = None;
+                    save_state(state)
+                }
+            }
         }
     }
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_loop(mut state: LoopState) {
+    if let Err(reason) = reconcile_pending_operation(&mut state).await {
+        pause_run(&mut state, reason);
+        return;
+    }
     loop {
         if refresh_cancel(&mut state) {
             return;
         }
-        if state.current_iteration >= state.max_iterations {
-            state.state = RunState::LimitReached;
-            state.stop_reason = Some("maximum iterations reached".to_owned());
+        if state.state != RunState::Evaluating {
+            if state.current_iteration >= state.max_iterations {
+                state.state = RunState::LimitReached;
+                state.stop_reason = Some("maximum iterations reached".to_owned());
+                let _saved = save_state(&state);
+                return;
+            }
+            let iteration_number = state.current_iteration.saturating_add(1);
+            state.state = RunState::Running;
             let _saved = save_state(&state);
-            return;
-        }
-        let iteration_number = state.current_iteration.saturating_add(1);
-        state.state = RunState::Running;
-        let _saved = save_state(&state);
-        let completion = loop {
-            let generation = match wait_until_automation_ready(state.session_id).await {
-                Ok(generation) => generation,
-                Err(error) => {
-                    fail_run(&mut state, error);
-                    return;
+            let completion = loop {
+                let generation = match wait_until_automation_ready(state.session_id).await {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        fail_run(&mut state, error);
+                        return;
+                    }
+                };
+                let session_id = state.session_id;
+                let operation_id = format!("{}:iteration:{iteration_number}", state.run_id);
+                let iteration_prompt = state.iteration_prompt.clone();
+                let result = run_automation_turn(
+                    &mut state,
+                    session_id,
+                    OperationKind::Iteration {
+                        iteration: iteration_number,
+                    },
+                    operation_id,
+                    format!("Loop iteration {iteration_number}"),
+                    iteration_prompt,
+                    generation,
+                    bcode_ipc::PluginAutomationExecutionPolicy::Normal,
+                )
+                .await;
+                match result {
+                    Ok(completion) => break completion,
+                    Err(AutomationTurnError::Retry) => {}
+                    Err(AutomationTurnError::Fatal(error)) => {
+                        fail_run(&mut state, error);
+                        return;
+                    }
                 }
             };
-            let result = run_automation_turn(
-                state.session_id,
-                &state.run_id,
-                format!("{}:iteration:{iteration_number}", state.run_id),
-                format!("Loop iteration {iteration_number}"),
-                state.iteration_prompt.clone(),
-                generation,
-                bcode_ipc::PluginAutomationExecutionPolicy::Normal,
-            )
-            .await;
-            match result {
-                Ok(completion) => break completion,
-                Err(AutomationTurnError::Retry) => {}
-                Err(AutomationTurnError::Fatal(error)) => {
-                    fail_run(&mut state, error);
-                    return;
-                }
+            state.current_iteration = iteration_number;
+            if completion.outcome != ModelTurnOutcome::Completed {
+                pause_run(
+                    &mut state,
+                    format!("iteration ended with {:?}", completion.outcome),
+                );
+                return;
             }
-        };
-        state.current_iteration = iteration_number;
-        if completion.outcome != ModelTurnOutcome::Completed {
-            pause_run(
-                &mut state,
-                format!("iteration ended with {:?}", completion.outcome),
-            );
-            return;
-        }
-        if refresh_cancel(&mut state) {
-            return;
+            if refresh_cancel(&mut state) {
+                return;
+            }
         }
         let mut source_generation = match wait_until_automation_ready(state.session_id).await {
             Ok(generation) => generation,
@@ -606,11 +733,12 @@ async fn run_loop(mut state: LoopState) {
                 "{}:evaluation:{}:{source_generation}",
                 state.run_id, state.current_iteration
             );
+            let stop_condition = state.stop_condition.clone();
             let evaluation = run_evaluation_turn(
-                state.session_id,
-                &state.run_id,
+                &mut state,
+                OperationKind::Evaluation { source_generation },
                 operation_id,
-                evaluator_prompt(&state.stop_condition),
+                evaluator_prompt(&stop_condition),
             )
             .await;
             let evaluation = match evaluation {
@@ -710,11 +838,12 @@ enum AutomationTurnError {
 }
 
 async fn run_evaluation_turn(
-    source_session_id: SessionId,
-    run_id: &str,
+    state: &mut LoopState,
+    kind: OperationKind,
     operation_id: String,
     prompt: String,
 ) -> Result<TurnCompletion, String> {
+    let source_session_id = state.session_id;
     let client = BcodeClient::default_endpoint();
     let clone = client
         .clone_session(
@@ -726,8 +855,9 @@ async fn run_evaluation_turn(
     let evaluator_session_id = clone.session.id;
     let generation = wait_until_automation_ready(evaluator_session_id).await?;
     let result = run_automation_turn(
+        state,
         evaluator_session_id,
-        run_id,
+        kind,
         operation_id,
         "Loop evaluator".to_owned(),
         prompt,
@@ -748,9 +878,11 @@ async fn run_evaluation_turn(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_automation_turn(
+    state: &mut LoopState,
     session_id: SessionId,
-    run_id: &str,
+    kind: OperationKind,
     operation_id: String,
     display_label: String,
     text: String,
@@ -763,12 +895,23 @@ async fn run_automation_turn(
         .await
         .map_err(|error| AutomationTurnError::Fatal(error.to_string()))?;
     let initial = watcher.take_initial();
+    state.pending_operation = Some(PendingOperation {
+        operation_id: operation_id.clone(),
+        kind,
+        target_session_id: session_id,
+        expected_generation,
+        status: OperationStatus::Prepared,
+        accepted_turn_id: None,
+        accepted_sequence: None,
+        completion: None,
+    });
+    save_state(state).map_err(AutomationTurnError::Fatal)?;
     let result = client
         .submit_plugin_automation_turn(bcode_ipc::PluginAutomationTurnRequest {
             session_id,
             origin: bcode_ipc::PluginAutomationOrigin {
                 plugin_id: PLUGIN_ID.to_owned(),
-                run_id: run_id.to_owned(),
+                run_id: state.run_id.clone(),
                 operation_id: operation_id.clone(),
                 display_label,
             },
@@ -785,9 +928,18 @@ async fn run_automation_turn(
         | bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending { .. }
         | bcode_ipc::PluginAutomationTurnDisposition::SessionBusy
         | bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld => {
+            state.pending_operation = None;
+            save_state(state).map_err(AutomationTurnError::Fatal)?;
             return Err(AutomationTurnError::Retry);
         }
     };
+    if let Some(pending) = state.pending_operation.as_mut() {
+        pending.status = OperationStatus::Accepted;
+        pending.accepted_turn_id = Some(operation.turn_id.clone());
+        pending.accepted_sequence = Some(operation.user_event_sequence);
+        pending.completion.clone_from(&operation.completion);
+    }
+    save_state(state).map_err(AutomationTurnError::Fatal)?;
     let mut assistant_text = initial
         .as_ref()
         .and_then(|attached| {
@@ -802,6 +954,7 @@ async fn run_automation_turn(
         })
         .unwrap_or_default();
     if let Some(completion) = operation.completion {
+        complete_pending_operation(state, completion.clone())?;
         return Ok(TurnCompletion {
             outcome: completion.outcome,
             assistant_text,
@@ -821,6 +974,17 @@ async fn run_automation_turn(
                     outcome,
                     ..
                 } if plugin_id == PLUGIN_ID && event_operation_id == &operation_id => {
+                    let completion = bcode_ipc::PluginAutomationTurnCompletion {
+                        outcome: *outcome,
+                        message: match &event.kind {
+                            SessionEventKind::PluginAutomationTurnFinished { message, .. } => {
+                                message.clone()
+                            }
+                            _ => None,
+                        },
+                        event_sequence: event.sequence,
+                    };
+                    complete_pending_operation(state, completion)?;
                     return Ok(TurnCompletion {
                         outcome: *outcome,
                         assistant_text,
@@ -830,6 +994,19 @@ async fn run_automation_turn(
             }
         }
     }
+}
+
+fn complete_pending_operation(
+    state: &mut LoopState,
+    completion: bcode_ipc::PluginAutomationTurnCompletion,
+) -> Result<(), AutomationTurnError> {
+    if let Some(pending) = state.pending_operation.as_mut() {
+        pending.status = OperationStatus::Completed;
+        pending.completion = Some(completion);
+    }
+    save_state(state).map_err(AutomationTurnError::Fatal)?;
+    state.last_completed_operation = state.pending_operation.take();
+    save_state(state).map_err(AutomationTurnError::Fatal)
 }
 
 fn assistant_text_for_operation(
@@ -912,18 +1089,57 @@ fn state_root() -> PathBuf {
     )
 }
 
-fn load_state(session_id: SessionId) -> Option<LoopState> {
+fn validate_state(state: &LoopState) -> Result<(), String> {
+    if state.schema_version != STATE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported loop state schema version {}; expected {STATE_SCHEMA_VERSION}",
+            state.schema_version
+        ));
+    }
+    if state.iteration_prompt.len() > MAX_PROMPT_BYTES
+        || state.stop_condition.len() > MAX_PROMPT_BYTES
+    {
+        return Err("loop prompt or stop condition exceeds the persisted size limit".to_owned());
+    }
+    if !(1..=HARD_MAX_ITERATIONS).contains(&state.max_iterations) {
+        return Err("persisted loop maximum iterations is invalid".to_owned());
+    }
+    if state.current_iteration > state.max_iterations {
+        return Err("persisted loop iteration count exceeds its maximum".to_owned());
+    }
+    Ok(())
+}
+
+fn load_state_result(session_id: SessionId) -> Result<Option<LoopState>, String> {
+    let path = state_path(session_id);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.len() > MAX_STATE_BYTES {
+        return Err(format!(
+            "loop state exceeds the {MAX_STATE_BYTES}-byte safety limit"
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let mut state: LoopState =
-        serde_json::from_slice(&fs::read(state_path(session_id)).ok()?).ok()?;
+        serde_json::from_slice(&bytes).map_err(|error| format!("corrupt loop state: {error}"))?;
+    validate_state(&state)?;
     if !state.state.is_terminal() && state.owner_pid != std::process::id() {
         state.state = RunState::Paused;
         state.stop_reason =
             Some("daemon or TUI restarted; explicit /loop resume required".to_owned());
     }
-    Some(state)
+    Ok(Some(state))
+}
+
+fn load_state(session_id: SessionId) -> Option<LoopState> {
+    load_state_result(session_id).ok().flatten()
 }
 
 fn save_state(state: &LoopState) -> Result<(), String> {
+    validate_state(state)?;
     let root = state_root();
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     let path = state_path(state.session_id);
@@ -936,6 +1152,49 @@ fn save_state(state: &LoopState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loop_state_round_trip_preserves_pending_operation_journal() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.pending_operation = Some(PendingOperation {
+            operation_id: "operation-1".to_owned(),
+            kind: OperationKind::Iteration { iteration: 1 },
+            target_session_id: state.session_id,
+            expected_generation: 7,
+            status: OperationStatus::Accepted,
+            accepted_turn_id: Some("turn-1".to_owned()),
+            accepted_sequence: Some(8),
+            completion: None,
+        });
+
+        let encoded = serde_json::to_vec(&state).expect("encode state");
+        let decoded: LoopState = serde_json::from_slice(&encoded).expect("decode state");
+        validate_state(&decoded).expect("valid state");
+        let pending = decoded.pending_operation.expect("pending operation");
+        assert_eq!(pending.operation_id, "operation-1");
+        assert_eq!(pending.status, OperationStatus::Accepted);
+        assert_eq!(pending.accepted_sequence, Some(8));
+    }
+
+    #[test]
+    fn state_validation_rejects_incompatible_and_invalid_state() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.schema_version = STATE_SCHEMA_VERSION.saturating_add(1);
+        assert!(validate_state(&state).is_err());
+        state.schema_version = STATE_SCHEMA_VERSION;
+        state.current_iteration = 21;
+        assert!(validate_state(&state).is_err());
+    }
 
     #[test]
     fn evaluation_requires_valid_json_and_evidence() {
