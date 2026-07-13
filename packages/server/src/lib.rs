@@ -14365,6 +14365,14 @@ fn automation_policy_allows_tool(
         || side_effect == ToolSideEffect::ReadOnly
 }
 
+fn read_only_policy_denies_tool(
+    policy: Option<bcode_ipc::PluginAutomationExecutionPolicy>,
+    side_effect: Option<ToolSideEffect>,
+) -> bool {
+    policy == Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection)
+        && side_effect.is_none_or(|side_effect| !automation_policy_allows_tool(policy, side_effect))
+}
+
 async fn collect_model_tools(
     state: &ServerState,
     session_id: SessionId,
@@ -14493,11 +14501,12 @@ async fn execute_model_tool_batch(
             .await
             .get(&session_id)
             .copied();
-        if policy == Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection)
-            && !provider.as_ref().is_some_and(|(_, definition)| {
-                automation_policy_allows_tool(policy, definition.side_effect)
-            })
-        {
+        if read_only_policy_denies_tool(
+            policy,
+            provider
+                .as_ref()
+                .map(|(_, definition)| definition.side_effect),
+        ) {
             let result = ToolFinishedEventInput {
                 tool_call_id: call.id,
                 result: "tool denied by read-only inspection policy".to_owned(),
@@ -23927,6 +23936,28 @@ mod tests {
             })
         ));
         assert!(plugin_automation_preflight_disposition(false, 0, false, Some(7), 7).is_none());
+    }
+
+    #[test]
+    fn read_only_execution_denies_mutating_and_unknown_tool_calls() {
+        let read_only = Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection);
+        assert!(!read_only_policy_denies_tool(
+            read_only,
+            Some(ToolSideEffect::ReadOnly)
+        ));
+        assert!(read_only_policy_denies_tool(
+            read_only,
+            Some(ToolSideEffect::WriteFiles)
+        ));
+        assert!(read_only_policy_denies_tool(
+            read_only,
+            Some(ToolSideEffect::ExecuteProcess)
+        ));
+        assert!(read_only_policy_denies_tool(read_only, None));
+        assert!(!read_only_policy_denies_tool(
+            Some(bcode_ipc::PluginAutomationExecutionPolicy::Normal),
+            Some(ToolSideEffect::WriteFiles)
+        ));
     }
 
     #[test]
