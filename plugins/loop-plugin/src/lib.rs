@@ -807,6 +807,10 @@ async fn run_loop(mut state: LoopState) {
                 if refresh_cancel(&mut state) {
                     return;
                 }
+                if completion.outcome == ModelTurnOutcome::Cancelled {
+                    pause_for_steering(&mut state, "iteration cancelled".to_owned());
+                    return;
+                }
                 pause_run(
                     &mut state,
                     format!("iteration ended with {:?}", completion.outcome),
@@ -856,6 +860,10 @@ async fn run_loop(mut state: LoopState) {
                     if refresh_cancel(&mut state) {
                         return;
                     }
+                    if completion.outcome == ModelTurnOutcome::Cancelled {
+                        pause_for_steering(&mut state, "evaluation cancelled".to_owned());
+                        return;
+                    }
                     pause_run(
                         &mut state,
                         format!("evaluation ended with {:?}", completion.outcome),
@@ -895,6 +903,65 @@ async fn run_loop(mut state: LoopState) {
             break;
         }
     }
+}
+
+fn pause_for_steering(state: &mut LoopState, reason: String) {
+    pause_run(state, reason);
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _resumed = resume_after_manual_steering(state).await;
+    });
+}
+
+async fn resume_after_manual_steering(state: LoopState) -> Result<(), String> {
+    let baseline_sequence = state
+        .last_completed_operation
+        .as_ref()
+        .and_then(|operation| operation.completion.as_ref())
+        .map_or(0, |completion| completion.event_sequence);
+    let mut watcher = BcodeClient::default_endpoint()
+        .watch_session(state.session_id, 64)
+        .await
+        .map_err(|error| error.to_string())?;
+    let initial_has_manual = watcher.take_initial().is_some_and(|attached| {
+        attached.history.iter().any(|event| {
+            event.sequence > baseline_sequence
+                && matches!(event.kind, SessionEventKind::UserMessage { .. })
+        })
+    });
+    if initial_has_manual {
+        return resume_after_steering_settles(state).await;
+    }
+    loop {
+        let event = watcher
+            .next_event()
+            .await
+            .map_err(|error| error.to_string())?;
+        let SessionWatchEvent::Durable(event) = event else {
+            continue;
+        };
+        if event.sequence <= baseline_sequence
+            || !matches!(event.kind, SessionEventKind::UserMessage { .. })
+        {
+            continue;
+        }
+        return resume_after_steering_settles(state).await;
+    }
+}
+
+async fn resume_after_steering_settles(state: LoopState) -> Result<(), String> {
+    let Some(mut saved) = load_state_result(state.session_id)? else {
+        return Ok(());
+    };
+    if saved.run_id != state.run_id || saved.cancel_requested || saved.state != RunState::Paused {
+        return Ok(());
+    }
+    let _generation = wait_until_automation_ready(saved.session_id).await?;
+    saved.state = RunState::Evaluating;
+    saved.stop_reason = None;
+    save_state(&saved)?;
+    run_loop(saved).await;
+    Ok(())
 }
 
 fn pause_run(state: &mut LoopState, reason: String) {
@@ -1269,6 +1336,43 @@ mod tests {
             key,
             modifiers: bmux_keyboard::Modifiers::NONE,
         })
+    }
+
+    fn modified_key(key: KeyCode, ctrl: bool, shift: bool) -> Event {
+        Event::Key(bmux_keyboard::KeyStroke {
+            key,
+            modifiers: bmux_keyboard::Modifiers {
+                ctrl,
+                shift,
+                ..bmux_keyboard::Modifiers::NONE
+            },
+        })
+    }
+
+    #[test]
+    fn ctrl_enter_starts_instead_of_inserting_newline() {
+        let host = TestHost;
+        let mut surface = LoopSurface::new(None);
+        surface.prompt = text_state("work");
+        surface.condition = text_state("done");
+        let before = surface.prompt.buffer().text().to_owned();
+        assert_eq!(
+            surface.handle_event(&modified_key(KeyCode::Enter, true, false), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.prompt.buffer().text(), before);
+        assert!(surface.status.contains("active persisted session"));
+    }
+
+    #[test]
+    fn shift_tab_traverses_fields_backward() {
+        let host = TestHost;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        assert_eq!(
+            surface.handle_event(&modified_key(KeyCode::Tab, false, true), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.field, Field::Limit);
     }
 
     #[test]

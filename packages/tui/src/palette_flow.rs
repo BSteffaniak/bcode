@@ -246,7 +246,7 @@ async fn open_command_plugin_surface<W: Write>(
         plugin_id,
         &surface_kind,
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
-            instance_id,
+            instance_id: instance_id.clone(),
             repo_path: chat
                 .app
                 .working_directory()
@@ -260,13 +260,44 @@ async fn open_command_plugin_surface<W: Write>(
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
     })?;
-    let outcome = crate::plugin_surface_host::run_plugin_surface_with_input_and_client(
+    let hold = chat.app.session_id().map(|session_id| {
+        (
+            session_id,
+            format!("tui-plugin-surface:{plugin_id}:{surface_kind}:{instance_id}"),
+        )
+    });
+    if let Some((session_id, holder_id)) = &hold {
+        services
+            .client
+            .set_plugin_automation_hold(bcode_ipc::PluginAutomationHoldRequest {
+                session_id: *session_id,
+                holder_id: holder_id.clone(),
+                held: true,
+            })
+            .await?;
+    }
+    let surface_result = crate::plugin_surface_host::run_plugin_surface_with_input_and_client(
         io.terminal,
         io.input,
         surface.as_mut(),
         services.client.clone(),
     )
-    .await?;
+    .await;
+    let release_result = if let Some((session_id, holder_id)) = hold {
+        services
+            .client
+            .set_plugin_automation_hold(bcode_ipc::PluginAutomationHoldRequest {
+                session_id,
+                holder_id,
+                held: false,
+            })
+            .await
+            .map(|_response| ())
+    } else {
+        Ok(())
+    };
+    let outcome = surface_result?;
+    release_result?;
     apply_plugin_surface_outcome(chat, outcome);
     Ok(())
 }
