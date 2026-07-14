@@ -8,6 +8,13 @@
 //! daemon IPC or TUI code. Higher-level crates supply concrete provider, tool, and permission
 //! implementations.
 
+pub mod turn;
+
+pub use turn::{
+    InvocationCancellation, ScopedTurnEvent, TurnControl, TurnEventSink, TurnGeneration,
+    TurnLifecycle, TurnScope,
+};
+
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MessageRole, ModelMessage,
     ModelParameters, ModelTurnRequest, PollTurnEventsRequest, PollTurnEventsResponse,
@@ -16,8 +23,9 @@ use bcode_model::{
 };
 use bcode_session_models::SessionId;
 use bcode_tool::{
-    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolResultContent as InvocationToolResultContent,
+    PreparedToolInvocation, ToolAuthorizationFact, ToolDefinition, ToolExecutionOptions,
+    ToolInvocationRequest, ToolInvocationResponse, ToolPreparationRequest, ToolPreparationResponse,
+    ToolResultContent as InvocationToolResultContent, ToolSchedulingContract,
 };
 use futures::{StreamExt, stream};
 use std::collections::BTreeMap;
@@ -84,6 +92,24 @@ pub enum RuntimeError {
     /// The runtime reached its configured maximum tool rounds.
     #[error("maximum tool rounds reached: {0}")]
     MaxToolRounds(u32),
+    /// A host adapter returned an invalid batch response.
+    #[error("invalid {component} batch response: expected {expected} decisions, received {actual}")]
+    InvalidBatchResponse {
+        /// Adapter component that returned the invalid response.
+        component: &'static str,
+        /// Required response count.
+        expected: usize,
+        /// Actual response count.
+        actual: usize,
+    },
+    /// Tool preparation failed.
+    #[error("tool preparation failed for {tool_name}: {message}")]
+    ToolPreparation {
+        /// Tool whose preparation failed.
+        tool_name: String,
+        /// Human-readable preparation failure.
+        message: String,
+    },
 }
 
 /// Cancellation state shared between callers and a running turn.
@@ -385,6 +411,14 @@ pub struct ToolBatchExecutionOutput {
     pub results: Vec<Result<ToolExecutionOutput>>,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedRuntimeToolCall {
+    index: usize,
+    call: ToolCall,
+    tool: RegisteredTool,
+    invocation: PreparedToolInvocation,
+}
+
 /// Mutable state that enforces a maximum number of tool rounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRoundState {
@@ -431,6 +465,149 @@ pub trait ToolExecutor: Send + Sync {
         tool: &'a RegisteredTool,
         request: &'a ToolInvocationRequest,
     ) -> RuntimeFuture<'a, ToolInvocationResponse>;
+}
+
+/// Neutral adapter that prepares and invokes tools regardless of their transport.
+pub trait ToolInvoker: Send + Sync {
+    /// Prepare one invocation without performing its side effects.
+    fn prepare_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        request: &'a ToolPreparationRequest,
+    ) -> RuntimeFuture<'a, ToolPreparationResponse>;
+
+    /// Return an opaque cancellation handle before the invocation becomes externally active.
+    ///
+    /// Invokers without external work may use the default `None` implementation.
+    fn cancellation_handle(
+        &self,
+        _tool: &RegisteredTool,
+        _invocation: &PreparedToolInvocation,
+    ) -> Option<Arc<dyn InvocationCancellation>> {
+        None
+    }
+
+    /// Execute a previously prepared invocation.
+    fn invoke_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        invocation: &'a PreparedToolInvocation,
+        scope: &'a TurnScope,
+    ) -> RuntimeFuture<'a, ToolInvocationResponse>;
+}
+
+/// Compatibility adapter for existing executors that do not yet provide preparation contracts.
+pub struct LegacyToolInvoker<'a, E> {
+    executor: &'a E,
+}
+
+impl<'a, E> LegacyToolInvoker<'a, E> {
+    /// Wrap an existing executor with conservative isolated preparation.
+    #[must_use]
+    pub const fn new(executor: &'a E) -> Self {
+        Self { executor }
+    }
+}
+
+impl<E> ToolInvoker for LegacyToolInvoker<'_, E>
+where
+    E: ToolExecutor,
+{
+    fn prepare_tool<'a>(
+        &'a self,
+        _tool: &'a RegisteredTool,
+        _request: &'a ToolPreparationRequest,
+    ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+        Box::pin(async { Ok(ToolPreparationResponse::default()) })
+    }
+
+    fn invoke_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        invocation: &'a PreparedToolInvocation,
+        _scope: &'a TurnScope,
+    ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+        self.executor.execute_tool(tool, &invocation.request)
+    }
+}
+
+/// One prepared call supplied to a batch authorization coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolAuthorizationRequest {
+    /// Input order in the provider batch.
+    pub index: usize,
+    /// Requested provider tool call.
+    pub call: ToolCall,
+    /// Resolved tool registration.
+    pub tool: RegisteredTool,
+    /// Tool-owner-produced authorization facts.
+    pub facts: Vec<ToolAuthorizationFact>,
+    /// Stable host permission context.
+    pub context: RuntimePermissionContext,
+}
+
+/// Decision returned by a batch authorization coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolAuthorizationDecision {
+    /// Permit invocation.
+    Allow,
+    /// Require host/user approval that the coordinator did not resolve.
+    Ask(String),
+    /// Reject invocation with a model-visible reason.
+    Deny(String),
+}
+
+/// Host-injected authorization coordinator that evaluates a complete prepared batch.
+pub trait ToolAuthorizationCoordinator: Send + Sync {
+    /// Authorize every request and return decisions in matching order.
+    fn authorize_batch<'a>(
+        &'a self,
+        requests: &'a [ToolAuthorizationRequest],
+        scope: &'a TurnScope,
+    ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>>;
+}
+
+/// Permission-policy compatibility adapter for the neutral batch coordinator.
+pub struct PermissionPolicyAuthorization<'a, P: ?Sized> {
+    policy: &'a P,
+}
+
+impl<'a, P: ?Sized> PermissionPolicyAuthorization<'a, P> {
+    /// Wrap an existing permission policy as a batch authorization coordinator.
+    #[must_use]
+    pub const fn new(policy: &'a P) -> Self {
+        Self { policy }
+    }
+}
+
+impl<P> ToolAuthorizationCoordinator for PermissionPolicyAuthorization<'_, P>
+where
+    P: PermissionPolicy + ?Sized,
+{
+    fn authorize_batch<'a>(
+        &'a self,
+        requests: &'a [ToolAuthorizationRequest],
+        _scope: &'a TurnScope,
+    ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
+        Box::pin(async move {
+            let mut decisions = Vec::with_capacity(requests.len());
+            for request in requests {
+                let permission_request = RuntimePermissionRequest {
+                    context: request.context.clone(),
+                    call: request.call.clone(),
+                    tool: request.tool.clone(),
+                };
+                decisions.push(
+                    match self.policy.evaluate_tool_call(&permission_request).await? {
+                        PermissionDecision::Allow => ToolAuthorizationDecision::Allow,
+                        PermissionDecision::Ask(reason) => ToolAuthorizationDecision::Ask(reason),
+                        PermissionDecision::Deny(reason) => ToolAuthorizationDecision::Deny(reason),
+                    },
+                );
+            }
+            Ok(decisions)
+        })
+    }
 }
 
 /// Tool catalog visible to the runtime.
@@ -658,14 +835,145 @@ impl AgentRuntime {
         .await
     }
 
-    /// Execute an ordered tool-call batch with bounded read-only concurrency.
+    /// Execute an ordered tool-call batch through neutral preparation and authorization contracts.
     ///
-    /// The batch consumes one tool round. Calls with side effects execute as ordering barriers;
-    /// adjacent read-only calls may overlap. Results retain input order.
+    /// The complete batch is prepared and authorized before invocation begins. Scheduling uses
+    /// only tool-owner-produced opaque resource claims; missing contracts remain isolated. Results
+    /// retain provider order regardless of completion order.
     ///
     /// # Errors
     ///
-    /// Returns an error when the tool-round budget is exhausted before the batch starts.
+    /// Returns an error when the tool-round budget is exhausted, an authorization adapter returns
+    /// an invalid response, or authorization cannot complete. Per-call resolution, preparation,
+    /// denial, cancellation, and invocation failures are returned in the ordered batch output.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_prepared_tool_batch<C, A, I>(
+        &self,
+        catalog: &C,
+        authorization: &A,
+        invoker: &I,
+        calls: &[ToolCall],
+        rounds: &mut ToolRoundState,
+        context: &RuntimePermissionContext,
+        options: ToolExecutionOptions,
+        scope: &TurnScope,
+    ) -> Result<ToolBatchExecutionOutput>
+    where
+        C: ToolCatalog + Sync,
+        A: ToolAuthorizationCoordinator + ?Sized,
+        I: ToolInvoker + Sync,
+    {
+        if calls.is_empty() {
+            return Ok(ToolBatchExecutionOutput {
+                results: Vec::new(),
+            });
+        }
+        rounds.begin_round()?;
+        if !scope.control().accepts_normal_output() {
+            return Ok(cancelled_batch_output(calls.len()));
+        }
+
+        let mut terminal = BTreeMap::<usize, Result<ToolExecutionOutput>>::new();
+        let prepared =
+            prepare_runtime_tool_batch(catalog, invoker, calls, scope, &mut terminal).await;
+
+        if !scope.control().accepts_normal_output() {
+            for call in &prepared {
+                terminal.insert(call.index, Err(RuntimeError::Cancelled));
+            }
+            return Ok(ordered_batch_output(calls.len(), terminal));
+        }
+
+        let requests = prepared
+            .iter()
+            .map(|prepared| ToolAuthorizationRequest {
+                index: prepared.index,
+                call: prepared.call.clone(),
+                tool: prepared.tool.clone(),
+                facts: prepared.invocation.preparation.authorization.clone(),
+                context: context.clone(),
+            })
+            .collect::<Vec<_>>();
+        let authorization_future = authorization.authorize_batch(&requests, scope);
+        let cancellation = scope.control().cancellation();
+        let decisions = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                for call in &prepared {
+                    terminal.insert(call.index, Err(RuntimeError::Cancelled));
+                }
+                return Ok(ordered_batch_output(calls.len(), terminal));
+            }
+            decisions = authorization_future => decisions?,
+        };
+        if decisions.len() != prepared.len() {
+            return Err(RuntimeError::InvalidBatchResponse {
+                component: "authorization",
+                expected: prepared.len(),
+                actual: decisions.len(),
+            });
+        }
+
+        let mut approved = Vec::with_capacity(prepared.len());
+        for (prepared, decision) in prepared.into_iter().zip(decisions) {
+            match decision {
+                ToolAuthorizationDecision::Allow => approved.push(prepared),
+                ToolAuthorizationDecision::Ask(reason) => {
+                    terminal.insert(
+                        prepared.index,
+                        Err(RuntimeError::PermissionRequired(reason)),
+                    );
+                }
+                ToolAuthorizationDecision::Deny(reason) => {
+                    terminal.insert(prepared.index, Err(RuntimeError::PermissionDenied(reason)));
+                }
+            }
+        }
+
+        if !scope.control().accepts_normal_output() {
+            for call in &approved {
+                terminal.insert(call.index, Err(RuntimeError::Cancelled));
+            }
+            return Ok(ordered_batch_output(calls.len(), terminal));
+        }
+
+        for group in scheduling_groups(approved, options.parallel) {
+            if !scope.control().accepts_normal_output() {
+                for call in group {
+                    terminal.insert(call.index, Err(RuntimeError::Cancelled));
+                }
+                continue;
+            }
+            let group_indices = group.iter().map(|call| call.index);
+            let executions = stream::iter(group.iter().cloned().map(|prepared| async move {
+                let index = prepared.index;
+                let result = invoke_prepared_tool(invoker, prepared, scope).await;
+                (index, result)
+            }))
+            .buffer_unordered(options.max_concurrency.get())
+            .collect::<Vec<_>>();
+            let cancellation = scope.control().cancellation();
+            let completions = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => group_indices
+                    .map(|index| (index, Err(RuntimeError::Cancelled)))
+                    .collect(),
+                completions = executions => completions,
+            };
+            terminal.extend(completions);
+        }
+
+        Ok(ordered_batch_output(calls.len(), terminal))
+    }
+
+    /// Execute an ordered batch through compatibility adapters.
+    ///
+    /// Legacy executors do not expose preparation contracts, so every call is safely isolated.
+    /// The complete permission batch is still evaluated before any invocation begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch cannot be authorized or the round budget is exhausted.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_tool_batch_with_round_state_and_context<C, P, E>(
         &self,
@@ -682,70 +990,26 @@ impl AgentRuntime {
         P: PermissionPolicy + ?Sized,
         E: ToolExecutor + Sync,
     {
-        if calls.is_empty() {
-            return Ok(ToolBatchExecutionOutput {
-                results: Vec::new(),
-            });
-        }
-        rounds.begin_round()?;
-        let mut results = Vec::with_capacity(calls.len());
-        let mut offset = 0;
-        while offset < calls.len() {
-            let read_only = catalog.find_tool(&calls[offset].name).is_some_and(|tool| {
-                tool.definition.side_effect == bcode_tool::ToolSideEffect::ReadOnly
-            });
-            let end = if read_only {
-                calls[offset..]
-                    .iter()
-                    .position(|call| {
-                        catalog.find_tool(&call.name).is_none_or(|tool| {
-                            tool.definition.side_effect != bcode_tool::ToolSideEffect::ReadOnly
-                        })
-                    })
-                    .map_or(calls.len(), |length| offset.saturating_add(length))
-            } else {
-                offset.saturating_add(1)
-            };
-            if read_only {
-                let mut group = stream::iter(calls[offset..end].iter().enumerate().map(
-                    |(index, call)| async move {
-                        let mut local_round = ToolRoundState::new(1);
-                        (
-                            index,
-                            self.execute_tool_call_with_round_state_and_context(
-                                catalog,
-                                policy,
-                                executor,
-                                call,
-                                &mut local_round,
-                                context,
-                            )
-                            .await,
-                        )
-                    },
-                ))
-                .buffer_unordered(max_concurrency.max(1))
-                .collect::<Vec<_>>()
-                .await;
-                group.sort_by_key(|(index, _)| *index);
-                results.extend(group.into_iter().map(|(_, result)| result));
-            } else {
-                let mut local_round = ToolRoundState::new(1);
-                results.push(
-                    self.execute_tool_call_with_round_state_and_context(
-                        catalog,
-                        policy,
-                        executor,
-                        &calls[offset],
-                        &mut local_round,
-                        context,
-                    )
-                    .await,
-                );
-            }
-            offset = end;
-        }
-        Ok(ToolBatchExecutionOutput { results })
+        let authorization = PermissionPolicyAuthorization::new(policy);
+        let invoker = LegacyToolInvoker::new(executor);
+        let max_concurrency =
+            std::num::NonZeroUsize::new(max_concurrency).unwrap_or(std::num::NonZeroUsize::MIN);
+        let options = ToolExecutionOptions {
+            parallel: max_concurrency.get() > 1,
+            max_concurrency,
+        };
+        let scope = TurnScope::without_events("legacy-tool-batch", TurnGeneration::new(0));
+        self.execute_prepared_tool_batch(
+            catalog,
+            &authorization,
+            &invoker,
+            calls,
+            rounds,
+            context,
+            options,
+            &scope,
+        )
+        .await
     }
 
     /// Execute a tool call and enforce a mutable tool-round budget.
@@ -1072,6 +1336,184 @@ fn finished_event(
     }
 }
 
+async fn prepare_runtime_tool_batch<C, I>(
+    catalog: &C,
+    invoker: &I,
+    calls: &[ToolCall],
+    scope: &TurnScope,
+    terminal: &mut BTreeMap<usize, Result<ToolExecutionOutput>>,
+) -> Vec<PreparedRuntimeToolCall>
+where
+    C: ToolCatalog + ?Sized,
+    I: ToolInvoker + ?Sized,
+{
+    let mut prepared = Vec::with_capacity(calls.len());
+    for (index, call) in calls.iter().enumerate() {
+        if !scope.control().accepts_normal_output() {
+            terminal.insert(index, Err(RuntimeError::Cancelled));
+            continue;
+        }
+        let Some(tool) = catalog.find_tool(&call.name) else {
+            terminal.insert(index, Err(RuntimeError::ToolNotFound(call.name.clone())));
+            continue;
+        };
+        let request = tool_invocation_request(call);
+        let preparation_request = ToolPreparationRequest {
+            invocation: request.clone(),
+        };
+        let preparation = invoker.prepare_tool(&tool, &preparation_request);
+        let cancellation = scope.control().cancellation();
+        let prepared_result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(RuntimeError::Cancelled),
+            result = preparation => result,
+        };
+        match prepared_result {
+            Ok(preparation) => prepared.push(PreparedRuntimeToolCall {
+                index,
+                call: call.clone(),
+                tool,
+                invocation: PreparedToolInvocation {
+                    request,
+                    preparation,
+                },
+            }),
+            Err(error) => {
+                terminal.insert(index, Err(error));
+            }
+        }
+    }
+    prepared
+}
+
+fn tool_invocation_request(call: &ToolCall) -> ToolInvocationRequest {
+    ToolInvocationRequest {
+        tool_call_id: call.id.clone(),
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+        cwd: None,
+        artifact_dir: None,
+        cancellation_path: None,
+        invocation_action_path: None,
+    }
+}
+
+fn scheduling_groups(
+    prepared: Vec<PreparedRuntimeToolCall>,
+    parallel: bool,
+) -> Vec<Vec<PreparedRuntimeToolCall>> {
+    if !parallel {
+        return prepared.into_iter().map(|call| vec![call]).collect();
+    }
+
+    let mut groups: Vec<Vec<PreparedRuntimeToolCall>> = Vec::new();
+    for call in prepared {
+        let isolated = matches!(
+            call.invocation.preparation.scheduling,
+            ToolSchedulingContract::Isolated
+        );
+        let conflicts = groups.last().is_none_or(|group| {
+            isolated
+                || group.iter().any(|active| {
+                    active
+                        .invocation
+                        .preparation
+                        .scheduling
+                        .conflicts_with(&call.invocation.preparation.scheduling)
+                })
+        });
+        if conflicts {
+            groups.push(vec![call]);
+        } else if let Some(group) = groups.last_mut() {
+            group.push(call);
+        }
+    }
+    groups
+}
+
+async fn invoke_prepared_tool<I>(
+    invoker: &I,
+    prepared: PreparedRuntimeToolCall,
+    scope: &TurnScope,
+) -> Result<ToolExecutionOutput>
+where
+    I: ToolInvoker + ?Sized,
+{
+    if !scope.control().accepts_normal_output() {
+        return Err(RuntimeError::Cancelled);
+    }
+    if let Some(handle) = invoker.cancellation_handle(&prepared.tool, &prepared.invocation)
+        && !scope
+            .control()
+            .register_cancellation(prepared.call.id.clone(), handle)
+    {
+        return Err(RuntimeError::Cancelled);
+    }
+    if !scope.control().accepts_normal_output() {
+        scope.control().unregister_cancellation(&prepared.call.id);
+        return Err(RuntimeError::Cancelled);
+    }
+    let invocation = invoker
+        .invoke_tool(&prepared.tool, &prepared.invocation, scope)
+        .await
+        .map_err(|error| RuntimeError::ToolExecution {
+            tool_name: prepared.call.name.clone(),
+            message: error.to_string(),
+        });
+    scope.control().unregister_cancellation(&prepared.call.id);
+    let invocation = invocation?;
+    if !scope.control().accepts_normal_output() {
+        return Err(RuntimeError::Cancelled);
+    }
+    Ok(tool_execution_output(&prepared.call, invocation))
+}
+
+fn tool_execution_output(
+    call: &ToolCall,
+    invocation: ToolInvocationResponse,
+) -> ToolExecutionOutput {
+    let model_result = ToolResult {
+        call_id: call.id.clone(),
+        output: invocation.output.clone(),
+        is_error: invocation.is_error,
+        content: invocation
+            .content
+            .iter()
+            .cloned()
+            .map(model_tool_result_content)
+            .collect(),
+    };
+    ToolExecutionOutput {
+        model_result: model_result.clone(),
+        invocation,
+        events: vec![
+            AgentRuntimeEvent::ToolCallFinished(call.clone()),
+            AgentRuntimeEvent::ToolResult(model_result),
+        ],
+    }
+}
+
+fn ordered_batch_output(
+    len: usize,
+    mut results: BTreeMap<usize, Result<ToolExecutionOutput>>,
+) -> ToolBatchExecutionOutput {
+    ToolBatchExecutionOutput {
+        results: (0..len)
+            .map(|index| {
+                results
+                    .remove(&index)
+                    .unwrap_or(Err(RuntimeError::Cancelled))
+            })
+            .collect(),
+    }
+}
+
+fn cancelled_batch_output(len: usize) -> ToolBatchExecutionOutput {
+    ToolBatchExecutionOutput {
+        results: (0..len).map(|_| Err(RuntimeError::Cancelled)).collect(),
+    }
+}
+
 fn model_tool_result_content(
     content: InvocationToolResultContent,
 ) -> bcode_model::ToolResultContent {
@@ -1226,8 +1668,11 @@ fn normalize_provider_event(
 mod tests {
     use super::*;
     use bcode_model::{ProviderTurnEvent, StopReason};
-    use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
+    use bcode_tool::{
+        ToolPolicyMetadata, ToolResourceAccess, ToolResourceClaim, ToolSideEffect, ToolUiMetadata,
+    };
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
 
     struct FakeProvider {
         events: VecDeque<ProviderTurnEvent>,
@@ -1319,6 +1764,778 @@ mod tests {
             policy: ToolPolicyMetadata::default(),
             ui: ToolUiMetadata::default(),
         }
+    }
+
+    #[derive(Debug)]
+    struct TestCancelHandle(Arc<AtomicUsize>);
+
+    impl InvocationCancellation for TestCancelHandle {
+        fn request_cancel(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancellationHandleInvoker {
+        started: AtomicUsize,
+        cancellations: BTreeMap<String, Arc<AtomicUsize>>,
+    }
+
+    impl ToolInvoker for CancellationHandleInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _request: &'a ToolPreparationRequest,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            Box::pin(async move {
+                Ok(ToolPreparationResponse {
+                    scheduling: ToolSchedulingContract::Concurrent { claims: Vec::new() },
+                    authorization: Vec::new(),
+                    descriptor: serde_json::Value::Null,
+                })
+            })
+        }
+
+        fn cancellation_handle(
+            &self,
+            _tool: &RegisteredTool,
+            invocation: &PreparedToolInvocation,
+        ) -> Option<Arc<dyn InvocationCancellation>> {
+            self.cancellations
+                .get(&invocation.request.name)
+                .map(|count| {
+                    Arc::new(TestCancelHandle(Arc::clone(count))) as Arc<dyn InvocationCancellation>
+                })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _invocation: &'a PreparedToolInvocation,
+            _scope: &'a TurnScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PerCallContractInvoker {
+        prepared: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl ToolInvoker for PerCallContractInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            request: &'a ToolPreparationRequest,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            self.prepared.fetch_add(1, Ordering::SeqCst);
+            let access = if request.invocation.name == "exclusive" {
+                ToolResourceAccess::Exclusive
+            } else {
+                ToolResourceAccess::Shared
+            };
+            Box::pin(async move {
+                Ok(ToolPreparationResponse {
+                    scheduling: ToolSchedulingContract::Concurrent {
+                        claims: vec![ToolResourceClaim {
+                            namespace: "synthetic".to_string(),
+                            resource: "same".to_string(),
+                            access,
+                        }],
+                    },
+                    authorization: Vec::new(),
+                    descriptor: serde_json::Value::Null,
+                })
+            })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            invocation: &'a PreparedToolInvocation,
+            _scope: &'a TurnScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            Box::pin(async move {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ToolInvocationResponse {
+                    output: invocation.request.name.clone(),
+                    is_error: false,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SelectivePreparationInvoker {
+        fail_name: String,
+        started: AtomicUsize,
+    }
+
+    impl ToolInvoker for SelectivePreparationInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            request: &'a ToolPreparationRequest,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            Box::pin(async move {
+                if request.invocation.name == self.fail_name {
+                    Err(RuntimeError::ToolPreparation {
+                        tool_name: request.invocation.name.clone(),
+                        message: "synthetic preparation failure".to_string(),
+                    })
+                } else {
+                    Ok(ToolPreparationResponse::default())
+                }
+            })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            invocation: &'a PreparedToolInvocation,
+            _scope: &'a TurnScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(ToolInvocationResponse {
+                    output: format!("called {}", invocation.request.name),
+                    is_error: false,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                })
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingAuthorization {
+        release: Notify,
+        observed: AtomicUsize,
+    }
+
+    impl ToolAuthorizationCoordinator for BlockingAuthorization {
+        fn authorize_batch<'a>(
+            &'a self,
+            requests: &'a [ToolAuthorizationRequest],
+            _scope: &'a TurnScope,
+        ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
+            self.observed.store(requests.len(), Ordering::SeqCst);
+            Box::pin(async move {
+                self.release.notified().await;
+                Ok(requests
+                    .iter()
+                    .map(|_| ToolAuthorizationDecision::Allow)
+                    .collect())
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct AllowBatchAuthorization {
+        observed: AtomicUsize,
+    }
+
+    impl ToolAuthorizationCoordinator for AllowBatchAuthorization {
+        fn authorize_batch<'a>(
+            &'a self,
+            requests: &'a [ToolAuthorizationRequest],
+            _scope: &'a TurnScope,
+        ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
+            self.observed.store(requests.len(), Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(requests
+                    .iter()
+                    .map(|_| ToolAuthorizationDecision::Allow)
+                    .collect())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ContractTestInvoker {
+        prepared: AtomicUsize,
+        started: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        expected_prepared_before_start: usize,
+        scheduling: ToolSchedulingContract,
+    }
+
+    impl ContractTestInvoker {
+        fn new(expected_prepared_before_start: usize, scheduling: ToolSchedulingContract) -> Self {
+            Self {
+                prepared: AtomicUsize::new(0),
+                started: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                expected_prepared_before_start,
+                scheduling,
+            }
+        }
+    }
+
+    impl ToolInvoker for ContractTestInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _request: &'a ToolPreparationRequest,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            self.prepared.fetch_add(1, Ordering::SeqCst);
+            let scheduling = self.scheduling.clone();
+            Box::pin(async move {
+                Ok(ToolPreparationResponse {
+                    scheduling,
+                    authorization: Vec::new(),
+                    descriptor: serde_json::Value::Null,
+                })
+            })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            invocation: &'a PreparedToolInvocation,
+            scope: &'a TurnScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            Box::pin(async move {
+                assert_eq!(
+                    self.prepared.load(Ordering::SeqCst),
+                    self.expected_prepared_before_start,
+                    "every call must be prepared before invocation"
+                );
+                if !scope.control().accepts_normal_output() {
+                    return Err(RuntimeError::Cancelled);
+                }
+                self.started.fetch_add(1, Ordering::SeqCst);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ToolInvocationResponse {
+                    output: format!("called {}", invocation.request.name),
+                    is_error: false,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                })
+            })
+        }
+    }
+
+    fn concurrent_contract(resource: &str) -> ToolSchedulingContract {
+        ToolSchedulingContract::Concurrent {
+            claims: vec![ToolResourceClaim {
+                namespace: "synthetic".to_string(),
+                resource: resource.to_string(),
+                access: ToolResourceAccess::Shared,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn neutral_batch_never_exceeds_configured_concurrency() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"))
+            .with_inline_tool(tool_definition("third"));
+        let calls = [
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-3".to_string(),
+                name: "third".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let invoker = ContractTestInvoker::new(3, concurrent_contract("shared"));
+        let mut rounds = ToolRoundState::new(1);
+
+        AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions {
+                    parallel: true,
+                    max_concurrency: std::num::NonZeroUsize::new(2).expect("two is non-zero"),
+                },
+                &TurnScope::without_events("turn", TurnGeneration::new(14)),
+            )
+            .await
+            .expect("batch should execute");
+
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 3);
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_signals_every_active_invoker_handle_and_returns_immediately() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"));
+        let calls = [
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let invoker = CancellationHandleInvoker {
+            started: AtomicUsize::new(0),
+            cancellations: BTreeMap::from([
+                ("first".to_string(), Arc::clone(&first)),
+                ("second".to_string(), Arc::clone(&second)),
+            ]),
+        };
+        let scope = TurnScope::without_events("turn", TurnGeneration::new(13));
+        let control = scope.control();
+        let mut rounds = ToolRoundState::new(1);
+        let runtime = AgentRuntime::new();
+        let authorization = AllowBatchAuthorization::default();
+        let context = RuntimePermissionContext::default();
+        let execution = runtime.execute_prepared_tool_batch(
+            &catalog,
+            &authorization,
+            &invoker,
+            &calls,
+            &mut rounds,
+            &context,
+            ToolExecutionOptions::default(),
+            &scope,
+        );
+        let cancellation = async {
+            while invoker.started.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+            assert!(control.begin_cancellation());
+        };
+        let output = tokio::time::timeout(Duration::from_secs(1), async {
+            let (output, ()) = tokio::join!(execution, cancellation);
+            output
+        })
+        .await
+        .expect("local cancellation must not wait for invocations")
+        .expect("batch orchestration should finish");
+
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+        assert!(
+            output
+                .results
+                .iter()
+                .all(|result| matches!(result, Err(RuntimeError::Cancelled)))
+        );
+    }
+
+    #[tokio::test]
+    async fn neutral_batch_conflicting_claim_is_an_ordering_barrier() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("shared-before"))
+            .with_inline_tool(tool_definition("exclusive"))
+            .with_inline_tool(tool_definition("shared-after"));
+        let calls = [
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "shared-before".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "exclusive".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-3".to_string(),
+                name: "shared-after".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let invoker = PerCallContractInvoker {
+            prepared: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        };
+        let mut rounds = ToolRoundState::new(1);
+        let output = AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &TurnScope::without_events("turn", TurnGeneration::new(11)),
+            )
+            .await
+            .expect("batch should execute");
+
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .map(|result| result
+                    .as_ref()
+                    .expect("call should succeed")
+                    .model_result
+                    .call_id
+                    .as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-1", "call-2", "call-3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_option_prevents_compatible_overlap() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"));
+        let calls = [
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let invoker = ContractTestInvoker::new(2, concurrent_contract("shared"));
+        let mut rounds = ToolRoundState::new(1);
+
+        AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions {
+                    parallel: false,
+                    max_concurrency: std::num::NonZeroUsize::new(8).expect("eight is non-zero"),
+                },
+                &TurnScope::without_events("turn", TurnGeneration::new(12)),
+            )
+            .await
+            .expect("batch should execute");
+
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn neutral_batch_keeps_preparation_failure_local_to_one_call() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("broken"))
+            .with_inline_tool(tool_definition("working"));
+        let calls = [
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "broken".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "working".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let invoker = SelectivePreparationInvoker {
+            fail_name: "broken".to_string(),
+            started: AtomicUsize::new(0),
+        };
+        let mut rounds = ToolRoundState::new(1);
+        let output = AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &TurnScope::without_events("turn", TurnGeneration::new(9)),
+            )
+            .await
+            .expect("batch orchestration should succeed");
+
+        assert!(matches!(
+            &output.results[0],
+            Err(RuntimeError::ToolPreparation { tool_name, .. }) if tool_name == "broken"
+        ));
+        assert_eq!(
+            output.results[1]
+                .as_ref()
+                .expect("working sibling should execute")
+                .model_result
+                .call_id,
+            "call-2"
+        );
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_authorization_starts_no_tools() {
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("first"));
+        let calls = [ToolCall {
+            id: "call-1".to_string(),
+            name: "first".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        let invoker = ContractTestInvoker::new(1, concurrent_contract("shared"));
+        let authorization = BlockingAuthorization::default();
+        let scope = TurnScope::without_events("turn", TurnGeneration::new(10));
+        let control = scope.control();
+        let mut rounds = ToolRoundState::new(1);
+        let runtime = AgentRuntime::new();
+        let context = RuntimePermissionContext::default();
+        let execution = runtime.execute_prepared_tool_batch(
+            &catalog,
+            &authorization,
+            &invoker,
+            &calls,
+            &mut rounds,
+            &context,
+            ToolExecutionOptions::default(),
+            &scope,
+        );
+        let cancellation = async {
+            while authorization.observed.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+            assert!(control.begin_cancellation());
+        };
+        let (output, ()) = tokio::join!(execution, cancellation);
+        let output = output.expect("batch orchestration should finish");
+
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 0);
+        assert!(matches!(&output.results[0], Err(RuntimeError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn neutral_batch_waits_for_complete_authorization_before_starting() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"));
+        let calls = [
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let invoker = ContractTestInvoker::new(2, concurrent_contract("shared"));
+        let authorization = BlockingAuthorization::default();
+        let scope = TurnScope::without_events("turn", TurnGeneration::new(8));
+        let mut rounds = ToolRoundState::new(1);
+        let runtime = AgentRuntime::new();
+        let context = RuntimePermissionContext::default();
+        let execution = runtime.execute_prepared_tool_batch(
+            &catalog,
+            &authorization,
+            &invoker,
+            &calls,
+            &mut rounds,
+            &context,
+            ToolExecutionOptions::default(),
+            &scope,
+        );
+        let release = async {
+            while authorization.observed.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(invoker.started.load(Ordering::SeqCst), 0);
+            authorization.release.notify_one();
+        };
+        let (output, ()) = tokio::join!(execution, release);
+
+        assert!(output.is_ok());
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn neutral_batch_prepares_and_authorizes_before_overlapping_invocations() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"));
+        let calls = vec![
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let invoker = ContractTestInvoker::new(2, concurrent_contract("shared"));
+        let authorization = AllowBatchAuthorization::default();
+        let scope = TurnScope::without_events("turn", TurnGeneration::new(1));
+        let mut rounds = ToolRoundState::new(1);
+        let output = AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &authorization,
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &scope,
+            )
+            .await
+            .expect("batch should execute");
+
+        assert_eq!(authorization.observed.load(Ordering::SeqCst), 2);
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(rounds.completed_rounds(), 1);
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .map(|result| result
+                    .as_ref()
+                    .expect("call should succeed")
+                    .model_result
+                    .call_id
+                    .as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-1", "call-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn neutral_batch_isolates_missing_scheduling_contracts() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"));
+        let calls = [
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let invoker = ContractTestInvoker::new(2, ToolSchedulingContract::Isolated);
+        let mut rounds = ToolRoundState::new(1);
+
+        AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &TurnScope::without_events("turn", TurnGeneration::new(2)),
+            )
+            .await
+            .expect("batch should execute");
+
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn neutral_batch_cancellation_prevents_queued_start() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"));
+        let calls = [
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let invoker = ContractTestInvoker::new(2, concurrent_contract("shared"));
+        let scope = TurnScope::without_events("turn", TurnGeneration::new(3));
+        let control = scope.control();
+        let mut rounds = ToolRoundState::new(1);
+        let cancellation = async {
+            while invoker.started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(control.begin_cancellation());
+        };
+        let runtime = AgentRuntime::new();
+        let authorization = AllowBatchAuthorization::default();
+        let context = RuntimePermissionContext::default();
+        let execution = runtime.execute_prepared_tool_batch(
+            &catalog,
+            &authorization,
+            &invoker,
+            &calls,
+            &mut rounds,
+            &context,
+            ToolExecutionOptions {
+                parallel: true,
+                max_concurrency: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+            },
+            &scope,
+        );
+        let (output, ()) = tokio::join!(execution, cancellation);
+        let output = output.expect("batch orchestration should finish");
+
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 1);
+        assert!(
+            output
+                .results
+                .iter()
+                .all(|result| matches!(result, Err(RuntimeError::Cancelled)))
+        );
     }
 
     #[tokio::test]

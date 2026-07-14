@@ -177,7 +177,7 @@ pub struct ServerState {
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
-    tool_execution: bcode_config::ToolExecutionConfig,
+    tool_execution: bcode_tool::ToolExecutionOptions,
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
@@ -996,7 +996,7 @@ struct ServerStateInit {
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
-    tool_execution: bcode_config::ToolExecutionConfig,
+    tool_execution: bcode_tool::ToolExecutionOptions,
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
@@ -1843,7 +1843,7 @@ pub async fn run_with_static_bundled(
             observability: config.observability,
             trace_store: TraceStore::new(default_trace_store_dir()),
             max_tool_rounds: config.model.effective_max_tool_rounds(),
-            tool_execution: config.tools.execution,
+            tool_execution: config.tools.execution.runtime_options(),
             tool_output_context_chars: config.model.tool_output.context_chars,
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
@@ -14643,7 +14643,7 @@ async fn execute_model_tool_batch(
                     }
                 },
             ))
-            .buffer_unordered(state.tool_execution.max_concurrency.max(1))
+            .buffer_unordered(state.tool_execution.max_concurrency.get())
             .collect::<Vec<_>>();
             let ProviderCallWait::Completed(mut results) = wait_for_provider_call(
                 state,
@@ -21395,7 +21395,7 @@ mod tests {
                 observability: bcode_config::ObservabilityConfig::default(),
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
-                tool_execution: bcode_config::ToolExecutionConfig::default(),
+                tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
@@ -23026,7 +23026,7 @@ mod tests {
                 observability: bcode_config::ObservabilityConfig::default(),
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
-                tool_execution: bcode_config::ToolExecutionConfig::default(),
+                tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
@@ -23478,7 +23478,7 @@ mod tests {
                 observability: bcode_config::ObservabilityConfig::default(),
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
-                tool_execution: bcode_config::ToolExecutionConfig::default(),
+                tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),

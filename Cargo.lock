@@ -1574,6 +1574,7 @@ dependencies = [
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_skill_models",
+ "bcode_tool",
  "hyperchad_docs_config",
  "hyperchad_docs_config_derive",
  "serde",

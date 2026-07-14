@@ -1856,6 +1856,18 @@ pub struct ToolExecutionConfig {
     pub max_concurrency: usize,
 }
 
+impl ToolExecutionConfig {
+    /// Convert configuration into the portable runtime execution options.
+    #[must_use]
+    pub fn runtime_options(&self) -> bcode_tool::ToolExecutionOptions {
+        bcode_tool::ToolExecutionOptions {
+            parallel: self.parallel,
+            max_concurrency: std::num::NonZeroUsize::new(self.max_concurrency)
+                .unwrap_or(std::num::NonZeroUsize::MIN),
+        }
+    }
+}
+
 impl Default for ToolExecutionConfig {
     fn default() -> Self {
         Self {

@@ -17,6 +17,7 @@ bcode_model                  = { workspace = true }
 bcode_plugin                 = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
 bcode_skill_models           = { workspace = true }
+bcode_tool                   = { workspace = true }
 hyperchad_docs_config        = { workspace = true }
 hyperchad_docs_config_derive = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }

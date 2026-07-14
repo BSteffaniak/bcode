@@ -4,7 +4,15 @@
 
 //! Model-callable tool contract types for Bcode.
 
+pub mod contracts;
 pub mod interaction;
+
+pub use contracts::{
+    PreparedToolInvocation, ToolAuthorizationFact, ToolContributionEvent,
+    ToolContributionOperation, ToolContributionPersistence, ToolExecutionOptions,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolPreparationRequest,
+    ToolPreparationResponse, ToolResourceAccess, ToolResourceClaim, ToolSchedulingContract,
+};
 
 pub use interaction::{
     InteractionControlId, InteractionController, InteractionInput, InteractionNavigation,
