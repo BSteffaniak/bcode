@@ -56,6 +56,7 @@ fn open_picker_command() -> CommandContribution {
         description: Some("Browse completed eval runs in the TUI viewer".to_string()),
         category: Some("eval".to_string()),
         surfaces: BTreeSet::from([CommandSurface::Palette]),
+        execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_string(),
         },
@@ -73,6 +74,7 @@ fn open_latest_command() -> CommandContribution {
         description: Some("Open the latest completed eval run in the TUI viewer".to_string()),
         category: Some("eval".to_string()),
         surfaces: BTreeSet::from([CommandSurface::Palette]),
+        execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_string(),
         },

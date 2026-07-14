@@ -125,6 +125,7 @@ fn command(id: &str, title: &str, description: &str, slash: bool) -> CommandCont
         description: Some(description.to_owned()),
         category: Some("automation".to_owned()),
         surfaces,
+        execution: bcode_command::CommandExecution::Immediate,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_owned(),
         },
@@ -2651,12 +2652,14 @@ mod tests {
     }
 
     #[test]
-    fn loop_command_is_available_on_slash_and_palette_surfaces() {
-        let loop_command = commands()
-            .into_iter()
-            .find(|command| command.id == START_COMMAND)
-            .expect("loop command");
-        assert!(loop_command.supports_surface(&CommandSurface::Slash));
-        assert!(loop_command.supports_surface(&CommandSurface::Palette));
+    fn loop_commands_are_available_and_immediate_on_chat_surfaces() {
+        for command in commands() {
+            assert!(command.supports_surface(&CommandSurface::Slash));
+            assert!(command.supports_surface(&CommandSurface::Palette));
+            assert_eq!(
+                command.execution,
+                bcode_command::CommandExecution::Immediate
+            );
+        }
     }
 }

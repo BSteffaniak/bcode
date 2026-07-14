@@ -47,6 +47,7 @@ fn open_dashboard_command() -> CommandContribution {
         description: Some("Inspect persisted Bcode performance metrics".to_owned()),
         category: Some("metrics".to_owned()),
         surfaces: BTreeSet::from([CommandSurface::Palette, CommandSurface::Slash]),
+        execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_owned(),
         },

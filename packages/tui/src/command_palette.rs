@@ -1,6 +1,6 @@
 //! TUI command palette state and actions.
 
-use bcode_command::{CommandAction, CommandContribution, CommandSurface};
+use bcode_command::{CommandContribution, CommandSurface};
 use bmux_tui::palette::{CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
@@ -44,12 +44,10 @@ impl BmuxCommandPalette {
         &mut self.state
     }
 
-    /// Resolve an item index to a command action.
+    /// Resolve an item index to its full command contribution.
     #[must_use]
-    pub fn command_at(&self, index: usize) -> Option<CommandAction> {
-        self.contributions
-            .get(index)
-            .map(|contribution| contribution.action.clone())
+    pub fn contribution_at(&self, index: usize) -> Option<CommandContribution> {
+        self.contributions.get(index).cloned()
     }
 }
 
@@ -97,7 +95,7 @@ fn raw_item(id: &str, title: &str, description: &str, search_text: &str) -> Pale
 mod tests {
     use std::collections::BTreeSet;
 
-    use bcode_command::{CommandOwner, CommandRegistry};
+    use bcode_command::{CommandAction, CommandOwner, CommandRegistry};
 
     use super::*;
 
@@ -116,6 +114,7 @@ mod tests {
             description: None,
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Palette]),
+            execution: bcode_command::CommandExecution::Normal,
             owner: CommandOwner::Plugin {
                 plugin_id: "bcode.example".to_string(),
             },
@@ -134,7 +133,7 @@ mod tests {
             .expect("dynamic plugin command should be present");
 
         assert_eq!(
-            palette.command_at(index),
+            palette.contribution_at(index).map(|item| item.action),
             Some(CommandAction::Plugin {
                 plugin_id: "bcode.example".to_string(),
                 command_id: "example.dynamic".to_string(),
@@ -147,7 +146,7 @@ mod tests {
         let palette = BmuxCommandPalette::new();
 
         assert_eq!(
-            palette.command_at(0),
+            palette.contribution_at(0).map(|item| item.action),
             Some(CommandAction::Host {
                 route: "session.new".to_string(),
             })
@@ -162,6 +161,7 @@ mod tests {
             description: None,
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Slash]),
+            execution: bcode_command::CommandExecution::Normal,
             owner: CommandOwner::Plugin {
                 plugin_id: "bcode.example".to_string(),
             },

@@ -15,6 +15,7 @@ pub enum SlashCommandOutcome {
     /// Execute a plugin-owned slash command.
     PluginCommand {
         action: bcode_command::CommandAction,
+        execution: bcode_command::CommandExecution,
         arguments: String,
     },
     /// Open timeline message browser.
@@ -604,6 +605,7 @@ pub async fn execute_resolved(
         slash_registry::SlashResolution::PluginCommand(contribution) => {
             Ok(SlashCommandOutcome::PluginCommand {
                 action: contribution.action,
+                execution: contribution.execution,
                 arguments: parts.iter().skip(1).copied().collect::<Vec<_>>().join(" "),
             })
         }

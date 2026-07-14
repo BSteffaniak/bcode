@@ -152,6 +152,17 @@ impl CommandSurface {
     }
 }
 
+/// Host scheduling class for command execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandExecution {
+    /// Ordinary command execution.
+    #[default]
+    Normal,
+    /// Control-plane command that must execute directly rather than entering model-turn queues.
+    Immediate,
+}
+
 /// Registry contribution for a user-visible command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandContribution {
@@ -168,6 +179,9 @@ pub struct CommandContribution {
     /// Surfaces this command appears on.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub surfaces: BTreeSet<CommandSurface>,
+    /// Host scheduling class.
+    #[serde(default)]
+    pub execution: CommandExecution,
     /// Command owner.
     pub owner: CommandOwner,
     /// Command action.
@@ -184,6 +198,7 @@ impl CommandContribution {
             description: Some(description.to_owned()),
             category: Some(category.to_owned()),
             surfaces: BTreeSet::from([CommandSurface::Palette]),
+            execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {
                 route: id.to_owned(),
@@ -328,6 +343,7 @@ mod tests {
             description: None,
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Palette]),
+            execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {
                 route: "example.palette".to_owned(),
@@ -339,6 +355,7 @@ mod tests {
             description: None,
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Slash]),
+            execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {
                 route: "example.slash".to_owned(),

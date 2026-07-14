@@ -96,6 +96,7 @@ fn worktree_command(id: &str, title: &str, description: &str) -> CommandContribu
         description: Some(description.to_string()),
         category: Some("worktree".to_string()),
         surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
+        execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.worktree".to_string(),
         },

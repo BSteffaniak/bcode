@@ -191,6 +191,7 @@ fn diff_toggle_command() -> CommandContribution {
         description: Some("Show or hide the inline diff review panel".to_string()),
         category: Some("diff".to_string()),
         surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
+        execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.code_review".to_string(),
         },

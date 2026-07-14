@@ -26,6 +26,25 @@ pub enum ComposerModalRequest {
     Timeline(super::timeline_dialog::TimelineDialogState),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerSubmissionRoute {
+    PluginOrBuiltinCommand,
+    SessionMessage,
+}
+
+fn composer_submission_route(
+    message: &str,
+    resolution: Option<&slash_registry::SlashResolution>,
+) -> ComposerSubmissionRoute {
+    if slash_registry::slash_command_name(message).is_some()
+        && resolution.is_some_and(slash_registry::SlashResolution::is_known)
+    {
+        ComposerSubmissionRoute::PluginOrBuiltinCommand
+    } else {
+        ComposerSubmissionRoute::SessionMessage
+    }
+}
+
 fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
     if matches!(chat.app.activity(), ActivityState::Idle) {
         format!("agent {agent_name} selected")
@@ -165,10 +184,14 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             apply_draft_agent_selection(chat, agent_id, &agent_name, agent_accent);
         }
-        slash_commands::SlashCommandOutcome::PluginCommand { action, arguments } => {
+        slash_commands::SlashCommandOutcome::PluginCommand {
+            action,
+            execution,
+            arguments,
+        } => {
             chat.app.clear_pending_submission(message);
             super::palette_flow::execute_plugin_slash_command(
-                io, services, chat, action, arguments,
+                io, services, chat, action, execution, arguments,
             )
             .await?;
         }
@@ -353,7 +376,10 @@ pub async fn submit_composer<W: Write>(
     } else {
         None
     };
-    if let Some(resolution) = slash_resolution.filter(slash_registry::SlashResolution::is_known) {
+    if composer_submission_route(&message, slash_resolution.as_ref())
+        == ComposerSubmissionRoute::PluginOrBuiltinCommand
+    {
+        let resolution = slash_resolution.expect("known slash resolution");
         if session_id.is_some() || resolution.is_draft_safe() {
             return handle_slash_command(io, services, chat, session_id, &message, resolution)
                 .await;
@@ -400,4 +426,71 @@ pub async fn submit_composer<W: Write>(
         .set_daemon_connection(DaemonConnectionState::Starting);
     chat.app.set_status("starting daemon…".to_owned());
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_command::{
+        CommandAction, CommandContribution, CommandExecution, CommandOwner, CommandSurface,
+    };
+    use std::collections::BTreeSet;
+
+    fn loop_command() -> slash_registry::SlashResolution {
+        slash_registry::SlashResolution::PluginCommand(CommandContribution {
+            id: "loop".to_owned(),
+            title: "Loop".to_owned(),
+            description: None,
+            category: Some("automation".to_owned()),
+            surfaces: BTreeSet::from([CommandSurface::Slash]),
+            execution: CommandExecution::Immediate,
+            owner: CommandOwner::Plugin {
+                plugin_id: "bcode.loop".to_owned(),
+            },
+            action: CommandAction::Plugin {
+                plugin_id: "bcode.loop".to_owned(),
+                command_id: "loop".to_owned(),
+            },
+        })
+    }
+
+    #[test]
+    fn ordinary_messages_and_loop_commands_keep_distinct_routes() {
+        assert_eq!(
+            composer_submission_route("ordinary steering", None),
+            ComposerSubmissionRoute::SessionMessage
+        );
+        let resolution = loop_command();
+        assert_eq!(
+            composer_submission_route("/loop stop", Some(&resolution)),
+            ComposerSubmissionRoute::PluginOrBuiltinCommand
+        );
+    }
+
+    #[test]
+    fn active_plugin_status_does_not_block_ordinary_composer_staging() {
+        let mut app = super::super::app::BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_plugin_status(vec![bcode_plugin_sdk::SessionStatusContribution {
+            contribution_id: "loop-active".to_owned(),
+            text: "Loop active".to_owned(),
+            priority: 1,
+            metadata: std::collections::BTreeMap::new(),
+        }]);
+        app.paste_composer_text("manual steering");
+        app.stage_submission();
+
+        assert_eq!(app.take_pending_submission(), "manual steering");
+        assert_eq!(app.plugin_status()[0].text, "Loop active");
+    }
+
+    #[test]
+    fn unknown_slash_text_remains_an_ordinary_session_message() {
+        assert_eq!(
+            composer_submission_route(
+                "/not-a-command",
+                Some(&slash_registry::SlashResolution::Unknown)
+            ),
+            ComposerSubmissionRoute::SessionMessage
+        );
+    }
 }

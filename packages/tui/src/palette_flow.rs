@@ -57,7 +57,7 @@ pub async fn handle_palette_key<W: Write>(
             Ok(true)
         }
         CommandPaletteKeyOutcome::Activated(index) => {
-            let command = active_palette.command_at(index);
+            let command = active_palette.contribution_at(index);
             *palette = None;
             if let Some(command) = command
                 && let Err(error) = execute_palette_command(io, services, chat, command).await
@@ -83,7 +83,7 @@ pub async fn handle_palette_mouse<W: Write>(
     let Some(active_palette) = palette else {
         return Ok(false);
     };
-    let command = active_palette.command_at(index);
+    let command = active_palette.contribution_at(index);
     *palette = None;
     if let Some(command) = command
         && let Err(error) = execute_palette_command(io, services, chat, command).await
@@ -97,16 +97,31 @@ async fn execute_palette_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    command: CommandAction,
+    contribution: bcode_command::CommandContribution,
 ) -> Result<(), TuiError> {
-    match command {
+    match contribution.action {
         CommandAction::Host { route } => {
             dispatch_host_palette_route(io, services, chat, &route).await
         }
         CommandAction::Plugin {
             plugin_id,
             command_id,
-        } => dispatch_plugin_command(io, services, chat, plugin_id, command_id).await,
+        } => {
+            let command_client = match contribution.execution {
+                bcode_command::CommandExecution::Immediate => services.client,
+                bcode_command::CommandExecution::Normal => services.passive_client,
+            };
+            dispatch_plugin_command_with_arguments(
+                io,
+                services,
+                command_client,
+                chat,
+                plugin_id,
+                command_id,
+                None,
+            )
+            .await
+        }
     }
 }
 
@@ -115,8 +130,13 @@ pub async fn execute_plugin_slash_command<W: Write>(
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     command: CommandAction,
+    execution: bcode_command::CommandExecution,
     arguments: String,
 ) -> Result<(), TuiError> {
+    let command_client = match execution {
+        bcode_command::CommandExecution::Immediate => services.client,
+        bcode_command::CommandExecution::Normal => services.passive_client,
+    };
     match command {
         CommandAction::Plugin {
             plugin_id,
@@ -125,6 +145,7 @@ pub async fn execute_plugin_slash_command<W: Write>(
             dispatch_plugin_command_with_arguments(
                 io,
                 services,
+                command_client,
                 chat,
                 plugin_id,
                 command_id,
@@ -138,19 +159,10 @@ pub async fn execute_plugin_slash_command<W: Write>(
     }
 }
 
-async fn dispatch_plugin_command<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-    plugin_id: String,
-    command_id: String,
-) -> Result<(), TuiError> {
-    dispatch_plugin_command_with_arguments(io, services, chat, plugin_id, command_id, None).await
-}
-
 async fn dispatch_plugin_command_with_arguments<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
+    command_client: &bcode_client::BcodeClient,
     chat: &mut ActiveChat,
     plugin_id: String,
     command_id: String,
@@ -167,8 +179,7 @@ async fn dispatch_plugin_command_with_arguments<W: Write>(
         args.insert("arguments".to_string(), arguments);
     }
     let payload = serde_json::to_vec(&InvokeCommandRequest { command_id, args })?;
-    let response = services
-        .passive_client
+    let response = command_client
         .invoke_plugin_service(
             plugin_id.clone(),
             COMMAND_INTERFACE_ID.to_string(),
