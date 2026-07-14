@@ -340,6 +340,8 @@ pub enum TuiEffectResult {
         active_skill_count: Option<usize>,
         /// Runtime work snapshots, if available.
         runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
+        /// Active plugin-owned status contributions, replacing the previous set atomically.
+        plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
         /// First non-critical error encountered.
         error: Option<String>,
     },
@@ -651,6 +653,7 @@ impl TuiEffect {
                 model: None,
                 active_skill_count: None,
                 runtime_work: None,
+                plugin_status: Vec::new(),
                 error: Some(client_error.to_string()),
             },
             Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
@@ -1395,12 +1398,75 @@ async fn load_draft_status(
     }
 }
 
+async fn load_plugin_session_status(
+    client: &BcodeClient,
+    session_id: SessionId,
+) -> (
+    Vec<bcode_plugin_sdk::SessionStatusContribution>,
+    Option<String>,
+) {
+    let services = match client.plugin_services().await {
+        Ok(services) => services,
+        Err(error) => return (Vec::new(), Some(error.to_string())),
+    };
+    let mut contributions = Vec::new();
+    let mut first_error = None;
+    for service in services
+        .into_iter()
+        .filter(|service| service.interface_id == bcode_plugin_sdk::SESSION_STATUS_INTERFACE_ID)
+    {
+        let payload =
+            match serde_json::to_vec(&bcode_plugin_sdk::SessionStatusRequest { session_id }) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    first_error.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+            };
+        match client
+            .invoke_plugin_service(
+                service.plugin_id,
+                bcode_plugin_sdk::SESSION_STATUS_INTERFACE_ID.to_owned(),
+                bcode_plugin_sdk::OP_SESSION_STATUS.to_owned(),
+                payload,
+            )
+            .await
+        {
+            Ok(response) if response.error.is_none() => {
+                match serde_json::from_slice::<bcode_plugin_sdk::SessionStatusResponse>(
+                    &response.payload,
+                ) {
+                    Ok(response) => contributions.extend(response.contribution),
+                    Err(error) => {
+                        first_error.get_or_insert_with(|| error.to_string());
+                    }
+                }
+            }
+            Ok(response) => {
+                if let Some(error) = response.error {
+                    first_error.get_or_insert(error.message);
+                }
+            }
+            Err(error) => {
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+    }
+    contributions.sort_by_key(|contribution| contribution.priority);
+    (contributions, first_error)
+}
+
 async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> TuiEffectResult {
     let (model, model_error) =
         optional_client_result(client.session_model_status(session_id)).await;
-    let ((active_skills, skills_error), (runtime_work, runtime_work_error)) = tokio::join!(
+    let (
+        (active_skills, skills_error),
+        (runtime_work, runtime_work_error),
+        (plugin_status, plugin_error),
+    ) = tokio::join!(
         optional_client_result(client.active_skills(session_id)),
         optional_client_result(client.list_runtime_work(session_id)),
+        load_plugin_session_status(client, session_id),
     );
     TuiEffectResult::SessionStatusLoaded {
         daemon_connected: model.is_some() || active_skills.is_some() || runtime_work.is_some(),
@@ -1408,7 +1474,11 @@ async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> Tui
         model,
         active_skill_count: active_skills.map(|skills| skills.len()),
         runtime_work,
-        error: model_error.or(skills_error).or(runtime_work_error),
+        plugin_status,
+        error: model_error
+            .or(skills_error)
+            .or(runtime_work_error)
+            .or(plugin_error),
     }
 }
 

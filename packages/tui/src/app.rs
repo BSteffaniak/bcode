@@ -320,6 +320,7 @@ pub struct BmuxApp {
     activity_started_at: Instant,
     daemon_connection: DaemonConnectionState,
     status: String,
+    plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
     key_hints: String,
     jump_to_latest_key_label: String,
     tui_config: TuiConfig,
@@ -535,6 +536,7 @@ impl BmuxApp {
             activity_started_at: now,
             daemon_connection: DaemonConnectionState::Connecting,
             status: String::from("Connecting to daemon… Enter submits; Esc/Ctrl-C exits."),
+            plugin_status: Vec::new(),
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
             tui_config: TuiConfig::default(),
@@ -1291,6 +1293,20 @@ impl BmuxApp {
     #[must_use]
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    /// Return active plugin-owned session status contributions.
+    #[must_use]
+    pub fn plugin_status(&self) -> &[bcode_plugin_sdk::SessionStatusContribution] {
+        &self.plugin_status
+    }
+
+    /// Atomically replace active plugin-owned session status contributions.
+    pub fn set_plugin_status(
+        &mut self,
+        plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
+    ) {
+        self.plugin_status = plugin_status;
     }
 
     /// Return configured key hints for the status line.

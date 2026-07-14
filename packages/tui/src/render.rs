@@ -1699,6 +1699,15 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
         line = line.optional(token_segment, muted, priority, false);
     }
 
+    for contribution in app.plugin_status() {
+        line = line.optional(
+            contribution.text.clone(),
+            Style::new().fg(theme.accent),
+            u8::try_from(contribution.priority).unwrap_or(u8::MAX - 1),
+            true,
+        );
+    }
+
     let status_text = statusline_status_text(app);
     if !status_text.is_empty() {
         line = line.optional(status_text, muted, 90, true);

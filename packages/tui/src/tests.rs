@@ -1433,6 +1433,27 @@ fn header_and_footer_include_model_agent_and_token_context() {
 }
 
 #[test]
+fn plugin_status_is_rendered_and_atomic_replacement_removes_stale_text() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_plugin_status(vec![bcode_plugin_sdk::SessionStatusContribution {
+        contribution_id: "test".to_owned(),
+        text: "Plugin active · normal messages remain usable".to_owned(),
+        priority: 20,
+        metadata: std::collections::BTreeMap::new(),
+    }]);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 160, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    assert!(rendered_text(&buffer).contains("Plugin active"));
+
+    app.set_plugin_status(Vec::new());
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 160, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    assert!(!rendered_text(&buffer).contains("Plugin active"));
+}
+
+#[test]
 fn status_line_prioritizes_context_over_spent_tokens() {
     let session_id = SessionId::new();
     let history = [event(

@@ -536,6 +536,7 @@ fn apply_effect_result(
             model,
             active_skill_count,
             runtime_work,
+            plugin_status,
             error,
         } => {
             apply_session_status_result(
@@ -544,6 +545,7 @@ fn apply_effect_result(
                 model,
                 active_skill_count,
                 runtime_work,
+                plugin_status,
                 error,
             );
         }
@@ -707,11 +709,13 @@ fn apply_session_status_result(
     model: Option<bcode_ipc::SessionModelStatus>,
     active_skill_count: Option<usize>,
     runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
+    plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
     error: Option<String>,
 ) {
     if chat.session_id != Some(session_id) {
         return;
     }
+    chat.app.set_plugin_status(plugin_status);
     let model_text = model.as_ref().map_or_else(
         || "model unknown".to_owned(),
         |status| {
