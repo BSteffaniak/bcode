@@ -8,10 +8,14 @@ pub mod contracts;
 pub mod interaction;
 
 pub use contracts::{
-    PreparedToolInvocation, ToolAuthorizationFact, ToolContributionEvent,
-    ToolContributionOperation, ToolContributionPersistence, ToolExecutionOptions,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolPreparationRequest,
-    ToolPreparationResponse, ToolResourceAccess, ToolResourceClaim, ToolSchedulingContract,
+    PreparedToolInvocation, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
+    ToolAuthorizationFact, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolExchangeRequest, ToolExchangeResolution,
+    ToolExchangeResponsePolicy, ToolExecutionOptions, ToolHostContextEntry,
+    ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationServiceRequest,
+    ToolInvocationServiceResolution, ToolPreparationRequest, ToolPreparationResponse,
+    ToolResourceAccess, ToolResourceClaim, ToolSchedulingContract,
 };
 
 pub use interaction::{

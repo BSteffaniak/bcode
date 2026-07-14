@@ -1,9 +1,15 @@
 //! Turn-scoped lifecycle, cancellation, and event publication primitives.
 
 use crate::{AgentRuntimeEvent, CancellationToken};
-use bcode_tool::{ToolContributionEvent, ToolInvocationLifecycleEvent};
+use bcode_tool::{
+    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolContributionEvent,
+    ToolExchangeRequest, ToolExchangeResolution, ToolInvocationInputResolution,
+    ToolInvocationLifecycleEvent, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
+};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -89,6 +95,136 @@ struct DiscardingTurnEventSink;
 
 impl TurnEventSink for DiscardingTurnEventSink {
     fn emit(&self, _event: ScopedTurnEvent) {}
+}
+
+/// Boxed asynchronous invocation capability operation.
+pub type InvocationCapabilityFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Host broker for correlated renderer-neutral invocation exchanges.
+pub trait InvocationExchangeBroker: Send + Sync {
+    /// Resolve one exchange request exactly once.
+    fn request(
+        &self,
+        request: ToolExchangeRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution>;
+}
+
+/// Host router for unsolicited inputs addressed to active invocations.
+pub trait InvocationInputRouter: Send + Sync {
+    /// Wait for the next input addressed to `invocation_id`.
+    fn receive(
+        &self,
+        invocation_id: &str,
+    ) -> InvocationCapabilityFuture<'_, ToolInvocationInputResolution>;
+}
+
+/// Host router for nested services requested by active invocations.
+pub trait InvocationServiceRouter: Send + Sync {
+    /// Route one opaque service request.
+    fn invoke(
+        &self,
+        request: ToolInvocationServiceRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolInvocationServiceResolution>;
+}
+
+/// Host-owned bounded artifact sink for active invocations.
+pub trait InvocationArtifactSink: Send + Sync {
+    /// Persist one complete bounded artifact.
+    fn write(
+        &self,
+        request: ToolArtifactWriteRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution>;
+}
+
+#[derive(Debug, Default)]
+struct UnsupportedInvocationCapabilities;
+
+impl InvocationExchangeBroker for UnsupportedInvocationCapabilities {
+    fn request(
+        &self,
+        _request: ToolExchangeRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution> {
+        Box::pin(async { ToolExchangeResolution::NoCompatibleConsumer })
+    }
+}
+
+impl InvocationInputRouter for UnsupportedInvocationCapabilities {
+    fn receive(
+        &self,
+        _invocation_id: &str,
+    ) -> InvocationCapabilityFuture<'_, ToolInvocationInputResolution> {
+        Box::pin(async { ToolInvocationInputResolution::Closed })
+    }
+}
+
+impl InvocationServiceRouter for UnsupportedInvocationCapabilities {
+    fn invoke(
+        &self,
+        _request: ToolInvocationServiceRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolInvocationServiceResolution> {
+        Box::pin(async { ToolInvocationServiceResolution::Unsupported })
+    }
+}
+
+impl InvocationArtifactSink for UnsupportedInvocationCapabilities {
+    fn write(
+        &self,
+        _request: ToolArtifactWriteRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
+        Box::pin(async {
+            ToolArtifactWriteResolution::Failed {
+                code: "artifact_sink_unavailable".to_string(),
+                message: "host does not provide an invocation artifact sink".to_string(),
+            }
+        })
+    }
+}
+
+/// Host capabilities shared by invocation scopes under one turn.
+#[derive(Clone)]
+pub struct InvocationCapabilities {
+    exchanges: Arc<dyn InvocationExchangeBroker>,
+    inputs: Arc<dyn InvocationInputRouter>,
+    services: Arc<dyn InvocationServiceRouter>,
+    artifacts: Arc<dyn InvocationArtifactSink>,
+}
+
+impl fmt::Debug for InvocationCapabilities {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InvocationCapabilities")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for InvocationCapabilities {
+    fn default() -> Self {
+        let unsupported = Arc::new(UnsupportedInvocationCapabilities);
+        Self {
+            exchanges: unsupported.clone(),
+            inputs: unsupported.clone(),
+            services: unsupported.clone(),
+            artifacts: unsupported,
+        }
+    }
+}
+
+impl InvocationCapabilities {
+    /// Create host invocation capabilities.
+    #[must_use]
+    pub fn new(
+        exchanges: Arc<dyn InvocationExchangeBroker>,
+        inputs: Arc<dyn InvocationInputRouter>,
+        services: Arc<dyn InvocationServiceRouter>,
+        artifacts: Arc<dyn InvocationArtifactSink>,
+    ) -> Self {
+        Self {
+            exchanges,
+            inputs,
+            services,
+            artifacts,
+        }
+    }
 }
 
 /// Shared lifecycle and cancellation state for one turn generation.
@@ -270,6 +406,7 @@ pub struct TurnScope {
     generation: TurnGeneration,
     control: Arc<TurnControl>,
     events: Arc<dyn TurnEventSink>,
+    capabilities: InvocationCapabilities,
 }
 
 impl fmt::Debug for TurnScope {
@@ -291,11 +428,28 @@ impl TurnScope {
         generation: TurnGeneration,
         events: Arc<dyn TurnEventSink>,
     ) -> Self {
+        Self::with_capabilities(
+            turn_id,
+            generation,
+            events,
+            InvocationCapabilities::default(),
+        )
+    }
+
+    /// Create a scope with explicit event and invocation capability adapters.
+    #[must_use]
+    pub fn with_capabilities(
+        turn_id: impl Into<Arc<str>>,
+        generation: TurnGeneration,
+        events: Arc<dyn TurnEventSink>,
+        capabilities: InvocationCapabilities,
+    ) -> Self {
         Self {
             turn_id: turn_id.into(),
             generation,
             control: Arc::new(TurnControl::new()),
             events,
+            capabilities,
         }
     }
 
@@ -327,6 +481,240 @@ impl TurnScope {
     #[must_use]
     pub fn emit(&self, event: ScopedTurnEvent) -> bool {
         self.control.emit(self.events.as_ref(), event)
+    }
+}
+
+/// Side-effect-free preparation context derived from one turn generation.
+#[derive(Debug, Clone)]
+pub struct PreparationScope {
+    turn: TurnScope,
+    host_context: Arc<[bcode_tool::ToolHostContextEntry]>,
+}
+
+impl PreparationScope {
+    /// Create a preparation scope for one turn and opaque host context set.
+    #[must_use]
+    pub fn new(
+        turn: TurnScope,
+        host_context: impl Into<Arc<[bcode_tool::ToolHostContextEntry]>>,
+    ) -> Self {
+        Self {
+            turn,
+            host_context: host_context.into(),
+        }
+    }
+
+    /// Return the parent turn scope.
+    #[must_use]
+    pub const fn turn(&self) -> &TurnScope {
+        &self.turn
+    }
+
+    /// Return opaque host context forwarded to preparation.
+    #[must_use]
+    pub fn host_context(&self) -> &[bcode_tool::ToolHostContextEntry] {
+        &self.host_context
+    }
+
+    /// Return cancellation state shared with the parent turn.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.turn.control().cancellation()
+    }
+
+    /// Return whether preparation may continue producing normal work.
+    #[must_use]
+    pub fn accepts_work(&self) -> bool {
+        self.turn.control().accepts_normal_output()
+    }
+}
+
+/// Active invocation context derived from one turn generation.
+#[derive(Clone)]
+pub struct InvocationScope {
+    turn: TurnScope,
+    invocation_id: Arc<str>,
+}
+
+impl fmt::Debug for InvocationScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InvocationScope")
+            .field("invocation_id", &self.invocation_id)
+            .field("turn", &self.turn)
+            .finish()
+    }
+}
+
+impl InvocationScope {
+    /// Create an invocation scope under `turn`.
+    #[must_use]
+    pub fn new(turn: TurnScope, invocation_id: impl Into<Arc<str>>) -> Self {
+        Self {
+            turn,
+            invocation_id: invocation_id.into(),
+        }
+    }
+
+    /// Return the invocation identifier.
+    #[must_use]
+    pub fn invocation_id(&self) -> &str {
+        &self.invocation_id
+    }
+
+    /// Return the parent turn scope.
+    #[must_use]
+    pub const fn turn(&self) -> &TurnScope {
+        &self.turn
+    }
+
+    /// Return cancellation state shared with the parent turn.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.turn.control().cancellation()
+    }
+
+    /// Return whether invocation work and normal output remain accepted.
+    #[must_use]
+    pub fn accepts_work(&self) -> bool {
+        self.turn.control().accepts_normal_output()
+    }
+
+    /// Register this invocation's opaque cancellation handle.
+    pub fn register_cancellation(&self, handle: Arc<dyn InvocationCancellation>) -> bool {
+        self.turn
+            .control()
+            .register_cancellation(self.invocation_id.to_string(), handle)
+    }
+
+    /// Remove this invocation's cancellation handle after terminal completion.
+    #[must_use]
+    pub fn unregister_cancellation(&self) -> bool {
+        self.turn
+            .control()
+            .unregister_cancellation(&self.invocation_id)
+    }
+
+    /// Emit lifecycle output only when it belongs to this active invocation.
+    #[must_use]
+    pub fn emit_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
+        event.invocation_id == self.invocation_id.as_ref()
+            && self.turn.emit(ScopedTurnEvent::InvocationLifecycle(event))
+    }
+
+    /// Emit a contribution only when it belongs to this active invocation.
+    #[must_use]
+    pub fn emit_contribution(&self, event: ToolContributionEvent) -> bool {
+        event.invocation_id == self.invocation_id.as_ref()
+            && self.turn.emit(ScopedTurnEvent::Contribution(event))
+    }
+
+    /// Request one correlated external exchange, bounded by turn cancellation.
+    pub async fn request_exchange(&self, request: ToolExchangeRequest) -> ToolExchangeResolution {
+        if request.invocation_id != self.invocation_id.as_ref() {
+            return ToolExchangeResolution::Failed {
+                code: "invocation_id_mismatch".to_string(),
+                message: "exchange request does not belong to this invocation scope".to_string(),
+            };
+        }
+        if !self.accepts_work() {
+            return ToolExchangeResolution::Cancelled;
+        }
+        let cancellation = self.cancellation();
+        let resolution = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => ToolExchangeResolution::Cancelled,
+            resolution = self.turn.capabilities.exchanges.request(request) => resolution,
+        };
+        if self.accepts_work() {
+            resolution
+        } else {
+            ToolExchangeResolution::Cancelled
+        }
+    }
+
+    /// Wait for one unsolicited input, bounded by turn cancellation.
+    pub async fn receive_input(&self) -> ToolInvocationInputResolution {
+        if !self.accepts_work() {
+            return ToolInvocationInputResolution::Cancelled;
+        }
+        let cancellation = self.cancellation();
+        let resolution = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => ToolInvocationInputResolution::Cancelled,
+            resolution = self.turn.capabilities.inputs.receive(self.invocation_id()) => {
+                match resolution {
+                    ToolInvocationInputResolution::Received { input }
+                        if input.invocation_id != self.invocation_id.as_ref() =>
+                    {
+                        ToolInvocationInputResolution::Failed {
+                            code: "invocation_id_mismatch".to_string(),
+                            message: "received input does not belong to this invocation scope".to_string(),
+                        }
+                    }
+                    resolution => resolution,
+                }
+            },
+        };
+        if self.accepts_work() {
+            resolution
+        } else {
+            ToolInvocationInputResolution::Cancelled
+        }
+    }
+
+    /// Invoke one nested host service, bounded by turn cancellation.
+    pub async fn invoke_service(
+        &self,
+        request: ToolInvocationServiceRequest,
+    ) -> ToolInvocationServiceResolution {
+        if request.invocation_id != self.invocation_id.as_ref() {
+            return ToolInvocationServiceResolution::Failed {
+                code: "invocation_id_mismatch".to_string(),
+                message: "service request does not belong to this invocation scope".to_string(),
+            };
+        }
+        if !self.accepts_work() {
+            return ToolInvocationServiceResolution::Cancelled;
+        }
+        let cancellation = self.cancellation();
+        let resolution = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => ToolInvocationServiceResolution::Cancelled,
+            resolution = self.turn.capabilities.services.invoke(request) => resolution,
+        };
+        if self.accepts_work() {
+            resolution
+        } else {
+            ToolInvocationServiceResolution::Cancelled
+        }
+    }
+
+    /// Write one bounded host artifact, bounded by turn cancellation.
+    pub async fn write_artifact(
+        &self,
+        request: ToolArtifactWriteRequest,
+    ) -> ToolArtifactWriteResolution {
+        if request.invocation_id != self.invocation_id.as_ref() {
+            return ToolArtifactWriteResolution::Failed {
+                code: "invocation_id_mismatch".to_string(),
+                message: "artifact request does not belong to this invocation scope".to_string(),
+            };
+        }
+        if !self.accepts_work() {
+            return ToolArtifactWriteResolution::Cancelled;
+        }
+        let cancellation = self.cancellation();
+        let resolution = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => ToolArtifactWriteResolution::Cancelled,
+            resolution = self.turn.capabilities.artifacts.write(request) => resolution,
+        };
+        if self.accepts_work() {
+            resolution
+        } else {
+            ToolArtifactWriteResolution::Cancelled
+        }
     }
 }
 
@@ -376,6 +764,126 @@ mod tests {
 
         assert!(!scope.control.register_cancellation("late", late.clone()));
         assert_eq!(late.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_invocation_capabilities_are_explicitly_unsupported() {
+        let scope = InvocationScope::new(
+            TurnScope::without_events("turn", TurnGeneration::new(3)),
+            "invoke",
+        );
+
+        let exchange = scope
+            .request_exchange(ToolExchangeRequest {
+                invocation_id: "invoke".to_string(),
+                exchange_id: "exchange".to_string(),
+                producer_id: "producer".to_string(),
+                schema: "example.exchange".to_string(),
+                schema_version: 1,
+                payload: serde_json::Value::Null,
+                response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+            })
+            .await;
+        let input = scope.receive_input().await;
+        let service = scope
+            .invoke_service(ToolInvocationServiceRequest {
+                invocation_id: "invoke".to_string(),
+                request_id: "request".to_string(),
+                interface_id: "example.service/v1".to_string(),
+                operation: "run".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
+        let artifact = scope
+            .write_artifact(ToolArtifactWriteRequest {
+                invocation_id: "invoke".to_string(),
+                artifact_id: "artifact".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                bytes: vec![1, 2, 3],
+                metadata: serde_json::Value::Null,
+            })
+            .await;
+
+        assert_eq!(exchange, ToolExchangeResolution::NoCompatibleConsumer);
+        assert_eq!(input, ToolInvocationInputResolution::Closed);
+        assert_eq!(service, ToolInvocationServiceResolution::Unsupported);
+        assert!(matches!(
+            artifact,
+            ToolArtifactWriteResolution::Failed { ref code, .. }
+                if code == "artifact_sink_unavailable"
+        ));
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingExchangeBroker;
+
+    impl InvocationExchangeBroker for BlockingExchangeBroker {
+        fn request(
+            &self,
+            _request: ToolExchangeRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_blocked_exchange_without_broker_completion() {
+        let scope = TurnScope::with_capabilities(
+            "turn",
+            TurnGeneration::new(4),
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::new(
+                Arc::new(BlockingExchangeBroker),
+                Arc::new(UnsupportedInvocationCapabilities),
+                Arc::new(UnsupportedInvocationCapabilities),
+                Arc::new(UnsupportedInvocationCapabilities),
+            ),
+        );
+        let invocation = InvocationScope::new(scope.clone(), "invoke");
+        let waiting = tokio::spawn(async move {
+            invocation
+                .request_exchange(ToolExchangeRequest {
+                    invocation_id: "invoke".to_string(),
+                    exchange_id: "exchange".to_string(),
+                    producer_id: "producer".to_string(),
+                    schema: "example.exchange".to_string(),
+                    schema_version: 1,
+                    payload: serde_json::Value::Null,
+                    response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        assert!(scope.control().begin_cancellation());
+        let resolution = tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
+            .await
+            .expect("cancellation should wake the exchange")
+            .expect("exchange task should not panic");
+        assert_eq!(resolution, ToolExchangeResolution::Cancelled);
+    }
+
+    #[test]
+    fn invocation_scope_rejects_mismatched_event_identity() {
+        let sink = Arc::new(CountingSink::default());
+        let scope = InvocationScope::new(
+            TurnScope::new("turn", TurnGeneration::new(5), sink.clone()),
+            "invoke",
+        );
+        let event = ToolContributionEvent {
+            invocation_id: "other".to_string(),
+            contribution_id: "contribution".to_string(),
+            sequence: 1,
+            producer_id: "producer".to_string(),
+            schema: "example.contribution".to_string(),
+            schema_version: 1,
+            operation: bcode_tool::ToolContributionOperation::Upsert,
+            persistence: bcode_tool::ToolContributionPersistence::Transient,
+            payload: serde_json::Value::Null,
+        };
+
+        assert!(!scope.emit_contribution(event));
+        assert_eq!(sink.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]

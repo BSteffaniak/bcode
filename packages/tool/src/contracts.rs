@@ -7,8 +7,6 @@
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 
-use crate::ToolInvocationRequest;
-
 /// Runtime options controlling neutral tool scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecutionOptions {
@@ -107,11 +105,36 @@ pub struct ToolAuthorizationFact {
     pub metadata: serde_json::Value,
 }
 
+/// Transport-free identity and arguments for one requested tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInvocationDescriptor {
+    /// Provider-assigned call identifier.
+    pub invocation_id: String,
+    /// Registered tool name.
+    pub tool_name: String,
+    /// Opaque JSON arguments supplied by the provider.
+    pub arguments: serde_json::Value,
+}
+
+/// Opaque host context made available during side-effect-free preparation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolHostContextEntry {
+    /// Host-owned context schema.
+    pub schema: String,
+    /// Version of `schema` used by `payload`.
+    pub schema_version: u32,
+    /// Opaque context interpreted only by adapters that understand `schema`.
+    pub payload: serde_json::Value,
+}
+
 /// Request to prepare one invocation without performing its side effects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPreparationRequest {
-    /// Complete invocation request that will be executed if preparation and authorization succeed.
-    pub invocation: ToolInvocationRequest,
+    /// Transport-free invocation identity and arguments.
+    pub invocation: ToolInvocationDescriptor,
+    /// Opaque host context available to the tool owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_context: Vec<ToolHostContextEntry>,
 }
 
 /// Neutral preparation data returned by the tool owner.
@@ -131,10 +154,151 @@ pub struct ToolPreparationResponse {
 /// Fully prepared invocation passed from neutral orchestration to an invoker adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedToolInvocation {
-    /// Original invocation request.
-    pub request: ToolInvocationRequest,
+    /// Transport-free invocation identity and arguments.
+    pub invocation: ToolInvocationDescriptor,
     /// Tool-owner-produced preparation data.
     pub preparation: ToolPreparationResponse,
+}
+
+/// Policy controlling how a host handles an exchange with no compatible consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExchangeResponsePolicy {
+    /// The invocation cannot complete without a compatible response.
+    Required,
+    /// The host may decline the exchange and allow the invocation to continue.
+    Optional,
+}
+
+/// Correlated renderer-neutral request for external input while an invocation remains active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExchangeRequest {
+    /// Invocation that owns the exchange.
+    pub invocation_id: String,
+    /// Producer-assigned exchange identifier unique within the invocation.
+    pub exchange_id: String,
+    /// Plugin, direct tool, or adapter that owns the payload schema.
+    pub producer_id: String,
+    /// Producer-owned request/response schema.
+    pub schema: String,
+    /// Version of `schema` used by `payload`.
+    pub schema_version: u32,
+    /// Opaque request payload.
+    pub payload: serde_json::Value,
+    /// Required versus optional response behavior.
+    pub response_policy: ToolExchangeResponsePolicy,
+}
+
+/// Terminal resolution of one invocation exchange.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolExchangeResolution {
+    /// A compatible consumer supplied an opaque response payload.
+    Responded { payload: serde_json::Value },
+    /// The owning invocation or turn was cancelled.
+    Cancelled,
+    /// The exchange deadline elapsed.
+    TimedOut,
+    /// No attached consumer supports the exchange schema/version.
+    NoCompatibleConsumer,
+    /// The selected consumer detached before responding.
+    ConsumerDetached,
+    /// The host failed to route or resolve the exchange.
+    Failed { code: String, message: String },
+}
+
+/// Unsolicited schema-versioned input delivered to an active invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInvocationInput {
+    /// Invocation that owns the input.
+    pub invocation_id: String,
+    /// Producer-assigned input identifier.
+    pub input_id: String,
+    /// Plugin, host adapter, or client that owns the payload schema.
+    pub producer_id: String,
+    /// Producer-owned input schema.
+    pub schema: String,
+    /// Version of `schema` used by `payload`.
+    pub schema_version: u32,
+    /// Opaque input payload.
+    pub payload: serde_json::Value,
+}
+
+/// Result of waiting for the next input addressed to an invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolInvocationInputResolution {
+    /// One input is available.
+    Received { input: ToolInvocationInput },
+    /// The owning invocation or turn was cancelled.
+    Cancelled,
+    /// The host closed input delivery for this invocation.
+    Closed,
+    /// Input routing failed.
+    Failed { code: String, message: String },
+}
+
+/// Opaque nested service request issued by an active invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInvocationServiceRequest {
+    /// Invocation that owns the request.
+    pub invocation_id: String,
+    /// Producer-assigned request identifier.
+    pub request_id: String,
+    /// Versioned service interface identifier.
+    pub interface_id: String,
+    /// Operation within `interface_id`.
+    pub operation: String,
+    /// Opaque service request payload.
+    pub payload: serde_json::Value,
+}
+
+/// Terminal result of one nested invocation service request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolInvocationServiceResolution {
+    /// The routed service returned an opaque response payload.
+    Responded { payload: serde_json::Value },
+    /// The owning invocation or turn was cancelled.
+    Cancelled,
+    /// No host service supports the interface and operation.
+    Unsupported,
+    /// The routed service failed.
+    Failed { code: String, message: String },
+}
+
+/// Bounded artifact write requested by an active invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolArtifactWriteRequest {
+    /// Invocation that owns the artifact.
+    pub invocation_id: String,
+    /// Producer-assigned artifact identifier unique within the invocation.
+    pub artifact_id: String,
+    /// Artifact content type.
+    pub content_type: String,
+    /// Complete artifact bytes. Host sinks enforce their configured bound.
+    pub bytes: Vec<u8>,
+    /// Opaque producer metadata.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+/// Terminal result of a bounded host artifact write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolArtifactWriteResolution {
+    /// The host persisted the complete artifact and returned an opaque reference.
+    Written {
+        artifact_id: String,
+        byte_len: u64,
+        reference: serde_json::Value,
+    },
+    /// The owning invocation or turn was cancelled.
+    Cancelled,
+    /// The artifact exceeded the host sink's configured bound.
+    TooLarge { max_bytes: u64 },
+    /// The artifact sink failed.
+    Failed { code: String, message: String },
 }
 
 /// Mutation applied to a generic renderer contribution.
@@ -190,8 +354,14 @@ pub enum ToolInvocationLifecycleStage {
     Started,
     /// The invocation is still running and published progress metadata.
     Progress,
-    /// The invocation has stopped running.
-    Finished,
+    /// The invocation is waiting for an external response or resource.
+    Waiting,
+    /// The invocation completed successfully.
+    Completed,
+    /// The invocation stopped because its turn was cancelled.
+    Cancelled,
+    /// The invocation completed with an error.
+    Failed,
 }
 
 /// Renderer-independent invocation lifecycle event.

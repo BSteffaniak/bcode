@@ -14487,14 +14487,6 @@ async fn collect_model_tools(
             name: tool.name,
             description: tool.description,
             input_schema: tool.input_schema,
-            side_effect: match tool.side_effect {
-                bcode_tool::ToolSideEffect::ReadOnly => bcode_model::ToolSideEffect::ReadOnly,
-                bcode_tool::ToolSideEffect::WriteFiles => bcode_model::ToolSideEffect::WriteFiles,
-                bcode_tool::ToolSideEffect::ExecuteProcess => {
-                    bcode_model::ToolSideEffect::ExecuteProcess
-                }
-            },
-            requires_permission: tool.requires_permission,
         })
         .collect()
 }
@@ -18330,8 +18322,6 @@ mod tests {
                     "type": "object",
                     "properties": {"large": {"description": "schema ".repeat(100)}}
                 }),
-                side_effect: bcode_model::ToolSideEffect::ReadOnly,
-                requires_permission: false,
             });
         });
         assert_increases(|request| {
@@ -18371,8 +18361,6 @@ mod tests {
                 "type": "object",
                 "properties": {"large": {"description": "schema ".repeat(500)}}
             }),
-            side_effect: bcode_model::ToolSideEffect::ReadOnly,
-            requires_permission: false,
         });
         let tool_tokens = estimated_model_request_tokens(&with_tool);
         assert!(baseline_tokens < tool_tokens);

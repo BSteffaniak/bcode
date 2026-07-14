@@ -2388,8 +2388,6 @@ mod tests {
                 name: "filesystem.read".to_string(),
                 description: "read".to_string(),
                 input_schema: serde_json::json!({"type":"object"}),
-                side_effect: bcode_model::ToolSideEffect::default(),
-                requires_permission: false,
             }],
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),

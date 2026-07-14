@@ -7769,15 +7769,11 @@ mod tests {
                 name: "fs.read".to_string(),
                 description: "read".to_string(),
                 input_schema: serde_json::json!({ "type": "object" }),
-                side_effect: bcode_model::ToolSideEffect::ReadOnly,
-                requires_permission: false,
             },
             bcode_model::ToolDefinition {
                 name: "fs_read".to_string(),
                 description: "read".to_string(),
                 input_schema: serde_json::json!({ "type": "object" }),
-                side_effect: bcode_model::ToolSideEffect::ReadOnly,
-                requires_permission: false,
             },
         ];
 
@@ -7794,8 +7790,6 @@ mod tests {
             name: "shell.run".to_string(),
             description: "run shell".to_string(),
             input_schema: serde_json::json!({ "type": "object" }),
-            side_effect: bcode_model::ToolSideEffect::ExecuteProcess,
-            requires_permission: true,
         }];
         let name_map = projected_tool_name_map(&request, OpenAiCompatibleDialect::ChatGptCodex)
             .expect("tool names should project");

@@ -11,8 +11,10 @@
 pub mod turn;
 
 pub use turn::{
-    InvocationCancellation, ScopedTurnEvent, TurnControl, TurnEventSink, TurnGeneration,
-    TurnLifecycle, TurnScope,
+    InvocationArtifactSink, InvocationCancellation, InvocationCapabilities,
+    InvocationCapabilityFuture, InvocationExchangeBroker, InvocationInputRouter, InvocationScope,
+    InvocationServiceRouter, PreparationScope, ScopedTurnEvent, TurnControl, TurnEventSink,
+    TurnGeneration, TurnLifecycle, TurnScope,
 };
 
 use bcode_model::{
@@ -24,7 +26,8 @@ use bcode_model::{
 use bcode_session_models::SessionId;
 use bcode_tool::{
     PreparedToolInvocation, ToolAuthorizationFact, ToolDefinition, ToolExecutionOptions,
-    ToolInvocationRequest, ToolInvocationResponse, ToolPreparationRequest, ToolPreparationResponse,
+    ToolInvocationDescriptor, ToolInvocationRequest, ToolInvocationResponse,
+    ToolPreparationRequest, ToolPreparationResponse,
     ToolResultContent as InvocationToolResultContent, ToolSchedulingContract,
 };
 use futures::{StreamExt, stream};
@@ -474,6 +477,7 @@ pub trait ToolInvoker: Send + Sync {
         &'a self,
         tool: &'a RegisteredTool,
         request: &'a ToolPreparationRequest,
+        scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse>;
 
     /// Return an opaque cancellation handle before the invocation becomes externally active.
@@ -492,7 +496,7 @@ pub trait ToolInvoker: Send + Sync {
         &'a self,
         tool: &'a RegisteredTool,
         invocation: &'a PreparedToolInvocation,
-        scope: &'a TurnScope,
+        scope: &'a InvocationScope,
     ) -> RuntimeFuture<'a, ToolInvocationResponse>;
 }
 
@@ -517,6 +521,7 @@ where
         &'a self,
         _tool: &'a RegisteredTool,
         _request: &'a ToolPreparationRequest,
+        _scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
         Box::pin(async { Ok(ToolPreparationResponse::default()) })
     }
@@ -525,9 +530,10 @@ where
         &'a self,
         tool: &'a RegisteredTool,
         invocation: &'a PreparedToolInvocation,
-        _scope: &'a TurnScope,
+        _scope: &'a InvocationScope,
     ) -> RuntimeFuture<'a, ToolInvocationResponse> {
-        self.executor.execute_tool(tool, &invocation.request)
+        let request = legacy_tool_invocation_request(&invocation.invocation);
+        Box::pin(async move { self.executor.execute_tool(tool, &request).await })
     }
 }
 
@@ -835,17 +841,11 @@ impl AgentRuntime {
         .await
     }
 
-    /// Execute an ordered tool-call batch through neutral preparation and authorization contracts.
-    ///
-    /// The complete batch is prepared and authorized before invocation begins. Scheduling uses
-    /// only tool-owner-produced opaque resource claims; missing contracts remain isolated. Results
-    /// retain provider order regardless of completion order.
+    /// Execute an ordered tool-call batch with no additional host preparation context.
     ///
     /// # Errors
     ///
-    /// Returns an error when the tool-round budget is exhausted, an authorization adapter returns
-    /// an invalid response, or authorization cannot complete. Per-call resolution, preparation,
-    /// denial, cancellation, and invocation failures are returned in the ordered batch output.
+    /// Returns the same errors as [`Self::execute_prepared_tool_batch_with_host_context`].
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_prepared_tool_batch<C, A, I>(
         &self,
@@ -855,6 +855,50 @@ impl AgentRuntime {
         calls: &[ToolCall],
         rounds: &mut ToolRoundState,
         context: &RuntimePermissionContext,
+        options: ToolExecutionOptions,
+        scope: &TurnScope,
+    ) -> Result<ToolBatchExecutionOutput>
+    where
+        C: ToolCatalog + Sync,
+        A: ToolAuthorizationCoordinator + ?Sized,
+        I: ToolInvoker + Sync,
+    {
+        self.execute_prepared_tool_batch_with_host_context(
+            catalog,
+            authorization,
+            invoker,
+            calls,
+            rounds,
+            context,
+            &[],
+            options,
+            scope,
+        )
+        .await
+    }
+
+    /// Execute an ordered tool-call batch through neutral preparation and authorization contracts.
+    ///
+    /// The complete batch is prepared and authorized before invocation begins. Scheduling uses
+    /// only tool-owner-produced opaque resource claims; missing contracts remain isolated. Results
+    /// retain provider order regardless of completion order. `host_context` remains opaque to the
+    /// runtime and is forwarded unchanged to every preparation request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tool-round budget is exhausted, an authorization adapter returns
+    /// an invalid response, or authorization cannot complete. Per-call resolution, preparation,
+    /// denial, cancellation, and invocation failures are returned in the ordered batch output.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_prepared_tool_batch_with_host_context<C, A, I>(
+        &self,
+        catalog: &C,
+        authorization: &A,
+        invoker: &I,
+        calls: &[ToolCall],
+        rounds: &mut ToolRoundState,
+        context: &RuntimePermissionContext,
+        host_context: &[bcode_tool::ToolHostContextEntry],
         options: ToolExecutionOptions,
         scope: &TurnScope,
     ) -> Result<ToolBatchExecutionOutput>
@@ -875,7 +919,8 @@ impl AgentRuntime {
 
         let mut terminal = BTreeMap::<usize, Result<ToolExecutionOutput>>::new();
         let prepared =
-            prepare_runtime_tool_batch(catalog, invoker, calls, scope, &mut terminal).await;
+            prepare_runtime_tool_batch(catalog, invoker, calls, host_context, scope, &mut terminal)
+                .await;
 
         if !scope.control().accepts_normal_output() {
             for call in &prepared {
@@ -1340,6 +1385,7 @@ async fn prepare_runtime_tool_batch<C, I>(
     catalog: &C,
     invoker: &I,
     calls: &[ToolCall],
+    host_context: &[bcode_tool::ToolHostContextEntry],
     scope: &TurnScope,
     terminal: &mut BTreeMap<usize, Result<ToolExecutionOutput>>,
 ) -> Vec<PreparedRuntimeToolCall>
@@ -1357,11 +1403,13 @@ where
             terminal.insert(index, Err(RuntimeError::ToolNotFound(call.name.clone())));
             continue;
         };
-        let request = tool_invocation_request(call);
+        let invocation = tool_invocation_descriptor(call);
         let preparation_request = ToolPreparationRequest {
-            invocation: request.clone(),
+            invocation: invocation.clone(),
+            host_context: host_context.to_vec(),
         };
-        let preparation = invoker.prepare_tool(&tool, &preparation_request);
+        let preparation_scope = PreparationScope::new(scope.clone(), host_context.to_vec());
+        let preparation = invoker.prepare_tool(&tool, &preparation_request, &preparation_scope);
         let cancellation = scope.control().cancellation();
         let prepared_result = tokio::select! {
             biased;
@@ -1374,7 +1422,7 @@ where
                 call: call.clone(),
                 tool,
                 invocation: PreparedToolInvocation {
-                    request,
+                    invocation,
                     preparation,
                 },
             }),
@@ -1386,11 +1434,19 @@ where
     prepared
 }
 
-fn tool_invocation_request(call: &ToolCall) -> ToolInvocationRequest {
-    ToolInvocationRequest {
-        tool_call_id: call.id.clone(),
-        name: call.name.clone(),
+fn tool_invocation_descriptor(call: &ToolCall) -> ToolInvocationDescriptor {
+    ToolInvocationDescriptor {
+        invocation_id: call.id.clone(),
+        tool_name: call.name.clone(),
         arguments: call.arguments.clone(),
+    }
+}
+
+fn legacy_tool_invocation_request(invocation: &ToolInvocationDescriptor) -> ToolInvocationRequest {
+    ToolInvocationRequest {
+        tool_call_id: invocation.invocation_id.clone(),
+        name: invocation.tool_name.clone(),
+        arguments: invocation.arguments.clone(),
         cwd: None,
         artifact_dir: None,
         cancellation_path: None,
@@ -1442,25 +1498,24 @@ where
     if !scope.control().accepts_normal_output() {
         return Err(RuntimeError::Cancelled);
     }
+    let invocation_scope = InvocationScope::new(scope.clone(), prepared.call.id.clone());
     if let Some(handle) = invoker.cancellation_handle(&prepared.tool, &prepared.invocation)
-        && !scope
-            .control()
-            .register_cancellation(prepared.call.id.clone(), handle)
+        && !invocation_scope.register_cancellation(handle)
     {
         return Err(RuntimeError::Cancelled);
     }
-    if !scope.control().accepts_normal_output() {
-        scope.control().unregister_cancellation(&prepared.call.id);
+    if !invocation_scope.accepts_work() {
+        let _ = invocation_scope.unregister_cancellation();
         return Err(RuntimeError::Cancelled);
     }
     let invocation = invoker
-        .invoke_tool(&prepared.tool, &prepared.invocation, scope)
+        .invoke_tool(&prepared.tool, &prepared.invocation, &invocation_scope)
         .await
         .map_err(|error| RuntimeError::ToolExecution {
             tool_name: prepared.call.name.clone(),
             message: error.to_string(),
         });
-    scope.control().unregister_cancellation(&prepared.call.id);
+    let _ = invocation_scope.unregister_cancellation();
     let invocation = invocation?;
     if !scope.control().accepts_normal_output() {
         return Err(RuntimeError::Cancelled);
@@ -1583,18 +1638,6 @@ fn model_tool_definition(definition: ToolDefinition) -> bcode_model::ToolDefinit
         name: definition.name,
         description: definition.description,
         input_schema: definition.input_schema,
-        side_effect: model_tool_side_effect(definition.side_effect),
-        requires_permission: definition.requires_permission,
-    }
-}
-
-const fn model_tool_side_effect(
-    side_effect: bcode_tool::ToolSideEffect,
-) -> bcode_model::ToolSideEffect {
-    match side_effect {
-        bcode_tool::ToolSideEffect::ReadOnly => bcode_model::ToolSideEffect::ReadOnly,
-        bcode_tool::ToolSideEffect::WriteFiles => bcode_model::ToolSideEffect::WriteFiles,
-        bcode_tool::ToolSideEffect::ExecuteProcess => bcode_model::ToolSideEffect::ExecuteProcess,
     }
 }
 
@@ -1786,6 +1829,7 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             _request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
         ) -> RuntimeFuture<'a, ToolPreparationResponse> {
             Box::pin(async move {
                 Ok(ToolPreparationResponse {
@@ -1802,7 +1846,7 @@ mod tests {
             invocation: &PreparedToolInvocation,
         ) -> Option<Arc<dyn InvocationCancellation>> {
             self.cancellations
-                .get(&invocation.request.name)
+                .get(&invocation.invocation.tool_name)
                 .map(|count| {
                     Arc::new(TestCancelHandle(Arc::clone(count))) as Arc<dyn InvocationCancellation>
                 })
@@ -1812,7 +1856,7 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             _invocation: &'a PreparedToolInvocation,
-            _scope: &'a TurnScope,
+            _scope: &'a InvocationScope,
         ) -> RuntimeFuture<'a, ToolInvocationResponse> {
             self.started.fetch_add(1, Ordering::SeqCst);
             Box::pin(std::future::pending())
@@ -1831,9 +1875,10 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
         ) -> RuntimeFuture<'a, ToolPreparationResponse> {
             self.prepared.fetch_add(1, Ordering::SeqCst);
-            let access = if request.invocation.name == "exclusive" {
+            let access = if request.invocation.tool_name == "exclusive" {
                 ToolResourceAccess::Exclusive
             } else {
                 ToolResourceAccess::Shared
@@ -1857,7 +1902,7 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             invocation: &'a PreparedToolInvocation,
-            _scope: &'a TurnScope,
+            _scope: &'a InvocationScope,
         ) -> RuntimeFuture<'a, ToolInvocationResponse> {
             Box::pin(async move {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1865,7 +1910,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 self.active.fetch_sub(1, Ordering::SeqCst);
                 Ok(ToolInvocationResponse {
-                    output: invocation.request.name.clone(),
+                    output: invocation.invocation.tool_name.clone(),
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
@@ -1887,11 +1932,12 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
         ) -> RuntimeFuture<'a, ToolPreparationResponse> {
             Box::pin(async move {
-                if request.invocation.name == self.fail_name {
+                if request.invocation.tool_name == self.fail_name {
                     Err(RuntimeError::ToolPreparation {
-                        tool_name: request.invocation.name.clone(),
+                        tool_name: request.invocation.tool_name.clone(),
                         message: "synthetic preparation failure".to_string(),
                     })
                 } else {
@@ -1904,12 +1950,12 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             invocation: &'a PreparedToolInvocation,
-            _scope: &'a TurnScope,
+            _scope: &'a InvocationScope,
         ) -> RuntimeFuture<'a, ToolInvocationResponse> {
             self.started.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 Ok(ToolInvocationResponse {
-                    output: format!("called {}", invocation.request.name),
+                    output: format!("called {}", invocation.invocation.tool_name),
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
@@ -1992,6 +2038,7 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             _request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
         ) -> RuntimeFuture<'a, ToolPreparationResponse> {
             self.prepared.fetch_add(1, Ordering::SeqCst);
             let scheduling = self.scheduling.clone();
@@ -2008,7 +2055,7 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             invocation: &'a PreparedToolInvocation,
-            scope: &'a TurnScope,
+            scope: &'a InvocationScope,
         ) -> RuntimeFuture<'a, ToolInvocationResponse> {
             Box::pin(async move {
                 assert_eq!(
@@ -2016,7 +2063,7 @@ mod tests {
                     self.expected_prepared_before_start,
                     "every call must be prepared before invocation"
                 );
-                if !scope.control().accepts_normal_output() {
+                if !scope.accepts_work() {
                     return Err(RuntimeError::Cancelled);
                 }
                 self.started.fetch_add(1, Ordering::SeqCst);
@@ -2025,7 +2072,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 self.active.fetch_sub(1, Ordering::SeqCst);
                 Ok(ToolInvocationResponse {
-                    output: format!("called {}", invocation.request.name),
+                    output: format!("called {}", invocation.invocation.tool_name),
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
@@ -2044,6 +2091,86 @@ mod tests {
                 access: ToolResourceAccess::Shared,
             }],
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct HostContextInvoker {
+        observed: std::sync::Mutex<Vec<bcode_tool::ToolHostContextEntry>>,
+    }
+
+    impl ToolInvoker for HostContextInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            request: &'a ToolPreparationRequest,
+            scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            assert_eq!(scope.host_context(), request.host_context);
+            *self
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = request.host_context.clone();
+            Box::pin(async { Ok(ToolPreparationResponse::default()) })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            invocation: &'a PreparedToolInvocation,
+            _scope: &'a InvocationScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            Box::pin(async move {
+                Ok(ToolInvocationResponse {
+                    output: invocation.invocation.tool_name.clone(),
+                    is_error: false,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_receives_opaque_host_context_unchanged() {
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("first"));
+        let calls = [ToolCall {
+            id: "call-1".to_string(),
+            name: "first".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        let host_context = [bcode_tool::ToolHostContextEntry {
+            schema: "example.host-context".to_string(),
+            schema_version: 7,
+            payload: serde_json::json!({"opaque": [1, 2, 3]}),
+        }];
+        let invoker = HostContextInvoker::default();
+        let mut rounds = ToolRoundState::new(1);
+
+        let output = AgentRuntime::new()
+            .execute_prepared_tool_batch_with_host_context(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                &host_context,
+                ToolExecutionOptions::default(),
+                &TurnScope::without_events("turn", TurnGeneration::new(1)),
+            )
+            .await
+            .expect("batch should execute");
+
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(
+            *invoker
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            host_context
+        );
     }
 
     #[tokio::test]
