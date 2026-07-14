@@ -38,7 +38,8 @@ bcode_web_search_plugin                 = { workspace = true, optional = true }
 bcode_worktree_plugin                   = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+bcode_command = { workspace = true }
+serde_json    = { workspace = true }
 
 [features]
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]

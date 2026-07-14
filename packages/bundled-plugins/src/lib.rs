@@ -258,6 +258,71 @@ fn worktree_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "static-bundled-loop-plugin")]
+    #[test]
+    fn disabling_loop_removes_all_manifest_contributions() {
+        let static_plugins = super::static_bundled_plugins();
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &static_plugins,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("static plugin manifests parse");
+        let loop_manifest = selected
+            .iter()
+            .find_map(|(manifest, _)| (manifest.id == "bcode.loop").then_some(manifest))
+            .expect("loop plugin is included in the static bundle");
+        assert!(!loop_manifest.services.is_empty());
+        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &static_plugins,
+        )
+        .expect("enabled static plugin host should load");
+        assert!(host
+            .registered_command_contributions(&bcode_command::CommandSurface::Palette)
+            .iter()
+            .any(|contribution| matches!(
+                &contribution.action,
+                bcode_command::CommandAction::Plugin { plugin_id, .. } if plugin_id == "bcode.loop"
+            )));
+
+        let selection = bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::All,
+            enabled: std::collections::BTreeSet::new(),
+            disabled: std::collections::BTreeSet::from(["bcode.loop".to_owned()]),
+        };
+        let selected = bcode_plugin::filter_selected_static_plugins(&static_plugins, &selection)
+            .expect("disabled static plugin selection should parse");
+
+        assert!(
+            selected
+                .iter()
+                .all(|(manifest, _)| manifest.id != "bcode.loop")
+        );
+        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &selection,
+            &static_plugins,
+        )
+        .expect("disabled static plugin host should load");
+        assert!(host
+            .registered_command_contributions(&bcode_command::CommandSurface::Palette)
+            .iter()
+            .all(|contribution| !matches!(
+                &contribution.action,
+                bcode_command::CommandAction::Plugin { plugin_id, .. } if plugin_id == "bcode.loop"
+            )));
+        assert!(host
+            .registered_command_contributions(&bcode_command::CommandSurface::Slash)
+            .iter()
+            .all(|contribution| !matches!(
+                &contribution.action,
+                bcode_command::CommandAction::Plugin { plugin_id, .. } if plugin_id == "bcode.loop"
+            )));
+        assert!(
+            host.service_summaries()
+                .iter()
+                .all(|(plugin_id, _)| plugin_id != "bcode.loop")
+        );
+    }
 
     #[cfg(not(any(
         feature = "static-bundled-bedrock-provider-plugin",
@@ -265,10 +330,12 @@ mod tests {
         feature = "static-bundled-code-review-plugin",
         feature = "static-bundled-default-agents-plugin",
         feature = "static-bundled-document-plugin",
+        feature = "static-bundled-eval-plugin",
         feature = "static-bundled-fake-provider-plugin",
         feature = "static-bundled-filesystem-plugin",
         feature = "static-bundled-git-plugin",
         feature = "static-bundled-github-review-publisher-plugin",
+        feature = "static-bundled-loop-plugin",
         feature = "static-bundled-model-plugin",
         feature = "static-bundled-ocr-plugin",
         feature = "static-bundled-openai-compatible-provider-plugin",

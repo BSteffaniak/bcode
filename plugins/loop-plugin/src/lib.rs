@@ -280,6 +280,10 @@ fn status_response(message: &str) -> InvokeCommandResponse {
     }
 }
 
+fn stop_confirmation() -> String {
+    "loop cancellation requested; terminal outcome: Canceled · reason: stopped by user".to_owned()
+}
+
 fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
     let mut state = match load_state_result(session_id) {
         Ok(Some(state)) => state,
@@ -304,7 +308,7 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
             tokio::spawn(async move {
                 let _cancelled = client.cancel_session_turn(cancel_session_id).await;
             });
-            "loop stopped".to_owned()
+            stop_confirmation()
         }
         Err(error) => format!("failed to stop loop: {error}"),
     };
@@ -2216,6 +2220,14 @@ mod tests {
             state.state = terminal;
             assert!(active_status_contribution(&state, 0).is_none());
         }
+    }
+
+    #[test]
+    fn stop_confirmation_distinguishes_request_from_terminal_outcome() {
+        assert_eq!(
+            stop_confirmation(),
+            "loop cancellation requested; terminal outcome: Canceled · reason: stopped by user"
+        );
     }
 
     #[test]
