@@ -133,6 +133,7 @@ Minimum expected validation once Rust crates exist:
 - `cargo check --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `scripts/check-session-architecture.sh` for session persistence changes
+- `scripts/check-loop-runtime-architecture.sh` for generic runtime, turn scheduling, cancellation, plugin/tool domain isolation, or `/loop` changes
 - `scripts/check-model-catalog-architecture.sh` for model catalog/provider resolution changes
 - relevant `cargo test` commands for changed packages
 - relevant plugin rebuild/check commands when plugin crates exist

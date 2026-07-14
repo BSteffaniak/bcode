@@ -7,6 +7,10 @@ if ! scripts/check-no-normal-full-scans.sh; then
   violations=1
 fi
 
+if ! scripts/check-loop-runtime-architecture.sh; then
+  violations=1
+fi
+
 if rg -n "handle\.state" packages/session/src/lib.rs >/tmp/bcode-session-actor-violations.txt; then
   echo "Session actor architecture violation: SessionHandle state must not be accessed directly." >&2
   cat /tmp/bcode-session-actor-violations.txt >&2

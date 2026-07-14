@@ -1307,6 +1307,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decodes_schema_29_automation_compatibility_fixtures() {
+        let cases = [
+            (
+                include_str!("../fixtures/migrations/plugin-automation-turn-started-v29.json"),
+                "plugin_automation_turn_started",
+            ),
+            (
+                include_str!("../fixtures/migrations/plugin-automation-turn-finished-v29.json"),
+                "plugin_automation_turn_finished",
+            ),
+            (
+                include_str!("../fixtures/migrations/plugin-status-note-v29.json"),
+                "plugin_status_note",
+            ),
+        ];
+
+        for (payload, expected_kind) in cases {
+            let event = decode_session_event(payload).expect("schema-29 fixture should decode");
+            let actual_kind = match event.kind {
+                SessionEventKind::PluginAutomationTurnStarted { .. } => {
+                    "plugin_automation_turn_started"
+                }
+                SessionEventKind::PluginAutomationTurnFinished { .. } => {
+                    "plugin_automation_turn_finished"
+                }
+                SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
+                other => panic!("unexpected compatibility event: {other:?}"),
+            };
+            assert_eq!(actual_kind, expected_kind);
+        }
+    }
+
+    #[test]
     fn decodes_current_and_legacy_persisted_tool_results() {
         for (semantic_result, assertion) in semantic_result_cases() {
             let event = decode_session_event(&event_payload(&semantic_result))

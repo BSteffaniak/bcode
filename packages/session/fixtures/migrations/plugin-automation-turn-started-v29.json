@@ -1,0 +1,1 @@
+{"schema_version":29,"sequence":41,"timestamp_ms":1700000000041,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"plugin_automation_turn_started":{"plugin_id":"bcode.loop","run_id":"run-1","operation_id":"iteration-4","display_label":"Loop iteration 4","turn_id":"turn-4","user_event_sequence":40,"read_only":false}}}
