@@ -1897,6 +1897,19 @@ impl SessionManager {
         })
     }
 
+    /// Return the latest durable context-usage observation with a bounded indexed lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn latest_context_usage(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.latest_context_usage().await
+    }
+
     /// Return the model-visible session events, starting at the latest compaction when possible.
     ///
     /// # Errors

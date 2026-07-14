@@ -705,6 +705,9 @@ pub struct SessionModelStatus {
     pub context_input_tokens: Option<u64>,
     #[serde(default)]
     pub context_usage_source: Option<String>,
+    /// Durable sequence of the context-usage observation projected above.
+    #[serde(default)]
+    pub context_usage_sequence: Option<u64>,
     #[serde(default)]
     pub auth_profile: Option<String>,
     #[serde(default)]
@@ -2274,6 +2277,17 @@ mod tests {
         let decoded = decode_response(&encoded).expect("response should decode");
 
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn legacy_session_model_status_defaults_context_usage_sequence() {
+        let status = serde_json::from_str::<SessionModelStatus>(
+            r#"{"provider_plugin_id":"provider","model_id":"model","context_input_tokens":42,"context_usage_source":"estimated"}"#,
+        )
+        .expect("legacy model status should decode");
+
+        assert_eq!(status.context_input_tokens, Some(42));
+        assert_eq!(status.context_usage_sequence, None);
     }
 
     #[test]

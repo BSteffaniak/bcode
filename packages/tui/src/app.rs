@@ -268,6 +268,7 @@ pub struct BmuxApp {
     selected_compatibility_key: Option<String>,
     context_usage_request_id: Option<String>,
     context_usage_request_fingerprint: Option<String>,
+    context_usage_sequence: Option<u64>,
     current_agent_id: String,
     current_agent_accent: Option<String>,
     pending_agent_id: Option<String>,
@@ -484,6 +485,7 @@ impl BmuxApp {
             selected_compatibility_key: None,
             context_usage_request_id: None,
             context_usage_request_fingerprint: None,
+            context_usage_sequence: None,
             current_agent_id: "build".to_owned(),
             current_agent_accent: None,
             pending_agent_id: None,
@@ -1108,11 +1110,18 @@ impl BmuxApp {
                 visibility: bcode_model::ModelVisibility::Visible,
             });
         self.token_usage.apply_model_info(model.as_ref());
-        if let Some(input_tokens) = status.context_input_tokens {
+        if let Some(input_tokens) = status.context_input_tokens
+            && match (status.context_usage_sequence, self.context_usage_sequence) {
+                (Some(sequence), Some(current)) => sequence >= current,
+                (Some(_) | None, None) => true,
+                (None, Some(_)) => false,
+            }
+        {
             self.token_usage.observe_context_usage(
                 input_tokens,
                 status.context_usage_source.as_deref() == Some("estimated"),
             );
+            self.context_usage_sequence = status.context_usage_sequence;
         }
     }
 
@@ -2360,12 +2369,14 @@ impl BmuxApp {
                                 .clone_from(&snapshot.request_fingerprint);
                             self.token_usage
                                 .observe_context_usage(snapshot.input_tokens, true);
+                            self.context_usage_sequence = Some(event.sequence);
                         }
                         bcode_session_models::ContextUsageSource::Provider
                             if self.context_usage_identity_matches(snapshot) =>
                         {
                             self.token_usage
                                 .observe_context_usage(snapshot.input_tokens, false);
+                            self.context_usage_sequence = Some(event.sequence);
                         }
                         bcode_session_models::ContextUsageSource::Provider => {}
                     }
@@ -3527,6 +3538,7 @@ impl BmuxApp {
         self.token_usage.clear_context_occupancy();
         self.context_usage_request_id = None;
         self.context_usage_request_fingerprint = None;
+        self.context_usage_sequence = None;
     }
 
     fn push_compaction(&mut self, summary: &str) {
@@ -4502,6 +4514,119 @@ mod tests {
             compatibility_key: None,
             source,
         }
+    }
+
+    fn model_status_with_context(
+        input_tokens: u64,
+        source: &str,
+        sequence: u64,
+    ) -> bcode_ipc::SessionModelStatus {
+        bcode_ipc::SessionModelStatus {
+            provider_plugin_id: Some("provider".to_string()),
+            model_id: Some("model".to_string()),
+            context_window: Some(400_000),
+            context_input_tokens: Some(input_tokens),
+            context_usage_source: Some(source.to_string()),
+            context_usage_sequence: Some(sequence),
+            auth_profile: None,
+            context_format_version: None,
+            compatibility_key: None,
+            max_output_tokens: None,
+            reasoning: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            prompt_cache_mode: None,
+            conversation_reuse_mode: None,
+            compaction_mode: None,
+            compaction_backend: None,
+            proactive_compaction_threshold_percent: None,
+            cache: None,
+            metadata_source: None,
+            pricing: None,
+        }
+    }
+
+    #[test]
+    fn stale_status_hydration_does_not_overwrite_newer_live_context_usage() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        app.apply_session_event(
+            &context_event(
+                3,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Estimated),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+
+        app.apply_model_status(model_status_with_context(1_000, "provider", 2));
+
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
+        assert!(app.token_usage.context_usage_estimated);
+        assert_eq!(app.context_usage_sequence, Some(3));
+    }
+
+    #[test]
+    fn unsequenced_status_hydration_does_not_overwrite_live_context_usage() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        app.apply_session_event(
+            &context_event(
+                3,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Estimated),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        let mut legacy_status = model_status_with_context(1_000, "provider", 2);
+        legacy_status.context_usage_sequence = None;
+
+        app.apply_model_status(legacy_status);
+
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
+        assert!(app.token_usage.context_usage_estimated);
+        assert_eq!(app.context_usage_sequence, Some(3));
+    }
+
+    #[test]
+    fn newer_status_hydration_advances_context_usage() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        app.apply_session_event(
+            &context_event(
+                2,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Estimated),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+
+        app.apply_model_status(model_status_with_context(3_000, "provider", 3));
+
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(3_000));
+        assert!(!app.token_usage.context_usage_estimated);
+        assert_eq!(app.context_usage_sequence, Some(3));
     }
 
     #[test]

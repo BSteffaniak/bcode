@@ -8130,47 +8130,55 @@ async fn model_status_for_selection(
         .reasoning_capabilities
         .clone()
         .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone()));
-    let history = if let Some(session_id) = session_id {
+    let context_usage = if let Some(session_id) = session_id {
         state
             .sessions
-            .model_context_events(session_id)
+            .latest_context_usage(session_id)
             .await
-            .unwrap_or_default()
+            .ok()
+            .flatten()
     } else {
-        Vec::new()
+        None
     };
     let context_format = provider_context_management_capabilities(state, &selection)
         .await
         .and_then(|capabilities| capabilities.context_format)
         .filter(|format| format.version > 0 && !format.compatibility_key.trim().is_empty());
     let active_auth_profile = selection.provider_context.auth_profile.as_deref();
-    let context_usage = history.iter().rev().find_map(|event| match &event.kind {
-        SessionEventKind::ContextUsageObserved { snapshot }
-            if snapshot.provider_plugin_id
-                == selection.provider_plugin_id.as_deref().unwrap_or("<auto>")
-                && snapshot.model_id
-                    == model_id_for_provider_request(selection.model_id.as_deref())
-                && snapshot.auth_profile.as_deref() == active_auth_profile
-                && snapshot.context_format_version
-                    == context_format.as_ref().map(|format| format.version)
-                && snapshot.compatibility_key.as_deref()
-                    == context_format
-                        .as_ref()
-                        .map(|format| format.compatibility_key.as_str()) =>
-        {
-            Some(snapshot)
-        }
+    let context_usage = context_usage.as_ref().filter(|event| {
+        matches!(
+            &event.kind,
+            SessionEventKind::ContextUsageObserved { snapshot }
+                if snapshot.provider_plugin_id
+                    == selection.provider_plugin_id.as_deref().unwrap_or("<auto>")
+                    && snapshot.model_id
+                        == model_id_for_provider_request(selection.model_id.as_deref())
+                    && snapshot.auth_profile.as_deref() == active_auth_profile
+                    && snapshot.context_format_version
+                        == context_format.as_ref().map(|format| format.version)
+                    && snapshot.compatibility_key.as_deref()
+                        == context_format
+                            .as_ref()
+                            .map(|format| format.compatibility_key.as_str())
+        )
+    });
+    let context_input_tokens = context_usage.and_then(|event| match &event.kind {
+        SessionEventKind::ContextUsageObserved { snapshot } => Some(snapshot.input_tokens),
         _ => None,
     });
     bcode_ipc::SessionModelStatus {
         provider_plugin_id: selection.provider_plugin_id,
         model_id,
         context_window,
-        context_input_tokens: context_usage.map(|snapshot| snapshot.input_tokens),
-        context_usage_source: context_usage.map(|snapshot| match snapshot.source {
-            bcode_session_models::ContextUsageSource::Provider => "provider".to_string(),
-            bcode_session_models::ContextUsageSource::Estimated => "estimated".to_string(),
+        context_input_tokens,
+        context_usage_source: context_usage.map(|event| match &event.kind {
+            SessionEventKind::ContextUsageObserved { snapshot } => match snapshot.source {
+                bcode_session_models::ContextUsageSource::Provider => "provider".to_string(),
+                bcode_session_models::ContextUsageSource::Estimated => "estimated".to_string(),
+            },
+            _ => unreachable!("context usage projection selects only context usage events"),
         }),
+        context_usage_sequence: context_usage.map(|event| event.sequence),
         auth_profile: selection.provider_context.auth_profile,
         context_format_version: context_format.as_ref().map(|format| format.version),
         compatibility_key: context_format.map(|format| format.compatibility_key),

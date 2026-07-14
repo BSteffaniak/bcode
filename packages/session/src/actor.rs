@@ -175,6 +175,10 @@ impl SessionHandle {
         self.send(SessionCommand::InputHistory).await?
     }
 
+    pub async fn latest_context_usage(&self) -> Result<Option<SessionEvent>, SessionError> {
+        self.send(SessionCommand::LatestContextUsage).await?
+    }
+
     pub async fn model_context_events(&self) -> Result<Vec<SessionEvent>, SessionError> {
         self.send(SessionCommand::ModelContextEvents).await?
     }
@@ -304,6 +308,7 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
     },
     InputHistory(oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>),
+    LatestContextUsage(oneshot::Sender<Result<Option<SessionEvent>, SessionError>>),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
     ActiveRuntimeWork(oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>),
@@ -427,6 +432,9 @@ impl SessionActor {
             }
             SessionCommand::InputHistory(reply) => {
                 let _ = reply.send(self.input_history().await);
+            }
+            SessionCommand::LatestContextUsage(reply) => {
+                let _ = reply.send(self.latest_context_usage().await);
             }
             SessionCommand::ModelContextEvents(reply) => {
                 let _ = reply.send(self.model_context_events().await);
@@ -1055,6 +1063,20 @@ impl SessionActor {
             checkpoint,
             expected: expected_last_sequence,
         })
+    }
+
+    async fn latest_context_usage(&mut self) -> Result<Option<SessionEvent>, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            return Ok(db.latest_context_usage().await?);
+        }
+        if let Some(events) = &self.state.events {
+            return Ok(events
+                .iter()
+                .rev()
+                .find(|event| matches!(event.kind, SessionEventKind::ContextUsageObserved { .. }))
+                .cloned());
+        }
+        Err(SessionError::NotFound(self.state.summary.id))
     }
 
     async fn model_context_events(&mut self) -> Result<Vec<SessionEvent>, SessionError> {

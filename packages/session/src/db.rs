@@ -1353,6 +1353,33 @@ impl SessionDb {
         Ok(canonical_model_context_from_events(candidates))
     }
 
+    /// Return the latest durable context-usage observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bounded query or event deserialization fails.
+    pub async fn latest_context_usage(&self) -> SessionDbResult<Option<SessionEvent>> {
+        let row = self
+            .db
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_type", "context_usage_observed")
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
+        let Some(row) = row.as_ref() else {
+            return Ok(None);
+        };
+        let event = decode_session_event(&required_string(row, "payload")?)?;
+        if !matches!(event.kind, SessionEventKind::ContextUsageObserved { .. }) {
+            return Err(SessionDbError::InvalidRow {
+                column: "events.payload".to_string(),
+            });
+        }
+        Ok(Some(event))
+    }
+
     async fn latest_context_compaction_event(&self) -> SessionDbResult<Option<SessionEvent>> {
         let mut latest = None;
         for event_type in ["context_compacted", "provider_context_compacted"] {
@@ -2592,7 +2619,34 @@ const fn bool_to_value(value: bool) -> DatabaseValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId};
+    use bcode_session_models::{
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ContextUsageSnapshot, ContextUsageSource,
+    };
+
+    fn context_usage_event(session_id: SessionId, sequence: u64) -> SessionEvent {
+        event(
+            session_id,
+            sequence,
+            SessionEventKind::ContextUsageObserved {
+                snapshot: ContextUsageSnapshot {
+                    provider_plugin_id: "provider".to_string(),
+                    model_id: "model".to_string(),
+                    input_tokens: sequence,
+                    context_through_sequence: sequence.saturating_sub(1),
+                    request_id: None,
+                    model_turn_id: None,
+                    round: None,
+                    request_fingerprint: None,
+                    turn_id: None,
+                    auth_profile: None,
+                    estimated_input_tokens: None,
+                    context_format_version: None,
+                    compatibility_key: None,
+                    source: ContextUsageSource::Estimated,
+                },
+            },
+        )
+    }
 
     fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
@@ -3835,6 +3889,38 @@ mod tests {
         assert_eq!(events.len(), 514);
         assert_eq!(events.first().map(|event| event.sequence), Some(0));
         assert_eq!(events.last().map(|event| event.sequence), Some(8_706));
+    }
+
+    #[tokio::test]
+    async fn latest_context_usage_returns_only_the_newest_observation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        db.append_event(&context_usage_event(session_id, 1))
+            .await
+            .expect("append first context usage");
+        db.append_event(&event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "unrelated".to_string(),
+            },
+        ))
+        .await
+        .expect("append unrelated event");
+        db.append_event(&context_usage_event(session_id, 3))
+            .await
+            .expect("append latest context usage");
+
+        let latest = db
+            .latest_context_usage()
+            .await
+            .expect("latest context usage")
+            .expect("context usage should exist");
+        assert_eq!(latest.sequence, 3);
     }
 
     #[tokio::test]
