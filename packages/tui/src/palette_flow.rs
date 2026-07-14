@@ -313,6 +313,18 @@ async fn open_command_plugin_surface<W: Write>(
     Ok(())
 }
 
+fn insert_surface_session_id(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    session_id: Option<bcode_session_models::SessionId>,
+) {
+    if let Some(session_id) = session_id {
+        map.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id.to_string()),
+        );
+    }
+}
+
 async fn hydrate_plugin_surface_options(
     services: &TuiServices<'_>,
     chat: &ActiveChat,
@@ -339,7 +351,9 @@ async fn hydrate_plugin_surface_options(
     {
         map.insert("server_status".to_string(), value);
     }
-    if let Some(session_id) = chat.app.session_id() {
+    let session_id = chat.app.session_id();
+    insert_surface_session_id(&mut map, session_id);
+    if let Some(session_id) = session_id {
         if let Ok(status) = services
             .passive_client
             .session_model_status(session_id)
@@ -496,4 +510,29 @@ fn show_bmux_help(chat: &mut ActiveChat) {
         .join("\n"),
     );
     chat.app.set_status("help shown".to_owned());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insert_surface_session_id;
+
+    #[test]
+    fn plugin_surface_options_include_active_session_id() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut map = serde_json::Map::new();
+
+        insert_surface_session_id(&mut map, Some(session_id));
+
+        assert_eq!(
+            map.get("session_id").and_then(serde_json::Value::as_str),
+            Some(session_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn draft_plugin_surface_options_omit_session_id() {
+        let mut map = serde_json::Map::new();
+        insert_surface_session_id(&mut map, None);
+        assert!(!map.contains_key("session_id"));
+    }
 }

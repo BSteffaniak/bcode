@@ -564,7 +564,7 @@ impl PluginTuiSurface for LoopSurface {
         .placement(ModalPlacement::Centered);
         modal.render(area, frame);
         let content = modal.content_area(area);
-        let available = content.height.saturating_sub(7);
+        let available = content.height.saturating_sub(8);
         let prompt_rows = available.saturating_mul(3) / 5;
         let condition_rows = available.saturating_sub(prompt_rows).max(3);
         self.prompt_area = Rect::new(content.x, content.y, content.width, prompt_rows.max(4));
@@ -578,7 +578,7 @@ impl PluginTuiSurface for LoopSurface {
             content.x,
             self.condition_area.bottom().saturating_add(1),
             content.width.min(36),
-            3,
+            4,
         );
         Self::render_input(
             self.prompt_area,
@@ -640,16 +640,6 @@ impl PluginTuiSurface for LoopSurface {
             if stroke.key == KeyCode::Enter && self.field == Field::Limit {
                 return self.start(host);
             }
-            if self.field == Field::Limit
-                && matches!(stroke.key, KeyCode::Char(value) if !value.is_ascii_digit())
-            {
-                return PluginTuiAction::None;
-            }
-        }
-        if self.field == Field::Limit
-            && matches!(event, Event::Paste(text) if !text.chars().all(|value| value.is_ascii_digit()))
-        {
-            return PluginTuiAction::None;
         }
         self.focus_from_click(event);
         if self.field != Field::Limit
@@ -1934,16 +1924,69 @@ mod tests {
     }
 
     #[test]
-    fn numeric_field_rejects_non_digit_input() {
+    fn maximum_iterations_has_visible_editable_content_row() {
+        let host = TestHost;
+        let area = Rect::new(0, 0, 120, 40);
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.field = Field::Limit;
+        surface.limit.buffer_mut().select_all();
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('7')), &host),
+            PluginTuiAction::Redraw
+        );
+
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let cursor = {
+            let mut frame = Frame::new(&mut buffer);
+            surface.render(area, &mut frame);
+            frame.cursor()
+        };
+
+        assert!(!surface.limit.content_area().is_empty());
+        assert_eq!(surface.limit.content_area().height, 1);
+        assert!(cursor.is_some_and(|cursor| {
+            cursor.visible && surface.limit.content_area().contains(cursor.position)
+        }));
+        assert!(
+            buffer
+                .row_symbols(surface.limit.content_area().y)
+                .is_some_and(|row| row.contains('7'))
+        );
+    }
+
+    #[test]
+    fn numeric_field_accepts_editing_and_validates_on_submit() {
         let host = TestHost;
         let mut surface = LoopSurface::new(Some(SessionId::new()));
         surface.field = Field::Limit;
-        let before = surface.limit.buffer().text().to_owned();
+        surface.limit.buffer_mut().select_all();
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('7')), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.limit.buffer().text(), "7");
+        assert_eq!(
+            surface.handle_event(&Event::Paste("25".to_owned()), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.limit.buffer().text(), "725");
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Backspace), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.limit.buffer().text(), "72");
+
+        surface.limit.buffer_mut().select_all();
         assert_eq!(
             surface.handle_event(&key(KeyCode::Char('x')), &host),
-            PluginTuiAction::None
+            PluginTuiAction::Redraw
         );
-        assert_eq!(surface.limit.buffer().text(), before);
+        assert_eq!(surface.limit.buffer().text(), "x");
+        surface.prompt = text_state("do work");
+        surface.condition = text_state("done");
+        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
+        assert_eq!(surface.field, Field::Limit);
+        assert_eq!(surface.status, "maximum iterations must be a number");
     }
 
     #[test]
