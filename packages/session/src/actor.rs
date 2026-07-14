@@ -90,11 +90,13 @@ impl SessionHandle {
         &self,
         client_id: ClientId,
         text: String,
+        origin: Option<bcode_session_models::TurnOrigin>,
         activity_timestamp_ms: u64,
     ) -> Result<Vec<SessionEvent>, SessionError> {
         self.send(|reply| SessionCommand::AppendUserMessage {
             client_id,
             text,
+            origin,
             activity_timestamp_ms,
             reply,
         })
@@ -280,6 +282,7 @@ enum SessionCommand {
     AppendUserMessage {
         client_id: ClientId,
         text: String,
+        origin: Option<bcode_session_models::TurnOrigin>,
         activity_timestamp_ms: u64,
         reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
     },
@@ -373,11 +376,12 @@ impl SessionActor {
             SessionCommand::AppendUserMessage {
                 client_id,
                 text,
+                origin,
                 activity_timestamp_ms,
                 reply,
             } => {
                 let _ = reply.send(
-                    self.append_user_message(client_id, text, activity_timestamp_ms)
+                    self.append_user_message(client_id, text, origin, activity_timestamp_ms)
                         .await,
                 );
             }
@@ -701,6 +705,7 @@ impl SessionActor {
         &mut self,
         client_id: ClientId,
         text: String,
+        origin: Option<bcode_session_models::TurnOrigin>,
         activity_timestamp_ms: u64,
     ) -> Result<Vec<SessionEvent>, SessionError> {
         let mut events = Vec::new();
@@ -717,7 +722,11 @@ impl SessionActor {
         }
         events.push(
             self.append_event(
-                SessionEventKind::UserMessage { client_id, text },
+                SessionEventKind::UserMessage {
+                    client_id,
+                    text,
+                    origin,
+                },
                 None,
                 activity_timestamp_ms,
             )

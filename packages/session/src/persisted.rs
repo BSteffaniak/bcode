@@ -10,7 +10,7 @@ use bcode_session_models::{
     LegacyToolRequestPresentationMetadata, ModelTurnOutcome, ProviderContextSnapshot,
     RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
     SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent, ToolArtifact,
-    ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, WorkId,
+    ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, TurnOrigin, WorkId,
     current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
@@ -173,6 +173,8 @@ enum PersistedSessionEventKind {
     UserMessage {
         client_id: ClientId,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<TurnOrigin>,
     },
     AssistantDelta {
         text: String,
@@ -489,9 +491,14 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             SessionEventKind::ClientDetached { client_id } => Self::ClientDetached {
                 client_id: *client_id,
             },
-            SessionEventKind::UserMessage { client_id, text } => Self::UserMessage {
+            SessionEventKind::UserMessage {
+                client_id,
+                text,
+                origin,
+            } => Self::UserMessage {
                 client_id: *client_id,
                 text: text.clone(),
+                origin: origin.clone(),
             },
             SessionEventKind::AssistantDelta { text } => {
                 Self::AssistantDelta { text: text.clone() }
@@ -878,9 +885,15 @@ impl PersistedSessionEventKind {
             },
             Self::ClientAttached { client_id } => SessionEventKind::ClientAttached { client_id },
             Self::ClientDetached { client_id } => SessionEventKind::ClientDetached { client_id },
-            Self::UserMessage { client_id, text } => {
-                SessionEventKind::UserMessage { client_id, text }
-            }
+            Self::UserMessage {
+                client_id,
+                text,
+                origin,
+            } => SessionEventKind::UserMessage {
+                client_id,
+                text,
+                origin,
+            },
             Self::AssistantDelta { text } => SessionEventKind::AssistantDelta { text },
             Self::AssistantMessage { text } => SessionEventKind::AssistantMessage { text },
             Self::ToolCallRequested {
@@ -1307,6 +1320,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_user_message_defaults_missing_turn_origin() {
+        let payload = r#"{"schema_version":29,"sequence":1,"timestamp_ms":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"user_message":{"client_id":"00000000-0000-0000-0000-000000000002","text":"hello"}}}"#;
+
+        let event = decode_session_event(payload).expect("legacy user message should decode");
+        assert!(matches!(
+            event.kind,
+            SessionEventKind::UserMessage { origin: None, .. }
+        ));
+    }
+
+    #[test]
+    fn user_message_turn_origin_round_trips_through_persistence() {
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "background prompt".to_string(),
+                origin: Some(TurnOrigin {
+                    producer: "test.producer".to_string(),
+                    correlation_id: Some("operation-1".to_string()),
+                    display_label: Some("Background pass 1".to_string()),
+                }),
+            },
+        };
+
+        let encoded = encode_session_event(&event).expect("event should encode");
+        let decoded = decode_session_event(&encoded).expect("event should decode");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
     fn decodes_schema_29_automation_compatibility_fixtures() {
         let cases = [
             (
@@ -1400,6 +1448,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "hello".to_string(),
+                origin: None,
             },
             SessionEventKind::AssistantDelta {
                 text: "delta".to_string(),

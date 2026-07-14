@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 8;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 9;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -2572,6 +2572,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "hello".to_string(),
+                origin: None,
             },
             SessionEventKind::AssistantDelta {
                 text: "delta".to_string(),

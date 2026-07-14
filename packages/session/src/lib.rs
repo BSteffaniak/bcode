@@ -2212,11 +2212,30 @@ impl SessionManager {
         client_id: ClientId,
         text: String,
     ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.append_user_message_with_origin(session_id, client_id, text, None)
+            .await
+    }
+
+    /// Append a user message carrying optional generic turn-origin metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// * the session does not exist
+    /// * the user-message event cannot be persisted
+    pub async fn append_user_message_with_origin(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        text: String,
+        origin: Option<bcode_session_models::TurnOrigin>,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
         self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let events = handle
-            .append_user_message(client_id, text, activity_timestamp_ms)
+            .append_user_message(client_id, text, origin, activity_timestamp_ms)
             .await?;
         let summary = handle.summary().await?;
         self.release_persistent_idle_session_resources(session_id)
@@ -5200,6 +5219,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_turn_origin_is_persisted_on_the_ordinary_user_message_path() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("origin".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let origin = bcode_session_models::TurnOrigin {
+            producer: "test.producer".to_string(),
+            correlation_id: Some("operation-1".to_string()),
+            display_label: Some("Background pass 1".to_string()),
+        };
+
+        let events = manager
+            .append_user_message_with_origin(
+                session.id,
+                ClientId::new(),
+                "ordinary prompt".to_string(),
+                Some(origin.clone()),
+            )
+            .await
+            .expect("message should append");
+
+        assert!(matches!(
+            events.last().map(|event| &event.kind),
+            Some(SessionEventKind::UserMessage {
+                text,
+                origin: Some(actual),
+                ..
+            }) if text == "ordinary prompt" && actual == &origin
+        ));
+    }
+
+    #[tokio::test]
     async fn unnamed_session_uses_first_prompt_as_title() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -5522,6 +5574,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id,
                     text: "user".to_string(),
+                    origin: None,
                 },
             ),
             (

@@ -7630,7 +7630,16 @@ async fn persist_plugin_automation_acceptance(
     }
     let events = state
         .sessions
-        .append_user_message(request.session_id, client_id, request.text.clone())
+        .append_user_message_with_origin(
+            request.session_id,
+            client_id,
+            request.text.clone(),
+            Some(bcode_session_models::TurnOrigin {
+                producer: request.origin.plugin_id.clone(),
+                correlation_id: Some(request.origin.operation_id.clone()),
+                display_label: Some(request.origin.display_label.clone()),
+            }),
+        )
         .await?;
     for event in &events {
         publish_session_event(state, event).await;
@@ -19508,6 +19517,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "hello".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -19568,6 +19578,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old request".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -19584,6 +19595,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "new request".to_string(),
+                    origin: None,
                 },
             ),
         ];
@@ -19614,6 +19626,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id,
                     text: "old request".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -19622,6 +19635,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id,
                     text: "current request".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -19669,6 +19683,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id,
                     text: "continue".to_string(),
+                    origin: None,
                 },
             ),
         ];
@@ -19810,6 +19825,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "one".into(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -19825,6 +19841,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "two".into(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -19840,6 +19857,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "three".into(),
+                    origin: None,
                 },
             ),
         ];
@@ -19863,6 +19881,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "work".into(),
+                origin: None,
             },
         )];
         for (sequence, call) in [(2, "a"), (4, "b")] {
@@ -19933,6 +19952,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old".into(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -19948,6 +19968,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active".into(),
+                    origin: None,
                 },
             ),
         ];
@@ -19981,6 +20002,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("history user {index}"),
+                        origin: None,
                     },
                 )
                 .await
@@ -20001,6 +20023,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active delayed turn".to_string(),
+                    origin: None,
                 },
             )
             .await
@@ -20114,6 +20137,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
+                        origin: None,
                     },
                 )
                 .await
@@ -20190,6 +20214,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "x".repeat(4_000),
+                    origin: None,
                 },
             )
             .await
@@ -20233,6 +20258,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "x".repeat(4_000),
+                origin: None,
             },
         )];
         let error =
@@ -20254,6 +20280,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older question".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -20269,6 +20296,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active question".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -20310,6 +20338,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "inspect".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -20360,6 +20389,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -20375,6 +20405,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -20408,6 +20439,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "first".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -20438,6 +20470,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "second".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -20453,6 +20486,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active".to_string(),
+                    origin: None,
                 },
             ),
         ];
@@ -20493,6 +20527,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_string(),
+                    origin: None,
                 },
             ),
             session_event(
@@ -20508,6 +20543,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active".to_string(),
+                    origin: None,
                 },
             ),
         ];
@@ -20535,6 +20571,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "continue".to_string(),
+                    origin: None,
                 },
             ),
         ];
@@ -20602,6 +20639,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "x".repeat(COMPACTION_DEFAULT_KEEP_RECENT_CHARS / 4),
+                    origin: None,
                 }
             } else {
                 SessionEventKind::AssistantMessage {
@@ -21575,6 +21613,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "managed context turn".to_string(),
+                    origin: None,
                 },
             )
             .await
@@ -21686,6 +21725,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("history {index} {}", "x".repeat(1_000)),
+                        origin: None,
                     },
                 )
                 .await
@@ -21706,6 +21746,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "continue with unknown window".to_string(),
+                    origin: None,
                 },
             )
             .await
@@ -21796,6 +21837,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("overflow history user {index} {}", "x".repeat(500)),
+                        origin: None,
                     },
                 )
                 .await
@@ -21816,6 +21858,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "retry after overflow".to_string(),
+                    origin: None,
                 },
             )
             .await
@@ -21917,6 +21960,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("historical user turn {index} {}", "x".repeat(1_000)),
+                        origin: None,
                     },
                 )
                 .await
@@ -21937,6 +21981,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "continue after proactive compaction".to_string(),
+                    origin: None,
                 },
             )
             .await
@@ -22025,6 +22070,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
+                        origin: None,
                     },
                 )
                 .await
@@ -22103,6 +22149,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old context".to_string(),
+                    origin: None,
                 },
             )
             .await
@@ -22166,6 +22213,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
+                        origin: None,
                     },
                 )
                 .await
@@ -22246,6 +22294,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
+                        origin: None,
                     },
                 )
                 .await
@@ -22312,6 +22361,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
+                        origin: None,
                     },
                 )
                 .await
@@ -22389,6 +22439,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
+                        origin: None,
                     },
                 )
                 .await
@@ -22538,6 +22589,7 @@ mod tests {
                         SessionEventKind::UserMessage {
                             client_id: ClientId::new(),
                             text: format!("round {round} user {turn}"),
+                            origin: None,
                         },
                     )
                     .await
@@ -22624,6 +22676,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
+                        origin: None,
                     },
                 )
                 .await

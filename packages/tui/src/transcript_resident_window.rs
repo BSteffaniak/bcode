@@ -181,6 +181,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: format!("user {sequence}"),
+                origin: None,
             },
         )
     }

@@ -232,7 +232,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 29;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 30;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -499,6 +499,19 @@ pub struct SessionInputHistoryEntry {
     #[serde(default)]
     pub timestamp_ms: u64,
     pub text: String,
+}
+
+/// Generic optional origin attached to an ordinary accepted turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnOrigin {
+    /// Stable producer namespace. Core stores but does not interpret this value.
+    pub producer: String,
+    /// Optional producer-owned correlation identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Optional presentation label supplied by the producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
 }
 
 /// Durable work identifier used across session history, IPC, and UI surfaces.
@@ -1555,6 +1568,8 @@ pub enum SessionEventKind {
     UserMessage {
         client_id: ClientId,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<TurnOrigin>,
     },
     AssistantDelta {
         text: String,

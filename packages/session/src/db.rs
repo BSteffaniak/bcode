@@ -3012,6 +3012,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "hello".to_string(),
+                origin: None,
             },
         ))
         .await
@@ -3383,6 +3384,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: "legacy".to_string(),
+                        origin: None,
                     },
                 ),
                 None,
@@ -3507,6 +3509,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "projected".to_string(),
+                origin: None,
             },
         ))
         .await
@@ -3558,6 +3561,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old".to_string(),
+                    origin: None,
                 },
             ),
             (
@@ -3623,6 +3627,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old".to_string(),
+                    origin: None,
                 },
             ),
             (
@@ -3643,6 +3648,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "new".to_string(),
+                    origin: None,
                 },
             ),
         ] {
@@ -3739,6 +3745,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "projected".to_string(),
+                origin: None,
             },
         ))
         .await
@@ -3809,6 +3816,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "unprojected tail".to_string(),
+                    origin: None,
                 },
             ),
             None,
@@ -3847,6 +3855,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("semantic-{sequence}"),
+                        origin: None,
                     },
                 ),
                 None,
@@ -3969,6 +3978,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "old".to_string(),
+                origin: None,
             },
         ))
         .await
@@ -3989,6 +3999,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "new".to_string(),
+                origin: None,
             },
         ))
         .await

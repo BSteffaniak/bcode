@@ -1110,6 +1110,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "question".to_owned(),
+                    origin: None,
                 },
             ),
             event(
@@ -1148,6 +1149,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_owned(),
+                    origin: None,
                 },
             ),
             event(
@@ -1163,6 +1165,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "newer".to_owned(),
+                    origin: None,
                 },
             ),
         ];
@@ -1231,6 +1234,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "a".to_owned(),
+                    origin: None,
                 },
             ),
             event(
@@ -1246,6 +1250,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "c".to_owned(),
+                    origin: None,
                 },
             ),
             event(
@@ -1292,6 +1297,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_owned(),
+                    origin: None,
                 },
             ),
             event(
@@ -1338,6 +1344,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_owned(),
+                    origin: None,
                 },
             ),
             event(

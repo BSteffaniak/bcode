@@ -995,6 +995,7 @@ fn push_transcript_item_from_event(
             if let Some(index) = items
                 .iter()
                 .position(|item| item.event_sequence() == Some(*user_event_sequence))
+                && items[index].display_label.is_none()
             {
                 let replacement = items[index]
                     .clone()
@@ -1118,8 +1119,14 @@ fn non_streaming_transcript_item_from_event(
     streamed_tool_results: &BTreeMap<String, StreamedToolReplayContext>,
 ) -> Option<TranscriptItem> {
     match &event.kind {
-        SessionEventKind::UserMessage { text, .. } => Some(
-            TranscriptItem::new("You", text.clone())
+        SessionEventKind::UserMessage { text, origin, .. } => Some(
+            origin
+                .as_ref()
+                .and_then(|origin| origin.display_label.clone())
+                .map_or_else(
+                    || TranscriptItem::new("You", text.clone()),
+                    |label| TranscriptItem::new("You", text.clone()).with_display_label(label),
+                )
                 .with_event_metadata(event.sequence, event.timestamp_ms),
         ),
         SessionEventKind::SystemMessage { text } => Some(
@@ -1501,6 +1508,11 @@ mod tests {
                 kind: SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
                     text: "automated prompt".to_owned(),
+                    origin: Some(bcode_session_models::TurnOrigin {
+                        producer: "test.producer".to_owned(),
+                        correlation_id: Some("operation-1".to_owned()),
+                        display_label: Some("Background pass 4".to_owned()),
+                    }),
                 },
             },
             SessionEvent {
@@ -1528,12 +1540,13 @@ mod tests {
                 kind: SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
                     text: "manual steering".to_owned(),
+                    origin: None,
                 },
             },
         ];
 
         let items = transcript_items_from_events_with_reasoning(&events, false);
-        assert_eq!(items[0].display_role(), "You · Loop iteration 4");
+        assert_eq!(items[0].display_role(), "You · Background pass 4");
         assert_eq!(items[0].text(), "automated prompt");
         assert_eq!(items[1].display_role(), "You");
         assert_eq!(items[1].text(), "manual steering");

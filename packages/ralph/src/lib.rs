@@ -3904,6 +3904,7 @@ mod tests {
             kind: SessionEventKind::UserMessage {
                 client_id: bcode_session_models::ClientId(uuid::Uuid::new_v4()),
                 text: "Build the correct online multiplayer architecture.".to_owned(),
+                origin: None,
             },
         }];
 

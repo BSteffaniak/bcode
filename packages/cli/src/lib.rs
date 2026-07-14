@@ -6973,7 +6973,9 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::ClientDetached { client_id } => {
             println!("#{} client detached: {client_id}", event.sequence);
         }
-        SessionEventKind::UserMessage { client_id, text } => {
+        SessionEventKind::UserMessage {
+            client_id, text, ..
+        } => {
             println!("#{} {client_id}: {text}", event.sequence);
         }
         SessionEventKind::AssistantReasoningDelta { text }

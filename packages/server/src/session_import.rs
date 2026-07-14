@@ -121,6 +121,7 @@ pub async fn import_external_session(
                         SessionEventKind::UserMessage {
                             client_id: ClientId::new(),
                             text,
+                            origin: None,
                         }
                     }
                     ImportableSessionEventKind::AssistantMessage { text } => {
