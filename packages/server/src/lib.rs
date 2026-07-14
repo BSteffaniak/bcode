@@ -191,7 +191,7 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     plugin_automation_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
-    plugin_automation_holds: Mutex<BTreeMap<SessionId, BTreeSet<String>>>,
+    plugin_automation_holds: Mutex<BTreeMap<SessionId, BTreeMap<String, ClientId>>>,
     plugin_automation_policies:
         Mutex<BTreeMap<SessionId, bcode_ipc::PluginAutomationExecutionPolicy>>,
     runtime_work: RuntimeWorkManager,
@@ -1096,6 +1096,9 @@ impl ServerState {
             .lock()
             .await
             .remove(&client_id);
+        let mut holds = self.plugin_automation_holds.lock().await;
+        remove_client_automation_holds(&mut holds, client_id);
+        drop(holds);
         self.unregister_catalog_event_client(client_id).await;
     }
 
@@ -2333,7 +2336,7 @@ async fn handle_request_inner(
             handle_lookup_plugin_automation_operation(request_id, state, writer, request).await
         }
         Request::SetPluginAutomationHold(request) => {
-            handle_set_plugin_automation_hold(request_id, state, writer, request).await
+            handle_set_plugin_automation_hold(request_id, client_id, state, writer, request).await
         }
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
@@ -7409,13 +7412,24 @@ async fn lookup_plugin_automation_operation(
     ))
 }
 
+fn remove_client_automation_holds(
+    holds: &mut BTreeMap<SessionId, BTreeMap<String, ClientId>>,
+    client_id: ClientId,
+) {
+    holds.retain(|_, session_holds| {
+        session_holds.retain(|_, owner| *owner != client_id);
+        !session_holds.is_empty()
+    });
+}
+
 fn update_plugin_automation_hold(
-    holds: &mut BTreeMap<SessionId, BTreeSet<String>>,
+    holds: &mut BTreeMap<SessionId, BTreeMap<String, ClientId>>,
+    client_id: ClientId,
     request: &bcode_ipc::PluginAutomationHoldRequest,
 ) -> bcode_ipc::PluginAutomationHoldResponse {
     let session_holds = holds.entry(request.session_id).or_default();
     if request.held {
-        session_holds.insert(request.holder_id.clone());
+        session_holds.insert(request.holder_id.clone(), client_id);
     } else {
         session_holds.remove(&request.holder_id);
     }
@@ -7429,6 +7443,7 @@ fn update_plugin_automation_hold(
 
 async fn handle_set_plugin_automation_hold(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     request: bcode_ipc::PluginAutomationHoldRequest,
@@ -7447,7 +7462,7 @@ async fn handle_set_plugin_automation_hold(
     }
     let response = {
         let mut holds = state.plugin_automation_holds.lock().await;
-        update_plugin_automation_hold(&mut holds, &request)
+        update_plugin_automation_hold(&mut holds, client_id, &request)
     };
     send_response(
         writer,
@@ -23801,8 +23816,9 @@ mod tests {
             held: true,
         };
 
-        let acquired = update_plugin_automation_hold(&mut holds, &request);
-        let reacquired = update_plugin_automation_hold(&mut holds, &request);
+        let client_id = ClientId::new();
+        let acquired = update_plugin_automation_hold(&mut holds, client_id, &request);
+        let reacquired = update_plugin_automation_hold(&mut holds, client_id, &request);
         assert_eq!(acquired.active_holds, 1);
         assert_eq!(reacquired.active_holds, 1);
         assert!(active.load(Ordering::Acquire));
@@ -23813,6 +23829,7 @@ mod tests {
 
         let released = update_plugin_automation_hold(
             &mut holds,
+            client_id,
             &bcode_ipc::PluginAutomationHoldRequest {
                 held: false,
                 ..request
@@ -23822,6 +23839,29 @@ mod tests {
         assert_eq!(released.active_holds, 0);
         assert!(!holds.contains_key(&session_id));
         assert!(active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disconnect_removes_only_the_disconnected_clients_automation_holds() {
+        let session_id = SessionId::new();
+        let disconnected = ClientId::new();
+        let connected = ClientId::new();
+        let mut holds = BTreeMap::from([(
+            session_id,
+            BTreeMap::from([
+                ("disconnected-modal".to_owned(), disconnected),
+                ("connected-modal".to_owned(), connected),
+            ]),
+        )]);
+
+        remove_client_automation_holds(&mut holds, disconnected);
+
+        assert_eq!(
+            holds.get(&session_id),
+            Some(&BTreeMap::from([("connected-modal".to_owned(), connected)]))
+        );
+        remove_client_automation_holds(&mut holds, connected);
+        assert!(!holds.contains_key(&session_id));
     }
 
     #[tokio::test]

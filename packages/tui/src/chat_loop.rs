@@ -123,6 +123,7 @@ struct ChatLoopState {
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     interactive_surface: Option<InteractiveSurfaceState>,
     plugin_runtime: Option<PluginRuntimeHost>,
+    automation_hold: ModalAutomationHold,
 }
 
 impl ChatLoopState {
@@ -143,6 +144,7 @@ impl ChatLoopState {
             timeline_dialog: None,
             interactive_surface: None,
             plugin_runtime: None,
+            automation_hold: ModalAutomationHold::new(),
         }
     }
 
@@ -188,6 +190,25 @@ impl ChatLoopState {
         }
     }
 
+    const fn has_blocking_surface(&self) -> bool {
+        self.palette.is_some()
+            || self.slash_palette.is_some()
+            || self.permission_dialog.is_some()
+            || self.thinking_dialog.is_some()
+            || self.timeline_dialog.is_some()
+            || self.interactive_surface.is_some()
+    }
+
+    async fn sync_automation_hold(
+        &mut self,
+        client: &BcodeClient,
+        session_id: Option<bcode_session_models::SessionId>,
+    ) -> Result<(), ClientError> {
+        self.automation_hold
+            .sync(client, session_id, self.has_blocking_surface())
+            .await
+    }
+
     fn maybe_start_permission_poll(&mut self, chat: &ActiveChat) {
         if self.permission_dialog.is_some()
             || Instant::now() < self.permission_poll.next_poll_at
@@ -198,6 +219,57 @@ impl ChatLoopState {
         if self.start_effect(TuiEffect::ListPermissions) {
             self.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
         }
+    }
+}
+
+struct ModalAutomationHold {
+    holder_id: String,
+    held_session_id: Option<bcode_session_models::SessionId>,
+}
+
+impl ModalAutomationHold {
+    fn new() -> Self {
+        Self {
+            holder_id: format!("tui-modal:{}", uuid::Uuid::new_v4()),
+            held_session_id: None,
+        }
+    }
+
+    async fn sync(
+        &mut self,
+        client: &BcodeClient,
+        session_id: Option<bcode_session_models::SessionId>,
+        blocking_surface_open: bool,
+    ) -> Result<(), ClientError> {
+        let desired_session_id = blocking_surface_open.then_some(session_id).flatten();
+        if self.held_session_id == desired_session_id {
+            return Ok(());
+        }
+        if let Some(held_session_id) = self.held_session_id {
+            client
+                .set_plugin_automation_hold(bcode_ipc::PluginAutomationHoldRequest {
+                    session_id: held_session_id,
+                    holder_id: self.holder_id.clone(),
+                    held: false,
+                })
+                .await?;
+            self.held_session_id = None;
+        }
+        if let Some(desired_session_id) = desired_session_id {
+            client
+                .set_plugin_automation_hold(bcode_ipc::PluginAutomationHoldRequest {
+                    session_id: desired_session_id,
+                    holder_id: self.holder_id.clone(),
+                    held: true,
+                })
+                .await?;
+            self.held_session_id = Some(desired_session_id);
+        }
+        Ok(())
+    }
+
+    async fn release(&mut self, client: &BcodeClient) -> Result<(), ClientError> {
+        self.sync(client, None, false).await
     }
 }
 
@@ -302,6 +374,38 @@ pub async fn run_with_client<W: Write>(
         .clone()
         .with_daemon_availability(DaemonAvailability::RequireRunning);
     let mut loop_state = ChatLoopState::new(client, &passive_client, daemon_host);
+    let result = run_chat_loop(
+        terminal,
+        terminal_events,
+        client,
+        &passive_client,
+        settings,
+        chat,
+        startup_action,
+        &mut loop_state,
+    )
+    .await;
+    let release_result = loop_state.automation_hold.release(client).await;
+    loop_state.abort_all_effects();
+    release_result?;
+    result
+}
+
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+async fn run_chat_loop<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TuiInput,
+    client: &BcodeClient,
+    passive_client: &BcodeClient,
+    settings: &mut TuiRuntimeSettings,
+    chat: &mut ActiveChat,
+    startup_action: super::startup_action::StartupTuiAction,
+    loop_state: &mut ChatLoopState,
+) -> Result<(), TuiError> {
     loop_state.drain_pending_effects(chat);
     sync_chat_key_labels(chat, &settings.keymap);
     let mut draft_autosave = DraftAutosave::new(
@@ -319,13 +423,16 @@ pub async fn run_with_client<W: Write>(
 
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, &settings.keymap);
-        if drain_bcode_events(chat, &mut loop_state).await {
+        if drain_bcode_events(chat, loop_state).await {
             needs_redraw = true;
         }
 
-        if handle_loop_housekeeping(settings, chat, &mut draft_autosave, &mut loop_state).await {
+        if handle_loop_housekeeping(settings, chat, &mut draft_autosave, loop_state).await {
             needs_redraw = true;
         }
+        loop_state
+            .sync_automation_hold(client, chat.session_id)
+            .await?;
 
         if helpers::resize_from_terminal(terminal)? {
             needs_redraw = true;
@@ -340,7 +447,7 @@ pub async fn run_with_client<W: Write>(
 
         let redraw_at = next_redraw_at(last_redraw);
         if needs_redraw && Instant::now() >= redraw_at {
-            draw_chat_frame(terminal, chat, &mut loop_state)?;
+            draw_chat_frame(terminal, chat, loop_state)?;
             if let Some(action) = startup_action.take()
                 && action == super::startup_action::StartupTuiAction::OpenRalphHome
             {
@@ -350,7 +457,7 @@ pub async fn run_with_client<W: Write>(
                 };
                 let services = TuiServices {
                     client,
-                    passive_client: &passive_client,
+                    passive_client,
                     keymap: &settings.keymap,
                     theme: render::TuiTheme::for_app(&chat.app),
                 };
@@ -386,7 +493,7 @@ pub async fn run_with_client<W: Write>(
                 let mut context = ChatEventContext {
                     services: TuiServices {
                         client,
-                        passive_client: &passive_client,
+                        passive_client,
                         keymap: &settings.keymap,
                         theme: render::TuiTheme::for_app(&chat.app),
                     },
@@ -394,14 +501,7 @@ pub async fn run_with_client<W: Write>(
                     terminal_events,
                     mouse_scroll_rows: settings.mouse_scroll_rows,
                 };
-                match handle_event(
-                    &mut context,
-                    chat,
-                    &mut loop_state,
-                    event,
-                    &mut draft_autosave,
-                )
-                .await
+                match handle_event(&mut context, chat, loop_state, event, &mut draft_autosave).await
                 {
                     Ok(handled) => {
                         if handled {
@@ -416,8 +516,8 @@ pub async fn run_with_client<W: Write>(
                 }
             }
             ChatLoopEvent::Bcode(event) => {
-                if absorb_bcode_event(chat, &mut loop_state, *event).await
-                    || drain_bcode_events(chat, &mut loop_state).await
+                if absorb_bcode_event(chat, loop_state, *event).await
+                    || drain_bcode_events(chat, loop_state).await
                 {
                     needs_redraw = true;
                 }
@@ -433,6 +533,9 @@ pub async fn run_with_client<W: Write>(
             }
             ChatLoopEvent::Timer => {}
         }
+        loop_state
+            .sync_automation_hold(client, chat.session_id)
+            .await?;
         if before_session_id != chat.session_id {
             draft_autosave.last_saved_text = None;
             draft_autosave.dirty = true;
@@ -440,7 +543,6 @@ pub async fn run_with_client<W: Write>(
         }
     }
 
-    loop_state.abort_all_effects();
     Ok(())
 }
 
