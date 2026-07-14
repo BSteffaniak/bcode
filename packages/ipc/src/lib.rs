@@ -8,9 +8,9 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
-    SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
-    SessionLiveEvent, SessionSummary,
+    ClientId, ProjectionWindowRequest, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
+    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
+    SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -266,7 +266,7 @@ pub enum Request {
     },
     CancelRuntimeWork {
         session_id: SessionId,
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
     },
     CompactSession {
         session_id: SessionId,
@@ -1145,7 +1145,7 @@ pub struct RalphRunStatusResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkSnapshot {
-    pub work_id: RuntimeWorkId,
+    pub work_id: WorkId,
     pub kind: RuntimeWorkKind,
     pub label: String,
     #[serde(default)]
@@ -2694,7 +2694,7 @@ mod tests {
                 text: "thought".to_string(),
             },
             SessionEventKind::RuntimeWorkStarted {
-                work_id: RuntimeWorkId::new("work-1"),
+                work_id: WorkId::new("work-1"),
                 kind: RuntimeWorkKind::Tool,
                 label: "work".to_string(),
                 tool_call_id: Some("call-1".to_string()),
@@ -2706,18 +2706,18 @@ mod tests {
                 cancellable: true,
             },
             SessionEventKind::RuntimeWorkCancelRequested {
-                work_id: RuntimeWorkId::new("work-1"),
+                work_id: WorkId::new("work-1"),
                 requested_at_ms: Some(2),
                 client_id: Some(ClientId::new()),
             },
             SessionEventKind::RuntimeWorkFinished {
-                work_id: RuntimeWorkId::new("work-1"),
+                work_id: WorkId::new("work-1"),
                 status: RuntimeWorkStatus::Completed,
                 finished_at_ms: Some(3),
                 message: Some("done".to_string()),
             },
             SessionEventKind::RuntimeWorkProgress {
-                work_id: RuntimeWorkId::new("work-1"),
+                work_id: WorkId::new("work-1"),
                 message: "progress".to_string(),
                 progress_at_ms: Some(2),
                 completed_units: Some(1),

@@ -68,11 +68,11 @@ use bcode_session::{
 };
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveToolArgumentPreview, ModelTurnOutcome,
-    PluginVisualDescriptor, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId,
-    RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind,
-    SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
-    TraceBlobRef, TraceRedaction,
+    PluginVisualDescriptor, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkKind,
+    RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind, SessionTokenUsage,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
+    TraceRedaction, WorkId,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -3478,10 +3478,10 @@ async fn append_ralph_session_lifecycle(
 async fn register_ralph_runtime_work(
     state: &ServerState,
     session_id: Option<SessionId>,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
     label: String,
     run_id: String,
-    parent_work_id: Option<RuntimeWorkId>,
+    parent_work_id: Option<WorkId>,
 ) {
     if let Some(session_id) = session_id {
         register_runtime_work(
@@ -3505,7 +3505,7 @@ async fn register_ralph_runtime_work(
 async fn finish_ralph_runtime_work(
     state: &ServerState,
     session_id: Option<SessionId>,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
     status: RuntimeWorkStatus,
     message: Option<String>,
 ) {
@@ -3517,7 +3517,7 @@ async fn finish_ralph_runtime_work(
 async fn append_ralph_runner_progress(
     state: &ServerState,
     session_id: Option<SessionId>,
-    runtime_work_id: &RuntimeWorkId,
+    runtime_work_id: &WorkId,
     message: &str,
     completed_units: u64,
 ) {
@@ -3537,13 +3537,13 @@ async fn append_ralph_runner_progress(
 async fn submit_ralph_skeleton_work_turn(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     run_id: &str,
     work_prompt: String,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Option<ModelTurnCompletion> {
     let session_id = runtime_session_id?;
-    let work_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:work:1"));
+    let work_turn_id = WorkId::new(format!("ralph:{run_id}:work:1"));
     register_ralph_runtime_work(
         state,
         runtime_session_id,
@@ -3581,13 +3581,13 @@ async fn submit_ralph_skeleton_work_turn(
 async fn submit_ralph_skeleton_audit_turn(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     run_id: &str,
     audit_prompt: String,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Option<ModelTurnCompletion> {
     let session_id = runtime_session_id?;
-    let audit_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:audit:1"));
+    let audit_turn_id = WorkId::new(format!("ralph:{run_id}:audit:1"));
     register_ralph_runtime_work(
         state,
         runtime_session_id,
@@ -3625,13 +3625,13 @@ async fn submit_ralph_skeleton_audit_turn(
 async fn submit_ralph_skeleton_replan_turn(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     run_id: &str,
     replan_prompt: String,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Option<ModelTurnCompletion> {
     let session_id = runtime_session_id?;
-    let replan_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:replan:1"));
+    let replan_turn_id = WorkId::new(format!("ralph:{run_id}:replan:1"));
     register_ralph_runtime_work(
         state,
         runtime_session_id,
@@ -3780,14 +3780,14 @@ struct RalphRunnerIterationInput {
 async fn record_ralph_skeleton_noop_iteration(
     state: &ServerState,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     input: RalphRunnerIterationInput,
 ) -> Option<bcode_ralph::RalphIterationRecord> {
     let iteration_number = input.iteration_number;
     let iteration_work_id =
-        RuntimeWorkId::new(format!("ralph:{}:iteration:{iteration_number}", run.run_id));
+        WorkId::new(format!("ralph:{}:iteration:{iteration_number}", run.run_id));
     register_ralph_runtime_work(
         state,
         runtime_session_id,
@@ -3896,7 +3896,7 @@ async fn execute_ralph_validation_command(
 async fn run_ralph_iteration_validations(
     state: &ServerState,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: &bcode_ralph::RalphIterationRecord,
@@ -3910,7 +3910,7 @@ async fn run_ralph_iteration_validations(
         .unwrap_or_default();
     for (index, command) in commands.into_iter().enumerate() {
         let validation_work_id =
-            RuntimeWorkId::new(format!("ralph:{}:validation:{}", run.run_id, index + 1));
+            WorkId::new(format!("ralph:{}:validation:{}", run.run_id, index + 1));
         register_ralph_runtime_work(
             state,
             runtime_session_id,
@@ -4098,7 +4098,7 @@ const fn ralph_run_terminal_from_decision(
 async fn submit_ralph_audit_after_validation(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
@@ -4131,7 +4131,7 @@ async fn submit_ralph_audit_after_validation(
 async fn submit_ralph_replan_after_audit(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
@@ -4164,7 +4164,7 @@ async fn submit_ralph_replan_after_audit(
 async fn apply_ralph_post_audit_decision(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
@@ -4261,7 +4261,7 @@ fn ralph_cancelled_iteration_completion(
 async fn complete_ralph_skeleton_after_iteration(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
-    parent_work_id: &RuntimeWorkId,
+    parent_work_id: &WorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
@@ -4371,7 +4371,7 @@ async fn run_ralph_runner_skeleton(
         .session_id
         .as_deref()
         .and_then(|session_id| session_id.parse::<SessionId>().ok());
-    let runtime_work_id = RuntimeWorkId::new(format!("ralph:{}", run.run_id));
+    let runtime_work_id = WorkId::new(format!("ralph:{}", run.run_id));
     register_ralph_runtime_work(
         &state,
         runtime_session_id,
@@ -9011,7 +9011,7 @@ async fn request_session_turn_cancellation(
         cancel_registered_runtime_work(
             state,
             session_id,
-            RuntimeWorkId::new(format!("model_{turn_id}")),
+            WorkId::new(format!("model_{turn_id}")),
             requested_by,
         )
         .await;
@@ -9043,7 +9043,7 @@ async fn handle_cancel_runtime_work(
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
 ) -> Result<(), ServerError> {
     let cancelled =
         cancel_registered_runtime_work(state, session_id, work_id, Some(client_id)).await;
@@ -10484,7 +10484,7 @@ async fn run_model_turn(
 ) -> ModelTurnCompletion {
     let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
-    let model_work_id = RuntimeWorkId::new(format!("model_{turn_id}"));
+    let model_work_id = WorkId::new(format!("model_{turn_id}"));
     let cancel_state = Arc::new(TurnCancelState::default());
     append_model_runtime_work_started_event(
         state,
@@ -14709,7 +14709,7 @@ async fn execute_model_tool(
         cancel_registered_runtime_work(
             state,
             session_id,
-            RuntimeWorkId::new(format!("tool_{}", call.id)),
+            WorkId::new(format!("tool_{}", call.id)),
             None,
         )
         .await;
@@ -15089,7 +15089,7 @@ async fn invoke_model_tool(
         )
         .await
         .map_err(|error| error.to_string())?;
-    let tool_work_id = RuntimeWorkId::new(format!("tool_{}", call.id));
+    let tool_work_id = WorkId::new(format!("tool_{}", call.id));
     let _ = state
         .runtime_work
         .replace_cancellation(
@@ -15310,22 +15310,19 @@ const fn is_legacy_tool_presentation_stream_event(event: &ToolInvocationStreamEv
 
 fn runtime_work_progress_from_tool_stream_event(
     event: &ToolInvocationStreamEvent,
-) -> Option<(RuntimeWorkId, String)> {
+) -> Option<(WorkId, String)> {
     match event {
         ToolInvocationStreamEvent::Status {
             tool_call_id,
             message,
             ..
-        } => Some((
-            RuntimeWorkId::new(format!("tool_{tool_call_id}")),
-            message.clone(),
-        )),
+        } => Some((WorkId::new(format!("tool_{tool_call_id}")), message.clone())),
         ToolInvocationStreamEvent::Started {
             tool_call_id,
             tool_name,
             ..
         } => Some((
-            RuntimeWorkId::new(format!("tool_{tool_call_id}")),
+            WorkId::new(format!("tool_{tool_call_id}")),
             format!("started {tool_name}"),
         )),
         ToolInvocationStreamEvent::Finished {
@@ -15333,7 +15330,7 @@ fn runtime_work_progress_from_tool_stream_event(
             is_error,
             ..
         } => Some((
-            RuntimeWorkId::new(format!("tool_{tool_call_id}")),
+            WorkId::new(format!("tool_{tool_call_id}")),
             if *is_error {
                 "finished with error"
             } else {
@@ -16459,7 +16456,7 @@ async fn append_tool_request_event(
     working_directory: &std::path::Path,
 ) {
     let request_visual = tool_request_visual_descriptor(state, &tool_name, &arguments_json).await;
-    let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
+    let runtime_work_id = WorkId::new(format!("tool_{tool_call_id}"));
     let runtime_label = tool_name.clone();
     let runtime_tool_call_id = tool_call_id.clone();
     match state
@@ -16499,7 +16496,7 @@ async fn append_tool_request_event(
             state
                 .session_current_turn(session_id)
                 .await
-                .map(|turn| RuntimeWorkId::new(format!("model_{}", turn.turn_id))),
+                .map(|turn| WorkId::new(format!("model_{}", turn.turn_id))),
         ),
     )
     .await;
@@ -16508,7 +16505,7 @@ async fn append_tool_request_event(
 async fn append_runtime_work_cancel_requested_event(
     state: &ServerState,
     session_id: SessionId,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
     client_id: Option<ClientId>,
 ) {
     match state
@@ -16783,7 +16780,7 @@ async fn append_tool_finished_event_inner(
         output,
         semantic_result,
     } = input;
-    let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
+    let runtime_work_id = WorkId::new(format!("tool_{tool_call_id}"));
     let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
     state
         .runtime_work
@@ -16917,7 +16914,7 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
 async fn cancel_registered_runtime_work(
     state: &ServerState,
     session_id: SessionId,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
     client_id: Option<ClientId>,
 ) -> bool {
     let cancelled_work_ids = state
@@ -16937,7 +16934,7 @@ async fn cancel_registered_runtime_work(
 async fn finish_registered_runtime_work(
     state: &ServerState,
     session_id: SessionId,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
     status: RuntimeWorkStatus,
     message: Option<String>,
 ) {
@@ -16949,7 +16946,7 @@ async fn finish_registered_runtime_work(
 async fn append_model_runtime_work_started_event(
     state: &ServerState,
     session_id: SessionId,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
     turn_id: String,
     cancel_state: Arc<TurnCancelState>,
 ) {
@@ -16984,7 +16981,7 @@ async fn append_model_turn_started_event(
 async fn append_runtime_work_progress_event(
     state: &ServerState,
     session_id: SessionId,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
     message: String,
     completed_units: Option<u64>,
     total_units: Option<u64>,
@@ -17011,7 +17008,7 @@ async fn append_runtime_work_progress_event(
 async fn append_runtime_work_finished_event(
     state: &ServerState,
     session_id: SessionId,
-    work_id: RuntimeWorkId,
+    work_id: WorkId,
     status: RuntimeWorkStatus,
     message: Option<String>,
 ) {
@@ -19013,7 +19010,7 @@ mod tests {
             .await
             .expect("session should attach");
         let state = test_server_state(sessions);
-        let work_id = RuntimeWorkId::new("ralph:test-run");
+        let work_id = WorkId::new("ralph:test-run");
 
         register_ralph_runtime_work(
             &state,
@@ -19133,7 +19130,7 @@ mod tests {
         let completion = submit_ralph_audit_after_validation(
             &state,
             None,
-            &RuntimeWorkId::new("ralph:test-run"),
+            &WorkId::new("ralph:test-run"),
             &summary,
             &run,
             Some(&iteration),

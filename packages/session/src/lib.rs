@@ -2378,7 +2378,7 @@ impl SessionManager {
     pub async fn append_runtime_work_cancel_requested(
         &self,
         session_id: SessionId,
-        work_id: bcode_session_models::RuntimeWorkId,
+        work_id: bcode_session_models::WorkId,
         requested_at_ms: Option<u64>,
         client_id: Option<ClientId>,
     ) -> Result<SessionEvent, SessionError> {
@@ -2401,7 +2401,7 @@ impl SessionManager {
     pub async fn append_runtime_work_finished(
         &self,
         session_id: SessionId,
-        work_id: bcode_session_models::RuntimeWorkId,
+        work_id: bcode_session_models::WorkId,
         status: bcode_session_models::RuntimeWorkStatus,
         finished_at_ms: Option<u64>,
         message: Option<String>,
@@ -3504,11 +3504,11 @@ mod tests {
 
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderContextSnapshot,
-        ProviderContextSnapshotOrigin, ProviderStreamEvent, RuntimeWorkId, RuntimeWorkKind,
-        RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind,
-        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
+        ProviderContextSnapshotOrigin, ProviderStreamEvent, RuntimeWorkKind, RuntimeWorkStatus,
+        SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind, SessionId,
+        SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
         SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
-        TraceBlobRef,
+        TraceBlobRef, WorkId,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -5730,7 +5730,7 @@ mod tests {
                 27,
                 "RuntimeWorkStarted",
                 SessionEventKind::RuntimeWorkStarted {
-                    work_id: RuntimeWorkId::new("work"),
+                    work_id: WorkId::new("work"),
                     kind: RuntimeWorkKind::Tool,
                     label: "tool".to_string(),
                     tool_call_id: Some("call".to_string()),
@@ -5746,7 +5746,7 @@ mod tests {
                 28,
                 "RuntimeWorkCancelRequested",
                 SessionEventKind::RuntimeWorkCancelRequested {
-                    work_id: RuntimeWorkId::new("work"),
+                    work_id: WorkId::new("work"),
                     requested_at_ms: Some(2),
                     client_id: Some(client_id),
                 },
@@ -5755,7 +5755,7 @@ mod tests {
                 29,
                 "RuntimeWorkFinished",
                 SessionEventKind::RuntimeWorkFinished {
-                    work_id: RuntimeWorkId::new("work"),
+                    work_id: WorkId::new("work"),
                     status: RuntimeWorkStatus::Completed,
                     finished_at_ms: Some(3),
                     message: None,
@@ -5765,7 +5765,7 @@ mod tests {
                 30,
                 "RuntimeWorkProgress",
                 SessionEventKind::RuntimeWorkProgress {
-                    work_id: RuntimeWorkId::new("work"),
+                    work_id: WorkId::new("work"),
                     message: "progress".to_string(),
                     progress_at_ms: Some(4),
                     completed_units: Some(1),

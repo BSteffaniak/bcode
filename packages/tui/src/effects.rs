@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
-    ProjectionWindowRequest, RuntimeWorkId, SessionForkResult, SessionHistoryCursor,
-    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
+    ProjectionWindowRequest, SessionForkResult, SessionHistoryCursor, SessionHistoryDirection,
+    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary, WorkId,
 };
 use bcode_skill_models::SkillId;
 use bcode_worktree_models::{WorktreeCreateRequest, WorktreeCreateResponse};
@@ -212,7 +212,7 @@ pub enum TuiEffect {
         /// Session that owns the work.
         session_id: SessionId,
         /// Runtime work id.
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
     },
     /// Request context compaction for the current session.
     CompactContext {
@@ -456,7 +456,7 @@ pub enum TuiEffectResult {
     /// Runtime work cancellation completed.
     CancelRuntimeWork {
         /// Cancelled work id.
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         /// Daemon response.
         result: Result<bool, ClientError>,
     },

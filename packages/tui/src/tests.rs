@@ -16,12 +16,11 @@ use bcode_session_models::{
     LegacyToolPresentationEvent, LegacyToolPresentationField, LegacyToolPresentationLevel,
     LegacyToolPresentationSection, LegacyToolPresentationTarget,
     LegacyToolRequestPresentationMetadata, LegacyToolRequestPreviewMetadata,
-    LegacyToolStatusPresentation, LiveToolArgumentPreview, PluginVisualDescriptor, RuntimeWorkId,
-    RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
-    SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolArtifact, ToolArtifactRef,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
-    build_tool_invocation_projections,
+    LegacyToolStatusPresentation, LiveToolArgumentPreview, PluginVisualDescriptor, RuntimeWorkKind,
+    SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionProjectionKind,
+    SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
+    SessionTracePhase, ToolArtifact, ToolArtifactRef, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolOutputStream, WorkId, build_tool_invocation_projections,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -3296,7 +3295,7 @@ fn runtime_work_events_do_not_pull_final_response_to_bottom() {
         session_id,
         3,
         SessionEventKind::RuntimeWorkStarted {
-            work_id: RuntimeWorkId::new("work-1"),
+            work_id: WorkId::new("work-1"),
             kind: RuntimeWorkKind::ModelTurn,
             label: "model turn".to_owned(),
             tool_call_id: None,

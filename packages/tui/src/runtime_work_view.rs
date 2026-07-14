@@ -1,6 +1,6 @@
 use bcode_ipc::RuntimeWorkSnapshot;
 use bcode_session_models::{
-    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, WorkId,
 };
 use std::collections::BTreeMap;
 
@@ -13,7 +13,7 @@ struct RuntimeWorkItem {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeWorkViewState {
-    active: BTreeMap<RuntimeWorkId, RuntimeWorkItem>,
+    active: BTreeMap<WorkId, RuntimeWorkItem>,
 }
 
 impl RuntimeWorkViewState {
@@ -116,7 +116,7 @@ mod tests {
         let mut state = RuntimeWorkViewState::default();
         for index in 0..2 {
             state.apply_snapshot(&RuntimeWorkSnapshot {
-                work_id: RuntimeWorkId::new(format!("tool-{index}")),
+                work_id: WorkId::new(format!("tool-{index}")),
                 kind: RuntimeWorkKind::Tool,
                 label: format!("tool {index}"),
                 tool_call_id: Some(format!("call-{index}")),

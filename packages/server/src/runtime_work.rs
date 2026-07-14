@@ -1,6 +1,6 @@
 use bcode_ipc::RuntimeWorkSnapshot;
 use bcode_plugin::PluginInvocationCancelHandle;
-use bcode_session_models::{RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionId};
+use bcode_session_models::{RuntimeWorkKind, RuntimeWorkStatus, SessionId, WorkId};
 use futures::{StreamExt, stream};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -56,21 +56,21 @@ impl CancellationHandle {
 /// Specification for starting runtime work.
 #[derive(Debug, Clone)]
 pub struct RuntimeWorkSpec {
-    pub work_id: RuntimeWorkId,
+    pub work_id: WorkId,
     pub kind: RuntimeWorkKind,
     pub label: String,
     pub tool_call_id: Option<String>,
     pub plugin_id: Option<String>,
     pub service_interface: Option<String>,
     pub operation: Option<String>,
-    pub parent_work_id: Option<RuntimeWorkId>,
+    pub parent_work_id: Option<WorkId>,
     pub cancellation: CancellationHandle,
 }
 
 impl RuntimeWorkSpec {
     #[allow(clippy::missing_const_for_fn)]
     pub fn new(
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         kind: RuntimeWorkKind,
         label: String,
         cancellation: CancellationHandle,
@@ -93,7 +93,7 @@ impl RuntimeWorkSpec {
         self
     }
 
-    pub fn with_parent_work_id(mut self, parent_work_id: Option<RuntimeWorkId>) -> Self {
+    pub fn with_parent_work_id(mut self, parent_work_id: Option<WorkId>) -> Self {
         self.parent_work_id = parent_work_id;
         self
     }
@@ -108,7 +108,7 @@ struct ActiveRuntimeWork {
 /// Central server registry and cancellation router for active runtime work.
 #[derive(Debug, Default)]
 pub struct RuntimeWorkManager {
-    active: Mutex<BTreeMap<(SessionId, RuntimeWorkId), ActiveRuntimeWork>>,
+    active: Mutex<BTreeMap<(SessionId, WorkId), ActiveRuntimeWork>>,
 }
 
 impl RuntimeWorkManager {
@@ -129,7 +129,7 @@ impl RuntimeWorkManager {
     pub async fn replace_cancellation(
         &self,
         session_id: SessionId,
-        work_id: &RuntimeWorkId,
+        work_id: &WorkId,
         cancellation: CancellationHandle,
     ) -> bool {
         let mut active = self.active.lock().await;
@@ -147,8 +147,8 @@ impl RuntimeWorkManager {
     pub async fn cancel_with_children(
         &self,
         session_id: SessionId,
-        work_id: &RuntimeWorkId,
-    ) -> Vec<RuntimeWorkId> {
+        work_id: &WorkId,
+    ) -> Vec<WorkId> {
         let mut active = self.active.lock().await;
         if !active.contains_key(&(session_id, work_id.clone())) {
             return Vec::new();
@@ -187,7 +187,7 @@ impl RuntimeWorkManager {
     }
 
     /// Finish work and remove it from the active registry.
-    pub async fn finish(&self, session_id: SessionId, work_id: &RuntimeWorkId) {
+    pub async fn finish(&self, session_id: SessionId, work_id: &WorkId) {
         self.active
             .lock()
             .await
@@ -224,7 +224,7 @@ mod tests {
 
     fn test_spec(work_id: &str, count: Arc<AtomicUsize>) -> RuntimeWorkSpec {
         RuntimeWorkSpec::new(
-            RuntimeWorkId::new(work_id),
+            WorkId::new(work_id),
             RuntimeWorkKind::Tool,
             work_id.to_string(),
             CancellationHandle::Test(count),
@@ -236,7 +236,7 @@ mod tests {
         let manager = RuntimeWorkManager::default();
         let session_id = SessionId::new();
         let count = Arc::new(AtomicUsize::new(0));
-        let work_id = RuntimeWorkId::new("work");
+        let work_id = WorkId::new("work");
 
         assert!(
             manager
@@ -264,7 +264,7 @@ mod tests {
         let manager = RuntimeWorkManager::default();
         let session_id = SessionId::new();
         let count = Arc::new(AtomicUsize::new(0));
-        let work_id = RuntimeWorkId::new("work");
+        let work_id = WorkId::new("work");
 
         manager
             .start(session_id, test_spec("work", Arc::clone(&count)))
@@ -290,7 +290,7 @@ mod tests {
         let session_id = SessionId::new();
         let first = Arc::new(AtomicUsize::new(0));
         let second = Arc::new(AtomicUsize::new(0));
-        let work_id = RuntimeWorkId::new("work");
+        let work_id = WorkId::new("work");
 
         manager
             .start(session_id, test_spec("work", Arc::clone(&first)))
@@ -319,8 +319,8 @@ mod tests {
         let session_id = SessionId::new();
         let parent_count = Arc::new(AtomicUsize::new(0));
         let child_count = Arc::new(AtomicUsize::new(0));
-        let parent_id = RuntimeWorkId::new("parent");
-        let child_id = RuntimeWorkId::new("child");
+        let parent_id = WorkId::new("parent");
+        let child_id = WorkId::new("child");
 
         manager
             .start(session_id, test_spec("parent", Arc::clone(&parent_count)))

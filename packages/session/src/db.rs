@@ -16,10 +16,10 @@ use crate::persisted::{
 use bcode_database_observability::ObservedDatabase;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation, MetricsRegistry};
 use bcode_session_models::{
-    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
-    SessionId, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
-    ToolInvocationStreamEvent,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryCursor,
+    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    SessionInputHistoryEntry, SessionSummary, SessionTitleSource, ToolInvocationStreamEvent,
+    WorkId,
 };
 use switchy::{
     database::{
@@ -183,7 +183,7 @@ pub struct ToolRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeWorkProjection {
     /// Runtime work identifier.
-    pub work_id: RuntimeWorkId,
+    pub work_id: WorkId,
     /// Event sequence that started the work.
     pub event_seq_start: u64,
     /// Event sequence that finished the work, when terminal.
@@ -195,7 +195,7 @@ pub struct RuntimeWorkProjection {
     /// Current status.
     pub status: RuntimeWorkStatus,
     /// Parent runtime work id, when nested.
-    pub parent_work_id: Option<RuntimeWorkId>,
+    pub parent_work_id: Option<WorkId>,
     /// Start timestamp, when known.
     pub started_at_ms: Option<u64>,
     /// Finish timestamp, when terminal and known.
@@ -2309,13 +2309,13 @@ async fn update_projection_checkpoint(
 
 fn runtime_work_from_row(row: &switchy::database::Row) -> SessionDbResult<RuntimeWorkProjection> {
     Ok(RuntimeWorkProjection {
-        work_id: RuntimeWorkId::new(required_string(row, "work_id")?),
+        work_id: WorkId::new(required_string(row, "work_id")?),
         event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
         event_seq_end: optional_i64(row, "event_seq_end").map(i64_to_u64),
         kind: parse_runtime_work_kind(&required_string(row, "kind")?),
         label: required_string(row, "label")?,
         status: parse_runtime_work_status(&required_string(row, "status")?),
-        parent_work_id: optional_string(row, "parent_work_id").map(RuntimeWorkId::new),
+        parent_work_id: optional_string(row, "parent_work_id").map(WorkId::new),
         started_at_ms: optional_i64(row, "started_at_ms").map(i64_to_u64),
         finished_at_ms: optional_i64(row, "finished_at_ms").map(i64_to_u64),
         message: optional_string(row, "message"),
@@ -3088,7 +3088,7 @@ mod tests {
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
             .await
             .expect("open session db");
-        let work_id = RuntimeWorkId::new("work-1");
+        let work_id = WorkId::new("work-1");
 
         db.append_event(&event(
             session_id,

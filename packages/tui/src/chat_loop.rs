@@ -1286,7 +1286,7 @@ fn apply_create_worktree_result(
 
 fn apply_cancel_runtime_work_result(
     chat: &mut ActiveChat,
-    work_id: &bcode_session_models::RuntimeWorkId,
+    work_id: &bcode_session_models::WorkId,
     result: Result<bool, ClientError>,
 ) {
     match result {

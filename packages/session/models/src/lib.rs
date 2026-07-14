@@ -501,20 +501,20 @@ pub struct SessionInputHistoryEntry {
     pub text: String,
 }
 
-/// Durable runtime work identifier used across session history, IPC, and UI surfaces.
+/// Durable work identifier used across session history, IPC, and UI surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct RuntimeWorkId(pub String);
+pub struct WorkId(pub String);
 
-impl RuntimeWorkId {
-    /// Create a runtime work identifier.
+impl WorkId {
+    /// Create a work identifier.
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 }
 
-impl Display for RuntimeWorkId {
+impl Display for WorkId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -1693,7 +1693,7 @@ pub enum SessionEventKind {
     },
     /// Durable runtime work start marker.
     RuntimeWorkStarted {
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         kind: RuntimeWorkKind,
         label: String,
         #[serde(default)]
@@ -1705,7 +1705,7 @@ pub enum SessionEventKind {
         #[serde(default)]
         operation: Option<String>,
         #[serde(default)]
-        parent_work_id: Option<RuntimeWorkId>,
+        parent_work_id: Option<WorkId>,
         #[serde(default)]
         started_at_ms: Option<u64>,
         #[serde(default)]
@@ -1713,7 +1713,7 @@ pub enum SessionEventKind {
     },
     /// Durable runtime work cancellation request marker.
     RuntimeWorkCancelRequested {
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         #[serde(default)]
         requested_at_ms: Option<u64>,
         #[serde(default)]
@@ -1721,7 +1721,7 @@ pub enum SessionEventKind {
     },
     /// Durable runtime work finish marker.
     RuntimeWorkFinished {
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         status: RuntimeWorkStatus,
         #[serde(default)]
         finished_at_ms: Option<u64>,
@@ -1730,7 +1730,7 @@ pub enum SessionEventKind {
     },
     /// Durable runtime work progress marker.
     RuntimeWorkProgress {
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         message: String,
         #[serde(default)]
         progress_at_ms: Option<u64>,
@@ -1851,6 +1851,20 @@ pub enum SessionEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_id_remains_a_transparent_serialized_identifier() {
+        let work_id = WorkId::new("work-1");
+
+        assert_eq!(
+            serde_json::to_string(&work_id).expect("work id should serialize"),
+            r#""work-1""#
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkId>(r#""work-1""#).expect("work id should deserialize"),
+            work_id
+        );
+    }
 
     #[test]
     fn legacy_context_usage_snapshot_defaults_new_attempt_identity_fields() {

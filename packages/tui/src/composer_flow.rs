@@ -13,7 +13,7 @@ use super::{
     TuiError, helpers, model_flow, ralph_flow, session_flow, session_fork_flow, skill_flow,
     slash_commands, slash_registry, thinking_dialog, worktree_flow,
 };
-use bcode_session_models::RuntimeWorkId;
+use bcode_session_models::WorkId;
 
 /// Result of submitting staged composer text.
 pub type SubmitComposerOutcome = Option<ComposerModalRequest>;
@@ -293,7 +293,7 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             chat.start_effect(TuiEffect::CancelRuntimeWork {
                 session_id,
-                work_id: RuntimeWorkId::new(work_id),
+                work_id: WorkId::new(work_id),
             });
             chat.app
                 .set_status("requesting runtime cancellation…".to_owned());

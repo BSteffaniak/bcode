@@ -6798,10 +6798,7 @@ async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), 
             work_id,
         } => {
             if client
-                .cancel_runtime_work(
-                    session_id,
-                    bcode_session_models::RuntimeWorkId::new(work_id),
-                )
+                .cancel_runtime_work(session_id, bcode_session_models::WorkId::new(work_id))
                 .await?
             {
                 println!("runtime work cancellation requested");

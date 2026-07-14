@@ -21,9 +21,9 @@ use bcode_ipc::{
     default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
-    SessionEventKind, SessionForkResult, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionInputHistoryEntry, SessionSummary,
+    ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    SessionForkResult, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    SessionInputHistoryEntry, SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
@@ -48,8 +48,8 @@ pub struct SessionArtifactRange {
 /// Grouped runtime-work lifecycle span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeWorkSpan {
-    pub work_id: RuntimeWorkId,
-    pub parent_work_id: Option<RuntimeWorkId>,
+    pub work_id: WorkId,
+    pub parent_work_id: Option<WorkId>,
     pub label: String,
     pub status: Option<RuntimeWorkStatus>,
     pub started_at_ms: Option<u64>,
@@ -1678,7 +1678,7 @@ impl BcodeClient {
     pub async fn cancel_runtime_work(
         &self,
         session_id: SessionId,
-        work_id: bcode_session_models::RuntimeWorkId,
+        work_id: bcode_session_models::WorkId,
     ) -> Result<bool, ClientError> {
         match self
             .send_request(Request::CancelRuntimeWork {

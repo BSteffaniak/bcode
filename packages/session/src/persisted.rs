@@ -8,9 +8,9 @@
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ContextUsageSnapshot,
     LegacyToolRequestPresentationMetadata, ModelTurnOutcome, ProviderContextSnapshot,
-    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-    SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
-    ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
+    SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent, ToolArtifact,
+    ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, WorkId,
     current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
@@ -331,7 +331,7 @@ enum PersistedSessionEventKind {
     },
     /// Durable runtime work start marker.
     RuntimeWorkStarted {
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         kind: RuntimeWorkKind,
         label: String,
         #[serde(default)]
@@ -343,7 +343,7 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         operation: Option<String>,
         #[serde(default)]
-        parent_work_id: Option<RuntimeWorkId>,
+        parent_work_id: Option<WorkId>,
         #[serde(default)]
         started_at_ms: Option<u64>,
         #[serde(default)]
@@ -351,7 +351,7 @@ enum PersistedSessionEventKind {
     },
     /// Durable runtime work cancellation request marker.
     RuntimeWorkCancelRequested {
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         #[serde(default)]
         requested_at_ms: Option<u64>,
         #[serde(default)]
@@ -359,7 +359,7 @@ enum PersistedSessionEventKind {
     },
     /// Durable runtime work finish marker.
     RuntimeWorkFinished {
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         status: RuntimeWorkStatus,
         #[serde(default)]
         finished_at_ms: Option<u64>,
@@ -368,7 +368,7 @@ enum PersistedSessionEventKind {
     },
     /// Durable runtime work progress marker.
     RuntimeWorkProgress {
-        work_id: RuntimeWorkId,
+        work_id: WorkId,
         message: String,
         #[serde(default)]
         progress_at_ms: Option<u64>,
@@ -1494,7 +1494,7 @@ mod tests {
                 text: "reasoning".to_string(),
             },
             SessionEventKind::RuntimeWorkStarted {
-                work_id: RuntimeWorkId::new("work-started"),
+                work_id: WorkId::new("work-started"),
                 kind: RuntimeWorkKind::Tool,
                 label: "work".to_string(),
                 tool_call_id: Some("call".to_string()),
@@ -1506,18 +1506,18 @@ mod tests {
                 cancellable: true,
             },
             SessionEventKind::RuntimeWorkCancelRequested {
-                work_id: RuntimeWorkId::new("work-cancel"),
+                work_id: WorkId::new("work-cancel"),
                 requested_at_ms: Some(8),
                 client_id: None,
             },
             SessionEventKind::RuntimeWorkFinished {
-                work_id: RuntimeWorkId::new("work-finished"),
+                work_id: WorkId::new("work-finished"),
                 status: RuntimeWorkStatus::Completed,
                 finished_at_ms: Some(9),
                 message: Some("finished".to_string()),
             },
             SessionEventKind::RuntimeWorkProgress {
-                work_id: RuntimeWorkId::new("work-progress"),
+                work_id: WorkId::new("work-progress"),
                 message: "progress".to_string(),
                 progress_at_ms: Some(10),
                 completed_units: Some(1),

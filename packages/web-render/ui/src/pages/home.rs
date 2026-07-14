@@ -671,7 +671,7 @@ mod tests {
     use super::*;
     use bcode_session_models::{
         InteractiveToolRenderTarget, InteractiveToolTurnBehavior, PluginVisualDescriptor,
-        RuntimeWorkId, RuntimeWorkStatus, ToolArtifact,
+        RuntimeWorkStatus, ToolArtifact, WorkId,
     };
     use bcode_session_view_models::{
         RuntimeWorkView, ToolArtifactView, ToolInvocationView, ToolResultView, ToolTimingView,
@@ -682,7 +682,7 @@ mod tests {
         let mut snapshot = SessionViewSnapshot::empty();
         snapshot.session_id = Some(bcode_session_models::SessionId::new());
         snapshot.runtime_work.push(RuntimeWorkView {
-            work_id: RuntimeWorkId::new("work-1"),
+            work_id: WorkId::new("work-1"),
             status: RuntimeWorkStatus::Running,
             message: Some("indexing".to_owned()),
             completed_units: Some(2),

@@ -10,8 +10,7 @@
 
 use bcode_session_models::{
     ClientId, InteractiveToolRenderTarget, InteractiveToolTurnBehavior, PluginVisualDescriptor,
-    RuntimeWorkId, RuntimeWorkStatus, SessionId, SessionSummary, ToolArtifact,
-    ToolInvocationResult,
+    RuntimeWorkStatus, SessionId, SessionSummary, ToolArtifact, ToolInvocationResult, WorkId,
 };
 use bcode_tool::InteractionInput;
 use serde::{Deserialize, Serialize};
@@ -413,7 +412,7 @@ pub struct PermissionView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkView {
     /// Work identifier.
-    pub work_id: RuntimeWorkId,
+    pub work_id: WorkId,
     /// Current status.
     pub status: RuntimeWorkStatus,
     /// Latest human-readable message.
