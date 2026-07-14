@@ -5,7 +5,7 @@
 //! runtime and are interpreted only by the tool owner and host adapters that understand them.
 
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 /// Runtime options controlling neutral tool scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +14,8 @@ pub struct ToolExecutionOptions {
     pub parallel: bool,
     /// Maximum number of invocations that may execute concurrently.
     pub max_concurrency: NonZeroUsize,
+    /// Maximum duration of one side-effect-free preparation operation, in milliseconds.
+    pub preparation_timeout_ms: NonZeroU64,
 }
 
 impl Default for ToolExecutionOptions {
@@ -21,6 +23,7 @@ impl Default for ToolExecutionOptions {
         Self {
             parallel: true,
             max_concurrency: NonZeroUsize::new(4).expect("four is non-zero"),
+            preparation_timeout_ms: NonZeroU64::new(30_000).expect("thirty thousand is non-zero"),
         }
     }
 }

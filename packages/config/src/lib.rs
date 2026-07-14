@@ -1844,16 +1844,23 @@ const fn default_tool_execution_max_concurrency() -> usize {
     4
 }
 
+const fn default_tool_preparation_timeout_ms() -> u64 {
+    30_000
+}
+
 /// Tool invocation scheduler configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "execution")]
 pub struct ToolExecutionConfig {
-    /// Whether independent read-only tool calls may execute concurrently.
+    /// Whether scheduler-compatible tool calls may execute concurrently.
     #[serde(default = "default_tool_execution_parallel")]
     pub parallel: bool,
-    /// Maximum number of read-only tool calls executing concurrently. Zero is normalized to one.
+    /// Maximum number of scheduler-compatible tool calls executing concurrently. Zero is normalized to one.
     #[serde(default = "default_tool_execution_max_concurrency")]
     pub max_concurrency: usize,
+    /// Maximum duration of one side-effect-free preparation operation, in milliseconds. Zero is normalized to one.
+    #[serde(default = "default_tool_preparation_timeout_ms")]
+    pub preparation_timeout_ms: u64,
 }
 
 impl ToolExecutionConfig {
@@ -1864,6 +1871,8 @@ impl ToolExecutionConfig {
             parallel: self.parallel,
             max_concurrency: std::num::NonZeroUsize::new(self.max_concurrency)
                 .unwrap_or(std::num::NonZeroUsize::MIN),
+            preparation_timeout_ms: std::num::NonZeroU64::new(self.preparation_timeout_ms)
+                .unwrap_or(std::num::NonZeroU64::MIN),
         }
     }
 }
@@ -1873,6 +1882,7 @@ impl Default for ToolExecutionConfig {
         Self {
             parallel: default_tool_execution_parallel(),
             max_concurrency: default_tool_execution_max_concurrency(),
+            preparation_timeout_ms: default_tool_preparation_timeout_ms(),
         }
     }
 }

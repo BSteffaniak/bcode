@@ -1754,7 +1754,7 @@ impl BcodeBuilder {
 
     /// Configure the reusable agent runtime used by agents built from this handle.
     #[must_use]
-    pub const fn runtime(mut self, runtime: AgentRuntime) -> Self {
+    pub fn runtime(mut self, runtime: AgentRuntime) -> Self {
         self.runtime = runtime;
         self
     }
@@ -2851,7 +2851,7 @@ impl Default for AgentBuilder {
 impl AgentBuilder {
     /// Configure the reusable runtime used by this agent.
     #[must_use]
-    pub const fn runtime(mut self, runtime: AgentRuntime) -> Self {
+    pub fn runtime(mut self, runtime: AgentRuntime) -> Self {
         self.runtime = runtime;
         self
     }

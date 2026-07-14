@@ -6,11 +6,11 @@ use bcode_tool::{
     ToolExchangeRequest, ToolExchangeResolution, ToolInvocationInputResolution,
     ToolInvocationLifecycleEvent, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Monotonic identity assigned by a host to one turn within its owning runtime/session.
@@ -28,6 +28,179 @@ impl TurnGeneration {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+}
+
+/// Runtime/session-owned allocator and active-generation authority for turn scopes.
+#[derive(Clone)]
+pub struct TurnScopeOwner {
+    next_generation: Arc<AtomicU64>,
+    active_generation: Arc<AtomicU64>,
+    active_control: Arc<Mutex<Option<Arc<TurnControl>>>>,
+}
+
+impl fmt::Debug for TurnScopeOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnScopeOwner")
+            .field(
+                "active_generation",
+                &self.active_generation.load(Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for TurnScopeOwner {
+    fn default() -> Self {
+        Self {
+            next_generation: Arc::new(AtomicU64::new(1)),
+            active_generation: Arc::new(AtomicU64::new(0)),
+            active_control: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl TurnScopeOwner {
+    /// Create an owner with no active turn and a first generation of one.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allocate and activate the next monotonic turn generation.
+    ///
+    /// Any previously active turn is synchronously closed before this method returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owner's `u64` generation space is exhausted.
+    #[must_use]
+    pub fn begin_turn(
+        &self,
+        turn_id: impl Into<Arc<str>>,
+        events: Arc<dyn TurnEventSink>,
+        capabilities: InvocationCapabilities,
+    ) -> TurnScope {
+        let control = Arc::new(TurnControl::new());
+        let (generation, previous, cancellation_handles) = {
+            let mut active = self
+                .active_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cancellation_handles = active
+                .as_ref()
+                .and_then(|previous| previous.close_for_cancellation())
+                .unwrap_or_default();
+            let generation = self
+                .next_generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                })
+                .expect("turn generation exhausted");
+            let previous = active.replace(Arc::clone(&control));
+            self.active_generation.store(generation, Ordering::Release);
+            drop(active);
+            (generation, previous, cancellation_handles)
+        };
+        drop(previous);
+        TurnControl::signal_cancellation_handles(cancellation_handles);
+        TurnScope::with_owner(
+            turn_id,
+            TurnGeneration::new(generation),
+            control,
+            events,
+            capabilities,
+            Arc::clone(&self.active_generation),
+        )
+    }
+
+    /// Return the currently active generation, when any turn has been allocated.
+    #[must_use]
+    pub fn active_generation(&self) -> Option<TurnGeneration> {
+        let generation = self.active_generation.load(Ordering::Acquire);
+        (generation != 0).then_some(TurnGeneration::new(generation))
+    }
+
+    /// Cancel `scope` only if it is still this owner's active turn.
+    ///
+    /// Local progression and every invocation channel close before cancellation handles are
+    /// signalled. A stale scope cannot cancel a newer turn.
+    pub fn cancel_turn(&self, scope: &TurnScope) -> bool {
+        let handles = {
+            let active = self
+                .active_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(control) = active.as_ref() else {
+                return false;
+            };
+            if scope.generation
+                != TurnGeneration::new(self.active_generation.load(Ordering::Acquire))
+                || !Arc::ptr_eq(control, &scope.control)
+            {
+                return false;
+            }
+            let handles = control.close_for_cancellation();
+            drop(active);
+            handles
+        };
+        let Some(handles) = handles else {
+            return false;
+        };
+        TurnControl::signal_cancellation_handles(handles);
+        true
+    }
+
+    /// Complete and remove `scope` only if it is still this owner's active turn.
+    ///
+    /// The scope is closed before the owner clears its active-generation marker. A stale scope
+    /// cannot complete or remove a newer turn.
+    pub fn complete_turn(&self, scope: &TurnScope) -> bool {
+        let mut active = self
+            .active_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(control) = active.as_ref() else {
+            return false;
+        };
+        if scope.generation != TurnGeneration::new(self.active_generation.load(Ordering::Acquire))
+            || !Arc::ptr_eq(control, &scope.control)
+            || !control.complete()
+        {
+            return false;
+        }
+        active.take();
+        self.active_generation.store(0, Ordering::Release);
+        drop(active);
+        true
+    }
+
+    /// Remove a terminal `scope` only if it is still this owner's active turn.
+    ///
+    /// Running and cancelling scopes cannot be released; callers must first complete them or mark
+    /// cancellation terminal. A stale scope cannot remove a newer turn.
+    pub fn release_terminal_turn(&self, scope: &TurnScope) -> bool {
+        let mut active = self
+            .active_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(control) = active.as_ref() else {
+            return false;
+        };
+        if scope.generation != TurnGeneration::new(self.active_generation.load(Ordering::Acquire))
+            || !Arc::ptr_eq(control, &scope.control)
+            || !matches!(
+                control.lifecycle(),
+                TurnLifecycle::Cancelled | TurnLifecycle::Completed
+            )
+        {
+            return false;
+        }
+        active.take();
+        self.active_generation.store(0, Ordering::Release);
+        drop(active);
+        true
     }
 }
 
@@ -87,14 +260,18 @@ pub enum ScopedTurnEvent {
 /// final publication boundary.
 pub trait TurnEventSink: Send + Sync {
     /// Accept an event whose turn scope is currently running.
-    fn emit(&self, event: ScopedTurnEvent);
+    ///
+    /// Returns `false` when the sink can no longer accept publication.
+    fn emit(&self, event: ScopedTurnEvent) -> bool;
 }
 
 #[derive(Debug, Default)]
 struct DiscardingTurnEventSink;
 
 impl TurnEventSink for DiscardingTurnEventSink {
-    fn emit(&self, _event: ScopedTurnEvent) {}
+    fn emit(&self, _event: ScopedTurnEvent) -> bool {
+        true
+    }
 }
 
 /// Boxed asynchronous invocation capability operation.
@@ -233,6 +410,7 @@ pub struct TurnControl {
     cancellation: CancellationToken,
     publication_gate: Mutex<()>,
     cancellations: Mutex<BTreeMap<String, Arc<dyn InvocationCancellation>>>,
+    discarded_normal_events: AtomicU64,
 }
 
 impl fmt::Debug for TurnControl {
@@ -241,6 +419,10 @@ impl fmt::Debug for TurnControl {
             .debug_struct("TurnControl")
             .field("lifecycle", &self.lifecycle())
             .field("registered_cancellations", &self.cancellation_count())
+            .field(
+                "discarded_normal_events",
+                &self.discarded_normal_event_count(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -252,6 +434,7 @@ impl Default for TurnControl {
             cancellation: CancellationToken::new(),
             publication_gate: Mutex::new(()),
             cancellations: Mutex::new(BTreeMap::new()),
+            discarded_normal_events: AtomicU64::new(0),
         }
     }
 }
@@ -285,36 +468,42 @@ impl TurnControl {
     ///
     /// Returns `true` only for the caller that transitions this turn from running to cancelling.
     pub fn begin_cancellation(&self) -> bool {
-        let handles = {
-            let _gate = self
-                .publication_gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if self
-                .lifecycle
-                .compare_exchange(
-                    TurnLifecycle::RUNNING,
-                    TurnLifecycle::CANCELLING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                return false;
-            }
-            self.cancellation.cancel();
-            let mut cancellations = self
-                .cancellations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::take(&mut *cancellations)
-                .into_values()
-                .collect::<Vec<_>>()
+        let Some(handles) = self.close_for_cancellation() else {
+            return false;
         };
+        Self::signal_cancellation_handles(handles);
+        true
+    }
+
+    fn close_for_cancellation(&self) -> Option<Vec<Arc<dyn InvocationCancellation>>> {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .lifecycle
+            .compare_exchange(
+                TurnLifecycle::RUNNING,
+                TurnLifecycle::CANCELLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        self.cancellation.cancel();
+        let mut cancellations = self
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(std::mem::take(&mut *cancellations).into_values().collect())
+    }
+
+    fn signal_cancellation_handles(handles: Vec<Arc<dyn InvocationCancellation>>) {
         for handle in handles {
             handle.request_cancel();
         }
-        true
     }
 
     /// Mark a cancelling turn as terminally cancelled.
@@ -386,16 +575,45 @@ impl TurnControl {
             .len()
     }
 
+    /// Return the number of normal events rejected after closure or supersession.
+    #[must_use]
+    pub fn discarded_normal_event_count(&self) -> u64 {
+        self.discarded_normal_events.load(Ordering::Acquire)
+    }
+
+    fn record_discarded_normal_event(&self) {
+        self.discarded_normal_events.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn emit(&self, sink: &dyn TurnEventSink, event: ScopedTurnEvent) -> bool {
         let _gate = self
             .publication_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.lifecycle() != TurnLifecycle::Running {
+            self.record_discarded_normal_event();
             return false;
         }
-        sink.emit(event);
-        true
+        sink.emit(event)
+    }
+
+    fn emit_cancellation_lifecycle(
+        &self,
+        sink: &dyn TurnEventSink,
+        event: ToolInvocationLifecycleEvent,
+    ) -> bool {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(
+            self.lifecycle(),
+            TurnLifecycle::Cancelling | TurnLifecycle::Cancelled
+        ) || event.stage != bcode_tool::ToolInvocationLifecycleStage::Cancelled
+        {
+            return false;
+        }
+        sink.emit(ScopedTurnEvent::InvocationLifecycle(event))
     }
 }
 
@@ -407,6 +625,7 @@ pub struct TurnScope {
     control: Arc<TurnControl>,
     events: Arc<dyn TurnEventSink>,
     capabilities: InvocationCapabilities,
+    active_generation: Option<Arc<AtomicU64>>,
 }
 
 impl fmt::Debug for TurnScope {
@@ -450,6 +669,25 @@ impl TurnScope {
             control: Arc::new(TurnControl::new()),
             events,
             capabilities,
+            active_generation: None,
+        }
+    }
+
+    fn with_owner(
+        turn_id: impl Into<Arc<str>>,
+        generation: TurnGeneration,
+        control: Arc<TurnControl>,
+        events: Arc<dyn TurnEventSink>,
+        capabilities: InvocationCapabilities,
+        active_generation: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            generation,
+            control,
+            events,
+            capabilities,
+            active_generation: Some(active_generation),
         }
     }
 
@@ -477,10 +715,33 @@ impl TurnScope {
         Arc::clone(&self.control)
     }
 
-    /// Emit a normal event if cancellation or completion has not closed this scope.
+    /// Return whether this scope still owns the active generation and accepts normal work.
+    #[must_use]
+    pub fn accepts_work(&self) -> bool {
+        let generation_is_active = self
+            .active_generation
+            .as_ref()
+            .is_none_or(|active| active.load(Ordering::Acquire) == self.generation.get());
+        generation_is_active && self.control.accepts_normal_output()
+    }
+
+    /// Emit a normal event if this generation remains active and running.
     #[must_use]
     pub fn emit(&self, event: ScopedTurnEvent) -> bool {
+        if !self.accepts_work() {
+            self.control.record_discarded_normal_event();
+            return false;
+        }
         self.control.emit(self.events.as_ref(), event)
+    }
+
+    /// Emit only a cancelled invocation lifecycle event after normal output has closed.
+    ///
+    /// This explicit bookkeeping path cannot publish normal runtime events or contributions.
+    #[must_use]
+    pub fn emit_cancellation_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
+        self.control
+            .emit_cancellation_lifecycle(self.events.as_ref(), event)
     }
 }
 
@@ -525,7 +786,7 @@ impl PreparationScope {
     /// Return whether preparation may continue producing normal work.
     #[must_use]
     pub fn accepts_work(&self) -> bool {
-        self.turn.control().accepts_normal_output()
+        self.turn.accepts_work()
     }
 }
 
@@ -534,6 +795,7 @@ impl PreparationScope {
 pub struct InvocationScope {
     turn: TurnScope,
     invocation_id: Arc<str>,
+    exchange_ids: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl fmt::Debug for InvocationScope {
@@ -542,6 +804,14 @@ impl fmt::Debug for InvocationScope {
             .debug_struct("InvocationScope")
             .field("invocation_id", &self.invocation_id)
             .field("turn", &self.turn)
+            .field(
+                "submitted_exchange_ids",
+                &self
+                    .exchange_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+            )
             .finish()
     }
 }
@@ -553,6 +823,7 @@ impl InvocationScope {
         Self {
             turn,
             invocation_id: invocation_id.into(),
+            exchange_ids: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -577,7 +848,7 @@ impl InvocationScope {
     /// Return whether invocation work and normal output remain accepted.
     #[must_use]
     pub fn accepts_work(&self) -> bool {
-        self.turn.control().accepts_normal_output()
+        self.turn.accepts_work()
     }
 
     /// Register this invocation's opaque cancellation handle.
@@ -602,6 +873,13 @@ impl InvocationScope {
             && self.turn.emit(ScopedTurnEvent::InvocationLifecycle(event))
     }
 
+    /// Emit cancelled lifecycle bookkeeping after normal invocation output has closed.
+    #[must_use]
+    pub fn emit_cancellation_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
+        event.invocation_id == self.invocation_id.as_ref()
+            && self.turn.emit_cancellation_lifecycle(event)
+    }
+
     /// Emit a contribution only when it belongs to this active invocation.
     #[must_use]
     pub fn emit_contribution(&self, event: ToolContributionEvent) -> bool {
@@ -610,6 +888,10 @@ impl InvocationScope {
     }
 
     /// Request one correlated external exchange, bounded by turn cancellation.
+    ///
+    /// Each non-empty exchange ID may be submitted exactly once per invocation scope, including
+    /// across clones. Duplicate IDs fail locally and are never forwarded to the host broker. The
+    /// returned resolution is terminal for this request.
     pub async fn request_exchange(&self, request: ToolExchangeRequest) -> ToolExchangeResolution {
         if request.invocation_id != self.invocation_id.as_ref() {
             return ToolExchangeResolution::Failed {
@@ -617,8 +899,25 @@ impl InvocationScope {
                 message: "exchange request does not belong to this invocation scope".to_string(),
             };
         }
+        if request.exchange_id.is_empty() {
+            return ToolExchangeResolution::Failed {
+                code: "invalid_exchange_id".to_string(),
+                message: "exchange request ID must not be empty".to_string(),
+            };
+        }
         if !self.accepts_work() {
             return ToolExchangeResolution::Cancelled;
+        }
+        let inserted = self
+            .exchange_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request.exchange_id.clone());
+        if !inserted {
+            return ToolExchangeResolution::Failed {
+                code: "duplicate_exchange_id".to_string(),
+                message: "exchange request ID was already submitted by this invocation".to_string(),
+            };
         }
         let cancellation = self.cancellation();
         let resolution = tokio::select! {
@@ -727,8 +1026,9 @@ mod tests {
     struct CountingSink(AtomicUsize);
 
     impl TurnEventSink for CountingSink {
-        fn emit(&self, _event: ScopedTurnEvent) {
+        fn emit(&self, _event: ScopedTurnEvent) -> bool {
             self.0.fetch_add(1, Ordering::SeqCst);
+            true
         }
     }
 
@@ -884,6 +1184,367 @@ mod tests {
 
         assert!(!scope.emit_contribution(event));
         assert_eq!(sink.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn owner_allocates_monotonic_generations_and_closes_previous_scope() {
+        let owner = TurnScopeOwner::new();
+        let first_sink = Arc::new(CountingSink::default());
+        let second_sink = Arc::new(CountingSink::default());
+        let first = owner.begin_turn(
+            "first",
+            first_sink.clone(),
+            InvocationCapabilities::default(),
+        );
+        assert_eq!(first.generation(), TurnGeneration::new(1));
+        assert!(first.emit(ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted)));
+
+        let second = owner.begin_turn(
+            "second",
+            second_sink.clone(),
+            InvocationCapabilities::default(),
+        );
+
+        assert_eq!(second.generation(), TurnGeneration::new(2));
+        assert_eq!(owner.active_generation(), Some(TurnGeneration::new(2)));
+        assert_eq!(first.control().lifecycle(), TurnLifecycle::Cancelling);
+        assert!(first.control().cancellation().is_cancelled());
+        assert!(!first.accepts_work());
+        assert!(!first.emit(ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted)));
+        assert!(second.emit(ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted)));
+        assert_eq!(first_sink.0.load(Ordering::SeqCst), 1);
+        assert_eq!(second_sink.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn superseding_generation_cancels_blocked_exchange_and_rejects_response() {
+        let owner = TurnScopeOwner::new();
+        let first = owner.begin_turn(
+            "first",
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::new(
+                Arc::new(BlockingExchangeBroker),
+                Arc::new(UnsupportedInvocationCapabilities),
+                Arc::new(UnsupportedInvocationCapabilities),
+                Arc::new(UnsupportedInvocationCapabilities),
+            ),
+        );
+        let invocation = InvocationScope::new(first, "invoke");
+        let waiting = tokio::spawn(async move {
+            invocation
+                .request_exchange(ToolExchangeRequest {
+                    invocation_id: "invoke".to_string(),
+                    exchange_id: "exchange".to_string(),
+                    producer_id: "producer".to_string(),
+                    schema: "example.exchange".to_string(),
+                    schema_version: 1,
+                    payload: serde_json::Value::Null,
+                    response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let _second = owner.begin_turn(
+            "second",
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::default(),
+        );
+        let resolution = tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
+            .await
+            .expect("superseding generation should wake the exchange")
+            .expect("exchange task should not panic");
+
+        assert_eq!(resolution, ToolExchangeResolution::Cancelled);
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingExchangeBroker(AtomicUsize);
+
+    impl InvocationExchangeBroker for CountingExchangeBroker {
+        fn request(
+            &self,
+            request: ToolExchangeRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"exchange_id": request.exchange_id}),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_ids_are_forwarded_exactly_once_across_scope_clones() {
+        let broker = Arc::new(CountingExchangeBroker::default());
+        let scope = InvocationScope::new(
+            TurnScope::with_capabilities(
+                "turn",
+                TurnGeneration::new(6),
+                Arc::new(DiscardingTurnEventSink),
+                InvocationCapabilities::new(
+                    broker.clone(),
+                    Arc::new(UnsupportedInvocationCapabilities),
+                    Arc::new(UnsupportedInvocationCapabilities),
+                    Arc::new(UnsupportedInvocationCapabilities),
+                ),
+            ),
+            "invoke",
+        );
+        let request = ToolExchangeRequest {
+            invocation_id: "invoke".to_string(),
+            exchange_id: "exchange".to_string(),
+            producer_id: "producer".to_string(),
+            schema: "example.exchange".to_string(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        };
+
+        assert!(matches!(
+            scope.request_exchange(request.clone()).await,
+            ToolExchangeResolution::Responded { .. }
+        ));
+        let duplicate = scope.clone().request_exchange(request).await;
+
+        assert!(matches!(
+            duplicate,
+            ToolExchangeResolution::Failed { ref code, .. }
+                if code == "duplicate_exchange_id"
+        ));
+        assert_eq!(broker.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_exchange_id_is_rejected_without_broker_invocation() {
+        let broker = Arc::new(CountingExchangeBroker::default());
+        let scope = InvocationScope::new(
+            TurnScope::with_capabilities(
+                "turn",
+                TurnGeneration::new(7),
+                Arc::new(DiscardingTurnEventSink),
+                InvocationCapabilities::new(
+                    broker.clone(),
+                    Arc::new(UnsupportedInvocationCapabilities),
+                    Arc::new(UnsupportedInvocationCapabilities),
+                    Arc::new(UnsupportedInvocationCapabilities),
+                ),
+            ),
+            "invoke",
+        );
+
+        let resolution = scope
+            .request_exchange(ToolExchangeRequest {
+                invocation_id: "invoke".to_string(),
+                exchange_id: String::new(),
+                producer_id: "producer".to_string(),
+                schema: "example.exchange".to_string(),
+                schema_version: 1,
+                payload: serde_json::Value::Null,
+                response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+            })
+            .await;
+
+        assert!(matches!(
+            resolution,
+            ToolExchangeResolution::Failed { ref code, .. }
+                if code == "invalid_exchange_id"
+        ));
+        assert_eq!(broker.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn removing_active_turn_keeps_scope_closed_and_stale_scope_cannot_remove_newer_turn() {
+        let owner = TurnScopeOwner::new();
+        let first = owner.begin_turn(
+            "first",
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::default(),
+        );
+
+        assert!(owner.complete_turn(&first));
+        assert_eq!(first.control().lifecycle(), TurnLifecycle::Completed);
+        assert_eq!(owner.active_generation(), None);
+        assert!(!first.accepts_work());
+        assert!(!first.emit(ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted)));
+
+        let second = owner.begin_turn(
+            "second",
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::default(),
+        );
+        assert!(!owner.complete_turn(&first));
+        assert_eq!(owner.active_generation(), Some(second.generation()));
+        assert!(second.accepts_work());
+    }
+
+    #[test]
+    fn terminal_cancellation_must_precede_owner_release() {
+        let owner = TurnScopeOwner::new();
+        let scope = owner.begin_turn(
+            "turn",
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::default(),
+        );
+
+        assert!(!owner.release_terminal_turn(&scope));
+        assert!(scope.control().begin_cancellation());
+        assert!(!owner.release_terminal_turn(&scope));
+        assert!(scope.control().mark_cancelled());
+        assert!(owner.release_terminal_turn(&scope));
+        assert_eq!(owner.active_generation(), None);
+        assert!(!scope.accepts_work());
+    }
+
+    #[test]
+    fn cancellation_bookkeeping_is_the_only_event_allowed_after_normal_closure() {
+        let sink = Arc::new(CountingSink::default());
+        let turn = TurnScope::new("turn", TurnGeneration::new(8), sink.clone());
+        let invocation = InvocationScope::new(turn.clone(), "invoke");
+        assert!(turn.control().begin_cancellation());
+
+        assert!(!invocation.emit_contribution(ToolContributionEvent {
+            invocation_id: "invoke".to_string(),
+            contribution_id: "late".to_string(),
+            sequence: 1,
+            producer_id: "producer".to_string(),
+            schema: "example.contribution".to_string(),
+            schema_version: 1,
+            operation: bcode_tool::ToolContributionOperation::Upsert,
+            persistence: bcode_tool::ToolContributionPersistence::Transient,
+            payload: serde_json::Value::Null,
+        }));
+        assert!(
+            !invocation.emit_cancellation_lifecycle(ToolInvocationLifecycleEvent {
+                invocation_id: "invoke".to_string(),
+                sequence: 1,
+                stage: bcode_tool::ToolInvocationLifecycleStage::Completed,
+                message: None,
+                metadata: serde_json::Value::Null,
+            })
+        );
+        assert!(
+            invocation.emit_cancellation_lifecycle(ToolInvocationLifecycleEvent {
+                invocation_id: "invoke".to_string(),
+                sequence: 2,
+                stage: bcode_tool::ToolInvocationLifecycleStage::Cancelled,
+                message: None,
+                metadata: serde_json::Value::Null,
+            })
+        );
+
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+        assert_eq!(turn.control().discarded_normal_event_count(), 1);
+    }
+
+    #[test]
+    fn stale_generation_rejections_increment_discard_count_without_payload_inspection() {
+        let owner = TurnScopeOwner::new();
+        let first = owner.begin_turn(
+            "first",
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::default(),
+        );
+        let _second = owner.begin_turn(
+            "second",
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::default(),
+        );
+
+        assert!(!first.emit(ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted)));
+        assert_eq!(first.control().discarded_normal_event_count(), 1);
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingInvocationCapabilities;
+
+    impl InvocationInputRouter for BlockingInvocationCapabilities {
+        fn receive(
+            &self,
+            _invocation_id: &str,
+        ) -> InvocationCapabilityFuture<'_, ToolInvocationInputResolution> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    impl InvocationServiceRouter for BlockingInvocationCapabilities {
+        fn invoke(
+            &self,
+            _request: ToolInvocationServiceRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolInvocationServiceResolution> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    impl InvocationArtifactSink for BlockingInvocationCapabilities {
+        fn write(
+            &self,
+            _request: ToolArtifactWriteRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_blocked_input_service_and_artifact_operations() {
+        let blocking = Arc::new(BlockingInvocationCapabilities);
+        let turn = TurnScope::with_capabilities(
+            "turn",
+            TurnGeneration::new(9),
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::new(
+                Arc::new(UnsupportedInvocationCapabilities),
+                blocking.clone(),
+                blocking.clone(),
+                blocking,
+            ),
+        );
+        let input_scope = InvocationScope::new(turn.clone(), "invoke");
+        let service_scope = input_scope.clone();
+        let artifact_scope = input_scope.clone();
+        let input = tokio::spawn(async move { input_scope.receive_input().await });
+        let service = tokio::spawn(async move {
+            service_scope
+                .invoke_service(ToolInvocationServiceRequest {
+                    invocation_id: "invoke".to_string(),
+                    request_id: "service".to_string(),
+                    interface_id: "example.service/v1".to_string(),
+                    operation: "run".to_string(),
+                    payload: serde_json::Value::Null,
+                })
+                .await
+        });
+        let artifact = tokio::spawn(async move {
+            artifact_scope
+                .write_artifact(ToolArtifactWriteRequest {
+                    invocation_id: "invoke".to_string(),
+                    artifact_id: "artifact".to_string(),
+                    content_type: "application/octet-stream".to_string(),
+                    bytes: vec![1, 2, 3],
+                    metadata: serde_json::Value::Null,
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        assert!(turn.control().begin_cancellation());
+        let input = tokio::time::timeout(std::time::Duration::from_millis(100), input)
+            .await
+            .expect("input wait should wake")
+            .expect("input task should not panic");
+        let service = tokio::time::timeout(std::time::Duration::from_millis(100), service)
+            .await
+            .expect("service wait should wake")
+            .expect("service task should not panic");
+        let artifact = tokio::time::timeout(std::time::Duration::from_millis(100), artifact)
+            .await
+            .expect("artifact wait should wake")
+            .expect("artifact task should not panic");
+
+        assert_eq!(input, ToolInvocationInputResolution::Cancelled);
+        assert_eq!(service, ToolInvocationServiceResolution::Cancelled);
+        assert_eq!(artifact, ToolArtifactWriteResolution::Cancelled);
     }
 
     #[test]

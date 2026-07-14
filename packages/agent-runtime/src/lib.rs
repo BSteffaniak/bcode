@@ -6,7 +6,8 @@
 //!
 //! This crate owns the provider/tool/policy boundary for a single agent turn without depending on
 //! daemon IPC or TUI code. Higher-level crates supply concrete provider, tool, and permission
-//! implementations.
+//! implementations. Contract ownership and dependency direction are documented in
+//! `docs/tool-runtime-contract-ownership.md`.
 
 pub mod turn;
 
@@ -14,7 +15,7 @@ pub use turn::{
     InvocationArtifactSink, InvocationCancellation, InvocationCapabilities,
     InvocationCapabilityFuture, InvocationExchangeBroker, InvocationInputRouter, InvocationScope,
     InvocationServiceRouter, PreparationScope, ScopedTurnEvent, TurnControl, TurnEventSink,
-    TurnGeneration, TurnLifecycle, TurnScope,
+    TurnGeneration, TurnLifecycle, TurnScope, TurnScopeOwner,
 };
 
 use bcode_model::{
@@ -112,6 +113,14 @@ pub enum RuntimeError {
         tool_name: String,
         /// Human-readable preparation failure.
         message: String,
+    },
+    /// Tool preparation exceeded its configured bound.
+    #[error("tool preparation timed out for {tool_name} after {timeout:?}")]
+    ToolPreparationTimeout {
+        /// Tool whose preparation timed out.
+        tool_name: String,
+        /// Configured per-invocation preparation timeout.
+        timeout: Duration,
     },
 }
 
@@ -312,13 +321,29 @@ pub enum AgentRuntimeStreamItem {
 /// Typed asynchronous stream of agent runtime events.
 #[derive(Debug)]
 pub struct AgentRuntimeStream {
-    receiver: mpsc::Receiver<AgentRuntimeStreamItem>,
+    receiver: mpsc::UnboundedReceiver<AgentRuntimeStreamItem>,
 }
 
 impl AgentRuntimeStream {
     /// Receive the next stream item.
     pub async fn next(&mut self) -> Option<AgentRuntimeStreamItem> {
         self.receiver.recv().await
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeStreamEventSink {
+    sender: Option<mpsc::UnboundedSender<AgentRuntimeStreamItem>>,
+}
+
+impl TurnEventSink for RuntimeStreamEventSink {
+    fn emit(&self, event: ScopedTurnEvent) -> bool {
+        let ScopedTurnEvent::Runtime(event) = event else {
+            return false;
+        };
+        self.sender
+            .as_ref()
+            .is_none_or(|sender| sender.send(AgentRuntimeStreamItem::Event(event)).is_ok())
     }
 }
 
@@ -473,6 +498,10 @@ pub trait ToolExecutor: Send + Sync {
 /// Neutral adapter that prepares and invokes tools regardless of their transport.
 pub trait ToolInvoker: Send + Sync {
     /// Prepare one invocation without performing its side effects.
+    ///
+    /// Implementations must only inspect the request, opaque host context, and tool-owned state;
+    /// they must not mutate external state, start externally visible work, or require cleanup.
+    /// The runtime bounds this future by the configured preparation timeout and turn cancellation.
     fn prepare_tool<'a>(
         &'a self,
         tool: &'a RegisteredTool,
@@ -763,12 +792,56 @@ impl PermissionPolicy for AllowAllPolicy {
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     poll_interval: Duration,
+    turns: TurnScopeOwner,
+}
+
+struct ActiveRuntimeTurn {
+    owner: TurnScopeOwner,
+    scope: TurnScope,
+    terminal: bool,
+}
+
+impl ActiveRuntimeTurn {
+    fn new(
+        owner: TurnScopeOwner,
+        turn_id: impl Into<Arc<str>>,
+        events: Arc<dyn TurnEventSink>,
+    ) -> Self {
+        let scope = owner.begin_turn(turn_id, events, InvocationCapabilities::default());
+        Self {
+            owner,
+            scope,
+            terminal: false,
+        }
+    }
+
+    const fn scope(&self) -> &TurnScope {
+        &self.scope
+    }
+
+    fn complete(&mut self) -> bool {
+        let completed = self.owner.complete_turn(&self.scope);
+        self.terminal = completed;
+        completed
+    }
+}
+
+impl Drop for ActiveRuntimeTurn {
+    fn drop(&mut self) {
+        if self.terminal {
+            return;
+        }
+        let _ = self.owner.cancel_turn(&self.scope);
+        let _ = self.scope.control().mark_cancelled();
+        let _ = self.owner.release_terminal_turn(&self.scope);
+    }
 }
 
 impl Default for AgentRuntime {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_millis(50),
+            turns: TurnScopeOwner::new(),
         }
     }
 }
@@ -785,6 +858,37 @@ impl AgentRuntime {
     pub const fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
         self.poll_interval = poll_interval;
         self
+    }
+
+    /// Allocate and activate the runtime's next monotonic turn scope.
+    ///
+    /// Any prior runtime-owned scope is synchronously closed before this method returns.
+    #[must_use]
+    pub fn begin_turn_scope(
+        &self,
+        turn_id: impl Into<Arc<str>>,
+        events: Arc<dyn TurnEventSink>,
+        capabilities: InvocationCapabilities,
+    ) -> TurnScope {
+        self.turns.begin_turn(turn_id, events, capabilities)
+    }
+
+    /// Return the runtime's active turn generation, when one has been allocated.
+    #[must_use]
+    pub fn active_turn_generation(&self) -> Option<TurnGeneration> {
+        self.turns.active_generation()
+    }
+
+    /// Cancel a runtime-owned turn only if it is still active.
+    #[must_use]
+    pub fn cancel_turn_scope(&self, scope: &TurnScope) -> bool {
+        self.turns.cancel_turn(scope)
+    }
+
+    /// Complete and release a runtime-owned turn only if it is still active.
+    #[must_use]
+    pub fn complete_turn_scope(&self, scope: &TurnScope) -> bool {
+        self.turns.complete_turn(scope)
     }
 
     /// Execute a tool call through a catalog, policy, and executor.
@@ -918,14 +1022,19 @@ impl AgentRuntime {
         }
 
         let mut terminal = BTreeMap::<usize, Result<ToolExecutionOutput>>::new();
-        let prepared =
-            prepare_runtime_tool_batch(catalog, invoker, calls, host_context, scope, &mut terminal)
-                .await;
+        let prepared = prepare_runtime_tool_batch(
+            catalog,
+            invoker,
+            calls,
+            host_context,
+            Duration::from_millis(options.preparation_timeout_ms.get()),
+            scope,
+            &mut terminal,
+        )
+        .await;
 
         if !scope.control().accepts_normal_output() {
-            for call in &prepared {
-                terminal.insert(call.index, Err(RuntimeError::Cancelled));
-            }
+            insert_cancelled_calls(&mut terminal, &prepared);
             return Ok(ordered_batch_output(calls.len(), terminal));
         }
 
@@ -976,9 +1085,7 @@ impl AgentRuntime {
         }
 
         if !scope.control().accepts_normal_output() {
-            for call in &approved {
-                terminal.insert(call.index, Err(RuntimeError::Cancelled));
-            }
+            insert_cancelled_calls(&mut terminal, &approved);
             return Ok(ordered_batch_output(calls.len(), terminal));
         }
 
@@ -1042,6 +1149,7 @@ impl AgentRuntime {
         let options = ToolExecutionOptions {
             parallel: max_concurrency.get() > 1,
             max_concurrency,
+            ..ToolExecutionOptions::default()
         };
         let scope = TurnScope::without_events("legacy-tool-batch", TurnGeneration::new(0));
         self.execute_prepared_tool_batch(
@@ -1183,7 +1291,7 @@ impl AgentRuntime {
     where
         P: ModelProviderInvoker + 'static,
     {
-        let (sender, receiver) = mpsc::channel(64);
+        let (sender, receiver) = mpsc::unbounded_channel();
         let runtime = self.clone();
         tokio::spawn(async move {
             let mut provider = provider;
@@ -1194,21 +1302,29 @@ impl AgentRuntime {
                 Ok(response) => AgentRuntimeStreamItem::Finished(response),
                 Err(error) => AgentRuntimeStreamItem::Error(error),
             };
-            let _ = sender.send(item).await;
+            let _ = sender.send(item);
         });
         AgentRuntimeStream { receiver }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_text_turn_internal<P>(
         &self,
         provider: &mut P,
         request: AgentTurnRequest,
-        stream: Option<&mpsc::Sender<AgentRuntimeStreamItem>>,
+        stream: Option<&mpsc::UnboundedSender<AgentRuntimeStreamItem>>,
     ) -> Result<AgentTurnResponse>
     where
         P: ModelProviderInvoker,
     {
         let start = Instant::now();
+        let mut active_turn = ActiveRuntimeTurn::new(
+            self.turns.clone(),
+            "text-turn",
+            Arc::new(RuntimeStreamEventSink {
+                sender: stream.cloned(),
+            }),
+        );
         let model_request = model_turn_request(&request);
         let provider_plugin_id = request.provider_plugin_id.as_deref();
         let start_response = provider
@@ -1228,7 +1344,10 @@ impl AgentRuntime {
         let mut usage = None;
 
         let turn_started = AgentRuntimeEvent::TurnStarted;
-        if !emit_stream_event(stream, &turn_started).await {
+        if !active_turn
+            .scope()
+            .emit(ScopedTurnEvent::Runtime(turn_started.clone()))
+        {
             cancel_and_finish(
                 provider,
                 provider_plugin_id,
@@ -1241,6 +1360,16 @@ impl AgentRuntime {
         events.push(turn_started);
 
         loop {
+            if !active_turn.scope().accepts_work() {
+                cancel_and_finish(
+                    provider,
+                    provider_plugin_id,
+                    &cancel_request,
+                    &finish_request,
+                )
+                .await;
+                return Err(RuntimeError::Cancelled);
+            }
             if let Some(error) = terminal_control_error(
                 provider,
                 provider_plugin_id,
@@ -1261,7 +1390,10 @@ impl AgentRuntime {
             for event in poll.events {
                 match normalize_provider_event(event, &mut text, &mut usage)? {
                     EventDisposition::Continue(event) => {
-                        if !emit_stream_event(stream, &event).await {
+                        if !active_turn
+                            .scope()
+                            .emit(ScopedTurnEvent::Runtime(event.clone()))
+                        {
                             cancel_and_finish(
                                 provider,
                                 provider_plugin_id,
@@ -1279,10 +1411,16 @@ impl AgentRuntime {
                             .await?;
                         let finished_event =
                             finished_event(usage.as_ref(), start.elapsed(), stop_reason);
-                        if !emit_stream_event(stream, &finished_event).await {
+                        if !active_turn
+                            .scope()
+                            .emit(ScopedTurnEvent::Runtime(finished_event.clone()))
+                        {
                             return Err(RuntimeError::Cancelled);
                         }
                         events.push(finished_event);
+                        if !active_turn.complete() {
+                            return Err(RuntimeError::Cancelled);
+                        }
                         return Ok(AgentTurnResponse {
                             text,
                             stop_reason: Some(stop_reason),
@@ -1292,7 +1430,10 @@ impl AgentRuntime {
                         });
                     }
                     EventDisposition::Cancelled(event) => {
-                        if !emit_stream_event(stream, &event).await {
+                        if !active_turn
+                            .scope()
+                            .emit(ScopedTurnEvent::Runtime(event.clone()))
+                        {
                             return Err(RuntimeError::Cancelled);
                         }
                         events.push(event);
@@ -1314,19 +1455,6 @@ enum EventDisposition {
     Continue(AgentRuntimeEvent),
     Finished { stop_reason: StopReason },
     Cancelled(AgentRuntimeEvent),
-}
-
-async fn emit_stream_event(
-    stream: Option<&mpsc::Sender<AgentRuntimeStreamItem>>,
-    event: &AgentRuntimeEvent,
-) -> bool {
-    let Some(stream) = stream else {
-        return true;
-    };
-    stream
-        .send(AgentRuntimeStreamItem::Event(event.clone()))
-        .await
-        .is_ok()
 }
 
 async fn terminal_control_error<P>(
@@ -1381,11 +1509,23 @@ fn finished_event(
     }
 }
 
+fn insert_cancelled_calls(
+    terminal: &mut BTreeMap<usize, Result<ToolExecutionOutput>>,
+    calls: &[PreparedRuntimeToolCall],
+) {
+    terminal.extend(
+        calls
+            .iter()
+            .map(|call| (call.index, Err(RuntimeError::Cancelled))),
+    );
+}
+
 async fn prepare_runtime_tool_batch<C, I>(
     catalog: &C,
     invoker: &I,
     calls: &[ToolCall],
     host_context: &[bcode_tool::ToolHostContextEntry],
+    preparation_timeout: Duration,
     scope: &TurnScope,
     terminal: &mut BTreeMap<usize, Result<ToolExecutionOutput>>,
 ) -> Vec<PreparedRuntimeToolCall>
@@ -1414,7 +1554,12 @@ where
         let prepared_result = tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(RuntimeError::Cancelled),
-            result = preparation => result,
+            result = tokio::time::timeout(preparation_timeout, preparation) => result.unwrap_or_else(
+                |_| Err(RuntimeError::ToolPreparationTimeout {
+                    tool_name: call.name.clone(),
+                    timeout: preparation_timeout,
+                }),
+            ),
         };
         match prepared_result {
             Ok(preparation) => prepared.push(PreparedRuntimeToolCall {
@@ -1712,9 +1857,15 @@ mod tests {
     use super::*;
     use bcode_model::{ProviderTurnEvent, StopReason};
     use bcode_tool::{
-        ToolPolicyMetadata, ToolResourceAccess, ToolResourceClaim, ToolSideEffect, ToolUiMetadata,
+        ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolContributionEvent,
+        ToolContributionOperation, ToolContributionPersistence, ToolExchangeRequest,
+        ToolExchangeResolution, ToolExchangeResponsePolicy, ToolInvocationInput,
+        ToolInvocationInputResolution, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+        ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolPolicyMetadata,
+        ToolResourceAccess, ToolResourceClaim, ToolSideEffect, ToolUiMetadata,
     };
     use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
 
     struct FakeProvider {
@@ -2094,6 +2245,543 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct BlockingPreparationInvoker;
+
+    impl ToolInvoker for BlockingPreparationInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            Box::pin(std::future::pending())
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _invocation: &'a PreparedToolInvocation,
+            _scope: &'a InvocationScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            unreachable!("timed-out preparation must not invoke the tool")
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_timeout_is_a_per_call_terminal_outcome() {
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("blocked"));
+        let calls = [ToolCall {
+            id: "call".to_string(),
+            name: "blocked".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        let mut rounds = ToolRoundState::new(1);
+        let timeout = std::num::NonZeroU64::new(1).expect("one is non-zero");
+
+        let output = AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &BlockingPreparationInvoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions {
+                    preparation_timeout_ms: timeout,
+                    ..ToolExecutionOptions::default()
+                },
+                &TurnScope::without_events("turn", TurnGeneration::new(1)),
+            )
+            .await
+            .expect("batch orchestration should complete");
+
+        assert!(matches!(
+            &output.results[0],
+            Err(RuntimeError::ToolPreparationTimeout { tool_name, timeout: actual })
+                if tool_name == "blocked" && *actual == Duration::from_millis(timeout.get())
+        ));
+    }
+
+    #[derive(Debug, Default)]
+    struct DirectInvocationHost {
+        events: StdMutex<Vec<ScopedTurnEvent>>,
+        exchanges: AtomicUsize,
+        inputs: AtomicUsize,
+        services: AtomicUsize,
+        artifacts: AtomicUsize,
+    }
+
+    impl TurnEventSink for DirectInvocationHost {
+        fn emit(&self, event: ScopedTurnEvent) -> bool {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+            true
+        }
+    }
+
+    impl InvocationExchangeBroker for DirectInvocationHost {
+        fn request(
+            &self,
+            request: ToolExchangeRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution> {
+            self.exchanges.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"exchange_id": request.exchange_id}),
+                }
+            })
+        }
+    }
+
+    impl InvocationInputRouter for DirectInvocationHost {
+        fn receive(
+            &self,
+            invocation_id: &str,
+        ) -> InvocationCapabilityFuture<'_, ToolInvocationInputResolution> {
+            self.inputs.fetch_add(1, Ordering::SeqCst);
+            let invocation_id = invocation_id.to_string();
+            Box::pin(async move {
+                ToolInvocationInputResolution::Received {
+                    input: ToolInvocationInput {
+                        invocation_id,
+                        input_id: "input".to_string(),
+                        producer_id: "test-host".to_string(),
+                        schema: "test.input".to_string(),
+                        schema_version: 1,
+                        payload: serde_json::json!({"action": "continue"}),
+                    },
+                }
+            })
+        }
+    }
+
+    impl InvocationServiceRouter for DirectInvocationHost {
+        fn invoke(
+            &self,
+            request: ToolInvocationServiceRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolInvocationServiceResolution> {
+            self.services.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                ToolInvocationServiceResolution::Responded {
+                    payload: serde_json::json!({"operation": request.operation}),
+                }
+            })
+        }
+    }
+
+    impl InvocationArtifactSink for DirectInvocationHost {
+        fn write(
+            &self,
+            request: ToolArtifactWriteRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
+            self.artifacts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                ToolArtifactWriteResolution::Written {
+                    artifact_id: request.artifact_id,
+                    byte_len: u64::try_from(request.bytes.len()).unwrap_or(u64::MAX),
+                    reference: serde_json::json!({"stored": true}),
+                }
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct DirectCapabilityInvoker;
+
+    impl ToolInvoker for DirectCapabilityInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _request: &'a ToolPreparationRequest,
+            scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            Box::pin(async move {
+                assert!(scope.accepts_work());
+                Ok(ToolPreparationResponse {
+                    scheduling: ToolSchedulingContract::Concurrent { claims: Vec::new() },
+                    authorization: Vec::new(),
+                    descriptor: serde_json::json!({"prepared": true}),
+                })
+            })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            invocation: &'a PreparedToolInvocation,
+            scope: &'a InvocationScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            Box::pin(async move {
+                let invocation_id = invocation.invocation.invocation_id.clone();
+                assert!(scope.emit_lifecycle(ToolInvocationLifecycleEvent {
+                    invocation_id: invocation_id.clone(),
+                    sequence: 1,
+                    stage: ToolInvocationLifecycleStage::Started,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                }));
+                assert!(scope.emit_contribution(ToolContributionEvent {
+                    invocation_id: invocation_id.clone(),
+                    contribution_id: "contribution".to_string(),
+                    sequence: 1,
+                    producer_id: "direct-tool".to_string(),
+                    schema: "test.contribution".to_string(),
+                    schema_version: 1,
+                    operation: ToolContributionOperation::Upsert,
+                    persistence: ToolContributionPersistence::Transient,
+                    payload: serde_json::json!({"text": "working"}),
+                }));
+                assert!(matches!(
+                    scope
+                        .request_exchange(ToolExchangeRequest {
+                            invocation_id: invocation_id.clone(),
+                            exchange_id: "exchange".to_string(),
+                            producer_id: "direct-tool".to_string(),
+                            schema: "test.exchange".to_string(),
+                            schema_version: 1,
+                            payload: serde_json::json!({"prompt": "continue?"}),
+                            response_policy: ToolExchangeResponsePolicy::Required,
+                        })
+                        .await,
+                    ToolExchangeResolution::Responded { .. }
+                ));
+                assert!(matches!(
+                    scope.receive_input().await,
+                    ToolInvocationInputResolution::Received { .. }
+                ));
+                assert!(matches!(
+                    scope
+                        .invoke_service(ToolInvocationServiceRequest {
+                            invocation_id: invocation_id.clone(),
+                            request_id: "service".to_string(),
+                            interface_id: "test.service/v1".to_string(),
+                            operation: "execute".to_string(),
+                            payload: serde_json::Value::Null,
+                        })
+                        .await,
+                    ToolInvocationServiceResolution::Responded { .. }
+                ));
+                assert!(matches!(
+                    scope
+                        .write_artifact(ToolArtifactWriteRequest {
+                            invocation_id: invocation_id.clone(),
+                            artifact_id: "artifact".to_string(),
+                            content_type: "application/octet-stream".to_string(),
+                            bytes: vec![1, 2, 3],
+                            metadata: serde_json::Value::Null,
+                        })
+                        .await,
+                    ToolArtifactWriteResolution::Written { .. }
+                ));
+                assert!(scope.emit_lifecycle(ToolInvocationLifecycleEvent {
+                    invocation_id,
+                    sequence: 2,
+                    stage: ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                }));
+                Ok(ToolInvocationResponse {
+                    output: "direct capability invocation completed".to_string(),
+                    is_error: false,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_rust_tool_uses_every_neutral_invocation_capability() {
+        let host = Arc::new(DirectInvocationHost::default());
+        let runtime = AgentRuntime::new();
+        let scope = runtime.begin_turn_scope(
+            "turn",
+            host.clone(),
+            InvocationCapabilities::new(host.clone(), host.clone(), host.clone(), host.clone()),
+        );
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("direct"));
+        let calls = [ToolCall {
+            id: "call".to_string(),
+            name: "direct".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        let mut rounds = ToolRoundState::new(1);
+
+        let output = runtime
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &DirectCapabilityInvoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &scope,
+            )
+            .await
+            .expect("direct invocation should execute");
+
+        assert!(output.results[0].is_ok());
+        assert_eq!(host.exchanges.load(Ordering::SeqCst), 1);
+        assert_eq!(host.inputs.load(Ordering::SeqCst), 1);
+        assert_eq!(host.services.load(Ordering::SeqCst), 1);
+        assert_eq!(host.artifacts.load(Ordering::SeqCst), 1);
+        let events = host
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ScopedTurnEvent::InvocationLifecycle(_),
+                ScopedTurnEvent::Contribution(_),
+                ScopedTurnEvent::InvocationLifecycle(_)
+            ]
+        ));
+        drop(events);
+    }
+
+    #[derive(Debug)]
+    struct GatedExchangeBroker {
+        requests: AtomicUsize,
+        permits: tokio::sync::Semaphore,
+    }
+
+    impl Default for GatedExchangeBroker {
+        fn default() -> Self {
+            Self {
+                requests: AtomicUsize::new(0),
+                permits: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl InvocationExchangeBroker for GatedExchangeBroker {
+        fn request(
+            &self,
+            request: ToolExchangeRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                self.permits
+                    .acquire()
+                    .await
+                    .expect("test semaphore should remain open")
+                    .forget();
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"exchange_id": request.exchange_id}),
+                }
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ExchangeWaitingInvoker {
+        started: AtomicUsize,
+    }
+
+    impl ToolInvoker for ExchangeWaitingInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            Box::pin(async {
+                Ok(ToolPreparationResponse {
+                    scheduling: ToolSchedulingContract::Concurrent { claims: Vec::new() },
+                    authorization: Vec::new(),
+                    descriptor: serde_json::Value::Null,
+                })
+            })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            invocation: &'a PreparedToolInvocation,
+            scope: &'a InvocationScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let resolution = scope
+                    .request_exchange(ToolExchangeRequest {
+                        invocation_id: invocation.invocation.invocation_id.clone(),
+                        exchange_id: "exchange".to_string(),
+                        producer_id: "direct-tool".to_string(),
+                        schema: "test.exchange".to_string(),
+                        schema_version: 1,
+                        payload: serde_json::Value::Null,
+                        response_policy: ToolExchangeResponsePolicy::Required,
+                    })
+                    .await;
+                assert!(matches!(
+                    resolution,
+                    ToolExchangeResolution::Responded { .. }
+                ));
+                Ok(ToolInvocationResponse {
+                    output: invocation.invocation.tool_name.clone(),
+                    is_error: false,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_wait_retains_scheduler_concurrency_slot() {
+        let broker = Arc::new(GatedExchangeBroker::default());
+        let host = Arc::new(DirectInvocationHost::default());
+        let invoker = Arc::new(ExchangeWaitingInvoker::default());
+        let runtime = Arc::new(AgentRuntime::new());
+        let catalog = Arc::new(
+            UnifiedToolCatalog::new()
+                .with_inline_tool(tool_definition("first"))
+                .with_inline_tool(tool_definition("second")),
+        );
+        let calls = vec![
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let scope = runtime.begin_turn_scope(
+            "turn",
+            Arc::new(RuntimeStreamEventSink { sender: None }),
+            InvocationCapabilities::new(broker.clone(), host.clone(), host.clone(), host),
+        );
+        let task_runtime = runtime.clone();
+        let task_catalog = catalog.clone();
+        let task_invoker = invoker.clone();
+        let task_scope = scope.clone();
+        let execution = tokio::spawn(async move {
+            let mut rounds = ToolRoundState::new(1);
+            task_runtime
+                .execute_prepared_tool_batch(
+                    task_catalog.as_ref(),
+                    &AllowBatchAuthorization::default(),
+                    task_invoker.as_ref(),
+                    &calls,
+                    &mut rounds,
+                    &RuntimePermissionContext::default(),
+                    ToolExecutionOptions {
+                        max_concurrency: std::num::NonZeroUsize::MIN,
+                        ..ToolExecutionOptions::default()
+                    },
+                    &task_scope,
+                )
+                .await
+        });
+
+        wait_for_atomic_value(&invoker.started, 1).await;
+        assert_eq!(broker.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 1);
+        broker.permits.add_permits(1);
+        wait_for_atomic_value(&invoker.started, 2).await;
+        assert_eq!(broker.requests.load(Ordering::SeqCst), 2);
+        broker.permits.add_permits(1);
+
+        let output = execution
+            .await
+            .expect("execution task should not panic")
+            .expect("batch should complete");
+        assert!(output.results.iter().all(Result::is_ok));
+    }
+
+    #[tokio::test]
+    async fn cancelling_exchange_wait_terminates_scheduler_without_starting_queued_sibling() {
+        let broker = Arc::new(GatedExchangeBroker::default());
+        let host = Arc::new(DirectInvocationHost::default());
+        let invoker = Arc::new(ExchangeWaitingInvoker::default());
+        let runtime = Arc::new(AgentRuntime::new());
+        let catalog = Arc::new(
+            UnifiedToolCatalog::new()
+                .with_inline_tool(tool_definition("first"))
+                .with_inline_tool(tool_definition("second")),
+        );
+        let calls = vec![
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let scope = runtime.begin_turn_scope(
+            "turn",
+            Arc::new(RuntimeStreamEventSink { sender: None }),
+            InvocationCapabilities::new(broker.clone(), host.clone(), host.clone(), host),
+        );
+        let task_runtime = runtime.clone();
+        let task_catalog = catalog.clone();
+        let task_invoker = invoker.clone();
+        let task_scope = scope.clone();
+        let execution = tokio::spawn(async move {
+            let mut rounds = ToolRoundState::new(1);
+            task_runtime
+                .execute_prepared_tool_batch(
+                    task_catalog.as_ref(),
+                    &AllowBatchAuthorization::default(),
+                    task_invoker.as_ref(),
+                    &calls,
+                    &mut rounds,
+                    &RuntimePermissionContext::default(),
+                    ToolExecutionOptions {
+                        max_concurrency: std::num::NonZeroUsize::MIN,
+                        ..ToolExecutionOptions::default()
+                    },
+                    &task_scope,
+                )
+                .await
+        });
+
+        wait_for_atomic_value(&invoker.started, 1).await;
+        assert!(runtime.cancel_turn_scope(&scope));
+        let output = tokio::time::timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("cancelled scheduler should terminate")
+            .expect("execution task should not panic")
+            .expect("batch orchestration should return ordered outcomes");
+
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 1);
+        assert_eq!(broker.requests.load(Ordering::SeqCst), 1);
+        assert!(
+            output
+                .results
+                .iter()
+                .all(|result| matches!(result, Err(RuntimeError::Cancelled)))
+        );
+    }
+
+    async fn wait_for_atomic_value(value: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while value.load(Ordering::SeqCst) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("atomic value should reach expected count");
+    }
+
+    #[derive(Debug, Default)]
     struct HostContextInvoker {
         observed: std::sync::Mutex<Vec<bcode_tool::ToolHostContextEntry>>,
     }
@@ -2210,6 +2898,7 @@ mod tests {
                 ToolExecutionOptions {
                     parallel: true,
                     max_concurrency: std::num::NonZeroUsize::new(2).expect("two is non-zero"),
+                    ..ToolExecutionOptions::default()
                 },
                 &TurnScope::without_events("turn", TurnGeneration::new(14)),
             )
@@ -2376,6 +3065,7 @@ mod tests {
                 ToolExecutionOptions {
                     parallel: false,
                     max_concurrency: std::num::NonZeroUsize::new(8).expect("eight is non-zero"),
+                    ..ToolExecutionOptions::default()
                 },
                 &TurnScope::without_events("turn", TurnGeneration::new(12)),
             )
@@ -2650,6 +3340,7 @@ mod tests {
             ToolExecutionOptions {
                 parallel: true,
                 max_concurrency: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+                ..ToolExecutionOptions::default()
             },
             &scope,
         );
@@ -2937,6 +3628,47 @@ mod tests {
         assert!(saw_projection);
         assert!(saw_metadata);
         assert!(saw_retry);
+    }
+
+    #[tokio::test]
+    async fn newer_runtime_text_turn_supersedes_blocked_older_turn() {
+        let runtime = AgentRuntime::new().with_poll_interval(Duration::from_millis(1));
+        let mut first = runtime.run_streaming_text_turn(
+            FakeProvider::new([]),
+            AgentTurnRequest::new("test-model", "first"),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut second = runtime.run_streaming_text_turn(
+            FakeProvider::new([ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            }]),
+            AgentTurnRequest::new("test-model", "second"),
+        );
+
+        let first_terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(item) = first.next().await {
+                if matches!(item, AgentRuntimeStreamItem::Error(RuntimeError::Cancelled)) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("superseded turn should terminate");
+        let second_terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(item) = second.next().await {
+                if matches!(item, AgentRuntimeStreamItem::Finished(_)) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("newer turn should complete");
+
+        assert!(first_terminal);
+        assert!(second_terminal);
+        assert_eq!(runtime.active_turn_generation(), None);
     }
 
     #[tokio::test]
