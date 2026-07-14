@@ -39,6 +39,7 @@ use super::{
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 const PERMISSION_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const SESSION_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PERMISSION_POLL_DAEMON_DOWN_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,7 @@ struct ChatLoopState {
     daemon_connection: DaemonConnectionMonitor,
     permission_dialog: Option<PermissionDialogState>,
     permission_poll: PermissionPollSchedule,
+    next_session_status_poll_at: Instant,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     interactive_surface: Option<InteractiveSurfaceState>,
@@ -136,6 +138,7 @@ impl ChatLoopState {
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             permission_poll: PermissionPollSchedule::new(Instant::now()),
+            next_session_status_poll_at: Instant::now(),
             thinking_dialog: None,
             timeline_dialog: None,
             interactive_surface: None,
@@ -170,6 +173,18 @@ impl ChatLoopState {
     fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: DaemonObservation) {
         if let Some(state) = self.daemon_connection.observe(observation) {
             chat.app.set_daemon_connection(state);
+        }
+    }
+
+    fn maybe_start_session_status_poll(&mut self, chat: &ActiveChat) {
+        let Some(session_id) = chat.session_id else {
+            return;
+        };
+        if Instant::now() < self.next_session_status_poll_at {
+            return;
+        }
+        if self.start_effect(TuiEffect::LoadSessionStatus { session_id }) {
+            self.next_session_status_poll_at = Instant::now() + SESSION_STATUS_POLL_INTERVAL;
         }
     }
 
@@ -448,6 +463,7 @@ async fn handle_loop_housekeeping(
     needs_redraw |= maybe_start_older_history_load(chat, loop_state);
     needs_redraw |= maybe_start_newer_history_load(chat, loop_state);
     loop_state.maybe_start_permission_poll(chat);
+    loop_state.maybe_start_session_status_poll(chat);
     needs_redraw
 }
 
