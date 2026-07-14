@@ -621,6 +621,10 @@ fn prepare_agent_daemon_isolation(
         EnvVarGuard::set_path("BCODE_AUTH_VAULT", &auth_vault),
         EnvVarGuard::set_path("BCODE_SOCKET", &socket),
         EnvVarGuard::set_value(bcode_ipc::BCODE_IPC_ENDPOINT_ENV, endpoint_value),
+        EnvVarGuard::set_value(
+            bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV,
+            bcode_ipc::daemon_namespace(),
+        ),
     ])
 }
 

@@ -550,6 +550,10 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             let mut child = tokio::process::Command::new(exe)
                 .args(["server", "run"])
                 .env(endpoint_env_name, endpoint_env_value)
+                .env(
+                    bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV,
+                    bcode_ipc::daemon_namespace(),
+                )
                 .env("BCODE_DAEMON_LOG", &log_path)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(log_file))

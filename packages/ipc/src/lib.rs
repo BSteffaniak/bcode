@@ -1996,6 +1996,9 @@ fn prepare_unix_socket_path_for_bind(path: &Path) -> Result<(), IpcTransportErro
 /// Environment variable carrying an encoded local IPC endpoint for child processes.
 pub const BCODE_IPC_ENDPOINT_ENV: &str = "BCODE_IPC_ENDPOINT";
 
+/// Environment variable identifying the build namespace that supplied an IPC endpoint override.
+pub const BCODE_IPC_ENDPOINT_NAMESPACE_ENV: &str = "BCODE_IPC_ENDPOINT_NAMESPACE";
+
 /// Serialize an IPC endpoint for process environment propagation.
 ///
 /// # Errors
@@ -2034,14 +2037,16 @@ pub fn daemon_namespace() -> String {
 /// Return the default local IPC endpoint.
 #[must_use]
 pub fn default_endpoint() -> IpcEndpoint {
-    if let Ok(value) = env::var(BCODE_IPC_ENDPOINT_ENV)
+    let endpoint_override_allowed = endpoint_override_allowed_for_current_process();
+    if endpoint_override_allowed
+        && let Ok(value) = env::var(BCODE_IPC_ENDPOINT_ENV)
         && let Ok(endpoint) = endpoint_from_env_value(&value)
     {
         return endpoint;
     }
     #[cfg(unix)]
     {
-        IpcEndpoint::unix_socket(default_socket_path())
+        IpcEndpoint::unix_socket(default_socket_path(endpoint_override_allowed))
     }
     #[cfg(windows)]
     {
@@ -2050,9 +2055,27 @@ pub fn default_endpoint() -> IpcEndpoint {
     }
 }
 
+fn endpoint_override_allowed_for_current_process() -> bool {
+    let current_namespace = daemon_namespace();
+    let inherited_namespace = env::var(BCODE_IPC_ENDPOINT_NAMESPACE_ENV).ok();
+    endpoint_override_allowed(
+        inherited_namespace.as_deref(),
+        env::var_os("BCODE_DAEMON_LOG").is_some(),
+        &current_namespace,
+    )
+}
+
+fn endpoint_override_allowed(
+    inherited_namespace: Option<&str>,
+    daemon_context: bool,
+    current_namespace: &str,
+) -> bool {
+    inherited_namespace.map_or(!daemon_context, |namespace| namespace == current_namespace)
+}
+
 #[cfg(unix)]
-fn default_socket_path() -> PathBuf {
-    if let Ok(path) = env::var("BCODE_SOCKET") {
+fn default_socket_path(endpoint_override_allowed: bool) -> PathBuf {
+    if endpoint_override_allowed && let Ok(path) = env::var("BCODE_SOCKET") {
         return PathBuf::from(path);
     }
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
@@ -2070,6 +2093,18 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn endpoint_override_rejects_stale_daemon_context() {
+        assert!(!endpoint_override_allowed(None, true, "current"));
+        assert!(!endpoint_override_allowed(
+            Some("previous"),
+            true,
+            "current"
+        ));
+        assert!(endpoint_override_allowed(Some("current"), true, "current"));
+        assert!(endpoint_override_allowed(None, false, "current"));
+    }
 
     #[test]
     fn ipc_v1_golden_fixtures_decode_to_expected_payloads() {
