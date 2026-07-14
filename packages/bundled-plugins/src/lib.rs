@@ -284,6 +284,18 @@ mod tests {
                 &contribution.action,
                 bcode_command::CommandAction::Plugin { plugin_id, .. } if plugin_id == "bcode.loop"
             )));
+        assert!(
+            host.registered_command_contributions(&bcode_command::CommandSurface::Slash)
+                .iter()
+                .any(|contribution| {
+                    contribution.id == "loop"
+                        && matches!(
+                            &contribution.action,
+                            bcode_command::CommandAction::Plugin { plugin_id, .. }
+                                if plugin_id == "bcode.loop"
+                        )
+                })
+        );
 
         let selection = bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::All,

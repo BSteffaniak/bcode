@@ -2,6 +2,7 @@
 
 use super::slash_registry;
 use bcode_client::BcodeClient;
+use bcode_command::{CommandContribution, CommandSurface};
 use bcode_session_models::SessionId;
 
 /// Slash completion picker.
@@ -206,6 +207,9 @@ async fn slash_items(
         thinking_items(parts[1], status.reasoning.as_ref())
     } else {
         let mut items = static_items();
+        if let Ok(contributions) = client.plugin_contributions().await {
+            items.extend(plugin_slash_items(contributions.command_contributions));
+        }
         if let Ok(skills) = client.list_skills().await {
             items.extend(skills.skills.into_iter().filter_map(|skill| {
                 slash_registry::is_non_conflicting_skill_alias(&skill.id).then(|| {
@@ -311,6 +315,22 @@ fn normalize(value: &str) -> String {
         .join(" ")
 }
 
+fn plugin_slash_items(
+    contributions: impl IntoIterator<Item = CommandContribution>,
+) -> Vec<SlashItem> {
+    contributions
+        .into_iter()
+        .filter(|contribution| contribution.supports_surface(&CommandSurface::Slash))
+        .filter(|contribution| !slash_registry::is_builtin_command_name(&contribution.id))
+        .map(|contribution| {
+            let description = contribution
+                .description
+                .unwrap_or_else(|| contribution.title.clone());
+            item(format!("/{}", contribution.id), description)
+        })
+        .collect()
+}
+
 fn static_items() -> Vec<SlashItem> {
     slash_registry::static_completions()
         .iter()
@@ -328,7 +348,51 @@ fn item(command: impl Into<String>, description: impl Into<String>) -> SlashItem
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_items, static_items};
+    use super::{filter_items, plugin_slash_items, static_items};
+    use bcode_command::{
+        CommandAction, CommandContribution, CommandExecution, CommandOwner, CommandSurface,
+    };
+    use std::collections::BTreeSet;
+
+    fn contribution(id: &str, surfaces: BTreeSet<CommandSurface>) -> CommandContribution {
+        CommandContribution {
+            id: id.to_owned(),
+            title: "Loop".to_owned(),
+            description: Some("Start a deterministic prompt loop".to_owned()),
+            category: Some("automation".to_owned()),
+            surfaces,
+            execution: CommandExecution::Immediate,
+            owner: CommandOwner::Plugin {
+                plugin_id: "bcode.loop".to_owned(),
+            },
+            action: CommandAction::Plugin {
+                plugin_id: "bcode.loop".to_owned(),
+                command_id: id.to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn plugin_slash_contributions_are_visible_and_selectable() {
+        let items = plugin_slash_items([contribution(
+            "loop",
+            BTreeSet::from([CommandSurface::Slash, CommandSurface::Palette]),
+        )]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].command(), "/loop");
+        assert_eq!(items[0].description(), "Start a deterministic prompt loop");
+    }
+
+    #[test]
+    fn non_slash_and_conflicting_plugin_contributions_are_hidden() {
+        let items = plugin_slash_items([
+            contribution("loop", BTreeSet::from([CommandSurface::Palette])),
+            contribution("new", BTreeSet::from([CommandSurface::Slash])),
+        ]);
+
+        assert!(items.is_empty());
+    }
 
     #[test]
     fn ranks_exact_matches_before_prefix_and_fuzzy_matches() {

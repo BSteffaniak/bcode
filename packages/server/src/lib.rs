@@ -17218,10 +17218,18 @@ async fn handle_list_plugin_contributions(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let contributions = PluginContributions {
-        command_contributions: state
+    let mut command_contributions = state
+        .plugins
+        .registered_command_contributions(&bcode_command::CommandSurface::Palette);
+    command_contributions.extend(
+        state
             .plugins
-            .registered_command_contributions(&bcode_command::CommandSurface::Palette),
+            .registered_command_contributions(&bcode_command::CommandSurface::Slash),
+    );
+    command_contributions.sort_by(|left, right| left.id.cmp(&right.id));
+    command_contributions.dedup_by(|left, right| left.id == right.id);
+    let contributions = PluginContributions {
+        command_contributions,
         commands: state.plugins.command_contributions(),
         config_extensions: state.plugins.config_extensions(),
     };
