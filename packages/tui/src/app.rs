@@ -4861,6 +4861,130 @@ mod tests {
     }
 
     #[test]
+    fn next_provider_round_advances_estimate_and_accepts_only_its_exact_usage() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        let first_estimate = usage_snapshot(bcode_session_models::ContextUsageSource::Estimated);
+        app.apply_session_event(
+            &context_event(
+                2,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: first_estimate.clone(),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        let mut first_exact = first_estimate.clone();
+        first_exact.source = bcode_session_models::ContextUsageSource::Provider;
+        first_exact.input_tokens = 2_400;
+        app.apply_session_event(
+            &context_event(
+                3,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: first_exact,
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+
+        let mut next_estimate = first_estimate;
+        next_estimate.input_tokens = 3_200;
+        next_estimate.request_id = Some("request-round-2".to_string());
+        next_estimate.request_fingerprint = Some("fingerprint-round-2".to_string());
+        next_estimate.round = Some(1);
+        app.apply_session_event(
+            &context_event(
+                4,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: next_estimate.clone(),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.token_usage.pending_context_input_tokens, Some(3_200));
+        assert_eq!(app.context_usage_sequence, Some(4));
+
+        let mut stale_exact = next_estimate.clone();
+        stale_exact.source = bcode_session_models::ContextUsageSource::Provider;
+        stale_exact.input_tokens = 2_600;
+        stale_exact.request_id = Some("request".to_string());
+        stale_exact.request_fingerprint = Some("fingerprint".to_string());
+        app.apply_session_event(
+            &context_event(
+                5,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: stale_exact,
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.token_usage.pending_context_input_tokens, Some(3_200));
+        assert_eq!(app.context_usage_sequence, Some(4));
+
+        next_estimate.source = bcode_session_models::ContextUsageSource::Provider;
+        next_estimate.input_tokens = 3_100;
+        app.apply_session_event(
+            &context_event(
+                6,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: next_estimate,
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(3_100));
+        assert_eq!(app.token_usage.pending_context_input_tokens, None);
+        assert!(!app.token_usage.context_usage_estimated);
+        assert_eq!(app.context_usage_sequence, Some(6));
+    }
+
+    #[test]
+    fn provider_without_exact_usage_keeps_latest_round_estimate() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        let mut estimate = usage_snapshot(bcode_session_models::ContextUsageSource::Estimated);
+        estimate.input_tokens = 3_200;
+        estimate.round = Some(1);
+        app.apply_session_event(
+            &context_event(
+                2,
+                SessionEventKind::ContextUsageObserved { snapshot: estimate },
+            ),
+            SessionEventApplication::Live,
+        );
+        app.apply_session_event(
+            &context_event(
+                3,
+                SessionEventKind::ModelUsage {
+                    turn_id: "turn".to_string(),
+                    usage: bcode_session_models::SessionTokenUsage {
+                        input_tokens: Some(2_500),
+                        total_tokens: Some(2_600),
+                        ..bcode_session_models::SessionTokenUsage::default()
+                    },
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(3_200));
+        assert!(app.token_usage.context_usage_estimated);
+        assert_eq!(app.context_usage_sequence, Some(2));
+    }
+
+    #[test]
     fn model_usage_updates_spending_without_replacing_context_occupancy() {
         let mut meter = TokenUsageMeter {
             context_window: Some(400_000),
@@ -4952,6 +5076,35 @@ mod tests {
     }
 
     #[test]
+    fn bounded_status_reattach_matches_replayed_latest_context_usage() {
+        let mut snapshot = usage_snapshot(bcode_session_models::ContextUsageSource::Estimated);
+        snapshot.input_tokens = 3_200;
+        let events = vec![
+            context_event(
+                1,
+                SessionEventKind::ModelChanged {
+                    provider: "provider".to_string(),
+                    model: "model".to_string(),
+                },
+            ),
+            context_event(2, SessionEventKind::ContextUsageObserved { snapshot }),
+        ];
+        let replayed = BmuxApp::new_with_history(None, &events, &[], false);
+        let mut reattached = BmuxApp::new_with_history(None, &[], &[], false);
+        reattached.apply_model_status(model_status_with_context(3_200, "estimated", 2));
+
+        assert_eq!(
+            reattached.token_usage.latest_context_input_tokens,
+            replayed.token_usage.latest_context_input_tokens
+        );
+        assert_eq!(
+            reattached.token_usage.context_usage_estimated,
+            replayed.token_usage.context_usage_estimated
+        );
+        assert_eq!(reattached.context_usage_sequence, Some(2));
+    }
+
+    #[test]
     fn live_and_replay_context_semantics_are_equivalent() {
         let events = vec![
             context_event(
@@ -5026,6 +5179,56 @@ mod tests {
             .join("\n");
         assert!(!rendered.contains("opaque-secret"));
         assert!(!rendered.contains("portable-secret"));
+    }
+
+    #[test]
+    fn context_usage_rebuilds_after_compaction_boundary() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        app.apply_session_event(
+            &context_event(
+                2,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Estimated),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        app.apply_session_event(
+            &context_event(
+                3,
+                SessionEventKind::ContextCompacted {
+                    summary: "summary".to_string(),
+                    compacted_through_sequence: 2,
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.token_usage.latest_context_input_tokens, None);
+        assert_eq!(app.context_usage_sequence, None);
+
+        let mut rebuilt = usage_snapshot(bcode_session_models::ContextUsageSource::Estimated);
+        rebuilt.input_tokens = 1_200;
+        rebuilt.context_through_sequence = 3;
+        rebuilt.request_id = Some("after-compaction".to_string());
+        rebuilt.request_fingerprint = Some("after-compaction-fingerprint".to_string());
+        app.apply_session_event(
+            &context_event(
+                4,
+                SessionEventKind::ContextUsageObserved { snapshot: rebuilt },
+            ),
+            SessionEventApplication::Live,
+        );
+
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(1_200));
+        assert!(app.token_usage.context_usage_estimated);
+        assert_eq!(app.context_usage_sequence, Some(4));
     }
 
     #[test]
