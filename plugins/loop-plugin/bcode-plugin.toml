@@ -8,6 +8,12 @@ description  = "Prompt loop commands"
 interface_id = "bcode.command/v1"
 name         = "Loop Commands"
 
+[[services]]
+class        = "service"
+description  = "Active prompt loop session status"
+interface_id = "bcode.session-status/v1"
+name         = "Loop Session Status"
+
 [[tui_surfaces]]
 description = "Configure and start a deterministic prompt loop"
 kind        = "loop.start"

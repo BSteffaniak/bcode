@@ -16,6 +16,41 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+/// Versioned interface for plugin-owned active session status contributions.
+pub const SESSION_STATUS_INTERFACE_ID: &str = "bcode.session-status/v1";
+/// Operation used to query one plugin's status contribution for a session.
+pub const OP_SESSION_STATUS: &str = "session_status";
+
+/// Request for a plugin-owned active session status contribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStatusRequest {
+    /// Session whose active status is requested.
+    pub session_id: bcode_session_models::SessionId,
+}
+
+/// Renderer-neutral active status supplied by a plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStatusContribution {
+    /// Stable contribution identity within the plugin.
+    pub contribution_id: String,
+    /// Compact text suitable for display near the composer.
+    pub text: String,
+    /// Lower values are retained before higher values in constrained layouts.
+    #[serde(default)]
+    pub priority: u16,
+    /// Plugin-owned structured detail for richer hosts and diagnostics.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Response containing a contribution only while it should occupy active status UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStatusResponse {
+    /// Active contribution, or `None` when stale/terminal status must be removed.
+    #[serde(default)]
+    pub contribution: Option<SessionStatusContribution>,
+}
+
 /// ABI-safe callback used by plugins to register command contributions during activation.
 pub type CommandRegistrationCallback = extern "C" fn(*const u8, usize, *mut c_void);
 

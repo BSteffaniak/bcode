@@ -58,6 +58,20 @@ impl RustPlugin for LoopPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == bcode_plugin_sdk::SESSION_STATUS_INTERFACE_ID
+            && context.request.operation == bcode_plugin_sdk::OP_SESSION_STATUS
+        {
+            let request = match context
+                .request
+                .payload_json::<bcode_plugin_sdk::SessionStatusRequest>()
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    return ServiceResponse::error("invalid_request", error.to_string());
+                }
+            };
+            return json_response(&session_status_response(request.session_id));
+        }
         if context.request.interface_id != COMMAND_INTERFACE_ID
             || context.request.operation != OP_INVOKE_COMMAND
         {
@@ -118,6 +132,60 @@ fn command(id: &str, title: &str, description: &str, slash: bool) -> CommandCont
             plugin_id: PLUGIN_ID.to_owned(),
             command_id: id.to_owned(),
         },
+    }
+}
+
+fn active_status_contribution(
+    state: &LoopState,
+    pending_steering: u32,
+) -> Option<bcode_plugin_sdk::SessionStatusContribution> {
+    if state.state.is_terminal() {
+        return None;
+    }
+    let reason = state.stop_reason.clone();
+    let mut metadata = std::collections::BTreeMap::from([
+        ("run_id".to_owned(), serde_json::json!(state.run_id)),
+        (
+            "phase".to_owned(),
+            serde_json::json!(format!("{:?}", state.state)),
+        ),
+        (
+            "iteration".to_owned(),
+            serde_json::json!(state.current_iteration),
+        ),
+        ("limit".to_owned(), serde_json::json!(state.max_iterations)),
+        (
+            "queued_steering".to_owned(),
+            serde_json::json!(pending_steering),
+        ),
+    ]);
+    if let Some(reason) = &reason {
+        metadata.insert("reason".to_owned(), serde_json::json!(reason));
+    }
+    let mut text = format!(
+        "Loop active · {}/{} · {:?} · steering {} · normal messages steer before the next iteration",
+        state.current_iteration, state.max_iterations, state.state, pending_steering
+    );
+    if let Some(reason) = reason {
+        text.push_str(" · ");
+        text.push_str(&reason);
+    }
+    Some(bcode_plugin_sdk::SessionStatusContribution {
+        contribution_id: "active-loop".to_owned(),
+        text,
+        priority: 20,
+        metadata,
+    })
+}
+
+fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionStatusResponse {
+    let Ok(Some(state)) = load_state_result(session_id) else {
+        return bcode_plugin_sdk::SessionStatusResponse::default();
+    };
+    let pending_steering = automation_snapshot_blocking(session_id)
+        .map_or(0, |snapshot| snapshot.pending_steering_messages);
+    bcode_plugin_sdk::SessionStatusResponse {
+        contribution: active_status_contribution(&state, pending_steering),
     }
 }
 
@@ -2118,6 +2186,35 @@ mod tests {
             );
             assert!(prepare_steering_resume(&mut state).is_err());
             assert_eq!(state.state, terminal);
+        }
+    }
+
+    #[test]
+    fn active_session_status_is_plugin_owned_and_terminal_states_remove_it() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            3,
+        );
+        state.current_iteration = 1;
+        state.state = RunState::RunningIteration;
+        let contribution = active_status_contribution(&state, 2).expect("active status");
+        assert!(contribution.text.contains("Loop active"));
+        assert!(contribution.text.contains("normal messages steer"));
+        assert_eq!(contribution.metadata["iteration"], serde_json::json!(1));
+        assert_eq!(
+            contribution.metadata["queued_steering"],
+            serde_json::json!(2)
+        );
+
+        for terminal in [
+            RunState::Completed,
+            RunState::LimitReached,
+            RunState::Canceled,
+        ] {
+            state.state = terminal;
+            assert!(active_status_contribution(&state, 0).is_none());
         }
     }
 
