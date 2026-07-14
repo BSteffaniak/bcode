@@ -6686,6 +6686,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
+        SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::PluginAutomationTurnStarted { .. } => "plugin_automation_turn_started",
         SessionEventKind::PluginAutomationTurnFinished { .. } => "plugin_automation_turn_finished",
     }
@@ -7224,6 +7225,9 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             "#{} Ralph {kind} for {loop_name}: {message}",
             event.sequence
         ),
+        SessionEventKind::PluginStatusNote {
+            plugin_id, text, ..
+        } => println!("#{} plugin status {plugin_id}: {text}", event.sequence),
         SessionEventKind::PluginAutomationTurnStarted {
             plugin_id,
             operation_id,

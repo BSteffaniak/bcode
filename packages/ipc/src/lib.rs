@@ -438,6 +438,8 @@ pub enum Request {
     SubmitPluginAutomationTurn(PluginAutomationTurnRequest),
     /// Look up a previously submitted plugin automation operation.
     LookupPluginAutomationOperation(PluginAutomationOperationLookupRequest),
+    /// Persist one idempotent plugin-owned status note in session history.
+    RecordPluginStatusNote(PluginStatusNoteRequest),
     /// Acquire or release one generic interactive automation hold.
     SetPluginAutomationHold(PluginAutomationHoldRequest),
 }
@@ -624,6 +626,18 @@ pub enum PluginAutomationTurnDisposition {
     },
     SessionBusy,
     AutomationHeld,
+}
+
+/// Request to persist one idempotent plugin-owned session status note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStatusNoteRequest {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    /// Stable note identity within the plugin/session.
+    pub note_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 /// Request to acquire or release a generic interactive automation hold.
@@ -1266,6 +1280,10 @@ pub enum ResponsePayload {
     RalphRunResumed(RalphResumeResponse),
     RalphRunApproved(RalphRunResponse),
     RalphRunStatus(RalphRunStatusResponse),
+    PluginStatusNoteRecorded {
+        event: SessionEvent,
+        created: bool,
+    },
     RalphLifecycleRecorded {
         event: SessionEvent,
     },

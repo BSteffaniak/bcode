@@ -1126,6 +1126,13 @@ fn non_streaming_transcript_item_from_event(
             TranscriptItem::new("System", text.clone())
                 .with_event_metadata(event.sequence, event.timestamp_ms),
         ),
+        SessionEventKind::PluginStatusNote {
+            plugin_id, text, ..
+        } => Some(
+            TranscriptItem::new("Plugin", text.clone())
+                .with_display_label(plugin_id.clone())
+                .with_event_metadata(event.sequence, event.timestamp_ms),
+        ),
         SessionEventKind::WorkingDirectoryChanged {
             old_working_directory,
             new_working_directory,
@@ -1530,6 +1537,29 @@ mod tests {
         assert_eq!(items[0].text(), "automated prompt");
         assert_eq!(items[1].display_role(), "You");
         assert_eq!(items[1].text(), "manual steering");
+    }
+
+    #[test]
+    fn plugin_status_note_projects_as_compact_plugin_transcript_item() {
+        let session_id = bcode_session_models::SessionId::new();
+        let events = [SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::PluginStatusNote {
+                plugin_id: "bcode.loop".to_owned(),
+                note_id: "run-1:lifecycle:Completed".to_owned(),
+                text: "Loop completed · evaluator accepted: done".to_owned(),
+                metadata: std::collections::BTreeMap::new(),
+            },
+        }];
+
+        let items = transcript_items_from_events_with_reasoning(&events, false);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_role(), "Plugin · bcode.loop");
+        assert_eq!(items[0].text(), "Loop completed · evaluator accepted: done");
     }
 
     #[test]

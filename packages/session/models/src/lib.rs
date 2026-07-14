@@ -1825,6 +1825,14 @@ pub enum SessionEventKind {
     ContextUsageObserved {
         snapshot: ContextUsageSnapshot,
     },
+    /// Compact plugin-owned status note; presentation-only and excluded from model context.
+    PluginStatusNote {
+        plugin_id: String,
+        note_id: String,
+        text: String,
+        #[serde(default)]
+        metadata: BTreeMap<String, serde_json::Value>,
+    },
     /// Durable generic origin marker for plugin-submitted automation.
     PluginAutomationTurnStarted {
         plugin_id: String,

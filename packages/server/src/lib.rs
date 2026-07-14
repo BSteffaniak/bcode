@@ -2136,6 +2136,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::PluginAutomationSnapshot(_) => "plugin_automation_snapshot",
         Request::SubmitPluginAutomationTurn(_) => "submit_plugin_automation_turn",
         Request::LookupPluginAutomationOperation(_) => "lookup_plugin_automation_operation",
+        Request::RecordPluginStatusNote(_) => "record_plugin_status_note",
         Request::SetPluginAutomationHold(_) => "set_plugin_automation_hold",
         Request::UpdateClientRuntimeContext { .. } => "update_client_runtime_context",
         Request::ChangeSessionWorkingDirectory { .. } => "change_session_working_directory",
@@ -2334,6 +2335,9 @@ async fn handle_request_inner(
         }
         Request::LookupPluginAutomationOperation(request) => {
             handle_lookup_plugin_automation_operation(request_id, state, writer, request).await
+        }
+        Request::RecordPluginStatusNote(request) => {
+            handle_record_plugin_status_note(request_id, state, writer, request).await
         }
         Request::SetPluginAutomationHold(request) => {
             handle_set_plugin_automation_hold(request_id, client_id, state, writer, request).await
@@ -2695,6 +2699,7 @@ async fn handle_agent_permission_plugin_request(
         | Request::PluginAutomationSnapshot(_)
         | Request::SubmitPluginAutomationTurn(_)
         | Request::LookupPluginAutomationOperation(_)
+        | Request::RecordPluginStatusNote(_)
         | Request::SetPluginAutomationHold(_) => {
             unreachable!("primary request routed to primary handler")
         }
@@ -7439,6 +7444,58 @@ fn update_plugin_automation_hold(
         holds.remove(&request.session_id);
     }
     bcode_ipc::PluginAutomationHoldResponse { held, active_holds }
+}
+
+async fn handle_record_plugin_status_note(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::PluginStatusNoteRequest,
+) -> Result<(), ServerError> {
+    if request.plugin_id.trim().is_empty()
+        || request.note_id.trim().is_empty()
+        || request.text.trim().is_empty()
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "invalid_plugin_status_note",
+                "plugin status note requires non-empty plugin_id, note_id, and text",
+            )),
+        )
+        .await;
+    }
+    let lock = plugin_automation_lock(state, request.session_id).await;
+    let _guard = lock.lock().await;
+    let existing = state
+        .sessions
+        .plugin_status_note_events(request.session_id, &request.plugin_id, &request.note_id)
+        .await?;
+    let (event, created) = if let Some(event) = existing.last() {
+        (event.clone(), false)
+    } else {
+        let event = state
+            .sessions
+            .append_event(
+                request.session_id,
+                SessionEventKind::PluginStatusNote {
+                    plugin_id: request.plugin_id,
+                    note_id: request.note_id,
+                    text: request.text,
+                    metadata: request.metadata,
+                },
+            )
+            .await?;
+        publish_session_event(state, &event).await;
+        (event, true)
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PluginStatusNoteRecorded { event, created }),
+    )
+    .await
 }
 
 async fn handle_set_plugin_automation_hold(
@@ -17396,6 +17453,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
+        SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::PluginAutomationTurnStarted { .. } => "plugin_automation_turn_started",
         SessionEventKind::PluginAutomationTurnFinished { .. } => "plugin_automation_turn_finished",
     }
@@ -21198,6 +21256,25 @@ mod tests {
             messages[5].content.last(),
             Some(ContentBlock::CachePoint { .. })
         ));
+    }
+
+    #[test]
+    fn plugin_status_notes_are_excluded_from_model_context() {
+        let event = bcode_session_models::SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::PluginStatusNote {
+                plugin_id: "bcode.loop".to_owned(),
+                note_id: "run-1:lifecycle:Completed".to_owned(),
+                text: "Loop completed".to_owned(),
+                metadata: BTreeMap::new(),
+            },
+        };
+
+        assert!(non_tool_session_event_to_model_message(&event).is_none());
     }
 
     #[test]

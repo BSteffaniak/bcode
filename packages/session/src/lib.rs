@@ -1560,6 +1560,29 @@ impl SessionManager {
             .await?)
     }
 
+    /// Return canonical plugin status-note events for one stable note identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn plugin_status_note_events(
+        &self,
+        session_id: SessionId,
+        plugin_id: &str,
+        note_id: &str,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        let db_path = db::session_db_path(&store.root_path(), session_id);
+        if !db_path.exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.plugin_status_note_events(plugin_id, note_id).await?)
+    }
+
     /// Return a semantic projection window for a session.
     ///
     /// # Errors

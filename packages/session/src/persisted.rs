@@ -15,6 +15,7 @@ use bcode_session_models::{
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -445,6 +446,13 @@ enum PersistedSessionEventKind {
     ContextUsageObserved {
         snapshot: ContextUsageSnapshot,
     },
+    PluginStatusNote {
+        plugin_id: String,
+        note_id: String,
+        text: String,
+        #[serde(default)]
+        metadata: BTreeMap<String, serde_json::Value>,
+    },
     PluginAutomationTurnStarted {
         plugin_id: String,
         run_id: String,
@@ -811,6 +819,17 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             },
             SessionEventKind::ContextUsageObserved { snapshot } => Self::ContextUsageObserved {
                 snapshot: snapshot.clone(),
+            },
+            SessionEventKind::PluginStatusNote {
+                plugin_id,
+                note_id,
+                text,
+                metadata,
+            } => Self::PluginStatusNote {
+                plugin_id: plugin_id.clone(),
+                note_id: note_id.clone(),
+                text: text.clone(),
+                metadata: metadata.clone(),
             },
             SessionEventKind::PluginAutomationTurnStarted {
                 plugin_id,
@@ -1184,6 +1203,17 @@ impl PersistedSessionEventKind {
             Self::ContextUsageObserved { snapshot } => {
                 SessionEventKind::ContextUsageObserved { snapshot }
             }
+            Self::PluginStatusNote {
+                plugin_id,
+                note_id,
+                text,
+                metadata,
+            } => SessionEventKind::PluginStatusNote {
+                plugin_id,
+                note_id,
+                text,
+                metadata,
+            },
             Self::PluginAutomationTurnStarted {
                 plugin_id,
                 run_id,

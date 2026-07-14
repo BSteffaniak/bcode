@@ -4423,6 +4423,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::RuntimeWorkFinished { .. }
         | SessionEventKind::ToolInvocationStream { .. }
         | SessionEventKind::RalphLifecycle { .. }
+        | SessionEventKind::PluginStatusNote { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. }
         | SessionEventKind::ModelTurnFinished { .. }

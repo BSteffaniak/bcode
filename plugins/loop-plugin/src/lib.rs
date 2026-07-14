@@ -304,6 +304,7 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
         .map_or(session_id, |operation| operation.target_session_id);
     let message = match save_state(&state) {
         Ok(()) => {
+            publish_lifecycle_note(&state);
             let client = BcodeClient::default_endpoint();
             tokio::spawn(async move {
                 let _cancelled = client.cancel_session_turn(cancel_session_id).await;
@@ -1021,6 +1022,7 @@ async fn run_loop(mut state: LoopState) {
                 }
                 state.stop_reason = Some("maximum iterations reached".to_owned());
                 let _saved = save_state(&state);
+                publish_lifecycle_note(&state);
                 return;
             };
             if !transition_or_fail(&mut state, RunState::SubmittingIteration) {
@@ -1198,6 +1200,7 @@ async fn run_loop(mut state: LoopState) {
                     }
                     state.stop_reason = Some(evaluation.summary);
                     let _saved = save_state(&state);
+                    publish_lifecycle_note(&state);
                     return;
                 }
                 EvaluationDecision::Continue => {
@@ -1277,12 +1280,60 @@ async fn resume_after_steering_settles(state: LoopState) -> Result<(), String> {
     Ok(())
 }
 
+fn lifecycle_note(state: &LoopState) -> (String, String) {
+    let reason = state.stop_reason.as_deref().unwrap_or("no reason recorded");
+    let note_id = format!("{}:lifecycle:{:?}", state.run_id, state.state);
+    let text = match state.state {
+        RunState::Completed => format!(
+            "Loop completed after {}/{} iterations · evaluator accepted: {reason}",
+            state.current_iteration, state.max_iterations
+        ),
+        RunState::LimitReached => format!(
+            "Loop reached its {} iteration limit · {reason}",
+            state.max_iterations
+        ),
+        RunState::Paused => format!("Loop paused · {reason}"),
+        RunState::Canceled => format!("Loop canceled · {reason}"),
+        RunState::Failed => format!("Loop failed · {reason}"),
+        _ => format!("Loop {:?} · {reason}", state.state),
+    };
+    (note_id, text)
+}
+
+fn publish_lifecycle_note(state: &LoopState) {
+    let (note_id, text) = lifecycle_note(state);
+    let request = bcode_ipc::PluginStatusNoteRequest {
+        session_id: state.session_id,
+        plugin_id: PLUGIN_ID.to_owned(),
+        note_id,
+        text,
+        metadata: std::collections::BTreeMap::from([
+            ("run_id".to_owned(), serde_json::json!(state.run_id)),
+            (
+                "phase".to_owned(),
+                serde_json::json!(format!("{:?}", state.state)),
+            ),
+            (
+                "iteration".to_owned(),
+                serde_json::json!(state.current_iteration),
+            ),
+            ("limit".to_owned(), serde_json::json!(state.max_iterations)),
+        ]),
+    };
+    tokio::spawn(async move {
+        let _recorded = BcodeClient::default_endpoint()
+            .record_plugin_status_note(request)
+            .await;
+    });
+}
+
 fn pause_run(state: &mut LoopState, reason: String) {
     if transition(state, RunState::Paused).is_err() {
         state.state = RunState::Failed;
     }
     state.stop_reason = Some(reason);
     let _saved = save_state(state);
+    publish_lifecycle_note(state);
 }
 
 fn fail_run(state: &mut LoopState, reason: String) {
@@ -1291,6 +1342,7 @@ fn fail_run(state: &mut LoopState, reason: String) {
     }
     state.stop_reason = Some(reason);
     let _saved = save_state(state);
+    publish_lifecycle_note(state);
 }
 
 #[derive(Debug)]
@@ -1572,6 +1624,7 @@ fn refresh_cancel(state: &mut LoopState) -> bool {
         }
         state.stop_reason = Some("stopped by user".to_owned());
         let _saved = save_state(state);
+        publish_lifecycle_note(state);
     }
     cancelled
 }
@@ -2219,6 +2272,51 @@ mod tests {
         ] {
             state.state = terminal;
             assert!(active_status_contribution(&state, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn lifecycle_notes_cover_every_terminal_reason_and_accepted_evaluation() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            3,
+        );
+        state.run_id = "run-1".to_owned();
+        state.current_iteration = 2;
+        for (phase, reason, expected) in [
+            (
+                RunState::Completed,
+                "all checks passed",
+                "evaluator accepted: all checks passed",
+            ),
+            (
+                RunState::LimitReached,
+                "maximum iterations reached",
+                "3 iteration limit",
+            ),
+            (
+                RunState::Paused,
+                "iteration cancelled",
+                "Loop paused · iteration cancelled",
+            ),
+            (
+                RunState::Canceled,
+                "stopped by user",
+                "Loop canceled · stopped by user",
+            ),
+            (
+                RunState::Failed,
+                "provider unavailable",
+                "Loop failed · provider unavailable",
+            ),
+        ] {
+            state.state = phase;
+            state.stop_reason = Some(reason.to_owned());
+            let (note_id, text) = lifecycle_note(&state);
+            assert_eq!(note_id, format!("run-1:lifecycle:{phase:?}"));
+            assert!(text.contains(expected), "{text}");
         }
     }
 

@@ -1146,6 +1146,47 @@ impl SessionDb {
         Ok(events)
     }
 
+    /// Return canonical plugin status-note events for one stable note identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event queries or deserialization fail.
+    pub async fn plugin_status_note_events(
+        &self,
+        plugin_id: &str,
+        note_id: &str,
+    ) -> SessionDbResult<Vec<SessionEvent>> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .where_eq(
+                "event_type",
+                DatabaseValue::String("plugin_status_note".to_owned()),
+            )
+            .sort("event_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+        let mut events = Vec::new();
+        for row in rows {
+            let payload = required_string(&row, "payload")?;
+            let Some(event) = decode_session_event_degraded(&payload) else {
+                continue;
+            };
+            if matches!(
+                &event.kind,
+                SessionEventKind::PluginStatusNote {
+                    plugin_id: event_plugin_id,
+                    note_id: event_note_id,
+                    ..
+                } if event_plugin_id == plugin_id && event_note_id == note_id
+            ) {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
     /// Return model-context events from canonical DB events and indexed compaction metadata.
     ///
     /// # Errors
@@ -2217,6 +2258,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
+        SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::PluginAutomationTurnStarted { .. } => "plugin_automation_turn_started",
         SessionEventKind::PluginAutomationTurnFinished { .. } => "plugin_automation_turn_finished",
     }

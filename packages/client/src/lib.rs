@@ -1264,6 +1264,24 @@ impl BcodeClient {
         }
     }
 
+    /// Persist one idempotent plugin-owned status note in session history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn record_plugin_status_note(
+        &self,
+        request: bcode_ipc::PluginStatusNoteRequest,
+    ) -> Result<(SessionEvent, bool), ClientError> {
+        match self
+            .send_request(Request::RecordPluginStatusNote(request))
+            .await?
+        {
+            ResponsePayload::PluginStatusNoteRecorded { event, created } => Ok((event, created)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Rename a session.
     ///
     /// # Errors
