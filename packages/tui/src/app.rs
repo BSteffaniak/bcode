@@ -4052,11 +4052,6 @@ impl TokenUsageMeter {
                 );
             }
         }
-        if let Some(input_tokens) = usage.context_input_tokens() {
-            self.latest_context_input_tokens = Some(input_tokens);
-            self.context_usage_estimated = false;
-            self.pending_context_input_tokens = None;
-        }
         self.latest_cached_input_tokens = usage.cached_input_tokens;
         self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
@@ -4738,6 +4733,49 @@ mod tests {
         );
         assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
         assert!(!app.token_usage.context_usage_estimated);
+    }
+
+    #[test]
+    fn model_usage_updates_spending_without_replacing_context_occupancy() {
+        let mut meter = TokenUsageMeter {
+            context_window: Some(400_000),
+            ..TokenUsageMeter::default()
+        };
+        meter.observe_context_usage(306_000, true);
+
+        meter.absorb(&bcode_session_models::SessionTokenUsage {
+            input_tokens: Some(253_000),
+            output_tokens: Some(1_000),
+            total_tokens: Some(254_000),
+            cached_input_tokens: Some(200_000),
+            cache_write_input_tokens: Some(10_000),
+            reasoning_tokens: Some(500),
+        });
+
+        assert_eq!(meter.latest_context_input_tokens, Some(306_000));
+        assert!(meter.context_usage_estimated);
+        assert_eq!(meter.pending_context_input_tokens, None);
+        assert_eq!(meter.session_tokens, 254_000);
+        assert_eq!(meter.latest_cached_input_tokens, Some(200_000));
+        assert_eq!(meter.latest_cache_write_input_tokens, Some(10_000));
+        assert_eq!(meter.context_summary(), "~306,000/400k 76%");
+    }
+
+    #[test]
+    fn model_usage_does_not_clear_newer_pending_context_estimate() {
+        let mut meter = TokenUsageMeter::default();
+        meter.observe_context_usage(253_000, false);
+        meter.observe_context_usage(306_000, true);
+
+        meter.absorb(&bcode_session_models::SessionTokenUsage {
+            input_tokens: Some(253_000),
+            total_tokens: Some(254_000),
+            ..bcode_session_models::SessionTokenUsage::default()
+        });
+
+        assert_eq!(meter.latest_context_input_tokens, Some(253_000));
+        assert!(!meter.context_usage_estimated);
+        assert_eq!(meter.pending_context_input_tokens, Some(306_000));
     }
 
     #[test]

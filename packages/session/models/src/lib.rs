@@ -1319,12 +1319,6 @@ impl SessionTokenUsage {
         })
     }
 
-    /// Return the token count that best represents current context pressure.
-    #[must_use]
-    pub const fn context_input_tokens(&self) -> Option<u32> {
-        self.input_tokens
-    }
-
     /// Return uncached input tokens when both input and cached counts are known.
     #[must_use]
     pub const fn uncached_input_tokens(&self) -> Option<u32> {
