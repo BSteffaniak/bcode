@@ -26,7 +26,6 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 #[cfg(feature = "embedded-plugins")]
 use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
 use bcode_session_models::SessionId;
-use bcode_tool::ToolInvocationRequest;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -243,7 +242,7 @@ impl GenerateTextBuilder {
     #[must_use]
     pub fn inline_tool<F>(mut self, definition: ToolDefinition, handler: F) -> Self
     where
-        F: Fn(ToolInvocationRequest) -> std::result::Result<ToolInvocationResponse, String>
+        F: Fn(ToolInvocationDescriptor) -> std::result::Result<ToolInvocationResponse, String>
             + Send
             + Sync
             + 'static,
@@ -376,7 +375,7 @@ impl StreamTextBuilder {
     #[must_use]
     pub fn inline_tool<F>(mut self, definition: ToolDefinition, handler: F) -> Self
     where
-        F: Fn(ToolInvocationRequest) -> std::result::Result<ToolInvocationResponse, String>
+        F: Fn(ToolInvocationDescriptor) -> std::result::Result<ToolInvocationResponse, String>
             + Send
             + Sync
             + 'static,
@@ -1197,7 +1196,7 @@ type InlineToolFuture = std::pin::Pin<
     >,
 >;
 type InlineToolHandler =
-    Arc<dyn Fn(ToolInvocationRequest, InvocationScope) -> InlineToolFuture + Send + Sync>;
+    Arc<dyn Fn(ToolInvocationDescriptor, InvocationScope) -> InlineToolFuture + Send + Sync>;
 type ProviderFactory = Arc<dyn Fn() -> Box<dyn ModelProviderInvoker> + Send + Sync>;
 
 #[derive(Debug, Default)]
@@ -1453,15 +1452,7 @@ impl ToolInvoker for SdkToolInvoker {
         invocation: &'a PreparedToolInvocation,
         scope: &'a InvocationScope,
     ) -> RuntimeFuture<'a, ToolInvocationResponse> {
-        let request = ToolInvocationRequest {
-            tool_call_id: invocation.invocation.invocation_id.clone(),
-            name: invocation.invocation.tool_name.clone(),
-            arguments: invocation.invocation.arguments.clone(),
-            cwd: None,
-            artifact_dir: None,
-            cancellation_path: None,
-            invocation_action_path: None,
-        };
+        let descriptor = invocation.invocation.clone();
         Box::pin(async move {
             match &tool.source {
                 ToolSource::Inline => {
@@ -1471,7 +1462,7 @@ impl ToolInvoker for SdkToolInvoker {
                             message: "inline tool handler not found".to_string(),
                         }
                     })?;
-                    handler(request, scope.clone()).await.map_err(|message| {
+                    handler(descriptor, scope.clone()).await.map_err(|message| {
                         RuntimeError::ToolExecution {
                             tool_name: tool.definition.name.clone(),
                             message,
@@ -1484,7 +1475,7 @@ impl ToolInvoker for SdkToolInvoker {
                         execute_plugin_tool(
                             self.plugins.as_ref(),
                             plugin_id,
-                            &request,
+                            &descriptor,
                             scope,
                             self.session_id,
                         )
@@ -1493,7 +1484,7 @@ impl ToolInvoker for SdkToolInvoker {
                     #[cfg(not(feature = "embedded-plugins"))]
                     {
                         Err(RuntimeError::ToolExecution {
-                            tool_name: request.name.clone(),
+                            tool_name: descriptor.tool_name.clone(),
                             message: format!(
                                 "plugin-backed tool routing for plugin '{plugin_id}' requires embedded-plugins"
                             ),
@@ -1509,16 +1500,25 @@ impl ToolInvoker for SdkToolInvoker {
 async fn execute_plugin_tool(
     plugins: Option<&bcode_plugin::PluginRuntimeHost>,
     plugin_id: &str,
-    request: &ToolInvocationRequest,
+    descriptor: &ToolInvocationDescriptor,
     scope: &InvocationScope,
     session_id: SessionId,
 ) -> std::result::Result<ToolInvocationResponse, RuntimeError> {
     let plugins = plugins.ok_or_else(|| RuntimeError::ToolExecution {
-        tool_name: request.name.clone(),
+        tool_name: descriptor.tool_name.clone(),
         message: "embedded plugin runtime is not configured".to_string(),
     })?;
-    let payload = serde_json::to_vec(request).map_err(|error| RuntimeError::ToolExecution {
-        tool_name: request.name.clone(),
+    let request = bcode_tool::ToolInvocationRequest {
+        tool_call_id: descriptor.invocation_id.clone(),
+        name: descriptor.tool_name.clone(),
+        arguments: descriptor.arguments.clone(),
+        cwd: None,
+        artifact_dir: None,
+        cancellation_path: None,
+        invocation_action_path: None,
+    };
+    let payload = serde_json::to_vec(&request).map_err(|error| RuntimeError::ToolExecution {
+        tool_name: descriptor.tool_name.clone(),
         message: error.to_string(),
     })?;
     let plugin_scope = bcode_plugin::PluginInvocationScope::session(session_id.to_string())
@@ -1540,7 +1540,7 @@ async fn execute_plugin_tool(
         )
         .await
         .map_err(|error| RuntimeError::ToolExecution {
-            tool_name: request.name.clone(),
+            tool_name: descriptor.tool_name.clone(),
             message: error.to_string(),
         })?;
     if !scope.register_cancellation(Arc::new(PluginInvocationCancellation(
@@ -1554,18 +1554,18 @@ async fn execute_plugin_tool(
             .next_event()
             .await
             .map_err(|error| RuntimeError::ToolExecution {
-                tool_name: request.name.clone(),
+                tool_name: descriptor.tool_name.clone(),
                 message: error.to_string(),
             })? {
             bcode_plugin::StreamingServiceInvocationEvent::Event(_) => {}
             bcode_plugin::StreamingServiceInvocationEvent::Response(response) => {
                 let response = response.map_err(|error| RuntimeError::ToolExecution {
-                    tool_name: request.name.clone(),
+                    tool_name: descriptor.tool_name.clone(),
                     message: error.to_string(),
                 })?;
                 return bcode_plugin::decode_service_response(response).map_err(|error| {
                     RuntimeError::ToolExecution {
-                        tool_name: request.name.clone(),
+                        tool_name: descriptor.tool_name.clone(),
                         message: error.to_string(),
                     }
                 });
@@ -3698,7 +3698,7 @@ impl AgentBuilder {
     #[must_use]
     pub fn inline_tool<F>(mut self, definition: ToolDefinition, handler: F) -> Self
     where
-        F: Fn(ToolInvocationRequest) -> std::result::Result<ToolInvocationResponse, String>
+        F: Fn(ToolInvocationDescriptor) -> std::result::Result<ToolInvocationResponse, String>
             + Send
             + Sync
             + 'static,
@@ -3719,7 +3719,7 @@ impl AgentBuilder {
     #[must_use]
     pub fn scoped_inline_tool<F, Fut>(mut self, definition: ToolDefinition, handler: F) -> Self
     where
-        F: Fn(ToolInvocationRequest, InvocationScope) -> Fut + Send + Sync + 'static,
+        F: Fn(ToolInvocationDescriptor, InvocationScope) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = std::result::Result<ToolInvocationResponse, String>>
             + Send
             + 'static,

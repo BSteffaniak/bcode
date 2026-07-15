@@ -1,6 +1,6 @@
 use bcode::{Agent, ToolCall};
 use bcode_tool::{
-    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolPolicyMetadata,
+    ToolDefinition, ToolInvocationDescriptor, ToolInvocationResponse, ToolPolicyMetadata,
     ToolSideEffect, ToolUiMetadata,
 };
 
@@ -22,7 +22,7 @@ fn uppercase_definition() -> ToolDefinition {
     }
 }
 
-fn uppercase(request: ToolInvocationRequest) -> Result<ToolInvocationResponse, String> {
+fn uppercase(request: ToolInvocationDescriptor) -> Result<ToolInvocationResponse, String> {
     let text = request
         .arguments
         .get("text")

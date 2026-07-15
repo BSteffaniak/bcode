@@ -37,7 +37,7 @@ For tests, examples, or custom integrations, implement `ModelProviderInvoker` an
 
 ### Custom tools
 
-Register synchronous inline tools with `Agent::builder().inline_tool(...)`. Use `scoped_inline_tool(...)` for asynchronous tools that need exchanges, unsolicited input, nested services, artifact writes, lifecycle events, contributions, or cancellation through `InvocationScope`. Tool definitions use `bcode_tool::ToolDefinition`. Provider-requested batches use the same registered tools and configured execution options as direct calls.
+Register synchronous inline tools with `Agent::builder().inline_tool(...)`; handlers receive a transport-free `ToolInvocationDescriptor`. Use `scoped_inline_tool(...)` for asynchronous tools that also need exchanges, unsolicited input, nested services, artifact writes, lifecycle events, contributions, or cancellation through `InvocationScope`. Tool definitions use `bcode_tool::ToolDefinition`. Provider-requested batches use the same registered tools and configured execution options as direct calls.
 
 Advanced hosts can inject typed adapters without implementing orchestration:
 

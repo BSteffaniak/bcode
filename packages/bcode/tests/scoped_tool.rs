@@ -123,56 +123,55 @@ async fn direct_tool_receives_canonical_scope_and_all_capabilities() {
         .input_router(capabilities.clone())
         .service_router(capabilities.clone())
         .artifact_sink(capabilities.clone())
-        .scoped_inline_tool(
-            definition(),
-            |_request, scope: InvocationScope| async move {
-                let invocation_id = scope.invocation_id().to_string();
-                let exchange = scope
-                    .request_exchange(ToolExchangeRequest {
-                        invocation_id: invocation_id.clone(),
-                        exchange_id: "exchange".to_string(),
-                        producer_id: "test".to_string(),
-                        schema: "test.exchange".to_string(),
-                        schema_version: 1,
-                        payload: serde_json::Value::Null,
-                        response_policy: ToolExchangeResponsePolicy::Required,
-                    })
-                    .await;
-                let input = scope.receive_input().await;
-                let service = scope
-                    .invoke_service(ToolInvocationServiceRequest {
-                        invocation_id: invocation_id.clone(),
-                        request_id: "service".to_string(),
-                        interface_id: "test.service/v1".to_string(),
-                        operation: "run".to_string(),
-                        payload: serde_json::Value::Null,
-                    })
-                    .await;
-                let artifact = scope
-                    .write_artifact(ToolArtifactWriteRequest {
-                        invocation_id: invocation_id.clone(),
-                        artifact_id: "artifact".to_string(),
-                        content_type: "text/plain".to_string(),
-                        bytes: b"hello".to_vec(),
-                        metadata: serde_json::Value::Null,
-                    })
-                    .await;
-                assert!(matches!(exchange, ToolExchangeResolution::Responded { .. }));
-                assert!(matches!(
-                    input,
-                    ToolInvocationInputResolution::Received { .. }
-                ));
-                assert!(matches!(
-                    service,
-                    ToolInvocationServiceResolution::Responded { .. }
-                ));
-                assert!(matches!(
-                    artifact,
-                    ToolArtifactWriteResolution::Written { .. }
-                ));
-                Ok(response(&invocation_id))
-            },
-        )
+        .scoped_inline_tool(definition(), |request, scope: InvocationScope| async move {
+            let invocation_id = scope.invocation_id().to_string();
+            assert_eq!(request.invocation_id, invocation_id);
+            assert_eq!(request.tool_name, "scoped");
+            let exchange = scope
+                .request_exchange(ToolExchangeRequest {
+                    invocation_id: invocation_id.clone(),
+                    exchange_id: "exchange".to_string(),
+                    producer_id: "test".to_string(),
+                    schema: "test.exchange".to_string(),
+                    schema_version: 1,
+                    payload: serde_json::Value::Null,
+                    response_policy: ToolExchangeResponsePolicy::Required,
+                })
+                .await;
+            let input = scope.receive_input().await;
+            let service = scope
+                .invoke_service(ToolInvocationServiceRequest {
+                    invocation_id: invocation_id.clone(),
+                    request_id: "service".to_string(),
+                    interface_id: "test.service/v1".to_string(),
+                    operation: "run".to_string(),
+                    payload: serde_json::Value::Null,
+                })
+                .await;
+            let artifact = scope
+                .write_artifact(ToolArtifactWriteRequest {
+                    invocation_id: invocation_id.clone(),
+                    artifact_id: "artifact".to_string(),
+                    content_type: "text/plain".to_string(),
+                    bytes: b"hello".to_vec(),
+                    metadata: serde_json::Value::Null,
+                })
+                .await;
+            assert!(matches!(exchange, ToolExchangeResolution::Responded { .. }));
+            assert!(matches!(
+                input,
+                ToolInvocationInputResolution::Received { .. }
+            ));
+            assert!(matches!(
+                service,
+                ToolInvocationServiceResolution::Responded { .. }
+            ));
+            assert!(matches!(
+                artifact,
+                ToolArtifactWriteResolution::Written { .. }
+            ));
+            Ok(response(&invocation_id))
+        })
         .build();
     let call = ToolCall {
         id: "call-scoped".to_string(),

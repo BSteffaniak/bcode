@@ -7,7 +7,7 @@ use bcode_model::{
     PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse, StopReason,
 };
 use bcode_tool::{
-    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolPolicyMetadata,
+    ToolDefinition, ToolInvocationDescriptor, ToolInvocationResponse, ToolPolicyMetadata,
     ToolSideEffect, ToolUiMetadata,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -93,7 +93,7 @@ fn echo_definition() -> ToolDefinition {
     }
 }
 
-fn echo(request: ToolInvocationRequest) -> Result<ToolInvocationResponse, String> {
+fn echo(request: ToolInvocationDescriptor) -> Result<ToolInvocationResponse, String> {
     let text = request
         .arguments
         .get("text")
