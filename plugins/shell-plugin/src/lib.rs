@@ -1285,10 +1285,11 @@ where
         .recording
         .as_deref()
         .map(|path| {
-            recording::AsyncShellRecordingWriter::create(
+            recording::AsyncShellRecordingWriter::create_with_observer(
                 path,
                 visual_context.columns,
                 visual_context.rows,
+                Some(shell_recording_commit_observer(events, tool_call_id)),
             )
         })
         .transpose()
@@ -1594,6 +1595,37 @@ fn shell_live_frames_json(frames: &StdMutex<Vec<ShellLiveFrame>>) -> serde_json:
             })
             .collect(),
     )
+}
+
+fn shell_recording_commit_observer(
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+) -> recording::ShellRecordingCommitObserver {
+    let tool_call_id = tool_call_id.to_owned();
+    let revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    Arc::new(move |commit| {
+        let revision = revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        emit_tool_stream_event(
+            events,
+            &ToolInvocationStreamEvent::ArtifactUpdate {
+                tool_call_id: tool_call_id.clone(),
+                sequence: revision,
+                artifact_id: format!("{tool_call_id}-shell-run"),
+                reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
+                producer_plugin_id: "bcode.shell".to_owned(),
+                schema: "bcode.shell.run".to_owned(),
+                schema_version: 1,
+                content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
+                storage_uri: file_storage_uri(&commit.path)
+                    .unwrap_or_else(|| commit.path.display().to_string()),
+                committed_bytes: commit.committed_bytes,
+                revision,
+                finalized: commit.finalized,
+            },
+        );
+    })
 }
 
 fn emit_tool_output_delta(
@@ -2225,8 +2257,13 @@ mod tests {
     fn terminal_invocation_publishes_one_valid_authoritative_recording() {
         let environment = isolated_config_environment("recording-integration");
         let artifact_dir = tempfile::tempdir().expect("artifact dir");
+        let events = Mutex::new(Vec::<Vec<u8>>::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(capture_service_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
         let response = run_terminal_shell_command_with_environment(
-            ServiceEventEmitter::default(),
+            emitter,
             &bcode_plugin_sdk::ServiceCancellation::default(),
             "test-recording",
             &ShellRunArguments {
@@ -2287,6 +2324,36 @@ mod tests {
             }
         )));
         assert!(!path.with_extension("shell-recording.partial").exists());
+        let artifact_updates = events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter_map(|payload| serde_json::from_slice::<ToolInvocationStreamEvent>(payload).ok())
+            .filter_map(|event| match event {
+                ToolInvocationStreamEvent::ArtifactUpdate {
+                    committed_bytes,
+                    revision,
+                    finalized,
+                    storage_uri,
+                    ..
+                } => Some((committed_bytes, revision, finalized, storage_uri)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(artifact_updates.len() >= 3);
+        assert!(
+            artifact_updates
+                .windows(2)
+                .all(|window| { window[1].0 >= window[0].0 && window[1].1 > window[0].1 })
+        );
+        assert!(artifact_updates.last().expect("final update").2);
+        assert_eq!(
+            url::Url::parse(&artifact_updates.last().expect("final update").3)
+                .expect("final update URL")
+                .to_file_path()
+                .expect("final update path"),
+            path
+        );
     }
 
     #[cfg(unix)]
@@ -2923,7 +2990,7 @@ mod tests {
             Some(capture_service_event),
             std::ptr::from_ref(&recorded_events).cast_mut().cast(),
         );
-        read_limited_streaming(
+        let mut recorded_output = read_limited_streaming(
             std::io::Cursor::new(bytes),
             recorded_emitter,
             "call",
@@ -2937,9 +3004,27 @@ mod tests {
             },
         )
         .expect("recorded stream");
+        recorded_output
+            .recording_writer
+            .take()
+            .expect("recording writer")
+            .finish(1, Some(0), None, false, false)
+            .expect("finish recording");
 
+        let recorded_non_artifact_events = recorded_events
+            .lock()
+            .expect("recorded lock")
+            .iter()
+            .filter(|payload| {
+                !matches!(
+                    serde_json::from_slice::<ToolInvocationStreamEvent>(payload),
+                    Ok(ToolInvocationStreamEvent::ArtifactUpdate { .. })
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
-            *recorded_events.lock().expect("recorded lock"),
+            recorded_non_artifact_events,
             *baseline_events.lock().expect("baseline lock")
         );
     }

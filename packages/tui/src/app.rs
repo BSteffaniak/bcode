@@ -3181,6 +3181,7 @@ impl BmuxApp {
                 streaming,
                 ..
             } => self.apply_tool_visual_update(tool_call_id, visual, *streaming),
+            ToolInvocationStreamEvent::ArtifactUpdate { .. } => {}
             ToolInvocationStreamEvent::Started {
                 tool_call_id,
                 tool_name,

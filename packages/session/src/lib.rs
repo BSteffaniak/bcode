@@ -56,6 +56,7 @@ const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'stati
         SessionEventKind::ToolInvocationStream {
             event:
                 bcode_session_models::ToolInvocationStreamEvent::OutputDelta { .. }
+                | bcode_session_models::ToolInvocationStreamEvent::ArtifactUpdate { .. }
                 | bcode_session_models::ToolInvocationStreamEvent::LegacyPresentation { .. },
         } => Some("tool_invocation_stream"),
         _ => None,
@@ -1118,16 +1119,37 @@ impl SessionManager {
                 };
             }
         };
-        match db.session_state().await {
-            Ok(Some(state)) if state.last_event_seq >= expected => SessionHealth::Ready,
-            Ok(Some(state)) => SessionHealth::ProjectionStale {
-                projection: "session_state",
-                checkpoint: Some(state.last_event_seq),
-                expected,
-            },
-            Ok(None) => SessionHealth::ProjectionStale {
-                projection: "session_state",
-                checkpoint: None,
+        let session_state = match db.session_state().await {
+            Ok(Some(state)) if state.last_event_seq >= expected => state,
+            Ok(Some(state)) => {
+                return SessionHealth::ProjectionStale {
+                    projection: "session_state",
+                    checkpoint: Some(state.last_event_seq),
+                    expected,
+                };
+            }
+            Ok(None) => {
+                return SessionHealth::ProjectionStale {
+                    projection: "session_state",
+                    checkpoint: None,
+                    expected,
+                };
+            }
+            Err(error) => {
+                return SessionHealth::RepairRequired {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        debug_assert!(session_state.last_event_seq >= expected);
+        match db
+            .materialized_projection_checkpoint(db::MaterializedProjection::ArtifactReferences)
+            .await
+        {
+            Ok(Some(checkpoint)) if checkpoint == expected => SessionHealth::Ready,
+            Ok(checkpoint) => SessionHealth::ProjectionStale {
+                projection: "artifact_references",
+                checkpoint,
                 expected,
             },
             Err(error) => SessionHealth::RepairRequired {
@@ -3334,10 +3356,12 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendToolCallRequestedInput, SessionError, SessionLeaseOwnerContext, SessionManager, db,
+        AppendToolCallRequestedInput, SessionError, SessionHealth, SessionLeaseOwnerContext,
+        SessionManager, db,
     };
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
+    use switchy::database::query::FilterableQuery;
 
     fn session_database_files(
         root: &std::path::Path,
@@ -3366,6 +3390,39 @@ mod tests {
             .collect::<Vec<_>>();
         files.sort_by(|left, right| left.0.cmp(&right.0));
         files
+    }
+
+    #[tokio::test]
+    async fn session_health_reports_missing_artifact_projection_as_stale() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should create");
+        let session = manager
+            .create_session(Some("health".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        assert_eq!(
+            manager.session_health(session.id).await,
+            SessionHealth::Ready
+        );
+
+        let db = db::SessionDb::open_turso_in_root(session.id, &root)
+            .await
+            .expect("session DB should open");
+        db.database()
+            .delete("projection_checkpoints")
+            .where_eq("projection_name", "artifact_references")
+            .execute(db.database())
+            .await
+            .expect("remove checkpoint");
+
+        assert_eq!(
+            manager.session_health(session.id).await,
+            SessionHealth::ProjectionStale {
+                projection: "artifact_references",
+                checkpoint: None,
+                expected: 0,
+            }
+        );
     }
 
     #[tokio::test]

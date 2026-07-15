@@ -42,7 +42,57 @@ pub struct SessionArtifactRange {
     pub content_type: Option<String>,
     pub offset: u64,
     pub total_bytes: u64,
+    pub reference_bytes: Option<u64>,
+    pub reference_revision: u64,
+    pub finalized: bool,
+    pub finalized_event_seq: Option<u64>,
+    pub availability: Option<String>,
+    pub complete: Option<bool>,
+    pub checksum_sha256: Option<String>,
     pub bytes: Vec<u8>,
+}
+
+impl SessionArtifactRange {
+    /// Return the offset immediately after this response.
+    #[must_use]
+    pub fn next_offset(&self) -> u64 {
+        self.offset
+            .saturating_add(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    /// Return whether this response reaches the current artifact EOF.
+    #[must_use]
+    pub fn is_eof(&self) -> bool {
+        self.next_offset() >= self.total_bytes
+    }
+}
+
+#[cfg(test)]
+mod artifact_range_tests {
+    use super::SessionArtifactRange;
+
+    #[test]
+    fn range_metadata_supports_eof_and_replacement_detection() {
+        let range = SessionArtifactRange {
+            artifact_id: "artifact".to_owned(),
+            reference_key: "recording".to_owned(),
+            content_type: Some("application/octet-stream".to_owned()),
+            offset: 8,
+            total_bytes: 10,
+            reference_bytes: Some(10),
+            reference_revision: 42,
+            finalized: true,
+            finalized_event_seq: Some(42),
+            availability: Some("complete".to_owned()),
+            complete: Some(true),
+            checksum_sha256: Some("abc".to_owned()),
+            bytes: b"89".to_vec(),
+        };
+        assert_eq!(range.next_offset(), 10);
+        assert!(range.is_eof());
+        assert_eq!(range.finalized_event_seq, Some(42));
+        assert_eq!(range.checksum_sha256.as_deref(), Some("abc"));
+    }
 }
 
 /// Grouped runtime-work lifecycle span.
@@ -1373,6 +1423,13 @@ impl BcodeClient {
                 content_type,
                 offset,
                 total_bytes,
+                reference_bytes,
+                reference_revision,
+                finalized,
+                finalized_event_seq,
+                availability,
+                complete,
+                checksum_sha256,
                 bytes,
             } => Ok(SessionArtifactRange {
                 artifact_id,
@@ -1380,6 +1437,13 @@ impl BcodeClient {
                 content_type,
                 offset,
                 total_bytes,
+                reference_bytes,
+                reference_revision,
+                finalized,
+                finalized_event_seq,
+                availability,
+                complete,
+                checksum_sha256,
                 bytes,
             }),
             _ => Err(ClientError::UnexpectedResponse),

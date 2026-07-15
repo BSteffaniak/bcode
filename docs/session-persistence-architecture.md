@@ -76,6 +76,21 @@ CLI maintenance commands provide explicit repair ergonomics. These commands may 
 
 Repair must use Bcode's native Turso open path for validation. Do not invoke stock SQLite checkpoint/repair as the primary repair path. Do not invoke these repair paths implicitly from catalog listing, session picker display, normal attach, or paged history reads.
 
+## Finalized artifact references
+
+Finalized plugin artifacts are resolved through the per-session `artifact_references` materialized projection. The projection is keyed by artifact id and reference key and stores only generic lookup data:
+
+* producer and schema identity;
+* storage URI and content type;
+* projected byte length;
+* generic availability and completeness;
+* generic SHA-256 integrity metadata;
+* the canonical event sequence that finalized the reference.
+
+Normal artifact range reads must use this projection and bounded file ranges. They must not scan `ToolCallFinished` events or load complete session history. The projection checkpoint must equal the canonical event tail. Missing or stale checkpoints surface `ProjectionStale`; malformed projection state surfaces `RepairRequired`. Normal reads never backfill or rebuild this projection.
+
+Range responses include current file length, projected reference length, finalizing sequence, availability/completeness, checksum, and returned bytes. Current relative references are resolved beneath the session artifact root. Supported legacy absolute/file references remain readable only after canonical path confinement verifies that the target remains beneath that root. Blocking metadata, seek, and read operations run outside async runtime workers.
+
 ## Architecture guardrails
 
 Run the session architecture guard before finishing session persistence changes:

@@ -205,6 +205,7 @@ pub struct ServerState {
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     pending_interactive_tools: Mutex<BTreeMap<String, PendingInteractiveToolRequest>>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
+    active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
@@ -1063,6 +1064,7 @@ impl ServerState {
             pending_permissions: Mutex::default(),
             pending_interactive_tools: Mutex::default(),
             active_plugin_invocations: Arc::default(),
+            active_artifacts: Arc::default(),
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
             client_runtime_contexts: Mutex::default(),
@@ -5082,6 +5084,45 @@ async fn handle_rename_session(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ActiveArtifactKey {
+    session_id: SessionId,
+    tool_call_id: String,
+    artifact_id: String,
+    reference_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveArtifactReference {
+    producer_plugin_id: String,
+    schema: String,
+    schema_version: u32,
+    content_type: Option<String>,
+    path: PathBuf,
+    committed_bytes: u64,
+    revision: u64,
+    finalized: bool,
+}
+
+impl ActiveArtifactReference {
+    fn stream_event(&self, key: &ActiveArtifactKey) -> ToolInvocationStreamEvent {
+        ToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id: key.tool_call_id.clone(),
+            sequence: 0,
+            artifact_id: key.artifact_id.clone(),
+            reference_key: key.reference_key.clone(),
+            producer_plugin_id: self.producer_plugin_id.clone(),
+            schema: self.schema.clone(),
+            schema_version: self.schema_version,
+            content_type: self.content_type.clone(),
+            storage_uri: String::new(),
+            committed_bytes: self.committed_bytes,
+            revision: self.revision,
+            finalized: self.finalized,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActivePluginInvocation {
     producer_plugin_id: String,
@@ -5091,12 +5132,14 @@ struct ActivePluginInvocation {
 #[derive(Debug)]
 struct ActivePluginInvocationRegistration {
     invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
+    active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     key: (SessionId, String),
 }
 
 impl ActivePluginInvocationRegistration {
     fn register(
         invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
+        active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
         session_id: SessionId,
         tool_call_id: &str,
         invocation: ActivePluginInvocation,
@@ -5110,7 +5153,11 @@ impl ActivePluginInvocationRegistration {
         }
         entries.insert(key.clone(), invocation);
         drop(entries);
-        Ok(Self { invocations, key })
+        Ok(Self {
+            invocations,
+            active_artifacts,
+            key,
+        })
     }
 }
 
@@ -5118,6 +5165,11 @@ impl Drop for ActivePluginInvocationRegistration {
     fn drop(&mut self) {
         if let Ok(mut entries) = self.invocations.lock() {
             entries.remove(&self.key);
+        }
+        if let Ok(mut artifacts) = self.active_artifacts.lock() {
+            artifacts.retain(|key, artifact| {
+                key.session_id != self.key.0 || key.tool_call_id != self.key.1 || artifact.finalized
+            });
         }
     }
 }
@@ -5226,11 +5278,12 @@ async fn handle_read_session_artifact(
     }
 }
 
-fn read_artifact_file_range(
+fn read_artifact_file_range_at_length(
     path: &Path,
     artifact_root: &Path,
     offset: u64,
     length: u32,
+    visible_bytes: Option<u64>,
 ) -> Result<(u64, Vec<u8>), String> {
     let artifact_root = artifact_root
         .canonicalize()
@@ -5242,7 +5295,8 @@ fn read_artifact_file_range(
         return Err("artifact path is outside the session artifact root".to_owned());
     }
     let mut file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
-    let total_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    let file_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    let total_bytes = visible_bytes.map_or(file_bytes, |visible| visible.min(file_bytes));
     if offset > total_bytes {
         return Err(format!(
             "artifact range offset {offset} exceeds artifact length {total_bytes}"
@@ -5255,6 +5309,15 @@ fn read_artifact_file_range(
     file.read_exact(&mut bytes)
         .map_err(|error| error.to_string())?;
     Ok((total_bytes, bytes))
+}
+
+fn read_artifact_file_range(
+    path: &Path,
+    artifact_root: &Path,
+    offset: u64,
+    length: u32,
+) -> Result<(u64, Vec<u8>), String> {
+    read_artifact_file_range_at_length(path, artifact_root, offset, length, None)
 }
 
 fn artifact_reference_path(uri: &str, artifact_root: &Path) -> Result<PathBuf, String> {
@@ -5296,6 +5359,41 @@ fn artifact_reference_unavailability(
     }
 }
 
+fn active_artifact_reference(
+    state: &ServerState,
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+) -> Result<Option<ActiveArtifactReference>, String> {
+    let artifacts = state
+        .active_artifacts
+        .lock()
+        .map_err(|_| "active artifact registry poisoned".to_owned())?;
+    Ok(artifacts
+        .iter()
+        .find(|(key, _)| {
+            key.session_id == session_id
+                && key.artifact_id == artifact_id
+                && key.reference_key == reference_key
+        })
+        .map(|(_, artifact)| artifact.clone()))
+}
+
+fn remove_finalized_active_artifact(
+    state: &ServerState,
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+) {
+    if let Ok(mut artifacts) = state.active_artifacts.lock() {
+        artifacts.retain(|key, _| {
+            key.session_id != session_id
+                || key.artifact_id != artifact_id
+                || key.reference_key != reference_key
+        });
+    }
+}
+
 async fn read_session_artifact_range(
     state: &ServerState,
     session_id: SessionId,
@@ -5308,6 +5406,42 @@ async fn read_session_artifact_range(
         return Err(format!(
             "artifact range length must be between 1 and {MAX_ARTIFACT_RANGE_BYTES} bytes"
         ));
+    }
+    if let Some(active) = active_artifact_reference(state, session_id, artifact_id, reference_key)?
+    {
+        let artifact_root = default_session_artifact_dir(session_id);
+        let path = active.path.clone();
+        let committed_bytes = active.committed_bytes;
+        let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
+            read_artifact_file_range_at_length(
+                &path,
+                &artifact_root,
+                offset,
+                length,
+                Some(committed_bytes),
+            )
+        })
+        .await
+        .map_err(|error| format!("active artifact range reader task failed: {error}"))??;
+        return Ok(ResponsePayload::SessionArtifactRange {
+            artifact_id: artifact_id.to_owned(),
+            reference_key: reference_key.to_owned(),
+            content_type: active.content_type,
+            offset,
+            total_bytes,
+            reference_bytes: Some(active.committed_bytes),
+            reference_revision: active.revision,
+            finalized: active.finalized,
+            finalized_event_seq: None,
+            availability: Some(if active.finalized {
+                "complete".to_owned()
+            } else {
+                "active".to_owned()
+            }),
+            complete: Some(active.finalized),
+            checksum_sha256: None,
+            bytes,
+        });
     }
     let reference = state
         .sessions
@@ -5331,14 +5465,23 @@ async fn read_session_artifact_range(
     })
     .await
     .map_err(|error| format!("artifact range reader task failed: {error}"))??;
-    Ok(ResponsePayload::SessionArtifactRange {
+    let response = ResponsePayload::SessionArtifactRange {
         artifact_id: artifact_id.to_owned(),
         reference_key: reference_key.to_owned(),
         content_type: reference.content_type,
         offset,
         total_bytes,
+        reference_bytes: reference.byte_len,
+        reference_revision: reference.finalized_event_seq,
+        finalized: true,
+        finalized_event_seq: Some(reference.finalized_event_seq),
+        availability: reference.availability,
+        complete: reference.complete,
+        checksum_sha256: reference.checksum_sha256,
         bytes,
-    })
+    };
+    remove_finalized_active_artifact(state, session_id, artifact_id, reference_key);
+    Ok(response)
 }
 
 async fn handle_delete_session(
@@ -5646,11 +5789,9 @@ async fn handle_attach_session(
                 }),
             )
             .await?;
-            let handle = forward_session_events(
-                ClientEventSink::new(client_id, writer.clone(), state.metrics.clone()),
-                attachment.events,
-                attachment.live_events,
-            );
+            let sink = ClientEventSink::new(client_id, writer.clone(), state.metrics.clone());
+            send_active_artifact_snapshots(state, session_id, &sink).await?;
+            let handle = forward_session_events(sink, attachment.events, attachment.live_events);
             state.register_client_forwarder(client_id, handle).await;
             Ok(())
         }
@@ -5924,15 +6065,13 @@ async fn finish_attach_session_projection_window_success(
         "server.attach_projection_window.total_duration_ms",
         elapsed_ms(timings.total_started_at),
     );
-    let handle = forward_session_events(
-        ClientEventSink::new(
-            context.client_id,
-            context.writer.clone(),
-            state.metrics.clone(),
-        ),
-        attachment.events,
-        attachment.live_events,
+    let sink = ClientEventSink::new(
+        context.client_id,
+        context.writer.clone(),
+        state.metrics.clone(),
     );
+    send_active_artifact_snapshots(state, session_id, &sink).await?;
+    let handle = forward_session_events(sink, attachment.events, attachment.live_events);
     state
         .register_client_forwarder(context.client_id, handle)
         .await;
@@ -6014,15 +6153,13 @@ async fn finish_attach_session_recent_success(
         "server.attach_recent.total_duration_ms",
         elapsed_ms(timings.total_started_at),
     );
-    let handle = forward_session_events(
-        ClientEventSink::new(
-            context.client_id,
-            context.writer.clone(),
-            state.metrics.clone(),
-        ),
-        attachment.events,
-        attachment.live_events,
+    let sink = ClientEventSink::new(
+        context.client_id,
+        context.writer.clone(),
+        state.metrics.clone(),
     );
+    send_active_artifact_snapshots(state, session_id, &sink).await?;
+    let handle = forward_session_events(sink, attachment.events, attachment.live_events);
     state
         .register_client_forwarder(context.client_id, handle)
         .await;
@@ -15098,6 +15235,7 @@ async fn invoke_model_tool(
     };
     let _action_registration = ActivePluginInvocationRegistration::register(
         Arc::clone(&state.active_plugin_invocations),
+        Arc::clone(&state.active_artifacts),
         session_id,
         &call.id,
         ActivePluginInvocation {
@@ -15305,6 +15443,132 @@ async fn handle_interactive_tool_request(
         .map_err(|error| error.to_string())
 }
 
+fn update_active_artifact(
+    state: &ServerState,
+    session_id: SessionId,
+    event: &ToolInvocationStreamEvent,
+) -> Result<(), String> {
+    let ToolInvocationStreamEvent::ArtifactUpdate {
+        tool_call_id,
+        artifact_id,
+        reference_key,
+        producer_plugin_id,
+        schema,
+        schema_version,
+        content_type,
+        storage_uri,
+        committed_bytes,
+        revision,
+        finalized,
+        ..
+    } = event
+    else {
+        return Ok(());
+    };
+    if artifact_id.trim().is_empty()
+        || reference_key.trim().is_empty()
+        || producer_plugin_id.trim().is_empty()
+        || schema.trim().is_empty()
+        || *schema_version == 0
+        || *revision == 0
+    {
+        return Err("active artifact identity, schema, and revision must be valid".to_owned());
+    }
+    let owner = state
+        .active_plugin_invocations
+        .lock()
+        .map_err(|_| "active plugin invocation registry poisoned".to_owned())?
+        .get(&(session_id, tool_call_id.clone()))
+        .cloned()
+        .ok_or_else(|| "active artifact invocation is not registered".to_owned())?;
+    if owner.producer_plugin_id != *producer_plugin_id {
+        return Err("active artifact producer does not own the invocation".to_owned());
+    }
+    let artifact_root = default_session_artifact_dir(session_id);
+    let path = artifact_reference_path(storage_uri, &artifact_root)?;
+    let canonical_root = artifact_root
+        .canonicalize()
+        .map_err(|error| format!("artifact root is unavailable: {error}"))?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| format!("active artifact is unavailable: {error}"))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err("active artifact path is outside the session artifact root".to_owned());
+    }
+    let file_bytes = std::fs::metadata(&canonical_path)
+        .map_err(|error| error.to_string())?
+        .len();
+    if *committed_bytes > file_bytes {
+        return Err(format!(
+            "active artifact committed length {committed_bytes} exceeds file length {file_bytes}"
+        ));
+    }
+    let key = ActiveArtifactKey {
+        session_id,
+        tool_call_id: tool_call_id.clone(),
+        artifact_id: artifact_id.clone(),
+        reference_key: reference_key.clone(),
+    };
+    let mut artifacts = state
+        .active_artifacts
+        .lock()
+        .map_err(|_| "active artifact registry poisoned".to_owned())?;
+    if let Some(existing) = artifacts.get(&key) {
+        let path_changed_on_finalization = *finalized
+            && existing.path != canonical_path
+            && existing.path.parent() == canonical_path.parent();
+        if existing.producer_plugin_id != *producer_plugin_id
+            || existing.schema != *schema
+            || existing.schema_version != *schema_version
+            || existing.content_type != *content_type
+            || (existing.path != canonical_path && !path_changed_on_finalization)
+        {
+            return Err("active artifact immutable identity changed".to_owned());
+        }
+        if *revision <= existing.revision || *committed_bytes < existing.committed_bytes {
+            return Err("active artifact revision and committed length must increase".to_owned());
+        }
+        if existing.finalized {
+            return Err("active artifact is already finalized".to_owned());
+        }
+    }
+    artifacts.insert(
+        key,
+        ActiveArtifactReference {
+            producer_plugin_id: producer_plugin_id.clone(),
+            schema: schema.clone(),
+            schema_version: *schema_version,
+            content_type: content_type.clone(),
+            path: canonical_path,
+            committed_bytes: *committed_bytes,
+            revision: *revision,
+            finalized: *finalized,
+        },
+    );
+    drop(artifacts);
+    Ok(())
+}
+
+fn active_artifact_snapshot_events(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<Vec<bcode_session_models::SessionLiveEvent>, String> {
+    let artifacts = state
+        .active_artifacts
+        .lock()
+        .map_err(|_| "active artifact registry poisoned".to_owned())?;
+    Ok(artifacts
+        .iter()
+        .filter(|(key, _)| key.session_id == session_id)
+        .map(|(key, artifact)| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolOutputDelta {
+                event: artifact.stream_event(key),
+            },
+        })
+        .collect())
+}
+
 /// Publish ephemeral tool output and visuals, or append bounded lifecycle events.
 ///
 /// `OutputDelta` carries raw live tool output, including PTY bytes, and is intentionally
@@ -15324,6 +15588,17 @@ async fn append_tool_stream_event(
         return;
     }
     let progress = runtime_work_progress_from_tool_stream_event(&event);
+    if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
+        if let Err(error) = update_active_artifact(state, session_id, &event) {
+            eprintln!("failed to update active artifact: {error}");
+            return;
+        }
+        let _ = state
+            .sessions
+            .publish_live_event(session_id, SessionLiveEventKind::ToolOutputDelta { event })
+            .await;
+        return;
+    }
     if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
         let _ = state
             .sessions
@@ -15384,6 +15659,7 @@ fn runtime_work_progress_from_tool_stream_event(
         )),
         ToolInvocationStreamEvent::OutputDelta { .. }
         | ToolInvocationStreamEvent::VisualUpdate { .. }
+        | ToolInvocationStreamEvent::ArtifactUpdate { .. }
         | ToolInvocationStreamEvent::LegacyPresentation { .. } => None,
     }
 }
@@ -15397,6 +15673,7 @@ fn normalize_tool_stream_event_sequence(
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
         | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
+        | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id.clone(),
@@ -15454,6 +15731,33 @@ fn set_tool_stream_event_sequence(
             sequence,
             visual,
             streaming,
+        },
+        ToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id,
+            artifact_id,
+            reference_key,
+            producer_plugin_id,
+            schema,
+            schema_version,
+            content_type,
+            storage_uri,
+            committed_bytes,
+            revision,
+            finalized,
+            ..
+        } => ToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id,
+            sequence,
+            artifact_id,
+            reference_key,
+            producer_plugin_id,
+            schema,
+            schema_version,
+            content_type,
+            storage_uri,
+            committed_bytes,
+            revision,
+            finalized,
         },
         ToolInvocationStreamEvent::Status {
             tool_call_id,
@@ -15537,6 +15841,33 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
                 payload: visual.payload,
             },
             streaming,
+        },
+        ServiceToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id,
+            sequence,
+            artifact_id,
+            reference_key,
+            producer_plugin_id,
+            schema,
+            schema_version,
+            content_type,
+            storage_uri,
+            committed_bytes,
+            revision,
+            finalized,
+        } => ToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id,
+            sequence,
+            artifact_id,
+            reference_key,
+            producer_plugin_id,
+            schema,
+            schema_version,
+            content_type,
+            storage_uri,
+            committed_bytes,
+            revision,
+            finalized,
         },
         ServiceToolInvocationStreamEvent::Status {
             tool_call_id,
@@ -17574,6 +17905,17 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
     )
 }
 
+async fn send_active_artifact_snapshots(
+    state: &ServerState,
+    session_id: SessionId,
+    sink: &ClientEventSink,
+) -> Result<(), CodecError> {
+    for event in active_artifact_snapshot_events(state, session_id).unwrap_or_default() {
+        sink.send(Event::SessionLive(event)).await?;
+    }
+    Ok(())
+}
+
 fn forward_session_events(
     sink: ClientEventSink,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
@@ -18156,10 +18498,12 @@ mod tests {
     #[test]
     fn active_plugin_invocation_registration_enforces_identity_and_lifetime() {
         let invocations = Arc::new(StdMutex::new(BTreeMap::new()));
+        let active_artifacts = Arc::new(StdMutex::new(BTreeMap::new()));
         let session_id = SessionId::new();
         let path = PathBuf::from("opaque-action-path");
         let registration = ActivePluginInvocationRegistration::register(
             Arc::clone(&invocations),
+            Arc::clone(&active_artifacts),
             session_id,
             "call-1",
             ActivePluginInvocation {
@@ -18178,6 +18522,7 @@ mod tests {
         assert!(
             ActivePluginInvocationRegistration::register(
                 Arc::clone(&invocations),
+                Arc::clone(&active_artifacts),
                 session_id,
                 "call-1",
                 ActivePluginInvocation {
@@ -18189,6 +18534,120 @@ mod tests {
         );
         drop(registration);
         assert!(invocations.lock().expect("registry").is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercises registration, revision, range, finalization, and cleanup as one lifecycle.
+    async fn active_artifact_registry_enforces_owner_revision_commit_and_snapshot() {
+        let sessions = SessionManager::default();
+        let state = test_server_state(sessions);
+        let session_id = SessionId::new();
+        let tool_call_id = "call-active";
+        let artifact_dir = default_session_artifact_dir(session_id);
+        std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
+        let path = artifact_dir.join("active.bin");
+        std::fs::write(&path, b"committed-uncommitted").expect("active artifact");
+        let registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            session_id,
+            tool_call_id,
+            ActivePluginInvocation {
+                producer_plugin_id: "fixture.plugin".to_owned(),
+                action_path: artifact_dir.join("actions"),
+            },
+        )
+        .expect("register invocation");
+        let update = ToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id: tool_call_id.to_owned(),
+            sequence: 1,
+            artifact_id: "artifact-active".to_owned(),
+            reference_key: "recording".to_owned(),
+            producer_plugin_id: "fixture.plugin".to_owned(),
+            schema: "fixture.recording".to_owned(),
+            schema_version: 1,
+            content_type: Some("application/octet-stream".to_owned()),
+            storage_uri: url::Url::from_file_path(&path)
+                .expect("file URL")
+                .to_string(),
+            committed_bytes: 9,
+            revision: 1,
+            finalized: false,
+        };
+        update_active_artifact(&state, session_id, &update).expect("register artifact");
+
+        let snapshots = active_artifact_snapshot_events(&state, session_id).expect("snapshots");
+        assert_eq!(snapshots.len(), 1);
+        let serialized_snapshot = serde_json::to_string(&snapshots[0]).expect("serialize snapshot");
+        assert!(!serialized_snapshot.contains("storage_uri"));
+        assert!(!serialized_snapshot.contains("active.bin"));
+        assert!(matches!(
+            &snapshots[0].kind,
+            SessionLiveEventKind::ToolOutputDelta {
+                event: ToolInvocationStreamEvent::ArtifactUpdate {
+                    committed_bytes: 9,
+                    revision: 1,
+                    ..
+                }
+            }
+        ));
+        let ResponsePayload::SessionArtifactRange {
+            total_bytes,
+            reference_revision,
+            finalized,
+            bytes,
+            ..
+        } = read_session_artifact_range(&state, session_id, "artifact-active", "recording", 0, 64)
+            .await
+            .expect("active range")
+        else {
+            panic!("expected artifact range");
+        };
+        assert_eq!(total_bytes, 9);
+        assert_eq!(reference_revision, 1);
+        assert!(!finalized);
+        assert_eq!(bytes, b"committed");
+
+        assert!(update_active_artifact(&state, session_id, &update).is_err());
+        let mut wrong_owner = update.clone();
+        if let ToolInvocationStreamEvent::ArtifactUpdate {
+            producer_plugin_id,
+            revision,
+            ..
+        } = &mut wrong_owner
+        {
+            *producer_plugin_id = "other.plugin".to_owned();
+            *revision = 2;
+        }
+        assert!(update_active_artifact(&state, session_id, &wrong_owner).is_err());
+
+        let mut finalized = update.clone();
+        if let ToolInvocationStreamEvent::ArtifactUpdate {
+            revision,
+            committed_bytes,
+            finalized: is_finalized,
+            ..
+        } = &mut finalized
+        {
+            *revision = 2;
+            *committed_bytes = 20;
+            *is_finalized = true;
+        }
+        update_active_artifact(&state, session_id, &finalized).expect("finalize artifact");
+        drop(registration);
+        assert_eq!(
+            active_artifact_snapshot_events(&state, session_id)
+                .expect("finalized snapshot")
+                .len(),
+            1
+        );
+        remove_finalized_active_artifact(&state, session_id, "artifact-active", "recording");
+        assert!(
+            active_artifact_snapshot_events(&state, session_id)
+                .expect("snapshots after finalized transition")
+                .is_empty()
+        );
+        remove_session_artifact_dir(&artifact_dir).expect("artifact cleanup");
     }
 
     #[test]
@@ -18213,6 +18672,25 @@ mod tests {
         std::fs::write(&outside, b"secret").expect("outside artifact");
         let error = read_artifact_file_range(&outside, &root, 0, 6)
             .expect_err("outside artifact must be rejected");
+        assert!(error.contains("outside the session artifact root"));
+        let missing = root.join("missing.bin");
+        let error = read_artifact_file_range(&missing, &root, 0, 1)
+            .expect_err("missing artifact must be explicit");
+        assert!(error.contains("artifact is unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_artifact_range_rejects_symlink_escape() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("artifacts");
+        std::fs::create_dir_all(&root).expect("artifact root");
+        let outside = temp_dir.path().join("outside.bin");
+        std::fs::write(&outside, b"secret").expect("outside artifact");
+        std::os::unix::fs::symlink(&outside, root.join("escape.bin")).expect("symlink");
+
+        let error = read_artifact_file_range(&root.join("escape.bin"), &root, 0, 6)
+            .expect_err("symlink escape must be rejected");
         assert!(error.contains("outside the session artifact root"));
     }
 

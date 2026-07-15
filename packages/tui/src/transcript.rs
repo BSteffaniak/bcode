@@ -1465,6 +1465,7 @@ fn apply_tool_invocation_stream_event(
             }
         }
         ToolInvocationStreamEvent::OutputDelta { .. }
+        | ToolInvocationStreamEvent::ArtifactUpdate { .. }
         | ToolInvocationStreamEvent::Status { .. }
         | ToolInvocationStreamEvent::LegacyPresentation { .. } => {}
     }

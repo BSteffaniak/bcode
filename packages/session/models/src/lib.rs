@@ -183,6 +183,7 @@ fn apply_tool_invocation_stream_projection_event(
                 .push_str(text);
         }
         ToolInvocationStreamEvent::VisualUpdate { .. }
+        | ToolInvocationStreamEvent::ArtifactUpdate { .. }
         | ToolInvocationStreamEvent::Status { .. } => {
             projection.status = ToolInvocationProjectionStatus::Running;
         }
@@ -225,6 +226,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
         | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
+        | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
@@ -995,6 +997,25 @@ pub enum ToolInvocationStreamEvent {
         is_error: bool,
         #[serde(default)]
         finished_at_ms: Option<u64>,
+    },
+    /// Generic active-artifact registration or committed-length revision.
+    ArtifactUpdate {
+        tool_call_id: String,
+        sequence: u64,
+        artifact_id: String,
+        reference_key: String,
+        producer_plugin_id: String,
+        schema: String,
+        schema_version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+        /// Host-local path used only while routing the producer update; never serialized to clients.
+        #[serde(skip)]
+        storage_uri: String,
+        committed_bytes: u64,
+        revision: u64,
+        #[serde(default)]
+        finalized: bool,
     },
 }
 

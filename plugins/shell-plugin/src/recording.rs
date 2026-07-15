@@ -15,6 +15,20 @@ use std::sync::{
 };
 use std::thread;
 
+/// One readable committed boundary of an active shell recording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellRecordingCommit {
+    /// Host-local recording path that contains the committed prefix.
+    pub path: PathBuf,
+    /// Complete readable bytes at this revision.
+    pub committed_bytes: u64,
+    /// Whether the recording has been atomically finalized.
+    pub finalized: bool,
+}
+
+/// Observer invoked from the recording worker after complete frames become readable.
+pub type ShellRecordingCommitObserver = Arc<dyn Fn(ShellRecordingCommit) + Send + Sync>;
+
 const MAGIC: &[u8; 8] = b"BCSHREC\0";
 const FORMAT_VERSION: u16 = 3;
 const SIGNAL_FORMAT_VERSION: u16 = 2;
@@ -107,11 +121,26 @@ impl AsyncShellRecordingWriter {
     ///
     /// Returns an error if the partial recording or writer thread cannot be created.
     pub fn create(path: &Path, columns: u16, rows: u16) -> io::Result<Self> {
-        let writer = ShellRecordingWriter::create(path, columns, rows)?;
+        Self::create_with_observer(path, columns, rows, None)
+    }
+
+    /// Start a bounded recording writer thread with committed-boundary notifications.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partial recording or writer thread cannot be created.
+    pub fn create_with_observer(
+        path: &Path,
+        columns: u16,
+        rows: u16,
+        observer: Option<ShellRecordingCommitObserver>,
+    ) -> io::Result<Self> {
+        let mut writer = ShellRecordingWriter::create(path, columns, rows)?;
+        writer.publish_commit(observer.as_ref(), false)?;
         let (sender, receiver) = mpsc::sync_channel(ASYNC_RECORDING_QUEUE_CAPACITY);
         let worker = thread::Builder::new()
             .name("bcode-shell-recording".to_owned())
-            .spawn(move || run_async_recording_writer(writer, &receiver))?;
+            .spawn(move || run_async_recording_writer(writer, &receiver, observer.as_ref()))?;
         Ok(Self {
             sender,
             worker: Some(worker),
@@ -241,6 +270,7 @@ impl Drop for AsyncShellRecordingWriter {
 fn run_async_recording_writer(
     mut writer: ShellRecordingWriter,
     receiver: &mpsc::Receiver<AsyncRecordingCommand>,
+    observer: Option<&ShellRecordingCommitObserver>,
 ) {
     let mut failure = None;
     while let Ok(command) = receiver.recv() {
@@ -251,12 +281,16 @@ fn run_async_recording_writer(
                 replay_bytes,
             } => {
                 if failure.is_none() {
-                    if let Err(error) = writer.write_output(offset_micros, &bytes) {
-                        failure = Some(error);
-                    } else if let Some(replay_bytes) = replay_bytes
-                        && !replay_bytes.is_empty()
-                        && let Err(error) = writer.write_replay_output(offset_micros, &replay_bytes)
-                    {
+                    let write_result = (|| {
+                        writer.write_output(offset_micros, &bytes)?;
+                        if let Some(replay_bytes) = replay_bytes
+                            && !replay_bytes.is_empty()
+                        {
+                            writer.write_replay_output(offset_micros, &replay_bytes)?;
+                        }
+                        writer.publish_commit(observer, false)
+                    })();
+                    if let Err(error) = write_result {
                         failure = Some(error);
                     }
                 }
@@ -266,10 +300,13 @@ fn run_async_recording_writer(
                 columns,
                 rows,
             } => {
-                if failure.is_none()
-                    && let Err(error) = writer.write_resize(offset_micros, columns, rows)
-                {
-                    failure = Some(error);
+                if failure.is_none() {
+                    let write_result = writer
+                        .write_resize(offset_micros, columns, rows)
+                        .and_then(|()| writer.publish_commit(observer, false));
+                    if let Err(error) = write_result {
+                        failure = Some(error);
+                    }
                 }
             }
             AsyncRecordingCommand::Finish {
@@ -282,13 +319,22 @@ fn run_async_recording_writer(
             } => {
                 let result = failure.map_or_else(
                     || {
-                        writer.finish(
+                        let final_path = writer.final_path.clone();
+                        let summary = writer.finish(
                             offset_micros,
                             exit_code,
                             signal.as_deref(),
                             timed_out,
                             cancelled,
-                        )
+                        )?;
+                        if let Some(observer) = observer {
+                            observer(ShellRecordingCommit {
+                                committed_bytes: fs::metadata(&final_path)?.len(),
+                                path: final_path,
+                                finalized: true,
+                            });
+                        }
+                        Ok(summary)
                     },
                     Err,
                 );
@@ -473,6 +519,31 @@ impl ShellRecordingWriter {
             output_bytes: self.output_bytes,
             checksum_sha256: format!("{:x}", self.checksum.clone().finalize()),
         })
+    }
+
+    fn publish_commit(
+        &mut self,
+        observer: Option<&ShellRecordingCommitObserver>,
+        finalized: bool,
+    ) -> io::Result<()> {
+        let Some(observer) = observer else {
+            return Ok(());
+        };
+        if !finalized {
+            self.writer.flush()?;
+        }
+        let path = if finalized {
+            self.final_path.clone()
+        } else {
+            self.partial_path.clone()
+        };
+        let committed_bytes = fs::metadata(&path)?.len();
+        observer(ShellRecordingCommit {
+            path,
+            committed_bytes,
+            finalized,
+        });
+        Ok(())
     }
 
     fn write_frame(&mut self, kind: u8, offset_micros: u64, payload: &[u8]) -> io::Result<()> {
@@ -794,6 +865,42 @@ mod tests {
         drop(held);
         assert!(writer.finish(2, Some(0), None, false, false).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn async_writer_publishes_monotonic_complete_boundaries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("observed.bcsr");
+        let commits = Arc::new(Mutex::new(Vec::<ShellRecordingCommit>::new()));
+        let observer_commits = Arc::clone(&commits);
+        let observer: ShellRecordingCommitObserver = Arc::new(move |commit| {
+            observer_commits.lock().expect("commits").push(commit);
+        });
+        let mut writer =
+            AsyncShellRecordingWriter::create_with_observer(&path, 80, 24, Some(observer))
+                .expect("writer");
+        assert!(writer.try_write_output(1, b"one"));
+        assert!(writer.try_write_resize(2, 100, 40));
+        writer
+            .finish(3, Some(0), None, false, false)
+            .expect("finish");
+
+        let commits = commits.lock().expect("commits");
+        assert!(commits.len() >= 4);
+        assert!(
+            commits
+                .windows(2)
+                .all(|window| { window[1].committed_bytes >= window[0].committed_bytes })
+        );
+        assert!(commits.last().expect("final commit").finalized);
+        assert_eq!(commits.last().expect("final commit").path, path);
+        assert!(
+            commits[..commits.len() - 1]
+                .iter()
+                .all(|commit| !commit.finalized
+                    && commit.path.extension().is_some_and(|ext| ext == "partial"))
+        );
+        drop(commits);
     }
 
     #[test]

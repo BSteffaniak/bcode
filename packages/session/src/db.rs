@@ -2331,6 +2331,7 @@ fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
         | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
+        | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
@@ -4403,6 +4404,45 @@ mod tests {
                 .expect("missing lookup")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn corrupt_finalized_artifact_projection_row_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("artifact projection".to_owned()),
+                working_directory: std::path::PathBuf::from("/tmp"),
+            },
+        ))
+        .await
+        .expect("append session creation");
+        db.database()
+            .insert("artifact_references")
+            .value("artifact_id", "artifact")
+            .value("reference_key", "recording")
+            .value("producer_plugin_id", "plugin")
+            .value("schema", "schema")
+            .value(
+                "schema_version",
+                DatabaseValue::String("invalid".to_owned()),
+            )
+            .value("finalized_event_seq", seq_to_value(0))
+            .execute(db.database())
+            .await
+            .expect("insert corrupt projection row");
+
+        let error = db
+            .finalized_artifact_reference("artifact", "recording")
+            .await
+            .expect_err("corrupt projection row must be rejected");
+        assert!(matches!(error, SessionDbError::InvalidRow { .. }));
     }
 
     #[tokio::test]

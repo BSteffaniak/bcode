@@ -481,6 +481,24 @@ pub enum ToolInvocationStreamEvent {
         #[serde(default)]
         finished_at_ms: Option<u64>,
     },
+    /// Generic active-artifact registration or committed-length revision.
+    ArtifactUpdate {
+        tool_call_id: String,
+        #[serde(default)]
+        sequence: u64,
+        artifact_id: String,
+        reference_key: String,
+        producer_plugin_id: String,
+        schema: String,
+        schema_version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+        storage_uri: String,
+        committed_bytes: u64,
+        revision: u64,
+        #[serde(default)]
+        finalized: bool,
+    },
 }
 
 /// Logical output stream for an incremental tool output chunk.
