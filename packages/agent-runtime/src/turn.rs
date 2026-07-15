@@ -402,6 +402,34 @@ impl InvocationCapabilities {
             artifacts,
         }
     }
+
+    /// Replace the exchange broker.
+    #[must_use]
+    pub fn with_exchange_broker(mut self, exchanges: Arc<dyn InvocationExchangeBroker>) -> Self {
+        self.exchanges = exchanges;
+        self
+    }
+
+    /// Replace the invocation input router.
+    #[must_use]
+    pub fn with_input_router(mut self, inputs: Arc<dyn InvocationInputRouter>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    /// Replace the nested service router.
+    #[must_use]
+    pub fn with_service_router(mut self, services: Arc<dyn InvocationServiceRouter>) -> Self {
+        self.services = services;
+        self
+    }
+
+    /// Replace the artifact sink.
+    #[must_use]
+    pub fn with_artifact_sink(mut self, artifacts: Arc<dyn InvocationArtifactSink>) -> Self {
+        self.artifacts = artifacts;
+        self
+    }
 }
 
 /// Shared lifecycle and cancellation state for one turn generation.

@@ -378,6 +378,43 @@ pub trait ModelProviderInvoker: Send {
     ) -> RuntimeFuture<'a, AckResponse>;
 }
 
+impl<T> ModelProviderInvoker for Box<T>
+where
+    T: ModelProviderInvoker + ?Sized,
+{
+    fn start_turn<'a>(
+        &'a mut self,
+        provider_plugin_id: Option<&'a str>,
+        request: &'a ModelTurnRequest,
+    ) -> RuntimeFuture<'a, StartTurnResponse> {
+        (**self).start_turn(provider_plugin_id, request)
+    }
+
+    fn poll_turn_events<'a>(
+        &'a mut self,
+        provider_plugin_id: Option<&'a str>,
+        request: &'a PollTurnEventsRequest,
+    ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+        (**self).poll_turn_events(provider_plugin_id, request)
+    }
+
+    fn cancel_turn<'a>(
+        &'a mut self,
+        provider_plugin_id: Option<&'a str>,
+        request: &'a CancelTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        (**self).cancel_turn(provider_plugin_id, request)
+    }
+
+    fn finish_turn<'a>(
+        &'a mut self,
+        provider_plugin_id: Option<&'a str>,
+        request: &'a FinishTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        (**self).finish_turn(provider_plugin_id, request)
+    }
+}
+
 /// Source used to route a registered model-callable tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolSource {
@@ -965,7 +1002,7 @@ impl AgentRuntime {
     where
         C: ToolCatalog + Sync,
         A: ToolAuthorizationCoordinator + ?Sized,
-        I: ToolInvoker + Sync,
+        I: ToolInvoker + Sync + ?Sized,
     {
         self.execute_prepared_tool_batch_with_host_context(
             catalog,
@@ -1009,7 +1046,7 @@ impl AgentRuntime {
     where
         C: ToolCatalog + Sync,
         A: ToolAuthorizationCoordinator + ?Sized,
-        I: ToolInvoker + Sync,
+        I: ToolInvoker + Sync + ?Sized,
     {
         if calls.is_empty() {
             return Ok(ToolBatchExecutionOutput {

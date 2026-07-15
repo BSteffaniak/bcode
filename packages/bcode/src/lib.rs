@@ -11,8 +11,8 @@
 use bcode_agent_permissions::{PermissionAskCallback, ask_callback};
 use bcode_agent_policy::active_tools_for;
 use bcode_agent_runtime::{
-    AgentRuntime, AgentTurnRequest, AgentTurnResponse, LegacyToolInvoker,
-    PermissionPolicyAuthorization, ToolBatchExecutionOutput, TurnGeneration, TurnScope,
+    AgentRuntime, AgentTurnRequest, AgentTurnResponse, PermissionPolicyAuthorization,
+    ToolBatchExecutionOutput, TurnGeneration, TurnScope,
 };
 #[cfg(feature = "embedded-plugins")]
 use bcode_model::{
@@ -23,8 +23,10 @@ use bcode_model::{
 };
 use bcode_model::{ModelParameters, ProviderRequestContext};
 use bcode_plugin_sdk::path::display_from_current_dir;
+#[cfg(feature = "embedded-plugins")]
+use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
 use bcode_session_models::SessionId;
-use bcode_tool::{ToolInvocationRequest, ToolInvocationResponse};
+use bcode_tool::ToolInvocationRequest;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -43,15 +45,28 @@ pub use bcode_agent_runtime::{
     RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
     ToolExecutionOutput, ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
+pub use bcode_agent_runtime::{
+    InvocationArtifactSink, InvocationCapabilities, InvocationCapabilityFuture,
+    InvocationExchangeBroker, InvocationInputRouter, InvocationScope, InvocationServiceRouter,
+    PreparationScope, ScopedTurnEvent, ToolAuthorizationCoordinator, ToolAuthorizationDecision,
+    ToolAuthorizationRequest, ToolInvoker, TurnEventSink,
+};
 #[cfg(feature = "daemon-client")]
 pub use bcode_client::{
     BcodeClient, ClientConnection, ClientError, DaemonAvailability, SessionList,
 };
 pub use bcode_model::{
     ContentBlock as ModelContentBlock, MessageRole, ModelInfo, ModelList, ModelMessage,
-    ProviderCapabilities, ToolCall,
+    ProviderCapabilities, ProviderTurnEvent, StopReason, ToolCall,
 };
-pub use bcode_tool::{ToolDefinition, ToolExecutionOptions};
+pub use bcode_tool::PreparedToolInvocation;
+pub use bcode_tool::{
+    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolDefinition, ToolExchangeRequest,
+    ToolExchangeResolution, ToolExchangeResponsePolicy, ToolExecutionOptions,
+    ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
+    ToolInvocationResponse, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
+    ToolPreparationRequest, ToolPreparationResponse,
+};
 
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
@@ -1175,11 +1190,76 @@ impl AgentHooks {
     }
 }
 
-type InlineToolHandler = Arc<
-    dyn Fn(ToolInvocationRequest) -> std::result::Result<ToolInvocationResponse, String>
-        + Send
-        + Sync,
+type InlineToolFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = std::result::Result<ToolInvocationResponse, String>>
+            + Send,
+    >,
 >;
+type InlineToolHandler =
+    Arc<dyn Fn(ToolInvocationRequest, InvocationScope) -> InlineToolFuture + Send + Sync>;
+type ProviderFactory = Arc<dyn Fn() -> Box<dyn ModelProviderInvoker> + Send + Sync>;
+
+#[derive(Debug, Default)]
+struct DiscardingSdkTurnEventSink;
+
+impl TurnEventSink for DiscardingSdkTurnEventSink {
+    fn emit(&self, _event: ScopedTurnEvent) -> bool {
+        true
+    }
+}
+
+/// Explicit policy for renderer-free invocation exchanges.
+#[derive(Clone)]
+pub enum HeadlessExchangePolicy {
+    /// Reject every exchange with a structured failure.
+    Reject,
+    /// Resolve exchanges with a caller callback.
+    Callback(Arc<dyn Fn(ToolExchangeRequest) -> ToolExchangeResolution + Send + Sync>),
+    /// Forward exchanges to another broker.
+    Forward(Arc<dyn InvocationExchangeBroker>),
+    /// Respond to every exchange with the configured opaque payload.
+    AutoResponse(serde_json::Value),
+}
+
+impl fmt::Debug for HeadlessExchangePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reject => formatter.write_str("Reject"),
+            Self::Callback(_) => formatter.write_str("Callback(<callback>)"),
+            Self::Forward(_) => formatter.write_str("Forward(<broker>)"),
+            Self::AutoResponse(payload) => formatter
+                .debug_tuple("AutoResponse")
+                .field(payload)
+                .finish(),
+        }
+    }
+}
+
+impl InvocationExchangeBroker for HeadlessExchangePolicy {
+    fn request(
+        &self,
+        request: ToolExchangeRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution> {
+        match self {
+            Self::Reject => Box::pin(async {
+                ToolExchangeResolution::Failed {
+                    code: "headless_exchange_rejected".to_string(),
+                    message: "headless host rejected the invocation exchange".to_string(),
+                }
+            }),
+            Self::Callback(callback) => {
+                let resolution = callback(request);
+                Box::pin(async move { resolution })
+            }
+            Self::Forward(broker) => broker.request(request),
+            Self::AutoResponse(payload) => {
+                let payload = payload.clone();
+                Box::pin(async move { ToolExchangeResolution::Responded { payload } })
+            }
+        }
+    }
+}
 
 fn structured_prompt(prompt: &str, options: &StructuredOutputOptions) -> String {
     format!(
@@ -1276,30 +1356,49 @@ fn text_from_message(message: &ModelMessage) -> Option<String> {
 }
 
 #[derive(Clone)]
-struct InlineToolExecutor {
+struct SdkToolInvoker {
     handlers: BTreeMap<String, InlineToolHandler>,
+    #[cfg(feature = "embedded-plugins")]
+    session_id: SessionId,
     #[cfg(feature = "embedded-plugins")]
     plugins: Option<bcode_plugin::PluginRuntimeHost>,
 }
 
-impl fmt::Debug for InlineToolExecutor {
+impl fmt::Debug for SdkToolInvoker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut debug = formatter.debug_struct("InlineToolExecutor");
+        let mut debug = formatter.debug_struct("SdkToolInvoker");
         debug.field("tools", &self.handlers.keys().collect::<Vec<_>>());
         #[cfg(feature = "embedded-plugins")]
         debug.field("plugins", &self.plugins.is_some());
-        #[cfg(not(feature = "embedded-plugins"))]
-        debug.field("plugins", &false);
         debug.finish()
     }
 }
 
-impl ToolExecutor for InlineToolExecutor {
-    fn execute_tool<'a>(
+impl ToolInvoker for SdkToolInvoker {
+    fn prepare_tool<'a>(
+        &'a self,
+        _tool: &'a RegisteredTool,
+        _request: &'a ToolPreparationRequest,
+        _scope: &'a PreparationScope,
+    ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+        Box::pin(async { Ok(ToolPreparationResponse::default()) })
+    }
+
+    fn invoke_tool<'a>(
         &'a self,
         tool: &'a RegisteredTool,
-        request: &'a ToolInvocationRequest,
-    ) -> bcode_agent_runtime::RuntimeFuture<'a, ToolInvocationResponse> {
+        invocation: &'a PreparedToolInvocation,
+        scope: &'a InvocationScope,
+    ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+        let request = ToolInvocationRequest {
+            tool_call_id: invocation.invocation.invocation_id.clone(),
+            name: invocation.invocation.tool_name.clone(),
+            arguments: invocation.invocation.arguments.clone(),
+            cwd: None,
+            artifact_dir: None,
+            cancellation_path: None,
+            invocation_action_path: None,
+        };
         Box::pin(async move {
             match &tool.source {
                 ToolSource::Inline => {
@@ -1309,19 +1408,33 @@ impl ToolExecutor for InlineToolExecutor {
                             message: "inline tool handler not found".to_string(),
                         }
                     })?;
-                    handler(request.clone()).map_err(|message| RuntimeError::ToolExecution {
-                        tool_name: tool.definition.name.clone(),
-                        message,
+                    handler(request, scope.clone()).await.map_err(|message| {
+                        RuntimeError::ToolExecution {
+                            tool_name: tool.definition.name.clone(),
+                            message,
+                        }
                     })
                 }
                 ToolSource::Plugin { plugin_id } => {
                     #[cfg(feature = "embedded-plugins")]
                     {
-                        execute_plugin_tool(self.plugins.as_ref(), plugin_id, request).await
+                        execute_plugin_tool(
+                            self.plugins.as_ref(),
+                            plugin_id,
+                            &request,
+                            scope,
+                            self.session_id,
+                        )
+                        .await
                     }
                     #[cfg(not(feature = "embedded-plugins"))]
                     {
-                        execute_plugin_tool(plugin_id, request)
+                        Err(RuntimeError::ToolExecution {
+                            tool_name: request.name.clone(),
+                            message: format!(
+                                "plugin-backed tool routing for plugin '{plugin_id}' requires embedded-plugins"
+                            ),
+                        })
                     }
                 }
             }
@@ -1334,36 +1447,102 @@ async fn execute_plugin_tool(
     plugins: Option<&bcode_plugin::PluginRuntimeHost>,
     plugin_id: &str,
     request: &ToolInvocationRequest,
+    scope: &InvocationScope,
+    session_id: SessionId,
 ) -> std::result::Result<ToolInvocationResponse, RuntimeError> {
     let plugins = plugins.ok_or_else(|| RuntimeError::ToolExecution {
         tool_name: request.name.clone(),
         message: "embedded plugin runtime is not configured".to_string(),
     })?;
-    plugins
-        .invoke_service_json_scoped(
+    let payload = serde_json::to_vec(request).map_err(|error| RuntimeError::ToolExecution {
+        tool_name: request.name.clone(),
+        message: error.to_string(),
+    })?;
+    let plugin_scope = bcode_plugin::PluginInvocationScope::session(session_id.to_string())
+        .with_turn_id(scope.turn().turn_id())
+        .with_work_id(scope.invocation_id());
+    let invocation_scope = scope.clone();
+    let handle = tokio::runtime::Handle::current();
+    let bridge = bcode_plugin::PluginInvocationBridge::new(move |request, _| {
+        handle.block_on(route_plugin_bridge_request(&invocation_scope, request))
+    });
+    let mut invocation = plugins
+        .invoke_service_with_events_and_bridge_scoped(
             plugin_id,
             bcode_tool::TOOL_SERVICE_INTERFACE_ID,
             bcode_tool::OP_INVOKE_TOOL,
-            request,
-            bcode_plugin::PluginInvocationScope::Global,
+            payload,
+            plugin_scope,
+            Some(bridge),
         )
         .await
         .map_err(|error| RuntimeError::ToolExecution {
             tool_name: request.name.clone(),
             message: error.to_string(),
-        })
+        })?;
+    if !scope.register_cancellation(Arc::new(PluginInvocationCancellation(
+        invocation.cancel.clone(),
+    ))) {
+        invocation.cancel.cancel();
+        return Err(RuntimeError::Cancelled);
+    }
+    loop {
+        match invocation
+            .next_event()
+            .await
+            .map_err(|error| RuntimeError::ToolExecution {
+                tool_name: request.name.clone(),
+                message: error.to_string(),
+            })? {
+            bcode_plugin::StreamingServiceInvocationEvent::Event(_) => {}
+            bcode_plugin::StreamingServiceInvocationEvent::Response(response) => {
+                let response = response.map_err(|error| RuntimeError::ToolExecution {
+                    tool_name: request.name.clone(),
+                    message: error.to_string(),
+                })?;
+                return bcode_plugin::decode_service_response(response).map_err(|error| {
+                    RuntimeError::ToolExecution {
+                        tool_name: request.name.clone(),
+                        message: error.to_string(),
+                    }
+                });
+            }
+        }
+    }
 }
 
-#[cfg(not(feature = "embedded-plugins"))]
-fn execute_plugin_tool(
-    plugin_id: &str,
-    request: &ToolInvocationRequest,
-) -> std::result::Result<ToolInvocationResponse, RuntimeError> {
-    Err(RuntimeError::ToolExecution {
-        tool_name: request.name.clone(),
-        message: format!(
-            "plugin-backed tool routing for plugin '{plugin_id}' requires embedded-plugins"
-        ),
+#[cfg(feature = "embedded-plugins")]
+#[derive(Debug)]
+struct PluginInvocationCancellation(bcode_plugin::PluginInvocationCancelHandle);
+
+#[cfg(feature = "embedded-plugins")]
+impl bcode_agent_runtime::InvocationCancellation for PluginInvocationCancellation {
+    fn request_cancel(&self) {
+        self.0.cancel();
+    }
+}
+
+#[cfg(feature = "embedded-plugins")]
+async fn route_plugin_bridge_request(
+    scope: &InvocationScope,
+    request: ServiceBridgeRequest,
+) -> std::result::Result<ServiceBridgeResponse, String> {
+    Ok(match request {
+        ServiceBridgeRequest::Exchange(request) => {
+            ServiceBridgeResponse::Exchange(scope.request_exchange(request).await)
+        }
+        ServiceBridgeRequest::ReceiveInput { invocation_id } => {
+            if invocation_id != scope.invocation_id() {
+                return Err("input request invocation ID does not match runtime scope".to_string());
+            }
+            ServiceBridgeResponse::Input(scope.receive_input().await)
+        }
+        ServiceBridgeRequest::InvokeService(request) => {
+            ServiceBridgeResponse::Service(scope.invoke_service(request).await)
+        }
+        ServiceBridgeRequest::WriteArtifact(request) => {
+            ServiceBridgeResponse::Artifact(scope.write_artifact(request).await)
+        }
     })
 }
 
@@ -2189,6 +2368,11 @@ pub struct Agent {
     timeout: Duration,
     max_tool_rounds: u32,
     execution_options: ToolExecutionOptions,
+    invocation_capabilities: InvocationCapabilities,
+    invocation_event_sink: Arc<dyn TurnEventSink>,
+    authorization_coordinator: Option<Arc<dyn ToolAuthorizationCoordinator>>,
+    tool_invoker: Option<Arc<dyn ToolInvoker>>,
+    provider_factory: Option<ProviderFactory>,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
@@ -2218,6 +2402,14 @@ impl fmt::Debug for Agent {
             .field("timeout", &self.timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("execution_options", &self.execution_options)
+            .field("invocation_capabilities", &self.invocation_capabilities)
+            .field("invocation_event_sink", &"<sink>")
+            .field(
+                "authorization_coordinator",
+                &self.authorization_coordinator.is_some(),
+            )
+            .field("tool_invoker", &self.tool_invoker.is_some())
+            .field("provider_factory", &self.provider_factory.is_some())
             .field("tool_catalog", &self.tool_catalog)
             .field(
                 "inline_tool_handlers",
@@ -2249,7 +2441,32 @@ impl Agent {
     /// runtime is cancelled, or the provider reports an error.
     #[cfg(feature = "embedded-plugins")]
     pub async fn generate_text(&self, prompt: impl Into<String>) -> Result<GenerateTextResponse> {
-        let mut provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
+        let mut provider: Box<dyn ModelProviderInvoker> =
+            self.provider_factory.as_ref().map_or_else(
+                || {
+                    self.provider
+                        .clone()
+                        .map(|provider| Box::new(provider) as Box<dyn ModelProviderInvoker>)
+                        .ok_or(BcodeError::MissingProvider)
+                },
+                |factory| Ok(factory()),
+            )?;
+        self.generate_text_with_provider(&mut provider, prompt)
+            .await
+    }
+
+    /// Generate text using the configured provider factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no provider factory is configured or provider invocation fails.
+    #[cfg(not(feature = "embedded-plugins"))]
+    pub async fn generate_text(&self, prompt: impl Into<String>) -> Result<GenerateTextResponse> {
+        let mut provider = self
+            .provider_factory
+            .as_ref()
+            .map(|factory| factory())
+            .ok_or(BcodeError::MissingProvider)?;
         self.generate_text_with_provider(&mut provider, prompt)
             .await
     }
@@ -2346,7 +2563,36 @@ impl Agent {
     where
         T: DeserializeOwned + schemars::JsonSchema,
     {
-        let mut provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
+        let mut provider: Box<dyn ModelProviderInvoker> =
+            self.provider_factory.as_ref().map_or_else(
+                || {
+                    self.provider
+                        .clone()
+                        .map(|provider| Box::new(provider) as Box<dyn ModelProviderInvoker>)
+                        .ok_or(BcodeError::MissingProvider)
+                },
+                |factory| Ok(factory()),
+            )?;
+        self.generate_object_with_provider(&mut provider, prompt)
+            .await
+    }
+
+    /// Generate and deserialize a structured object using the configured provider factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no provider factory is configured, provider invocation fails, or the
+    /// structured response is invalid.
+    #[cfg(not(feature = "embedded-plugins"))]
+    pub async fn generate_object<T>(&self, prompt: impl Into<String>) -> Result<T>
+    where
+        T: DeserializeOwned + schemars::JsonSchema,
+    {
+        let mut provider = self
+            .provider_factory
+            .as_ref()
+            .map(|factory| factory())
+            .ok_or(BcodeError::MissingProvider)?;
         self.generate_object_with_provider(&mut provider, prompt)
             .await
     }
@@ -2500,7 +2746,38 @@ impl Agent {
     /// Returns an error when no embedded provider is configured.
     #[cfg(feature = "embedded-plugins")]
     pub fn stream_text(&self, prompt: impl Into<String>) -> Result<AgentStream> {
-        let provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
+        let provider: Box<dyn ModelProviderInvoker> = self.provider_factory.as_ref().map_or_else(
+            || {
+                self.provider
+                    .clone()
+                    .map(|provider| Box::new(provider) as Box<dyn ModelProviderInvoker>)
+                    .ok_or(BcodeError::MissingProvider)
+            },
+            |factory| Ok(factory()),
+        )?;
+        Ok(self.runtime.run_streaming_text_turn(
+            provider,
+            self.turn_request_with_structured_output_messages_and_cancellation(
+                prompt.into(),
+                None,
+                Vec::new(),
+                CancellationToken::new(),
+            ),
+        ))
+    }
+
+    /// Stream text using the configured provider factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no provider factory is configured.
+    #[cfg(not(feature = "embedded-plugins"))]
+    pub fn stream_text(&self, prompt: impl Into<String>) -> Result<AgentStream> {
+        let provider = self
+            .provider_factory
+            .as_ref()
+            .map(|factory| factory())
+            .ok_or(BcodeError::MissingProvider)?;
         Ok(self.runtime.run_streaming_text_turn(
             provider,
             self.turn_request_with_structured_output_messages_and_cancellation(
@@ -2526,7 +2803,37 @@ impl Agent {
         prompt: impl Into<String>,
         cancellation: CancellationToken,
     ) -> Result<AgentStream> {
-        let provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
+        let provider: Box<dyn ModelProviderInvoker> = self.provider_factory.as_ref().map_or_else(
+            || {
+                self.provider
+                    .clone()
+                    .map(|provider| Box::new(provider) as Box<dyn ModelProviderInvoker>)
+                    .ok_or(BcodeError::MissingProvider)
+            },
+            |factory| Ok(factory()),
+        )?;
+        Ok(self.runtime.run_streaming_text_turn(
+            provider,
+            self.turn_request_with_cancellation(prompt.into(), cancellation),
+        ))
+    }
+
+    /// Stream text with cancellation using the configured provider factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no provider factory is configured.
+    #[cfg(not(feature = "embedded-plugins"))]
+    pub fn stream_text_with_cancellation(
+        &self,
+        prompt: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> Result<AgentStream> {
+        let provider = self
+            .provider_factory
+            .as_ref()
+            .map(|factory| factory())
+            .ok_or(BcodeError::MissingProvider)?;
         Ok(self.runtime.run_streaming_text_turn(
             provider,
             self.turn_request_with_cancellation(prompt.into(), cancellation),
@@ -2589,22 +2896,31 @@ impl Agent {
         calls: &[ToolCall],
         rounds: &mut ToolRoundState,
     ) -> Result<ToolBatchExecutionOutput> {
-        let executor = InlineToolExecutor {
+        let default_invoker = SdkToolInvoker {
             handlers: self.inline_tool_handlers.clone(),
+            #[cfg(feature = "embedded-plugins")]
+            session_id: self.session_id,
             #[cfg(feature = "embedded-plugins")]
             plugins: self.plugins.clone(),
         };
-        let authorization = PermissionPolicyAuthorization::new(self.permission_policy.as_ref());
-        let invoker = LegacyToolInvoker::new(&executor);
-        let scope = TurnScope::without_events(
+        let invoker = self.tool_invoker.as_deref().unwrap_or(&default_invoker);
+        let policy_authorization =
+            PermissionPolicyAuthorization::new(self.permission_policy.as_ref());
+        let authorization = self
+            .authorization_coordinator
+            .as_deref()
+            .unwrap_or(&policy_authorization);
+        let scope = TurnScope::with_capabilities(
             format!("sdk-tool-batch:{}", self.session_id),
             TurnGeneration::new(0),
+            Arc::clone(&self.invocation_event_sink),
+            self.invocation_capabilities.clone(),
         );
         self.runtime
             .execute_prepared_tool_batch(
                 &self.tool_catalog,
-                &authorization,
-                &invoker,
+                authorization,
+                invoker,
                 calls,
                 rounds,
                 &self.permission_context(),
@@ -2632,36 +2948,12 @@ impl Agent {
     ///
     /// Returns an error when the tool is unknown, denied, or its handler fails.
     pub async fn execute_tool_call(&self, call: &ToolCall) -> Result<ToolExecutionOutput> {
-        let executor = InlineToolExecutor {
-            handlers: self.inline_tool_handlers.clone(),
-            #[cfg(feature = "embedded-plugins")]
-            plugins: self.plugins.clone(),
-        };
-        let context = ToolCallContext {
-            agent_name: self.name.clone(),
-            call: call.clone(),
-        };
-        self.hooks.run_before_tool(&context)?;
-        let output = self
-            .runtime
-            .execute_tool_call_with_context(
-                &self.tool_catalog,
-                self.permission_policy.as_ref(),
-                &executor,
-                call,
-                &self.permission_context(),
-            )
-            .await?;
-        self.hooks.run_after_tool(
-            &context,
-            &ToolCallOutcome {
-                output: output.clone(),
-            },
-        )?;
-        Ok(output)
+        let mut rounds = self.tool_round_state();
+        self.execute_tool_call_with_round_state(call, &mut rounds)
+            .await
     }
 
-    /// Execute a registered tool call through this agent's unified tool catalog and round budget.
+    /// Execute a registered tool call through this agent's canonical batch path and round budget.
     ///
     /// # Errors
     ///
@@ -2672,27 +2964,19 @@ impl Agent {
         call: &ToolCall,
         rounds: &mut ToolRoundState,
     ) -> Result<ToolExecutionOutput> {
-        let executor = InlineToolExecutor {
-            handlers: self.inline_tool_handlers.clone(),
-            #[cfg(feature = "embedded-plugins")]
-            plugins: self.plugins.clone(),
-        };
         let context = ToolCallContext {
             agent_name: self.name.clone(),
             call: call.clone(),
         };
         self.hooks.run_before_tool(&context)?;
-        let output = self
-            .runtime
-            .execute_tool_call_with_round_state_and_context(
-                &self.tool_catalog,
-                self.permission_policy.as_ref(),
-                &executor,
-                call,
-                rounds,
-                &self.permission_context(),
-            )
+        let mut batch = self
+            .execute_tool_batch_with_round_state(std::slice::from_ref(call), rounds)
             .await?;
+        let output = batch.results.pop().ok_or_else(|| {
+            BcodeError::ToolExecution(
+                "canonical single-call batch returned no per-call result".to_string(),
+            )
+        })??;
         self.hooks.run_after_tool(
             &context,
             &ToolCallOutcome {
@@ -2821,6 +3105,11 @@ pub struct AgentBuilder {
     timeout: Duration,
     max_tool_rounds: u32,
     execution_options: ToolExecutionOptions,
+    invocation_capabilities: InvocationCapabilities,
+    invocation_event_sink: Arc<dyn TurnEventSink>,
+    authorization_coordinator: Option<Arc<dyn ToolAuthorizationCoordinator>>,
+    tool_invoker: Option<Arc<dyn ToolInvoker>>,
+    provider_factory: Option<ProviderFactory>,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
@@ -2851,6 +3140,14 @@ impl fmt::Debug for AgentBuilder {
             .field("timeout", &self.timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("execution_options", &self.execution_options)
+            .field("invocation_capabilities", &self.invocation_capabilities)
+            .field("invocation_event_sink", &"<sink>")
+            .field(
+                "authorization_coordinator",
+                &self.authorization_coordinator.is_some(),
+            )
+            .field("tool_invoker", &self.tool_invoker.is_some())
+            .field("provider_factory", &self.provider_factory.is_some())
             .field("tool_catalog", &self.tool_catalog)
             .field(
                 "inline_tool_handlers",
@@ -2891,6 +3188,11 @@ impl Default for AgentBuilder {
             timeout: Duration::from_mins(2),
             max_tool_rounds: 8,
             execution_options: ToolExecutionOptions::default(),
+            invocation_capabilities: InvocationCapabilities::default(),
+            invocation_event_sink: Arc::new(DiscardingSdkTurnEventSink),
+            authorization_coordinator: None,
+            tool_invoker: None,
+            provider_factory: None,
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
             hooks: AgentHooks::new(),
@@ -3012,6 +3314,77 @@ impl AgentBuilder {
         self
     }
 
+    /// Configure the invocation exchange broker.
+    #[must_use]
+    pub fn exchange_broker(mut self, broker: Arc<dyn InvocationExchangeBroker>) -> Self {
+        self.invocation_capabilities = self.invocation_capabilities.with_exchange_broker(broker);
+        self
+    }
+
+    /// Configure explicit renderer-free exchange behavior.
+    #[must_use]
+    pub fn headless_exchange_policy(mut self, policy: HeadlessExchangePolicy) -> Self {
+        self.invocation_capabilities = self
+            .invocation_capabilities
+            .with_exchange_broker(Arc::new(policy));
+        self
+    }
+
+    /// Configure the invocation input router.
+    #[must_use]
+    pub fn input_router(mut self, router: Arc<dyn InvocationInputRouter>) -> Self {
+        self.invocation_capabilities = self.invocation_capabilities.with_input_router(router);
+        self
+    }
+
+    /// Configure the nested invocation service router.
+    #[must_use]
+    pub fn service_router(mut self, router: Arc<dyn InvocationServiceRouter>) -> Self {
+        self.invocation_capabilities = self.invocation_capabilities.with_service_router(router);
+        self
+    }
+
+    /// Configure the invocation artifact sink.
+    #[must_use]
+    pub fn artifact_sink(mut self, sink: Arc<dyn InvocationArtifactSink>) -> Self {
+        self.invocation_capabilities = self.invocation_capabilities.with_artifact_sink(sink);
+        self
+    }
+
+    /// Configure the nonblocking scoped invocation event sink.
+    #[must_use]
+    pub fn invocation_event_sink(mut self, sink: Arc<dyn TurnEventSink>) -> Self {
+        self.invocation_event_sink = sink;
+        self
+    }
+
+    /// Configure the complete-batch authorization coordinator.
+    #[must_use]
+    pub fn authorization_coordinator(
+        mut self,
+        coordinator: Arc<dyn ToolAuthorizationCoordinator>,
+    ) -> Self {
+        self.authorization_coordinator = Some(coordinator);
+        self
+    }
+
+    /// Configure a canonical tool invoker registry/adapter.
+    #[must_use]
+    pub fn tool_invoker(mut self, invoker: Arc<dyn ToolInvoker>) -> Self {
+        self.tool_invoker = Some(invoker);
+        self
+    }
+
+    /// Configure a provider factory used by the agent's default generation and streaming methods.
+    #[must_use]
+    pub fn provider_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn ModelProviderInvoker> + Send + Sync + 'static,
+    {
+        self.provider_factory = Some(Arc::new(factory));
+        self
+    }
+
     /// Register an inline SDK tool.
     ///
     /// The supplied definition is exposed to providers as a normal [`ToolDefinition`], while the
@@ -3026,7 +3399,31 @@ impl AgentBuilder {
     {
         let name = definition.name.clone();
         self.tool_catalog.insert(RegisteredTool::inline(definition));
-        self.inline_tool_handlers.insert(name, Arc::new(handler));
+        self.inline_tool_handlers.insert(
+            name,
+            Arc::new(move |request, _scope| {
+                let result = handler(request);
+                Box::pin(async move { result })
+            }),
+        );
+        self
+    }
+
+    /// Register an asynchronous inline SDK tool that receives its canonical invocation scope.
+    #[must_use]
+    pub fn scoped_inline_tool<F, Fut>(mut self, definition: ToolDefinition, handler: F) -> Self
+    where
+        F: Fn(ToolInvocationRequest, InvocationScope) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<ToolInvocationResponse, String>>
+            + Send
+            + 'static,
+    {
+        let name = definition.name.clone();
+        self.tool_catalog.insert(RegisteredTool::inline(definition));
+        self.inline_tool_handlers.insert(
+            name,
+            Arc::new(move |request, scope| Box::pin(handler(request, scope))),
+        );
         self
     }
 
@@ -3246,6 +3643,11 @@ impl AgentBuilder {
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
             execution_options: self.execution_options,
+            invocation_capabilities: self.invocation_capabilities,
+            invocation_event_sink: self.invocation_event_sink,
+            authorization_coordinator: self.authorization_coordinator,
+            tool_invoker: self.tool_invoker,
+            provider_factory: self.provider_factory,
             tool_catalog: self.tool_catalog,
             inline_tool_handlers: self.inline_tool_handlers,
             hooks: self.hooks,

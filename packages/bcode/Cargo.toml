@@ -47,7 +47,9 @@ tokio = { workspace = true, features = [
 ], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+bcode_hello_plugin = { workspace = true }
+bcode_plugin       = { workspace = true }
+tokio              = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 app = ["cli", "static-bundled-plugins", "bundled-ocr-tesseract"]
@@ -75,7 +77,7 @@ bundled-plugins = ["dep:bcode_bundled_plugins"]
 cli = ["dep:bcode_cli", "dep:tokio"]
 daemon-client = ["dep:bcode_client"]
 default = []
-embedded-plugins = ["dep:bcode_plugin"]
+embedded-plugins = ["dep:bcode_plugin", "dep:tokio"]
 fail-on-warnings = []
 static-bundled-bedrock-provider-plugin = [
     "bundled-plugins",

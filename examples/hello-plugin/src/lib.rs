@@ -22,6 +22,23 @@ impl RustPlugin for HelloPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID
+            && context.request.operation == bcode_tool::OP_INVOKE_TOOL
+        {
+            let request = match context
+                .request
+                .payload_json::<bcode_tool::ToolInvocationRequest>()
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    return ServiceResponse::error("invalid_tool_request", error.to_string());
+                }
+            };
+            if request.name != "hello_bridge" {
+                return ServiceResponse::error("unsupported_tool", request.name);
+            }
+            return bridge_tool_response(&context, &request.tool_call_id);
+        }
         if context.request.interface_id != "example-hello/v1" {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -51,46 +68,7 @@ impl RustPlugin for HelloPlugin {
                 context.events.emit(b"hello-event");
                 ServiceResponse::text("event-emitted")
             }
-            "bridge-all" => {
-                let requests = [
-                    ServiceBridgeRequest::Exchange(bcode_tool::ToolExchangeRequest {
-                        invocation_id: "hello-invocation".to_string(),
-                        exchange_id: "hello-exchange".to_string(),
-                        producer_id: "example.hello".to_string(),
-                        schema: "example.hello.exchange".to_string(),
-                        schema_version: 1,
-                        payload: serde_json::Value::Null,
-                        response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
-                    }),
-                    ServiceBridgeRequest::ReceiveInput {
-                        invocation_id: "hello-invocation".to_string(),
-                    },
-                    ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
-                        invocation_id: "hello-invocation".to_string(),
-                        request_id: "hello-service".to_string(),
-                        interface_id: "example.nested/v1".to_string(),
-                        operation: "run".to_string(),
-                        payload: serde_json::Value::Null,
-                    }),
-                    ServiceBridgeRequest::WriteArtifact(bcode_tool::ToolArtifactWriteRequest {
-                        invocation_id: "hello-invocation".to_string(),
-                        artifact_id: "hello-artifact".to_string(),
-                        content_type: "text/plain".to_string(),
-                        bytes: b"hello".to_vec(),
-                        metadata: serde_json::Value::Null,
-                    }),
-                ];
-                let responses = requests
-                    .iter()
-                    .map(|request| context.bridge.request(request))
-                    .collect::<Result<Vec<_>, _>>();
-                match responses {
-                    Ok(responses) => ServiceResponse::json(&responses).unwrap_or_else(|error| {
-                        ServiceResponse::error("bridge_response_encode_failed", error.to_string())
-                    }),
-                    Err(error) => ServiceResponse::error("bridge_failed", error.to_string()),
-                }
-            }
+            "bridge-all" => bridge_responses(&context, "hello-invocation"),
             "wait-cancelled" => {
                 if context
                     .cancellation
@@ -115,6 +93,71 @@ impl RustPlugin for HelloPlugin {
         }
         Ok(())
     }
+}
+
+fn bridge_requests(invocation_id: &str) -> [ServiceBridgeRequest; 4] {
+    [
+        ServiceBridgeRequest::Exchange(bcode_tool::ToolExchangeRequest {
+            invocation_id: invocation_id.to_string(),
+            exchange_id: "hello-exchange".to_string(),
+            producer_id: "example.hello".to_string(),
+            schema: "example.hello.exchange".to_string(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        }),
+        ServiceBridgeRequest::ReceiveInput {
+            invocation_id: invocation_id.to_string(),
+        },
+        ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
+            invocation_id: invocation_id.to_string(),
+            request_id: "hello-service".to_string(),
+            interface_id: "example.nested/v1".to_string(),
+            operation: "run".to_string(),
+            payload: serde_json::Value::Null,
+        }),
+        ServiceBridgeRequest::WriteArtifact(bcode_tool::ToolArtifactWriteRequest {
+            invocation_id: invocation_id.to_string(),
+            artifact_id: "hello-artifact".to_string(),
+            content_type: "text/plain".to_string(),
+            bytes: b"hello".to_vec(),
+            metadata: serde_json::Value::Null,
+        }),
+    ]
+}
+
+fn bridge_responses(context: &NativeServiceContext, invocation_id: &str) -> ServiceResponse {
+    let responses = bridge_requests(invocation_id)
+        .iter()
+        .map(|request| context.bridge.request(request))
+        .collect::<Result<Vec<_>, _>>();
+    match responses {
+        Ok(responses) => ServiceResponse::json(&responses).unwrap_or_else(|error| {
+            ServiceResponse::error("bridge_response_encode_failed", error.to_string())
+        }),
+        Err(error) => ServiceResponse::error("bridge_failed", error.to_string()),
+    }
+}
+
+fn bridge_tool_response(context: &NativeServiceContext, invocation_id: &str) -> ServiceResponse {
+    let response = bridge_responses(context, invocation_id);
+    if let Some(error) = response.error {
+        return ServiceResponse {
+            payload: response.payload,
+            error: Some(error),
+        };
+    }
+    ServiceResponse::json(&bcode_tool::ToolInvocationResponse {
+        output: invocation_id.to_string(),
+        is_error: false,
+        content: Vec::new(),
+        full_output: None,
+        host_action: None,
+        result: None,
+    })
+    .unwrap_or_else(|error| {
+        ServiceResponse::error("tool_response_encode_failed", error.to_string())
+    })
 }
 
 /// Return the statically linked hello plugin vtable.
