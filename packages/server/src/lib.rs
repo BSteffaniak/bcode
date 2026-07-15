@@ -9745,6 +9745,7 @@ const MODEL_STREAM_FLUSH_BYTES: usize = 512;
 const TOOL_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const TOOL_OUTPUT_FLUSH_BYTES: usize = 4096;
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
+const MODEL_NO_PROGRESS_TIMEOUT_CODE: &str = "model_no_progress_timeout";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
 
 #[derive(Debug, Clone, Default)]
@@ -11653,6 +11654,7 @@ fn should_defer_visible_provider_error(
 ) -> bool {
     is_context_length_provider_error(error)
         || is_tool_arguments_decode_provider_error(error)
+        || is_model_no_progress_timeout(error)
         || is_overloaded_provider_error(error)
         || selection.is_some_and(|selection| {
             matching_provider_retry_policy(state, error, selection, &[], &[]).is_some()
@@ -11667,7 +11669,25 @@ fn is_tool_arguments_decode_provider_error(error: &bcode_model::ProviderError) -
     error.code == TOOL_ARGUMENTS_DECODE_FAILED_CODE
 }
 
+fn is_model_no_progress_timeout(error: &bcode_model::ProviderError) -> bool {
+    error.code == MODEL_NO_PROGRESS_TIMEOUT_CODE
+}
+
+fn model_no_progress_timeout_error(message: String) -> bcode_model::ProviderError {
+    bcode_model::ProviderError {
+        code: MODEL_NO_PROGRESS_TIMEOUT_CODE.to_string(),
+        category: bcode_model::ProviderErrorCategory::Timeout,
+        message,
+        retryable: true,
+        provider_message: None,
+        retry: None,
+    }
+}
+
 fn provider_error_message(error: &bcode_model::ProviderError) -> String {
+    if is_model_no_progress_timeout(error) {
+        return error.message.clone();
+    }
     format!("model error {}: {}", error.code, error.message)
 }
 
@@ -12216,11 +12236,12 @@ async fn wait_for_model_progress_or_timeout(
             "model provider made no progress for {} seconds before timeout{detail}",
             timeout_after.as_secs()
         );
-        append_system_event(state, session_id, message.clone()).await;
+        let error = model_no_progress_timeout_error(message.clone());
         outcome.completion = Some(ModelTurnCompletion::with_message(
             ModelTurnOutcome::IdleTimeout,
             message,
         ));
+        outcome.provider_error = Some(error);
         return None;
     }
     tokio::select! {
@@ -21716,6 +21737,86 @@ mod tests {
             &effective[0],
             &error,
             &selection
+        ));
+    }
+
+    #[test]
+    fn model_no_progress_timeout_is_a_structured_retryable_error() {
+        let message = "model provider made no progress for 300 seconds before timeout while assembling shell.run arguments · 2.0 KiB received".to_string();
+
+        let error = model_no_progress_timeout_error(message.clone());
+
+        assert_eq!(error.code, MODEL_NO_PROGRESS_TIMEOUT_CODE);
+        assert_eq!(error.category, bcode_model::ProviderErrorCategory::Timeout);
+        assert!(error.retryable);
+        assert_eq!(provider_error_message(&error), message);
+    }
+
+    #[test]
+    fn model_no_progress_timeout_matches_configured_retry_rule() {
+        let mut state = test_server_state(SessionManager::default());
+        state
+            .model_retry
+            .rules
+            .push(bcode_config::ModelRetryRuleConfig {
+                id: "model-no-progress-timeout".to_string(),
+                max_retries: Some(2),
+                initial_delay_ms: Some(500),
+                r#match: bcode_config::ModelRetryRuleMatchConfig {
+                    code: Some(MODEL_NO_PROGRESS_TIMEOUT_CODE.to_string()),
+                    ..bcode_config::ModelRetryRuleMatchConfig::default()
+                },
+                ..bcode_config::ModelRetryRuleConfig::default()
+            });
+        let error = model_no_progress_timeout_error("timed out".to_string());
+
+        let policy = matching_provider_retry_policy(
+            &state,
+            &error,
+            &SessionModelSelection::default(),
+            &[],
+            &[],
+        )
+        .expect("configured timeout retry policy should match");
+
+        assert_eq!(policy.id, "custom.model-no-progress-timeout");
+        assert_eq!(policy.max_retries, 2);
+        assert_eq!(policy.initial_delay_ms, 500);
+    }
+
+    #[test]
+    fn model_no_progress_timeout_is_not_retried_without_matching_rule() {
+        let state = test_server_state(SessionManager::default());
+        let error = model_no_progress_timeout_error("timed out".to_string());
+
+        assert!(
+            matching_provider_retry_policy(
+                &state,
+                &error,
+                &SessionModelSelection::default(),
+                &[],
+                &[],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn timeout_category_retry_rule_matches_model_no_progress_timeout() {
+        let rule = bcode_model::ProviderRetryRule {
+            id: "all-timeouts".to_string(),
+            r#match: bcode_model::ProviderRetryRuleMatch {
+                category: Some(bcode_model::ProviderErrorCategory::Timeout),
+                ..bcode_model::ProviderRetryRuleMatch::default()
+            },
+            ..bcode_model::ProviderRetryRule::default()
+        };
+        let error = model_no_progress_timeout_error("timed out".to_string());
+
+        assert!(custom_retry_rule_matches(
+            &rule,
+            &error,
+            &SessionModelSelection::default()
         ));
     }
 
