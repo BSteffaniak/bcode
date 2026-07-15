@@ -9800,6 +9800,7 @@ enum ToolOutputLivePublisherEvent {
 #[derive(Debug)]
 struct ToolOutputLivePublisher {
     pending_output: Option<ToolOutputStreamAccumulator>,
+    pending_artifacts: BTreeMap<(String, String, String), ToolInvocationStreamEvent>,
     flush_generation: u64,
     flush_tx: mpsc::UnboundedSender<ToolOutputLivePublisherEvent>,
     flush_rx: mpsc::UnboundedReceiver<ToolOutputLivePublisherEvent>,
@@ -9810,6 +9811,7 @@ impl ToolOutputLivePublisher {
         let (flush_tx, flush_rx) = mpsc::unbounded_channel();
         Self {
             pending_output: None,
+            pending_artifacts: BTreeMap::new(),
             flush_generation: 0,
             flush_tx,
             flush_rx,
@@ -9826,6 +9828,15 @@ impl ToolOutputLivePublisher {
         session_id: SessionId,
         event: ToolInvocationStreamEvent,
     ) {
+        if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
+            let (was_empty, finalized) = self.enqueue_artifact_update(event);
+            if finalized {
+                self.flush(state, session_id).await;
+            } else if was_empty {
+                self.schedule_flush();
+            }
+            return;
+        }
         let ToolInvocationStreamEvent::OutputDelta {
             tool_call_id,
             stream,
@@ -9866,6 +9877,30 @@ impl ToolOutputLivePublisher {
         }
     }
 
+    fn enqueue_artifact_update(&mut self, event: ToolInvocationStreamEvent) -> (bool, bool) {
+        let ToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id,
+            artifact_id,
+            reference_key,
+            finalized,
+            ..
+        } = &event
+        else {
+            unreachable!("artifact enqueue requires an artifact update");
+        };
+        let was_empty = self.pending_artifacts.is_empty();
+        let finalized = *finalized;
+        self.pending_artifacts.insert(
+            (
+                tool_call_id.clone(),
+                artifact_id.clone(),
+                reference_key.clone(),
+            ),
+            event,
+        );
+        (was_empty, finalized)
+    }
+
     async fn handle_event(
         &mut self,
         state: &ServerState,
@@ -9889,6 +9924,10 @@ impl ToolOutputLivePublisher {
     async fn flush(&mut self, state: &ServerState, session_id: SessionId) {
         self.flush_generation = self.flush_generation.wrapping_add(1);
         flush_tool_output_stream(state, session_id, &mut self.pending_output).await;
+        let artifacts = std::mem::take(&mut self.pending_artifacts);
+        for event in artifacts.into_values() {
+            append_tool_stream_event(state, session_id, event).await;
+        }
     }
 
     fn schedule_flush(&mut self) {
@@ -23260,6 +23299,48 @@ mod tests {
                 ralph_store,
             },
         )
+    }
+
+    #[test]
+    fn tool_output_publisher_coalesces_artifact_revisions_by_identity() {
+        let mut publisher = ToolOutputLivePublisher::new();
+        let update =
+            |revision, committed_bytes, finalized| ToolInvocationStreamEvent::ArtifactUpdate {
+                tool_call_id: "call".to_owned(),
+                sequence: revision,
+                artifact_id: "artifact".to_owned(),
+                reference_key: "recording".to_owned(),
+                producer_plugin_id: "plugin".to_owned(),
+                schema: "plugin.recording".to_owned(),
+                schema_version: 1,
+                content_type: None,
+                storage_uri: String::new(),
+                committed_bytes,
+                revision,
+                finalized,
+            };
+
+        assert_eq!(
+            publisher.enqueue_artifact_update(update(1, 10, false)),
+            (true, false)
+        );
+        assert_eq!(
+            publisher.enqueue_artifact_update(update(2, 20, false)),
+            (false, false)
+        );
+        assert_eq!(publisher.pending_artifacts.len(), 1);
+        assert!(matches!(
+            publisher.pending_artifacts.values().next(),
+            Some(ToolInvocationStreamEvent::ArtifactUpdate {
+                revision: 2,
+                committed_bytes: 20,
+                ..
+            })
+        ));
+        assert_eq!(
+            publisher.enqueue_artifact_update(update(3, 30, true)),
+            (false, true)
+        );
     }
 
     #[tokio::test]

@@ -291,6 +291,7 @@ pub struct BmuxApp {
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
+    active_artifact_revisions: BTreeMap<(String, String, String), u64>,
     live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
     live_preview_revision: u64,
     live_preview_frames_requested: u64,
@@ -506,6 +507,7 @@ impl BmuxApp {
             tool_call_contexts: BTreeMap::new(),
             tool_invocation_projections: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
+            active_artifact_revisions: BTreeMap::new(),
             live_tool_previews: BTreeMap::new(),
             live_preview_revision: 0,
             live_preview_frames_requested: 0,
@@ -1960,6 +1962,7 @@ impl BmuxApp {
         self.tool_invocation_projections.clear();
         self.live_tool_previews.clear();
         self.streamed_tool_results.clear();
+        self.active_artifact_revisions.clear();
         self.active_tool_calls.clear();
         self.active_plugin_visuals.clear();
         for event in &events {
@@ -2012,6 +2015,7 @@ impl BmuxApp {
         self.live_tool_previews
             .retain(|tool_call_id, _| referenced.contains(tool_call_id));
         self.streamed_tool_results.clear();
+        self.active_artifact_revisions.clear();
     }
 
     /// Prepend older history and preserve the current viewport.
@@ -3156,7 +3160,26 @@ impl BmuxApp {
                 streaming,
                 ..
             } => self.apply_tool_visual_update(tool_call_id, visual, *streaming),
-            ToolInvocationStreamEvent::ArtifactUpdate { .. } => {}
+            ToolInvocationStreamEvent::ArtifactUpdate {
+                tool_call_id,
+                artifact_id,
+                reference_key,
+                revision,
+                ..
+            } => {
+                let key = (
+                    tool_call_id.clone(),
+                    artifact_id.clone(),
+                    reference_key.clone(),
+                );
+                if self
+                    .active_artifact_revisions
+                    .get(&key)
+                    .is_none_or(|current| revision > current)
+                {
+                    self.active_artifact_revisions.insert(key, *revision);
+                }
+            }
             ToolInvocationStreamEvent::Started {
                 tool_call_id,
                 tool_name,
@@ -3182,6 +3205,23 @@ impl BmuxApp {
                 ..
             } => self.apply_tool_finished(tool_call_id, *is_error, *finished_at_ms, application),
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn active_artifact_revision(
+        &self,
+        tool_call_id: &str,
+        artifact_id: &str,
+        reference_key: &str,
+    ) -> Option<u64> {
+        self.active_artifact_revisions
+            .get(&(
+                tool_call_id.to_owned(),
+                artifact_id.to_owned(),
+                reference_key.to_owned(),
+            ))
+            .copied()
     }
 
     fn apply_tool_visual_update(
@@ -4490,5 +4530,36 @@ mod tests {
         });
         assert_eq!(app.token_usage.latest_context_input_tokens, None);
         assert_eq!(app.context_usage_sequence, None);
+    }
+
+    #[test]
+    fn active_artifact_revisions_ignore_stale_and_duplicate_updates() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let event = |revision| SessionLiveEvent {
+            session_id: SessionId::new(),
+            kind: SessionLiveEventKind::ToolOutputDelta {
+                event: ToolInvocationStreamEvent::ArtifactUpdate {
+                    tool_call_id: "call".to_owned(),
+                    sequence: revision,
+                    artifact_id: "artifact".to_owned(),
+                    reference_key: "recording".to_owned(),
+                    producer_plugin_id: "plugin".to_owned(),
+                    schema: "plugin.recording".to_owned(),
+                    schema_version: 1,
+                    content_type: None,
+                    storage_uri: String::new(),
+                    committed_bytes: revision,
+                    revision,
+                    finalized: false,
+                },
+            },
+        };
+        app.absorb_session_live_event(&event(3));
+        app.absorb_session_live_event(&event(2));
+        app.absorb_session_live_event(&event(3));
+        assert_eq!(
+            app.active_artifact_revision("call", "artifact", "recording"),
+            Some(3)
+        );
     }
 }
