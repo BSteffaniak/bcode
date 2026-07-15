@@ -215,6 +215,86 @@ fn immediate_theme_transition_ignores_curve() {
 }
 
 #[test]
+fn compaction_trace_lifecycle_preserves_status_and_ignores_diagnostics() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_status("existing notice".to_owned());
+
+    let event = |sequence, phase, reason: &str, compacted, message: &str| SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence,
+        timestamp_ms: sequence,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::TraceEvent {
+            trace: Box::new(SessionTraceEvent {
+                timestamp_ms: sequence,
+                turn_id: Some("turn-1".to_owned()),
+                phase,
+                payload: SessionTracePayload::ContextCompaction {
+                    reason: reason.to_owned(),
+                    projected_context_chars: 0,
+                    compacted,
+                    message: Some(message.to_owned()),
+                },
+            }),
+        },
+    };
+
+    app.absorb_session_event(&event(
+        1,
+        SessionTracePhase::ContextCompactionDiagnostic,
+        "strategy_resolved",
+        false,
+        "automatic compaction strategy OverflowOnly",
+    ));
+    assert_eq!(app.activity(), &ActivityState::Idle);
+    assert_eq!(app.status(), "existing notice");
+
+    app.absorb_session_event(&event(
+        2,
+        SessionTracePhase::ContextCompactionStarted,
+        "compaction_started",
+        false,
+        "older context",
+    ));
+    assert_eq!(
+        app.activity(),
+        &ActivityState::Compacting {
+            detail: "older context".to_owned()
+        }
+    );
+    assert_eq!(app.status(), "existing notice");
+
+    app.absorb_session_event(&event(
+        3,
+        SessionTracePhase::ContextCompactionFinished,
+        "compaction_finished",
+        true,
+        "compacted context",
+    ));
+    assert_eq!(app.activity(), &ActivityState::PreparingModelRequest);
+    assert_eq!(app.status(), "existing notice");
+
+    app.absorb_session_event(&event(
+        4,
+        SessionTracePhase::ContextCompactionStarted,
+        "compaction_started",
+        false,
+        "older context",
+    ));
+    app.absorb_session_event(&event(
+        5,
+        SessionTracePhase::ContextCompactionSkipped,
+        "nothing_to_compact",
+        false,
+        "nothing new to compact",
+    ));
+    assert_eq!(app.activity(), &ActivityState::PreparingModelRequest);
+    assert_eq!(app.status(), "existing notice");
+}
+
+#[test]
 fn provider_tool_call_delta_trace_does_not_replace_status() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);

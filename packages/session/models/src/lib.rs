@@ -1404,6 +1404,8 @@ pub enum SessionTracePhase {
     ContextCompactionStarted,
     ContextCompactionFinished,
     ToolInvocationOutput,
+    /// Diagnostic compaction detail that does not represent lifecycle progress.
+    ContextCompactionDiagnostic,
 }
 
 /// Structured model-provider streaming event for user-facing progress and debug correlation.

@@ -6186,6 +6186,11 @@ mod tests {
                 "ToolInvocationOutput",
                 SessionTracePhase::ToolInvocationOutput,
             ),
+            (
+                19,
+                "ContextCompactionDiagnostic",
+                SessionTracePhase::ContextCompactionDiagnostic,
+            ),
         ]
     }
 

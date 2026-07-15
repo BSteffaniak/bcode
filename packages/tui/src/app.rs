@@ -3602,12 +3602,9 @@ impl BmuxApp {
                     self.status = detail;
                 }
             }
-            SessionTracePayload::ContextCompaction {
-                reason,
-                compacted,
-                message,
-                ..
-            } => self.apply_compaction_trace(trace.phase, reason, *compacted, message.as_deref()),
+            SessionTracePayload::ContextCompaction { message, .. } => {
+                self.apply_compaction_trace(trace.phase, message.as_deref());
+            }
             SessionTracePayload::ModelRequestBuilt {
                 provider,
                 uses_previous_provider_response,
@@ -3743,31 +3740,14 @@ impl BmuxApp {
         }
     }
 
-    fn apply_compaction_trace(
-        &mut self,
-        phase: SessionTracePhase,
-        reason: &str,
-        compacted: bool,
-        message: Option<&str>,
-    ) {
+    fn apply_compaction_trace(&mut self, phase: SessionTracePhase, message: Option<&str>) {
         match phase {
             SessionTracePhase::ContextCompactionStarted => {
-                let detail = message.map_or_else(
-                    || format!("context compaction · {reason}"),
-                    ToOwned::to_owned,
-                );
-                self.set_activity(ActivityState::Compacting {
-                    detail: detail.clone(),
-                });
-                self.status = detail;
+                let detail = message.map_or_else(|| "older context".to_owned(), ToOwned::to_owned);
+                self.set_activity(ActivityState::Compacting { detail });
             }
             SessionTracePhase::ContextCompactionFinished => {
-                let detail = message.map_or_else(
-                    || "context compaction finished".to_owned(),
-                    ToOwned::to_owned,
-                );
-                self.status = detail;
-                if compacted {
+                if matches!(self.activity, ActivityState::Compacting { .. }) {
                     self.set_activity(ActivityState::PreparingModelRequest);
                 }
             }
@@ -3775,11 +3755,9 @@ impl BmuxApp {
                 if matches!(self.activity, ActivityState::Compacting { .. }) {
                     self.set_activity(ActivityState::PreparingModelRequest);
                 }
-                if let Some(message) = message {
-                    message.clone_into(&mut self.status);
-                }
             }
-            SessionTracePhase::ModelRequestBuilt
+            SessionTracePhase::ContextCompactionDiagnostic
+            | SessionTracePhase::ModelRequestBuilt
             | SessionTracePhase::ModelProviderRoundStarted
             | SessionTracePhase::ModelProviderRoundFinished
             | SessionTracePhase::ModelProviderEvent

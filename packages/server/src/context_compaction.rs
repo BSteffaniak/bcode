@@ -148,9 +148,18 @@ pub async fn compact_session_context_with_limit(
         state.tool_output_context_chars,
         usize::try_from(state.auto_compaction.keep_recent_tokens).unwrap_or(usize::MAX),
     ) else {
-        return Err(CompactionError::NothingToCompact(
-            "nothing new to compact".to_string(),
-        ));
+        let message = "nothing new to compact".to_string();
+        append_context_compaction_trace(
+            state,
+            session_id,
+            CompactionTraceKind::Skipped,
+            "nothing_to_compact",
+            0,
+            false,
+            Some(message.clone()),
+        )
+        .await;
+        return Err(CompactionError::NothingToCompact(message));
     };
     let transcript = compaction_transcript_from_plan(&plan);
     debug_assert!(
@@ -173,11 +182,22 @@ pub async fn compact_session_context_with_limit(
     if let Some(requirement) = progress_requirement
         && !compaction_plan_meets_progress_requirement(&transcript, requirement)
     {
+        let message = format!(
+            "plan would reclaim approximately {} tokens, below the required {} tokens or without advancing the prior boundary",
+            transcript.estimated_reclaimable_tokens, requirement.minimum_reclaimable_tokens
+        );
+        append_context_compaction_trace(
+            state,
+            session_id,
+            CompactionTraceKind::Skipped,
+            "insufficient_progress",
+            0,
+            false,
+            Some(message.clone()),
+        )
+        .await;
         return Err(CompactionError::InsufficientProgress {
-            message: format!(
-                "plan would reclaim approximately {} tokens, below the required {} tokens or without advancing the prior boundary",
-                transcript.estimated_reclaimable_tokens, requirement.minimum_reclaimable_tokens
-            ),
+            message,
             compacted_through_sequence: transcript.compacted_through_sequence,
         });
     }
@@ -186,85 +206,119 @@ pub async fn compact_session_context_with_limit(
         return Err(CompactionError::ProviderUnavailable);
     }
 
-    let native_snapshot = compact_context_with_selected_backend(
+    append_context_compaction_trace(
         state,
         session_id,
-        selection,
-        &plan.compactable_prefix,
-        cancel_state,
+        CompactionTraceKind::Started,
+        "compaction_started",
+        0,
+        false,
+        Some("older context".to_string()),
     )
-    .await?;
-    let portable_summary = if native_snapshot.is_some() {
-        match collect_compaction_summary(
+    .await;
+
+    let result = async {
+        let native_snapshot = compact_context_with_selected_backend(
             state,
             session_id,
             selection,
-            &transcript,
-            command_context,
-            cancel_state,
-        )
-        .await
-        {
-            Ok(summary) if !summary.trim().is_empty() => summary.trim().to_string(),
-            Ok(_) => local_compaction_summary(&transcript, "provider returned an empty summary"),
-            Err(CompactionError::Cancelled) => return Err(CompactionError::Cancelled),
-            Err(error) => local_compaction_summary(&transcript, &compaction_error_detail(error)),
-        }
-    } else {
-        let summary = collect_compaction_summary(
-            state,
-            session_id,
-            selection,
-            &transcript,
-            command_context,
+            &plan.compactable_prefix,
             cancel_state,
         )
         .await?;
-        let summary = summary.trim().to_string();
-        if summary.is_empty() {
-            return Err(CompactionError::Provider(
-                "provider returned an empty compaction summary".to_string(),
-            ));
+        let portable_summary = if native_snapshot.is_some() {
+            match collect_compaction_summary(
+                state,
+                session_id,
+                selection,
+                &transcript,
+                command_context,
+                cancel_state,
+            )
+            .await
+            {
+                Ok(summary) if !summary.trim().is_empty() => summary.trim().to_string(),
+                Ok(_) => {
+                    local_compaction_summary(&transcript, "provider returned an empty summary")
+                }
+                Err(CompactionError::Cancelled) => return Err(CompactionError::Cancelled),
+                Err(error) => {
+                    local_compaction_summary(&transcript, &compaction_error_detail(error))
+                }
+            }
+        } else {
+            let summary = collect_compaction_summary(
+                state,
+                session_id,
+                selection,
+                &transcript,
+                command_context,
+                cancel_state,
+            )
+            .await?;
+            let summary = summary.trim().to_string();
+            if summary.is_empty() {
+                return Err(CompactionError::Provider(
+                    "provider returned an empty compaction summary".to_string(),
+                ));
+            }
+            summary
+        };
+        let marker_commit = cancel_state.marker_commit.lock().await;
+        if cancel_state.is_cancelled() {
+            return Err(CompactionError::Cancelled);
         }
-        summary
-    };
-    let marker_commit = cancel_state.marker_commit.lock().await;
-    if cancel_state.is_cancelled() {
-        return Err(CompactionError::Cancelled);
-    }
-    let event = if let Some(mut snapshot) = native_snapshot {
-        snapshot.portable_summary = portable_summary;
-        state
-            .sessions
-            .append_provider_context_compacted(
-                session_id,
-                snapshot,
-                transcript.compacted_through_sequence,
-            )
-            .await?
-    } else {
-        state
-            .sessions
-            .append_context_compacted(
-                session_id,
-                portable_summary,
-                transcript.compacted_through_sequence,
-            )
-            .await?
-    };
-    publish_session_event(state, &event).await;
-    state.invalidate_session_continuations(session_id).await;
-    drop(marker_commit);
+        let event = if let Some(mut snapshot) = native_snapshot {
+            snapshot.portable_summary = portable_summary;
+            state
+                .sessions
+                .append_provider_context_compacted(
+                    session_id,
+                    snapshot,
+                    transcript.compacted_through_sequence,
+                )
+                .await?
+        } else {
+            state
+                .sessions
+                .append_context_compacted(
+                    session_id,
+                    portable_summary,
+                    transcript.compacted_through_sequence,
+                )
+                .await?
+        };
+        publish_session_event(state, &event).await;
+        state.invalidate_session_continuations(session_id).await;
+        drop(marker_commit);
 
-    Ok(CompactionCompletion {
-        message: format!(
-            "compacted {} events through #{} (retained approximately {} tokens)",
-            transcript.event_count,
-            transcript.compacted_through_sequence,
-            plan.estimated_tail_tokens,
-        ),
-        compacted_through_sequence: transcript.compacted_through_sequence,
-    })
+        Ok(CompactionCompletion {
+            message: format!(
+                "compacted {} events through #{} (retained approximately {} tokens)",
+                transcript.event_count,
+                transcript.compacted_through_sequence,
+                plan.estimated_tail_tokens,
+            ),
+            compacted_through_sequence: transcript.compacted_through_sequence,
+        })
+    }
+    .await;
+
+    let (compacted, message) = match &result {
+        Ok(completion) => (true, Some(completion.message.clone())),
+        Err(error) => (false, Some(format!("context compaction failed: {error}"))),
+    };
+    append_context_compaction_trace(
+        state,
+        session_id,
+        CompactionTraceKind::Finished,
+        "compaction_finished",
+        0,
+        compacted,
+        message,
+    )
+    .await;
+    result
 }
 
 pub async fn provider_context_management_capabilities(
@@ -418,6 +472,7 @@ pub async fn compact_context_with_selected_backend(
             append_context_compaction_trace(
                 state,
                 session_id,
+                CompactionTraceKind::Diagnostic,
                 "provider_native_fallback",
                 0,
                 false,
@@ -632,6 +687,7 @@ pub async fn maybe_auto_compact_session_context(
         append_context_compaction_trace(
             state,
             session_id,
+            CompactionTraceKind::Skipped,
             "context_window_unknown",
             projected_context_chars,
             false,
@@ -660,6 +716,7 @@ pub async fn maybe_auto_compact_session_context(
         append_context_compaction_trace(
             state,
             session_id,
+            CompactionTraceKind::Skipped,
             "below_threshold",
             projected_context_chars,
             false,
@@ -678,6 +735,7 @@ pub async fn maybe_auto_compact_session_context(
     append_context_compaction_trace(
         state,
         session_id,
+        CompactionTraceKind::Diagnostic,
         "threshold_exceeded",
         projected_context_chars,
         false,
@@ -716,6 +774,7 @@ pub async fn maybe_auto_compact_session_context(
     append_context_compaction_trace(
         state,
         session_id,
+        CompactionTraceKind::Diagnostic,
         "threshold_exceeded",
         projected_context_chars,
         true,
@@ -725,20 +784,28 @@ pub async fn maybe_auto_compact_session_context(
     Ok(Some(completion.compacted_through_sequence))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionTraceKind {
+    Diagnostic,
+    Skipped,
+    Started,
+    Finished,
+}
+
 pub async fn append_context_compaction_trace(
     state: &ServerState,
     session_id: SessionId,
+    kind: CompactionTraceKind,
     reason: &str,
     projected_context_chars: usize,
     compacted: bool,
     message: Option<String>,
 ) {
-    let phase = if compacted {
-        SessionTracePhase::ContextCompactionFinished
-    } else if reason == "below_threshold" {
-        SessionTracePhase::ContextCompactionSkipped
-    } else {
-        SessionTracePhase::ContextCompactionStarted
+    let phase = match kind {
+        CompactionTraceKind::Diagnostic => SessionTracePhase::ContextCompactionDiagnostic,
+        CompactionTraceKind::Skipped => SessionTracePhase::ContextCompactionSkipped,
+        CompactionTraceKind::Started => SessionTracePhase::ContextCompactionStarted,
+        CompactionTraceKind::Finished => SessionTracePhase::ContextCompactionFinished,
     };
     append_trace_event(
         state,
@@ -766,6 +833,7 @@ pub async fn collect_compaction_summary(
     append_context_compaction_trace(
         state,
         session_id,
+        CompactionTraceKind::Diagnostic,
         "summary_request",
         0,
         false,
@@ -798,6 +866,7 @@ pub async fn collect_compaction_summary(
             append_context_compaction_trace(
                 state,
                 session_id,
+                CompactionTraceKind::Diagnostic,
                 "local_fallback",
                 0,
                 true,

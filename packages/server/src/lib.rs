@@ -20,7 +20,7 @@ use context_accounting::{
 };
 use context_compaction::{
     AutomaticCompactionPolicy, AutomaticCompactionStrategy, COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
-    CompactionDecision, CompactionError, ProactiveCompactionEvaluation,
+    CompactionDecision, CompactionError, CompactionTraceKind, ProactiveCompactionEvaluation,
     append_context_compaction_trace, automatic_compaction_policy,
     compact_session_context_before_sequence, compact_session_context_with_limit,
     compaction_capacity_tokens, maybe_auto_compact_session_context,
@@ -10768,6 +10768,7 @@ async fn run_model_turn_inner(
     append_context_compaction_trace(
         state,
         session_id,
+        CompactionTraceKind::Diagnostic,
         "strategy_resolved",
         0,
         false,
@@ -10867,7 +10868,7 @@ async fn run_model_turn_inner(
                     }
                 };
             }
-            Ok(None) => {}
+            Ok(None) | Err(CompactionError::NothingToCompact(_)) => {}
             Err(CompactionError::Cancelled) => {
                 return ModelTurnCompletion::with_message(
                     ModelTurnOutcome::Cancelled,
@@ -10875,30 +10876,10 @@ async fn run_model_turn_inner(
                 );
             }
             Err(CompactionError::InsufficientProgress {
-                message,
                 compacted_through_sequence,
+                ..
             }) => {
                 last_proactive_attempt_boundary = Some(compacted_through_sequence);
-                append_context_compaction_trace(
-                    state,
-                    session_id,
-                    "insufficient_progress",
-                    0,
-                    false,
-                    Some(message),
-                )
-                .await;
-            }
-            Err(CompactionError::NothingToCompact(message)) => {
-                append_context_compaction_trace(
-                    state,
-                    session_id,
-                    "nothing_to_compact",
-                    0,
-                    false,
-                    Some(message),
-                )
-                .await;
             }
             Err(error) => {
                 append_system_event(
@@ -10921,6 +10902,7 @@ async fn run_model_turn_inner(
             append_context_compaction_trace(
                 state,
                 session_id,
+                CompactionTraceKind::Diagnostic,
                 "request_still_too_large",
                 0,
                 false,
@@ -11608,6 +11590,7 @@ async fn compact_session_after_context_overflow(
     append_context_compaction_trace(
         state,
         session_id,
+        CompactionTraceKind::Diagnostic,
         "overflow",
         0,
         false,
@@ -11630,6 +11613,7 @@ async fn compact_session_after_context_overflow(
             append_context_compaction_trace(
                 state,
                 session_id,
+                CompactionTraceKind::Diagnostic,
                 "overflow",
                 0,
                 true,
@@ -22966,6 +22950,30 @@ mod tests {
                 .count(),
             2
         );
+        let compaction_phases = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::TraceEvent { trace }
+                    if matches!(
+                        &trace.payload,
+                        SessionTracePayload::ContextCompaction { .. }
+                    ) =>
+                {
+                    Some(trace.phase)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(compaction_phases.contains(&SessionTracePhase::ContextCompactionDiagnostic));
+        let started = compaction_phases
+            .iter()
+            .position(|phase| *phase == SessionTracePhase::ContextCompactionStarted)
+            .expect("compaction should start");
+        let finished = compaction_phases
+            .iter()
+            .position(|phase| *phase == SessionTracePhase::ContextCompactionFinished)
+            .expect("compaction should finish");
+        assert!(started < finished, "phases: {compaction_phases:?}");
         assert_eq!(permit.turn_entries, 1);
     }
 
@@ -23161,7 +23169,27 @@ mod tests {
             .model_context_events(session_id)
             .await
             .expect("context after failure");
-        assert_eq!(after, before);
+        let before_non_trace = before
+            .iter()
+            .filter(|event| !matches!(event.kind, SessionEventKind::TraceEvent { .. }))
+            .collect::<Vec<_>>();
+        let after_non_trace = after
+            .iter()
+            .filter(|event| !matches!(event.kind, SessionEventKind::TraceEvent { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(after_non_trace, before_non_trace);
+        assert!(after.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if trace.phase == SessionTracePhase::ContextCompactionFinished
+                    && matches!(
+                        &trace.payload,
+                        SessionTracePayload::ContextCompaction {
+                            compacted: false,
+                            ..
+                        }
+                    )
+        )));
         assert!(!after.iter().any(|event| matches!(
             event.kind,
             SessionEventKind::ContextCompacted { .. }
