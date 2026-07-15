@@ -2517,14 +2517,27 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn forced_termination_fixture() {
+        if std::env::var_os("BCODE_VIM_EDIT_TERMINATION_FIXTURE").is_none() {
+            return;
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn forced_termination_reaps_running_child() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         runtime.block_on(async {
-            let mut child = Command::new("sleep")
-                .arg("30")
+            let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("tests::forced_termination_fixture")
+                .env("BCODE_VIM_EDIT_TERMINATION_FIXTURE", "1")
                 .kill_on_drop(true)
                 .spawn()
                 .expect("spawn fixture");
