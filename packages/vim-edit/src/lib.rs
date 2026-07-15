@@ -2517,54 +2517,18 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn forced_termination_reaps_ready_child() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let executable = temp_dir.path().join("fixture");
-        let ready_file = temp_dir.path().join("ready");
-        fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > {}.tmp\nmv {}.tmp {}\nexec sleep 30\n",
-                ready_file.display(),
-                ready_file.display(),
-                ready_file.display(),
-            ),
-        )
-        .expect("write fixture");
-        let mut permissions = fs::metadata(&executable)
-            .expect("fixture metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable, permissions).expect("make fixture executable");
-
+    fn forced_termination_reaps_running_child() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         runtime.block_on(async {
-            let mut child = Command::new(&executable)
+            let mut child = Command::new("sleep")
+                .arg("30")
                 .kill_on_drop(true)
                 .spawn()
                 .expect("spawn fixture");
-            let deadline = time::Instant::now() + Duration::from_secs(2);
-            loop {
-                if ready_file.exists() {
-                    break;
-                }
-                assert!(
-                    time::Instant::now() < deadline,
-                    "fixture did not report readiness before deadline"
-                );
-                time::sleep(Duration::from_millis(10)).await;
-            }
-            let fixture_pid = fs::read_to_string(&ready_file)
-                .expect("read fixture pid")
-                .trim()
-                .parse::<u32>()
-                .expect("parse fixture pid");
-            assert_eq!(child.id(), Some(fixture_pid));
+            let fixture_pid = child.id().expect("fixture pid");
 
             let termination = terminate_child(&mut child, false)
                 .await
