@@ -177,8 +177,14 @@ impl SessionHandle {
         self.send(SessionCommand::InputHistory).await?
     }
 
-    pub async fn latest_context_usage(&self) -> Result<Option<SessionEvent>, SessionError> {
-        self.send(SessionCommand::LatestContextUsage).await?
+    pub async fn current_context_epoch(&self) -> Result<u64, SessionError> {
+        self.send(SessionCommand::CurrentContextEpoch).await?
+    }
+
+    pub async fn current_context_occupancy(
+        &self,
+    ) -> Result<Option<bcode_session_models::ContextOccupancy>, SessionError> {
+        self.send(SessionCommand::CurrentContextOccupancy).await?
     }
 
     pub async fn model_context_events(&self) -> Result<Vec<SessionEvent>, SessionError> {
@@ -311,7 +317,10 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
     },
     InputHistory(oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>),
-    LatestContextUsage(oneshot::Sender<Result<Option<SessionEvent>, SessionError>>),
+    CurrentContextEpoch(oneshot::Sender<Result<u64, SessionError>>),
+    CurrentContextOccupancy(
+        oneshot::Sender<Result<Option<bcode_session_models::ContextOccupancy>, SessionError>>,
+    ),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
     ActiveRuntimeWork(oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>),
@@ -398,6 +407,7 @@ impl SessionActor {
         false
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_read_command(&mut self, command: SessionCommand) -> bool {
         match command {
             SessionCommand::AppendEvent { .. }
@@ -437,8 +447,16 @@ impl SessionActor {
             SessionCommand::InputHistory(reply) => {
                 let _ = reply.send(self.input_history().await);
             }
-            SessionCommand::LatestContextUsage(reply) => {
-                let _ = reply.send(self.latest_context_usage().await);
+            SessionCommand::CurrentContextEpoch(reply) => {
+                let result = if let Ok(Some(db)) = self.existing_session_db().await {
+                    db.current_context_epoch().await.map_err(SessionError::from)
+                } else {
+                    Ok(self.state.context_epoch)
+                };
+                let _ = reply.send(result);
+            }
+            SessionCommand::CurrentContextOccupancy(reply) => {
+                let _ = reply.send(self.current_context_occupancy().await);
             }
             SessionCommand::ModelContextEvents(reply) => {
                 let _ = reply.send(self.model_context_events().await);
@@ -1075,16 +1093,14 @@ impl SessionActor {
         })
     }
 
-    async fn latest_context_usage(&mut self) -> Result<Option<SessionEvent>, SessionError> {
+    async fn current_context_occupancy(
+        &mut self,
+    ) -> Result<Option<bcode_session_models::ContextOccupancy>, SessionError> {
         if let Some(db) = self.existing_session_db().await? {
-            return Ok(db.latest_context_usage().await?);
+            return Ok(db.current_context_occupancy().await?);
         }
-        if let Some(events) = &self.state.events {
-            return Ok(events
-                .iter()
-                .rev()
-                .find(|event| matches!(event.kind, SessionEventKind::ContextUsageObserved { .. }))
-                .cloned());
+        if self.state.events.is_some() {
+            return Ok(self.state.context_occupancy.clone());
         }
         Err(SessionError::NotFound(self.state.summary.id))
     }

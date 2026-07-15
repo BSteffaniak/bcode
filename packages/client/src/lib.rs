@@ -314,6 +314,7 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
     Some(ClientRuntimeContext {
         selected_provider_plugin_id: resolved.provider_plugin_id,
         selected_model_id: resolved.model_id,
+        requested_model_id: resolved.selected_model_id,
         provider_context: bcode_model::ProviderRequestContext {
             model_profile: resolved.model_profile,
             auth_profile: resolved.auth_profile,

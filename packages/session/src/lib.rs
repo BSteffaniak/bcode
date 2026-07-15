@@ -553,6 +553,8 @@ pub(crate) struct SessionState {
     reasoning_summary: Option<String>,
     current_agent: Option<String>,
     latest_compaction_sequence: Option<u64>,
+    context_epoch: u64,
+    context_occupancy: Option<bcode_session_models::ContextOccupancy>,
     total_metered_tokens: u64,
     load_status: SessionLoadStatusKind,
     sender: broadcast::Sender<SessionEvent>,
@@ -1207,6 +1209,8 @@ impl SessionManager {
             reasoning_summary: None,
             current_agent: None,
             latest_compaction_sequence: None,
+            context_epoch: 0,
+            context_occupancy: None,
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
             sender,
@@ -1947,17 +1951,28 @@ impl SessionManager {
         })
     }
 
-    /// Return the latest durable context-usage observation with a bounded indexed lookup.
+    /// Return the current context generation.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::NotFound`] when the session does not exist.
-    pub async fn latest_context_usage(
+    pub async fn current_context_epoch(&self, session_id: SessionId) -> Result<u64, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.current_context_epoch().await
+    }
+
+    /// Return authoritative current context occupancy with a bounded projection lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist, or a projection error
+    /// when the occupancy read model is not trustworthy.
+    pub async fn current_context_occupancy(
         &self,
         session_id: SessionId,
-    ) -> Result<Option<SessionEvent>, SessionError> {
+    ) -> Result<Option<bcode_session_models::ContextOccupancy>, SessionError> {
         let handle = self.session_handle(session_id).await?;
-        handle.latest_context_usage().await
+        handle.current_context_occupancy().await
     }
 
     /// Return the model-visible session events, starting at the latest compaction when possible.
@@ -2939,6 +2954,8 @@ impl SessionState {
             reasoning_summary: None,
             current_agent: None,
             latest_compaction_sequence: None,
+            context_epoch: 0,
+            context_occupancy: None,
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::SummaryOnly,
             sender,
@@ -2986,6 +3003,8 @@ impl SessionState {
             reasoning_summary: state.reasoning_summary,
             current_agent: None,
             latest_compaction_sequence: state.latest_compaction_sequence,
+            context_epoch: state.latest_compaction_sequence.unwrap_or_default(),
+            context_occupancy: None,
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
             sender,
@@ -3089,6 +3108,8 @@ impl SessionState {
             SessionEventKind::ModelChanged { provider, model } => {
                 self.current_provider = Some(provider.clone());
                 self.current_model = Some(model.clone());
+                self.context_epoch = event.sequence;
+                self.context_occupancy = None;
             }
             SessionEventKind::ReasoningChanged { effort, summary } => {
                 self.reasoning_effort.clone_from(effort);
@@ -3106,6 +3127,16 @@ impl SessionState {
                 ..
             } => {
                 self.latest_compaction_sequence = Some(*compacted_through_sequence);
+                self.context_epoch = event.sequence;
+                self.context_occupancy = None;
+            }
+            SessionEventKind::ContextUsageObserved { snapshot } => {
+                self.context_occupancy = bcode_session_models::ContextOccupancy::reconcile(
+                    self.context_occupancy.as_ref(),
+                    self.context_epoch,
+                    event.sequence,
+                    snapshot.clone(),
+                );
             }
             SessionEventKind::ModelUsage { usage, .. } => {
                 if let Some(total) = usage.metered_total_tokens() {

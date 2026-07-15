@@ -550,6 +550,8 @@ struct ModelRequestAttempt {
     auth_profile: Option<String>,
     context_format_version: Option<u16>,
     compatibility_key: Option<String>,
+    requested_model_id: Option<String>,
+    context_epoch: u64,
     portable_context: String,
     estimated_input_tokens: u64,
     managed_compaction_persisted: bool,
@@ -711,6 +713,7 @@ impl ProviderStateStore {
 #[derive(Debug, Clone, Default)]
 struct SessionModelSelection {
     provider_plugin_id: Option<String>,
+    requested_model_id: Option<String>,
     model_id: Option<String>,
     thinking_level: Option<ReasoningEffort>,
     reasoning_effort: Option<String>,
@@ -8081,6 +8084,7 @@ async fn handle_set_session_model(
         Ok(event) => {
             let selection = SessionModelSelection {
                 provider_plugin_id: provider_to_selection(&provider),
+                requested_model_id: None,
                 model_id: model_to_selection(&model_id),
                 thinking_level: None,
                 reasoning_effort: state.selected_reasoning.effort.clone(),
@@ -8139,6 +8143,7 @@ async fn handle_set_session_reasoning(
                         .entry(session_id)
                         .or_insert_with(|| SessionModelSelection {
                             provider_plugin_id: state.selected_provider_plugin_id.clone(),
+                            requested_model_id: None,
                             model_id: state.selected_model_id.clone(),
                             thinking_level: None,
                             reasoning_effort: state.selected_reasoning.effort.clone(),
@@ -8329,55 +8334,38 @@ async fn model_status_for_selection(
         .reasoning_capabilities
         .clone()
         .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone()));
-    let context_usage = if let Some(session_id) = session_id {
-        state
-            .sessions
-            .latest_context_usage(session_id)
-            .await
-            .ok()
-            .flatten()
+    let (context_occupancy, context_usage_error) = if let Some(session_id) = session_id {
+        match state.sessions.current_context_occupancy(session_id).await {
+            Ok(occupancy) => (occupancy, None),
+            Err(error) => (None, Some(error.to_string())),
+        }
     } else {
-        None
+        (None, None)
     };
     let context_format = provider_context_management_capabilities(state, &selection)
         .await
         .and_then(|capabilities| capabilities.context_format)
         .filter(|format| format.version > 0 && !format.compatibility_key.trim().is_empty());
-    let active_auth_profile = selection.provider_context.auth_profile.as_deref();
-    let context_usage = context_usage.as_ref().filter(|event| {
-        matches!(
-            &event.kind,
-            SessionEventKind::ContextUsageObserved { snapshot }
-                if snapshot.provider_plugin_id
-                    == selection.provider_plugin_id.as_deref().unwrap_or("<auto>")
-                    && snapshot.model_id
-                        == model_id_for_provider_request(selection.model_id.as_deref())
-                    && snapshot.auth_profile.as_deref() == active_auth_profile
-                    && snapshot.context_format_version
-                        == context_format.as_ref().map(|format| format.version)
-                    && snapshot.compatibility_key.as_deref()
-                        == context_format
-                            .as_ref()
-                            .map(|format| format.compatibility_key.as_str())
-        )
-    });
-    let context_input_tokens = context_usage.and_then(|event| match &event.kind {
-        SessionEventKind::ContextUsageObserved { snapshot } => Some(snapshot.input_tokens),
-        _ => None,
-    });
+    let context_input_tokens = context_occupancy
+        .as_ref()
+        .map(|occupancy| occupancy.snapshot.input_tokens);
     bcode_ipc::SessionModelStatus {
         provider_plugin_id: selection.provider_plugin_id,
+        requested_model_id: selection.requested_model_id.clone(),
+        effective_model_id: model_id.clone(),
         model_id,
         context_window,
         context_input_tokens,
-        context_usage_source: context_usage.map(|event| match &event.kind {
-            SessionEventKind::ContextUsageObserved { snapshot } => match snapshot.source {
+        context_usage_source: context_occupancy.as_ref().map(|occupancy| {
+            match occupancy.snapshot.source {
                 bcode_session_models::ContextUsageSource::Provider => "provider".to_string(),
                 bcode_session_models::ContextUsageSource::Estimated => "estimated".to_string(),
-            },
-            _ => unreachable!("context usage projection selects only context usage events"),
+            }
         }),
-        context_usage_sequence: context_usage.map(|event| event.sequence),
+        context_usage_sequence: context_occupancy
+            .as_ref()
+            .map(|occupancy| occupancy.observation_sequence),
+        context_usage_error,
         auth_profile: selection.provider_context.auth_profile,
         context_format_version: context_format.as_ref().map(|format| format.version),
         compatibility_key: context_format.map(|format| format.compatibility_key),
@@ -8792,6 +8780,7 @@ async fn apply_skill_model_request(
         .map_err(|error| session_error_response(&error))?;
     let mut selection = SessionModelSelection {
         provider_plugin_id: provider_to_selection(&provider),
+        requested_model_id: None,
         model_id: model_to_selection(&model_id),
         thinking_level: None,
         reasoning_effort: state.selected_reasoning.effort.clone(),
@@ -11845,6 +11834,12 @@ async fn run_model_turn_round(
             .get("bcode_context_format_version")
             .and_then(|value| value.parse().ok()),
         compatibility_key: request.metadata.get("bcode_compatibility_key").cloned(),
+        requested_model_id: request.metadata.get("bcode_requested_model_id").cloned(),
+        context_epoch: state
+            .sessions
+            .current_context_epoch(session_id)
+            .await
+            .unwrap_or_default(),
         portable_context: bounded_portable_context(&request.messages),
         estimated_input_tokens: estimated_model_request_tokens(request),
         managed_compaction_persisted: false,
@@ -13088,6 +13083,9 @@ async fn session_model_selection_with_runtime_context(
         if selection.model_id.is_none() {
             selection.model_id = context.selected_model_id;
         }
+        if selection.requested_model_id.is_none() {
+            selection.requested_model_id = context.requested_model_id;
+        }
         selection.provider_context = context.provider_context;
     }
     selection
@@ -13102,6 +13100,7 @@ fn default_model_selection_with_runtime_context(
     }
     SessionModelSelection {
         provider_plugin_id: state.selected_provider_plugin_id.clone(),
+        requested_model_id: None,
         model_id: state.selected_model_id.clone(),
         thinking_level: None,
         reasoning_effort: state.selected_reasoning.effort.clone(),
@@ -13117,6 +13116,7 @@ fn model_selection_from_runtime_context(
 ) -> SessionModelSelection {
     SessionModelSelection {
         provider_plugin_id: context.selected_provider_plugin_id,
+        requested_model_id: context.requested_model_id,
         model_id: context.selected_model_id,
         thinking_level: None,
         reasoning_effort: state.selected_reasoning.effort.clone(),
@@ -13150,6 +13150,10 @@ async fn session_model_selection(
             .as_deref()
             .and_then(provider_to_selection)
             .or_else(|| state.selected_provider_plugin_id.clone()),
+        requested_model_id: runtime_selection
+            .model_id
+            .as_deref()
+            .and_then(model_to_selection),
         model_id: runtime_selection
             .model_id
             .as_deref()
@@ -13223,6 +13227,8 @@ async fn session_runtime_selection_payload(
                 .provider_plugin_id
                 .as_deref()
                 .and_then(provider_to_selection),
+            requested_model_id: selection.model_id.as_deref().and_then(model_to_selection),
+            effective_model_id: selection.model_id.as_deref().and_then(model_to_selection),
             model_id: selection.model_id.as_deref().and_then(model_to_selection),
             reasoning_effort: selection.reasoning_effort,
             reasoning_summary: selection.reasoning_summary,
@@ -13625,6 +13631,16 @@ async fn build_model_turn_request(
     } else {
         bcode_model::ContextManagementRequest::default()
     };
+    if let Some(selected_model_id) = selection
+        .requested_model_id
+        .as_deref()
+        .or(selected_model_id)
+    {
+        metadata.insert(
+            "bcode_requested_model_id".to_string(),
+            selected_model_id.to_string(),
+        );
+    }
     if state.tool_execution.parallel {
         metadata.insert("bcode_parallel_tool_calls".to_string(), "true".to_string());
     }
@@ -13656,31 +13672,74 @@ async fn build_model_turn_request(
     Ok(request)
 }
 
+async fn publish_context_occupancy(state: &ServerState, session_id: SessionId) {
+    let Ok(occupancy) = state.sessions.current_context_occupancy(session_id).await else {
+        return;
+    };
+    let _ = state
+        .sessions
+        .publish_live_event(
+            session_id,
+            SessionLiveEventKind::ContextOccupancyChanged {
+                occupancy: Box::new(occupancy),
+            },
+        )
+        .await;
+}
+
 async fn append_estimated_context_usage(
     state: &ServerState,
     session_id: SessionId,
     provider_plugin_id: Option<&str>,
     request: &ModelTurnRequest,
 ) {
+    let context_epoch = state
+        .sessions
+        .current_context_epoch(session_id)
+        .await
+        .unwrap_or_default();
     let input_tokens = estimated_model_request_tokens(request);
     let context_through_sequence = request
         .metadata
         .get("bcode_context_through_sequence")
         .and_then(|value| value.parse().ok())
         .unwrap_or_default();
+    let provider_plugin_id = provider_plugin_id.unwrap_or("<auto>").to_string();
+    let requested_model_id = request.metadata.get("bcode_requested_model_id").cloned();
+    let request_id = request.turn_id.clone();
+    let model_turn_id = request
+        .turn_id
+        .rsplit_once('-')
+        .map(|(turn, _)| turn.to_string());
+    let round = model_round_from_turn_id(&request.turn_id);
+    let request_fingerprint = stable_json_hash(request);
     let snapshot = bcode_session_models::ContextUsageSnapshot {
-        provider_plugin_id: provider_plugin_id.unwrap_or("<auto>").to_string(),
+        invocation: Some(bcode_session_models::ModelInvocationIdentity {
+            provider_plugin_id: provider_plugin_id.clone(),
+            requested_model_id,
+            effective_model_id: request.model_id.clone(),
+            request_id: request_id.clone(),
+            model_turn_id: model_turn_id.clone().unwrap_or_else(|| request_id.clone()),
+            round: round.unwrap_or_default(),
+            request_fingerprint: request_fingerprint.clone(),
+            provider_turn_id: request_id.clone(),
+            effective_auth_profile: request.provider_context.auth_profile.clone(),
+            context_format_version: request
+                .metadata
+                .get("bcode_context_format_version")
+                .and_then(|value| value.parse().ok()),
+            compatibility_key: request.metadata.get("bcode_compatibility_key").cloned(),
+            context_epoch,
+        }),
+        provider_plugin_id,
         model_id: request.model_id.clone(),
         input_tokens,
         context_through_sequence,
-        request_id: Some(request.turn_id.clone()),
-        model_turn_id: request
-            .turn_id
-            .rsplit_once('-')
-            .map(|(turn, _)| turn.to_string()),
-        round: model_round_from_turn_id(&request.turn_id),
-        request_fingerprint: Some(stable_json_hash(request)),
-        turn_id: Some(request.turn_id.clone()),
+        request_id: Some(request_id.clone()),
+        model_turn_id,
+        round,
+        request_fingerprint: Some(request_fingerprint),
+        turn_id: Some(request_id),
         auth_profile: request.provider_context.auth_profile.clone(),
         estimated_input_tokens: Some(input_tokens),
         context_format_version: request
@@ -13696,6 +13755,7 @@ async fn append_estimated_context_usage(
         .await
     {
         publish_session_event(state, &event).await;
+        publish_context_occupancy(state, session_id).await;
     }
 }
 
@@ -18065,11 +18125,26 @@ async fn append_provider_context_usage_observation(
         eprintln!("provider usage was not associated with the active request");
         return;
     };
+    let provider_plugin_id = attempt
+        .provider_plugin_id
+        .clone()
+        .unwrap_or_else(|| "<auto>".to_string());
     let snapshot = bcode_session_models::ContextUsageSnapshot {
-        provider_plugin_id: attempt
-            .provider_plugin_id
-            .clone()
-            .unwrap_or_else(|| "<auto>".to_string()),
+        invocation: Some(bcode_session_models::ModelInvocationIdentity {
+            provider_plugin_id: provider_plugin_id.clone(),
+            requested_model_id: attempt.requested_model_id.clone(),
+            effective_model_id: attempt.model_id.clone(),
+            request_id: attempt.request_id.clone(),
+            model_turn_id: attempt.model_turn_id.clone(),
+            round: attempt.round,
+            request_fingerprint: attempt.request_fingerprint.clone(),
+            provider_turn_id: attempt.provider_turn_id.clone(),
+            effective_auth_profile: attempt.auth_profile.clone(),
+            context_format_version: attempt.context_format_version,
+            compatibility_key: attempt.compatibility_key.clone(),
+            context_epoch: attempt.context_epoch,
+        }),
+        provider_plugin_id,
         model_id: attempt.model_id.clone(),
         input_tokens: u64::from(input_tokens),
         context_through_sequence: attempt.context_through_sequence,
@@ -18089,7 +18164,10 @@ async fn append_provider_context_usage_observation(
         .append_context_usage_observed(session_id, snapshot)
         .await
     {
-        Ok(event) => publish_session_event(state, &event).await,
+        Ok(event) => {
+            publish_session_event(state, &event).await;
+            publish_context_occupancy(state, session_id).await;
+        }
         Err(error) => eprintln!("failed to append provider context usage: {error}"),
     }
 }
@@ -21405,6 +21483,7 @@ mod tests {
             session_id,
             SessionModelSelection {
                 provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                requested_model_id: None,
                 model_id: Some("fake-echo".to_string()),
                 provider_context: state.selected_provider_context.clone(),
                 ..SessionModelSelection::default()
@@ -21540,6 +21619,7 @@ mod tests {
             ClientId::new(),
             SessionModelSelection {
                 provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                requested_model_id: None,
                 model_id: Some("fake-model".to_string()),
                 ..SessionModelSelection::default()
             },
@@ -22402,6 +22482,7 @@ mod tests {
         };
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+            requested_model_id: None,
             model_id: Some("anthropic.claude-test".to_string()),
             ..SessionModelSelection::default()
         };
@@ -22440,6 +22521,7 @@ mod tests {
         };
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.bedrock".to_string()),
+            requested_model_id: None,
             ..SessionModelSelection::default()
         };
 
@@ -23394,6 +23476,7 @@ mod tests {
             session_id,
             SessionModelSelection {
                 provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                requested_model_id: None,
                 model_id: Some("fake-echo".to_string()),
                 provider_context: provider_context.clone(),
                 ..SessionModelSelection::default()
@@ -23402,6 +23485,7 @@ mod tests {
         let runtime_context = ClientRuntimeContext {
             selected_provider_plugin_id: Some("bcode.fake-provider".to_string()),
             selected_model_id: Some("fake-echo".to_string()),
+            requested_model_id: None,
             provider_context,
             ..ClientRuntimeContext::default()
         };
@@ -23528,6 +23612,7 @@ mod tests {
             session_id,
             SessionModelSelection {
                 provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                requested_model_id: None,
                 model_id: Some("fake-echo".to_string()),
                 provider_context: state.selected_provider_context.clone(),
                 ..SessionModelSelection::default()
@@ -23642,6 +23727,7 @@ mod tests {
             session_id,
             SessionModelSelection {
                 provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                requested_model_id: None,
                 model_id: Some("fake-echo".to_string()),
                 provider_context: state.selected_provider_context.clone(),
                 ..SessionModelSelection::default()
@@ -23885,6 +23971,7 @@ mod tests {
         state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            requested_model_id: None,
             model_id: Some("fake-model".to_string()),
             provider_context: bcode_model::ProviderRequestContext {
                 settings: BTreeMap::from([
@@ -24044,6 +24131,7 @@ mod tests {
         state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            requested_model_id: None,
             model_id: Some("fake-model".to_string()),
             provider_context: bcode_model::ProviderRequestContext {
                 settings: BTreeMap::from([
@@ -24125,6 +24213,7 @@ mod tests {
         state.auto_compaction.backend = bcode_config::CompactionBackend::Auto;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            requested_model_id: None,
             model_id: Some("fake-model".to_string()),
             ..SessionModelSelection::default()
         };
@@ -24192,6 +24281,7 @@ mod tests {
         state.auto_compaction.backend = bcode_config::CompactionBackend::Auto;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            requested_model_id: None,
             model_id: Some("fake-model".to_string()),
             provider_context: bcode_model::ProviderRequestContext {
                 settings: BTreeMap::from([
@@ -24270,6 +24360,7 @@ mod tests {
         state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            requested_model_id: None,
             model_id: Some("fake-model".to_string()),
             provider_context: bcode_model::ProviderRequestContext {
                 auth_profile: Some("profile-a".to_string()),
@@ -24380,6 +24471,7 @@ mod tests {
         state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            requested_model_id: None,
             model_id: Some("fake-model".to_string()),
             provider_context: bcode_model::ProviderRequestContext {
                 settings: BTreeMap::from([(
@@ -25645,6 +25737,8 @@ mod tests {
             auth_profile: None,
             context_format_version: None,
             compatibility_key: None,
+            requested_model_id: None,
+            context_epoch: 0,
             portable_context: "context".to_string(),
             estimated_input_tokens: 1,
             managed_compaction_persisted: false,

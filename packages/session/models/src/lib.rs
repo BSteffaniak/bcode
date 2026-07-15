@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 mod context_management;
 pub use context_management::{
-    ContextUsageSnapshot, ContextUsageSource, ProviderContextSnapshot,
-    ProviderContextSnapshotOrigin,
+    ContextOccupancy, ContextUsageSnapshot, ContextUsageSource, ModelInvocationIdentity,
+    ProviderContextSnapshot, ProviderContextSnapshotOrigin,
 };
 
 /// Renderer-neutral state for one tool invocation reconstructed from raw session events.
@@ -637,6 +637,11 @@ pub enum SessionLiveEventKind {
         argument_bytes: usize,
         /// Partial tool argument visual.
         preview: LiveToolArgumentPreview,
+    },
+    /// Authoritative current context occupancy after a durable projection update.
+    ContextOccupancyChanged {
+        /// Current occupancy, or `None` when a model/compaction boundary cleared it.
+        occupancy: Box<Option<ContextOccupancy>>,
     },
     /// Live-only provider stream progress for active model turns.
     ProviderStreamProgress {
@@ -1906,6 +1911,24 @@ mod tests {
             serde_json::from_str::<WorkId>(r#""work-1""#).expect("work id should deserialize"),
             work_id
         );
+    }
+
+    #[test]
+    fn context_occupancy_reconciles_by_request_not_auth_selection() {
+        let estimate: ContextUsageSnapshot = serde_json::from_str(
+            r#"{"provider_plugin_id":"provider","model_id":"model","input_tokens":42,"context_through_sequence":1,"request_id":"request","request_fingerprint":"fingerprint","auth_profile":"openai-2","source":"estimated"}"#,
+        )
+        .expect("estimate");
+        let current = ContextOccupancy::reconcile(None, 3, 4, estimate.clone())
+            .expect("estimate should establish occupancy");
+        let mut exact = estimate;
+        exact.source = ContextUsageSource::Provider;
+        exact.input_tokens = 40;
+        let confirmed = ContextOccupancy::reconcile(Some(&current), 3, 5, exact)
+            .expect("same routed request should confirm occupancy");
+
+        assert_eq!(confirmed.snapshot.input_tokens, 40);
+        assert_eq!(confirmed.observation_sequence, 5);
     }
 
     #[test]

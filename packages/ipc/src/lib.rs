@@ -462,6 +462,9 @@ pub struct ClientRuntimeContext {
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]
     pub selected_model_id: Option<String>,
+    /// User-facing model id before alias resolution.
+    #[serde(default)]
+    pub requested_model_id: Option<String>,
     #[serde(default)]
     pub provider_context: bcode_model::ProviderRequestContext,
     /// Redacted names of transient environment variables included in `provider_context.env`.
@@ -684,6 +687,13 @@ pub struct DaemonStatus {
 pub struct SessionRuntimeSelection {
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
+    /// User-facing requested model id.
+    #[serde(default)]
+    pub requested_model_id: Option<String>,
+    /// Concrete effective model id when known.
+    #[serde(default)]
+    pub effective_model_id: Option<String>,
+    /// Legacy model selection field.
     #[serde(default)]
     pub model_id: Option<String>,
     #[serde(default)]
@@ -697,6 +707,13 @@ pub struct SessionRuntimeSelection {
 pub struct SessionModelStatus {
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
+    /// User-facing requested model id before alias/default resolution.
+    #[serde(default)]
+    pub requested_model_id: Option<String>,
+    /// Concrete effective model id used for metadata and provider requests.
+    #[serde(default)]
+    pub effective_model_id: Option<String>,
+    /// Legacy display model field retained for wire compatibility.
     #[serde(default)]
     pub model_id: Option<String>,
     #[serde(default)]
@@ -705,9 +722,12 @@ pub struct SessionModelStatus {
     pub context_input_tokens: Option<u64>,
     #[serde(default)]
     pub context_usage_source: Option<String>,
-    /// Durable sequence of the context-usage observation projected above.
+    /// Durable sequence of the accepted context observation.
     #[serde(default)]
     pub context_usage_sequence: Option<u64>,
+    /// Projection error preventing a trustworthy occupancy value.
+    #[serde(default)]
+    pub context_usage_error: Option<String>,
     #[serde(default)]
     pub auth_profile: Option<String>,
     #[serde(default)]
@@ -2446,6 +2466,7 @@ mod tests {
             runtime_context: Some(ClientRuntimeContext {
                 selected_provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 selected_model_id: Some("model".to_string()),
+                requested_model_id: None,
                 provider_context: bcode_model::ProviderRequestContext {
                     auth_profile: Some("openrouter".to_string()),
                     auth: Some(bcode_model::ProviderAuthContext {

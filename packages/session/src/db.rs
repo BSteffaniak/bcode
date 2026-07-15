@@ -42,6 +42,8 @@ const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
+const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 1;
+const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
 
 /// Errors returned by Switchy-backed session database operations.
 #[derive(Debug, Error)]
@@ -87,6 +89,15 @@ pub enum SessionDbError {
         checkpoint: Option<u64>,
         expected: u64,
     },
+    /// A materialized projection uses an unsupported schema.
+    #[error(
+        "unsupported session DB projection schema: {projection} actual={actual} expected={expected}"
+    )]
+    ProjectionIncompatible {
+        projection: &'static str,
+        actual: u64,
+        expected: u64,
+    },
     /// A compaction marker is malformed or internally inconsistent.
     #[error("invalid context compaction marker at event #{sequence}: {message}")]
     InvalidCompactionMarker { sequence: u64, message: String },
@@ -125,16 +136,19 @@ pub enum MaterializedProjection {
     ArtifactReferences,
     /// Runtime-work lifecycle rows.
     RuntimeWork,
+    /// Authoritative current context occupancy.
+    ContextOccupancy,
 }
 
 impl MaterializedProjection {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::SessionState,
         Self::InputHistory,
         Self::Transcript,
         Self::ToolRuns,
         Self::ArtifactReferences,
         Self::RuntimeWork,
+        Self::ContextOccupancy,
     ];
 
     /// Return all checkpointed materialized projections.
@@ -153,6 +167,7 @@ impl MaterializedProjection {
             Self::ToolRuns => "tool_runs",
             Self::ArtifactReferences => "artifact_references",
             Self::RuntimeWork => "runtime_work",
+            Self::ContextOccupancy => "context_occupancy",
         }
     }
 }
@@ -949,6 +964,7 @@ impl SessionDb {
         insert_event(&*tx, event, activity_timestamp_ms).await?;
         project_event(&*tx, event).await?;
         project_model_context_event(&*tx, event).await?;
+        project_context_occupancy_event(&*tx, event).await?;
         update_projection_checkpoints(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
@@ -1395,31 +1411,73 @@ impl SessionDb {
         Ok(canonical_model_context_from_events(candidates))
     }
 
-    /// Return the latest durable context-usage observation.
+    /// Return the authoritative current context generation.
     ///
     /// # Errors
     ///
-    /// Returns an error if the bounded query or event deserialization fails.
-    pub async fn latest_context_usage(&self) -> SessionDbResult<Option<SessionEvent>> {
+    /// Returns an error when the projection row is missing or malformed.
+    pub async fn current_context_epoch(&self) -> SessionDbResult<u64> {
         let row = self
             .db
-            .select("events")
-            .columns(&["payload"])
-            .where_eq("event_type", "context_usage_observed")
-            .sort("event_seq", SortDirection::Desc)
-            .limit(1)
+            .select("context_occupancy_projection")
+            .columns(&["schema_version", "context_epoch"])
+            .where_eq("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
+            .execute_first(&**self.db)
+            .await?;
+        let Some(row) = row.as_ref() else {
+            return Ok(0);
+        };
+        let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
+        if schema_version != u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION) {
+            return Err(SessionDbError::ProjectionIncompatible {
+                projection: MaterializedProjection::ContextOccupancy.as_str(),
+                actual: schema_version,
+                expected: u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION),
+            });
+        }
+        required_i64(row, "context_epoch").map(i64_to_u64)
+    }
+
+    /// Return the authoritative current context occupancy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the projection is stale, incompatible, or malformed.
+    pub async fn current_context_occupancy(
+        &self,
+    ) -> SessionDbResult<Option<bcode_session_models::ContextOccupancy>> {
+        let expected = self.last_event_sequence().await?.unwrap_or_default();
+        let checkpoint = self
+            .materialized_projection_checkpoint(MaterializedProjection::ContextOccupancy)
+            .await?;
+        if checkpoint != Some(expected) {
+            return Err(SessionDbError::ProjectionStale {
+                projection: MaterializedProjection::ContextOccupancy.as_str(),
+                checkpoint,
+                expected,
+            });
+        }
+        let row = self
+            .db
+            .select("context_occupancy_projection")
+            .columns(&["schema_version", "occupancy_json"])
+            .where_eq("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
             .execute_first(&**self.db)
             .await?;
         let Some(row) = row.as_ref() else {
             return Ok(None);
         };
-        let event = decode_session_event(&required_string(row, "payload")?)?;
-        if !matches!(event.kind, SessionEventKind::ContextUsageObserved { .. }) {
-            return Err(SessionDbError::InvalidRow {
-                column: "events.payload".to_string(),
+        let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
+        if schema_version != u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION) {
+            return Err(SessionDbError::ProjectionIncompatible {
+                projection: MaterializedProjection::ContextOccupancy.as_str(),
+                actual: schema_version,
+                expected: u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION),
             });
         }
-        Ok(Some(event))
+        optional_string(row, "occupancy_json")
+            .map(|json| serde_json::from_str(&json).map_err(SessionDbError::from))
+            .transpose()
     }
 
     async fn latest_context_compaction_event(&self) -> SessionDbResult<Option<SessionEvent>> {
@@ -1890,6 +1948,12 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "CREATE TABLE IF NOT EXISTS artifact_references (\n    artifact_id TEXT NOT NULL,\n    reference_key TEXT NOT NULL,\n    producer_plugin_id TEXT NOT NULL,\n    schema TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    storage_uri TEXT,\n    content_type TEXT,\n    byte_len INTEGER,\n    availability TEXT,\n    complete INTEGER,\n    checksum_sha256 TEXT,\n    finalized_event_seq INTEGER NOT NULL,\n    PRIMARY KEY(artifact_id, reference_key),\n    FOREIGN KEY(finalized_event_seq) REFERENCES events(event_seq)\n)",
         "DROP TABLE IF EXISTS artifact_references",
     );
+    add_sql_migration(
+        source,
+        "022_context_occupancy_projection_table",
+        "CREATE TABLE IF NOT EXISTS context_occupancy_projection (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    context_epoch INTEGER NOT NULL,\n    occupancy_json TEXT\n);\nINSERT OR IGNORE INTO context_occupancy_projection (projection_id, schema_version, context_epoch, occupancy_json) SELECT 1, 1, COALESCE(MAX(event_seq), 0), NULL FROM events WHERE event_type IN ('model_changed', 'context_compacted', 'provider_context_compacted');\nINSERT OR IGNORE INTO projection_checkpoints (projection_name, last_event_seq, projection_version, updated_at_ms) SELECT 'context_occupancy', COALESCE(MAX(event_seq), 0), 1, 0 FROM events",
+        "DROP TABLE IF EXISTS context_occupancy_projection",
+    );
 }
 
 fn add_sql_migration(
@@ -2005,6 +2069,63 @@ async fn project_model_context_event(
             DatabaseValue::Int64(i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)),
         )
         .value("last_event_seq", seq_to_value(event.sequence))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn project_context_occupancy_event(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    use bcode_session_models::{ContextOccupancy, SessionEventKind};
+
+    let row = db
+        .select("context_occupancy_projection")
+        .columns(&["schema_version", "context_epoch", "occupancy_json"])
+        .where_eq("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
+        .execute_first(db)
+        .await?;
+    let (context_epoch, current) = if let Some(row) = row.as_ref() {
+        let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
+        if schema_version != u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION) {
+            return Ok(());
+        }
+        let context_epoch = required_i64(row, "context_epoch").map(i64_to_u64)?;
+        let current = optional_string(row, "occupancy_json")
+            .map(|json| serde_json::from_str::<ContextOccupancy>(&json))
+            .transpose()?;
+        (context_epoch, current)
+    } else {
+        (0, None)
+    };
+
+    let (context_epoch, occupancy) = match &event.kind {
+        SessionEventKind::ModelChanged { .. }
+        | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::ProviderContextCompacted { .. } => (event.sequence, None),
+        SessionEventKind::ContextUsageObserved { snapshot } => (
+            context_epoch,
+            ContextOccupancy::reconcile(
+                current.as_ref(),
+                context_epoch,
+                event.sequence,
+                snapshot.clone(),
+            ),
+        ),
+        _ => (context_epoch, current),
+    };
+    db.upsert("context_occupancy_projection")
+        .value("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
+        .value(
+            "schema_version",
+            DatabaseValue::Int64(i64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION)),
+        )
+        .value("context_epoch", seq_to_value(context_epoch))
+        .value(
+            "occupancy_json",
+            occupancy.as_ref().map(serde_json::to_string).transpose()?,
+        )
         .execute(db)
         .await?;
     Ok(())
@@ -2808,6 +2929,20 @@ mod tests {
             sequence,
             SessionEventKind::ContextUsageObserved {
                 snapshot: ContextUsageSnapshot {
+                    invocation: Some(bcode_session_models::ModelInvocationIdentity {
+                        provider_plugin_id: "provider".to_string(),
+                        requested_model_id: Some("alias".to_string()),
+                        effective_model_id: "model".to_string(),
+                        request_id: format!("request-{sequence}"),
+                        model_turn_id: format!("turn-{sequence}"),
+                        round: 0,
+                        request_fingerprint: format!("fingerprint-{sequence}"),
+                        provider_turn_id: format!("provider-turn-{sequence}"),
+                        effective_auth_profile: None,
+                        context_format_version: None,
+                        compatibility_key: None,
+                        context_epoch: 0,
+                    }),
                     provider_plugin_id: "provider".to_string(),
                     model_id: "model".to_string(),
                     input_tokens: sequence,
@@ -4080,35 +4215,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_context_usage_returns_only_the_newest_observation() {
+    async fn context_occupancy_projection_reconciles_requests_and_boundaries() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
             .await
             .expect("open session db");
 
-        db.append_event(&context_usage_event(session_id, 1))
-            .await
-            .expect("append first context usage");
         db.append_event(&event(
             session_id,
-            2,
-            SessionEventKind::AssistantMessage {
-                text: "unrelated".to_string(),
+            0,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
             },
         ))
         .await
-        .expect("append unrelated event");
-        db.append_event(&context_usage_event(session_id, 3))
+        .expect("append model boundary");
+        db.append_event(&context_usage_event(session_id, 1))
             .await
-            .expect("append latest context usage");
+            .expect("append estimate");
+        let occupancy = db
+            .current_context_occupancy()
+            .await
+            .expect("occupancy")
+            .expect("estimate should project");
+        assert_eq!(occupancy.observation_sequence, 1);
 
-        let latest = db
-            .latest_context_usage()
-            .await
-            .expect("latest context usage")
-            .expect("context usage should exist");
-        assert_eq!(latest.sequence, 3);
+        db.append_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ContextCompacted {
+                summary: "summary".to_string(),
+                compacted_through_sequence: 1,
+            },
+        ))
+        .await
+        .expect("append compaction boundary");
+        assert_eq!(
+            db.current_context_occupancy().await.expect("occupancy"),
+            None
+        );
     }
 
     #[tokio::test]

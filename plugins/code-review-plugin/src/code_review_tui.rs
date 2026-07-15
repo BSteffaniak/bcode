@@ -3385,6 +3385,7 @@ impl ReviewAgentSessionStreamState {
                 self.status = live_tool_preview_status(&tool_name, &preview);
                 self.activity = Some(format!("tool: {}", self.status));
             }
+            SessionLiveEventKind::ContextOccupancyChanged { .. } => {}
             SessionLiveEventKind::ProviderStreamProgress { turn_id, .. } => {
                 self.active_turn_id = Some(turn_id);
                 self.phase = ReviewAgentThreadPhase::Running;
