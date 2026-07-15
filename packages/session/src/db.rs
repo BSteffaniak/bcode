@@ -284,8 +284,12 @@ pub struct FinalizedArtifactReference {
     pub content_type: Option<String>,
     /// Referenced byte length, when known.
     pub byte_len: Option<u64>,
-    /// Plugin-owned reference metadata.
-    pub metadata: Option<serde_json::Value>,
+    /// Generic availability state supplied by the producer, when known.
+    pub availability: Option<String>,
+    /// Whether the producer marked this reference complete.
+    pub complete: Option<bool>,
+    /// Generic SHA-256 integrity digest, when supplied by the producer.
+    pub checksum_sha256: Option<String>,
     /// Canonical event that finalized this reference.
     pub finalized_event_seq: u64,
 }
@@ -1629,7 +1633,9 @@ impl SessionDb {
                 "storage_uri",
                 "content_type",
                 "byte_len",
-                "metadata",
+                "availability",
+                "complete",
+                "checksum_sha256",
                 "finalized_event_seq",
             ])
             .where_eq("artifact_id", artifact_id)
@@ -1881,7 +1887,7 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
     add_sql_migration(
         source,
         "021_artifact_references_table",
-        "CREATE TABLE IF NOT EXISTS artifact_references (\n    artifact_id TEXT NOT NULL,\n    reference_key TEXT NOT NULL,\n    producer_plugin_id TEXT NOT NULL,\n    schema TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    storage_uri TEXT,\n    content_type TEXT,\n    byte_len INTEGER,\n    metadata TEXT,\n    finalized_event_seq INTEGER NOT NULL,\n    PRIMARY KEY(artifact_id, reference_key),\n    FOREIGN KEY(finalized_event_seq) REFERENCES events(event_seq)\n)",
+        "CREATE TABLE IF NOT EXISTS artifact_references (\n    artifact_id TEXT NOT NULL,\n    reference_key TEXT NOT NULL,\n    producer_plugin_id TEXT NOT NULL,\n    schema TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    storage_uri TEXT,\n    content_type TEXT,\n    byte_len INTEGER,\n    availability TEXT,\n    complete INTEGER,\n    checksum_sha256 TEXT,\n    finalized_event_seq INTEGER NOT NULL,\n    PRIMARY KEY(artifact_id, reference_key),\n    FOREIGN KEY(finalized_event_seq) REFERENCES events(event_seq)\n)",
         "DROP TABLE IF EXISTS artifact_references",
     );
 }
@@ -2385,17 +2391,32 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
     }
 }
 
+fn generic_artifact_reference_metadata(
+    reference: &bcode_session_models::ToolArtifactRef,
+) -> (Option<String>, Option<bool>, Option<String>) {
+    let metadata = reference.metadata.as_ref();
+    let availability = metadata
+        .and_then(|metadata| metadata.get("availability"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let complete = metadata
+        .and_then(|metadata| metadata.get("complete"))
+        .and_then(serde_json::Value::as_bool);
+    let checksum_sha256 = metadata
+        .and_then(|metadata| metadata.get("checksum_sha256"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    (availability, complete, checksum_sha256)
+}
+
 async fn project_artifact_references(
     db: &dyn Database,
     finalized_event_seq: u64,
     artifact: &bcode_session_models::ToolArtifact,
 ) -> SessionDbResult<()> {
     for reference in &artifact.refs {
-        let metadata = reference
-            .metadata
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
+        let (availability, complete, checksum_sha256) =
+            generic_artifact_reference_metadata(reference);
         db.upsert("artifact_references")
             .value("artifact_id", artifact.artifact_id.clone())
             .value("reference_key", reference.key.clone())
@@ -2408,7 +2429,9 @@ async fn project_artifact_references(
             .value("storage_uri", reference.storage_uri.clone())
             .value("content_type", reference.content_type.clone())
             .value("byte_len", reference.byte_len.map(seq_to_value))
-            .value("metadata", metadata)
+            .value("availability", availability)
+            .value("complete", complete.map(bool_to_value))
+            .value("checksum_sha256", checksum_sha256)
             .value("finalized_event_seq", seq_to_value(finalized_event_seq))
             .execute(db)
             .await?;
@@ -2419,9 +2442,6 @@ async fn project_artifact_references(
 fn finalized_artifact_reference_from_row(
     row: &switchy::database::Row,
 ) -> SessionDbResult<FinalizedArtifactReference> {
-    let metadata = optional_string(row, "metadata")
-        .map(|value| serde_json::from_str(&value))
-        .transpose()?;
     Ok(FinalizedArtifactReference {
         artifact_id: required_string(row, "artifact_id")?,
         reference_key: required_string(row, "reference_key")?,
@@ -2435,7 +2455,9 @@ fn finalized_artifact_reference_from_row(
         storage_uri: optional_string(row, "storage_uri"),
         content_type: optional_string(row, "content_type"),
         byte_len: optional_i64(row, "byte_len").map(i64_to_u64),
-        metadata,
+        availability: optional_string(row, "availability"),
+        complete: optional_i64(row, "complete").map(|value| value != 0),
+        checksum_sha256: optional_string(row, "checksum_sha256"),
         finalized_event_seq: required_i64(row, "finalized_event_seq").map(i64_to_u64)?,
     })
 }
@@ -4348,7 +4370,12 @@ mod tests {
                             content_type: Some("application/octet-stream".to_owned()),
                             storage_uri: Some("file:///tmp/recording".to_owned()),
                             byte_len: Some(42),
-                            metadata: Some(serde_json::json!({"availability": "complete"})),
+                            metadata: Some(serde_json::json!({
+                                "availability": "complete",
+                                "complete": true,
+                                "checksum_sha256": "abc123",
+                                "plugin_only": "must not be projected"
+                            })),
                         }],
                     }),
                 }),
@@ -4367,10 +4394,9 @@ mod tests {
         assert_eq!(reference.schema_version, 3);
         assert_eq!(reference.byte_len, Some(42));
         assert_eq!(reference.finalized_event_seq, 1);
-        assert_eq!(
-            reference.metadata,
-            Some(serde_json::json!({"availability": "complete"}))
-        );
+        assert_eq!(reference.availability.as_deref(), Some("complete"));
+        assert_eq!(reference.complete, Some(true));
+        assert_eq!(reference.checksum_sha256.as_deref(), Some("abc123"));
         assert!(
             db.finalized_artifact_reference("artifact-1", "missing")
                 .await

@@ -5243,6 +5243,11 @@ fn read_artifact_file_range(
     }
     let mut file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
     let total_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    if offset > total_bytes {
+        return Err(format!(
+            "artifact range offset {offset} exceeds artifact length {total_bytes}"
+        ));
+    }
     let read_len = u64::from(length).min(total_bytes.saturating_sub(offset));
     let mut bytes = vec![0; usize::try_from(read_len).unwrap_or(usize::MAX)];
     file.seek(SeekFrom::Start(offset))
@@ -5250,6 +5255,45 @@ fn read_artifact_file_range(
     file.read_exact(&mut bytes)
         .map_err(|error| error.to_string())?;
     Ok((total_bytes, bytes))
+}
+
+fn artifact_reference_path(uri: &str, artifact_root: &Path) -> Result<PathBuf, String> {
+    if let Ok(url) = url::Url::parse(uri) {
+        if url.scheme() != "file" {
+            return Err("artifact storage URI is not locally readable".to_owned());
+        }
+        return url
+            .to_file_path()
+            .map_err(|()| "artifact file path is invalid".to_owned());
+    }
+    let path = PathBuf::from(uri);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err("artifact relative storage path is invalid".to_owned());
+    }
+    Ok(artifact_root.join(path))
+}
+
+fn artifact_reference_unavailability(
+    availability: Option<&str>,
+    complete: Option<bool>,
+) -> Option<String> {
+    match availability {
+        Some(state @ ("missing" | "incomplete" | "corrupt" | "evicted" | "unavailable")) => {
+            Some(format!("artifact reference is unavailable: {state}"))
+        }
+        _ if complete == Some(false) => Some("artifact reference is incomplete".to_owned()),
+        _ => None,
+    }
 }
 
 async fn read_session_artifact_range(
@@ -5271,18 +5315,17 @@ async fn read_session_artifact_range(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "artifact reference was not found in the finalized projection".to_owned())?;
+    if let Some(error) =
+        artifact_reference_unavailability(reference.availability.as_deref(), reference.complete)
+    {
+        return Err(error);
+    }
     let uri = reference
         .storage_uri
         .as_deref()
         .ok_or_else(|| "artifact reference has no storage URI".to_owned())?;
-    let url = url::Url::parse(uri).map_err(|_| "artifact storage URI is invalid".to_owned())?;
-    if url.scheme() != "file" {
-        return Err("artifact storage URI is not locally readable".to_owned());
-    }
-    let path = url
-        .to_file_path()
-        .map_err(|()| "artifact file path is invalid".to_owned())?;
     let artifact_root = default_session_artifact_dir(session_id);
+    let path = artifact_reference_path(uri, &artifact_root)?;
     let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
         read_artifact_file_range(&path, &artifact_root, offset, length)
     })
@@ -18154,12 +18197,44 @@ mod tests {
         assert_eq!(bytes, b"3456");
         let (_, tail) = read_artifact_file_range(&path, &root, 8, 100).expect("tail");
         assert_eq!(tail, b"89");
+        let (_, eof) = read_artifact_file_range(&path, &root, 10, 1).expect("EOF");
+        assert!(eof.is_empty());
+        let error = read_artifact_file_range(&path, &root, 11, 1)
+            .expect_err("offset beyond EOF must be rejected");
+        assert!(error.contains("exceeds artifact length"));
 
         let outside = temp_dir.path().join("outside.bin");
         std::fs::write(&outside, b"secret").expect("outside artifact");
         let error = read_artifact_file_range(&outside, &root, 0, 6)
             .expect_err("outside artifact must be rejected");
         assert!(error.contains("outside the session artifact root"));
+    }
+
+    #[test]
+    fn artifact_reference_paths_support_confined_relative_and_legacy_absolute_locations() {
+        let root = PathBuf::from("/tmp/session-artifacts");
+        assert_eq!(
+            artifact_reference_path("recordings/run.bcsr", &root).expect("relative path"),
+            root.join("recordings/run.bcsr")
+        );
+        assert_eq!(
+            artifact_reference_path("/tmp/legacy-recording.bcsr", &root)
+                .expect("legacy absolute path"),
+            PathBuf::from("/tmp/legacy-recording.bcsr")
+        );
+        assert!(artifact_reference_path("../escape", &root).is_err());
+        assert!(artifact_reference_path("https://example.com/a", &root).is_err());
+    }
+
+    #[test]
+    fn artifact_reference_unavailability_is_explicit() {
+        for state in ["missing", "incomplete", "corrupt", "evicted", "unavailable"] {
+            let error = artifact_reference_unavailability(Some(state), None)
+                .expect("unavailable reference must be rejected");
+            assert!(error.contains(state));
+        }
+        assert!(artifact_reference_unavailability(None, Some(false)).is_some());
+        assert!(artifact_reference_unavailability(Some("complete"), Some(true)).is_none());
     }
 
     #[test]

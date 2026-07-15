@@ -1762,6 +1762,7 @@ fn finalize_recording(
             "frame_count": summary.frame_count,
             "output_bytes": summary.output_bytes,
             "checksum_sha256": summary.checksum_sha256,
+            "availability": "complete",
             "complete": true,
             "retention": "session_lifetime",
             "eviction": "none",
@@ -2773,6 +2774,115 @@ mod tests {
         assert!(!status.cancelled);
         assert!(!status.success);
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    struct FixedChunkReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        chunk_bytes: usize,
+    }
+
+    impl std::io::Read for FixedChunkReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == self.bytes.len() {
+                return Ok(0);
+            }
+            let end = self
+                .offset
+                .saturating_add(self.chunk_bytes)
+                .min(self.bytes.len());
+            let len = end.saturating_sub(self.offset).min(buffer.len());
+            buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset = self.offset.saturating_add(len);
+            Ok(len)
+        }
+    }
+
+    fn cumulative_live_visual_payload_measurement(
+        chunk_count: usize,
+        chunk_bytes: usize,
+    ) -> (usize, usize, usize) {
+        let arguments = json!({});
+        let live_frames = Arc::new(StdMutex::new(Vec::new()));
+        let context = ShellVisualStreamContext {
+            arguments: &arguments,
+            stream: ToolOutputStream::Pty,
+            columns: 80,
+            rows: 24,
+            timeout_ms: None,
+            prelude_markers: PreludeGateMarkers::default(),
+            live_frames: Some(Arc::clone(&live_frames)),
+        };
+        let events = Mutex::new(Vec::<Vec<u8>>::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(capture_service_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        read_limited_streaming(
+            FixedChunkReader {
+                bytes: vec![b'x'; chunk_count.saturating_mul(chunk_bytes)],
+                offset: 0,
+                chunk_bytes,
+            },
+            emitter,
+            "growth-call",
+            &context,
+            TerminalStreamPaths {
+                clean: None,
+                raw: None,
+                replay: None,
+                recording: None,
+                recording_ready: None,
+            },
+        )
+        .expect("stream measurement");
+        let events = events.lock().expect("event lock");
+        let payload_bytes = events.iter().map(Vec::len).sum();
+        let base64_bytes = events
+            .iter()
+            .map(|payload| {
+                let event: ToolInvocationStreamEvent =
+                    serde_json::from_slice(payload).expect("stream event");
+                let ToolInvocationStreamEvent::VisualUpdate { visual, .. } = event else {
+                    panic!("expected visual update");
+                };
+                visual
+                    .payload
+                    .pointer("/_bcode_runtime/frames")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|frame| frame.get("bytes_base64"))
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::len)
+                    .sum::<usize>()
+            })
+            .sum();
+        (events.len(), payload_bytes, base64_bytes)
+    }
+
+    #[test]
+    fn cumulative_live_visual_fixture_proves_superlinear_payload_and_base64_growth() {
+        let small = cumulative_live_visual_payload_measurement(64, 32);
+        let large = cumulative_live_visual_payload_measurement(128, 32);
+
+        assert_eq!(small.0, 64);
+        assert_eq!(large.0, 128);
+        assert!(large.1 > small.1.saturating_mul(3));
+        assert!(large.2 > small.2.saturating_mul(3));
+    }
+
+    #[test]
+    #[ignore = "release benchmark for the known interim cumulative live-visual transport"]
+    fn benchmark_cumulative_live_visual_growth() {
+        let started = Instant::now();
+        let (event_count, payload_bytes, base64_bytes) =
+            cumulative_live_visual_payload_measurement(2_000, 32);
+        eprintln!(
+            "events={event_count} payload_bytes={payload_bytes} base64_bytes={base64_bytes} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        assert_eq!(event_count, 2_000);
     }
 
     #[test]
