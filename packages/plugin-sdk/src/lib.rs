@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_void};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 /// Versioned interface for plugin-owned active session status contributions.
 pub const SESSION_STATUS_INTERFACE_ID: &str = "bcode.session-status/v1";
@@ -57,6 +58,28 @@ pub type CommandRegistrationCallback = extern "C" fn(*const u8, usize, *mut c_vo
 /// ABI-safe callback used by plugins to emit incremental service events.
 pub type ServiceEventCallback = extern "C" fn(*const u8, usize, *mut c_void);
 
+/// ABI-safe callback used by plugins for one bounded invocation request/reply operation.
+pub type ServiceBridgeCallback =
+    extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize, *mut c_void) -> i32;
+
+/// ABI-safe callback used to wait for host cancellation for at most `timeout_ms`.
+pub type ServiceCancellationWaitCallback = extern "C" fn(u64, *mut c_void) -> bool;
+
+/// Maximum encoded bridge request accepted by the native ABI.
+pub const SERVICE_BRIDGE_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// Maximum encoded bridge response accepted by the native ABI.
+pub const SERVICE_BRIDGE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Bridge request completed successfully.
+pub const SERVICE_BRIDGE_STATUS_OK: i32 = 0;
+/// Bridge request or output pointers were invalid.
+pub const SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT: i32 = 2;
+/// Bridge response exceeded the supplied output buffer.
+pub const SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE: i32 = 4;
+/// Bridge request was cancelled.
+pub const SERVICE_BRIDGE_STATUS_CANCELLED: i32 = 6;
+/// Host bridge operation failed.
+pub const SERVICE_BRIDGE_STATUS_FAILED: i32 = 70;
+
 /// Private marker prefix for transparent service response chunks emitted over the streaming
 /// callback channel.
 #[doc(hidden)]
@@ -71,29 +94,115 @@ pub type StreamingServiceFn = fn(
     *mut usize,
     Option<ServiceEventCallback>,
     *mut c_void,
+    Option<ServiceBridgeCallback>,
+    *mut c_void,
+    Option<ServiceCancellationWaitCallback>,
+    *mut c_void,
 ) -> i32;
 
 /// Cloneable cancellation state scoped to one service invocation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServiceCancellation {
-    cancelled: Option<Arc<AtomicBool>>,
+    state: Arc<ServiceCancellationState>,
+    wait_callback: Option<ServiceCancellationWaitCallback>,
+    wait_user_data: usize,
+}
+
+#[derive(Debug)]
+struct ServiceCancellationState {
+    cancelled: Arc<AtomicBool>,
+    mutex: Mutex<()>,
+    wakeup: Condvar,
+}
+
+impl Default for ServiceCancellation {
+    fn default() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)))
+    }
 }
 
 impl ServiceCancellation {
     /// Create cancellation state from a shared flag.
     #[must_use]
-    pub const fn new(cancelled: Arc<AtomicBool>) -> Self {
+    pub fn new(cancelled: Arc<AtomicBool>) -> Self {
         Self {
-            cancelled: Some(cancelled),
+            state: Arc::new(ServiceCancellationState {
+                cancelled,
+                mutex: Mutex::new(()),
+                wakeup: Condvar::new(),
+            }),
+            wait_callback: None,
+            wait_user_data: 0,
         }
+    }
+
+    /// Create cancellation state backed by an ABI wait callback.
+    #[must_use]
+    pub fn from_wait_callback(
+        callback: Option<ServiceCancellationWaitCallback>,
+        user_data: *mut c_void,
+    ) -> Self {
+        Self {
+            wait_callback: callback,
+            wait_user_data: user_data as usize,
+            ..Self::default()
+        }
+    }
+
+    /// Request cancellation and wake threads blocked on this state.
+    pub fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::SeqCst);
+        self.state.wakeup.notify_all();
     }
 
     /// Return whether host cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled
-            .as_ref()
-            .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
+        self.state.cancelled.load(Ordering::SeqCst)
+            || self
+                .wait_callback
+                .is_some_and(|callback| callback(0, self.wait_user_data as *mut c_void))
+    }
+
+    /// Block until cancellation is requested or `timeout` elapses.
+    ///
+    /// Returns `true` when cancellation was requested.
+    #[must_use]
+    pub fn wait_cancelled(&self, timeout: Duration) -> bool {
+        if let Some(callback) = self.wait_callback {
+            let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+            return callback(timeout_ms, self.wait_user_data as *mut c_void);
+        }
+        if self.is_cancelled() {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        let mut guard = self
+            .state
+            .mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if self.is_cancelled() {
+                drop(guard);
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop(guard);
+                return false;
+            }
+            let (next_guard, wait) = self
+                .state
+                .wakeup
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next_guard;
+            if wait.timed_out() && !self.is_cancelled() {
+                drop(guard);
+                return false;
+            }
+        }
     }
 }
 
@@ -182,8 +291,213 @@ impl ServiceEventEmitter {
 unsafe impl Send for ServiceEventEmitter {}
 unsafe impl Sync for ServiceEventEmitter {}
 
+/// Renderer- and transport-neutral request routed through the native invocation bridge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ServiceBridgeRequest {
+    /// Request a correlated external exchange.
+    Exchange(bcode_tool::ToolExchangeRequest),
+    /// Wait for the next unsolicited invocation input.
+    ReceiveInput { invocation_id: String },
+    /// Invoke a nested host service.
+    InvokeService(bcode_tool::ToolInvocationServiceRequest),
+    /// Write one bounded host artifact.
+    WriteArtifact(bcode_tool::ToolArtifactWriteRequest),
+}
+
+/// Renderer- and transport-neutral response returned through the native invocation bridge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ServiceBridgeResponse {
+    /// Resolution of an exchange request.
+    Exchange(bcode_tool::ToolExchangeResolution),
+    /// Resolution of an input wait.
+    Input(bcode_tool::ToolInvocationInputResolution),
+    /// Resolution of a nested service request.
+    Service(bcode_tool::ToolInvocationServiceResolution),
+    /// Resolution of an artifact write.
+    Artifact(bcode_tool::ToolArtifactWriteResolution),
+}
+
+/// Error returned by a native invocation bridge request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceBridgeError {
+    /// This invocation has no host bridge.
+    Unavailable,
+    /// The invocation was cancelled before or during the bridge operation.
+    Cancelled,
+    /// Request encoding failed.
+    Encode(String),
+    /// Request exceeded the ABI bound.
+    RequestTooLarge { actual: usize, maximum: usize },
+    /// Host bridge failed.
+    Host { status: i32 },
+    /// Host returned a response for a different bridge operation family.
+    UnexpectedResponse {
+        expected: &'static str,
+        actual: &'static str,
+    },
+    /// Response exceeded the ABI bound.
+    ResponseTooLarge { required: usize, maximum: usize },
+    /// Response decoding failed.
+    Decode(String),
+}
+
+impl std::fmt::Display for ServiceBridgeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("invocation bridge is unavailable"),
+            Self::Cancelled => formatter.write_str("invocation bridge request was cancelled"),
+            Self::Encode(error) => write!(formatter, "bridge request encoding failed: {error}"),
+            Self::RequestTooLarge { actual, maximum } => write!(
+                formatter,
+                "bridge request contains {actual} bytes but maximum is {maximum}"
+            ),
+            Self::Host { status } => write!(formatter, "host bridge failed with status {status}"),
+            Self::UnexpectedResponse { expected, actual } => write!(
+                formatter,
+                "host bridge returned {actual} response for {expected} request"
+            ),
+            Self::ResponseTooLarge { required, maximum } => write!(
+                formatter,
+                "bridge response requires {required} bytes but maximum is {maximum}"
+            ),
+            Self::Decode(error) => write!(formatter, "bridge response decoding failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ServiceBridgeError {}
+
+/// Cloneable bounded request/reply bridge scoped to one native service invocation.
+#[derive(Debug, Clone, Default)]
+pub struct ServiceBridge {
+    callback: Option<ServiceBridgeCallback>,
+    user_data: usize,
+    cancellation: ServiceCancellation,
+}
+
+impl ServiceBridge {
+    /// Create a bridge from raw ABI callback parts.
+    #[must_use]
+    pub fn new(
+        callback: Option<ServiceBridgeCallback>,
+        user_data: *mut c_void,
+        cancellation: ServiceCancellation,
+    ) -> Self {
+        Self {
+            callback,
+            user_data: user_data as usize,
+            cancellation,
+        }
+    }
+
+    /// Return whether this invocation provides a request/reply bridge.
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        self.callback.is_some()
+    }
+
+    /// Execute one bounded request/reply bridge operation.
+    ///
+    /// Each call is its own correlation scope: the callback must return exactly one matching
+    /// response synchronously. Encoded requests and responses are each limited to one MiB, and a
+    /// response from a different operation family is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no bridge exists, cancellation wins, encoding/decoding fails, the
+    /// host reports failure, or the response exceeds the fixed ABI bound.
+    pub fn request(
+        &self,
+        request: &ServiceBridgeRequest,
+    ) -> Result<ServiceBridgeResponse, ServiceBridgeError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ServiceBridgeError::Cancelled);
+        }
+        let callback = self.callback.ok_or(ServiceBridgeError::Unavailable)?;
+        let encoded = serde_json::to_vec(request)
+            .map_err(|error| ServiceBridgeError::Encode(error.to_string()))?;
+        if encoded.len() > SERVICE_BRIDGE_MAX_REQUEST_BYTES {
+            return Err(ServiceBridgeError::RequestTooLarge {
+                actual: encoded.len(),
+                maximum: SERVICE_BRIDGE_MAX_REQUEST_BYTES,
+            });
+        }
+        let mut output = vec![0; SERVICE_BRIDGE_MAX_RESPONSE_BYTES];
+        let mut output_len = 0;
+        let status = callback(
+            encoded.as_ptr(),
+            encoded.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            &raw mut output_len,
+            self.user_data as *mut c_void,
+        );
+        if self.cancellation.is_cancelled() || status == SERVICE_BRIDGE_STATUS_CANCELLED {
+            return Err(ServiceBridgeError::Cancelled);
+        }
+        if status == SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE
+            || output_len > SERVICE_BRIDGE_MAX_RESPONSE_BYTES
+        {
+            return Err(ServiceBridgeError::ResponseTooLarge {
+                required: output_len,
+                maximum: SERVICE_BRIDGE_MAX_RESPONSE_BYTES,
+            });
+        }
+        if status != SERVICE_BRIDGE_STATUS_OK {
+            return Err(ServiceBridgeError::Host { status });
+        }
+        output.truncate(output_len);
+        let response = serde_json::from_slice(&output)
+            .map_err(|error| ServiceBridgeError::Decode(error.to_string()))?;
+        validate_bridge_response_kind(request, response)
+    }
+}
+
+fn validate_bridge_response_kind(
+    request: &ServiceBridgeRequest,
+    response: ServiceBridgeResponse,
+) -> Result<ServiceBridgeResponse, ServiceBridgeError> {
+    let valid = matches!(
+        (request, &response),
+        (
+            ServiceBridgeRequest::Exchange(_),
+            ServiceBridgeResponse::Exchange(_)
+        ) | (
+            ServiceBridgeRequest::ReceiveInput { .. },
+            ServiceBridgeResponse::Input(_)
+        ) | (
+            ServiceBridgeRequest::InvokeService(_),
+            ServiceBridgeResponse::Service(_)
+        ) | (
+            ServiceBridgeRequest::WriteArtifact(_),
+            ServiceBridgeResponse::Artifact(_)
+        )
+    );
+    if valid {
+        return Ok(response);
+    }
+    let expected = match request {
+        ServiceBridgeRequest::Exchange(_) => "exchange",
+        ServiceBridgeRequest::ReceiveInput { .. } => "input",
+        ServiceBridgeRequest::InvokeService(_) => "service",
+        ServiceBridgeRequest::WriteArtifact(_) => "artifact",
+    };
+    let actual = match response {
+        ServiceBridgeResponse::Exchange(_) => "exchange",
+        ServiceBridgeResponse::Input(_) => "input",
+        ServiceBridgeResponse::Service(_) => "service",
+        ServiceBridgeResponse::Artifact(_) => "artifact",
+    };
+    Err(ServiceBridgeError::UnexpectedResponse { expected, actual })
+}
+
+unsafe impl Send for ServiceBridge {}
+unsafe impl Sync for ServiceBridge {}
+
 /// Current stable native plugin ABI version.
-pub const CURRENT_PLUGIN_ABI_VERSION: u16 = 1;
+pub const CURRENT_PLUGIN_ABI_VERSION: u16 = 2;
 
 /// Default manifest export symbol for native plugins.
 pub const DEFAULT_NATIVE_MANIFEST_SYMBOL: &str = "bcode_plugin_manifest_v1";
@@ -197,12 +511,9 @@ pub const DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL: &str = "bcode_plugin_register
 /// Default deactivation hook export symbol for native plugins.
 pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bcode_plugin_deactivate_v1";
 
-/// Default service invocation export symbol for native plugins.
-pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bcode_plugin_invoke_service_v1";
-
 /// Default streaming service invocation export symbol for native plugins.
 pub const DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL: &str =
-    "bcode_plugin_invoke_service_streaming_v1";
+    "bcode_plugin_invoke_service_streaming_v2";
 
 /// Default event handler export symbol for native plugins.
 pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bcode_plugin_handle_event_v1";
@@ -313,6 +624,8 @@ pub struct NativeServiceContext {
     pub events: ServiceEventEmitter,
     #[serde(skip)]
     pub cancellation: ServiceCancellation,
+    #[serde(skip)]
+    pub bridge: ServiceBridge,
 }
 
 /// Resolved plugin configuration delivered by the host.
@@ -694,7 +1007,7 @@ pub fn write_service_response(
 
 /// Decode and invoke a service with an explicit invocation-scoped event emitter.
 #[doc(hidden)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 pub fn invoke_service_with_emitter_export<P: RustPlugin>(
     instance: &'static Mutex<P>,
     input_ptr: *const u8,
@@ -703,6 +1016,10 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
     output_capacity: usize,
     output_len: *mut usize,
     events: ServiceEventEmitter,
+    bridge_callback: Option<ServiceBridgeCallback>,
+    bridge_user_data: *mut c_void,
+    cancellation_callback: Option<ServiceCancellationWaitCallback>,
+    cancellation_user_data: *mut c_void,
 ) -> i32 {
     if input_ptr.is_null() || output_len.is_null() {
         return SERVICE_STATUS_INVALID_ARGUMENT;
@@ -713,6 +1030,13 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
         return SERVICE_STATUS_DECODE_FAILED;
     };
     context.events = events;
+    context.cancellation =
+        ServiceCancellation::from_wait_callback(cancellation_callback, cancellation_user_data);
+    context.bridge = ServiceBridge::new(
+        bridge_callback,
+        bridge_user_data,
+        context.cancellation.clone(),
+    );
     let response = match instance.lock() {
         Ok(mut plugin) => plugin.invoke_service(context),
         Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
@@ -734,7 +1058,7 @@ pub fn deactivate_concurrent_export<P: ConcurrentRustPlugin>(instance: &'static 
 
 /// Decode and invoke a concurrent service with an explicit invocation-scoped event emitter.
 #[doc(hidden)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
     instance: &'static Arc<P>,
     input_ptr: *const u8,
@@ -743,6 +1067,10 @@ pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
     output_capacity: usize,
     output_len: *mut usize,
     events: ServiceEventEmitter,
+    bridge_callback: Option<ServiceBridgeCallback>,
+    bridge_user_data: *mut c_void,
+    cancellation_callback: Option<ServiceCancellationWaitCallback>,
+    cancellation_user_data: *mut c_void,
 ) -> i32 {
     if input_ptr.is_null() || output_len.is_null() {
         return SERVICE_STATUS_INVALID_ARGUMENT;
@@ -753,29 +1081,15 @@ pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
         return SERVICE_STATUS_DECODE_FAILED;
     };
     context.events = events;
+    context.cancellation =
+        ServiceCancellation::from_wait_callback(cancellation_callback, cancellation_user_data);
+    context.bridge = ServiceBridge::new(
+        bridge_callback,
+        bridge_user_data,
+        context.cancellation.clone(),
+    );
     let response = instance.invoke_service_concurrent(context);
     write_service_response(&response, output_ptr, output_capacity, output_len, events)
-}
-
-#[doc(hidden)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn invoke_concurrent_service_export<P: ConcurrentRustPlugin>(
-    instance: &'static Arc<P>,
-    input_ptr: *const u8,
-    input_len: usize,
-    output_ptr: *mut u8,
-    output_capacity: usize,
-    output_len: *mut usize,
-) -> i32 {
-    invoke_concurrent_service_with_emitter_export(
-        instance,
-        input_ptr,
-        input_len,
-        output_ptr,
-        output_capacity,
-        output_len,
-        ServiceEventEmitter::default(),
-    )
 }
 
 #[doc(hidden)]
@@ -790,6 +1104,10 @@ pub fn invoke_concurrent_service_streaming_export<P: ConcurrentRustPlugin>(
     output_len: *mut usize,
     event_callback: Option<ServiceEventCallback>,
     event_user_data: *mut c_void,
+    bridge_callback: Option<ServiceBridgeCallback>,
+    bridge_user_data: *mut c_void,
+    cancellation_callback: Option<ServiceCancellationWaitCallback>,
+    cancellation_user_data: *mut c_void,
 ) -> i32 {
     invoke_concurrent_service_with_emitter_export(
         instance,
@@ -799,6 +1117,10 @@ pub fn invoke_concurrent_service_streaming_export<P: ConcurrentRustPlugin>(
         output_capacity,
         output_len,
         ServiceEventEmitter::new(event_callback, event_user_data),
+        bridge_callback,
+        bridge_user_data,
+        cancellation_callback,
+        cancellation_user_data,
     )
 }
 
@@ -815,45 +1137,6 @@ fn emit_service_response_chunks(events: ServiceEventEmitter, encoded: &[u8]) {
 
 #[doc(hidden)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn invoke_service_export<P: RustPlugin>(
-    instance: &'static Mutex<P>,
-    input_ptr: *const u8,
-    input_len: usize,
-    output_ptr: *mut u8,
-    output_capacity: usize,
-    output_len: *mut usize,
-) -> i32 {
-    if input_ptr.is_null() || output_len.is_null() {
-        return SERVICE_STATUS_INVALID_ARGUMENT;
-    }
-
-    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let Ok(mut context) = serde_json::from_slice::<NativeServiceContext>(input) else {
-        return SERVICE_STATUS_DECODE_FAILED;
-    };
-    context.events = ServiceEventEmitter::default();
-    let response = match instance.lock() {
-        Ok(mut plugin) => plugin.invoke_service(context),
-        Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
-    };
-    let Ok(encoded) = serde_json::to_vec(&response) else {
-        return SERVICE_STATUS_ENCODE_FAILED;
-    };
-
-    unsafe {
-        *output_len = encoded.len();
-    }
-    if output_ptr.is_null() || output_capacity < encoded.len() {
-        return SERVICE_STATUS_BUFFER_TOO_SMALL;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-    }
-    SERVICE_STATUS_OK
-}
-
-#[doc(hidden)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[allow(clippy::too_many_arguments)]
 pub fn invoke_service_streaming_export<P: RustPlugin>(
     instance: &'static Mutex<P>,
@@ -864,6 +1147,10 @@ pub fn invoke_service_streaming_export<P: RustPlugin>(
     output_len: *mut usize,
     event_callback: Option<ServiceEventCallback>,
     event_user_data: *mut c_void,
+    bridge_callback: Option<ServiceBridgeCallback>,
+    bridge_user_data: *mut c_void,
+    cancellation_callback: Option<ServiceCancellationWaitCallback>,
+    cancellation_user_data: *mut c_void,
 ) -> i32 {
     invoke_service_with_emitter_export(
         instance,
@@ -873,6 +1160,10 @@ pub fn invoke_service_streaming_export<P: RustPlugin>(
         output_capacity,
         output_len,
         ServiceEventEmitter::new(event_callback, event_user_data),
+        bridge_callback,
+        bridge_user_data,
+        cancellation_callback,
+        cancellation_user_data,
     )
 }
 
@@ -967,8 +1258,6 @@ pub struct StaticPluginVtable {
     pub register_commands: Option<StaticCommandRegistrationFn>,
     /// Deactivation hook.
     pub deactivate: fn(*const c_void) -> i32,
-    /// Service invocation hook.
-    pub invoke_service: fn(*const c_void, *const u8, usize, *mut u8, usize, *mut usize) -> i32,
     /// Streaming service invocation hook.
     pub invoke_service_streaming: StreamingServiceFn,
     /// Event handling hook.
@@ -1027,28 +1316,6 @@ pub fn static_deactivate_export<P: RustPlugin>(instance: *const c_void) -> i32 {
 }
 
 #[doc(hidden)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn static_invoke_service_export<P: RustPlugin>(
-    instance: *const c_void,
-    input_ptr: *const u8,
-    input_len: usize,
-    output_ptr: *mut u8,
-    output_capacity: usize,
-    output_len: *mut usize,
-) -> i32 {
-    let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
-    let instance = plugin_instance::<P>(instance);
-    invoke_service_export(
-        instance,
-        input_ptr,
-        input_len,
-        output_ptr,
-        output_capacity,
-        output_len,
-    )
-}
-
-#[doc(hidden)]
 #[must_use]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[allow(clippy::too_many_arguments)]
@@ -1061,6 +1328,10 @@ pub fn static_invoke_service_streaming_export<P: RustPlugin>(
     output_len: *mut usize,
     event_callback: Option<ServiceEventCallback>,
     event_user_data: *mut c_void,
+    bridge_callback: Option<ServiceBridgeCallback>,
+    bridge_user_data: *mut c_void,
+    cancellation_callback: Option<ServiceCancellationWaitCallback>,
+    cancellation_user_data: *mut c_void,
 ) -> i32 {
     let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
     let instance = plugin_instance::<P>(instance);
@@ -1073,6 +1344,10 @@ pub fn static_invoke_service_streaming_export<P: RustPlugin>(
         output_len,
         event_callback,
         event_user_data,
+        bridge_callback,
+        bridge_user_data,
+        cancellation_callback,
+        cancellation_user_data,
     )
 }
 
@@ -1124,26 +1399,7 @@ macro_rules! export_plugin {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn bcode_plugin_invoke_service_v1(
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-        ) -> i32 {
-            let instance = $crate::plugin_instance::<$plugin>(&BCODE_PLUGIN_INSTANCE);
-            $crate::invoke_service_export(
-                instance,
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
-
-        #[unsafe(no_mangle)]
-        pub extern "C" fn bcode_plugin_invoke_service_streaming_v1(
+        pub extern "C" fn bcode_plugin_invoke_service_streaming_v2(
             input_ptr: *const u8,
             input_len: usize,
             output_ptr: *mut u8,
@@ -1151,6 +1407,10 @@ macro_rules! export_plugin {
             output_len: *mut usize,
             event_callback: Option<$crate::ServiceEventCallback>,
             event_user_data: *mut std::ffi::c_void,
+            bridge_callback: Option<$crate::ServiceBridgeCallback>,
+            bridge_user_data: *mut std::ffi::c_void,
+            cancellation_callback: Option<$crate::ServiceCancellationWaitCallback>,
+            cancellation_user_data: *mut std::ffi::c_void,
         ) -> i32 {
             let instance = $crate::plugin_instance::<$plugin>(&BCODE_PLUGIN_INSTANCE);
             $crate::invoke_service_streaming_export(
@@ -1162,6 +1422,10 @@ macro_rules! export_plugin {
                 output_len,
                 event_callback,
                 event_user_data,
+                bridge_callback,
+                bridge_user_data,
+                cancellation_callback,
+                cancellation_user_data,
             )
         }
 
@@ -1202,26 +1466,7 @@ macro_rules! export_concurrent_plugin {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn bcode_plugin_invoke_service_v1(
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-        ) -> i32 {
-            let instance = $crate::plugin_instance_arc::<$plugin>(&BCODE_PLUGIN_INSTANCE);
-            $crate::invoke_concurrent_service_export(
-                instance,
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
-
-        #[unsafe(no_mangle)]
-        pub extern "C" fn bcode_plugin_invoke_service_streaming_v1(
+        pub extern "C" fn bcode_plugin_invoke_service_streaming_v2(
             input_ptr: *const u8,
             input_len: usize,
             output_ptr: *mut u8,
@@ -1229,6 +1474,10 @@ macro_rules! export_concurrent_plugin {
             output_len: *mut usize,
             event_callback: Option<$crate::ServiceEventCallback>,
             event_user_data: *mut std::ffi::c_void,
+            bridge_callback: Option<$crate::ServiceBridgeCallback>,
+            bridge_user_data: *mut std::ffi::c_void,
+            cancellation_callback: Option<$crate::ServiceCancellationWaitCallback>,
+            cancellation_user_data: *mut std::ffi::c_void,
         ) -> i32 {
             let instance = $crate::plugin_instance_arc::<$plugin>(&BCODE_PLUGIN_INSTANCE);
             $crate::invoke_concurrent_service_streaming_export(
@@ -1240,6 +1489,10 @@ macro_rules! export_concurrent_plugin {
                 output_len,
                 event_callback,
                 event_user_data,
+                bridge_callback,
+                bridge_user_data,
+                cancellation_callback,
+                cancellation_user_data,
             )
         }
 
@@ -1270,7 +1523,6 @@ macro_rules! static_plugin_vtable {
             activate: $crate::static_activate_export::<$plugin>,
             register_commands: Some($crate::static_register_commands_export::<$plugin>),
             deactivate: $crate::static_deactivate_export::<$plugin>,
-            invoke_service: $crate::static_invoke_service_export::<$plugin>,
             invoke_service_streaming: $crate::static_invoke_service_streaming_export::<$plugin>,
             handle_event: $crate::static_handle_event_export::<$plugin>,
             tui_registry: None,
@@ -1290,26 +1542,6 @@ macro_rules! static_concurrent_plugin_vtable {
         ) -> *const std::ffi::c_char {
             $crate::static_manifest_export($manifest_toml, cached)
         }
-        fn invoke_service(
-            instance: *const std::ffi::c_void,
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-        ) -> i32 {
-            let instance =
-                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
-            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
-            $crate::invoke_concurrent_service_export(
-                instance,
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
         #[allow(clippy::too_many_arguments)]
         fn invoke_service_streaming(
             instance: *const std::ffi::c_void,
@@ -1320,6 +1552,10 @@ macro_rules! static_concurrent_plugin_vtable {
             output_len: *mut usize,
             event_callback: Option<$crate::ServiceEventCallback>,
             event_user_data: *mut std::ffi::c_void,
+            bridge_callback: Option<$crate::ServiceBridgeCallback>,
+            bridge_user_data: *mut std::ffi::c_void,
+            cancellation_callback: Option<$crate::ServiceCancellationWaitCallback>,
+            cancellation_user_data: *mut std::ffi::c_void,
         ) -> i32 {
             let instance =
                 unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
@@ -1333,6 +1569,10 @@ macro_rules! static_concurrent_plugin_vtable {
                 output_len,
                 event_callback,
                 event_user_data,
+                bridge_callback,
+                bridge_user_data,
+                cancellation_callback,
+                cancellation_user_data,
             )
         }
         fn handle_event(_: *const std::ffi::c_void, _: *const u8, _: usize) -> i32 {
@@ -1356,7 +1596,6 @@ macro_rules! static_concurrent_plugin_vtable {
             activate,
             register_commands: None,
             deactivate,
-            invoke_service,
             invoke_service_streaming,
             handle_event,
             tui_registry: None,
@@ -1376,9 +1615,11 @@ pub mod prelude {
         PluginError, PluginEvent, RustPlugin, SERVICE_STATUS_BUFFER_TOO_SMALL,
         SERVICE_STATUS_DECODE_FAILED, SERVICE_STATUS_ENCODE_FAILED,
         SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK, SERVICE_STATUS_PLUGIN_UNAVAILABLE,
-        ServiceError, ServiceEventCallback, ServiceEventEmitter, ServiceRequest, ServiceResponse,
-        StaticPluginVtable, StreamingServiceFn, export_concurrent_plugin, export_plugin,
-        static_concurrent_plugin_vtable, static_plugin_vtable,
+        ServiceBridge, ServiceBridgeCallback, ServiceBridgeError, ServiceBridgeRequest,
+        ServiceBridgeResponse, ServiceError, ServiceEventCallback, ServiceEventEmitter,
+        ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn,
+        export_concurrent_plugin, export_plugin, static_concurrent_plugin_vtable,
+        static_plugin_vtable,
         tui::{
             PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
             PluginSessionEventSubscriptionRequest, PluginTuiAction, PluginTuiHost,
@@ -1390,8 +1631,13 @@ pub mod prelude {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceRequest, ServiceResponse};
+    use super::{
+        SERVICE_BRIDGE_STATUS_OK, ServiceBridge, ServiceBridgeRequest, ServiceBridgeResponse,
+        ServiceCancellation, ServiceRequest, ServiceResponse,
+    };
     use serde::{Deserialize, Serialize};
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct ExamplePayload {
@@ -1432,6 +1678,211 @@ mod tests {
             ExamplePayload {
                 value: "hello".to_string()
             }
+        );
+    }
+
+    extern "C" fn bridge_callback(
+        request_ptr: *const u8,
+        request_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        user_data: *mut c_void,
+    ) -> i32 {
+        let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+        let request = serde_json::from_slice::<ServiceBridgeRequest>(request)
+            .expect("bridge request should decode");
+        let requests = unsafe { &*user_data.cast::<Mutex<Vec<ServiceBridgeRequest>>>() };
+        requests
+            .lock()
+            .expect("request lock should not be poisoned")
+            .push(request.clone());
+        let response =
+            match &request {
+                ServiceBridgeRequest::Exchange(_) => {
+                    ServiceBridgeResponse::Exchange(bcode_tool::ToolExchangeResolution::Responded {
+                        payload: serde_json::json!({"answer": true}),
+                    })
+                }
+                ServiceBridgeRequest::ReceiveInput { .. } => {
+                    ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Closed)
+                }
+                ServiceBridgeRequest::InvokeService(_) => ServiceBridgeResponse::Service(
+                    bcode_tool::ToolInvocationServiceResolution::Unsupported,
+                ),
+                ServiceBridgeRequest::WriteArtifact(_) => ServiceBridgeResponse::Artifact(
+                    bcode_tool::ToolArtifactWriteResolution::TooLarge { max_bytes: 42 },
+                ),
+            };
+        let encoded = serde_json::to_vec(&response).expect("response should encode");
+        assert!(encoded.len() <= output_capacity);
+        unsafe {
+            *output_len = encoded.len();
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+        }
+        SERVICE_BRIDGE_STATUS_OK
+    }
+
+    #[test]
+    fn service_bridge_round_trips_neutral_exchange_payload() {
+        let requests = Mutex::new(Vec::<ServiceBridgeRequest>::new());
+        let bridge = ServiceBridge::new(
+            Some(bridge_callback),
+            (&raw const requests).cast_mut().cast::<c_void>(),
+            ServiceCancellation::default(),
+        );
+        let request = ServiceBridgeRequest::Exchange(bcode_tool::ToolExchangeRequest {
+            invocation_id: "invoke".to_string(),
+            exchange_id: "exchange".to_string(),
+            producer_id: "producer".to_string(),
+            schema: "example.exchange".to_string(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        });
+
+        let response = bridge.request(&request).expect("bridge should respond");
+
+        assert!(matches!(
+            response,
+            ServiceBridgeResponse::Exchange(bcode_tool::ToolExchangeResolution::Responded { .. })
+        ));
+        assert_eq!(
+            requests
+                .lock()
+                .expect("request lock should not be poisoned")
+                .as_slice(),
+            &[request]
+        );
+    }
+
+    #[test]
+    fn service_bridge_supports_all_request_families() {
+        let requests = Mutex::new(Vec::<ServiceBridgeRequest>::new());
+        let bridge = ServiceBridge::new(
+            Some(bridge_callback),
+            (&raw const requests).cast_mut().cast::<c_void>(),
+            ServiceCancellation::default(),
+        );
+        let input = ServiceBridgeRequest::ReceiveInput {
+            invocation_id: "invoke".to_string(),
+        };
+        let service =
+            ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
+                invocation_id: "invoke".to_string(),
+                request_id: "service".to_string(),
+                interface_id: "example/v1".to_string(),
+                operation: "run".to_string(),
+                payload: serde_json::Value::Null,
+            });
+        let artifact = ServiceBridgeRequest::WriteArtifact(bcode_tool::ToolArtifactWriteRequest {
+            invocation_id: "invoke".to_string(),
+            artifact_id: "artifact".to_string(),
+            content_type: "text/plain".to_string(),
+            bytes: b"hello".to_vec(),
+            metadata: serde_json::Value::Null,
+        });
+
+        assert!(matches!(
+            bridge.request(&input),
+            Ok(ServiceBridgeResponse::Input(_))
+        ));
+        assert!(matches!(
+            bridge.request(&service),
+            Ok(ServiceBridgeResponse::Service(_))
+        ));
+        assert!(matches!(
+            bridge.request(&artifact),
+            Ok(ServiceBridgeResponse::Artifact(_))
+        ));
+    }
+
+    #[test]
+    fn service_bridge_rejects_cancelled_invocation_before_callback() {
+        let requests = Mutex::new(Vec::<ServiceBridgeRequest>::new());
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let bridge = ServiceBridge::new(
+            Some(bridge_callback),
+            (&raw const requests).cast_mut().cast::<c_void>(),
+            ServiceCancellation::new(cancelled),
+        );
+        let request = ServiceBridgeRequest::ReceiveInput {
+            invocation_id: "invoke".to_string(),
+        };
+
+        assert_eq!(
+            bridge.request(&request),
+            Err(super::ServiceBridgeError::Cancelled)
+        );
+        assert!(
+            requests
+                .lock()
+                .expect("request lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    extern "C" fn mismatched_bridge_callback(
+        _request_ptr: *const u8,
+        _request_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        _user_data: *mut c_void,
+    ) -> i32 {
+        let response =
+            ServiceBridgeResponse::Exchange(bcode_tool::ToolExchangeResolution::Cancelled);
+        let encoded = serde_json::to_vec(&response).expect("response should encode");
+        assert!(encoded.len() <= output_capacity);
+        unsafe {
+            *output_len = encoded.len();
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+        }
+        SERVICE_BRIDGE_STATUS_OK
+    }
+
+    #[test]
+    fn service_bridge_rejects_response_from_wrong_operation_family() {
+        let requests = Mutex::new(Vec::<ServiceBridgeRequest>::new());
+        let bridge = ServiceBridge::new(
+            Some(mismatched_bridge_callback),
+            (&raw const requests).cast_mut().cast::<c_void>(),
+            ServiceCancellation::default(),
+        );
+        let request = ServiceBridgeRequest::ReceiveInput {
+            invocation_id: "invoke".to_string(),
+        };
+
+        assert_eq!(
+            bridge.request(&request),
+            Err(super::ServiceBridgeError::UnexpectedResponse {
+                expected: "input",
+                actual: "exchange",
+            })
+        );
+    }
+
+    #[test]
+    fn service_bridge_rejects_request_over_fixed_bound() {
+        let requests = Mutex::new(Vec::<ServiceBridgeRequest>::new());
+        let bridge = ServiceBridge::new(
+            Some(bridge_callback),
+            (&raw const requests).cast_mut().cast::<c_void>(),
+            ServiceCancellation::default(),
+        );
+        let request = ServiceBridgeRequest::ReceiveInput {
+            invocation_id: "x".repeat(super::SERVICE_BRIDGE_MAX_REQUEST_BYTES),
+        };
+
+        assert!(matches!(
+            bridge.request(&request),
+            Err(super::ServiceBridgeError::RequestTooLarge { .. })
+        ));
+        assert!(
+            requests
+                .lock()
+                .expect("request lock should not be poisoned")
+                .is_empty()
         );
     }
 

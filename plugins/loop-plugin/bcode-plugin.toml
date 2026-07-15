@@ -24,7 +24,7 @@ max  = 1
 type = "limited"
 
 [runtime]
-abi_version  = 1
+abi_version  = 2
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_loop_plugin.dylib"
 type         = "native"

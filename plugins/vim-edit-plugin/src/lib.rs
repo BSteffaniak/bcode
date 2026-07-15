@@ -1394,6 +1394,7 @@ mod tests {
             config: bcode_plugin_sdk::PluginConfigContext::default(),
             events: ServiceEventEmitter::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            bridge: bcode_plugin_sdk::ServiceBridge::default(),
         };
         let service_response = resume_interactive_tool(&context);
         assert!(service_response.error.is_none(), "{service_response:?}");

@@ -68,8 +68,7 @@ max  = 2
 type = "limited"
 
 [runtime]
-abi_version    = 1
-event_symbol   = "bcode_plugin_handle_event_v1"
-library        = "libbcode_worktree_plugin.dylib"
-service_symbol = "bcode_plugin_invoke_service_v1"
-type           = "native"
+abi_version  = 2
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_worktree_plugin.dylib"
+type         = "native"

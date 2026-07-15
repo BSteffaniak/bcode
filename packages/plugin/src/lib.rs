@@ -10,10 +10,14 @@ use bcode_plugin_sdk::tui::PluginTuiRegistry;
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CommandRegistrationCallback, DEFAULT_NATIVE_ACTIVATE_SYMBOL,
     DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL,
-    DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
-    DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_OK, NativeEventContext,
-    NativeServiceContext, PluginConfigContext, PluginEvent, SERVICE_RESPONSE_CHUNK_PREFIX,
-    SERVICE_STATUS_OK, ServiceEventCallback, ServiceRequest, StaticPluginVtable,
+    DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL,
+    EVENT_STATUS_OK, NativeEventContext, NativeServiceContext, PluginConfigContext, PluginEvent,
+    SERVICE_BRIDGE_MAX_REQUEST_BYTES, SERVICE_BRIDGE_MAX_RESPONSE_BYTES,
+    SERVICE_BRIDGE_STATUS_CANCELLED, SERVICE_BRIDGE_STATUS_FAILED,
+    SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT, SERVICE_BRIDGE_STATUS_OK,
+    SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE, SERVICE_RESPONSE_CHUNK_PREFIX, SERVICE_STATUS_OK,
+    ServiceBridgeCallback, ServiceBridgeRequest, ServiceBridgeResponse,
+    ServiceCancellationWaitCallback, ServiceEventCallback, ServiceRequest, StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 pub use bmux_host_adapter::{
@@ -42,7 +46,6 @@ type ManifestFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
 type LifecycleFn = unsafe extern "C" fn() -> i32;
 type RegisterCommandsFn =
     unsafe extern "C" fn(Option<CommandRegistrationCallback>, *mut std::ffi::c_void) -> i32;
-type ServiceFn = unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
 type StreamingServiceFn = unsafe extern "C" fn(
     *const u8,
     usize,
@@ -51,12 +54,21 @@ type StreamingServiceFn = unsafe extern "C" fn(
     *mut usize,
     Option<ServiceEventCallback>,
     *mut std::ffi::c_void,
+    Option<ServiceBridgeCallback>,
+    *mut std::ffi::c_void,
+    Option<ServiceCancellationWaitCallback>,
+    *mut std::ffi::c_void,
 ) -> i32;
 type EventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 
 struct ServiceCallbackState<'a> {
     on_event: &'a mut dyn FnMut(Vec<u8>),
+    on_bridge: &'a mut dyn FnMut(
+        ServiceBridgeRequest,
+        bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<ServiceBridgeResponse, String>,
     response_chunks: Vec<Vec<u8>>,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
 }
 
 extern "C" fn service_event_callback(
@@ -74,6 +86,68 @@ extern "C" fn service_event_callback(
     } else {
         (state.on_event)(payload);
     }
+}
+
+extern "C" fn service_bridge_callback(
+    request_ptr: *const u8,
+    request_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    if request_ptr.is_null()
+        || output_len.is_null()
+        || user_data.is_null()
+        || request_len > SERVICE_BRIDGE_MAX_REQUEST_BYTES
+    {
+        return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
+    }
+    let state = unsafe { &mut *user_data.cast::<ServiceCallbackState<'_>>() };
+    if state.cancellation.is_cancelled() {
+        return SERVICE_BRIDGE_STATUS_CANCELLED;
+    }
+    let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+    let Ok(request) = serde_json::from_slice::<ServiceBridgeRequest>(request) else {
+        return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
+    };
+    let response = match (state.on_bridge)(request, state.cancellation.clone()) {
+        Ok(response) => response,
+        Err(_) if state.cancellation.is_cancelled() => return SERVICE_BRIDGE_STATUS_CANCELLED,
+        Err(_) => return SERVICE_BRIDGE_STATUS_FAILED,
+    };
+    if state.cancellation.is_cancelled() {
+        return SERVICE_BRIDGE_STATUS_CANCELLED;
+    }
+    let Ok(encoded) = serde_json::to_vec(&response) else {
+        return SERVICE_BRIDGE_STATUS_FAILED;
+    };
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if encoded.len() > SERVICE_BRIDGE_MAX_RESPONSE_BYTES
+        || output_ptr.is_null()
+        || output_capacity < encoded.len()
+    {
+        return SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    SERVICE_BRIDGE_STATUS_OK
+}
+
+extern "C" fn service_cancellation_wait_callback(
+    timeout_ms: u64,
+    user_data: *mut std::ffi::c_void,
+) -> bool {
+    if user_data.is_null() {
+        return false;
+    }
+    let state = unsafe { &*user_data.cast::<ServiceCallbackState<'_>>() };
+    state
+        .cancellation
+        .wait_cancelled(Duration::from_millis(timeout_ms))
 }
 
 /// Plugin manifest loaded from `bcode-plugin.toml`.
@@ -298,8 +372,6 @@ pub struct NativePluginRuntime {
     pub activate_symbol: String,
     #[serde(default = "default_deactivate_symbol")]
     pub deactivate_symbol: String,
-    #[serde(default = "default_service_symbol")]
-    pub service_symbol: String,
     #[serde(default = "default_streaming_service_symbol")]
     pub streaming_service_symbol: String,
     #[serde(default = "default_event_symbol")]
@@ -532,8 +604,7 @@ enum LoadedPluginBackend {
         activate: LifecycleFn,
         register_commands: Option<RegisterCommandsFn>,
         deactivate: LifecycleFn,
-        invoke_service: ServiceFn,
-        invoke_service_streaming: Option<StreamingServiceFn>,
+        invoke_service_streaming: StreamingServiceFn,
         handle_event: EventFn,
     },
     Static {
@@ -708,22 +779,33 @@ impl LoadedPlugin {
         payload: Vec<u8>,
         on_event: impl FnMut(Vec<u8>),
     ) -> Result<ServiceResponse, PluginLoadError> {
-        self.invoke_service_with_events_and_cancellation(
+        self.invoke_service_with_bridge(
             interface_id,
             operation,
             payload,
             on_event,
-            bcode_plugin_sdk::ServiceCancellation::default(),
+            |_, _| Err("invocation bridge is unavailable".to_string()),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
         )
     }
 
-    fn invoke_service_with_events_and_cancellation(
+    /// Invoke a service operation with incremental events and a generic bounded bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request encoding, FFI invocation, bridge handling, or response
+    /// decoding fails.
+    pub fn invoke_service_with_bridge(
         &self,
         interface_id: impl Into<String>,
         operation: impl Into<String>,
         payload: Vec<u8>,
         mut on_event: impl FnMut(Vec<u8>),
-        cancellation: bcode_plugin_sdk::ServiceCancellation,
+        mut on_bridge: impl FnMut(
+            ServiceBridgeRequest,
+            bcode_plugin_sdk::ServiceCancellation,
+        ) -> Result<ServiceBridgeResponse, String>,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let context = NativeServiceContext {
             plugin_id: self.manifest.id.clone(),
@@ -738,7 +820,8 @@ impl LoadedPlugin {
                 secrets: BTreeMap::new(),
             },
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
-            cancellation,
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            bridge: bcode_plugin_sdk::ServiceBridge::default(),
         };
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let output_capacity = 1024 * 1024;
@@ -746,7 +829,9 @@ impl LoadedPlugin {
         let mut output = vec![0_u8; output_capacity];
         let mut callback_state = ServiceCallbackState {
             on_event: &mut on_event,
+            on_bridge: &mut on_bridge,
             response_chunks: Vec::new(),
+            cancellation: cancellation.clone(),
         };
         let event_user_data = (&raw mut callback_state).cast::<std::ffi::c_void>();
         let status = self.invoke_service_raw(
@@ -756,6 +841,10 @@ impl LoadedPlugin {
             output.len(),
             &raw mut output_len,
             Some(service_event_callback),
+            event_user_data,
+            Some(service_bridge_callback),
+            event_user_data,
+            Some(service_cancellation_wait_callback),
             event_user_data,
         );
         if output_len > output_capacity {
@@ -852,34 +941,28 @@ impl LoadedPlugin {
         output_len: *mut usize,
         event_callback: Option<ServiceEventCallback>,
         event_user_data: *mut std::ffi::c_void,
+        bridge_callback: Option<ServiceBridgeCallback>,
+        bridge_user_data: *mut std::ffi::c_void,
+        cancellation_callback: Option<ServiceCancellationWaitCallback>,
+        cancellation_user_data: *mut std::ffi::c_void,
     ) -> i32 {
         match &self.backend {
             LoadedPluginBackend::Dynamic {
-                invoke_service,
                 invoke_service_streaming,
                 ..
             } => unsafe {
-                invoke_service_streaming.as_ref().map_or_else(
-                    || {
-                        invoke_service(
-                            input_ptr,
-                            input_len,
-                            output_ptr,
-                            output_capacity,
-                            output_len,
-                        )
-                    },
-                    |invoke_service_streaming| {
-                        invoke_service_streaming(
-                            input_ptr,
-                            input_len,
-                            output_ptr,
-                            output_capacity,
-                            output_len,
-                            event_callback,
-                            event_user_data,
-                        )
-                    },
+                invoke_service_streaming(
+                    input_ptr,
+                    input_len,
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                    event_callback,
+                    event_user_data,
+                    bridge_callback,
+                    bridge_user_data,
+                    cancellation_callback,
+                    cancellation_user_data,
                 )
             },
             LoadedPluginBackend::Static { vtable } => (vtable.invoke_service_streaming)(
@@ -891,6 +974,10 @@ impl LoadedPlugin {
                 output_len,
                 event_callback,
                 event_user_data,
+                bridge_callback,
+                bridge_user_data,
+                cancellation_callback,
+                cancellation_user_data,
             ),
         }
     }
@@ -1322,7 +1409,7 @@ impl PluginInvocationId {
 #[derive(Debug, Clone)]
 pub struct PluginInvocationCancelHandle {
     id: PluginInvocationId,
-    cancelled: Arc<AtomicBool>,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
 }
 
 impl PluginInvocationCancelHandle {
@@ -1334,13 +1421,13 @@ impl PluginInvocationCancelHandle {
 
     /// Request cancellation for this invocation.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancellation.cancel();
     }
 
     /// Return whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.cancellation.is_cancelled()
     }
 }
 
@@ -1524,6 +1611,53 @@ fn next_plugin_invocation_id() -> PluginInvocationId {
     PluginInvocationId(NEXT_PLUGIN_INVOCATION_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Thread-safe request/reply handler attached to one plugin invocation.
+#[derive(Clone)]
+pub struct PluginInvocationBridge {
+    handler: Arc<
+        dyn Fn(
+                ServiceBridgeRequest,
+                bcode_plugin_sdk::ServiceCancellation,
+            ) -> Result<ServiceBridgeResponse, String>
+            + Send
+            + Sync,
+    >,
+}
+
+impl PluginInvocationBridge {
+    /// Create a bridge from a thread-safe request handler.
+    #[must_use]
+    pub fn new(
+        handler: impl Fn(
+            ServiceBridgeRequest,
+            bcode_plugin_sdk::ServiceCancellation,
+        ) -> Result<ServiceBridgeResponse, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            handler: Arc::new(handler),
+        }
+    }
+
+    fn request(
+        &self,
+        request: ServiceBridgeRequest,
+        cancellation: bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<ServiceBridgeResponse, String> {
+        (self.handler)(request, cancellation)
+    }
+}
+
+impl std::fmt::Debug for PluginInvocationBridge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginInvocationBridge")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 struct PluginInvocation {
     id: PluginInvocationId,
@@ -1534,6 +1668,7 @@ struct PluginInvocation {
     operation: String,
     payload: Vec<u8>,
     cancellation: PluginInvocationCancelHandle,
+    bridge: Option<PluginInvocationBridge>,
     response: oneshot::Sender<Result<ServiceResponse, PluginLoadError>>,
     event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
@@ -1674,6 +1809,7 @@ impl PluginExecutorHandle {
         scope: PluginInvocationScope,
         invocation_id: PluginInvocationId,
         cancel: PluginInvocationCancelHandle,
+        bridge: Option<PluginInvocationBridge>,
         response: oneshot::Sender<Result<ServiceResponse, PluginLoadError>>,
         event_sender: mpsc::UnboundedSender<Vec<u8>>,
         response_receiver: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
@@ -1690,6 +1826,7 @@ impl PluginExecutorHandle {
                     operation,
                     payload,
                     cancellation: cancel.clone(),
+                    bridge: bridge.clone(),
                     response,
                     event_sender: Some(event_sender),
                 };
@@ -1721,6 +1858,7 @@ impl PluginExecutorHandle {
                     operation,
                     payload,
                     cancellation: cancel.clone(),
+                    bridge,
                     response: unused_response,
                     event_sender: Some(event_sender),
                 };
@@ -1744,6 +1882,7 @@ impl PluginExecutorHandle {
             resource_permit: None,
         })
     }
+    #[allow(clippy::too_many_arguments)]
     async fn invoke_service_scoped(
         &self,
         interface_id: String,
@@ -1752,6 +1891,7 @@ impl PluginExecutorHandle {
         class: PluginInvocationClass,
         scope: PluginInvocationScope,
         event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
+        bridge: Option<PluginInvocationBridge>,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let invocation_id = next_plugin_invocation_id();
         let invocation = PluginInvocation {
@@ -1764,8 +1904,9 @@ impl PluginExecutorHandle {
             payload,
             cancellation: PluginInvocationCancelHandle {
                 id: invocation_id,
-                cancelled: Arc::new(AtomicBool::new(false)),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
             },
+            bridge,
             response: oneshot::channel().0,
             event_sender,
         };
@@ -2330,6 +2471,31 @@ impl PluginRuntimeHost {
         payload: Vec<u8>,
         scope: PluginInvocationScope,
     ) -> Result<ServiceResponse, PluginLoadError> {
+        self.invoke_service_with_bridge_scoped(
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+            scope,
+            None,
+        )
+        .await
+    }
+
+    /// Invoke a service operation with explicit ownership scope and a duplex bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is not loaded or service invocation fails.
+    pub async fn invoke_service_with_bridge_scoped(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+        scope: PluginInvocationScope,
+        bridge: Option<PluginInvocationBridge>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
         let interface_id = interface_id.into();
         let operation = operation.into();
         let executor = self
@@ -2362,7 +2528,7 @@ impl PluginRuntimeHost {
             "plugin resource slot acquired"
         );
         let result = executor
-            .invoke_service_scoped(interface_id, operation, payload, class, scope, None)
+            .invoke_service_scoped(interface_id, operation, payload, class, scope, None, bridge)
             .await;
         self.metrics
             .span("plugin.invocation")
@@ -2406,6 +2572,31 @@ impl PluginRuntimeHost {
         payload: Vec<u8>,
         scope: PluginInvocationScope,
     ) -> Result<StreamingServiceInvocation, PluginLoadError> {
+        self.invoke_service_with_events_and_bridge_scoped(
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+            scope,
+            None,
+        )
+        .await
+    }
+
+    /// Invoke a service with explicit scope, events, and a duplex bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is not loaded or service invocation fails.
+    pub async fn invoke_service_with_events_and_bridge_scoped(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+        scope: PluginInvocationScope,
+        bridge: Option<PluginInvocationBridge>,
+    ) -> Result<StreamingServiceInvocation, PluginLoadError> {
         let interface_id = interface_id.into();
         let operation = operation.into();
         let executor = self
@@ -2423,7 +2614,7 @@ impl PluginRuntimeHost {
         let invocation_id = next_plugin_invocation_id();
         let cancel = PluginInvocationCancelHandle {
             id: invocation_id,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
         };
         let resource_permit = self.resources.acquire(&scope).await?;
         let metric_labels =
@@ -2453,6 +2644,7 @@ impl PluginRuntimeHost {
                 scope,
                 invocation_id,
                 cancel,
+                bridge,
                 response,
                 event_sender,
                 response_receiver,
@@ -2814,7 +3006,8 @@ fn execute_plugin_service_invocation(
         operation = %invocation.operation,
         "plugin service invocation started"
     );
-    let response = plugin.invoke_service_with_events_and_cancellation(
+    let bridge = invocation.bridge.clone();
+    let response = plugin.invoke_service_with_bridge(
         invocation.interface_id,
         invocation.operation,
         invocation.payload,
@@ -2823,7 +3016,13 @@ fn execute_plugin_service_invocation(
                 let _ = sender.send(event);
             }
         },
-        bcode_plugin_sdk::ServiceCancellation::new(Arc::clone(&invocation.cancellation.cancelled)),
+        move |request, cancellation| {
+            bridge.as_ref().map_or_else(
+                || Err("invocation bridge is unavailable".to_string()),
+                |bridge| bridge.request(request, cancellation),
+            )
+        },
+        &invocation.cancellation.cancellation,
     );
     metrics.running.fetch_sub(1, Ordering::Relaxed);
     if response.is_ok() {
@@ -3461,9 +3660,8 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
     let activate = load_lifecycle_symbol(&library, &library_path, &runtime.activate_symbol)?;
     let register_commands = load_register_commands_symbol(&library);
     let deactivate = load_lifecycle_symbol(&library, &library_path, &runtime.deactivate_symbol)?;
-    let invoke_service = load_service_symbol(&library, &library_path, &runtime.service_symbol)?;
     let invoke_service_streaming =
-        load_streaming_service_symbol(&library, &runtime.streaming_service_symbol);
+        load_streaming_service_symbol(&library, &library_path, &runtime.streaming_service_symbol)?;
     let handle_event = load_event_symbol(&library, &library_path, &runtime.event_symbol)?;
     tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "native symbols loaded");
 
@@ -3474,7 +3672,6 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
             activate,
             register_commands,
             deactivate,
-            invoke_service,
             invoke_service_streaming,
             handle_event,
         },
@@ -3633,28 +3830,20 @@ fn load_register_commands_symbol(library: &Library) -> Option<RegisterCommandsFn
     unsafe { library.get::<RegisterCommandsFn>(&*symbol).ok().map(|s| *s) }
 }
 
-fn load_service_symbol(
+fn load_streaming_service_symbol(
     library: &Library,
     library_path: &Path,
     symbol: &str,
-) -> Result<ServiceFn, PluginLoadError> {
-    let loaded = unsafe { library.get::<ServiceFn>(symbol.as_bytes()) }.map_err(|source| {
-        PluginLoadError::SymbolLoad {
-            library: library_path.to_path_buf(),
-            symbol: symbol.to_string(),
-            source,
-        }
-    })?;
+) -> Result<StreamingServiceFn, PluginLoadError> {
+    let loaded =
+        unsafe { library.get::<StreamingServiceFn>(symbol.as_bytes()) }.map_err(|source| {
+            PluginLoadError::SymbolLoad {
+                library: library_path.to_path_buf(),
+                symbol: symbol.to_string(),
+                source,
+            }
+        })?;
     Ok(*loaded)
-}
-
-fn load_streaming_service_symbol(
-    library: &Library,
-    symbol_name: &str,
-) -> Option<StreamingServiceFn> {
-    let mut symbol = symbol_name.as_bytes().to_vec();
-    symbol.push(0);
-    unsafe { library.get::<StreamingServiceFn>(&*symbol).ok().map(|s| *s) }
 }
 
 fn load_event_symbol(
@@ -3690,10 +3879,6 @@ fn default_activate_symbol() -> String {
 
 fn default_deactivate_symbol() -> String {
     DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string()
-}
-
-fn default_service_symbol() -> String {
-    DEFAULT_NATIVE_SERVICE_SYMBOL.to_string()
 }
 
 fn default_streaming_service_symbol() -> String {
@@ -3787,16 +3972,6 @@ library = "libexample.dylib"
         fn lifecycle(_instance: *const std::ffi::c_void) -> i32 {
             SERVICE_STATUS_OK
         }
-        fn service(
-            _instance: *const std::ffi::c_void,
-            _input: *const u8,
-            _input_len: usize,
-            _output: *mut u8,
-            _cap: usize,
-            _len: *mut usize,
-        ) -> i32 {
-            SERVICE_STATUS_OK
-        }
         fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
             SERVICE_STATUS_OK
         }
@@ -3820,7 +3995,6 @@ library = "libdisabled.dylib"
                 activate: lifecycle,
                 register_commands: None,
                 deactivate: lifecycle,
-                invoke_service: service,
                 invoke_service_streaming: test_streaming_service,
                 tui_registry: None,
                 interaction_registry: None,
@@ -3850,16 +4024,6 @@ library = "libdisabled.dylib"
         fn lifecycle(_instance: *const std::ffi::c_void) -> i32 {
             SERVICE_STATUS_OK
         }
-        fn service(
-            _instance: *const std::ffi::c_void,
-            _input: *const u8,
-            _input_len: usize,
-            _output: *mut u8,
-            _cap: usize,
-            _len: *mut usize,
-        ) -> i32 {
-            SERVICE_STATUS_OK
-        }
         fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
             SERVICE_STATUS_OK
         }
@@ -3880,7 +4044,6 @@ library = "libexample_static.dylib"
                 activate: lifecycle,
                 register_commands: None,
                 deactivate: lifecycle,
-                invoke_service: service,
                 invoke_service_streaming: test_streaming_service,
                 tui_registry: None,
                 interaction_registry: None,
@@ -3989,7 +4152,6 @@ library = "libcommands.dylib"
                     activate: test_activate,
                     register_commands: Some(register_commands),
                     deactivate: test_deactivate,
-                    invoke_service: test_service,
                     invoke_service_streaming: test_streaming_service,
                     tui_registry: None,
                     interaction_registry: None,
@@ -4043,7 +4205,6 @@ library = "libcommands.dylib"
                 manifest_symbol: default_manifest_symbol(),
                 activate_symbol: default_activate_symbol(),
                 deactivate_symbol: default_deactivate_symbol(),
-                service_symbol: default_service_symbol(),
                 streaming_service_symbol: default_streaming_service_symbol(),
                 event_symbol: default_event_symbol(),
             }),
@@ -4086,7 +4247,6 @@ library = "libcommands.dylib"
                 manifest_symbol: default_manifest_symbol(),
                 activate_symbol: default_activate_symbol(),
                 deactivate_symbol: default_deactivate_symbol(),
-                service_symbol: default_service_symbol(),
                 streaming_service_symbol: default_streaming_service_symbol(),
                 event_symbol: default_event_symbol(),
             }),
@@ -4322,6 +4482,228 @@ library = "libexample_plugin.dylib"
         ] {
             toml::from_str::<PluginManifest>(manifest_toml).expect("bundled manifest should parse");
         }
+    }
+
+    fn hello_dynamic_library_path() -> PathBuf {
+        let executable = std::env::current_exe().expect("current test executable path");
+        let directory = executable.parent().expect("test executable parent");
+        let prefix = format!("{}bcode_hello_plugin", std::env::consts::DLL_PREFIX);
+        std::fs::read_dir(directory)
+            .expect("test dependency directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&prefix) && name.ends_with(std::env::consts::DLL_SUFFIX)
+                    })
+            })
+            .expect("hello plugin dynamic library should be built as a dev dependency")
+    }
+
+    fn load_dynamic_hello_plugin() -> LoadedPlugin {
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/hello-plugin/bcode-plugin.toml");
+        let mut manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .expect("hello manifest should parse");
+        let PluginRuntime::Native(runtime) = &mut manifest.runtime;
+        runtime.library = hello_dynamic_library_path();
+        load_registered_plugin(&RegisteredPlugin {
+            manifest_path,
+            manifest,
+        })
+        .expect("dynamic hello plugin should load")
+    }
+
+    fn load_static_hello_plugin() -> LoadedPlugin {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .expect("hello manifest should parse");
+        load_static_plugin(manifest, bcode_hello_plugin::static_plugin())
+            .expect("static hello plugin should load")
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn hello_bridge_response(
+        request: ServiceBridgeRequest,
+        _: bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<ServiceBridgeResponse, String> {
+        Ok(match request {
+            ServiceBridgeRequest::Exchange(_) => {
+                ServiceBridgeResponse::Exchange(bcode_tool::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"answer": true}),
+                })
+            }
+            ServiceBridgeRequest::ReceiveInput { .. } => {
+                ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Closed)
+            }
+            ServiceBridgeRequest::InvokeService(_) => ServiceBridgeResponse::Service(
+                bcode_tool::ToolInvocationServiceResolution::Responded {
+                    payload: serde_json::json!({"nested": true}),
+                },
+            ),
+            ServiceBridgeRequest::WriteArtifact(request) => {
+                ServiceBridgeResponse::Artifact(bcode_tool::ToolArtifactWriteResolution::Written {
+                    artifact_id: request.artifact_id,
+                    byte_len: u64::try_from(request.bytes.len()).unwrap_or(u64::MAX),
+                    reference: serde_json::json!({"stored": true}),
+                })
+            }
+        })
+    }
+
+    fn assert_hello_plugin_bridge_and_cancellation(plugin: LoadedPlugin) {
+        let plugin = Arc::new(plugin);
+        let mut events = Vec::new();
+        let event_response = plugin
+            .invoke_service_with_bridge(
+                "example-hello/v1",
+                "emit-event",
+                Vec::new(),
+                |event| events.push(event),
+                |_, _| Err("bridge is unused".to_string()),
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .expect("event invocation should complete");
+        assert_eq!(event_response.payload, b"event-emitted");
+        assert_eq!(events, vec![b"hello-event".to_vec()]);
+
+        let response = plugin
+            .invoke_service_with_bridge(
+                "example-hello/v1",
+                "bridge-all",
+                Vec::new(),
+                |_| {},
+                hello_bridge_response,
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .expect("bridge invocation should complete");
+        let responses = response
+            .payload_json::<Vec<ServiceBridgeResponse>>()
+            .expect("bridge responses should decode");
+        assert!(matches!(responses[0], ServiceBridgeResponse::Exchange(_)));
+        assert!(matches!(responses[1], ServiceBridgeResponse::Input(_)));
+        assert!(matches!(responses[2], ServiceBridgeResponse::Service(_)));
+        assert!(matches!(responses[3], ServiceBridgeResponse::Artifact(_)));
+
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let task_plugin = Arc::clone(&plugin);
+        let task_cancellation = cancellation.clone();
+        let started = Instant::now();
+        let task = std::thread::spawn(move || {
+            task_plugin.invoke_service_with_bridge(
+                "example-hello/v1",
+                "wait-cancelled",
+                Vec::new(),
+                |_| {},
+                |_, _| Err("bridge is unused".to_string()),
+                &task_cancellation,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        cancellation.cancel();
+        let response = task
+            .join()
+            .expect("service thread should join")
+            .expect("cancellation invocation should complete");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(response.payload, b"cancelled");
+    }
+
+    #[test]
+    fn dynamic_loader_supports_all_bridge_families_and_cancellation() {
+        assert_hello_plugin_bridge_and_cancellation(load_dynamic_hello_plugin());
+    }
+
+    #[test]
+    fn static_loader_supports_all_bridge_families_and_cancellation() {
+        assert_hello_plugin_bridge_and_cancellation(load_static_hello_plugin());
+    }
+
+    #[test]
+    fn static_service_bridge_round_trips_neutral_request() {
+        let plugin = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest: test_manifest("bridge"),
+            backend: LoadedPluginBackend::Static {
+                vtable: test_bridge_vtable(),
+            },
+        };
+        let mut requests = Vec::new();
+
+        let response = plugin
+            .invoke_service_with_bridge(
+                "bridge",
+                "run",
+                Vec::new(),
+                |_| {},
+                |request, _| {
+                    requests.push(request);
+                    Ok(ServiceBridgeResponse::Exchange(
+                        bcode_tool::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"answer": true}),
+                        },
+                    ))
+                },
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .expect("service should invoke");
+
+        assert_eq!(response.payload, b"bridge-ok");
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0], ServiceBridgeRequest::Exchange(_)));
+    }
+
+    #[test]
+    fn blocked_static_bridge_call_wakes_on_cancellation() {
+        let plugin = Arc::new(LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest: test_manifest("bridge"),
+            backend: LoadedPluginBackend::Static {
+                vtable: test_bridge_vtable(),
+            },
+        });
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let task_plugin = Arc::clone(&plugin);
+        let task_cancellation = cancellation.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let task_started = Arc::clone(&started);
+        let task = std::thread::spawn(move || {
+            task_plugin.invoke_service_with_bridge(
+                "bridge",
+                "run",
+                Vec::new(),
+                |_| {},
+                |_, cancellation| {
+                    task_started.store(true, Ordering::SeqCst);
+                    if cancellation.wait_cancelled(Duration::from_secs(5)) {
+                        Err("cancelled".to_string())
+                    } else {
+                        panic!("bridge handler did not wake on cancellation")
+                    }
+                },
+                &task_cancellation,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "bridge handler did not start");
+            std::thread::yield_now();
+        }
+        let cancel_started = Instant::now();
+        cancellation.cancel();
+        let response = task
+            .join()
+            .expect("service thread should join")
+            .expect("service invocation should complete");
+
+        assert!(cancel_started.elapsed() < Duration::from_secs(1));
+        assert_eq!(response.payload, b"bridge-cancelled");
     }
 
     #[test]
@@ -4587,7 +4969,6 @@ library = "libexample_plugin.dylib"
                     manifest_symbol: DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string(),
                     activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
                     deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
-                    service_symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
                     streaming_service_symbol: DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string(),
                     event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
                 }),
@@ -4615,7 +4996,6 @@ library = "libexample_plugin.dylib"
                                 activate,
                                 register_commands: None,
                                 deactivate,
-                                invoke_service: slow_service,
                                 invoke_service_streaming:
                                     |_,
                                      input_ptr,
@@ -4623,6 +5003,10 @@ library = "libexample_plugin.dylib"
                                      output_ptr,
                                      output_capacity,
                                      output_len,
+                                     _,
+                                     _,
+                                     _,
+                                     _,
                                      _,
                                      _| {
                                         slow_service(
@@ -4653,7 +5037,6 @@ library = "libexample_plugin.dylib"
                                 activate,
                                 register_commands: None,
                                 deactivate,
-                                invoke_service: fast_service,
                                 invoke_service_streaming:
                                     |_,
                                      input_ptr,
@@ -4661,6 +5044,10 @@ library = "libexample_plugin.dylib"
                                      output_ptr,
                                      output_capacity,
                                      output_len,
+                                     _,
+                                     _,
+                                     _,
+                                     _,
                                      _,
                                      _| {
                                         fast_service(
@@ -4751,6 +5138,10 @@ library = "libexample_plugin.dylib"
             len: *mut usize,
             _: Option<ServiceEventCallback>,
             _: *mut c_void,
+            _: Option<ServiceBridgeCallback>,
+            _: *mut c_void,
+            _: Option<ServiceCancellationWaitCallback>,
+            _: *mut c_void,
         ) -> i32 {
             service(std::ptr::null(), input_ptr, input_len, output, cap, len)
         }
@@ -4789,7 +5180,6 @@ library = "libexample_plugin.dylib"
                             activate: test_activate,
                             register_commands: None,
                             deactivate: test_deactivate,
-                            invoke_service: service,
                             invoke_service_streaming: service_streaming,
                             handle_event: test_handle_event,
                             tui_registry: None,
@@ -4881,6 +5271,10 @@ library = "libexample_plugin.dylib"
             len: *mut usize,
             _: Option<ServiceEventCallback>,
             _: *mut c_void,
+            _: Option<ServiceBridgeCallback>,
+            _: *mut c_void,
+            _: Option<ServiceCancellationWaitCallback>,
+            _: *mut c_void,
         ) -> i32 {
             service(std::ptr::null(), input_ptr, input_len, output, cap, len)
         }
@@ -4919,7 +5313,6 @@ library = "libexample_plugin.dylib"
                             activate: test_activate,
                             register_commands: None,
                             deactivate: test_deactivate,
-                            invoke_service: service,
                             invoke_service_streaming: service_streaming,
                             handle_event: test_handle_event,
                             tui_registry: None,
@@ -4993,6 +5386,64 @@ library = "libexample_plugin.dylib"
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn test_bridge_service(
+        _instance: *const std::ffi::c_void,
+        _input_ptr: *const u8,
+        _input_len: usize,
+        output: *mut u8,
+        cap: usize,
+        len: *mut usize,
+        _event_callback: Option<ServiceEventCallback>,
+        _event_user_data: *mut std::ffi::c_void,
+        bridge_callback: Option<ServiceBridgeCallback>,
+        bridge_user_data: *mut std::ffi::c_void,
+        _cancellation_callback: Option<ServiceCancellationWaitCallback>,
+        _cancellation_user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let callback = bridge_callback.expect("bridge callback should be provided");
+        let request = ServiceBridgeRequest::Exchange(bcode_tool::ToolExchangeRequest {
+            invocation_id: "invoke".to_string(),
+            exchange_id: "exchange".to_string(),
+            producer_id: "producer".to_string(),
+            schema: "example.exchange".to_string(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        });
+        let request = serde_json::to_vec(&request).expect("bridge request encodes");
+        let mut bridge_output = vec![0; SERVICE_BRIDGE_MAX_RESPONSE_BYTES];
+        let mut bridge_output_len = 0;
+        let status = callback(
+            request.as_ptr(),
+            request.len(),
+            bridge_output.as_mut_ptr(),
+            bridge_output.len(),
+            &raw mut bridge_output_len,
+            bridge_user_data,
+        );
+        if status == SERVICE_BRIDGE_STATUS_CANCELLED {
+            return write_test_response(
+                &ServiceResponse::text("bridge-cancelled"),
+                output,
+                cap,
+                len,
+            );
+        }
+        assert_eq!(status, SERVICE_BRIDGE_STATUS_OK);
+        bridge_output.truncate(bridge_output_len);
+        let response = serde_json::from_slice::<ServiceBridgeResponse>(&bridge_output)
+            .expect("bridge response decodes");
+        assert!(matches!(response, ServiceBridgeResponse::Exchange(_)));
+        write_test_response(&ServiceResponse::text("bridge-ok"), output, cap, len)
+    }
+
+    fn test_bridge_vtable() -> StaticPluginVtable {
+        let mut vtable = test_streaming_vtable();
+        vtable.invoke_service_streaming = test_bridge_service;
+        vtable
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn test_streaming_service(
         instance: *const std::ffi::c_void,
         input_ptr: *const u8,
@@ -5002,6 +5453,10 @@ library = "libexample_plugin.dylib"
         len: *mut usize,
         callback: Option<ServiceEventCallback>,
         user_data: *mut std::ffi::c_void,
+        _bridge_callback: Option<ServiceBridgeCallback>,
+        _bridge_user_data: *mut std::ffi::c_void,
+        _cancellation_callback: Option<ServiceCancellationWaitCallback>,
+        _cancellation_user_data: *mut std::ffi::c_void,
     ) -> i32 {
         if let Some(callback) = callback {
             callback(b"event".as_ptr(), b"event".len(), user_data);
@@ -5045,6 +5500,10 @@ library = "libexample_plugin.dylib"
         len: *mut usize,
         callback: Option<ServiceEventCallback>,
         user_data: *mut std::ffi::c_void,
+        _bridge_callback: Option<ServiceBridgeCallback>,
+        _bridge_user_data: *mut std::ffi::c_void,
+        _cancellation_callback: Option<ServiceCancellationWaitCallback>,
+        _cancellation_user_data: *mut std::ffi::c_void,
     ) -> i32 {
         LARGE_CHUNKING_CALLS.fetch_add(1, Ordering::SeqCst);
         let response = ServiceResponse::text("x".repeat(1024 * 1024 + 1));
@@ -5081,7 +5540,6 @@ library = "libexample_plugin.dylib"
             activate: test_activate,
             register_commands: None,
             deactivate: test_deactivate,
-            invoke_service: test_large_service,
             invoke_service_streaming: test_large_chunking_service,
             tui_registry: None,
             interaction_registry: None,
@@ -5097,8 +5555,18 @@ library = "libexample_plugin.dylib"
             activate: test_activate,
             register_commands: None,
             deactivate: test_deactivate,
-            invoke_service: test_large_service,
-            invoke_service_streaming: |instance, input_ptr, input_len, output, cap, len, _, _| {
+            invoke_service_streaming: |instance,
+                                       input_ptr,
+                                       input_len,
+                                       output,
+                                       cap,
+                                       len,
+                                       _,
+                                       _,
+                                       _,
+                                       _,
+                                       _,
+                                       _| {
                 test_large_service(instance, input_ptr, input_len, output, cap, len)
             },
             tui_registry: None,
@@ -5115,7 +5583,6 @@ library = "libexample_plugin.dylib"
             activate: test_activate,
             register_commands: None,
             deactivate: test_deactivate,
-            invoke_service: test_service,
             invoke_service_streaming: test_streaming_service,
             tui_registry: None,
             interaction_registry: None,
@@ -5148,7 +5615,6 @@ library = "libexample_plugin.dylib"
                 manifest_symbol: DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string(),
                 activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
                 deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
-                service_symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
                 streaming_service_symbol: DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string(),
                 event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
             }),

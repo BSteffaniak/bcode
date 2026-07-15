@@ -13,7 +13,6 @@ max  = 2
 type = "limited"
 
 [runtime]
-abi_version    = 1
-library        = "libbcode_pi_session_import_plugin.dylib"
-service_symbol = "bcode_plugin_invoke_service_v1"
-type           = "native"
+abi_version = 2
+library     = "libbcode_pi_session_import_plugin.dylib"
+type        = "native"

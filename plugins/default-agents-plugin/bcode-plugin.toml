@@ -38,8 +38,7 @@ build_tools = [
 plan_disabled_tools = ["filesystem.write", "filesystem.edit"]
 
 [runtime]
-abi_version    = 1
-event_symbol   = "bcode_plugin_handle_event_v1"
-library        = "libbcode_default_agents_plugin.dylib"
-service_symbol = "bcode_plugin_invoke_service_v1"
-type           = "native"
+abi_version  = 2
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_default_agents_plugin.dylib"
+type         = "native"
