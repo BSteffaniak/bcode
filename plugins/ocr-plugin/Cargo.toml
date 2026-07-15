@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_model_provider_runtime = { workspace = true }
-bcode_plugin_sdk             = { workspace = true }
+bcode_plugin_sdk             = { workspace = true, features = ["tui"] }
 bcode_tesseract_ocr          = { workspace = true, optional = true }
 bcode_tool                   = { workspace = true }
 bmux_tui                     = { workspace = true, optional = true }

@@ -10,7 +10,10 @@
 
 use bcode_agent_permissions::{PermissionAskCallback, ask_callback};
 use bcode_agent_policy::active_tools_for;
-use bcode_agent_runtime::{AgentRuntime, AgentTurnRequest, AgentTurnResponse};
+use bcode_agent_runtime::{
+    AgentRuntime, AgentTurnRequest, AgentTurnResponse, LegacyToolInvoker,
+    PermissionPolicyAuthorization, ToolBatchExecutionOutput, TurnGeneration, TurnScope,
+};
 #[cfg(feature = "embedded-plugins")]
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
@@ -21,7 +24,7 @@ use bcode_model::{
 use bcode_model::{ModelParameters, ProviderRequestContext};
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::SessionId;
-use bcode_tool::{ToolDefinition, ToolInvocationRequest, ToolInvocationResponse};
+use bcode_tool::{ToolInvocationRequest, ToolInvocationResponse};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -48,6 +51,7 @@ pub use bcode_model::{
     ContentBlock as ModelContentBlock, MessageRole, ModelInfo, ModelList, ModelMessage,
     ProviderCapabilities, ToolCall,
 };
+pub use bcode_tool::{ToolDefinition, ToolExecutionOptions};
 
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
@@ -2184,6 +2188,7 @@ pub struct Agent {
     metadata: BTreeMap<String, String>,
     timeout: Duration,
     max_tool_rounds: u32,
+    execution_options: ToolExecutionOptions,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
@@ -2212,6 +2217,7 @@ impl fmt::Debug for Agent {
             .field("metadata", &self.metadata)
             .field("timeout", &self.timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("execution_options", &self.execution_options)
             .field("tool_catalog", &self.tool_catalog)
             .field(
                 "inline_tool_handlers",
@@ -2569,6 +2575,57 @@ impl Agent {
         ToolRoundState::new(self.max_tool_rounds)
     }
 
+    /// Execute an ordered tool-call batch as one canonical tool round.
+    ///
+    /// This is the explicit advanced batch API. It performs one complete-batch authorization pass,
+    /// delegates scheduling exactly once to the canonical runtime, and returns per-call results in
+    /// provider order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the round budget is exhausted or complete-batch authorization fails.
+    pub async fn execute_tool_batch_with_round_state(
+        &self,
+        calls: &[ToolCall],
+        rounds: &mut ToolRoundState,
+    ) -> Result<ToolBatchExecutionOutput> {
+        let executor = InlineToolExecutor {
+            handlers: self.inline_tool_handlers.clone(),
+            #[cfg(feature = "embedded-plugins")]
+            plugins: self.plugins.clone(),
+        };
+        let authorization = PermissionPolicyAuthorization::new(self.permission_policy.as_ref());
+        let invoker = LegacyToolInvoker::new(&executor);
+        let scope = TurnScope::without_events(
+            format!("sdk-tool-batch:{}", self.session_id),
+            TurnGeneration::new(0),
+        );
+        self.runtime
+            .execute_prepared_tool_batch(
+                &self.tool_catalog,
+                &authorization,
+                &invoker,
+                calls,
+                rounds,
+                &self.permission_context(),
+                self.execution_options,
+                &scope,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Execute an ordered tool-call batch using this agent's configured round budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_tool_batch_with_round_state`].
+    pub async fn execute_tool_batch(&self, calls: &[ToolCall]) -> Result<ToolBatchExecutionOutput> {
+        let mut rounds = self.tool_round_state();
+        self.execute_tool_batch_with_round_state(calls, &mut rounds)
+            .await
+    }
+
     /// Execute a registered tool call through this agent's unified tool catalog.
     ///
     /// # Errors
@@ -2763,6 +2820,7 @@ pub struct AgentBuilder {
     metadata: BTreeMap<String, String>,
     timeout: Duration,
     max_tool_rounds: u32,
+    execution_options: ToolExecutionOptions,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
@@ -2792,6 +2850,7 @@ impl fmt::Debug for AgentBuilder {
             .field("metadata", &self.metadata)
             .field("timeout", &self.timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("execution_options", &self.execution_options)
             .field("tool_catalog", &self.tool_catalog)
             .field(
                 "inline_tool_handlers",
@@ -2831,6 +2890,7 @@ impl Default for AgentBuilder {
             metadata: BTreeMap::new(),
             timeout: Duration::from_mins(2),
             max_tool_rounds: 8,
+            execution_options: ToolExecutionOptions::default(),
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
             hooks: AgentHooks::new(),
@@ -2942,6 +3002,13 @@ impl AgentBuilder {
     #[must_use]
     pub const fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
         self.max_tool_rounds = max_tool_rounds;
+        self
+    }
+
+    /// Configure canonical tool batch scheduling and execution options.
+    #[must_use]
+    pub const fn execution_options(mut self, options: ToolExecutionOptions) -> Self {
+        self.execution_options = options;
         self
     }
 
@@ -3178,6 +3245,7 @@ impl AgentBuilder {
             metadata: self.metadata,
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
+            execution_options: self.execution_options,
             tool_catalog: self.tool_catalog,
             inline_tool_handlers: self.inline_tool_handlers,
             hooks: self.hooks,

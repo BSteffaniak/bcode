@@ -20,7 +20,7 @@ bcode_config         = { workspace = true }
 bcode_ipc            = { workspace = true }
 bcode_model          = { workspace = true }
 bcode_plugin         = { workspace = true }
-bcode_plugin_sdk     = { workspace = true }
+bcode_plugin_sdk     = { workspace = true, features = ["tui"] }
 bcode_session_models = { workspace = true }
 bmux_keyboard        = { workspace = true }
 bmux_tui             = { workspace = true }

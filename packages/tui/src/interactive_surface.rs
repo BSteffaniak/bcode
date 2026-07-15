@@ -111,8 +111,7 @@ async fn open_surface(
         {
             continue;
         }
-        let registry = runtime
-            .tui_registry(&plugin_id)
+        let registry = crate::plugin_tui::tui_registry(&plugin_id)
             .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.clone()))?;
         let request = PluginTuiSurfaceOpenRequest {
             instance_id: interaction_id.to_owned(),

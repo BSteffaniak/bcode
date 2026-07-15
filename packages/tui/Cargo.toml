@@ -23,7 +23,7 @@ bcode_ipc                = { workspace = true }
 bcode_markdown_render    = { workspace = true }
 bcode_model              = { workspace = true }
 bcode_plugin             = { workspace = true }
-bcode_plugin_sdk         = { workspace = true }
+bcode_plugin_sdk         = { workspace = true, features = ["tui"] }
 bcode_provider_auth      = { workspace = true }
 bcode_ralph              = { workspace = true }
 bcode_server             = { workspace = true }

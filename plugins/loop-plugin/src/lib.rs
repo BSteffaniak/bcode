@@ -356,12 +356,11 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 
 #[must_use]
 pub fn static_plugin() -> StaticPluginVtable {
-    let mut vtable = static_plugin_vtable!(LoopPlugin, include_str!("../bcode-plugin.toml"));
-    vtable.tui_registry = Some(tui_registry);
-    vtable
+    static_plugin_vtable!(LoopPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-fn tui_registry() -> PluginTuiRegistry {
+#[must_use]
+pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
     registry.register_factory(Box::new(LoopSurfaceFactory));
     registry

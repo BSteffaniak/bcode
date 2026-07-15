@@ -1687,7 +1687,7 @@ async fn handle_event<W: Write>(
                         continue;
                     };
                     let Some(action) =
-                        runtime.tui_registry(&route.plugin_id).and_then(|registry| {
+                        crate::plugin_tui::tui_registry(&route.plugin_id).and_then(|registry| {
                             registry.visual_invocation_event_action(
                                 &route.schema,
                                 &visual.payload,

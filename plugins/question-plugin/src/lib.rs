@@ -660,24 +660,20 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
-        QuestionPlugin,
-        include_str!("../bcode-plugin.toml")
-    );
-    vtable.tui_registry = Some(question_tui_registry);
-    vtable.interaction_registry = Some(question_interaction_registry);
-    vtable
+    bcode_plugin_sdk::static_plugin_vtable!(QuestionPlugin, include_str!("../bcode-plugin.toml"))
 }
 
 #[cfg(feature = "static-bundled")]
-fn question_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
+#[must_use]
+pub fn question_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
     let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
     registry.register_interaction::<question_interaction::QuestionInteractionController>();
     registry
 }
 
 #[cfg(feature = "static-bundled")]
-fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+#[must_use]
+pub fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_interactive_surface::<
         question_interaction::QuestionInteractionController,

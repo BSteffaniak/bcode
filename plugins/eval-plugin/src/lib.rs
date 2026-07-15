@@ -150,7 +150,6 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     let mut vtable =
         bcode_plugin_sdk::static_plugin_vtable!(EvalPlugin, include_str!("../bcode-plugin.toml"));
-    vtable.tui_registry = Some(tui::tui_registry);
     vtable.cli_registration = Some(cli::registration);
     vtable
 }

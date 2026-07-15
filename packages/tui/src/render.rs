@@ -1035,7 +1035,7 @@ fn push_canonical_plugin_visual_rows(
         push_plugin_visual_degraded_rows(rows, visual, "no TUI visual adapter registered", width);
         return;
     };
-    let Some(registry) = host.tui_registry(&route.plugin_id) else {
+    let Some(registry) = crate::plugin_tui::tui_registry(&route.plugin_id) else {
         push_plugin_visual_degraded_rows(
             rows,
             visual,

@@ -134,13 +134,11 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable =
-        bcode_plugin_sdk::static_plugin_vtable!(ModelPlugin, include_str!("../bcode-plugin.toml"));
-    vtable.tui_registry = Some(model_tui_registry);
-    vtable
+    bcode_plugin_sdk::static_plugin_vtable!(ModelPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-fn model_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+#[must_use]
+pub fn model_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     for (surface_kind, title) in [
         ("model.status", "Model Status"),

@@ -1208,21 +1208,20 @@ fn json_tool_response<T: serde::Serialize>(value: &T, is_error: bool) -> ToolInv
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> StaticPluginVtable {
-    let mut vtable = static_plugin_vtable!(VimEditPlugin, include_str!("../bcode-plugin.toml"));
-    vtable.tui_registry = Some(vim_edit_tui_registry);
-    vtable.interaction_registry = Some(vim_edit_interaction_registry);
-    vtable
+    static_plugin_vtable!(VimEditPlugin, include_str!("../bcode-plugin.toml"))
 }
 
 #[cfg(feature = "static-bundled")]
-fn vim_edit_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
+#[must_use]
+pub fn vim_edit_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
     let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
     registry.register_interaction::<vim_edit_interaction::VimEditPlaybackInteractionController>();
     registry
 }
 
 #[cfg(feature = "static-bundled")]
-fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+#[must_use]
+pub fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_visual_adapter(Box::new(
         vim_edit_playback_tui::VimEditPlaybackTuiVisualAdapter,

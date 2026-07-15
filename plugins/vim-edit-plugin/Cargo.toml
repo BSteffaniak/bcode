@@ -14,7 +14,7 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_plugin_sdk = { workspace = true }
+bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_tool       = { workspace = true }
 bcode_vim_edit   = { workspace = true }
 bmux_keyboard    = { workspace = true, optional = true }

@@ -29,6 +29,7 @@ bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
 bcode_pi_session_import_plugin          = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true }
+bcode_plugin_sdk                        = { workspace = true, features = ["tui"] }
 bcode_question_plugin                   = { workspace = true, optional = true }
 bcode_ralph_plugin                      = { workspace = true, optional = true }
 bcode_shell_plugin                      = { workspace = true, optional = true }

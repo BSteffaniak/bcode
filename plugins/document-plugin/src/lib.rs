@@ -703,16 +703,12 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
-        DocumentPlugin,
-        include_str!("../bcode-plugin.toml")
-    );
-    vtable.tui_registry = Some(document_tui_registry);
-    vtable
+    bcode_plugin_sdk::static_plugin_vtable!(DocumentPlugin, include_str!("../bcode-plugin.toml"))
 }
 
 #[cfg(feature = "static-bundled")]
-fn document_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+#[must_use]
+pub fn document_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_visual_adapter(Box::new(document_tui::DocumentTuiVisualAdapter));
     registry

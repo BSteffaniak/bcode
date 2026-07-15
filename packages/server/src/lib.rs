@@ -15228,15 +15228,21 @@ async fn handle_interactive_tool_request(
         .interaction_kind
         .clone()
         .unwrap_or_else(|| request.surface_kind.clone());
-    let controller = state
+    let controller = if state
         .plugins
-        .interaction_registry(plugin_id)
-        .and_then(|registry| {
+        .plugin_ids()
+        .iter()
+        .any(|loaded| loaded == plugin_id)
+    {
+        bcode_bundled_plugins::interaction_registry(plugin_id).and_then(|registry| {
             registry
                 .open(&interaction_kind, request.request.clone())
                 .ok()
                 .map(|controller| Arc::new(Mutex::new(controller)))
-        });
+        })
+    } else {
+        None
+    };
     let pending = PendingInteractiveToolRequest {
         summary: bcode_ipc::InteractiveToolRequestSummary {
             interaction_id: request.interaction_id.clone(),

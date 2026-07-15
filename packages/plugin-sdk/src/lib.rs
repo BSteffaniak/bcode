@@ -6,6 +6,7 @@
 
 pub mod interaction;
 pub mod path;
+#[cfg(feature = "tui")]
 pub mod tui;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1262,10 +1263,6 @@ pub struct StaticPluginVtable {
     pub invoke_service_streaming: StreamingServiceFn,
     /// Event handling hook.
     pub handle_event: fn(*const c_void, *const u8, usize) -> i32,
-    /// Native TUI registry provider, when statically linked.
-    pub tui_registry: Option<fn() -> crate::tui::PluginTuiRegistry>,
-    /// Renderer-neutral interaction registry provider, when statically linked.
-    pub interaction_registry: Option<fn() -> crate::interaction::PluginInteractionRegistry>,
     /// Rust-native CLI contribution provider, when statically linked.
     pub cli_registration: Option<fn() -> StaticCliRegistration>,
 }
@@ -1525,8 +1522,6 @@ macro_rules! static_plugin_vtable {
             deactivate: $crate::static_deactivate_export::<$plugin>,
             invoke_service_streaming: $crate::static_invoke_service_streaming_export::<$plugin>,
             handle_event: $crate::static_handle_event_export::<$plugin>,
-            tui_registry: None,
-            interaction_registry: None,
             cli_registration: None,
         }
     }};
@@ -1598,8 +1593,6 @@ macro_rules! static_concurrent_plugin_vtable {
             deactivate,
             invoke_service_streaming,
             handle_event,
-            tui_registry: None,
-            interaction_registry: None,
             cli_registration: None,
         }
     }};
@@ -1607,6 +1600,13 @@ macro_rules! static_concurrent_plugin_vtable {
 
 /// Common imports for plugin authors.
 pub mod prelude {
+    #[cfg(feature = "tui")]
+    pub use crate::tui::{
+        PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
+        PluginSessionEventSubscriptionRequest, PluginTuiAction, PluginTuiHost, PluginTuiHostError,
+        PluginTuiRegistry, PluginTuiSurface, PluginTuiSurfaceFactory, PluginTuiSurfaceOpenRequest,
+        TokioPluginTuiHost,
+    };
     pub use crate::{
         CURRENT_PLUGIN_ABI_VERSION, CommandRegistrar, ConcurrentRustPlugin,
         DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_DECODE_FAILED,
@@ -1620,12 +1620,6 @@ pub mod prelude {
         ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn,
         export_concurrent_plugin, export_plugin, static_concurrent_plugin_vtable,
         static_plugin_vtable,
-        tui::{
-            PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
-            PluginSessionEventSubscriptionRequest, PluginTuiAction, PluginTuiHost,
-            PluginTuiHostError, PluginTuiRegistry, PluginTuiSurface, PluginTuiSurfaceFactory,
-            PluginTuiSurfaceOpenRequest, TokioPluginTuiHost,
-        },
     };
 }
 

@@ -1820,16 +1820,15 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable = bcode_plugin_sdk::static_concurrent_plugin_vtable!(
+    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
         ShellPlugin,
         include_str!("../bcode-plugin.toml")
-    );
-    vtable.tui_registry = Some(shell_tui_registry);
-    vtable
+    )
 }
 
 #[cfg(feature = "static-bundled")]
-fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+#[must_use]
+pub fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_visual_adapter(Box::new(shell_run_tui::ShellRunTuiVisualAdapter::default()));
     registry

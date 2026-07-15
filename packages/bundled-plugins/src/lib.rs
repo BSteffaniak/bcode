@@ -4,6 +4,62 @@
 
 //! Single source of truth for statically bundled Bcode plugins.
 
+/// Return a native TUI registry for one enabled statically bundled plugin.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiRegistry> {
+    match plugin_id {
+        #[cfg(feature = "static-bundled-code-review-plugin")]
+        "bcode.code_review" => Some(bcode_code_review_plugin::tui::tui_registry()),
+        #[cfg(feature = "static-bundled-document-plugin")]
+        "bcode.document" => Some(bcode_document_plugin::document_tui_registry()),
+        #[cfg(feature = "static-bundled-eval-plugin")]
+        "bcode.eval" => Some(bcode_eval_plugin::tui::tui_registry()),
+        #[cfg(feature = "static-bundled-filesystem-plugin")]
+        "bcode.filesystem" => Some(bcode_filesystem_plugin::filesystem_tui_registry()),
+        #[cfg(feature = "static-bundled-git-plugin")]
+        "bcode.git" => Some(bcode_git_plugin::git_tui_registry()),
+        #[cfg(feature = "static-bundled-loop-plugin")]
+        "bcode.loop" => Some(bcode_loop_plugin::tui_registry()),
+        #[cfg(feature = "static-bundled-metrics-plugin")]
+        "bcode.metrics" => Some(bcode_metrics_plugin::tui::tui_registry()),
+        #[cfg(feature = "static-bundled-model-plugin")]
+        "bcode.model" => Some(bcode_model_plugin::model_tui_registry()),
+        #[cfg(feature = "static-bundled-ocr-plugin")]
+        "bcode.ocr" => Some(bcode_ocr_plugin::ocr_tui_registry()),
+        #[cfg(feature = "static-bundled-question-plugin")]
+        "bcode.question" => Some(bcode_question_plugin::question_tui_registry()),
+        #[cfg(feature = "static-bundled-ralph-plugin")]
+        "bcode.ralph" => Some(bcode_ralph_plugin::tui_registry()),
+        #[cfg(feature = "static-bundled-shell-plugin")]
+        "bcode.shell" => Some(bcode_shell_plugin::shell_tui_registry()),
+        #[cfg(feature = "static-bundled-skills-plugin")]
+        "bcode.skills" => Some(bcode_skills_plugin::skills_tui_registry()),
+        #[cfg(feature = "static-bundled-vim-edit-plugin")]
+        "bcode.vim-edit" => Some(bcode_vim_edit_plugin::vim_edit_tui_registry()),
+        #[cfg(feature = "static-bundled-web-search-plugin")]
+        "bcode.web-search" => Some(bcode_web_search_plugin::web_search_tui_registry()),
+        #[cfg(feature = "static-bundled-worktree-plugin")]
+        "bcode.worktree" => Some(bcode_worktree_plugin::worktree_tui_registry()),
+        _ => None,
+    }
+}
+
+/// Return a renderer-neutral interaction registry for one enabled statically bundled plugin.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub fn interaction_registry(
+    plugin_id: &str,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionRegistry> {
+    match plugin_id {
+        #[cfg(feature = "static-bundled-question-plugin")]
+        "bcode.question" => Some(bcode_question_plugin::question_interaction_registry()),
+        #[cfg(feature = "static-bundled-vim-edit-plugin")]
+        "bcode.vim-edit" => Some(bcode_vim_edit_plugin::vim_edit_interaction_registry()),
+        _ => None,
+    }
+}
+
 /// Return statically bundled plugin registrations enabled by this crate's feature set.
 #[must_use]
 pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
@@ -364,6 +420,24 @@ mod tests {
     #[test]
     fn bundled_plugins_are_opt_in() {
         assert!(super::static_bundled_plugins().is_empty());
+        assert!(super::tui_registry("bcode.filesystem").is_none());
+        assert!(super::interaction_registry("bcode.question").is_none());
+    }
+
+    #[cfg(feature = "static-bundled-question-plugin")]
+    #[test]
+    fn question_bundle_provides_platform_interaction_registry() {
+        let registry = super::interaction_registry("bcode.question")
+            .expect("question interaction registry is available");
+        assert!(registry.supports("bcode.question"));
+    }
+
+    #[cfg(feature = "static-bundled-vim-edit-plugin")]
+    #[test]
+    fn vim_edit_bundle_provides_platform_interaction_registry() {
+        let registry = super::interaction_registry("bcode.vim-edit")
+            .expect("Vim edit interaction registry is available");
+        assert!(registry.supports("bcode.vim-edit.playback"));
     }
 
     #[cfg(feature = "static-bundled-filesystem-plugin")]
@@ -393,9 +467,8 @@ mod tests {
             .expect("filesystem file-change visual adapter route");
         assert_eq!(route.plugin_id, "bcode.filesystem");
 
-        let registry = host
-            .tui_registry(&route.plugin_id)
-            .expect("filesystem TUI registry is available");
+        let registry =
+            super::tui_registry(&route.plugin_id).expect("filesystem TUI registry is available");
         let payload = serde_json::json!({
             "path": "src/lib.rs",
             "old_text": "before\n",

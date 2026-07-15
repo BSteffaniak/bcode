@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 base64 = { workspace = true }
-bcode_plugin_sdk = { workspace = true }
+bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_tool = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
     "syntax",

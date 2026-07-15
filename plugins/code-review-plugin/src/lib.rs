@@ -3866,7 +3866,6 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
         CodeReviewPlugin,
         include_str!("../bcode-plugin.toml")
     );
-    vtable.tui_registry = Some(tui::tui_registry);
     vtable.cli_registration = Some(cli::registration);
     vtable
 }

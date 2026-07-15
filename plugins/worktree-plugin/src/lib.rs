@@ -485,19 +485,21 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
+    let vtable = bcode_plugin_sdk::static_plugin_vtable!(
         WorktreePlugin,
         include_str!("../bcode-plugin.toml")
     );
-    vtable.tui_registry = Some(worktree_tui_registry);
     #[cfg(feature = "static-bundled")]
-    {
+    let vtable = {
+        let mut vtable = vtable;
         vtable.cli_registration = Some(cli::registration);
-    }
+        vtable
+    };
     vtable
 }
 
-fn worktree_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+#[must_use]
+pub fn worktree_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_factory(Box::new(WorktreeCommandSurfaceFactory {
         surface_kind: "command.work-tree.attach",
