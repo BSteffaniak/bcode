@@ -28,8 +28,9 @@ toml             = { workspace = true }
 tracing          = { workspace = true }
 
 [dev-dependencies]
-bcode_hello_plugin = { workspace = true }
-tokio              = { workspace = true, features = ["macros", "rt", "time"] }
+bcode_hello_plugin    = { workspace = true }
+bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+tokio                 = { workspace = true, features = ["macros", "rt", "time"] }
 
 [features]
 default          = []

@@ -4539,6 +4539,113 @@ library = "libexample_plugin.dylib"
         assert_eq!(response.payload, b"cancelled");
     }
 
+    fn question_dynamic_library_path() -> PathBuf {
+        let executable = std::env::current_exe().expect("current test executable path");
+        let directory = executable.parent().expect("test executable parent");
+        let prefix = format!("{}bcode_question_plugin", std::env::consts::DLL_PREFIX);
+        std::fs::read_dir(directory)
+            .expect("test dependency directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&prefix) && name.ends_with(std::env::consts::DLL_SUFFIX)
+                    })
+            })
+            .expect("question plugin dynamic library should be built as a dev dependency")
+    }
+
+    fn load_dynamic_question_plugin() -> LoadedPlugin {
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/question-plugin/bcode-plugin.toml");
+        let mut manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../plugins/question-plugin/bcode-plugin.toml"
+        ))
+        .expect("question manifest should parse");
+        let PluginRuntime::Native(runtime) = &mut manifest.runtime;
+        runtime.library = question_dynamic_library_path();
+        load_registered_plugin(&RegisteredPlugin {
+            manifest_path,
+            manifest,
+        })
+        .expect("dynamic question plugin should load")
+    }
+
+    fn load_static_question_plugin() -> LoadedPlugin {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../plugins/question-plugin/bcode-plugin.toml"
+        ))
+        .expect("question manifest should parse");
+        load_static_plugin(manifest, bcode_question_plugin::static_plugin())
+            .expect("static question plugin should load")
+    }
+
+    fn assert_question_exchange_plugin(plugin: &LoadedPlugin) {
+        let request = bcode_tool::ToolInvocationRequest {
+            tool_call_id: "question-call".to_string(),
+            name: "question".to_string(),
+            arguments: serde_json::json!({
+                "questions": [{
+                    "question": "Proceed?",
+                    "options": [{"label": "Yes", "value": "yes"}],
+                    "required": true
+                }]
+            }),
+            cwd: None,
+            artifact_dir: None,
+            cancellation_path: None,
+            invocation_action_path: None,
+        };
+        let payload = serde_json::to_vec(&request).expect("question request encodes");
+        let mut requests = Vec::new();
+        let response = plugin
+            .invoke_service_with_bridge(
+                bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+                bcode_tool::OP_INVOKE_TOOL,
+                payload,
+                |_| {},
+                |request, _| {
+                    requests.push(request);
+                    Ok(ServiceBridgeResponse::Exchange(
+                        bcode_tool::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({
+                                "status": "answered",
+                                "questions": [{
+                                    "question_index": 0,
+                                    "selected": ["yes"]
+                                }]
+                            }),
+                        },
+                    ))
+                },
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .expect("question service should invoke");
+        let response: bcode_tool::ToolInvocationResponse =
+            decode_service_response(response).expect("question response decodes");
+
+        assert!(!response.is_error);
+        assert!(response.host_action.is_none());
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            &requests[0],
+            ServiceBridgeRequest::Exchange(request)
+                if request.invocation_id == "question-call"
+                    && request.schema == "bcode.question.request"
+        ));
+    }
+
+    #[test]
+    fn dynamic_question_plugin_uses_same_invocation_exchange() {
+        assert_question_exchange_plugin(&load_dynamic_question_plugin());
+    }
+
+    #[test]
+    fn static_question_plugin_uses_same_invocation_exchange() {
+        assert_question_exchange_plugin(&load_static_question_plugin());
+    }
     #[test]
     fn dynamic_loader_supports_all_bridge_families_and_cancellation() {
         assert_hello_plugin_bridge_and_cancellation(load_dynamic_hello_plugin());

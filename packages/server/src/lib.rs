@@ -60,8 +60,11 @@ use bcode_model::{
     OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
-use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
+use bcode_plugin::{
+    PluginInvocationBridge, PluginInvocationScope, StreamingServiceInvocationEvent,
+};
 use bcode_plugin_sdk::path::{display, display_from_current_dir};
+use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
 use bcode_session::{
     AppendToolCallRequestedInput, CatalogLoadStatus, SessionManager,
     lease::SessionLeaseOwnerContext,
@@ -88,7 +91,8 @@ use bcode_skill_models::{
 use bcode_tool::{
     InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
     OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID,
-    ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolDefinition as ServiceToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
+    ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
     ToolResultContent, ToolSideEffect,
@@ -14989,6 +14993,139 @@ fn tool_invocation_metric_labels(
     labels
 }
 
+struct ServerPluginBridgeCall {
+    request: ServiceBridgeRequest,
+    response: std::sync::mpsc::SyncSender<Result<ServiceBridgeResponse, String>>,
+}
+
+fn server_plugin_bridge() -> (
+    PluginInvocationBridge,
+    mpsc::UnboundedReceiver<ServerPluginBridgeCall>,
+) {
+    let (sender, receiver) = mpsc::unbounded_channel::<ServerPluginBridgeCall>();
+    let bridge = PluginInvocationBridge::new(move |request, cancellation| {
+        request_server_plugin_bridge(&sender, request, &cancellation)
+    });
+    (bridge, receiver)
+}
+
+fn request_server_plugin_bridge(
+    sender: &mpsc::UnboundedSender<ServerPluginBridgeCall>,
+    request: ServiceBridgeRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<ServiceBridgeResponse, String> {
+    let (response, response_receiver) = std::sync::mpsc::sync_channel(1);
+    sender
+        .send(ServerPluginBridgeCall { request, response })
+        .map_err(|_| "server invocation bridge closed".to_string())?;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err("server invocation bridge cancelled".to_string());
+        }
+        match response_receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok(response) => return response,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("server invocation bridge response closed".to_string());
+            }
+        }
+    }
+}
+
+async fn resolve_server_plugin_bridge_request(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    plugin_id: &str,
+    request: ServiceBridgeRequest,
+    cancel_state: &TurnCancelState,
+) -> Result<ServiceBridgeResponse, String> {
+    Ok(match request {
+        ServiceBridgeRequest::Exchange(request) => ServiceBridgeResponse::Exchange(
+            resolve_server_exchange(state, session_id, call, plugin_id, request, cancel_state)
+                .await?,
+        ),
+        ServiceBridgeRequest::ReceiveInput { .. } => {
+            ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Closed)
+        }
+        ServiceBridgeRequest::InvokeService(_) => {
+            ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Unsupported)
+        }
+        ServiceBridgeRequest::WriteArtifact(_) => {
+            ServiceBridgeResponse::Artifact(bcode_tool::ToolArtifactWriteResolution::Failed {
+                code: "unsupported".to_string(),
+                message: "server artifact bridge is not implemented".to_string(),
+            })
+        }
+    })
+}
+
+async fn resolve_server_exchange(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    plugin_id: &str,
+    request: ToolExchangeRequest,
+    cancel_state: &TurnCancelState,
+) -> Result<ToolExchangeResolution, String> {
+    if request.invocation_id != call.id {
+        return Ok(ToolExchangeResolution::Failed {
+            code: "invocation_id_mismatch".to_string(),
+            message: "exchange does not belong to the active tool invocation".to_string(),
+        });
+    }
+    if request.producer_id != "bcode.question"
+        || request.schema != "bcode.question.request"
+        || request.schema_version != 1
+    {
+        return Ok(ToolExchangeResolution::NoCompatibleConsumer);
+    }
+    let interactive = bcode_tool::InteractiveToolRequest {
+        interaction_id: request.exchange_id,
+        interaction_kind: Some("bcode.question".to_string()),
+        surface_kind: "bcode.question.inline".to_string(),
+        request: request.payload,
+        required: request.response_policy == bcode_tool::ToolExchangeResponsePolicy::Required,
+        turn_behavior: bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+        render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
+    };
+    let resolution = resolve_interactive_tool_request(
+        state,
+        session_id,
+        call,
+        plugin_id,
+        &interactive,
+        cancel_state,
+    )
+    .await?;
+    Ok(match resolution {
+        InteractiveToolResolution::Submitted { payload } => {
+            ToolExchangeResolution::Responded { payload }
+        }
+        InteractiveToolResolution::Aborted { reason, message } => match reason {
+            bcode_tool::InteractiveToolAbortReason::UserDismissed => {
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"status": "dismissed"}),
+                }
+            }
+            bcode_tool::InteractiveToolAbortReason::TurnCancelled => {
+                ToolExchangeResolution::Cancelled
+            }
+            bcode_tool::InteractiveToolAbortReason::ClientDetached => {
+                ToolExchangeResolution::ConsumerDetached
+            }
+            bcode_tool::InteractiveToolAbortReason::Timeout => ToolExchangeResolution::TimedOut,
+            bcode_tool::InteractiveToolAbortReason::UnsupportedSurface => {
+                ToolExchangeResolution::NoCompatibleConsumer
+            }
+            bcode_tool::InteractiveToolAbortReason::HostError => ToolExchangeResolution::Failed {
+                code: "host_error".to_string(),
+                message: message.unwrap_or_else(|| "question exchange host failed".to_string()),
+            },
+        },
+    })
+}
+
 struct ToolInvocationControlFiles {
     cancellation_path: PathBuf,
     invocation_action_path: PathBuf,
@@ -15254,14 +15391,17 @@ async fn invoke_model_tool(
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let scope = active_plugin_scope_for_tool_call(state, session_id, &call.id).await;
+    let (bridge, bridge_requests) = server_plugin_bridge();
+    let mut bridge_requests = Some(bridge_requests);
     let mut invocation = state
         .plugins
-        .invoke_service_with_events_scoped(
+        .invoke_service_with_events_and_bridge_scoped(
             &plugin_id,
             TOOL_SERVICE_INTERFACE_ID,
             OP_INVOKE_TOOL,
             payload,
             scope,
+            Some(bridge),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -15287,6 +15427,27 @@ async fn invoke_model_tool(
             publisher_event = tool_output_publisher.next_event() => {
                 if let Some(publisher_event) = publisher_event {
                     tool_output_publisher.handle_event(state, session_id, publisher_event).await;
+                }
+            }
+            bridge_call = async {
+                bridge_requests
+                    .as_mut()
+                    .expect("guarded bridge receiver")
+                    .recv()
+                    .await
+            }, if bridge_requests.is_some() => {
+                if let Some(bridge_call) = bridge_call {
+                    let resolution = resolve_server_plugin_bridge_request(
+                        state,
+                        session_id,
+                        call,
+                        &plugin_id,
+                        bridge_call.request,
+                        cancel_state,
+                    ).await;
+                    let _ = bridge_call.response.send(resolution);
+                } else {
+                    bridge_requests = None;
                 }
             }
             event = invocation.next_event() => {
@@ -15341,27 +15502,14 @@ async fn invoke_model_tool(
     Ok(response)
 }
 
-async fn handle_interactive_tool_request(
+async fn resolve_interactive_tool_request(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     plugin_id: &str,
-    request: bcode_tool::InteractiveToolRequest,
+    request: &bcode_tool::InteractiveToolRequest,
     cancel_state: &TurnCancelState,
-) -> Result<ToolInvocationResponse, String> {
-    if request.interaction_id.is_empty() {
-        return Ok(tool_error(
-            "interactive tool request missing interaction_id",
-        ));
-    }
-    if request.turn_behavior
-        == bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction
-    {
-        return Ok(tool_error(
-            "interactive turn behavior not supported yet: complete_turn_with_pending_interaction",
-        ));
-    }
-
+) -> Result<InteractiveToolResolution, String> {
     let interaction_kind = request
         .interaction_kind
         .clone()
@@ -15403,16 +15551,16 @@ async fn handle_interactive_tool_request(
     {
         let mut pending_interactions = state.pending_interactive_tools.lock().await;
         if pending_interactions.contains_key(&request.interaction_id) {
-            return Ok(tool_error(format!(
+            return Err(format!(
                 "duplicate interactive tool request id: {}",
                 request.interaction_id
-            )));
+            ));
         }
         pending_interactions.insert(request.interaction_id.clone(), pending);
     }
-    append_interactive_tool_request_created_event(state, session_id, call, &request).await;
+    append_interactive_tool_request_created_event(state, session_id, call, request).await;
 
-    let resolution = wait_for_interactive_tool_resolution(
+    Ok(wait_for_interactive_tool_resolution(
         state,
         session_id,
         call,
@@ -15421,7 +15569,39 @@ async fn handle_interactive_tool_request(
         &notify,
         cancel_state,
     )
-    .await;
+    .await)
+}
+
+async fn handle_interactive_tool_request(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    plugin_id: &str,
+    request: bcode_tool::InteractiveToolRequest,
+    cancel_state: &TurnCancelState,
+) -> Result<ToolInvocationResponse, String> {
+    if request.interaction_id.is_empty() {
+        return Ok(tool_error(
+            "interactive tool request missing interaction_id",
+        ));
+    }
+    if request.turn_behavior
+        == bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction
+    {
+        return Ok(tool_error(
+            "interactive turn behavior not supported yet: complete_turn_with_pending_interaction",
+        ));
+    }
+
+    let resolution = resolve_interactive_tool_request(
+        state,
+        session_id,
+        call,
+        plugin_id,
+        &request,
+        cancel_state,
+    )
+    .await?;
     let resume = InteractiveToolResumeRequest {
         tool_call_id: call.id.clone(),
         tool_name: call.name.clone(),
@@ -18460,6 +18640,76 @@ mod tests {
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
 
+    #[test]
+    fn server_plugin_bridge_round_trips_requests_without_async_runtime_blocking() {
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        let request = ServiceBridgeRequest::Exchange(ToolExchangeRequest {
+            invocation_id: "call".to_string(),
+            exchange_id: "exchange".to_string(),
+            producer_id: "test".to_string(),
+            schema: "test.exchange".to_string(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        });
+        let worker = std::thread::spawn(move || {
+            request_server_plugin_bridge(
+                &sender,
+                request,
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .expect("bridge response")
+        });
+        let call = requests.blocking_recv().expect("bridge request");
+        call.response
+            .send(Ok(ServiceBridgeResponse::Exchange(
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"ok": true}),
+                },
+            )))
+            .expect("bridge response delivery");
+
+        assert!(matches!(
+            worker.join().expect("bridge worker"),
+            ServiceBridgeResponse::Exchange(ToolExchangeResolution::Responded { payload })
+                if payload == serde_json::json!({"ok": true})
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_exchange_rejects_wrong_invocation_before_registering_interaction() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        let call = bcode_model::ToolCall {
+            id: "active-call".to_string(),
+            name: "question".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let resolution = resolve_server_exchange(
+            &state,
+            session_id,
+            &call,
+            "bcode.question",
+            ToolExchangeRequest {
+                invocation_id: "other-call".to_string(),
+                exchange_id: "exchange".to_string(),
+                producer_id: "bcode.question".to_string(),
+                schema: "bcode.question.request".to_string(),
+                schema_version: 1,
+                payload: serde_json::Value::Null,
+                response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+            },
+            &TurnCancelState::default(),
+        )
+        .await
+        .expect("exchange resolution");
+
+        assert!(matches!(
+            resolution,
+            ToolExchangeResolution::Failed { code, .. } if code == "invocation_id_mismatch"
+        ));
+        assert!(state.pending_interactive_tools.lock().await.is_empty());
+    }
     #[test]
     fn generic_plugin_invocation_actions_are_opaque_bounded_and_require_active_path() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -21932,6 +22182,107 @@ mod tests {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
 
+    fn test_server_state_with_question_plugin(sessions: SessionManager) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.question".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load question plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state
+    }
+
+    #[tokio::test]
+    async fn server_question_exchange_completes_original_plugin_invocation() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("question".to_string()), test_working_directory())
+            .await
+            .expect("question session");
+        let session_id = summary.id;
+        let trace_dir = tempfile::tempdir().expect("question trace dir");
+        let mut state = test_server_state_with_question_plugin(sessions);
+        state.trace_store = TraceStore::new(trace_dir.path().to_path_buf());
+        let state = Arc::new(state);
+        let call = bcode_model::ToolCall {
+            id: "question-call".to_string(),
+            name: "question".to_string(),
+            arguments: serde_json::json!({
+                "questions": [{
+                    "question": "Proceed?",
+                    "options": [{"label": "Yes", "value": "yes"}],
+                    "required": true
+                }]
+            }),
+        };
+        let working_directory = test_working_directory();
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let task_state = Arc::clone(&state);
+        let task_call = call.clone();
+        let task_cancel = Arc::clone(&cancel_state);
+        let task = tokio::spawn(async move {
+            invoke_model_tool(
+                task_state.as_ref(),
+                session_id,
+                &task_call,
+                &working_directory,
+                task_cancel.as_ref(),
+            )
+            .await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pending = state
+                    .pending_interactive_tools
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .cloned();
+                if let Some(pending) = pending {
+                    break pending;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("question exchange should become pending");
+        assert_eq!(pending.summary.interaction_id, "question-call-question");
+        complete_pending_interactive_tool_request(
+            state.as_ref(),
+            &pending,
+            InteractiveToolResolution::Submitted {
+                payload: serde_json::json!({
+                    "status": "answered",
+                    "questions": [{
+                        "question_index": 0,
+                        "selected": ["yes"]
+                    }]
+                }),
+            },
+        )
+        .await;
+
+        let response = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("question invocation should resume")
+            .expect("question task joins")
+            .expect("question invocation succeeds");
+        assert!(!response.is_error);
+        assert!(response.host_action.is_none());
+        assert!(response.output.contains("Answered"));
+        assert!(state.pending_interactive_tools.lock().await.is_empty());
+    }
     fn test_server_state_with_fake_provider(sessions: SessionManager) -> ServerState {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),

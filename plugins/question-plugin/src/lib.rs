@@ -14,18 +14,17 @@ mod question_types;
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    InteractiveToolRequest, InteractiveToolResolution, InteractiveToolResumeRequest,
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL,
-    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolCompatibilityAlias, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
-    ToolPolicyMetadata, ToolSideEffect,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ToolCompatibilityAlias, ToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
+    ToolExchangeResponsePolicy, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolList, ToolPolicyMetadata, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fmt::Write as _;
 
 const TOOL_NAME: &str = "question";
-const DEFAULT_ASK_AGGRESSIVENESS: u8 = 5;
+const QUESTION_EXCHANGE_SCHEMA: &str = "bcode.question.request";
 
 #[derive(Debug, Default)]
 pub struct QuestionPlugin;
@@ -48,7 +47,6 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(&context.request),
         OP_INVOKE_TOOL => invoke_tool(context),
-        OP_RESUME_INTERACTIVE_TOOL => resume_interactive_tool(&context.request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported question tool service operation",
@@ -147,64 +145,43 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return json_response(&tool_error(error)),
     };
-    let outcome = unanswered_outcome(&request);
-    let value = match serde_json::to_string(&outcome) {
-        Ok(value) => value,
-        Err(error) => return json_response(&tool_error(error.to_string())),
+    let exchange = ServiceBridgeRequest::Exchange(ToolExchangeRequest {
+        invocation_id: invocation.tool_call_id.clone(),
+        exchange_id: format!("{}-question", invocation.tool_call_id),
+        producer_id: "bcode.question".to_string(),
+        schema: QUESTION_EXCHANGE_SCHEMA.to_string(),
+        schema_version: 1,
+        payload: serde_json::to_value(&request).unwrap_or(Value::Null),
+        response_policy: if request.questions.iter().any(|question| question.required) {
+            ToolExchangeResponsePolicy::Required
+        } else {
+            ToolExchangeResponsePolicy::Optional
+        },
+    });
+    let response = match context.bridge.request(&exchange) {
+        Ok(ServiceBridgeResponse::Exchange(response)) => response,
+        Ok(_) => {
+            return json_response(&tool_error(
+                "question exchange returned unexpected bridge response".to_string(),
+            ));
+        }
+        Err(error) => {
+            return json_response(&tool_error(format!("question exchange failed: {error}")));
+        }
     };
-    json_response(&ToolInvocationResponse {
-        output: format_unanswered_output(&request, DEFAULT_ASK_AGGRESSIVENESS),
-        is_error: false,
-        content: Vec::new(),
-        full_output: Some(match serde_json::to_string_pretty(&request) {
-            Ok(output) => output,
-            Err(error) => error.to_string(),
-        }),
-        host_action: Some(interactive_question_request(
-            &invocation.tool_call_id,
-            &request,
-        )),
-        result: Some(ToolInvocationResult::Json { value }),
-    })
-}
-
-fn interactive_question_request(
-    tool_call_id: &str,
-    request: &NormalizedQuestionRequest,
-) -> bcode_tool::ToolInvocationHostAction {
-    bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(InteractiveToolRequest {
-        interaction_id: format!("{tool_call_id}-question"),
-        interaction_kind: Some(QUESTION_INTERACTION_KIND.to_string()),
-        surface_kind: QUESTION_INLINE_SURFACE.to_string(),
-        request: serde_json::to_value(request).unwrap_or(Value::Null),
-        required: request.questions.iter().any(|question| question.required),
-        turn_behavior: bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
-        render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
-    })
-}
-
-fn resume_interactive_tool(request: &ServiceRequest) -> ServiceResponse {
-    let resume = match request.payload_json::<InteractiveToolResumeRequest>() {
-        Ok(resume) => resume,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    let question_request = match parse_question_request(resume.original_arguments.clone()) {
-        Ok(request) => request,
-        Err(error) => return json_response(&tool_error(error)),
-    };
-    let outcome = match question_outcome_from_resolution(&question_request, resume.resolution) {
+    let outcome = match question_outcome_from_exchange(&request, response) {
         Ok(outcome) => outcome,
         Err(error) => return json_response(&tool_error(error)),
     };
-    json_response(&question_response(&resume.interaction_id, &outcome))
+    json_response(&question_response(&invocation.tool_call_id, &outcome))
 }
 
-fn question_outcome_from_resolution(
+fn question_outcome_from_exchange(
     request: &NormalizedQuestionRequest,
-    resolution: InteractiveToolResolution,
+    resolution: ToolExchangeResolution,
 ) -> Result<QuestionToolOutcome, String> {
     match resolution {
-        InteractiveToolResolution::Submitted { payload } => {
+        ToolExchangeResolution::Responded { payload } => {
             let payload = serde_json::from_value::<QuestionResolutionPayload>(payload)
                 .map_err(|error| format!("invalid question response payload: {error}"))?;
             Ok(match payload {
@@ -215,8 +192,21 @@ fn question_outcome_from_resolution(
                 QuestionResolutionPayload::Dismissed => dismissed_outcome(request),
             })
         }
-        InteractiveToolResolution::Aborted { reason, message } => {
-            Ok(aborted_outcome(request, reason, message))
+        ToolExchangeResolution::NoCompatibleConsumer
+            if !request.questions.iter().any(|question| question.required) =>
+        {
+            Ok(unanswered_outcome(request))
+        }
+        ToolExchangeResolution::Cancelled => Err("question exchange cancelled".to_string()),
+        ToolExchangeResolution::TimedOut => Err("question exchange timed out".to_string()),
+        ToolExchangeResolution::NoCompatibleConsumer => {
+            Err("required question has no compatible consumer".to_string())
+        }
+        ToolExchangeResolution::ConsumerDetached => {
+            Err("question exchange consumer detached".to_string())
+        }
+        ToolExchangeResolution::Failed { code, message } => {
+            Err(format!("question exchange failed ({code}): {message}"))
         }
     }
 }
@@ -326,18 +316,6 @@ fn dismissed_outcome(request: &NormalizedQuestionRequest) -> QuestionToolOutcome
     )
 }
 
-fn aborted_outcome(
-    request: &NormalizedQuestionRequest,
-    _reason: bcode_tool::InteractiveToolAbortReason,
-    _message: Option<String>,
-) -> QuestionToolOutcome {
-    request_status_outcome(
-        request,
-        QuestionRequestStatus::Unanswered,
-        QuestionStatus::Aborted,
-    )
-}
-
 fn question_outcome(
     question_index: usize,
     question: &Question,
@@ -410,25 +388,6 @@ fn format_question_outcome_output(outcome: &QuestionToolOutcome) -> String {
             question.question,
             selected,
             custom
-        );
-    }
-    output
-}
-
-fn format_unanswered_output(request: &NormalizedQuestionRequest, ask_aggressiveness: u8) -> String {
-    let mut output = format!(
-        "Question prompt is awaiting user input (ask aggressiveness: {ask_aggressiveness}/10)."
-    );
-    for (index, question) in request.questions.iter().enumerate() {
-        let _ = write!(
-            output,
-            "\n* {}. {}{}",
-            index.saturating_add(1),
-            question
-                .header
-                .as_ref()
-                .map_or_else(String::new, |header| format!("{header}: ")),
-            question.text
         );
     }
     output

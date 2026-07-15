@@ -57,6 +57,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_question_plugin      = { workspace = true, features = ["static-bundled"] }
 tempfile                   = { workspace = true }
 
 [features]

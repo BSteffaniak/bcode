@@ -44,9 +44,10 @@ thiserror               = { workspace = true }
 tokio                   = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [dev-dependencies]
-bcode_hello_plugin = { workspace = true }
-bcode_plugin       = { workspace = true }
-tokio              = { workspace = true, features = ["macros", "rt"] }
+bcode_hello_plugin    = { workspace = true }
+bcode_plugin          = { workspace = true }
+bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+tokio                 = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 app = ["cli", "static-bundled-plugins", "bundled-ocr-tesseract"]
