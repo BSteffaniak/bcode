@@ -2455,6 +2455,7 @@ fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
         | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
+        | ToolInvocationStreamEvent::LegacyTransientPruned { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
     }
 }

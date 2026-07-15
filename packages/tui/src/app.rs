@@ -3193,7 +3193,8 @@ impl BmuxApp {
                 *started_at_ms,
                 application,
             ),
-            ToolInvocationStreamEvent::LegacyPresentation { .. } => {
+            ToolInvocationStreamEvent::LegacyPresentation { .. }
+            | ToolInvocationStreamEvent::LegacyTransientPruned { .. } => {
                 Self::legacy_discard_tool_presentation_stream_event();
             }
             ToolInvocationStreamEvent::Finished {

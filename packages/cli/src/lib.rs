@@ -5,6 +5,7 @@
 //! Command-line interface for Bcode.
 
 mod plugin_cli;
+mod session_cleanup;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -91,6 +92,10 @@ pub enum CliError {
     PluginService { code: String, message: String },
     #[error("session repair usage error: {0}")]
     SessionRepairUsage(String),
+    #[error("legacy stream cleanup usage error: {0}")]
+    LegacyStreamCleanupUsage(String),
+    #[error(transparent)]
+    LegacyStreamCleanup(#[from] bcode_session::legacy_stream_cleanup::LegacyStreamCleanupError),
     #[error(transparent)]
     PluginCliComposition(#[from] plugin_cli::CompositionError),
     #[error("plugin CLI command failed: {0}")]
@@ -859,6 +864,18 @@ enum SessionCommand {
     Reindex {
         session_id: SessionId,
     },
+    /// Remove historically persisted live tool-stream payloads.
+    PruneLiveEvents {
+        session_id: Option<SessionId>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Audit local sessions for semantic-result migration readiness without writing changes.
     MigrateSemanticResults {
         /// Session store root to audit. Defaults to Bcode's local session store.
@@ -1362,6 +1379,34 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
         }
         SessionCommand::Reindex { session_id } => {
             reindex_session_model_context(session_id).await?;
+        }
+        SessionCommand::PruneLiveEvents {
+            session_id,
+            all,
+            dry_run,
+            apply,
+            json,
+        } => {
+            if dry_run == apply {
+                return Err(CliError::LegacyStreamCleanupUsage(
+                    "choose exactly one of --dry-run or --apply".to_owned(),
+                ));
+            }
+            if all == session_id.is_some() {
+                return Err(CliError::LegacyStreamCleanupUsage(
+                    "provide exactly one session id or --all".to_owned(),
+                ));
+            }
+            let target = session_id.map_or(
+                session_cleanup::RunTarget::All,
+                session_cleanup::RunTarget::Session,
+            );
+            let mode = if apply {
+                session_cleanup::RunMode::Apply
+            } else {
+                session_cleanup::RunMode::DryRun
+            };
+            session_cleanup::run(session_cleanup::RunOptions { target, mode, json }).await?;
         }
         SessionCommand::MigrateSemanticResults { root, json } => {
             audit_semantic_result_migration(root, json).await?;

@@ -16385,7 +16385,8 @@ fn runtime_work_progress_from_tool_stream_event(
         ToolInvocationStreamEvent::OutputDelta { .. }
         | ToolInvocationStreamEvent::VisualUpdate { .. }
         | ToolInvocationStreamEvent::ArtifactUpdate { .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { .. } => None,
+        | ToolInvocationStreamEvent::LegacyPresentation { .. }
+        | ToolInvocationStreamEvent::LegacyTransientPruned { .. } => None,
     }
 }
 
@@ -16401,6 +16402,7 @@ fn normalize_tool_stream_event_sequence(
         | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
+        | ToolInvocationStreamEvent::LegacyTransientPruned { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id.clone(),
     };
     let next = stream_sequences
@@ -16502,6 +16504,7 @@ fn set_tool_stream_event_sequence(
             sequence,
             presentation,
         },
+        event @ ToolInvocationStreamEvent::LegacyTransientPruned { .. } => event,
         ToolInvocationStreamEvent::Finished {
             tool_call_id,
             is_error,

@@ -132,6 +132,18 @@ impl Drop for SessionLeaseGuard {
     }
 }
 
+/// Held exclusive maintenance access to one session.
+#[derive(Debug)]
+pub struct SessionMaintenanceGuard {
+    coordinator: File,
+}
+
+impl Drop for SessionMaintenanceGuard {
+    fn drop(&mut self) {
+        let _ = unlock_file(&self.coordinator);
+    }
+}
+
 /// Held short-lived exclusive access to one session write critical section.
 #[derive(Debug)]
 pub struct SessionWriteGuard {
@@ -200,6 +212,58 @@ pub fn acquire_session_lease(
     write_owner_metadata(&owner_path, &owner)?;
     let _ = unlock_file(&file);
     Ok(SessionLeaseGuard { owner_path, owner })
+}
+
+/// Acquire exclusive maintenance access, refusing every live session owner.
+///
+/// The coordinator lock remains held for the guard lifetime, preventing new owners from
+/// registering while an offline migration is active.
+///
+/// # Errors
+///
+/// Returns an error if locking or owner inspection fails, or if any live owner exists.
+pub fn acquire_session_maintenance_guard(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<SessionMaintenanceGuard, SessionLeaseError> {
+    let lock_path = session_lock_path(root, session_id);
+    let coordinator = open_lock_file(&lock_path)?;
+    lock_file_exclusive(&coordinator).map_err(|source| SessionLeaseError::Io {
+        path: lock_path,
+        source,
+    })?;
+    let access_dir = session_owner_dir(root, session_id);
+    fs::create_dir_all(&access_dir).map_err(|source| SessionLeaseError::Io {
+        path: access_dir.clone(),
+        source,
+    })?;
+    prune_dead_owner_records(&access_dir)?;
+    if let Some(owner) = first_owner(&access_dir)? {
+        return Err(SessionLeaseError::OwnedByOtherDaemon {
+            session_id,
+            owner_summary: format!(": {}", format_owner(&owner)),
+            owner: Some(Box::new(owner)),
+        });
+    }
+    Ok(SessionMaintenanceGuard { coordinator })
+}
+
+fn first_owner(access_dir: &Path) -> Result<Option<SessionLeaseOwner>, SessionLeaseError> {
+    for entry in fs::read_dir(access_dir).map_err(|source| SessionLeaseError::Io {
+        path: access_dir.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| SessionLeaseError::Io {
+            path: access_dir.to_path_buf(),
+            source,
+        })?;
+        if entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            && let Some(owner) = read_owner_metadata(&entry.path())
+        {
+            return Ok(Some(owner));
+        }
+    }
+    Ok(None)
 }
 
 /// Acquire exclusive short-lived access to one session write critical section.

@@ -199,6 +199,7 @@ fn apply_tool_invocation_stream_projection_event(
         ToolInvocationStreamEvent::LegacyPresentation { presentation, .. } => {
             legacy_record_tool_presentation(projection, presentation);
         }
+        ToolInvocationStreamEvent::LegacyTransientPruned { .. } => {}
     }
 }
 
@@ -229,12 +230,13 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
         | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
+        | ToolInvocationStreamEvent::LegacyTransientPruned { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
     }
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 30;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 31;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -942,6 +944,16 @@ pub struct ToolArtifactRef {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Kind of historical transient stream payload removed by one-time maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyTransientStreamKind {
+    OutputDelta,
+    VisualUpdate,
+    ArtifactUpdate,
+    LegacyPresentation,
+}
+
 /// Incremental event emitted while a tool invocation is running.
 ///
 /// This enum is persisted inside [`SessionEventKind`]. Keep the default
@@ -1021,6 +1033,11 @@ pub enum ToolInvocationStreamEvent {
         revision: u64,
         #[serde(default)]
         finalized: bool,
+    },
+    /// Tiny compatibility marker replacing a historically persisted transient payload.
+    LegacyTransientPruned {
+        tool_call_id: String,
+        original_kind: LegacyTransientStreamKind,
     },
 }
 

@@ -17,6 +17,7 @@
 mod actor;
 pub mod db;
 pub mod lease;
+pub mod legacy_stream_cleanup;
 pub mod persisted;
 mod persisted_legacy;
 pub mod projection;
