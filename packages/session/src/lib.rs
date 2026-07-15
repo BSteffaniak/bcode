@@ -50,6 +50,31 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::spawn_blocking;
 
+/// Return the stable kind name when a session event is live-only and must not be persisted.
+const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'static str> {
+    match kind {
+        SessionEventKind::ToolInvocationStream {
+            event:
+                bcode_session_models::ToolInvocationStreamEvent::OutputDelta { .. }
+                | bcode_session_models::ToolInvocationStreamEvent::LegacyPresentation { .. },
+        } => Some("tool_invocation_stream"),
+        _ => None,
+    }
+}
+
+fn ensure_durable_session_event_kind(
+    kind: &SessionEventKind,
+    metrics: Option<&MetricsRegistry>,
+) -> Result<(), SessionError> {
+    let Some(event_kind) = live_only_session_event_kind(kind) else {
+        return Ok(());
+    };
+    if let Some(metrics) = metrics {
+        metrics.increment_counter("session.event.live_persistence_rejected");
+    }
+    Err(SessionError::LiveEventPersistenceRejected { event_kind })
+}
+
 fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &SessionEvent) {
     if let Ok(payload) = serde_json::to_vec(event) {
         metrics.record_histogram("session.event.payload_bytes", payload.len() as u64);
@@ -124,6 +149,9 @@ pub enum SessionError {
     ConnectedClients(SessionId),
     #[error("session is being deleted: {0}")]
     Deleting(SessionId),
+    /// A live-only event was passed to the durable append boundary.
+    #[error("live-only session event cannot be persisted: {event_kind}")]
+    LiveEventPersistenceRejected { event_kind: &'static str },
     #[error("unsupported session projection window request")]
     UnsupportedProjectionWindow,
     #[error(
@@ -2778,6 +2806,32 @@ impl SessionManager {
         .await
     }
 
+    /// Resolve one finalized generic artifact reference through its bounded projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session database is unavailable, the projection is stale, or the
+    /// projected row cannot be read.
+    pub async fn finalized_artifact_reference(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+        reference_key: &str,
+    ) -> Result<Option<db::FinalizedArtifactReference>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::DbUnavailable(session_id))?;
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        let reference = db
+            .finalized_artifact_reference(artifact_id, reference_key)
+            .await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        Ok(reference)
+    }
+
     /// Append an event to a session.
     ///
     /// # Errors
@@ -3315,6 +3369,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_boundary_rejects_live_only_tool_stream_events() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("live-boundary".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        let variants = [
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call".to_owned(),
+                stream: bcode_session_models::ToolOutputStream::Pty,
+                sequence: 1,
+                text: "live".to_owned(),
+                byte_len: 4,
+            },
+            ToolInvocationStreamEvent::LegacyPresentation {
+                tool_call_id: "call".to_owned(),
+                sequence: 2,
+                presentation: bcode_session_models::LegacyToolPresentationEvent::Card(
+                    bcode_session_models::LegacyToolCardPresentation {
+                        target: bcode_session_models::LegacyToolPresentationTarget::Result,
+                        title: "legacy".to_owned(),
+                        subtitle: None,
+                        sections: Vec::new(),
+                    },
+                ),
+            },
+        ];
+
+        for event in variants {
+            let error = manager
+                .append_event(session.id, SessionEventKind::ToolInvocationStream { event })
+                .await
+                .expect_err("live-only event must be rejected");
+            assert!(matches!(
+                error,
+                SessionError::LiveEventPersistenceRejected {
+                    event_kind: "tool_invocation_stream"
+                }
+            ));
+        }
+
+        let history = manager
+            .session_history(session.id)
+            .await
+            .expect("history should read");
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn reading_legacy_stream_events_does_not_rewrite_session_storage() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should create");
@@ -3322,21 +3429,28 @@ mod tests {
             .create_session(Some("legacy-stream".to_owned()), test_working_directory())
             .await
             .expect("session should create");
-        manager
-            .append_event(
-                session.id,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "legacy-call".to_owned(),
-                        stream: bcode_session_models::ToolOutputStream::Pty,
-                        sequence: 1,
-                        text: "legacy persisted bytes".to_owned(),
-                        byte_len: 22,
-                    },
+        let legacy_event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: session.id,
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "legacy-call".to_owned(),
+                    stream: bcode_session_models::ToolOutputStream::Pty,
+                    sequence: 1,
+                    text: "legacy persisted bytes".to_owned(),
+                    byte_len: 22,
                 },
-            )
+            },
+        };
+        let db = db::SessionDb::open_turso_in_root(session.id, &root)
             .await
-            .expect("legacy stream event should append");
+            .expect("session DB should open");
+        db.append_event(&legacy_event)
+            .await
+            .expect("legacy fixture should append below the current durable boundary");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let before = session_database_files(&root, session.id);
 

@@ -604,6 +604,7 @@ impl SessionActor {
     ) -> Result<SessionEvent, SessionError> {
         let total_started_at = Instant::now();
         let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
+        crate::ensure_durable_session_event_kind(&kind, metrics.as_ref())?;
         if let Some(metrics) = &metrics {
             metrics.increment_counter("session.actor.append_event.total");
         }

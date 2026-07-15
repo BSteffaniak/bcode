@@ -617,7 +617,11 @@ pub enum SessionLiveEventKind {
     AssistantTextDelta { turn_id: String, text: String },
     /// Coalesced provider-exposed reasoning text produced by an active model turn.
     AssistantReasoningDelta { turn_id: String, text: String },
-    /// Raw live tool output emitted while a tool is running.
+    /// Raw output emitted while a tool is running.
+    ///
+    /// Output deltas are live-only and must never be persisted in canonical session history.
+    /// Opaque visual updates currently share this live transport, but active-artifact snapshots
+    /// must replace their cumulative payload before durable visual compatibility can be removed.
     ToolOutputDelta { event: ToolInvocationStreamEvent },
     /// Live-only tool argument visual derived from partial tool-call arguments.
     ToolArgumentPreview {

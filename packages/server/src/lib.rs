@@ -5265,26 +5265,12 @@ async fn read_session_artifact_range(
             "artifact range length must be between 1 and {MAX_ARTIFACT_RANGE_BYTES} bytes"
         ));
     }
-    let history = state
+    let reference = state
         .sessions
-        .session_history(session_id)
+        .finalized_artifact_reference(session_id, artifact_id, reference_key)
         .await
-        .map_err(|error| error.to_string())?;
-    let reference = history
-        .iter()
-        .find_map(|event| match &event.kind {
-            SessionEventKind::ToolCallFinished {
-                semantic_result: Some(ToolInvocationResult::Artifact { artifact }),
-                ..
-            } if artifact.artifact_id == artifact_id => artifact
-                .refs
-                .iter()
-                .find(|reference| reference.key == reference_key),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            "artifact reference was not found in canonical session history".to_owned()
-        })?;
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "artifact reference was not found in the finalized projection".to_owned())?;
     let uri = reference
         .storage_uri
         .as_deref()
@@ -5296,16 +5282,16 @@ async fn read_session_artifact_range(
     let path = url
         .to_file_path()
         .map_err(|()| "artifact file path is invalid".to_owned())?;
-    let (total_bytes, bytes) = read_artifact_file_range(
-        &path,
-        &default_session_artifact_dir(session_id),
-        offset,
-        length,
-    )?;
+    let artifact_root = default_session_artifact_dir(session_id);
+    let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
+        read_artifact_file_range(&path, &artifact_root, offset, length)
+    })
+    .await
+    .map_err(|error| format!("artifact range reader task failed: {error}"))??;
     Ok(ResponsePayload::SessionArtifactRange {
         artifact_id: artifact_id.to_owned(),
         reference_key: reference_key.to_owned(),
-        content_type: reference.content_type.clone(),
+        content_type: reference.content_type,
         offset,
         total_bytes,
         bytes,
@@ -15270,13 +15256,13 @@ async fn handle_interactive_tool_request(
         .map_err(|error| error.to_string())
 }
 
-/// Append durable tool stream lifecycle events or publish ephemeral output deltas.
+/// Publish ephemeral tool output and visuals, or append bounded lifecycle events.
 ///
-/// `OutputDelta` carries raw live tool output, including PTY bytes. These chunks
-/// are intentionally transient: they are broadcast to currently attached clients
-/// and must not be appended to durable session history. Durable history stores the
-/// tool request, stream lifecycle metadata, final status, and final bounded tool
-/// result instead.
+/// `OutputDelta` carries raw live tool output, including PTY bytes, and is intentionally
+/// transient. `VisualUpdate` currently carries plugin-owned replaceable state to attached clients
+/// and remains durable for active-reattach compatibility until generic active-artifact snapshots
+/// replace the cumulative payload. Durable history otherwise stores the tool request, bounded
+/// stream lifecycle metadata, final status, and final bounded tool result.
 async fn append_tool_stream_event(
     state: &ServerState,
     session_id: SessionId,
@@ -21491,6 +21477,49 @@ mod tests {
             SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::OutputDelta { .. }
             }
+        )));
+    }
+
+    #[tokio::test]
+    async fn tool_stream_lifecycle_events_remain_durable() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+        let started = ToolInvocationStreamEvent::Started {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "test.tool".to_owned(),
+            sequence: 1,
+            terminal: false,
+            columns: None,
+            rows: None,
+            started_at_ms: Some(1),
+        };
+        let finished = ToolInvocationStreamEvent::Finished {
+            tool_call_id: "call-1".to_owned(),
+            sequence: 2,
+            is_error: false,
+            finished_at_ms: Some(2),
+        };
+
+        append_tool_stream_event(&state, session_id, started.clone()).await;
+        append_tool_stream_event(&state, session_id, finished.clone()).await;
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationStream { event } if event == &started
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationStream { event } if event == &finished
         )));
     }
 

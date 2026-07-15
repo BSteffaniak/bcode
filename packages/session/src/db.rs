@@ -18,8 +18,8 @@ use bcode_metrics::{DatabaseMetrics, DatabaseOperation, MetricsRegistry};
 use bcode_session_models::{
     RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionInputHistoryEntry, SessionSummary, SessionTitleSource, ToolInvocationStreamEvent,
-    WorkId,
+    SessionInputHistoryEntry, SessionSummary, SessionTitleSource, ToolInvocationResult,
+    ToolInvocationStreamEvent, WorkId,
 };
 use switchy::{
     database::{
@@ -78,6 +78,15 @@ pub enum SessionDbError {
     /// Canonical event sequences cannot produce a trustworthy incremental projection.
     #[error("invalid canonical event sequence for reindex: expected #{expected}, found #{actual}")]
     InvalidCanonicalSequence { expected: u64, actual: u64 },
+    /// A materialized projection does not match the canonical event tail.
+    #[error(
+        "session DB projection is stale: {projection} checkpoint={checkpoint:?} expected={expected}"
+    )]
+    ProjectionStale {
+        projection: &'static str,
+        checkpoint: Option<u64>,
+        expected: u64,
+    },
     /// A compaction marker is malformed or internally inconsistent.
     #[error("invalid context compaction marker at event #{sequence}: {message}")]
     InvalidCompactionMarker { sequence: u64, message: String },
@@ -112,16 +121,19 @@ pub enum MaterializedProjection {
     Transcript,
     /// Active and completed tool-call rows.
     ToolRuns,
+    /// Generic references from finalized plugin artifacts.
+    ArtifactReferences,
     /// Runtime-work lifecycle rows.
     RuntimeWork,
 }
 
 impl MaterializedProjection {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::SessionState,
         Self::InputHistory,
         Self::Transcript,
         Self::ToolRuns,
+        Self::ArtifactReferences,
         Self::RuntimeWork,
     ];
 
@@ -139,6 +151,7 @@ impl MaterializedProjection {
             Self::InputHistory => "input_history",
             Self::Transcript => "transcript",
             Self::ToolRuns => "tool_runs",
+            Self::ArtifactReferences => "artifact_references",
             Self::RuntimeWork => "runtime_work",
         }
     }
@@ -250,6 +263,31 @@ pub struct TranscriptItem {
     pub status: String,
     /// Optional display content.
     pub content: Option<String>,
+}
+
+/// Generic finalized artifact reference stored in a bounded session projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedArtifactReference {
+    /// Stable artifact identifier within the session.
+    pub artifact_id: String,
+    /// Plugin-owned reference key.
+    pub reference_key: String,
+    /// Plugin that produced the artifact.
+    pub producer_plugin_id: String,
+    /// Plugin-owned artifact schema identifier.
+    pub schema: String,
+    /// Artifact schema version.
+    pub schema_version: u32,
+    /// Storage URI, when the artifact is externally readable.
+    pub storage_uri: Option<String>,
+    /// Media type, when known.
+    pub content_type: Option<String>,
+    /// Referenced byte length, when known.
+    pub byte_len: Option<u64>,
+    /// Plugin-owned reference metadata.
+    pub metadata: Option<serde_json::Value>,
+    /// Canonical event that finalized this reference.
+    pub finalized_event_seq: u64,
 }
 
 /// Backend-agnostic handle for Bcode's global session catalog database.
@@ -1557,6 +1595,52 @@ impl SessionDb {
             .transpose()
     }
 
+    /// Resolve one finalized artifact reference from the bounded materialized projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails, projection rows are malformed, or the
+    /// artifact projection does not match the canonical event tail.
+    pub async fn finalized_artifact_reference(
+        &self,
+        artifact_id: &str,
+        reference_key: &str,
+    ) -> SessionDbResult<Option<FinalizedArtifactReference>> {
+        let expected = self.last_event_sequence().await?.unwrap_or_default();
+        let checkpoint = self
+            .materialized_projection_checkpoint(MaterializedProjection::ArtifactReferences)
+            .await?;
+        if checkpoint != Some(expected) {
+            return Err(SessionDbError::ProjectionStale {
+                projection: MaterializedProjection::ArtifactReferences.as_str(),
+                checkpoint,
+                expected,
+            });
+        }
+        let row = self
+            .db
+            .select("artifact_references")
+            .columns(&[
+                "artifact_id",
+                "reference_key",
+                "producer_plugin_id",
+                "schema",
+                "schema_version",
+                "storage_uri",
+                "content_type",
+                "byte_len",
+                "metadata",
+                "finalized_event_seq",
+            ])
+            .where_eq("artifact_id", artifact_id)
+            .where_eq("reference_key", reference_key)
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(finalized_artifact_reference_from_row)
+            .transpose()
+    }
+
     /// Return the latest transcript projection rows as generic database rows for callers that
     /// need a lightweight window before typed projection models are finalized.
     ///
@@ -1794,6 +1878,12 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "CREATE INDEX IF NOT EXISTS idx_model_context_entries_event_type ON model_context_entries(event_type)",
         "DROP INDEX IF EXISTS idx_model_context_entries_event_type",
     );
+    add_sql_migration(
+        source,
+        "021_artifact_references_table",
+        "CREATE TABLE IF NOT EXISTS artifact_references (\n    artifact_id TEXT NOT NULL,\n    reference_key TEXT NOT NULL,\n    producer_plugin_id TEXT NOT NULL,\n    schema TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    storage_uri TEXT,\n    content_type TEXT,\n    byte_len INTEGER,\n    metadata TEXT,\n    finalized_event_seq INTEGER NOT NULL,\n    PRIMARY KEY(artifact_id, reference_key),\n    FOREIGN KEY(finalized_event_seq) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS artifact_references",
+    );
 }
 
 fn add_sql_migration(
@@ -2012,6 +2102,7 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             is_error,
+            semantic_result,
             ..
         } => {
             db.update("tool_runs")
@@ -2021,6 +2112,9 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
                 .where_eq("tool_call_id", tool_call_id.clone())
                 .execute(db)
                 .await?;
+            if let Some(ToolInvocationResult::Artifact { artifact }) = semantic_result {
+                project_artifact_references(db, event.sequence, artifact).await?;
+            }
             insert_tool_result_transcript_item(db, event, tool_call_id, *is_error).await?;
         }
         SessionEventKind::ToolInvocationStream { event: stream } => {
@@ -2291,6 +2385,61 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
     }
 }
 
+async fn project_artifact_references(
+    db: &dyn Database,
+    finalized_event_seq: u64,
+    artifact: &bcode_session_models::ToolArtifact,
+) -> SessionDbResult<()> {
+    for reference in &artifact.refs {
+        let metadata = reference
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        db.upsert("artifact_references")
+            .value("artifact_id", artifact.artifact_id.clone())
+            .value("reference_key", reference.key.clone())
+            .value("producer_plugin_id", artifact.producer_plugin_id.clone())
+            .value("schema", artifact.schema.clone())
+            .value(
+                "schema_version",
+                DatabaseValue::Int64(i64::from(artifact.schema_version)),
+            )
+            .value("storage_uri", reference.storage_uri.clone())
+            .value("content_type", reference.content_type.clone())
+            .value("byte_len", reference.byte_len.map(seq_to_value))
+            .value("metadata", metadata)
+            .value("finalized_event_seq", seq_to_value(finalized_event_seq))
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+fn finalized_artifact_reference_from_row(
+    row: &switchy::database::Row,
+) -> SessionDbResult<FinalizedArtifactReference> {
+    let metadata = optional_string(row, "metadata")
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?;
+    Ok(FinalizedArtifactReference {
+        artifact_id: required_string(row, "artifact_id")?,
+        reference_key: required_string(row, "reference_key")?,
+        producer_plugin_id: required_string(row, "producer_plugin_id")?,
+        schema: required_string(row, "schema")?,
+        schema_version: u32::try_from(required_i64(row, "schema_version")?).map_err(|_| {
+            SessionDbError::InvalidRow {
+                column: "schema_version".to_owned(),
+            }
+        })?,
+        storage_uri: optional_string(row, "storage_uri"),
+        content_type: optional_string(row, "content_type"),
+        byte_len: optional_i64(row, "byte_len").map(i64_to_u64),
+        metadata,
+        finalized_event_seq: required_i64(row, "finalized_event_seq").map(i64_to_u64)?,
+    })
+}
+
 async fn update_projection_checkpoints(
     db: &dyn Database,
     event: &SessionEvent,
@@ -2321,6 +2470,13 @@ async fn update_projection_checkpoint(
             .where_eq("projection_name", projection_name)
             .execute(db)
             .await?;
+    } else if projection_name == MaterializedProjection::ArtifactReferences.as_str()
+        && (!matches!(event.kind, SessionEventKind::SessionCreated { .. }) || event.sequence != 0)
+    {
+        // A missing checkpoint on a non-empty session means this projection predates the
+        // canonical history. Do not make a partial projection appear current; explicit reindex
+        // or migration must populate the historical prefix first.
+        return Ok(());
     } else {
         db.insert("projection_checkpoints")
             .value("projection_name", projection_name)
@@ -4151,6 +4307,131 @@ mod tests {
                 event: ToolInvocationStreamEvent::OutputDelta { stream, .. }
             } if *stream == bcode_session_models::ToolOutputStream::Pty
         )));
+    }
+
+    #[tokio::test]
+    async fn finalized_artifact_references_are_projected_for_bounded_lookup() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("artifact projection".to_owned()),
+                working_directory: std::path::PathBuf::from("/tmp"),
+            },
+        ))
+        .await
+        .expect("append session creation");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-1".to_owned(),
+                result: "done".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_session_models::ToolArtifact {
+                        artifact_id: "artifact-1".to_owned(),
+                        producer_plugin_id: "fixture.plugin".to_owned(),
+                        schema: "fixture.recording".to_owned(),
+                        schema_version: 3,
+                        tool_call_id: Some("call-1".to_owned()),
+                        title: None,
+                        metadata: serde_json::Value::Null,
+                        refs: vec![bcode_session_models::ToolArtifactRef {
+                            key: "recording".to_owned(),
+                            content_type: Some("application/octet-stream".to_owned()),
+                            storage_uri: Some("file:///tmp/recording".to_owned()),
+                            byte_len: Some(42),
+                            metadata: Some(serde_json::json!({"availability": "complete"})),
+                        }],
+                    }),
+                }),
+            },
+        ))
+        .await
+        .expect("append finalized artifact");
+
+        let reference = db
+            .finalized_artifact_reference("artifact-1", "recording")
+            .await
+            .expect("projected lookup")
+            .expect("reference");
+        assert_eq!(reference.producer_plugin_id, "fixture.plugin");
+        assert_eq!(reference.schema, "fixture.recording");
+        assert_eq!(reference.schema_version, 3);
+        assert_eq!(reference.byte_len, Some(42));
+        assert_eq!(reference.finalized_event_seq, 1);
+        assert_eq!(
+            reference.metadata,
+            Some(serde_json::json!({"availability": "complete"}))
+        );
+        assert!(
+            db.finalized_artifact_reference("artifact-1", "missing")
+                .await
+                .expect("missing lookup")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_session_does_not_mark_partial_artifact_projection_fresh() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.database()
+            .insert("events")
+            .value("event_seq", seq_to_value(0))
+            .value("event_type", "session_created")
+            .value(
+                "schema_version",
+                DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
+            )
+            .value("created_at_ms", seq_to_value(0))
+            .value(
+                "payload",
+                encode_session_event(&event(
+                    session_id,
+                    0,
+                    SessionEventKind::SessionCreated {
+                        name: Some("legacy".to_owned()),
+                        working_directory: std::path::PathBuf::from("/tmp"),
+                    },
+                ))
+                .expect("encode legacy event"),
+            )
+            .execute(db.database())
+            .await
+            .expect("insert legacy canonical event");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::AssistantMessage {
+                text: "new tail".to_owned(),
+            },
+        ))
+        .await
+        .expect("append new tail");
+
+        let error = db
+            .finalized_artifact_reference("artifact", "recording")
+            .await
+            .expect_err("partial projection must remain stale");
+        assert!(matches!(
+            error,
+            SessionDbError::ProjectionStale {
+                projection: "artifact_references",
+                checkpoint: None,
+                expected: 1
+            }
+        ));
     }
 
     #[tokio::test]
