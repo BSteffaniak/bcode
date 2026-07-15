@@ -736,7 +736,7 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
     ]));
 
     let preview = inline_preview(&visible_lines, MAX_INLINE_DIFF_ROWS);
-    let resolved_layout = resolved_layout(input.layout, width, input.old_text, input.new_text);
+    let resolved_layout = resolved_layout(input.layout, width, diff.added, diff.removed);
     let card_width = if resolved_layout == DiffViewerLayout::SideBySide {
         side_by_side_card_width(&preview, width.saturating_sub(2))
     } else {
@@ -760,10 +760,10 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
 const fn resolved_layout(
     layout: DiffViewerLayout,
     width: u16,
-    old_text: &str,
-    new_text: &str,
+    added: u32,
+    removed: u32,
 ) -> DiffViewerLayout {
-    if old_text.is_empty() || new_text.is_empty() {
+    if added == 0 || removed == 0 {
         DiffViewerLayout::Unified
     } else {
         layout.resolve(width)
@@ -1431,6 +1431,39 @@ mod tests {
                     let text = line_text(row);
                     text.starts_with("  │")
                 })
+                .collect::<Vec<_>>();
+
+            assert!(!card_rows.is_empty(), "{rows:?}");
+            for row in card_rows {
+                let divider_count = row
+                    .spans
+                    .iter()
+                    .filter(|span| span.content.contains('│'))
+                    .map(|span| span.content.matches('│').count())
+                    .sum::<usize>();
+                assert_eq!(divider_count, 3, "{row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn one_kind_of_change_falls_back_to_unified_layout() {
+        for (old_text, new_text) in [
+            ("before\nafter\n", "before\ninserted\nafter\n"),
+            ("before\nremoved\nafter\n", "before\nafter\n"),
+        ] {
+            let rows = test_diff_viewer_rows_with_layout(
+                "src/lib.rs",
+                old_text,
+                new_text,
+                "Diff",
+                false,
+                120,
+                DiffViewerLayout::SideBySide,
+            );
+            let card_rows = rows
+                .iter()
+                .filter(|row| line_text(row).starts_with("  │"))
                 .collect::<Vec<_>>();
 
             assert!(!card_rows.is_empty(), "{rows:?}");
