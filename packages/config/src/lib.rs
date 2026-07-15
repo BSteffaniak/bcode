@@ -2732,6 +2732,9 @@ impl Default for StreamingConfig {
 }
 
 /// Model provider retry configuration.
+///
+/// Independent booleans intentionally preserve stable, separately configurable retry controls.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "retry")]
 pub struct ModelRetryConfig {
@@ -2750,6 +2753,18 @@ pub struct ModelRetryConfig {
     /// Maximum overload retry delay in milliseconds.
     #[serde(default = "default_overload_max_delay_ms")]
     pub overload_max_delay_ms: u64,
+    /// Enable built-in model no-progress timeout retries.
+    #[serde(default = "default_no_progress_timeout_retry_enabled")]
+    pub no_progress_timeout_enabled: bool,
+    /// Maximum automatic retry attempts for model no-progress timeouts.
+    #[serde(default = "default_max_no_progress_timeout_retries")]
+    pub max_no_progress_timeout_retries: u8,
+    /// Initial model no-progress timeout retry delay in milliseconds.
+    #[serde(default = "default_no_progress_timeout_initial_delay_ms")]
+    pub no_progress_timeout_initial_delay_ms: u64,
+    /// Maximum model no-progress timeout retry delay in milliseconds.
+    #[serde(default = "default_no_progress_timeout_max_delay_ms")]
+    pub no_progress_timeout_max_delay_ms: u64,
     /// Enable recoverable error patterns imported from the remote model catalog.
     #[serde(default = "default_remote_catalog_retry_rules_enabled")]
     pub remote_catalog_rules_enabled: bool,
@@ -2774,6 +2789,10 @@ impl Default for ModelRetryConfig {
             max_overload_retries: default_max_overload_retries(),
             overload_initial_delay_ms: default_overload_initial_delay_ms(),
             overload_max_delay_ms: default_overload_max_delay_ms(),
+            no_progress_timeout_enabled: default_no_progress_timeout_retry_enabled(),
+            max_no_progress_timeout_retries: default_max_no_progress_timeout_retries(),
+            no_progress_timeout_initial_delay_ms: default_no_progress_timeout_initial_delay_ms(),
+            no_progress_timeout_max_delay_ms: default_no_progress_timeout_max_delay_ms(),
             remote_catalog_rules_enabled: default_remote_catalog_retry_rules_enabled(),
             rules: Vec::new(),
         }
@@ -2798,6 +2817,22 @@ const fn default_overload_initial_delay_ms() -> u64 {
 
 const fn default_overload_max_delay_ms() -> u64 {
     30_000
+}
+
+const fn default_no_progress_timeout_retry_enabled() -> bool {
+    true
+}
+
+const fn default_max_no_progress_timeout_retries() -> u8 {
+    2
+}
+
+const fn default_no_progress_timeout_initial_delay_ms() -> u64 {
+    1_000
+}
+
+const fn default_no_progress_timeout_max_delay_ms() -> u64 {
+    8_000
 }
 
 /// Automatic context compaction configuration.
@@ -4249,6 +4284,32 @@ fn write_model_retry_toml(output: &mut String, retry: &ModelRetryConfig) {
         output,
         "overload_max_delay_ms = {}",
         retry.overload_max_delay_ms
+    )
+    .expect("writing to string should not fail");
+    if retry.no_progress_timeout_enabled != default_no_progress_timeout_retry_enabled() {
+        writeln!(
+            output,
+            "no_progress_timeout_enabled = {}",
+            retry.no_progress_timeout_enabled
+        )
+        .expect("writing to string should not fail");
+    }
+    writeln!(
+        output,
+        "max_no_progress_timeout_retries = {}",
+        retry.max_no_progress_timeout_retries
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "no_progress_timeout_initial_delay_ms = {}",
+        retry.no_progress_timeout_initial_delay_ms
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "no_progress_timeout_max_delay_ms = {}",
+        retry.no_progress_timeout_max_delay_ms
     )
     .expect("writing to string should not fail");
     if retry.remote_catalog_rules_enabled != default_remote_catalog_retry_rules_enabled() {
@@ -6088,6 +6149,10 @@ auth_pool = "openai"
 max_overload_retries = 3
 overload_initial_delay_ms = 1000
 overload_max_delay_ms = 10000
+no_progress_timeout_enabled = false
+max_no_progress_timeout_retries = 4
+no_progress_timeout_initial_delay_ms = 1500
+no_progress_timeout_max_delay_ms = 12000
 remote_catalog_rules_enabled = false
 
 [[model.retry.rules]]
@@ -6109,6 +6174,13 @@ message_contains = "Unsupported content type"
         assert_eq!(config.model.retry.max_overload_retries, 3);
         assert_eq!(config.model.retry.overload_initial_delay_ms, 1_000);
         assert_eq!(config.model.retry.overload_max_delay_ms, 10_000);
+        assert!(!config.model.retry.no_progress_timeout_enabled);
+        assert_eq!(config.model.retry.max_no_progress_timeout_retries, 4);
+        assert_eq!(
+            config.model.retry.no_progress_timeout_initial_delay_ms,
+            1_500
+        );
+        assert_eq!(config.model.retry.no_progress_timeout_max_delay_ms, 12_000);
         assert!(!config.model.retry.remote_catalog_rules_enabled);
         let rule = config
             .model

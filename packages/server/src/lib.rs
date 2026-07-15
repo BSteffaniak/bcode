@@ -11138,6 +11138,7 @@ struct ProviderRetryPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderRetryPolicyKind {
     Overload,
+    NoProgressTimeout,
     Custom,
 }
 
@@ -11160,6 +11161,17 @@ fn matching_provider_retry_policy(
             max_delay_ms: state.model_retry.overload_max_delay_ms,
             use_provider_retry_hint: true,
             kind: ProviderRetryPolicyKind::Overload,
+        });
+    }
+    if state.model_retry.no_progress_timeout_enabled && is_model_no_progress_timeout(error) {
+        return Some(ProviderRetryPolicy {
+            id: "builtin.no_progress_timeout".to_string(),
+            display_name: "no-progress timeout".to_string(),
+            max_retries: state.model_retry.max_no_progress_timeout_retries,
+            initial_delay_ms: state.model_retry.no_progress_timeout_initial_delay_ms,
+            max_delay_ms: state.model_retry.no_progress_timeout_max_delay_ms,
+            use_provider_retry_hint: false,
+            kind: ProviderRetryPolicyKind::NoProgressTimeout,
         });
     }
 
@@ -11480,9 +11492,16 @@ async fn retry_after_provider_error(
 }
 
 fn provider_retry_message(policy: &ProviderRetryPolicy, delay: Duration, attempt: u8) -> String {
-    if policy.kind == ProviderRetryPolicyKind::Overload {
+    let reason = match policy.kind {
+        ProviderRetryPolicyKind::Overload => Some("Model provider is overloaded."),
+        ProviderRetryPolicyKind::NoProgressTimeout => {
+            Some("Model provider made no progress before timeout.")
+        }
+        ProviderRetryPolicyKind::Custom => None,
+    };
+    if let Some(reason) = reason {
         return format!(
-            "Model provider is overloaded. Retrying automatically in {} (attempt {}/{}).",
+            "{reason} Retrying automatically in {} (attempt {}/{}).",
             format_retry_delay(delay),
             attempt,
             policy.max_retries
@@ -21753,21 +21772,8 @@ mod tests {
     }
 
     #[test]
-    fn model_no_progress_timeout_matches_configured_retry_rule() {
-        let mut state = test_server_state(SessionManager::default());
-        state
-            .model_retry
-            .rules
-            .push(bcode_config::ModelRetryRuleConfig {
-                id: "model-no-progress-timeout".to_string(),
-                max_retries: Some(2),
-                initial_delay_ms: Some(500),
-                r#match: bcode_config::ModelRetryRuleMatchConfig {
-                    code: Some(MODEL_NO_PROGRESS_TIMEOUT_CODE.to_string()),
-                    ..bcode_config::ModelRetryRuleMatchConfig::default()
-                },
-                ..bcode_config::ModelRetryRuleConfig::default()
-            });
+    fn model_no_progress_timeout_uses_builtin_retry_policy_by_default() {
+        let state = test_server_state(SessionManager::default());
         let error = model_no_progress_timeout_error("timed out".to_string());
 
         let policy = matching_provider_retry_policy(
@@ -21777,16 +21783,19 @@ mod tests {
             &[],
             &[],
         )
-        .expect("configured timeout retry policy should match");
+        .expect("built-in timeout retry policy should match");
 
-        assert_eq!(policy.id, "custom.model-no-progress-timeout");
+        assert_eq!(policy.id, "builtin.no_progress_timeout");
         assert_eq!(policy.max_retries, 2);
-        assert_eq!(policy.initial_delay_ms, 500);
+        assert_eq!(policy.initial_delay_ms, 1_000);
+        assert_eq!(policy.max_delay_ms, 8_000);
+        assert!(!policy.use_provider_retry_hint);
     }
 
     #[test]
-    fn model_no_progress_timeout_is_not_retried_without_matching_rule() {
-        let state = test_server_state(SessionManager::default());
+    fn model_no_progress_timeout_retry_can_be_disabled() {
+        let mut state = test_server_state(SessionManager::default());
+        state.model_retry.no_progress_timeout_enabled = false;
         let error = model_no_progress_timeout_error("timed out".to_string());
 
         assert!(

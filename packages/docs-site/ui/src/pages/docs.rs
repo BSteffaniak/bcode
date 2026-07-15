@@ -303,6 +303,8 @@ mod tests {
         assert!(doc.contains("reasoning.effort"));
         assert!(doc.contains("conversation_reuse.mode"));
         assert!(doc.contains("retry.max_overload_retries"));
+        assert!(doc.contains("retry.no_progress_timeout_enabled"));
+        assert!(doc.contains("retry.max_no_progress_timeout_retries"));
         assert!(doc.contains("profiles.<profile>.extends"));
         assert!(doc.contains("profiles.<profile>.patch"));
     }
@@ -361,6 +363,8 @@ mod tests {
         assert_row_default(&doc, "level", "standard");
         assert_row_default(&doc, "enabled", "true");
         assert_row_default(&doc, "retry.max_overload_retries", "5");
+        assert_row_default(&doc, "retry.no_progress_timeout_enabled", "true");
+        assert_row_default(&doc, "retry.max_no_progress_timeout_retries", "2");
         assert_row_default(&doc, "compaction.mode", "on_overflow");
         assert_row_default(&doc, "mouse.scroll_rows", "3");
         assert_row_default(&doc, "pools.<pool>.strategy", "failover");
