@@ -235,6 +235,8 @@ pub enum ToolInvocationInputResolution {
     Received { input: ToolInvocationInput },
     /// The owning invocation or turn was cancelled.
     Cancelled,
+    /// The bounded input wait elapsed without an input.
+    TimedOut,
     /// The host closed input delivery for this invocation.
     Closed,
     /// Input routing failed.

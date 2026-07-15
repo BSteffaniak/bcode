@@ -299,7 +299,11 @@ pub enum ServiceBridgeRequest {
     /// Request a correlated external exchange.
     Exchange(bcode_tool::ToolExchangeRequest),
     /// Wait for the next unsolicited invocation input.
-    ReceiveInput { invocation_id: String },
+    ReceiveInput {
+        invocation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
     /// Invoke a nested host service.
     InvokeService(bcode_tool::ToolInvocationServiceRequest),
     /// Write one bounded host artifact.
@@ -1760,6 +1764,7 @@ mod tests {
         );
         let input = ServiceBridgeRequest::ReceiveInput {
             invocation_id: "invoke".to_string(),
+            timeout_ms: None,
         };
         let service =
             ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
@@ -1802,6 +1807,7 @@ mod tests {
         );
         let request = ServiceBridgeRequest::ReceiveInput {
             invocation_id: "invoke".to_string(),
+            timeout_ms: None,
         };
 
         assert_eq!(
@@ -1845,6 +1851,7 @@ mod tests {
         );
         let request = ServiceBridgeRequest::ReceiveInput {
             invocation_id: "invoke".to_string(),
+            timeout_ms: None,
         };
 
         assert_eq!(
@@ -1866,6 +1873,7 @@ mod tests {
         );
         let request = ServiceBridgeRequest::ReceiveInput {
             invocation_id: "x".repeat(super::SERVICE_BRIDGE_MAX_REQUEST_BYTES),
+            timeout_ms: None,
         };
 
         assert!(matches!(

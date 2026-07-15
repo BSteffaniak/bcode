@@ -9,9 +9,9 @@ use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolDefinition, ToolInvocationHostAction, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolPluginVisualMetadata,
-    ToolSideEffect, ToolVisualPayloadSelector,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
+    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolInvocationStreamEvent,
+    ToolList, ToolPluginVisualMetadata, ToolSideEffect, ToolVisualPayloadSelector,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ use std::env;
 use std::time::Duration;
 use thiserror::Error;
 
+const MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE: &str = "bcode.web-search.model-native/v1";
+const MODEL_NATIVE_WEB_SEARCH_OPERATION: &str = "search";
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_MAX_RESULTS: usize = 8;
 const DEFAULT_FETCH_MAX_BYTES: usize = 256 * 1024;
@@ -118,6 +120,7 @@ impl WebSearchPlugin {
                 &context.cancellation,
                 &invocation,
                 context.events,
+                context.bridge.clone(),
             ),
             "web.fetch" => self.invoke_fetch(
                 &context.config,
@@ -145,6 +148,7 @@ impl WebSearchPlugin {
         cancellation: &bcode_plugin_sdk::ServiceCancellation,
         invocation: &ToolInvocationRequest,
         events: ServiceEventEmitter,
+        bridge: ServiceBridge,
     ) -> ToolInvocationResponse {
         let request = match serde_json::from_value::<SearchRequest>(invocation.arguments.clone()) {
             Ok(request) => request,
@@ -161,7 +165,13 @@ impl WebSearchPlugin {
         let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
         progress.emit(format!("search: query {}", request.query));
         match runtime.block_on(run_cancellable(
-            search_async(request, plugin_config, Some(progress)),
+            search_async(
+                request,
+                plugin_config,
+                Some(progress),
+                bridge,
+                invocation.tool_call_id.clone(),
+            ),
             cancellation.clone(),
         )) {
             Ok(Ok(response)) => search_tool_response(&response, &invocation.tool_call_id),
@@ -393,11 +403,9 @@ struct SearchResponse {
     results: Vec<SearchResult>,
     partial: bool,
     message: Option<String>,
-    #[serde(skip)]
-    host_action: Option<ToolInvocationHostAction>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchResult {
     title: String,
     url: String,
@@ -647,6 +655,8 @@ async fn search_async(
     request: SearchRequest,
     config: WebSearchConfig,
     progress: Option<ProgressReporter>,
+    bridge: ServiceBridge,
+    invocation_id: String,
 ) -> Result<SearchResponse, WebError> {
     validate_non_empty("query", &request.query)?;
     let provider = search_provider(request.provider.as_deref(), &config)?;
@@ -661,25 +671,7 @@ async fn search_async(
         "gemini" | "google_gemini" => search_gemini(request, &config).await,
         "serper" => search_serper(request, &config).await,
         "serpapi" | "serp_api" => search_serpapi(request, &config).await,
-        "model_native" => Ok(SearchResponse {
-            query: request.query.clone(),
-            provider: "model_native".to_string(),
-            results: Vec::new(),
-            partial: true,
-            message: Some(
-                "model-native web search requested through host provider bridge".to_string(),
-            ),
-            host_action: Some(ToolInvocationHostAction::HostModelNativeWebSearch(
-                bcode_tool::HostModelNativeWebSearchRequest {
-                    query: request.query,
-                    max_results: request.max_results,
-                    site: request.site,
-                    freshness: request.freshness,
-                    region: request.region,
-                    safe_search: request.safe_search,
-                },
-            )),
-        }),
+        "model_native" => search_model_native(&request, &bridge, &invocation_id),
         "duckduckgo_html" | "duckduckgo" | "ddg" => search_duckduckgo_html(request, &config).await,
         _ => Err(WebError::InvalidRequest(format!(
             "unsupported web search provider: {provider}"
@@ -692,6 +684,70 @@ async fn search_async(
         ));
     }
     Ok(response)
+}
+
+fn search_model_native(
+    request: &SearchRequest,
+    bridge: &ServiceBridge,
+    invocation_id: &str,
+) -> Result<SearchResponse, WebError> {
+    let query = request.query.clone();
+    let response = bridge
+        .request(&ServiceBridgeRequest::InvokeService(
+            ToolInvocationServiceRequest {
+                invocation_id: invocation_id.to_string(),
+                request_id: format!("{invocation_id}-model-native-search"),
+                interface_id: MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE.to_string(),
+                operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
+                payload: serde_json::json!({
+                    "query": request.query,
+                    "max_results": request.max_results,
+                    "site": request.site,
+                    "freshness": request.freshness,
+                    "region": request.region,
+                    "safe_search": request.safe_search,
+                }),
+            },
+        ))
+        .map_err(|error| WebError::InvalidRequest(error.to_string()))?;
+    let ServiceBridgeResponse::Service(response) = response else {
+        return Err(WebError::InvalidRequest(
+            "model-native search returned unexpected bridge response".to_string(),
+        ));
+    };
+    let payload = match response {
+        ToolInvocationServiceResolution::Responded { payload } => payload,
+        ToolInvocationServiceResolution::Cancelled => return Err(WebError::Cancelled),
+        ToolInvocationServiceResolution::Unsupported => {
+            return Err(WebError::InvalidRequest(
+                "model-native search is not supported by this host".to_string(),
+            ));
+        }
+        ToolInvocationServiceResolution::Failed { code, message } => {
+            return Err(WebError::InvalidRequest(format!(
+                "model-native search failed ({code}): {message}"
+            )));
+        }
+    };
+    let response = serde_json::from_value::<ModelNativeSearchResponse>(payload)?;
+    Ok(SearchResponse {
+        query,
+        provider: response.provider,
+        results: response.results,
+        partial: response.partial,
+        message: response.message,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelNativeSearchResponse {
+    provider: String,
+    #[serde(default)]
+    results: Vec<SearchResult>,
+    #[serde(default)]
+    partial: bool,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 async fn search_brave(
@@ -1910,7 +1966,6 @@ fn search_response(query: String, provider: &str, results: Vec<SearchResult>) ->
         results,
         partial: false,
         message: None,
-        host_action: None,
     }
 }
 
@@ -2371,7 +2426,7 @@ fn search_tool_response(value: &SearchResponse, tool_call_id: &str) -> ToolInvoc
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: value.host_action.clone(),
+            host_action: None,
             result: Some(web_artifact_result(
                 tool_call_id,
                 "search",
@@ -2479,7 +2534,6 @@ mod tests {
                 }],
                 partial: false,
                 message: Some("ok".to_string()),
-                host_action: None,
             },
             "test-search",
         );
@@ -2653,5 +2707,73 @@ mod tests {
             youtube.recommended_tool.as_deref(),
             Some("media.transcript")
         );
+    }
+    #[test]
+    fn model_native_search_uses_nested_service_and_decodes_response() {
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let bridge = ServiceBridge::new(
+            Some(test_model_native_bridge),
+            std::ptr::null_mut(),
+            cancellation,
+        );
+        let response = search_model_native(
+            &SearchRequest {
+                query: "rust".to_string(),
+                provider: Some("model_native".to_string()),
+                max_results: Some(3),
+                site: None,
+                freshness: None,
+                region: None,
+                safe_search: None,
+                timeout_ms: None,
+            },
+            &bridge,
+            "call-native",
+        )
+        .expect("model-native nested service succeeds");
+
+        assert_eq!(response.provider, "provider-native");
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].title, "Rust");
+    }
+
+    extern "C" fn test_model_native_bridge(
+        request_ptr: *const u8,
+        request_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        _user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+        let request: ServiceBridgeRequest =
+            serde_json::from_slice(request).expect("bridge request decodes");
+        let ServiceBridgeRequest::InvokeService(request) = request else {
+            panic!("expected nested service request");
+        };
+        assert_eq!(request.invocation_id, "call-native");
+        assert_eq!(
+            request.interface_id,
+            MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE
+        );
+        assert_eq!(request.operation, MODEL_NATIVE_WEB_SEARCH_OPERATION);
+        let response = ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
+            payload: serde_json::json!({
+                "provider": "provider-native",
+                "results": [{
+                    "title": "Rust",
+                    "url": "https://www.rust-lang.org/",
+                    "snippet": "Rust language"
+                }],
+                "partial": false
+            }),
+        });
+        let encoded = serde_json::to_vec(&response).expect("bridge response encodes");
+        assert!(encoded.len() <= output_capacity);
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            *output_len = encoded.len();
+        }
+        bcode_plugin_sdk::SERVICE_BRIDGE_STATUS_OK
     }
 }

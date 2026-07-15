@@ -1514,8 +1514,6 @@ async fn execute_plugin_tool(
         arguments: descriptor.arguments.clone(),
         cwd: None,
         artifact_dir: None,
-        cancellation_path: None,
-        invocation_action_path: None,
     };
     let payload = serde_json::to_vec(&request).map_err(|error| RuntimeError::ToolExecution {
         tool_name: descriptor.tool_name.clone(),
@@ -1594,11 +1592,21 @@ async fn route_plugin_bridge_request(
         ServiceBridgeRequest::Exchange(request) => {
             ServiceBridgeResponse::Exchange(scope.request_exchange(request).await)
         }
-        ServiceBridgeRequest::ReceiveInput { invocation_id } => {
+        ServiceBridgeRequest::ReceiveInput {
+            invocation_id,
+            timeout_ms,
+        } => {
             if invocation_id != scope.invocation_id() {
                 return Err("input request invocation ID does not match runtime scope".to_string());
             }
-            ServiceBridgeResponse::Input(scope.receive_input().await)
+            let receive = scope.receive_input();
+            ServiceBridgeResponse::Input(if let Some(timeout_ms) = timeout_ms {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), receive)
+                    .await
+                    .unwrap_or(ToolInvocationInputResolution::TimedOut)
+            } else {
+                receive.await
+            })
         }
         ServiceBridgeRequest::InvokeService(request) => {
             ServiceBridgeResponse::Service(scope.invoke_service(request).await)

@@ -108,6 +108,7 @@ fn bridge_requests(invocation_id: &str) -> [ServiceBridgeRequest; 4] {
         }),
         ServiceBridgeRequest::ReceiveInput {
             invocation_id: invocation_id.to_string(),
+            timeout_ms: None,
         },
         ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
             invocation_id: invocation_id.to_string(),

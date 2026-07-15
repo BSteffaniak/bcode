@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Read, Seek as _, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -244,8 +244,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             TerminalRunPaths {
                 session_cwd: request.cwd.as_deref(),
                 artifact_dir: request.artifact_dir.as_deref(),
-                cancellation_path: request.cancellation_path.as_deref(),
-                invocation_action_path: request.invocation_action_path.as_deref(),
+                input_bridge: Some(&context.bridge),
             },
         ),
         _ => ToolInvocationResponse {
@@ -548,8 +547,7 @@ fn shell_program_and_args(
 struct TerminalRunPaths<'a> {
     session_cwd: Option<&'a Path>,
     artifact_dir: Option<&'a Path>,
-    cancellation_path: Option<&'a Path>,
-    invocation_action_path: Option<&'a Path>,
+    input_bridge: Option<&'a ServiceBridge>,
 }
 
 fn run_terminal_shell_command(
@@ -619,43 +617,46 @@ struct ShellAppliedResize {
     rows: u16,
 }
 
-struct ShellInvocationActionReader<'a> {
-    path: &'a Path,
-    offset: u64,
-    pending: String,
+struct ShellInvocationActionReader {
+    bridge: ServiceBridge,
+    invocation_id: String,
     started: Instant,
     recording: Option<recording::AsyncShellRecordingResizeSender>,
     applied_resizes: Arc<StdMutex<Vec<ShellAppliedResize>>>,
     live_frames: Arc<StdMutex<Vec<ShellLiveFrame>>>,
 }
 
-impl ShellInvocationActionReader<'_> {
-    fn poll(&mut self, master: &dyn portable_pty::MasterPty) -> Result<(), String> {
-        let Ok(mut file) = File::open(self.path) else {
-            return Ok(());
-        };
-        file.seek(std::io::SeekFrom::Start(self.offset))
-            .map_err(|error| error.to_string())?;
-        let mut appended = String::new();
-        file.read_to_string(&mut appended)
-            .map_err(|error| error.to_string())?;
-        self.offset = file.stream_position().map_err(|error| error.to_string())?;
-        self.pending.push_str(&appended);
-        while let Some(newline) = self.pending.find('\n') {
-            let line = self.pending[..newline].trim().to_owned();
-            self.pending.drain(..=newline);
-            if line.is_empty() {
-                continue;
-            }
-            let envelope = serde_json::from_str::<bcode_tool::PluginInvocationAction>(&line)
-                .map_err(|error| format!("invalid shell invocation action envelope: {error}"))?;
-            if envelope.producer_plugin_id != "bcode.shell"
-                || envelope.schema != "bcode.shell.invocation-action"
-                || envelope.schema_version != 1
+impl ShellInvocationActionReader {
+    fn poll(&self, master: &dyn portable_pty::MasterPty) -> Result<(), String> {
+        loop {
+            let response = self
+                .bridge
+                .request(&ServiceBridgeRequest::ReceiveInput {
+                    invocation_id: self.invocation_id.clone(),
+                    timeout_ms: Some(1),
+                })
+                .map_err(|error| format!("shell input routing failed: {error}"))?;
+            let ServiceBridgeResponse::Input(resolution) = response else {
+                return Err("shell input request returned unexpected bridge response".to_string());
+            };
+            let input = match resolution {
+                bcode_tool::ToolInvocationInputResolution::Received { input } => input,
+                bcode_tool::ToolInvocationInputResolution::TimedOut
+                | bcode_tool::ToolInvocationInputResolution::Closed => break,
+                bcode_tool::ToolInvocationInputResolution::Cancelled => {
+                    return Err("shell input routing cancelled".to_string());
+                }
+                bcode_tool::ToolInvocationInputResolution::Failed { code, message } => {
+                    return Err(format!("shell input routing failed ({code}): {message}"));
+                }
+            };
+            if input.producer_id != "bcode.shell"
+                || input.schema != "bcode.shell.invocation-action"
+                || input.schema_version != 1
             {
-                return Err("unsupported shell invocation action schema".to_owned());
+                return Err("unsupported shell invocation input schema".to_owned());
             }
-            let event = serde_json::from_value::<ShellInvocationAction>(envelope.payload)
+            let event = serde_json::from_value::<ShellInvocationAction>(input.payload)
                 .map_err(|error| format!("invalid shell invocation action: {error}"))?;
             match event {
                 ShellInvocationAction::Resize { columns, rows } => {
@@ -722,24 +723,23 @@ struct TerminalShellStatus {
 fn wait_for_terminal_shell_status(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
-    cancellation_path: Option<&Path>,
     timeout: Duration,
     tool_call_id: &str,
     events: ServiceEventEmitter,
-    mut control: Option<&mut ShellInvocationActionReader<'_>>,
+    control: Option<&ShellInvocationActionReader>,
     master: Option<&dyn portable_pty::MasterPty>,
 ) -> Result<TerminalShellStatus, String> {
     let started = Instant::now();
     let mut timed_out = false;
     let mut cancelled = false;
     let status = loop {
-        if let (Some(control), Some(master)) = (control.as_deref_mut(), master) {
+        if let (Some(control), Some(master)) = (control, master) {
             control.poll(master)?;
         }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
         }
-        if cancellation.is_cancelled() || cancellation_path.is_some_and(Path::exists) {
+        if cancellation.is_cancelled() {
             cancelled = true;
             emit_tool_status(
                 events,
@@ -915,12 +915,11 @@ fn run_terminal_shell_command_inner(
         .recv()
         .map_err(|_| "recording reader did not initialize".to_owned())?;
     let applied_resizes = Arc::new(StdMutex::new(Vec::new()));
-    let mut control = paths
-        .invocation_action_path
-        .map(|path| ShellInvocationActionReader {
-            path,
-            offset: 0,
-            pending: String::new(),
+    let control = paths
+        .input_bridge
+        .map(|bridge| ShellInvocationActionReader {
+            bridge: bridge.clone(),
+            invocation_id: tool_call_id.to_owned(),
             started,
             recording,
             applied_resizes: Arc::clone(&applied_resizes),
@@ -929,11 +928,10 @@ fn run_terminal_shell_command_inner(
     let status = wait_for_terminal_shell_status(
         &mut child,
         cancellation,
-        paths.cancellation_path,
         timeout,
         tool_call_id,
         events,
-        control.as_mut(),
+        control.as_ref(),
         Some(&*pair.master),
     )?;
     drop(pair.master);
@@ -1887,6 +1885,60 @@ mod tests {
         events.lock().expect("event lock").push(payload.to_vec());
     }
 
+    struct TestResizeInputState {
+        next: std::sync::atomic::AtomicUsize,
+    }
+
+    extern "C" fn test_resize_input_bridge(
+        request_ptr: *const u8,
+        request_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        user_data: *mut c_void,
+    ) -> i32 {
+        // SAFETY: the test keeps this state alive through the terminal invocation.
+        let state = unsafe { &*user_data.cast::<TestResizeInputState>() };
+        // SAFETY: the SDK supplies this callback with a valid request buffer.
+        let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+        let request: ServiceBridgeRequest =
+            serde_json::from_slice(request).expect("input bridge request");
+        let ServiceBridgeRequest::ReceiveInput {
+            invocation_id,
+            timeout_ms: _,
+        } = request
+        else {
+            panic!("expected input request");
+        };
+        assert_eq!(invocation_id, "test-active-resize");
+        let index = state.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if index == 0 {
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let response = if index < 2 {
+            let (columns, rows) = if index == 0 { (100, 30) } else { (132, 40) };
+            ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Received {
+                input: bcode_tool::ToolInvocationInput {
+                    invocation_id,
+                    input_id: format!("resize-{index}"),
+                    producer_id: "bcode.shell".to_string(),
+                    schema: "bcode.shell.invocation-action".to_string(),
+                    schema_version: 1,
+                    payload: json!({"type":"resize","columns":columns,"rows":rows}),
+                },
+            })
+        } else {
+            ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Closed)
+        };
+        let encoded = serde_json::to_vec(&response).expect("input bridge response");
+        assert!(encoded.len() <= output_capacity);
+        // SAFETY: the SDK supplies a response buffer with `output_capacity` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            *output_len = encoded.len();
+        }
+        bcode_plugin_sdk::SERVICE_BRIDGE_STATUS_OK
+    }
     fn isolated_config_environment(name: &str) -> bcode_config::ConfigEnvironmentSnapshot {
         let root = std::env::temp_dir().join(format!(
             "bcode-shell-plugin-{name}-{}",
@@ -2027,8 +2079,7 @@ mod tests {
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: None,
-                cancellation_path: None,
-                invocation_action_path: None,
+                input_bridge: None,
             },
             &environment,
         );
@@ -2068,8 +2119,7 @@ mod tests {
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: None,
-                cancellation_path: None,
-                invocation_action_path: None,
+                input_bridge: None,
             },
             &environment,
         );
@@ -2117,31 +2167,14 @@ mod tests {
     fn active_terminal_control_resize_reaches_pty_and_recording() {
         let environment = isolated_config_environment("active-resize-recording");
         let artifact_dir = tempfile::tempdir().expect("artifact dir");
-        let invocation_action_path = artifact_dir.path().join("control.jsonl");
-        let resize_path = invocation_action_path.clone();
-        let resize = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            let actions = [
-                bcode_tool::PluginInvocationAction {
-                    producer_plugin_id: "bcode.shell".to_owned(),
-                    schema: "bcode.shell.invocation-action".to_owned(),
-                    schema_version: 1,
-                    payload: json!({"type":"resize","columns":100,"rows":30}),
-                },
-                bcode_tool::PluginInvocationAction {
-                    producer_plugin_id: "bcode.shell".to_owned(),
-                    schema: "bcode.shell.invocation-action".to_owned(),
-                    schema_version: 1,
-                    payload: json!({"type":"resize","columns":132,"rows":40}),
-                },
-            ];
-            let encoded = actions
-                .iter()
-                .map(|action| serde_json::to_string(action).expect("encode resize action"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            std::fs::write(resize_path, format!("{encoded}\n")).expect("resize control");
-        });
+        let input_state = TestResizeInputState {
+            next: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let bridge = ServiceBridge::new(
+            Some(test_resize_input_bridge),
+            std::ptr::from_ref(&input_state).cast_mut().cast(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
         let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
@@ -2158,12 +2191,10 @@ mod tests {
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
-                cancellation_path: None,
-                invocation_action_path: Some(&invocation_action_path),
+                input_bridge: Some(&bridge),
             },
             &environment,
         );
-        resize.join().expect("resize writer");
         assert!(!response.is_error, "{}", response.output);
         let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
             panic!("expected artifact");
@@ -2216,8 +2247,7 @@ mod tests {
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
-                cancellation_path: None,
-                invocation_action_path: None,
+                input_bridge: None,
             },
             &environment,
         );
@@ -2279,8 +2309,7 @@ mod tests {
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
-                cancellation_path: None,
-                invocation_action_path: None,
+                input_bridge: None,
             },
             &environment,
         );
@@ -2414,13 +2443,13 @@ mod tests {
             ),
         ] {
             let artifact_dir = tempfile::tempdir().expect("artifact dir");
-            let cancellation_path = artifact_dir.path().join("cancel");
+            let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
             if cancel {
-                std::fs::write(&cancellation_path, b"cancel").expect("cancellation marker");
+                cancellation.cancel();
             }
             let response = run_terminal_shell_command_with_environment(
                 ServiceEventEmitter::default(),
-                &bcode_plugin_sdk::ServiceCancellation::default(),
+                &cancellation,
                 name,
                 &ShellRunArguments {
                     command: command.to_owned(),
@@ -2434,8 +2463,7 @@ mod tests {
                 TerminalRunPaths {
                     session_cwd: None,
                     artifact_dir: Some(artifact_dir.path()),
-                    cancellation_path: cancel.then_some(cancellation_path.as_path()),
-                    invocation_action_path: None,
+                    input_bridge: None,
                 },
                 &environment,
             );
@@ -2496,8 +2524,7 @@ mod tests {
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: None,
-                cancellation_path: None,
-                invocation_action_path: None,
+                input_bridge: None,
             },
             &environment,
         );
@@ -2542,8 +2569,7 @@ mod tests {
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: None,
-                cancellation_path: None,
-                invocation_action_path: None,
+                input_bridge: None,
             },
         );
 
@@ -2805,7 +2831,6 @@ mod tests {
         let status = wait_for_terminal_shell_status(
             &mut child,
             &cancellation,
-            None,
             Duration::from_secs(10),
             "cancel-test",
             ServiceEventEmitter::default(),
@@ -2828,7 +2853,6 @@ mod tests {
         let status = wait_for_terminal_shell_status(
             &mut child,
             &bcode_plugin_sdk::ServiceCancellation::default(),
-            None,
             Duration::ZERO,
             "timeout-test",
             ServiceEventEmitter::default(),

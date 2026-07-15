@@ -405,12 +405,6 @@ pub struct ToolInvocationRequest {
     /// Host-managed artifact directory for this invocation/session.
     #[serde(default)]
     pub artifact_dir: Option<PathBuf>,
-    /// Optional host-managed cancellation file. Tools should stop work when this path exists.
-    #[serde(default)]
-    pub cancellation_path: Option<PathBuf>,
-    /// Optional host-managed append-only control stream for an active invocation.
-    #[serde(default)]
-    pub invocation_action_path: Option<PathBuf>,
 }
 
 /// Plugin-owned visual update emitted while a tool invocation is running.
@@ -564,7 +558,6 @@ pub struct ToolArtifactRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolInvocationHostAction {
-    HostModelNativeWebSearch(HostModelNativeWebSearchRequest),
     InteractiveToolRequest(InteractiveToolRequest),
 }
 
@@ -637,22 +630,6 @@ pub struct InteractiveToolResumeRequest {
 pub enum InteractiveToolRenderTarget {
     #[default]
     TranscriptToolCall,
-}
-
-/// Host-side model-native web search request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostModelNativeWebSearchRequest {
-    pub query: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_results: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub site: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub freshness: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub safe_search: Option<String>,
 }
 
 /// Semantic tool result values that UI layers can render without parsing text.

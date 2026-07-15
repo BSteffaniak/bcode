@@ -4595,8 +4595,6 @@ library = "libexample_plugin.dylib"
             }),
             cwd: None,
             artifact_dir: None,
-            cancellation_path: None,
-            invocation_action_path: None,
         };
         let payload = serde_json::to_vec(&request).expect("question request encodes");
         let mut requests = Vec::new();

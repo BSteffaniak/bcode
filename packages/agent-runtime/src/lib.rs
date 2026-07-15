@@ -1274,8 +1274,6 @@ impl AgentRuntime {
             arguments: call.arguments.clone(),
             cwd: None,
             artifact_dir: None,
-            cancellation_path: None,
-            invocation_action_path: None,
         };
         let invocation = executor
             .execute_tool(&tool, &request)
@@ -1738,8 +1736,6 @@ fn legacy_tool_invocation_request(invocation: &ToolInvocationDescriptor) -> Tool
         arguments: invocation.arguments.clone(),
         cwd: None,
         artifact_dir: None,
-        cancellation_path: None,
-        invocation_action_path: None,
     }
 }
 

@@ -8,12 +8,13 @@ use bcode_model::{
     AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
     ContextManagementCapabilities, ContextManagementCapabilitiesRequest, FinishTurnRequest,
     MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelInfo, ModelList,
-    ModelListRequest, ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES,
+    ModelListRequest, ModelMessage, ModelTurnRequest, NativeWebSearchRequest,
+    NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
     OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
-    PollTurnEventsResponse, ProviderCapabilities, ProviderCapability, ProviderContextFormat,
-    ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse, StopReason,
-    TokenUsage, ToolCall, ValidateConfigResponse,
+    OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
+    PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities, ProviderCapability,
+    ProviderContextFormat, ProviderError, ProviderErrorCategory, ProviderTurnEvent,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -134,6 +135,7 @@ impl FakeProviderPlugin {
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
             OP_FINISH_TURN => self.finish_turn(&context.request),
+            OP_NATIVE_WEB_SEARCH => native_web_search(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported model provider operation",
@@ -501,6 +503,25 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
         Ok(response) => response,
         Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
     }
+}
+
+fn native_web_search(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<NativeWebSearchRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    json_response(&NativeWebSearchResponse {
+        provider: "fake-native".to_string(),
+        results: vec![NativeWebSearchResult {
+            title: format!("Result for {}", request.query),
+            url: "https://example.com/native".to_string(),
+            snippet: "fake provider-native search result".to_string(),
+            published: None,
+            source: Some("fake".to_string()),
+        }],
+        partial: false,
+        message: None,
+    })
 }
 
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {

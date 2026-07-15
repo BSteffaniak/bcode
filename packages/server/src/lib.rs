@@ -36,7 +36,10 @@ use bcode_agent_profile::{
     AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
     OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
 };
-use bcode_agent_runtime::CancellationToken;
+use bcode_agent_runtime::{
+    CancellationToken, InvocationArtifactSink, InvocationCapabilityFuture,
+    InvocationExchangeBroker, InvocationInputRouter, InvocationServiceRouter,
+};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginContributions,
@@ -90,12 +93,13 @@ use bcode_skill_models::{
 };
 use bcode_tool::{
     InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID,
-    ToolDefinition as ServiceToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
+    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolArtifactWriteRequest,
+    ToolArtifactWriteResolution, ToolDefinition as ServiceToolDefinition, ToolExchangeRequest,
+    ToolExchangeResolution, ToolInvocationInput, ToolInvocationInputResolution,
     ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult as ServiceToolInvocationResult,
-    ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
-    ToolResultContent, ToolSideEffect,
+    ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
+    ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
+    ToolList, ToolOutputStream, ToolResultContent, ToolSideEffect,
 };
 use futures::{StreamExt, stream};
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
@@ -111,7 +115,7 @@ use std::pin::Pin;
 use std::process::Command;
 use std::sync::{
     Arc, Mutex as StdMutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -5127,10 +5131,13 @@ impl ActiveArtifactReference {
     }
 }
 
+const ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY: usize = 64;
+
 #[derive(Debug, Clone)]
 struct ActivePluginInvocation {
     producer_plugin_id: String,
-    action_path: PathBuf,
+    inputs: mpsc::Sender<ToolInvocationInput>,
+    next_input_id: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -5178,30 +5185,43 @@ impl Drop for ActivePluginInvocationRegistration {
     }
 }
 
-fn append_plugin_invocation_action(
-    path: &Path,
+fn enqueue_plugin_invocation_input(
+    active: &ActivePluginInvocation,
+    tool_call_id: &str,
     action: &bcode_tool::PluginInvocationAction,
 ) -> Result<(), String> {
     if action.producer_plugin_id.trim().is_empty() {
-        return Err("plugin invocation action producer id must not be empty".to_owned());
+        return Err("plugin invocation input producer id must not be empty".to_owned());
     }
     if action.schema.trim().is_empty() || action.schema_version == 0 {
-        return Err("plugin invocation action schema and version must be valid".to_owned());
+        return Err("plugin invocation input schema and version must be valid".to_owned());
     }
     if !action.payload.is_object() {
-        return Err("plugin invocation action payload must be a JSON object".to_owned());
+        return Err("plugin invocation input payload must be a JSON object".to_owned());
     }
     let encoded = serde_json::to_vec(action).map_err(|error| error.to_string())?;
     if encoded.len() > 64 * 1024 {
-        return Err("plugin invocation action exceeds 64 KiB".to_owned());
+        return Err("plugin invocation input exceeds 64 KiB".to_owned());
     }
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    file.write_all(&encoded)
-        .map_err(|error| error.to_string())?;
-    file.write_all(b"\n").map_err(|error| error.to_string())
+    let input_id = active.next_input_id.fetch_add(1, Ordering::Relaxed);
+    active
+        .inputs
+        .try_send(ToolInvocationInput {
+            invocation_id: tool_call_id.to_owned(),
+            input_id: format!("{tool_call_id}-input-{input_id}"),
+            producer_id: action.producer_plugin_id.clone(),
+            schema: action.schema.clone(),
+            schema_version: action.schema_version,
+            payload: action.payload.clone(),
+        })
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                "plugin invocation input queue is full".to_owned()
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                "plugin invocation input route is closed".to_owned()
+            }
+        })
 }
 
 async fn handle_plugin_invocation_action(
@@ -5225,7 +5245,7 @@ async fn handle_plugin_invocation_action(
                     "plugin invocation action producer does not own the invocation".to_owned(),
                 );
             }
-            append_plugin_invocation_action(&active.action_path, action)
+            enqueue_plugin_invocation_input(active, tool_call_id, action)
         });
     match result {
         Ok(()) => {
@@ -14705,12 +14725,12 @@ async fn collect_tool_definitions(state: &ServerState) -> Vec<ServiceToolDefinit
     tools
 }
 
-async fn invoke_host_provider_native_search(
+async fn invoke_host_provider_native_search_response(
     state: &ServerState,
     session_id: SessionId,
     tool_call_id: &str,
-    bridge_request: bcode_tool::HostModelNativeWebSearchRequest,
-) -> Result<ToolInvocationResponse, String> {
+    bridge_request: ModelNativeWebSearchServiceRequest,
+) -> Result<NativeWebSearchResponse, String> {
     let selection = session_model_selection(state, session_id).await;
     let request = NativeWebSearchRequest {
         query: bridge_request.query,
@@ -14722,21 +14742,13 @@ async fn invoke_host_provider_native_search(
         provider_context: selection.provider_context,
         metadata: BTreeMap::from([("tool_call_id".to_string(), tool_call_id.to_string())]),
     };
-    let response = invoke_model_provider_json_blocking::<_, NativeWebSearchResponse>(
+    invoke_model_provider_json_blocking::<_, NativeWebSearchResponse>(
         state,
         selection.provider_plugin_id,
         OP_NATIVE_WEB_SEARCH,
         request,
     )
-    .await?;
-    Ok(ToolInvocationResponse {
-        output: serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?,
-        is_error: false,
-        content: Vec::new(),
-        full_output: None,
-        host_action: None,
-        result: None,
-    })
+    .await
 }
 
 fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
@@ -15056,30 +15068,400 @@ fn request_server_plugin_bridge(
     }
 }
 
+struct ServerInputRouter<'a> {
+    invocation_id: &'a str,
+    inputs: &'a Mutex<mpsc::Receiver<ToolInvocationInput>>,
+    cancel_state: &'a TurnCancelState,
+}
+
+impl<'a> ServerInputRouter<'a> {
+    const fn new(
+        invocation_id: &'a str,
+        inputs: &'a Mutex<mpsc::Receiver<ToolInvocationInput>>,
+        cancel_state: &'a TurnCancelState,
+    ) -> Self {
+        Self {
+            invocation_id,
+            inputs,
+            cancel_state,
+        }
+    }
+}
+
+impl InvocationInputRouter for ServerInputRouter<'_> {
+    fn receive(
+        &self,
+        invocation_id: &str,
+    ) -> InvocationCapabilityFuture<'_, ToolInvocationInputResolution> {
+        let identity_matches = invocation_id == self.invocation_id;
+        Box::pin(async move {
+            if !identity_matches {
+                return ToolInvocationInputResolution::Failed {
+                    code: "invocation_id_mismatch".to_string(),
+                    message: "input request does not belong to the active invocation".to_string(),
+                };
+            }
+            if self.cancel_state.is_cancelled() {
+                return ToolInvocationInputResolution::Cancelled;
+            }
+            let mut inputs = self.inputs.lock().await;
+            let resolution = tokio::select! {
+                input = inputs.recv() => input.map_or(
+                    ToolInvocationInputResolution::Closed,
+                    |input| ToolInvocationInputResolution::Received { input },
+                ),
+                () = self.cancel_state.cancelled() => ToolInvocationInputResolution::Cancelled,
+            };
+            drop(inputs);
+            resolution
+        })
+    }
+}
+
+const SESSION_ARTIFACT_WRITE_MAX_BYTES: u64 = 1024 * 1024;
+
+struct SessionArtifactSink<'a> {
+    root: PathBuf,
+    invocation_id: &'a str,
+    cancel_state: &'a TurnCancelState,
+}
+
+impl<'a> SessionArtifactSink<'a> {
+    const fn new(root: PathBuf, invocation_id: &'a str, cancel_state: &'a TurnCancelState) -> Self {
+        Self {
+            root,
+            invocation_id,
+            cancel_state,
+        }
+    }
+}
+
+impl InvocationArtifactSink for SessionArtifactSink<'_> {
+    fn write(
+        &self,
+        request: ToolArtifactWriteRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
+        Box::pin(async move {
+            if request.invocation_id != self.invocation_id {
+                return ToolArtifactWriteResolution::Failed {
+                    code: "invocation_id_mismatch".to_string(),
+                    message: "artifact does not belong to the active invocation".to_string(),
+                };
+            }
+            if self.cancel_state.is_cancelled() {
+                return ToolArtifactWriteResolution::Cancelled;
+            }
+            let Ok(byte_len) = u64::try_from(request.bytes.len()) else {
+                return ToolArtifactWriteResolution::TooLarge {
+                    max_bytes: SESSION_ARTIFACT_WRITE_MAX_BYTES,
+                };
+            };
+            if byte_len > SESSION_ARTIFACT_WRITE_MAX_BYTES {
+                return ToolArtifactWriteResolution::TooLarge {
+                    max_bytes: SESSION_ARTIFACT_WRITE_MAX_BYTES,
+                };
+            }
+            if request.artifact_id.trim().is_empty() || request.content_type.trim().is_empty() {
+                return ToolArtifactWriteResolution::Failed {
+                    code: "invalid_request".to_string(),
+                    message: "artifact id and content type must not be empty".to_string(),
+                };
+            }
+            match write_session_invocation_artifact(
+                &self.root,
+                self.invocation_id,
+                &request,
+                self.cancel_state,
+            ) {
+                Ok(reference) => ToolArtifactWriteResolution::Written {
+                    artifact_id: request.artifact_id,
+                    byte_len,
+                    reference,
+                },
+                Err((code, _)) if code == "cancelled" => ToolArtifactWriteResolution::Cancelled,
+                Err((code, message)) => ToolArtifactWriteResolution::Failed { code, message },
+            }
+        })
+    }
+}
+
+fn write_session_invocation_artifact(
+    root: &Path,
+    invocation_id: &str,
+    request: &ToolArtifactWriteRequest,
+    cancel_state: &TurnCancelState,
+) -> Result<serde_json::Value, (String, String)> {
+    use sha2::{Digest as _, Sha256};
+
+    let invocation_key = format!("{:x}", Sha256::digest(invocation_id.as_bytes()));
+    let artifact_key = format!("{:x}", Sha256::digest(request.artifact_id.as_bytes()));
+    std::fs::create_dir_all(root)
+        .map_err(|error| ("create_directory_failed".to_string(), error.to_string()))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| ("invalid_artifact_root".to_string(), error.to_string()))?;
+    let directory = root.join("invocation-artifacts").join(&invocation_key);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| ("create_directory_failed".to_string(), error.to_string()))?;
+    let canonical_directory = directory
+        .canonicalize()
+        .map_err(|error| ("invalid_artifact_directory".to_string(), error.to_string()))?;
+    if !canonical_directory.starts_with(&canonical_root) {
+        return Err((
+            "invalid_artifact_directory".to_string(),
+            "artifact directory is outside the session artifact root".to_string(),
+        ));
+    }
+    let destination = canonical_directory.join(format!("{artifact_key}.bin"));
+    if destination.exists() {
+        return Err((
+            "duplicate_artifact".to_string(),
+            "artifact id is already written for this invocation".to_string(),
+        ));
+    }
+    let temporary = canonical_directory.join(format!(".{artifact_key}.tmp"));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&request.bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(("artifact_write_failed".to_string(), error.to_string()));
+    }
+    if cancel_state.is_cancelled() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err((
+            "cancelled".to_string(),
+            "artifact write cancelled".to_string(),
+        ));
+    }
+    if let Err(error) = std::fs::hard_link(&temporary, &destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Err((
+                "duplicate_artifact".to_string(),
+                "artifact id is already written for this invocation".to_string(),
+            ))
+        } else {
+            Err(("artifact_publish_failed".to_string(), error.to_string()))
+        };
+    }
+    let _ = std::fs::remove_file(&temporary);
+    if let Err(error) = sync_artifact_directory(&canonical_directory) {
+        let _ = std::fs::remove_file(&destination);
+        return Err(("artifact_sync_failed".to_string(), error.to_string()));
+    }
+    Ok(serde_json::json!({
+        "uri": format!("bcode-artifact://invocation/{invocation_key}/{artifact_key}"),
+        "content_type": request.content_type,
+        "metadata": request.metadata,
+    }))
+}
+
+fn sync_artifact_directory(directory: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(directory)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelNativeWebSearchServiceRequest {
+    query: String,
+    #[serde(default)]
+    max_results: Option<usize>,
+    #[serde(default)]
+    site: Option<String>,
+    #[serde(default)]
+    freshness: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    safe_search: Option<String>,
+}
+
+const MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE: &str = "bcode.web-search.model-native/v1";
+const MODEL_NATIVE_WEB_SEARCH_OPERATION: &str = "search";
+
+struct ServerServiceRouter<'a> {
+    state: &'a ServerState,
+    session_id: SessionId,
+    call: &'a bcode_model::ToolCall,
+    cancel_state: &'a TurnCancelState,
+}
+
+impl<'a> ServerServiceRouter<'a> {
+    const fn new(
+        state: &'a ServerState,
+        session_id: SessionId,
+        call: &'a bcode_model::ToolCall,
+        cancel_state: &'a TurnCancelState,
+    ) -> Self {
+        Self {
+            state,
+            session_id,
+            call,
+            cancel_state,
+        }
+    }
+}
+
+impl InvocationServiceRouter for ServerServiceRouter<'_> {
+    fn invoke(
+        &self,
+        request: ToolInvocationServiceRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolInvocationServiceResolution> {
+        Box::pin(async move {
+            if request.invocation_id != self.call.id {
+                return ToolInvocationServiceResolution::Failed {
+                    code: "invocation_id_mismatch".to_string(),
+                    message: "service request does not belong to the active invocation".to_string(),
+                };
+            }
+            if self.cancel_state.is_cancelled() {
+                return ToolInvocationServiceResolution::Cancelled;
+            }
+            if request.interface_id != MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE
+                || request.operation != MODEL_NATIVE_WEB_SEARCH_OPERATION
+            {
+                return ToolInvocationServiceResolution::Unsupported;
+            }
+            let request =
+                match serde_json::from_value::<ModelNativeWebSearchServiceRequest>(request.payload)
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ToolInvocationServiceResolution::Failed {
+                            code: "invalid_request".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                };
+            match invoke_host_provider_native_search_response(
+                self.state,
+                self.session_id,
+                &self.call.id,
+                request,
+            )
+            .await
+            {
+                Ok(response) => match serde_json::to_value(response) {
+                    Ok(payload) => ToolInvocationServiceResolution::Responded { payload },
+                    Err(error) => ToolInvocationServiceResolution::Failed {
+                        code: "response_encode_failed".to_string(),
+                        message: error.to_string(),
+                    },
+                },
+                Err(message) => ToolInvocationServiceResolution::Failed {
+                    code: "service_failed".to_string(),
+                    message,
+                },
+            }
+        })
+    }
+}
+
+struct ServerExchangeBroker<'a> {
+    state: &'a ServerState,
+    session_id: SessionId,
+    call: &'a bcode_model::ToolCall,
+    plugin_id: &'a str,
+    cancel_state: &'a TurnCancelState,
+}
+
+impl<'a> ServerExchangeBroker<'a> {
+    const fn new(
+        state: &'a ServerState,
+        session_id: SessionId,
+        call: &'a bcode_model::ToolCall,
+        plugin_id: &'a str,
+        cancel_state: &'a TurnCancelState,
+    ) -> Self {
+        Self {
+            state,
+            session_id,
+            call,
+            plugin_id,
+            cancel_state,
+        }
+    }
+}
+
+impl InvocationExchangeBroker for ServerExchangeBroker<'_> {
+    fn request(
+        &self,
+        request: ToolExchangeRequest,
+    ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution> {
+        Box::pin(async move {
+            if self.cancel_state.is_cancelled() {
+                return ToolExchangeResolution::Cancelled;
+            }
+            resolve_server_exchange(
+                self.state,
+                self.session_id,
+                self.call,
+                self.plugin_id,
+                request,
+                self.cancel_state,
+            )
+            .await
+            .unwrap_or_else(|message| ToolExchangeResolution::Failed {
+                code: "server_exchange_failed".to_string(),
+                message,
+            })
+        })
+    }
+}
+
 async fn resolve_server_plugin_bridge_request(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     plugin_id: &str,
     request: ServiceBridgeRequest,
+    inputs: &Mutex<mpsc::Receiver<ToolInvocationInput>>,
     cancel_state: &TurnCancelState,
 ) -> Result<ServiceBridgeResponse, String> {
     Ok(match request {
-        ServiceBridgeRequest::Exchange(request) => ServiceBridgeResponse::Exchange(
-            resolve_server_exchange(state, session_id, call, plugin_id, request, cancel_state)
-                .await?,
-        ),
-        ServiceBridgeRequest::ReceiveInput { .. } => {
-            ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Closed)
+        ServiceBridgeRequest::Exchange(request) => {
+            let broker =
+                ServerExchangeBroker::new(state, session_id, call, plugin_id, cancel_state);
+            ServiceBridgeResponse::Exchange(broker.request(request).await)
         }
-        ServiceBridgeRequest::InvokeService(_) => {
-            ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Unsupported)
-        }
-        ServiceBridgeRequest::WriteArtifact(_) => {
-            ServiceBridgeResponse::Artifact(bcode_tool::ToolArtifactWriteResolution::Failed {
-                code: "unsupported".to_string(),
-                message: "server artifact bridge is not implemented".to_string(),
+        ServiceBridgeRequest::ReceiveInput {
+            invocation_id,
+            timeout_ms,
+        } => {
+            let router = ServerInputRouter::new(&call.id, inputs, cancel_state);
+            let receive = router.receive(&invocation_id);
+            ServiceBridgeResponse::Input(if let Some(timeout_ms) = timeout_ms {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), receive)
+                    .await
+                    .unwrap_or(ToolInvocationInputResolution::TimedOut)
+            } else {
+                receive.await
             })
+        }
+        ServiceBridgeRequest::InvokeService(request) => {
+            let router = ServerServiceRouter::new(state, session_id, call, cancel_state);
+            ServiceBridgeResponse::Service(router.invoke(request).await)
+        }
+        ServiceBridgeRequest::WriteArtifact(request) => {
+            let sink = SessionArtifactSink::new(
+                default_session_artifact_dir(session_id),
+                &call.id,
+                cancel_state,
+            );
+            ServiceBridgeResponse::Artifact(sink.write(request).await)
         }
     })
 }
@@ -15148,18 +15530,6 @@ async fn resolve_server_exchange(
             },
         },
     })
-}
-
-struct ToolInvocationControlFiles {
-    cancellation_path: PathBuf,
-    invocation_action_path: PathBuf,
-}
-
-impl Drop for ToolInvocationControlFiles {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.cancellation_path);
-        let _ = std::fs::remove_file(&self.invocation_action_path);
-    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15369,31 +15739,8 @@ async fn invoke_model_tool(
         }
     }
     let working_directory = working_directory.to_path_buf();
-    let cancellation_path = default_session_artifact_dir(session_id).join(format!(
-        "tool-cancel-{}",
-        call.id
-            .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-            .collect::<String>()
-    ));
-    let invocation_action_path = default_session_artifact_dir(session_id).join(format!(
-        "tool-control-{}",
-        call.id
-            .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-            .collect::<String>()
-    ));
-    std::fs::create_dir_all(
-        invocation_action_path
-            .parent()
-            .ok_or_else(|| "tool control path has no parent".to_owned())?,
-    )
-    .map_err(|error| error.to_string())?;
-    std::fs::File::create(&invocation_action_path).map_err(|error| error.to_string())?;
-    let _control_files = ToolInvocationControlFiles {
-        cancellation_path: cancellation_path.clone(),
-        invocation_action_path: invocation_action_path.clone(),
-    };
+    let (input_sender, input_receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
+    let input_receiver = Mutex::new(input_receiver);
     let _action_registration = ActivePluginInvocationRegistration::register(
         Arc::clone(&state.active_plugin_invocations),
         Arc::clone(&state.active_artifacts),
@@ -15401,7 +15748,8 @@ async fn invoke_model_tool(
         &call.id,
         ActivePluginInvocation {
             producer_plugin_id: plugin_id.clone(),
-            action_path: invocation_action_path.clone(),
+            inputs: input_sender,
+            next_input_id: Arc::new(AtomicU64::new(1)),
         },
     )?;
     let request = ToolInvocationRequest {
@@ -15410,13 +15758,12 @@ async fn invoke_model_tool(
         arguments: call.arguments.clone(),
         cwd: Some(working_directory),
         artifact_dir: Some(default_session_artifact_dir(session_id)),
-        cancellation_path: Some(cancellation_path.clone()),
-        invocation_action_path: Some(invocation_action_path.clone()),
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let scope = active_plugin_scope_for_tool_call(state, session_id, &call.id).await;
     let (bridge, bridge_requests) = server_plugin_bridge();
     let mut bridge_requests = Some(bridge_requests);
+    let mut bridge_resolutions = futures::stream::FuturesUnordered::new();
     let mut invocation = state
         .plugins
         .invoke_service_with_events_and_bridge_scoped(
@@ -15445,7 +15792,6 @@ async fn invoke_model_tool(
             biased;
             () = cancel_state.cancelled() => {
                 invocation.cancel.cancel();
-                let _ = std::fs::write(&cancellation_path, b"cancelled\n");
                 return Ok(tool_error("tool invocation cancelled"));
             }
             publisher_event = tool_output_publisher.next_event() => {
@@ -15461,19 +15807,25 @@ async fn invoke_model_tool(
                     .await
             }, if bridge_requests.is_some() => {
                 if let Some(bridge_call) = bridge_call {
-                    let resolution = resolve_server_plugin_bridge_request(
-                        state,
-                        session_id,
-                        call,
-                        &plugin_id,
-                        bridge_call.request,
-                        cancel_state,
-                    ).await;
-                    let _ = bridge_call.response.send(resolution);
+                    let plugin_id = &plugin_id;
+                    let input_receiver = &input_receiver;
+                    bridge_resolutions.push(async move {
+                        let resolution = resolve_server_plugin_bridge_request(
+                            state,
+                            session_id,
+                            call,
+                            plugin_id,
+                            bridge_call.request,
+                            input_receiver,
+                            cancel_state,
+                        ).await;
+                        let _ = bridge_call.response.send(resolution);
+                    });
                 } else {
                     bridge_requests = None;
                 }
             }
+            _ = bridge_resolutions.next(), if !bridge_resolutions.is_empty() => {}
             event = invocation.next_event() => {
                 match event.map_err(|error| error.to_string())? {
                     StreamingServiceInvocationEvent::Event(payload) => {
@@ -15504,24 +15856,18 @@ async fn invoke_model_tool(
     tool_output_publisher.finish(state, session_id).await;
     let response: ToolInvocationResponse =
         bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())?;
-    if let Some(host_action) = response.host_action.clone() {
-        match host_action {
-            bcode_tool::ToolInvocationHostAction::HostModelNativeWebSearch(request) => {
-                return invoke_host_provider_native_search(state, session_id, &call.id, request)
-                    .await;
-            }
-            bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(request) => {
-                return handle_interactive_tool_request(
-                    state,
-                    session_id,
-                    call,
-                    &plugin_id,
-                    request,
-                    cancel_state,
-                )
-                .await;
-            }
-        }
+    if let Some(bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(request)) =
+        response.host_action.clone()
+    {
+        return handle_interactive_tool_request(
+            state,
+            session_id,
+            call,
+            &plugin_id,
+            request,
+            cancel_state,
+        )
+        .await;
     }
     Ok(response)
 }
@@ -18664,6 +19010,156 @@ mod tests {
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
 
+    #[tokio::test]
+    async fn server_input_router_delivers_owned_input_and_wakes_on_cancellation() {
+        let (sender, receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
+        let receiver = Mutex::new(receiver);
+        let cancel_state = TurnCancelState::default();
+        let router = ServerInputRouter::new("call-1", &receiver, &cancel_state);
+        sender
+            .try_send(ToolInvocationInput {
+                invocation_id: "call-1".to_string(),
+                input_id: "input-1".to_string(),
+                producer_id: "bcode.shell".to_string(),
+                schema: "bcode.shell.invocation-action".to_string(),
+                schema_version: 1,
+                payload: serde_json::json!({"type": "resize", "columns": 100, "rows": 30}),
+            })
+            .expect("send input");
+        assert!(matches!(
+            router.receive("call-1").await,
+            ToolInvocationInputResolution::Received { input }
+                if input.input_id == "input-1" && input.invocation_id == "call-1"
+        ));
+        assert!(matches!(
+            router.receive("other").await,
+            ToolInvocationInputResolution::Failed { code, .. }
+                if code == "invocation_id_mismatch"
+        ));
+
+        let waiting = router.receive("call-1");
+        tokio::pin!(waiting);
+        tokio::select! {
+            _ = &mut waiting => panic!("input wait completed before cancellation"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        cancel_state.cancel().await;
+        assert_eq!(waiting.await, ToolInvocationInputResolution::Cancelled);
+    }
+    #[tokio::test]
+    async fn session_artifact_sink_writes_bounded_owned_artifacts_transactionally() {
+        let root = tempfile::tempdir().expect("artifact sink root");
+        let cancel_state = TurnCancelState::default();
+        let sink =
+            SessionArtifactSink::new(root.path().to_path_buf(), "artifact-call", &cancel_state);
+        let request = ToolArtifactWriteRequest {
+            invocation_id: "artifact-call".to_string(),
+            artifact_id: "result".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            bytes: b"artifact bytes".to_vec(),
+            metadata: serde_json::json!({"kind": "test"}),
+        };
+        let resolution = sink.write(request.clone()).await;
+        let ToolArtifactWriteResolution::Written {
+            artifact_id,
+            byte_len,
+            reference,
+        } = resolution
+        else {
+            panic!("expected artifact write, got {resolution:?}");
+        };
+        assert_eq!(artifact_id, "result");
+        assert_eq!(byte_len, 14);
+        let uri = reference["uri"].as_str().expect("artifact capability URI");
+        assert!(uri.starts_with("bcode-artifact://invocation/"));
+        assert!(!uri.contains(root.path().to_string_lossy().as_ref()));
+        let artifact_directory = root
+            .path()
+            .join("invocation-artifacts")
+            .read_dir()
+            .expect("invocation artifact root")
+            .next()
+            .expect("invocation artifact directory")
+            .expect("invocation artifact entry")
+            .path();
+        let path = artifact_directory
+            .read_dir()
+            .expect("artifact directory")
+            .find_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|extension| extension.to_str()) == Some("bin"))
+                    .then_some(path)
+            })
+            .expect("persisted artifact");
+        assert_eq!(std::fs::read(path).expect("artifact bytes"), request.bytes);
+        assert!(
+            !artifact_directory
+                .read_dir()
+                .expect("artifact directory")
+                .any(|entry| entry
+                    .expect("artifact directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+
+        assert!(matches!(
+            sink.write(request).await,
+            ToolArtifactWriteResolution::Failed { code, .. } if code == "duplicate_artifact"
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_artifact_sink_enforces_identity_bound_and_cancellation() {
+        let root = tempfile::tempdir().expect("artifact sink root");
+        let active = TurnCancelState::default();
+        let sink = SessionArtifactSink::new(root.path().to_path_buf(), "active", &active);
+        assert!(matches!(
+            sink.write(ToolArtifactWriteRequest {
+                invocation_id: "other".to_string(),
+                artifact_id: "wrong".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                bytes: Vec::new(),
+                metadata: serde_json::Value::Null,
+            })
+            .await,
+            ToolArtifactWriteResolution::Failed { code, .. }
+                if code == "invocation_id_mismatch"
+        ));
+        assert_eq!(
+            sink.write(ToolArtifactWriteRequest {
+                invocation_id: "active".to_string(),
+                artifact_id: "large".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                bytes: vec![
+                    0;
+                    usize::try_from(SESSION_ARTIFACT_WRITE_MAX_BYTES).expect("bound") + 1
+                ],
+                metadata: serde_json::Value::Null,
+            })
+            .await,
+            ToolArtifactWriteResolution::TooLarge {
+                max_bytes: SESSION_ARTIFACT_WRITE_MAX_BYTES
+            }
+        );
+
+        let cancelled = TurnCancelState::default();
+        cancelled.cancel().await;
+        let cancelled_sink =
+            SessionArtifactSink::new(root.path().to_path_buf(), "cancelled", &cancelled);
+        assert_eq!(
+            cancelled_sink
+                .write(ToolArtifactWriteRequest {
+                    invocation_id: "cancelled".to_string(),
+                    artifact_id: "cancelled".to_string(),
+                    content_type: "application/octet-stream".to_string(),
+                    bytes: Vec::new(),
+                    metadata: serde_json::Value::Null,
+                })
+                .await,
+            ToolArtifactWriteResolution::Cancelled
+        );
+    }
     #[test]
     fn server_plugin_bridge_round_trips_requests_without_async_runtime_blocking() {
         let (sender, mut requests) = mpsc::unbounded_channel();
@@ -18709,12 +19205,11 @@ mod tests {
             name: "question".to_string(),
             arguments: serde_json::Value::Null,
         };
-        let resolution = resolve_server_exchange(
-            &state,
-            session_id,
-            &call,
-            "bcode.question",
-            ToolExchangeRequest {
+        let cancel_state = TurnCancelState::default();
+        let broker =
+            ServerExchangeBroker::new(&state, session_id, &call, "bcode.question", &cancel_state);
+        let resolution = broker
+            .request(ToolExchangeRequest {
                 invocation_id: "other-call".to_string(),
                 exchange_id: "exchange".to_string(),
                 producer_id: "bcode.question".to_string(),
@@ -18722,11 +19217,8 @@ mod tests {
                 schema_version: 1,
                 payload: serde_json::Value::Null,
                 response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
-            },
-            &TurnCancelState::default(),
-        )
-        .await
-        .expect("exchange resolution");
+            })
+            .await;
 
         assert!(matches!(
             resolution,
@@ -18734,11 +19226,61 @@ mod tests {
         ));
         assert!(state.pending_interactive_tools.lock().await.is_empty());
     }
+
+    #[tokio::test]
+    async fn server_exchange_broker_maps_cancellation_and_unknown_schema() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        let call = bcode_model::ToolCall {
+            id: "active-call".to_string(),
+            name: "question".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let cancelled = TurnCancelState::default();
+        cancelled.cancel().await;
+        let cancelled_broker =
+            ServerExchangeBroker::new(&state, session_id, &call, "bcode.question", &cancelled);
+        assert_eq!(
+            cancelled_broker
+                .request(ToolExchangeRequest {
+                    invocation_id: call.id.clone(),
+                    exchange_id: "cancelled".to_string(),
+                    producer_id: "bcode.question".to_string(),
+                    schema: "bcode.question.request".to_string(),
+                    schema_version: 1,
+                    payload: serde_json::Value::Null,
+                    response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+                })
+                .await,
+            ToolExchangeResolution::Cancelled
+        );
+
+        let active = TurnCancelState::default();
+        let active_broker =
+            ServerExchangeBroker::new(&state, session_id, &call, "bcode.question", &active);
+        assert_eq!(
+            active_broker
+                .request(ToolExchangeRequest {
+                    invocation_id: call.id.clone(),
+                    exchange_id: "unsupported".to_string(),
+                    producer_id: "unknown".to_string(),
+                    schema: "unknown.exchange".to_string(),
+                    schema_version: 1,
+                    payload: serde_json::Value::Null,
+                    response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+                })
+                .await,
+            ToolExchangeResolution::NoCompatibleConsumer
+        );
+    }
     #[test]
-    fn generic_plugin_invocation_actions_are_opaque_bounded_and_require_active_path() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("active-action.jsonl");
-        std::fs::File::create(&path).expect("active action path");
+    fn generic_plugin_invocation_actions_enqueue_opaque_bounded_inputs() {
+        let (sender, mut receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
+        let active = ActivePluginInvocation {
+            producer_plugin_id: "example.plugin".to_owned(),
+            inputs: sender,
+            next_input_id: Arc::new(AtomicU64::new(1)),
+        };
         let action = bcode_tool::PluginInvocationAction {
             producer_plugin_id: "example.plugin".to_owned(),
             schema: "example.invocation-action".to_owned(),
@@ -18748,33 +19290,48 @@ mod tests {
                 "nested": {"value": 42},
             }),
         };
-        append_plugin_invocation_action(&path, &action).expect("action append");
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("action bytes"),
-            format!(
-                "{}\n",
-                serde_json::to_string(&action).expect("encode action")
-            )
-        );
+        enqueue_plugin_invocation_input(&active, "call-1", &action).expect("enqueue input");
+        let input = receiver.try_recv().expect("queued input");
+        assert_eq!(input.invocation_id, "call-1");
+        assert_eq!(input.input_id, "call-1-input-1");
+        assert_eq!(input.schema, action.schema);
+        assert_eq!(input.payload, action.payload);
 
-        assert!(
-            append_plugin_invocation_action(&temp_dir.path().join("inactive.jsonl"), &action)
-                .is_err()
-        );
         let mut invalid = action.clone();
         invalid.payload = serde_json::json!("not-object");
-        assert!(append_plugin_invocation_action(&path, &invalid).is_err());
+        assert!(enqueue_plugin_invocation_input(&active, "call-1", &invalid).is_err());
         let mut oversized = action;
         oversized.payload = serde_json::json!({"payload": "x".repeat(65 * 1024)});
-        assert!(append_plugin_invocation_action(&path, &oversized).is_err());
+        assert!(enqueue_plugin_invocation_input(&active, "call-1", &oversized).is_err());
     }
 
+    #[tokio::test]
+    async fn active_invocation_input_queue_rejects_overflow() {
+        let (sender, _receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
+        let active = ActivePluginInvocation {
+            producer_plugin_id: "example.plugin".to_string(),
+            inputs: sender,
+            next_input_id: Arc::new(AtomicU64::new(1)),
+        };
+        let action = bcode_tool::PluginInvocationAction {
+            producer_plugin_id: "example.plugin".to_string(),
+            schema: "example.input".to_string(),
+            schema_version: 1,
+            payload: serde_json::json!({}),
+        };
+        for _ in 0..ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY {
+            enqueue_plugin_invocation_input(&active, "call", &action).expect("queue input");
+        }
+        assert_eq!(
+            enqueue_plugin_invocation_input(&active, "call", &action),
+            Err("plugin invocation input queue is full".to_string())
+        );
+    }
     #[test]
     fn active_plugin_invocation_registration_enforces_identity_and_lifetime() {
         let invocations = Arc::new(StdMutex::new(BTreeMap::new()));
         let active_artifacts = Arc::new(StdMutex::new(BTreeMap::new()));
         let session_id = SessionId::new();
-        let path = PathBuf::from("opaque-action-path");
         let registration = ActivePluginInvocationRegistration::register(
             Arc::clone(&invocations),
             Arc::clone(&active_artifacts),
@@ -18782,7 +19339,8 @@ mod tests {
             "call-1",
             ActivePluginInvocation {
                 producer_plugin_id: "example.plugin".to_owned(),
-                action_path: path.clone(),
+                inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
+                next_input_id: Arc::new(AtomicU64::new(1)),
             },
         )
         .expect("register invocation");
@@ -18791,7 +19349,6 @@ mod tests {
             .get(&(session_id, "call-1".to_owned()))
             .expect("active route");
         assert_eq!(route.producer_plugin_id, "example.plugin");
-        assert_eq!(route.action_path, path);
         drop(active);
         assert!(
             ActivePluginInvocationRegistration::register(
@@ -18801,7 +19358,8 @@ mod tests {
                 "call-1",
                 ActivePluginInvocation {
                     producer_plugin_id: "other.plugin".to_owned(),
-                    action_path: PathBuf::from("other"),
+                    inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
+                    next_input_id: Arc::new(AtomicU64::new(1)),
                 },
             )
             .is_err()
@@ -18828,7 +19386,8 @@ mod tests {
             tool_call_id,
             ActivePluginInvocation {
                 producer_plugin_id: "fixture.plugin".to_owned(),
-                action_path: artifact_dir.join("actions"),
+                inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
+                next_input_id: Arc::new(AtomicU64::new(1)),
             },
         )
         .expect("register invocation");
@@ -22276,6 +22835,193 @@ mod tests {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
 
+    #[tokio::test]
+    async fn server_service_router_routes_model_native_search_and_validates_identity() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("service".to_string()), test_working_directory())
+            .await
+            .expect("service session");
+        let session_id = summary.id;
+        let state = test_server_state_with_fake_provider(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                model_id: Some("fake-echo".to_string()),
+                ..SessionModelSelection::default()
+            },
+        );
+        let call = bcode_model::ToolCall {
+            id: "service-call".to_string(),
+            name: "web.search".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let cancel_state = TurnCancelState::default();
+        let router = ServerServiceRouter::new(&state, session_id, &call, &cancel_state);
+        let resolution = router
+            .invoke(ToolInvocationServiceRequest {
+                invocation_id: call.id.clone(),
+                request_id: "native-search".to_string(),
+                interface_id: MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE.to_string(),
+                operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
+                payload: serde_json::json!({"query": "rust"}),
+            })
+            .await;
+        let ToolInvocationServiceResolution::Responded { payload } = resolution else {
+            panic!("expected service response, got {resolution:?}");
+        };
+        assert_eq!(payload["provider"], "fake-native");
+        assert_eq!(payload["results"][0]["title"], "Result for rust");
+
+        assert!(matches!(
+            router
+                .invoke(ToolInvocationServiceRequest {
+                    invocation_id: "wrong-call".to_string(),
+                    request_id: "wrong".to_string(),
+                    interface_id: MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE.to_string(),
+                    operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
+                    payload: serde_json::json!({"query": "rust"}),
+                })
+                .await,
+            ToolInvocationServiceResolution::Failed { code, .. }
+                if code == "invocation_id_mismatch"
+        ));
+    }
+
+    fn test_server_state_with_shell_plugin(sessions: SessionManager) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.shell".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load shell plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn server_shell_input_route_resizes_active_invocation_without_jsonl_control() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("shell input".to_string()), test_working_directory())
+            .await
+            .expect("shell input session");
+        let session_id = summary.id;
+        let trace_dir = tempfile::tempdir().expect("shell trace dir");
+        let mut state = test_server_state_with_shell_plugin(sessions);
+        state.trace_store = TraceStore::new(trace_dir.path().to_path_buf());
+        let state = Arc::new(state);
+        let call = bcode_model::ToolCall {
+            id: "shell-input-call".to_string(),
+            name: "shell.run".to_string(),
+            arguments: serde_json::json!({
+                "command": "sleep 0.15; printf 'resized\\n'",
+                "columns": 80,
+                "rows": 24,
+                "timeout_ms": 5000
+            }),
+        };
+        let working_directory = test_working_directory();
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let task_state = Arc::clone(&state);
+        let task_call = call.clone();
+        let task_cancel = Arc::clone(&cancel_state);
+        let task = tokio::spawn(async move {
+            invoke_model_tool(
+                task_state.as_ref(),
+                session_id,
+                &task_call,
+                &working_directory,
+                task_cancel.as_ref(),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let permission = state
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .cloned();
+                if let Some(permission) = permission {
+                    state
+                        .pending_permissions
+                        .lock()
+                        .await
+                        .remove(&permission.summary.permission_id);
+                    *permission.decision.lock().await = Some(true);
+                    permission.notify.notify_waiters();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shell permission should become pending");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let routed = state
+                    .active_plugin_invocations
+                    .lock()
+                    .expect("active invocation registry")
+                    .get(&(session_id, call.id.clone()))
+                    .cloned();
+                if let Some(active) = routed {
+                    enqueue_plugin_invocation_input(
+                        &active,
+                        &call.id,
+                        &bcode_tool::PluginInvocationAction {
+                            producer_plugin_id: "bcode.shell".to_string(),
+                            schema: "bcode.shell.invocation-action".to_string(),
+                            schema_version: 1,
+                            payload: serde_json::json!({
+                                "type": "resize",
+                                "columns": 100,
+                                "rows": 30
+                            }),
+                        },
+                    )
+                    .expect("enqueue resize input");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shell invocation should register input route");
+
+        let response = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("shell invocation should complete")
+            .expect("shell task joins")
+            .expect("shell invocation succeeds");
+        assert!(!response.is_error, "{}", response.output);
+        assert!(response.output.contains("resized"));
+        assert!(response.output.contains("\"columns\":100"));
+        assert!(response.output.contains("\"rows\":30"));
+        assert!(
+            state
+                .active_plugin_invocations
+                .lock()
+                .expect("active invocation registry")
+                .is_empty()
+        );
+    }
     fn test_server_state_with_question_plugin(sessions: SessionManager) -> ServerState {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
