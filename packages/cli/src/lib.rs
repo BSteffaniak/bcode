@@ -7613,8 +7613,28 @@ mod context_compaction_tests {
 
 #[cfg(test)]
 mod client_timeout_cli_tests {
-    use super::Cli;
-    use clap::Parser as _;
+    use super::{Cli, config_override_from_matches};
+    use clap::{CommandFactory as _, Parser as _};
+    use std::sync::Mutex;
+
+    static CONFIG_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn request_timeout_override_is_visible_to_default_client() {
+        let _lock = CONFIG_OVERRIDE_LOCK
+            .lock()
+            .expect("config override lock should not be poisoned");
+        let matches = Cli::command()
+            .try_get_matches_from(["bcode", "--request-timeout-secs", "60"])
+            .expect("timeout override should parse");
+        let guard = config_override_from_matches(&matches)
+            .expect("timeout option should install a config override");
+
+        let client = bcode_client::BcodeClient::default_endpoint();
+
+        assert_eq!(client.request_timeout().as_secs(), 60);
+        drop(guard);
+    }
 
     #[test]
     fn request_timeout_override_accepts_positive_seconds() {

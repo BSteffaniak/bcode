@@ -5362,9 +5362,10 @@ pub fn load_config() -> Result<BcodeConfig, ConfigError> {
 pub fn load_config_with_environment(
     environment: &impl ConfigEnvironment,
 ) -> Result<BcodeConfig, ConfigError> {
+    let overrides = effective_config_overrides(environment);
     load_config_from_paths_with_overrides(
         &default_config_paths_with_environment(environment),
-        &ConfigLoadOverrides::from_config_environment_with_cli(environment, None, None),
+        &overrides,
     )
 }
 
@@ -5428,13 +5429,24 @@ pub fn load_config_from_paths_with_environment(
     )
 }
 
+fn effective_config_overrides(environment: &impl ConfigEnvironment) -> ConfigLoadOverrides {
+    process_config_overrides()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| {
+            ConfigLoadOverrides::from_config_environment_with_cli(environment, None, None)
+        })
+}
+
 /// Load composed raw configuration from default paths.
 ///
 /// # Errors
 ///
 /// Returns an error if an existing config layer cannot be read, parsed, or composed.
 pub fn load_composed_config_value() -> Result<toml::Value, ConfigError> {
-    load_composed_config_value_with_overrides(&ConfigLoadOverrides::from_env_with_cli(None, None))
+    let overrides = effective_config_overrides(&ProcessConfigEnvironment);
+    load_composed_config_value_with_overrides(&overrides)
 }
 
 /// Load composed raw configuration from default paths with explicit overrides.

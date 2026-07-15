@@ -2689,6 +2689,21 @@ mod client_timeout_tests {
     use std::time::Duration;
 
     #[test]
+    fn default_endpoint_honors_process_config_override() {
+        let guard = bcode_config::push_process_config_overrides(
+            bcode_config::ConfigLoadOverrides::from_env_with_cli(
+                None,
+                Some("[client]\nrequest_timeout_secs = 23\n".to_owned()),
+            ),
+        );
+
+        let client = BcodeClient::default_endpoint();
+
+        assert_eq!(client.request_timeout(), Duration::from_secs(23));
+        drop(guard);
+    }
+
+    #[test]
     fn request_timeout_can_be_overridden() {
         let client = BcodeClient::default_endpoint().with_request_timeout(Duration::from_secs(17));
 
