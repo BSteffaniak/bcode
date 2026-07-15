@@ -160,7 +160,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     json_response(&ToolList {
         tools: vec![ToolDefinition {
             name: "shell.run".to_string(),
-            description: "Run a shell command in pseudo-terminal mode so output streams live with human-like CLI colors and formatting.".to_string(),
+            description: "Run a non-interactive shell command in pseudo-terminal mode. Commands must complete without user input: avoid editors, REPLs, watchers, pagers, and prompts; use non-interactive flags and disable paging (for example, `git --no-pager`). Interactive commands will time out.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["command"],
@@ -2002,7 +2002,8 @@ mod tests {
             .expect("schema should have object properties");
 
         assert!(!properties.contains_key("terminal"));
-        assert!(shell_run.description.contains("streams live"));
+        assert!(shell_run.description.contains("non-interactive"));
+        assert!(shell_run.description.contains("git --no-pager"));
     }
 
     #[cfg(unix)]
