@@ -1575,6 +1575,164 @@ mod tests {
         assert_eq!(artifact, ToolArtifactWriteResolution::Cancelled);
     }
 
+    struct LateResolutionCapabilities {
+        exchange: Mutex<Option<tokio::sync::oneshot::Receiver<ToolExchangeResolution>>>,
+        input: Mutex<Option<tokio::sync::oneshot::Receiver<ToolInvocationInputResolution>>>,
+        service: Mutex<Option<tokio::sync::oneshot::Receiver<ToolInvocationServiceResolution>>>,
+    }
+
+    impl InvocationExchangeBroker for LateResolutionCapabilities {
+        fn request(
+            &self,
+            _request: ToolExchangeRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolExchangeResolution> {
+            let receiver = self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("one exchange wait");
+            Box::pin(async move {
+                receiver
+                    .await
+                    .unwrap_or(ToolExchangeResolution::ConsumerDetached)
+            })
+        }
+    }
+
+    impl InvocationInputRouter for LateResolutionCapabilities {
+        fn receive(
+            &self,
+            _invocation_id: &str,
+        ) -> InvocationCapabilityFuture<'_, ToolInvocationInputResolution> {
+            let receiver = self
+                .input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("one input wait");
+            Box::pin(async move {
+                receiver
+                    .await
+                    .unwrap_or(ToolInvocationInputResolution::Closed)
+            })
+        }
+    }
+
+    impl InvocationServiceRouter for LateResolutionCapabilities {
+        fn invoke(
+            &self,
+            _request: ToolInvocationServiceRequest,
+        ) -> InvocationCapabilityFuture<'_, ToolInvocationServiceResolution> {
+            let receiver = self
+                .service
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("one service wait");
+            Box::pin(async move {
+                receiver
+                    .await
+                    .unwrap_or(ToolInvocationServiceResolution::Unsupported)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn late_exchange_input_and_service_responses_cannot_revive_cancelled_turn() {
+        let (exchange_tx, exchange_rx) = tokio::sync::oneshot::channel();
+        let (input_tx, input_rx) = tokio::sync::oneshot::channel();
+        let (service_tx, service_rx) = tokio::sync::oneshot::channel();
+        let capabilities = Arc::new(LateResolutionCapabilities {
+            exchange: Mutex::new(Some(exchange_rx)),
+            input: Mutex::new(Some(input_rx)),
+            service: Mutex::new(Some(service_rx)),
+        });
+        let turn = TurnScope::with_capabilities(
+            "turn",
+            TurnGeneration::new(1),
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::new(
+                capabilities.clone(),
+                capabilities.clone(),
+                capabilities,
+                Arc::new(UnsupportedInvocationCapabilities),
+            ),
+        );
+        let invocation = InvocationScope::new(turn.clone(), "invoke");
+        let exchange_scope = invocation.clone();
+        let exchange = tokio::spawn(async move {
+            exchange_scope
+                .request_exchange(ToolExchangeRequest {
+                    invocation_id: "invoke".to_string(),
+                    exchange_id: "exchange".to_string(),
+                    producer_id: "producer".to_string(),
+                    schema: "example.exchange".to_string(),
+                    schema_version: 1,
+                    payload: serde_json::Value::Null,
+                    response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+                })
+                .await
+        });
+        let input_scope = invocation.clone();
+        let input = tokio::spawn(async move { input_scope.receive_input().await });
+        let service = tokio::spawn(async move {
+            invocation
+                .invoke_service(ToolInvocationServiceRequest {
+                    invocation_id: "invoke".to_string(),
+                    request_id: "service".to_string(),
+                    interface_id: "example.service/v1".to_string(),
+                    operation: "run".to_string(),
+                    payload: serde_json::Value::Null,
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        assert!(turn.control().begin_cancellation());
+        assert_eq!(
+            exchange.await.expect("exchange task"),
+            ToolExchangeResolution::Cancelled
+        );
+        assert_eq!(
+            input.await.expect("input task"),
+            ToolInvocationInputResolution::Cancelled
+        );
+        assert_eq!(
+            service.await.expect("service task"),
+            ToolInvocationServiceResolution::Cancelled
+        );
+        assert!(!turn.accepts_work());
+
+        assert!(
+            exchange_tx
+                .send(ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"late": true}),
+                })
+                .is_err()
+        );
+        assert!(
+            input_tx
+                .send(ToolInvocationInputResolution::Received {
+                    input: bcode_tool::ToolInvocationInput {
+                        invocation_id: "invoke".to_string(),
+                        input_id: "late".to_string(),
+                        producer_id: "producer".to_string(),
+                        schema: "example.input".to_string(),
+                        schema_version: 1,
+                        payload: serde_json::Value::Null,
+                    },
+                })
+                .is_err()
+        );
+        assert!(
+            service_tx
+                .send(ToolInvocationServiceResolution::Responded {
+                    payload: serde_json::json!({"late": true}),
+                })
+                .is_err()
+        );
+    }
     #[test]
     fn normal_completion_closes_output_without_requesting_cancellation() {
         let sink = Arc::new(CountingSink::default());

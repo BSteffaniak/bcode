@@ -32,7 +32,10 @@ fn response(output: &str) -> ToolInvocationResponse {
     }
 }
 
-fn exchange(scope: &InvocationScope) -> ToolExchangeRequest {
+fn exchange_with_policy(
+    scope: &InvocationScope,
+    response_policy: ToolExchangeResponsePolicy,
+) -> ToolExchangeRequest {
     ToolExchangeRequest {
         invocation_id: scope.invocation_id().to_string(),
         exchange_id: "exchange".to_string(),
@@ -40,7 +43,7 @@ fn exchange(scope: &InvocationScope) -> ToolExchangeRequest {
         schema: "test.exchange".to_string(),
         schema_version: 1,
         payload: serde_json::Value::Null,
-        response_policy: ToolExchangeResponsePolicy::Required,
+        response_policy,
     }
 }
 
@@ -52,15 +55,23 @@ fn call(name: &str) -> ToolCall {
     }
 }
 
-async fn run(policy: Option<HeadlessExchangePolicy>, name: &str) -> ToolExchangeResolution {
+async fn run_with_policy(
+    policy: Option<HeadlessExchangePolicy>,
+    name: &str,
+    response_policy: ToolExchangeResponsePolicy,
+) -> ToolExchangeResolution {
     let agent = {
-        let builder =
-            Agent::builder().scoped_inline_tool(definition(name), |_request, scope| async move {
-                let resolution = scope.request_exchange(exchange(&scope)).await;
+        let builder = Agent::builder().scoped_inline_tool(
+            definition(name),
+            move |_request, scope| async move {
+                let resolution = scope
+                    .request_exchange(exchange_with_policy(&scope, response_policy))
+                    .await;
                 let output =
                     serde_json::to_string(&resolution).map_err(|error| error.to_string())?;
                 Ok(response(&output))
-            });
+            },
+        );
         policy
             .map_or(builder.clone(), |policy| {
                 builder.headless_exchange_policy(policy)
@@ -72,6 +83,10 @@ async fn run(policy: Option<HeadlessExchangePolicy>, name: &str) -> ToolExchange
         .await
         .expect("tool executes");
     serde_json::from_str(&output.invocation.output).expect("resolution decodes")
+}
+
+async fn run(policy: Option<HeadlessExchangePolicy>, name: &str) -> ToolExchangeResolution {
+    run_with_policy(policy, name, ToolExchangeResponsePolicy::Required).await
 }
 
 #[derive(Debug)]
@@ -138,5 +153,27 @@ async fn headless_exchange_policies_are_explicit_and_default_required_is_unsuppo
         ToolExchangeResolution::Responded {
             payload: serde_json::json!({"answer": true}),
         }
+    );
+}
+
+#[tokio::test]
+async fn unsupported_headless_exchange_is_explicit_for_required_and_optional_policies() {
+    assert_eq!(
+        run_with_policy(
+            None,
+            "required-unsupported",
+            ToolExchangeResponsePolicy::Required,
+        )
+        .await,
+        ToolExchangeResolution::NoCompatibleConsumer
+    );
+    assert_eq!(
+        run_with_policy(
+            None,
+            "optional-unsupported",
+            ToolExchangeResponsePolicy::Optional,
+        )
+        .await,
+        ToolExchangeResolution::NoCompatibleConsumer
     );
 }

@@ -4539,6 +4539,62 @@ library = "libexample_plugin.dylib"
         assert_eq!(response.payload, b"cancelled");
     }
 
+    fn assert_blocked_plugin_bridge_wakes_on_cancellation(plugin: LoadedPlugin) {
+        let plugin = Arc::new(plugin);
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let task_plugin = Arc::clone(&plugin);
+        let task_cancellation = cancellation.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let task_started = Arc::clone(&started);
+        let task = std::thread::spawn(move || {
+            task_plugin.invoke_service_with_bridge(
+                "example-hello/v1",
+                "bridge-exchange",
+                Vec::new(),
+                |_| {},
+                |_, callback_cancellation| {
+                    task_started.store(true, Ordering::SeqCst);
+                    if callback_cancellation.wait_cancelled(Duration::from_secs(5)) {
+                        Err("cancelled".to_string())
+                    } else {
+                        panic!("ABI bridge callback did not wake on cancellation")
+                    }
+                },
+                &task_cancellation,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !started.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "ABI bridge callback did not start"
+            );
+            std::thread::yield_now();
+        }
+
+        let cancel_started = Instant::now();
+        cancellation.cancel();
+        let response = task
+            .join()
+            .expect("bridge invocation thread should join")
+            .expect("bridge invocation should return a plugin response");
+
+        assert!(cancel_started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("bridge_failed")
+        );
+    }
+
+    #[test]
+    fn dynamic_blocked_abi_bridge_wakes_on_cancellation() {
+        assert_blocked_plugin_bridge_wakes_on_cancellation(load_dynamic_hello_plugin());
+    }
+
+    #[test]
+    fn static_blocked_abi_bridge_wakes_on_cancellation() {
+        assert_blocked_plugin_bridge_wakes_on_cancellation(load_static_hello_plugin());
+    }
     fn question_dynamic_library_path() -> PathBuf {
         let executable = std::env::current_exe().expect("current test executable path");
         let directory = executable.parent().expect("test executable parent");

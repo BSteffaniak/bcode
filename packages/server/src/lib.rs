@@ -15923,6 +15923,8 @@ async fn invoke_model_tool(
             biased;
             () = cancel_state.cancelled() => {
                 invocation.cancel.cancel();
+                drop(bridge_resolutions);
+                input_receiver.lock().await.close();
                 return Ok(tool_error("tool invocation cancelled"));
             }
             publisher_event = tool_output_publisher.next_event() => {
@@ -15974,6 +15976,8 @@ async fn invoke_model_tool(
             }
         }
     };
+    drop(bridge_resolutions);
+    input_receiver.lock().await.close();
     while !cancel_state.is_cancelled()
         && let Some(payload) = invocation.try_recv_event()
     {
@@ -19245,6 +19249,18 @@ mod tests {
         }
         cancel_state.cancel().await;
         assert_eq!(waiting.await, ToolInvocationInputResolution::Cancelled);
+        receiver.lock().await.close();
+        assert!(matches!(
+            sender.try_send(ToolInvocationInput {
+                invocation_id: "call-1".to_string(),
+                input_id: "late".to_string(),
+                producer_id: "bcode.shell".to_string(),
+                schema: "bcode.shell.invocation-action".to_string(),
+                schema_version: 1,
+                payload: serde_json::Value::Null,
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
     }
     #[tokio::test]
     async fn session_artifact_sink_writes_bounded_owned_artifacts_transactionally() {

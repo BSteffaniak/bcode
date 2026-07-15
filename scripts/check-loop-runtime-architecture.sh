@@ -142,6 +142,24 @@ if [[ "$loop_default_clients" != "8" ]]; then
   violations=1
 fi
 
+native_search_implementations="$(
+  rg -l 'fn (native_web_search|native_web_search_inner)\b' packages plugins --glob '*.rs' \
+    | sort
+)"
+if [[ -n "$native_search_implementations" ]] && grep -Ev '^plugins/[^/]*provider-plugin/src/' <<<"$native_search_implementations" >/tmp/bcode-native-search-domain-leakage.txt; then
+  echo "Runtime architecture violation: provider-native search implementation escaped provider plugins." >&2
+  cat /tmp/bcode-native-search-domain-leakage.txt >&2
+  violations=1
+fi
+
+for removed_symbol in HostModelNativeWebSearchRequest cancellation_path invocation_action_path; do
+  if rg -n "\\b${removed_symbol}\\b" packages plugins examples --glob '*.rs' >/tmp/bcode-removed-runtime-symbol.txt; then
+    echo "Runtime architecture violation: removed symbol ${removed_symbol} was reintroduced." >&2
+    cat /tmp/bcode-removed-runtime-symbol.txt >&2
+    violations=1
+  fi
+done
+
 if (( violations != 0 )); then
   exit 1
 fi
