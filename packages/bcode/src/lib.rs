@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub use bcode_agent_permissions::{AgentPermissionPolicy, allow_all_agent_policy};
@@ -1261,6 +1261,69 @@ impl InvocationExchangeBroker for HeadlessExchangePolicy {
     }
 }
 
+/// Item produced by the generic scoped agent stream.
+#[derive(Debug)]
+pub enum ScopedAgentStreamItem {
+    /// Runtime, invocation lifecycle, or contribution event accepted by the canonical turn scope.
+    Event(ScopedTurnEvent),
+    /// Completed provider/tool orchestration response.
+    Finished(GenerateTextResponse),
+    /// Error that terminated provider/tool orchestration.
+    Error(BcodeError),
+}
+
+/// Generic stream for one complete provider/tool turn across every scoped event family.
+#[derive(Debug)]
+pub struct ScopedAgentStream {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<ScopedAgentStreamItem>,
+}
+
+impl ScopedAgentStream {
+    /// Receive the next scoped stream item.
+    pub async fn next(&mut self) -> Option<ScopedAgentStreamItem> {
+        self.receiver.recv().await
+    }
+}
+
+struct ScopedAgentEventSink {
+    configured: Arc<dyn TurnEventSink>,
+    sender: tokio::sync::mpsc::UnboundedSender<ScopedAgentStreamItem>,
+}
+
+impl TurnEventSink for ScopedAgentEventSink {
+    fn emit(&self, event: ScopedTurnEvent) -> bool {
+        let configured = self.configured.emit(event.clone());
+        let streamed = self
+            .sender
+            .send(ScopedAgentStreamItem::Event(event))
+            .is_ok();
+        configured && streamed
+    }
+}
+
+fn append_provider_tool_calls(
+    messages: &mut Vec<ModelMessage>,
+    response: &AgentTurnResponse,
+    calls: &[ToolCall],
+) {
+    let mut content = Vec::with_capacity(calls.len() + 1);
+    if !response.text.is_empty() {
+        content.push(ModelContentBlock::Text {
+            text: response.text.clone(),
+        });
+    }
+    content.extend(
+        calls
+            .iter()
+            .cloned()
+            .map(|call| ModelContentBlock::ToolCall { call }),
+    );
+    messages.push(ModelMessage {
+        role: MessageRole::Assistant,
+        content,
+    });
+}
+
 fn structured_prompt(prompt: &str, options: &StructuredOutputOptions) -> String {
     format!(
         "{prompt}\n\nReturn only a JSON object that matches this JSON Schema. Do not wrap it in Markdown fences or include explanatory text.\nSchema name: {name}\nSchema:\n{schema}",
@@ -2471,6 +2534,26 @@ impl Agent {
             .await
     }
 
+    /// Run one complete provider/tool turn with a caller-supplied provider.
+    ///
+    /// Provider-native tool-call batches are automatically authorized, scheduled once, executed,
+    /// and returned to the provider in provider order until the provider finishes normally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation, tool orchestration, cancellation, or timeout
+    /// handling fails.
+    pub async fn run<P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        self.generate_text_with_provider(provider, prompt).await
+    }
+
     /// Generate text using a caller-supplied provider invoker.
     ///
     /// # Errors
@@ -2715,8 +2798,7 @@ impl Agent {
         let context = self.model_call_context(prompt.clone());
         self.hooks.run_before_model(&context)?;
         let response = self
-            .runtime
-            .run_text_turn(
+            .run_provider_tool_loop(
                 provider,
                 self.turn_request_with_structured_output_messages_and_cancellation(
                     prompt,
@@ -2724,6 +2806,7 @@ impl Agent {
                     messages,
                     cancellation,
                 ),
+                Arc::clone(&self.invocation_event_sink),
             )
             .await?;
         let response = GenerateTextResponse::from(response);
@@ -2876,6 +2959,46 @@ impl Agent {
         )
     }
 
+    /// Stream a complete provider/tool turn through the generic scoped event surface.
+    #[must_use]
+    pub fn stream<P>(&self, provider: P, prompt: impl Into<String>) -> ScopedAgentStream
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        self.stream_with_cancellation(provider, prompt, CancellationToken::new())
+    }
+
+    /// Stream a complete provider/tool turn with explicit cancellation.
+    #[must_use]
+    pub fn stream_with_cancellation<P>(
+        &self,
+        mut provider: P,
+        prompt: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> ScopedAgentStream
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let agent = self.clone();
+        let events: Arc<dyn TurnEventSink> = Arc::new(ScopedAgentEventSink {
+            configured: Arc::clone(&agent.invocation_event_sink),
+            sender: sender.clone(),
+        });
+        let request = agent.turn_request_with_cancellation(prompt.into(), cancellation);
+        tokio::spawn(async move {
+            let result = agent
+                .run_provider_tool_loop(&mut provider, request, events)
+                .await;
+            let item = match result {
+                Ok(runtime) => ScopedAgentStreamItem::Finished(runtime.into()),
+                Err(error) => ScopedAgentStreamItem::Error(error),
+            };
+            let _ = sender.send(item);
+        });
+        ScopedAgentStream { receiver }
+    }
+
     /// Create mutable tool-round state using this agent's configured maximum.
     #[must_use]
     pub const fn tool_round_state(&self) -> ToolRoundState {
@@ -2896,6 +3019,22 @@ impl Agent {
         calls: &[ToolCall],
         rounds: &mut ToolRoundState,
     ) -> Result<ToolBatchExecutionOutput> {
+        let scope = TurnScope::with_capabilities(
+            format!("sdk-tool-batch:{}", self.session_id),
+            TurnGeneration::new(0),
+            Arc::clone(&self.invocation_event_sink),
+            self.invocation_capabilities.clone(),
+        );
+        self.execute_tool_batch_in_scope(calls, rounds, &scope)
+            .await
+    }
+
+    async fn execute_tool_batch_in_scope(
+        &self,
+        calls: &[ToolCall],
+        rounds: &mut ToolRoundState,
+        scope: &TurnScope,
+    ) -> Result<ToolBatchExecutionOutput> {
         let default_invoker = SdkToolInvoker {
             handlers: self.inline_tool_handlers.clone(),
             #[cfg(feature = "embedded-plugins")]
@@ -2910,12 +3049,6 @@ impl Agent {
             .authorization_coordinator
             .as_deref()
             .unwrap_or(&policy_authorization);
-        let scope = TurnScope::with_capabilities(
-            format!("sdk-tool-batch:{}", self.session_id),
-            TurnGeneration::new(0),
-            Arc::clone(&self.invocation_event_sink),
-            self.invocation_capabilities.clone(),
-        );
         self.runtime
             .execute_prepared_tool_batch(
                 &self.tool_catalog,
@@ -2925,7 +3058,7 @@ impl Agent {
                 rounds,
                 &self.permission_context(),
                 self.execution_options,
-                &scope,
+                scope,
             )
             .await
             .map_err(Into::into)
@@ -2986,6 +3119,178 @@ impl Agent {
         Ok(output)
     }
 
+    async fn run_provider_tool_loop<P>(
+        &self,
+        provider: &mut P,
+        mut request: AgentTurnRequest,
+        events: Arc<dyn TurnEventSink>,
+    ) -> Result<AgentTurnResponse>
+    where
+        P: ModelProviderInvoker + ?Sized,
+    {
+        let scope = self.runtime.begin_turn_scope(
+            format!("sdk-agent:{}", self.session_id),
+            events,
+            self.invocation_capabilities.clone(),
+        );
+        let result = self
+            .run_provider_tool_loop_in_scope(provider, &mut request, &scope)
+            .await;
+        match result {
+            Ok(response) if self.runtime.complete_turn_scope(&scope) => Ok(response),
+            Ok(_) => Err(RuntimeError::Cancelled.into()),
+            Err(error) => {
+                let _ = self.runtime.cancel_turn_scope(&scope);
+                Err(error)
+            }
+        }
+    }
+
+    async fn run_provider_tool_loop_in_scope<P>(
+        &self,
+        provider: &mut P,
+        request: &mut AgentTurnRequest,
+        scope: &TurnScope,
+    ) -> Result<AgentTurnResponse>
+    where
+        P: ModelProviderInvoker + ?Sized,
+    {
+        let mut rounds = ToolRoundState::new(request.max_tool_rounds);
+        let started = Instant::now();
+        let timeout = request.timeout;
+        let mut all_events = Vec::new();
+        let mut messages = request.messages.clone();
+        if request.append_prompt {
+            messages.push(ModelMessage {
+                role: MessageRole::User,
+                content: vec![ModelContentBlock::Text {
+                    text: request.prompt.clone(),
+                }],
+            });
+        }
+
+        loop {
+            request.timeout = timeout
+                .checked_sub(started.elapsed())
+                .ok_or(RuntimeError::Timeout { timeout })?;
+            let response = self
+                .runtime
+                .run_text_turn_in_scope(provider, request, scope)
+                .await?;
+            all_events.extend(response.events.iter().cloned());
+            let calls = response
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ToolCallFinished(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            if response.stop_reason != Some(StopReason::ToolCall) {
+                return Ok(AgentTurnResponse {
+                    text: response.text,
+                    stop_reason: response.stop_reason,
+                    usage: response.usage,
+                    latency_ms: started.elapsed().as_millis(),
+                    events: all_events,
+                });
+            }
+            if calls.is_empty() {
+                return Err(BcodeError::ToolExecution(
+                    "provider finished with tool_call but emitted no completed tool calls"
+                        .to_string(),
+                ));
+            }
+
+            append_provider_tool_calls(&mut messages, &response, &calls);
+            self.run_before_tool_hooks(&calls)?;
+            let cancellation = request.cancellation.clone();
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .ok_or(RuntimeError::Timeout { timeout })?;
+            let batch = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    let _ = self.runtime.cancel_turn_scope(scope);
+                    return Err(RuntimeError::Cancelled.into());
+                }
+                () = tokio::time::sleep(remaining) => {
+                    let _ = self.runtime.cancel_turn_scope(scope);
+                    return Err(RuntimeError::Timeout { timeout }.into());
+                }
+                batch = self.execute_tool_batch_in_scope(&calls, &mut rounds, scope) => batch?,
+            };
+
+            self.append_tool_results(&mut messages, &mut all_events, &calls, batch, scope)?;
+            request.messages.clone_from(&messages);
+            request.prompt.clear();
+            request.append_prompt = false;
+        }
+    }
+
+    fn run_before_tool_hooks(&self, calls: &[ToolCall]) -> Result<()> {
+        for call in calls {
+            self.hooks.run_before_tool(&ToolCallContext {
+                agent_name: self.name.clone(),
+                call: call.clone(),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn append_tool_results(
+        &self,
+        messages: &mut Vec<ModelMessage>,
+        all_events: &mut Vec<AgentEvent>,
+        calls: &[ToolCall],
+        batch: ToolBatchExecutionOutput,
+        scope: &TurnScope,
+    ) -> Result<()> {
+        for (call, result) in calls.iter().zip(batch.results) {
+            let model_result = match result {
+                Ok(output) => {
+                    self.hooks.run_after_tool(
+                        &ToolCallContext {
+                            agent_name: self.name.clone(),
+                            call: call.clone(),
+                        },
+                        &ToolCallOutcome {
+                            output: output.clone(),
+                        },
+                    )?;
+                    if let Some(event) = output.events.into_iter().find_map(|event| {
+                        matches!(event, AgentEvent::ToolResult(_)).then_some(event)
+                    }) {
+                        all_events.push(event);
+                    }
+                    output.model_result
+                }
+                Err(error) => {
+                    let result = bcode_model::ToolResult {
+                        call_id: call.id.clone(),
+                        output: error.to_string(),
+                        is_error: true,
+                        content: Vec::new(),
+                    };
+                    let event = AgentEvent::ToolResult(result.clone());
+                    if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
+                        return Err(RuntimeError::Cancelled.into());
+                    }
+                    all_events.push(event);
+                    result
+                }
+            };
+            messages.push(ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ModelContentBlock::ToolResult {
+                    result: model_result,
+                }],
+            });
+        }
+        Ok(())
+    }
+
     fn permission_context(&self) -> RuntimePermissionContext {
         RuntimePermissionContext {
             session_id: self.session_id,
@@ -3037,6 +3342,7 @@ impl Agent {
             system_prompt: self.system_prompt.clone(),
             messages: Vec::new(),
             prompt,
+            append_prompt: true,
             tools: self.enabled_tool_definitions(),
             structured_output: None,
             parameters: self.parameters.clone(),

@@ -25,26 +25,23 @@ required-features = ["daemon-client"]
 
 [dependencies]
 bcode_agent_permissions = { workspace = true }
-bcode_agent_policy = { workspace = true }
-bcode_agent_profile = { workspace = true }
-bcode_agent_runtime = { workspace = true }
-bcode_bundled_plugins = { workspace = true, optional = true }
-bcode_cli = { workspace = true, optional = true }
-bcode_client = { workspace = true, optional = true }
-bcode_model = { workspace = true }
-bcode_plugin = { workspace = true, optional = true }
-bcode_plugin_sdk = { workspace = true }
-bcode_session_models = { workspace = true }
-bcode_tool = { workspace = true }
-jsonschema = { workspace = true }
-schemars = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = [
-    "macros",
-    "rt-multi-thread",
-], optional = true }
+bcode_agent_policy      = { workspace = true }
+bcode_agent_profile     = { workspace = true }
+bcode_agent_runtime     = { workspace = true }
+bcode_bundled_plugins   = { workspace = true, optional = true }
+bcode_cli               = { workspace = true, optional = true }
+bcode_client            = { workspace = true, optional = true }
+bcode_model             = { workspace = true }
+bcode_plugin            = { workspace = true, optional = true }
+bcode_plugin_sdk        = { workspace = true }
+bcode_session_models    = { workspace = true }
+bcode_tool              = { workspace = true }
+jsonschema              = { workspace = true }
+schemars                = { workspace = true }
+serde                   = { workspace = true, features = ["derive"] }
+serde_json              = { workspace = true }
+thiserror               = { workspace = true }
+tokio                   = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [dev-dependencies]
 bcode_hello_plugin = { workspace = true }
@@ -74,10 +71,10 @@ bundled-ocr-tesseract-v5-5-2 = [
     "bcode_bundled_plugins/bundled-ocr-tesseract-v5-5-2",
 ]
 bundled-plugins = ["dep:bcode_bundled_plugins"]
-cli = ["dep:bcode_cli", "dep:tokio"]
+cli = ["dep:bcode_cli"]
 daemon-client = ["dep:bcode_client"]
 default = []
-embedded-plugins = ["dep:bcode_plugin", "dep:tokio"]
+embedded-plugins = ["dep:bcode_plugin"]
 fail-on-warnings = []
 static-bundled-bedrock-provider-plugin = [
     "bundled-plugins",

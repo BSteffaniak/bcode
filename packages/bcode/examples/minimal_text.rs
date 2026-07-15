@@ -1,4 +1,4 @@
-use bcode::{Agent, AgentEvent, AgentStreamItem};
+use bcode::{Agent, AgentEvent, ScopedAgentStreamItem, ScopedTurnEvent};
 use bcode_agent_runtime::{ModelProviderInvoker, RuntimeFuture};
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -78,21 +78,21 @@ async fn main() -> bcode::Result<()> {
         .build();
 
     let mut provider = ExampleProvider::new();
-    let response = agent
-        .generate_text_with_provider(&mut provider, "Say hello")
-        .await?;
+    let response = agent.run(&mut provider, "Say hello").await?;
     println!("{}", response.text);
 
-    let mut stream = agent.stream_text_with_provider(ExampleProvider::new(), "Say hello again");
+    let mut stream = agent.stream(ExampleProvider::new(), "Say hello again");
     while let Some(item) = stream.next().await {
         match item {
-            AgentStreamItem::Event(AgentEvent::TextDelta(text)) => print!("{text}"),
-            AgentStreamItem::Finished(response) => {
-                println!("\nfinished: {:?}", response.stop_reason);
+            ScopedAgentStreamItem::Event(ScopedTurnEvent::Runtime(AgentEvent::TextDelta(text))) => {
+                print!("{text}");
+            }
+            ScopedAgentStreamItem::Finished(response) => {
+                println!("\nfinished: {:?}", response.runtime.stop_reason);
                 break;
             }
-            AgentStreamItem::Error(error) => return Err(error.into()),
-            AgentStreamItem::Event(_) => {}
+            ScopedAgentStreamItem::Error(error) => return Err(error),
+            ScopedAgentStreamItem::Event(_) => {}
         }
     }
 

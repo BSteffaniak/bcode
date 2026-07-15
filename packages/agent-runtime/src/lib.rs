@@ -185,6 +185,8 @@ pub struct AgentTurnRequest {
     pub messages: Vec<ModelMessage>,
     /// User prompt for this turn.
     pub prompt: String,
+    /// Whether `prompt` should be appended as a new user message.
+    pub append_prompt: bool,
     /// Model-callable tool definitions available to the provider.
     pub tools: Vec<ToolDefinition>,
     /// Provider-native structured output request.
@@ -212,6 +214,7 @@ impl AgentTurnRequest {
             system_prompt: None,
             messages: Vec::new(),
             prompt: prompt.into(),
+            append_prompt: true,
             tools: Vec::new(),
             structured_output: None,
             parameters: ModelParameters::default(),
@@ -843,8 +846,9 @@ impl ActiveRuntimeTurn {
         owner: TurnScopeOwner,
         turn_id: impl Into<Arc<str>>,
         events: Arc<dyn TurnEventSink>,
+        capabilities: InvocationCapabilities,
     ) -> Self {
-        let scope = owner.begin_turn(turn_id, events, InvocationCapabilities::default());
+        let scope = owner.begin_turn(turn_id, events, capabilities);
         Self {
             owner,
             scope,
@@ -1344,29 +1348,30 @@ impl AgentRuntime {
         AgentRuntimeStream { receiver }
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn run_text_turn_internal<P>(
+    /// Run one provider turn inside an existing canonical turn scope.
+    ///
+    /// The caller owns scope completion and may continue the same scope through tool execution and
+    /// subsequent provider rounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, the provider reports an error, the turn is
+    /// cancelled, the scope closes, or the timeout expires.
+    pub async fn run_text_turn_in_scope<P>(
         &self,
         provider: &mut P,
-        request: AgentTurnRequest,
-        stream: Option<&mpsc::UnboundedSender<AgentRuntimeStreamItem>>,
+        request: &AgentTurnRequest,
+        scope: &TurnScope,
     ) -> Result<AgentTurnResponse>
     where
-        P: ModelProviderInvoker,
+        P: ModelProviderInvoker + ?Sized,
     {
         let start = Instant::now();
-        let mut active_turn = ActiveRuntimeTurn::new(
-            self.turns.clone(),
-            "text-turn",
-            Arc::new(RuntimeStreamEventSink {
-                sender: stream.cloned(),
-            }),
-        );
-        let model_request = model_turn_request(&request);
+        let model_request = model_turn_request(request);
         let provider_plugin_id = request.provider_plugin_id.as_deref();
-        let start_response = provider
-            .start_turn(provider_plugin_id, &model_request)
-            .await?;
+        let start_response =
+            start_provider_turn(provider, provider_plugin_id, &model_request, request, scope)
+                .await?;
         let poll_request = PollTurnEventsRequest {
             provider_turn_id: start_response.provider_turn_id.clone(),
         };
@@ -1380,57 +1385,43 @@ impl AgentRuntime {
         let mut text = String::new();
         let mut usage = None;
 
-        let turn_started = AgentRuntimeEvent::TurnStarted;
-        if !active_turn
-            .scope()
-            .emit(ScopedTurnEvent::Runtime(turn_started.clone()))
-        {
-            cancel_and_finish(
-                provider,
-                provider_plugin_id,
-                &cancel_request,
-                &finish_request,
-            )
-            .await;
-            return Err(RuntimeError::Cancelled);
-        }
-        events.push(turn_started);
+        emit_turn_started(
+            provider,
+            provider_plugin_id,
+            &cancel_request,
+            &finish_request,
+            scope,
+            &mut events,
+        )
+        .await?;
 
         loop {
-            if !active_turn.scope().accepts_work() {
-                cancel_and_finish(
-                    provider,
-                    provider_plugin_id,
-                    &cancel_request,
-                    &finish_request,
-                )
-                .await;
-                return Err(RuntimeError::Cancelled);
-            }
-            if let Some(error) = terminal_control_error(
+            ensure_scope_active(
                 provider,
                 provider_plugin_id,
                 &cancel_request,
                 &finish_request,
-                &request,
-                start,
+                scope,
             )
-            .await
-            {
-                return Err(error);
-            }
-
-            let poll = provider
-                .poll_turn_events(provider_plugin_id, &poll_request)
-                .await?;
+            .await?;
+            let poll = poll_provider_events(
+                provider,
+                &ProviderPollContext {
+                    provider_plugin_id,
+                    poll_request: &poll_request,
+                    cancel_request: &cancel_request,
+                    finish_request: &finish_request,
+                    request,
+                    scope,
+                    start,
+                },
+            )
+            .await?;
             let should_sleep = poll.events.is_empty();
             for event in poll.events {
                 match normalize_provider_event(event, &mut text, &mut usage)? {
                     EventDisposition::Continue(event) => {
-                        if !active_turn
-                            .scope()
-                            .emit(ScopedTurnEvent::Runtime(event.clone()))
-                        {
+                        if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
                             cancel_and_finish(
                                 provider,
                                 provider_plugin_id,
@@ -1448,16 +1439,10 @@ impl AgentRuntime {
                             .await?;
                         let finished_event =
                             finished_event(usage.as_ref(), start.elapsed(), stop_reason);
-                        if !active_turn
-                            .scope()
-                            .emit(ScopedTurnEvent::Runtime(finished_event.clone()))
-                        {
+                        if !scope.emit(ScopedTurnEvent::Runtime(finished_event.clone())) {
                             return Err(RuntimeError::Cancelled);
                         }
                         events.push(finished_event);
-                        if !active_turn.complete() {
-                            return Err(RuntimeError::Cancelled);
-                        }
                         return Ok(AgentTurnResponse {
                             text,
                             stop_reason: Some(stop_reason),
@@ -1467,10 +1452,7 @@ impl AgentRuntime {
                         });
                     }
                     EventDisposition::Cancelled(event) => {
-                        if !active_turn
-                            .scope()
-                            .emit(ScopedTurnEvent::Runtime(event.clone()))
-                        {
+                        if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
                             return Err(RuntimeError::Cancelled);
                         }
                         events.push(event);
@@ -1481,10 +1463,35 @@ impl AgentRuntime {
                     }
                 }
             }
-            if should_sleep {
-                tokio::time::sleep(self.poll_interval).await;
-            }
+            sleep_after_empty_poll(should_sleep, self.poll_interval).await;
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_text_turn_internal<P>(
+        &self,
+        provider: &mut P,
+        request: AgentTurnRequest,
+        stream: Option<&mpsc::UnboundedSender<AgentRuntimeStreamItem>>,
+    ) -> Result<AgentTurnResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        let mut active_turn = ActiveRuntimeTurn::new(
+            self.turns.clone(),
+            "text-turn",
+            Arc::new(RuntimeStreamEventSink {
+                sender: stream.cloned(),
+            }),
+            InvocationCapabilities::default(),
+        );
+        let response = self
+            .run_text_turn_in_scope(provider, &request, active_turn.scope())
+            .await?;
+        if !active_turn.complete() {
+            return Err(RuntimeError::Cancelled);
+        }
+        Ok(response)
     }
 }
 
@@ -1494,28 +1501,128 @@ enum EventDisposition {
     Cancelled(AgentRuntimeEvent),
 }
 
-async fn terminal_control_error<P>(
+async fn sleep_after_empty_poll(should_sleep: bool, poll_interval: Duration) {
+    if should_sleep {
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn ensure_scope_active<P>(
     provider: &mut P,
     provider_plugin_id: Option<&str>,
     cancel_request: &CancelTurnRequest,
     finish_request: &FinishTurnRequest,
-    request: &AgentTurnRequest,
-    start: Instant,
-) -> Option<RuntimeError>
+    scope: &TurnScope,
+) -> Result<()>
 where
-    P: ModelProviderInvoker,
+    P: ModelProviderInvoker + ?Sized,
 {
-    if request.cancellation.is_cancelled() {
-        cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
-        return Some(RuntimeError::Cancelled);
+    if scope.accepts_work() {
+        return Ok(());
     }
-    if start.elapsed() >= request.timeout {
-        cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
-        return Some(RuntimeError::Timeout {
-            timeout: request.timeout,
-        });
+    cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
+    Err(RuntimeError::Cancelled)
+}
+
+async fn emit_turn_started<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    cancel_request: &CancelTurnRequest,
+    finish_request: &FinishTurnRequest,
+    scope: &TurnScope,
+    events: &mut Vec<AgentRuntimeEvent>,
+) -> Result<()>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    let event = AgentRuntimeEvent::TurnStarted;
+    if scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
+        events.push(event);
+        return Ok(());
     }
-    None
+    cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
+    Err(RuntimeError::Cancelled)
+}
+
+async fn start_provider_turn<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    model_request: &ModelTurnRequest,
+    request: &AgentTurnRequest,
+    scope: &TurnScope,
+) -> Result<StartTurnResponse>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    let scope_cancellation = scope.control().cancellation();
+    tokio::select! {
+        biased;
+        () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        () = tokio::time::sleep(request.timeout) => {
+            Err(RuntimeError::Timeout { timeout: request.timeout })
+        }
+        response = provider.start_turn(provider_plugin_id, model_request) => response,
+    }
+}
+
+struct ProviderPollContext<'a> {
+    provider_plugin_id: Option<&'a str>,
+    poll_request: &'a PollTurnEventsRequest,
+    cancel_request: &'a CancelTurnRequest,
+    finish_request: &'a FinishTurnRequest,
+    request: &'a AgentTurnRequest,
+    scope: &'a TurnScope,
+    start: Instant,
+}
+
+async fn poll_provider_events<P>(
+    provider: &mut P,
+    context: &ProviderPollContext<'_>,
+) -> Result<PollTurnEventsResponse>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    let remaining = context
+        .request
+        .timeout
+        .checked_sub(context.start.elapsed())
+        .ok_or(RuntimeError::Timeout {
+            timeout: context.request.timeout,
+        })?;
+    let request_cancellation = context.request.cancellation.clone();
+    let scope_cancellation = context.scope.control().cancellation();
+    tokio::select! {
+        biased;
+        () = request_cancellation.cancelled() => {
+            cancel_and_finish(
+                provider,
+                context.provider_plugin_id,
+                context.cancel_request,
+                context.finish_request,
+            ).await;
+            Err(RuntimeError::Cancelled)
+        }
+        () = scope_cancellation.cancelled() => {
+            cancel_and_finish(
+                provider,
+                context.provider_plugin_id,
+                context.cancel_request,
+                context.finish_request,
+            ).await;
+            Err(RuntimeError::Cancelled)
+        }
+        () = tokio::time::sleep(remaining) => {
+            cancel_and_finish(
+                provider,
+                context.provider_plugin_id,
+                context.cancel_request,
+                context.finish_request,
+            ).await;
+            Err(RuntimeError::Timeout { timeout: context.request.timeout })
+        }
+        poll = provider.poll_turn_events(context.provider_plugin_id, context.poll_request) => poll,
+    }
 }
 
 async fn cancel_and_finish<P>(
@@ -1524,7 +1631,7 @@ async fn cancel_and_finish<P>(
     cancel_request: &CancelTurnRequest,
     finish_request: &FinishTurnRequest,
 ) where
-    P: ModelProviderInvoker,
+    P: ModelProviderInvoker + ?Sized,
 {
     let _ = provider
         .cancel_turn(provider_plugin_id, cancel_request)
@@ -1702,7 +1809,16 @@ where
     if !scope.control().accepts_normal_output() {
         return Err(RuntimeError::Cancelled);
     }
-    Ok(tool_execution_output(&prepared.call, invocation))
+    let output = tool_execution_output(&prepared.call, invocation);
+    for event in &output.events {
+        if matches!(event, AgentRuntimeEvent::ToolCallFinished(_)) {
+            continue;
+        }
+        if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
+            return Err(RuntimeError::Cancelled);
+        }
+    }
+    Ok(output)
 }
 
 fn tool_execution_output(
@@ -1787,12 +1903,14 @@ fn model_image_metadata(metadata: bcode_tool::ImageMetadata) -> bcode_model::Ima
 fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
     let session_id = SessionId::new();
     let mut messages = request.messages.clone();
-    messages.push(ModelMessage {
-        role: MessageRole::User,
-        content: vec![ContentBlock::Text {
-            text: request.prompt.clone(),
-        }],
-    });
+    if request.append_prompt {
+        messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: request.prompt.clone(),
+            }],
+        });
+    }
     ModelTurnRequest {
         session_id,
         turn_id: format!("sdk-turn-{session_id}"),
@@ -2571,13 +2689,14 @@ mod tests {
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 4);
         assert!(matches!(
             events.as_slice(),
             [
                 ScopedTurnEvent::InvocationLifecycle(_),
                 ScopedTurnEvent::Contribution(_),
-                ScopedTurnEvent::InvocationLifecycle(_)
+                ScopedTurnEvent::InvocationLifecycle(_),
+                ScopedTurnEvent::Runtime(AgentRuntimeEvent::ToolResult(_))
             ]
         ));
         drop(events);
@@ -3724,6 +3843,68 @@ mod tests {
                 break;
             }
         }
+
+        assert!(cancelled);
+    }
+    struct BlockingPollProvider;
+
+    impl ModelProviderInvoker for BlockingPollProvider {
+        fn start_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a ModelTurnRequest,
+        ) -> RuntimeFuture<'a, StartTurnResponse> {
+            Box::pin(async {
+                Ok(StartTurnResponse {
+                    provider_turn_id: "blocked".to_string(),
+                })
+            })
+        }
+
+        fn poll_turn_events<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a PollTurnEventsRequest,
+        ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+            Box::pin(std::future::pending())
+        }
+
+        fn cancel_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a CancelTurnRequest,
+        ) -> RuntimeFuture<'a, AckResponse> {
+            Box::pin(async { Ok(AckResponse::default()) })
+        }
+
+        fn finish_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a FinishTurnRequest,
+        ) -> RuntimeFuture<'a, AckResponse> {
+            Box::pin(async { Ok(AckResponse::default()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_blocked_provider_poll() {
+        let cancellation = CancellationToken::new();
+        let mut request = AgentTurnRequest::new("test-model", "hello");
+        request.cancellation = cancellation.clone();
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_text_turn(BlockingPollProvider, request);
+
+        cancellation.cancel();
+        let cancelled = tokio::time::timeout(Duration::from_millis(100), async {
+            while let Some(item) = stream.next().await {
+                if matches!(item, AgentRuntimeStreamItem::Error(RuntimeError::Cancelled)) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("cancellation should interrupt a blocked provider poll");
 
         assert!(cancelled);
     }

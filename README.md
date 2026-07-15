@@ -18,9 +18,7 @@ use bcode::{Agent, ModelProviderInvoker};
 
 # async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
 let agent = Agent::builder().model("example-model").build();
-let response = agent
-    .generate_text_with_provider(&mut provider, "Say hello")
-    .await?;
+let response = agent.run(&mut provider, "Say hello").await?;
 println!("{}", response.text);
 # Ok(())
 # }
@@ -35,15 +33,40 @@ println!("{}", response.text);
 
 ### Providers
 
-For tests, examples, or custom integrations, implement `ModelProviderInvoker` and call `Agent::generate_text_with_provider`, `Agent::stream_text_with_provider`, or `Agent::generate_object_with_provider`. For plugin-backed embedded use, create a plugin runtime host and pass it through `Bcode::builder().plugin_runtime(...)` with the `embedded-plugins` feature enabled.
+For tests, examples, or custom integrations, implement `ModelProviderInvoker` and call `Agent::run`. When a provider ends a round with one or more tool calls, `run` automatically executes the complete batch and sends results back in provider order until the provider finishes. Provider factories can instead be configured on `AgentBuilder` for `Agent::generate_text` and `Agent::stream_text`. Plugin-backed embedded applications can create a plugin runtime host and pass it through `Agent::builder().plugin_runtime(...)` with the `embedded-plugins` feature enabled.
 
 ### Custom tools
 
-Register inline tools with `Agent::builder().inline_tool(...)`. Tool definitions use `bcode_tool::ToolDefinition`, and handlers receive typed `ToolInvocationRequest` values and return `ToolInvocationResponse` values. Tool calls can be executed directly with `Agent::execute_tool_call(...)`; provider-requested tool calls are routed through the same runtime abstractions.
+Register synchronous inline tools with `Agent::builder().inline_tool(...)`. Use `scoped_inline_tool(...)` for asynchronous tools that need exchanges, unsolicited input, nested services, artifact writes, lifecycle events, contributions, or cancellation through `InvocationScope`. Tool definitions use `bcode_tool::ToolDefinition`. Provider-requested batches use the same registered tools and configured execution options as direct calls.
+
+Advanced hosts can inject typed adapters without implementing orchestration:
+
+```rust,no_run
+use bcode::{
+    Agent, HeadlessExchangePolicy, InvocationArtifactSink, InvocationInputRouter,
+    InvocationServiceRouter, ToolInvoker,
+};
+use std::sync::Arc;
+
+# fn build(
+#     invoker: Arc<dyn ToolInvoker>,
+#     inputs: Arc<dyn InvocationInputRouter>,
+#     services: Arc<dyn InvocationServiceRouter>,
+#     artifacts: Arc<dyn InvocationArtifactSink>,
+# ) -> Agent {
+Agent::builder()
+    .tool_invoker(invoker)
+    .input_router(inputs)
+    .service_router(services)
+    .artifact_sink(artifacts)
+    .headless_exchange_policy(HeadlessExchangePolicy::Reject)
+    .build()
+# }
+```
 
 ### Streaming events
 
-Use `Agent::stream_text_with_provider(...)` for event-driven generation. The stream yields `AgentStreamItem` values containing normalized `AgentEvent` events, a final response, or an error. Events include text deltas, reasoning deltas, tool calls/results, provider warnings, usage, and provider metadata.
+Use `Agent::stream(provider, prompt)` for a complete provider/tool turn. It yields `ScopedAgentStreamItem` values whose events are generic `ScopedTurnEvent` runtime, invocation-lifecycle, or contribution envelopes, followed by a final response or error. `Agent::stream_text_with_provider(...)` remains the provider-only compatibility stream.
 
 ### Structured output
 
