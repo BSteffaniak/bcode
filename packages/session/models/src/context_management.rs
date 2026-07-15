@@ -64,8 +64,10 @@ pub struct ContextUsageSnapshot {
     /// Last canonical event represented by the observed request.
     pub context_through_sequence: u64,
     /// Full active input-context occupancy.
+    #[serde(alias = "input_tokens")]
     pub context_input_tokens: u64,
     /// Local estimate of the complete model-visible request before calibration.
+    #[serde(alias = "estimated_input_tokens")]
     pub local_request_estimate_tokens: u64,
     /// Observation source.
     pub source: ContextUsageSource,

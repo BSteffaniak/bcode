@@ -1948,6 +1948,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_context_usage_token_fields_decode_without_changing_current_encoding() {
+        let legacy = serde_json::json!({
+            "invocation": invocation("legacy", 1),
+            "context_through_sequence": 42,
+            "input_tokens": 1234,
+            "estimated_input_tokens": 1200,
+            "source": "estimated"
+        });
+
+        let snapshot: ContextUsageSnapshot =
+            serde_json::from_value(legacy).expect("legacy context usage should decode");
+        assert_eq!(snapshot.context_input_tokens, 1234);
+        assert_eq!(snapshot.local_request_estimate_tokens, 1200);
+
+        let encoded = serde_json::to_value(snapshot).expect("current context usage should encode");
+        assert_eq!(encoded["context_input_tokens"], 1234);
+        assert_eq!(encoded["local_request_estimate_tokens"], 1200);
+        assert!(encoded.get("input_tokens").is_none());
+        assert!(encoded.get("estimated_input_tokens").is_none());
+    }
+
+    #[test]
     fn context_estimate_calibrates_from_compatible_anchor() {
         let estimate = ContextOccupancy::project_estimate(None, invocation("one", 3), 1, 42);
         let current = ContextOccupancy::reconcile(None, 3, 4, estimate.clone())

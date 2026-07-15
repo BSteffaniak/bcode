@@ -42,7 +42,7 @@ const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
-const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 2;
+const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 3;
 const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
 
 /// Errors returned by Switchy-backed session database operations.
@@ -1953,6 +1953,12 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "022_context_occupancy_projection_table",
         "CREATE TABLE IF NOT EXISTS context_occupancy_projection (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    context_epoch INTEGER NOT NULL,\n    occupancy_json TEXT\n);\nINSERT OR IGNORE INTO context_occupancy_projection (projection_id, schema_version, context_epoch, occupancy_json) SELECT 1, 1, COALESCE(MAX(event_seq), 0), NULL FROM events WHERE event_type IN ('model_changed', 'context_compacted', 'provider_context_compacted');\nINSERT OR IGNORE INTO projection_checkpoints (projection_name, last_event_seq, projection_version, updated_at_ms) SELECT 'context_occupancy', COALESCE(MAX(event_seq), 0), 1, 0 FROM events",
         "DROP TABLE IF EXISTS context_occupancy_projection",
+    );
+    add_sql_migration(
+        source,
+        "023_reset_legacy_context_occupancy_projection",
+        "UPDATE context_occupancy_projection SET schema_version = 3, occupancy_json = NULL WHERE schema_version < 3",
+        "UPDATE context_occupancy_projection SET schema_version = 2, occupancy_json = NULL WHERE schema_version = 3",
     );
 }
 
@@ -4246,6 +4252,62 @@ mod tests {
         assert_eq!(
             db.current_context_occupancy().await.expect("occupancy"),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_legacy_context_occupancy_resets_incompatible_derived_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        ))
+        .await
+        .expect("append model boundary");
+        db.database()
+            .update("context_occupancy_projection")
+            .value("schema_version", DatabaseValue::Int32(2))
+            .value(
+                "occupancy_json",
+                r#"{"context_epoch":0,"observation_sequence":1,"snapshot":{"invocation":{},"context_through_sequence":0}}"#,
+            )
+            .where_eq("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
+            .execute(db.database())
+            .await
+            .expect("install legacy occupancy");
+        db.database()
+            .delete(SESSION_MIGRATIONS_TABLE)
+            .where_eq("id", "023_reset_legacy_context_occupancy_projection")
+            .execute(db.database())
+            .await
+            .expect("mark compatibility migration pending");
+        drop(db);
+
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("reopen legacy session db");
+        assert_eq!(db.current_context_epoch().await.expect("context epoch"), 0);
+        assert_eq!(
+            db.current_context_occupancy().await.expect("occupancy"),
+            None
+        );
+
+        db.append_event(&context_usage_event(session_id, 1))
+            .await
+            .expect("append current usage");
+        assert!(
+            db.current_context_occupancy()
+                .await
+                .expect("current occupancy")
+                .is_some()
         );
     }
 
