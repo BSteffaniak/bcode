@@ -233,6 +233,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub session_import: SessionImportConfig,
     #[serde(default)]
+    pub client: ClientConfig,
+    #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub worktree: WorktreeConfig,
@@ -256,6 +258,7 @@ impl Default for BcodeConfig {
             system_prompt: SystemPromptConfig::default(),
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
+            client: ClientConfig::default(),
             daemon: DaemonConfig::default(),
             worktree: WorktreeConfig::default(),
             tools: ToolsConfig::default(),
@@ -310,6 +313,7 @@ impl ConfigDocSchema for BcodeConfig {
                 "session_import",
                 "External session import plugin settings.",
             ),
+            schema_section_doc::<ClientConfig>("client", "Client connection and request settings."),
             schema_section_doc::<DaemonConfig>(
                 "daemon",
                 "Daemon lifecycle and connection settings.",
@@ -1462,6 +1466,27 @@ impl Default for SessionImportConfig {
             opencode: OpenCodeSessionImportConfig::default(),
         }
     }
+}
+
+/// Client connection configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "client")]
+pub struct ClientConfig {
+    /// Maximum time to wait for a local client/daemon IPC request, in seconds.
+    #[serde(default = "default_client_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: default_client_request_timeout_secs(),
+        }
+    }
+}
+
+const fn default_client_request_timeout_secs() -> u64 {
+    15
 }
 
 /// Daemon lifecycle configuration.
@@ -3218,6 +3243,11 @@ pub enum ConfigError {
 }
 
 fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
+    if config.client.request_timeout_secs == 0 {
+        return Err(ConfigError::Composition {
+            message: "client.request_timeout_secs must be greater than zero".to_owned(),
+        });
+    }
     for (agent_id, agent) in &config.agent {
         for tool_id in agent.tools.keys() {
             if let Some(replacement) = removed_shorthand_tool_replacement(tool_id) {
@@ -4112,8 +4142,23 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_skills_toml(&mut output, &config.skills);
     write_system_prompt_toml(&mut output, &config.system_prompt);
     write_tui_toml(&mut output, &config.tui);
+    write_client_toml(&mut output, &config.client);
     write_domain_toml(&mut output, "web_search", &config.web_search);
     output
+}
+
+fn write_client_toml(output: &mut String, client: &ClientConfig) {
+    if client == &ClientConfig::default() {
+        return;
+    }
+    output.push_str("[client]\n");
+    writeln!(
+        output,
+        "request_timeout_secs = {}",
+        client.request_timeout_secs
+    )
+    .expect("writing to string should not fail");
+    output.push('\n');
 }
 
 fn write_domain_toml(output: &mut String, section: &str, value: &toml::Value) {
@@ -5529,6 +5574,45 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn client_request_timeout_defaults_to_fifteen_seconds() {
+        assert_eq!(BcodeConfig::default().client.request_timeout_secs, 15);
+    }
+
+    #[test]
+    fn client_request_timeout_can_be_configured() {
+        let value: toml::Value =
+            toml::from_str("[client]\nrequest_timeout_secs = 60\n").expect("config should parse");
+        let config =
+            super::validate_config_value(value, "test config").expect("config should validate");
+        assert_eq!(config.client.request_timeout_secs, 60);
+    }
+
+    #[test]
+    fn cli_overlay_overrides_client_request_timeout() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let config_path = root.join("bcode.toml");
+        std::fs::write(&config_path, "[client]\nrequest_timeout_secs = 30\n")
+            .expect("config should be written");
+        let overrides = ConfigLoadOverrides::default()
+            .with_cli_config_toml(Some("[client]\nrequest_timeout_secs = 60\n".to_owned()));
+
+        let config = load_config_from_paths_with_overrides(&[config_path], &overrides)
+            .expect("overridden config should load");
+
+        assert_eq!(config.client.request_timeout_secs, 60);
+    }
+
+    #[test]
+    fn zero_client_request_timeout_is_rejected() {
+        let value: toml::Value =
+            toml::from_str("[client]\nrequest_timeout_secs = 0\n").expect("config should parse");
+        let error = super::validate_config_value(value, "test config")
+            .expect_err("zero timeout should be rejected");
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
     const TEST_CODE_REVIEW_PLUGIN_ID: &str = "bcode.code_review";
     const TEST_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
     const TEST_PI_SESSION_IMPORT_PLUGIN_ID: &str = "bcode.pi-session-import";
@@ -5561,6 +5645,7 @@ mod tests {
                 "observability",
                 &["level", "persist_tool_io", "max_blob_bytes"],
             ),
+            ("client", &["request_timeout_secs"]),
             ("daemon", &["idle_shutdown", "idle_shutdown_after_secs"]),
             ("worktree", &["root", "branch_prefix", "setup"]),
             ("tools", &["shell"]),
@@ -6344,6 +6429,17 @@ disabled = ["vim_edit.apply"]
             rendered.contains("disabled = [\"vim_edit.apply\"]"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn config_to_toml_writes_client_request_timeout() {
+        let mut config = BcodeConfig::default();
+        config.client.request_timeout_secs = 60;
+
+        let rendered = super::config_to_toml(&config);
+
+        assert!(rendered.contains("[client]"), "{rendered}");
+        assert!(rendered.contains("request_timeout_secs = 60"), "{rendered}");
     }
 
     #[test]

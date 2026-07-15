@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 use thiserror::Error;
 
-const CLIENT_IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_DAEMON_RETRY_DELAY: Duration = Duration::from_millis(50);
 
@@ -583,6 +583,7 @@ pub struct BcodeClient {
     endpoint: IpcEndpoint,
     runtime_context: Option<ClientRuntimeContext>,
     daemon_availability: DaemonAvailability,
+    request_timeout: Duration,
 }
 
 /// Daemon availability policy used by client connections.
@@ -699,6 +700,12 @@ impl RuntimeWorkWatcher {
     }
 }
 
+fn configured_request_timeout() -> Duration {
+    bcode_config::load_config().map_or(DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT, |config| {
+        Duration::from_secs(config.client.request_timeout_secs)
+    })
+}
+
 impl BcodeClient {
     /// Create a client that connects to the default endpoint.
     #[must_use]
@@ -707,6 +714,7 @@ impl BcodeClient {
             endpoint: default_endpoint(),
             runtime_context: current_runtime_context(),
             daemon_availability: DaemonAvailability::AutoStart,
+            request_timeout: configured_request_timeout(),
         }
     }
 
@@ -717,6 +725,7 @@ impl BcodeClient {
             endpoint,
             runtime_context: None,
             daemon_availability: DaemonAvailability::RequireRunning,
+            request_timeout: DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT,
         }
     }
 
@@ -725,6 +734,19 @@ impl BcodeClient {
     pub fn with_runtime_context(mut self, runtime_context: Option<ClientRuntimeContext>) -> Self {
         self.runtime_context = runtime_context;
         self
+    }
+
+    /// Configure the maximum wait for connection handshakes and IPC responses.
+    #[must_use]
+    pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Return the configured IPC request timeout.
+    #[must_use]
+    pub const fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     /// Configure daemon availability behavior for future connections.
@@ -2290,13 +2312,12 @@ impl BcodeClient {
     pub async fn connect(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
         let mut last_error = None;
         for _ in 0..3 {
-            let result =
-                tokio::time::timeout(CLIENT_IPC_REQUEST_TIMEOUT, self.connect_once(client_name))
-                    .await
-                    .map_err(|_| ClientError::RequestTimeout {
-                        timeout: CLIENT_IPC_REQUEST_TIMEOUT,
-                    })
-                    .and_then(std::convert::identity);
+            let result = tokio::time::timeout(self.request_timeout, self.connect_once(client_name))
+                .await
+                .map_err(|_| ClientError::RequestTimeout {
+                    timeout: self.request_timeout,
+                })
+                .and_then(std::convert::identity);
             match result {
                 Ok(connection) => return Ok(connection),
                 Err(error)
@@ -2320,6 +2341,7 @@ impl BcodeClient {
             next_request_id: 1,
             client_id: None,
             pending_events: VecDeque::new(),
+            request_timeout: self.request_timeout,
         };
         match connection
             .send_request(Request::Hello {
@@ -2345,6 +2367,7 @@ pub struct ClientConnection {
     next_request_id: u64,
     client_id: Option<ClientId>,
     pending_events: VecDeque<Event>,
+    request_timeout: Duration,
 }
 
 impl ClientConnection {
@@ -2638,10 +2661,10 @@ impl ClientConnection {
 
         loop {
             let envelope =
-                tokio::time::timeout(CLIENT_IPC_REQUEST_TIMEOUT, recv_envelope(&mut self.stream))
+                tokio::time::timeout(self.request_timeout, recv_envelope(&mut self.stream))
                     .await
                     .map_err(|_| ClientError::RequestTimeout {
-                        timeout: CLIENT_IPC_REQUEST_TIMEOUT,
+                        timeout: self.request_timeout,
                     })??;
             if envelope.kind == EnvelopeKind::Event {
                 self.pending_events
@@ -2657,5 +2680,18 @@ impl ClientConnection {
                 Response::Err(error) => Err(error.into()),
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod client_timeout_tests {
+    use super::BcodeClient;
+    use std::time::Duration;
+
+    #[test]
+    fn request_timeout_can_be_overridden() {
+        let client = BcodeClient::default_endpoint().with_request_timeout(Duration::from_secs(17));
+
+        assert_eq!(client.request_timeout(), Duration::from_secs(17));
     }
 }

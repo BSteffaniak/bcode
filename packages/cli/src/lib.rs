@@ -136,6 +136,7 @@ pub async fn run_with_static_bundled(
     )?;
     let command = plugin_cli::compose(Cli::command(), &registrations);
     let matches = command.get_matches();
+    let _config_override = config_override_from_matches(&matches);
     if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
         && let Some((_, subcommand_matches)) = matches.subcommand()
     {
@@ -170,15 +171,30 @@ pub async fn run_with_static_bundled(
     Box::pin(handle_cli(cli)).await
 }
 
+fn config_override_from_matches(
+    matches: &clap::ArgMatches,
+) -> Option<bcode_config::ConfigOverrideGuard> {
+    let profile = matches.get_one::<String>("profile");
+    let request_timeout_secs = matches.get_one::<u64>("request_timeout_secs");
+    if profile.is_none() && request_timeout_secs.is_none() {
+        return None;
+    }
+    let mut override_toml = String::new();
+    if let Some(profile) = profile {
+        override_toml.push_str(&bcode_config::model_profile_override_toml(profile));
+    }
+    if let Some(timeout) = request_timeout_secs {
+        use std::fmt::Write as _;
+        writeln!(override_toml, "[client]\nrequest_timeout_secs = {timeout}")
+            .expect("writing to string should not fail");
+    }
+    Some(bcode_config::push_process_config_overrides(
+        bcode_config::ConfigLoadOverrides::from_env_with_cli(None, Some(override_toml)),
+    ))
+}
+
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {
-    let _config_override = cli.profile.as_deref().map(|profile| {
-        bcode_config::push_process_config_overrides(
-            bcode_config::ConfigLoadOverrides::from_env_with_cli(
-                None,
-                Some(bcode_config::model_profile_override_toml(profile)),
-            ),
-        )
-    });
+    let _ = (&cli.profile, cli.request_timeout_secs);
     if cli.new {
         if cli.command.is_some() {
             return Err(CliError::NewSessionWithCommand);
@@ -640,6 +656,14 @@ struct Cli {
     /// Select a model profile from configuration for this client connection.
     #[arg(long, value_name = "MODEL_PROFILE")]
     profile: Option<String>,
+    /// Override the local client/daemon IPC request timeout in seconds.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    request_timeout_secs: Option<u64>,
     /// Force the onboarding/setup-map flow.
     #[arg(long = "onboard", global = true)]
     onboard: bool,
@@ -7584,5 +7608,24 @@ mod context_compaction_tests {
             assert!(!output.contains("opaque-secret"));
             assert!(!output.contains("portable-secret"));
         }
+    }
+}
+
+#[cfg(test)]
+mod client_timeout_cli_tests {
+    use super::Cli;
+    use clap::Parser as _;
+
+    #[test]
+    fn request_timeout_override_accepts_positive_seconds() {
+        let cli = Cli::try_parse_from(["bcode", "--request-timeout-secs", "60"])
+            .expect("positive timeout should parse");
+
+        assert_eq!(cli.request_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn request_timeout_override_rejects_zero() {
+        assert!(Cli::try_parse_from(["bcode", "--request-timeout-secs", "0"]).is_err());
     }
 }

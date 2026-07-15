@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
@@ -68,7 +69,14 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     startup_action: StartupTuiAction,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> Result<(), TuiError> {
-    let client = BcodeClient::default_endpoint();
+    let config = bcode_config::load_config();
+    let client = config.as_ref().map_or_else(
+        |_| BcodeClient::default_endpoint(),
+        |config| {
+            BcodeClient::default_endpoint()
+                .with_request_timeout(Duration::from_secs(config.client.request_timeout_secs))
+        },
+    );
     let daemon_host = super::daemon_host::TuiDaemonHost::new(static_plugins);
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -91,7 +99,21 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
         opening_session_id: None,
         pending_effects: TuiEffectQueue::default(),
     };
-    chat.start_effect(TuiEffect::LoadConfig);
+    match config {
+        Ok(config) => {
+            settings.apply_tui_config(&config.tui);
+            chat.app.apply_tui_config(config.tui.clone());
+            chat.start_effect(TuiEffect::ReconcileAuthSecurity {
+                config: Box::new(config),
+            });
+            if session_id.is_none() {
+                chat.start_effect(TuiEffect::LoadDraftStatus {
+                    launch_working_directory: launch_working_directory.clone(),
+                });
+            }
+        }
+        Err(_) => chat.start_effect(TuiEffect::LoadConfig),
+    }
     chat.start_effect(TuiEffect::LoadAgentCatalog);
     if let Some(session_id) = session_id {
         let initial_window_request = session_flow::initial_transcript_window_request(

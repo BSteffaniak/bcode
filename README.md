@@ -213,3 +213,16 @@ paths = ["/path/to/pi/sessions"]
 ```
 
 The default Pi path is `~/.pi/agent/sessions`. Use `custom_only` to avoid scanning the default home-directory location. Import warnings are shown when mappings are lossy, such as image blocks that are not yet copied into Bcode artifacts.
+
+### Client request timeout
+
+Local client/daemon IPC requests time out after 15 seconds by default. For slower
+session opens, set a persistent override in `bcode.toml`:
+
+```toml
+[client]
+request_timeout_secs = 60
+```
+
+Use `bcode --request-timeout-secs 60 ...` for a one-shot override. This setting
+controls local IPC requests; it does not change model-provider HTTP timeouts.
