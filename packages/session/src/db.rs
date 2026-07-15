@@ -42,7 +42,7 @@ const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
-const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 1;
+const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 2;
 const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
 
 /// Errors returned by Switchy-backed session database operations.
@@ -2929,7 +2929,7 @@ mod tests {
             sequence,
             SessionEventKind::ContextUsageObserved {
                 snapshot: ContextUsageSnapshot {
-                    invocation: Some(bcode_session_models::ModelInvocationIdentity {
+                    invocation: bcode_session_models::ModelInvocationIdentity {
                         provider_plugin_id: "provider".to_string(),
                         requested_model_id: Some("alias".to_string()),
                         effective_model_id: "model".to_string(),
@@ -2942,20 +2942,10 @@ mod tests {
                         context_format_version: None,
                         compatibility_key: None,
                         context_epoch: 0,
-                    }),
-                    provider_plugin_id: "provider".to_string(),
-                    model_id: "model".to_string(),
-                    input_tokens: sequence,
+                    },
                     context_through_sequence: sequence.saturating_sub(1),
-                    request_id: None,
-                    model_turn_id: None,
-                    round: None,
-                    request_fingerprint: None,
-                    turn_id: None,
-                    auth_profile: None,
-                    estimated_input_tokens: None,
-                    context_format_version: None,
-                    compatibility_key: None,
+                    context_input_tokens: sequence,
+                    local_request_estimate_tokens: sequence,
                     source: ContextUsageSource::Estimated,
                 },
             },

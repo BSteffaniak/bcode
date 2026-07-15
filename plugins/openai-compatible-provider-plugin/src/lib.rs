@@ -3497,7 +3497,7 @@ fn process_stream_line(
 
 fn token_usage_from_openai_usage(
     usage: OpenAiUsage,
-    dialect: OpenAiCompatibleDialect,
+    _dialect: OpenAiCompatibleDialect,
 ) -> TokenUsage {
     let cached_input_tokens = usage
         .prompt_tokens_details
@@ -3519,10 +3519,7 @@ fn token_usage_from_openai_usage(
     let total_tokens = usage.total_tokens;
     TokenUsage {
         input_tokens,
-        active_context_tokens: matches!(dialect, OpenAiCompatibleDialect::ChatGptCodex)
-            .then_some(total_tokens)
-            .flatten(),
-        context_input_tokens: None,
+        context_input_tokens: input_tokens,
         output_tokens: usage.completion_tokens.or(usage.output_tokens),
         total_tokens,
         cached_input_tokens,
@@ -7194,7 +7191,7 @@ mod tests {
         let usage = token_usage_from_openai_usage(usage, OpenAiCompatibleDialect::ChatCompletions);
 
         assert_eq!(usage.input_tokens, Some(10));
-        assert_eq!(usage.active_context_tokens, None);
+        assert_eq!(usage.context_input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.total_tokens, Some(15));
         assert_eq!(usage.cached_input_tokens, Some(3));
@@ -7220,7 +7217,7 @@ mod tests {
             .expect("usage should parse");
 
         assert_eq!(usage.input_tokens, Some(20));
-        assert_eq!(usage.active_context_tokens, Some(27));
+        assert_eq!(usage.context_input_tokens, Some(20));
         assert_eq!(usage.output_tokens, Some(7));
         assert_eq!(usage.total_tokens, Some(27));
         assert_eq!(usage.cached_input_tokens, Some(4));

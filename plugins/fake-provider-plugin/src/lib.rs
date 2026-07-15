@@ -348,6 +348,7 @@ fn finish_fake_turn(turn: &FakeTurn, text: String) {
     turn.push(ProviderTurnEvent::Usage {
         usage: TokenUsage {
             input_tokens: Some(1),
+            context_input_tokens: Some(1),
             output_tokens: Some(output_tokens),
             total_tokens: Some(output_tokens.saturating_add(1)),
             ..TokenUsage::default()

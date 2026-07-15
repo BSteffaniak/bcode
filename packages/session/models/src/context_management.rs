@@ -59,82 +59,42 @@ pub struct ModelInvocationIdentity {
 /// Durable context occupancy observation tied to a model request boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUsageSnapshot {
-    /// Authoritative invocation identity for current events.
-    #[serde(default)]
-    pub invocation: Option<ModelInvocationIdentity>,
-    /// Provider plugin used for the observed request (legacy compatibility mirror).
-    pub provider_plugin_id: String,
-    /// Effective model used for the observed request (legacy compatibility mirror).
-    pub model_id: String,
-    /// Full active input context occupancy.
-    pub input_tokens: u64,
+    /// Exact request identity for this observation.
+    pub invocation: ModelInvocationIdentity,
     /// Last canonical event represented by the observed request.
     pub context_through_sequence: u64,
-    /// Unique host request-attempt identifier (legacy compatibility mirror).
-    #[serde(default)]
-    pub request_id: Option<String>,
-    /// Owning model-turn identifier (legacy compatibility mirror).
-    #[serde(default)]
-    pub model_turn_id: Option<String>,
-    /// Zero-based provider round within the model turn (legacy compatibility mirror).
-    #[serde(default)]
-    pub round: Option<u32>,
-    /// Stable fingerprint of the exact assembled request (legacy compatibility mirror).
-    #[serde(default)]
-    pub request_fingerprint: Option<String>,
-    /// Model turn/request identifier associated with this observation (legacy mirror).
-    #[serde(default)]
-    pub turn_id: Option<String>,
-    /// Effective non-secret auth profile used for this request (legacy mirror).
-    #[serde(default)]
-    pub auth_profile: Option<String>,
-    /// Conservative local estimate captured for the same request.
-    #[serde(default)]
-    pub estimated_input_tokens: Option<u64>,
-    /// Provider context format version used for this request, when supported (legacy mirror).
-    #[serde(default)]
-    pub context_format_version: Option<u16>,
-    /// Provider context compatibility identity used for this request (legacy mirror).
-    #[serde(default)]
-    pub compatibility_key: Option<String>,
+    /// Full active input-context occupancy.
+    pub context_input_tokens: u64,
+    /// Local estimate of the complete model-visible request before calibration.
+    pub local_request_estimate_tokens: u64,
     /// Observation source.
     pub source: ContextUsageSource,
 }
 
 impl ContextUsageSnapshot {
-    /// Return the request identity when the event uses the current unambiguous schema.
-    #[must_use]
-    pub const fn invocation(&self) -> Option<&ModelInvocationIdentity> {
-        self.invocation.as_ref()
-    }
-
     /// Return whether this observation belongs to the supplied context generation.
     #[must_use]
-    pub fn belongs_to_context_epoch(&self, context_epoch: u64) -> bool {
-        self.invocation
-            .as_ref()
-            .is_none_or(|identity| identity.context_epoch == context_epoch)
+    pub const fn belongs_to_context_epoch(&self, context_epoch: u64) -> bool {
+        self.invocation.context_epoch == context_epoch
     }
 
     /// Return whether this observation came from the same exact request as `other`.
     #[must_use]
     pub fn matches_request_attempt(&self, other: &Self) -> bool {
-        match (&self.invocation, &other.invocation) {
-            (Some(left), Some(right)) => {
-                left.request_id == right.request_id
-                    && left.request_fingerprint == right.request_fingerprint
-            }
-            _ => matches!(
-                (
-                    self.request_id.as_deref(),
-                    self.request_fingerprint.as_deref(),
-                    other.request_id.as_deref(),
-                    other.request_fingerprint.as_deref(),
-                ),
-                (Some(left_id), Some(left_fingerprint), Some(right_id), Some(right_fingerprint))
-                    if left_id == right_id && left_fingerprint == right_fingerprint
-            ),
-        }
+        self.invocation.request_id == other.invocation.request_id
+            && self.invocation.request_fingerprint == other.invocation.request_fingerprint
+    }
+
+    /// Return whether this observation can calibrate an estimate for `invocation`.
+    #[must_use]
+    pub fn is_compatible_anchor(&self, invocation: &ModelInvocationIdentity) -> bool {
+        let current = &self.invocation;
+        current.context_epoch == invocation.context_epoch
+            && current.provider_plugin_id == invocation.provider_plugin_id
+            && current.effective_model_id == invocation.effective_model_id
+            && current.effective_auth_profile == invocation.effective_auth_profile
+            && current.context_format_version == invocation.context_format_version
+            && current.compatibility_key == invocation.compatibility_key
     }
 }
 
@@ -150,11 +110,41 @@ pub struct ContextOccupancy {
 }
 
 impl ContextOccupancy {
+    /// Build a calibrated estimate from the current compatible occupancy when possible.
+    #[must_use]
+    pub fn project_estimate(
+        current: Option<&Self>,
+        invocation: ModelInvocationIdentity,
+        context_through_sequence: u64,
+        local_request_estimate_tokens: u64,
+    ) -> ContextUsageSnapshot {
+        let context_input_tokens = current
+            .filter(|occupancy| {
+                occupancy.context_epoch == invocation.context_epoch
+                    && occupancy.snapshot.is_compatible_anchor(&invocation)
+            })
+            .map_or(local_request_estimate_tokens, |occupancy| {
+                let anchor = &occupancy.snapshot;
+                if local_request_estimate_tokens >= anchor.local_request_estimate_tokens {
+                    anchor.context_input_tokens.saturating_add(
+                        local_request_estimate_tokens - anchor.local_request_estimate_tokens,
+                    )
+                } else {
+                    anchor.context_input_tokens.saturating_sub(
+                        anchor.local_request_estimate_tokens - local_request_estimate_tokens,
+                    )
+                }
+            });
+        ContextUsageSnapshot {
+            invocation,
+            context_through_sequence,
+            context_input_tokens,
+            local_request_estimate_tokens,
+            source: ContextUsageSource::Estimated,
+        }
+    }
+
     /// Reconcile one observation into the authoritative occupancy for `context_epoch`.
-    ///
-    /// Estimates start new request rounds. Provider observations may only confirm the exact
-    /// request represented by the current estimate, preventing late usage from an older request
-    /// from replacing newer pressure.
     #[must_use]
     pub fn reconcile(
         current: Option<&Self>,

@@ -1108,18 +1108,16 @@ impl BmuxApp {
                 visibility: bcode_model::ModelVisibility::Visible,
             });
         self.token_usage.apply_model_info(model.as_ref());
-        if let Some(input_tokens) = status.context_input_tokens
-            && match (status.context_usage_sequence, self.context_usage_sequence) {
-                (Some(sequence), Some(current)) => sequence >= current,
-                (Some(_) | None, None) => true,
-                (None, Some(_)) => false,
-            }
+        if let Some(occupancy) = status.context_occupancy
+            && self
+                .context_usage_sequence
+                .is_none_or(|current| occupancy.observation_sequence >= current)
         {
             self.token_usage.observe_context_usage(
-                input_tokens,
-                status.context_usage_source.as_deref() == Some("estimated"),
+                occupancy.snapshot.context_input_tokens,
+                occupancy.snapshot.source == bcode_session_models::ContextUsageSource::Estimated,
             );
-            self.context_usage_sequence = status.context_usage_sequence;
+            self.context_usage_sequence = Some(occupancy.observation_sequence);
         }
     }
 
@@ -2159,7 +2157,7 @@ impl BmuxApp {
             SessionLiveEventKind::ContextOccupancyChanged { occupancy } => {
                 if let Some(occupancy) = &**occupancy {
                     self.token_usage.observe_context_usage(
-                        occupancy.snapshot.input_tokens,
+                        occupancy.snapshot.context_input_tokens,
                         occupancy.snapshot.source
                             == bcode_session_models::ContextUsageSource::Estimated,
                     );
@@ -4005,7 +4003,6 @@ struct TokenUsageMeter {
     session_cost_micros: Option<u64>,
     latest_context_input_tokens: Option<u32>,
     context_usage_estimated: bool,
-    pending_context_input_tokens: Option<u32>,
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
     provider_reuse_active: bool,
@@ -4024,7 +4021,6 @@ impl TokenUsageMeter {
         if let Some(pricing) = &self.pricing {
             let usage = bcode_model::TokenUsage {
                 input_tokens: usage.input_tokens,
-                active_context_tokens: None,
                 context_input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 total_tokens: usage.total_tokens,
@@ -4046,20 +4042,13 @@ impl TokenUsageMeter {
 
     fn observe_context_usage(&mut self, input_tokens: u64, estimated: bool) {
         let input_tokens = u32::try_from(input_tokens).unwrap_or(u32::MAX);
-        if estimated && self.latest_context_input_tokens.is_some() && !self.context_usage_estimated
-        {
-            self.pending_context_input_tokens = Some(input_tokens);
-            return;
-        }
         self.latest_context_input_tokens = Some(input_tokens);
         self.context_usage_estimated = estimated;
-        self.pending_context_input_tokens = None;
     }
 
     const fn clear_context_occupancy(&mut self) {
         self.latest_context_input_tokens = None;
         self.context_usage_estimated = false;
-        self.pending_context_input_tokens = None;
         self.latest_cached_input_tokens = None;
         self.latest_cache_write_input_tokens = None;
     }
@@ -4074,7 +4063,6 @@ impl TokenUsageMeter {
     fn clear_model_info(&mut self) {
         self.latest_context_input_tokens = None;
         self.context_usage_estimated = false;
-        self.pending_context_input_tokens = None;
         self.latest_cached_input_tokens = None;
         self.latest_cache_write_input_tokens = None;
         self.context_window = None;
@@ -4132,21 +4120,25 @@ impl TokenUsageMeter {
     }
 
     fn context_summary(&self) -> String {
-        let (tokens, estimated) = self.pending_context_input_tokens.map_or(
-            (
-                self.latest_context_input_tokens,
-                self.context_usage_estimated,
-            ),
-            |pending| (Some(pending), true),
-        );
-        match (tokens, self.context_window) {
-            (Some(input), Some(window)) if window > 0 => format!(
-                "{}{}/{} {}%",
-                if estimated { "~" } else { "" },
-                format_context_count(u64::from(input)),
-                compact_context_window(u64::from(window)),
-                context_window_percentage(input, window)
-            ),
+        match (self.latest_context_input_tokens, self.context_window) {
+            (Some(input), Some(window)) if window > 0 => {
+                let percentage = context_window_percentage(input, window);
+                format!(
+                    "{}{}/{} {}",
+                    if self.context_usage_estimated {
+                        "~"
+                    } else {
+                        ""
+                    },
+                    format_context_count(u64::from(input)),
+                    compact_context_window(u64::from(window)),
+                    if percentage > 100 {
+                        "100%+".to_string()
+                    } else {
+                        format!("{percentage}%")
+                    }
+                )
+            }
             (None, Some(window)) if window > 0 => {
                 format!("—/{} —%", compact_context_window(u64::from(window)))
             }
@@ -4465,22 +4457,50 @@ mod tests {
         input_tokens: u64,
     ) -> bcode_session_models::ContextUsageSnapshot {
         bcode_session_models::ContextUsageSnapshot {
-            invocation: None,
-            provider_plugin_id: "provider".to_string(),
-            model_id: "effective-model".to_string(),
-            input_tokens,
+            invocation: bcode_session_models::ModelInvocationIdentity {
+                provider_plugin_id: "provider".to_string(),
+                requested_model_id: None,
+                effective_model_id: "effective-model".to_string(),
+                request_id: "request".to_string(),
+                model_turn_id: "turn".to_string(),
+                round: 0,
+                request_fingerprint: "fingerprint".to_string(),
+                provider_turn_id: "provider-turn".to_string(),
+                effective_auth_profile: Some("routed-profile".to_string()),
+                context_format_version: None,
+                compatibility_key: None,
+                context_epoch: 3,
+            },
             context_through_sequence: 1,
-            request_id: Some("request".to_string()),
-            model_turn_id: Some("turn".to_string()),
-            round: Some(0),
-            request_fingerprint: Some("fingerprint".to_string()),
-            turn_id: Some("provider-turn".to_string()),
-            auth_profile: Some("routed-profile".to_string()),
-            estimated_input_tokens: Some(input_tokens),
-            context_format_version: None,
-            compatibility_key: None,
+            context_input_tokens: input_tokens,
+            local_request_estimate_tokens: input_tokens,
             source,
         }
+    }
+
+    #[test]
+    fn context_summary_marks_estimated_overflow_without_exceeding_one_hundred_percent() {
+        let meter = TokenUsageMeter {
+            latest_context_input_tokens: Some(407_295),
+            context_usage_estimated: true,
+            context_window: Some(372_000),
+            ..TokenUsageMeter::default()
+        };
+
+        assert_eq!(meter.context_summary(), "~407,295/372k 100%+");
+    }
+
+    #[test]
+    fn context_summary_replaces_estimate_with_provider_observation() {
+        let mut meter = TokenUsageMeter {
+            context_window: Some(372_000),
+            ..TokenUsageMeter::default()
+        };
+        meter.observe_context_usage(47_295, true);
+        assert_eq!(meter.context_summary(), "~47,295/372k 12%");
+
+        meter.observe_context_usage(43_000, false);
+        assert_eq!(meter.context_summary(), "43,000/372k 11%");
     }
 
     #[test]

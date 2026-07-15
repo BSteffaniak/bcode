@@ -611,11 +611,7 @@ pub fn compaction_capacity_tokens(
 }
 
 pub struct ProactiveCompactionEvaluation {
-    /// Conservative estimate of the complete candidate request assembled for this round.
-    ///
-    /// Proactive policy intentionally uses this value instead of a prior provider observation:
-    /// system context, tools, provider extensions, parameters, and continuation state can change
-    /// between requests and must be budgeted together.
+    /// Calibrated projection of the complete candidate request assembled for this round.
     pub candidate_input_tokens: u64,
     pub requested_max_output_tokens: Option<u32>,
     pub decision: CompactionDecision,
@@ -636,7 +632,14 @@ pub async fn request_exceeds_compaction_capacity(
         request.parameters.max_output_tokens,
         model_status.max_output_tokens,
     );
-    let estimated_tokens = estimated_model_request_tokens(request);
+    let estimated_tokens = projected_context_usage(
+        state,
+        session_id,
+        selection.provider_plugin_id.as_deref(),
+        request,
+    )
+    .await
+    .context_input_tokens;
     (estimated_tokens > capacity.available_input_tokens).then_some((estimated_tokens, capacity))
 }
 

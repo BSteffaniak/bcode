@@ -7138,8 +7138,8 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::ContextUsageObserved { snapshot } => println!(
             "#{} context usage: {} tokens for {} through #{} ({:?})",
             event.sequence,
-            snapshot.input_tokens,
-            snapshot.model_id,
+            snapshot.context_input_tokens,
+            snapshot.invocation.effective_model_id,
             snapshot.context_through_sequence,
             snapshot.source
         ),

@@ -1913,40 +1913,58 @@ mod tests {
         );
     }
 
+    fn invocation(request_id: &str, context_epoch: u64) -> ModelInvocationIdentity {
+        ModelInvocationIdentity {
+            provider_plugin_id: "provider".to_string(),
+            requested_model_id: Some("alias".to_string()),
+            effective_model_id: "model".to_string(),
+            request_id: request_id.to_string(),
+            model_turn_id: "turn".to_string(),
+            round: 0,
+            request_fingerprint: format!("fingerprint-{request_id}"),
+            provider_turn_id: format!("provider-{request_id}"),
+            effective_auth_profile: Some("openai-2".to_string()),
+            context_format_version: None,
+            compatibility_key: None,
+            context_epoch,
+        }
+    }
+
     #[test]
-    fn context_occupancy_reconciles_by_request_not_auth_selection() {
-        let estimate: ContextUsageSnapshot = serde_json::from_str(
-            r#"{"provider_plugin_id":"provider","model_id":"model","input_tokens":42,"context_through_sequence":1,"request_id":"request","request_fingerprint":"fingerprint","auth_profile":"openai-2","source":"estimated"}"#,
-        )
-        .expect("estimate");
+    fn context_estimate_calibrates_from_compatible_anchor() {
+        let estimate = ContextOccupancy::project_estimate(None, invocation("one", 3), 1, 42);
         let current = ContextOccupancy::reconcile(None, 3, 4, estimate.clone())
             .expect("estimate should establish occupancy");
         let mut exact = estimate;
         exact.source = ContextUsageSource::Provider;
-        exact.input_tokens = 40;
+        exact.context_input_tokens = 40;
         let confirmed = ContextOccupancy::reconcile(Some(&current), 3, 5, exact)
-            .expect("same routed request should confirm occupancy");
+            .expect("same request should confirm occupancy");
+        let projected =
+            ContextOccupancy::project_estimate(Some(&confirmed), invocation("two", 3), 2, 52);
 
-        assert_eq!(confirmed.snapshot.input_tokens, 40);
-        assert_eq!(confirmed.observation_sequence, 5);
+        assert_eq!(confirmed.snapshot.context_input_tokens, 40);
+        assert_eq!(projected.context_input_tokens, 50);
+        assert_eq!(projected.local_request_estimate_tokens, 52);
     }
 
     #[test]
-    fn legacy_context_usage_snapshot_defaults_new_attempt_identity_fields() {
-        let decoded: ContextUsageSnapshot = serde_json::from_str(
-            r#"{"provider_plugin_id":"provider","model_id":"model","input_tokens":42,"context_through_sequence":7,"source":"estimated"}"#,
-        )
-        .expect("legacy context usage should decode");
+    fn context_estimate_supports_negative_delta() {
+        let anchor = ContextOccupancy {
+            context_epoch: 3,
+            observation_sequence: 5,
+            snapshot: ContextUsageSnapshot {
+                invocation: invocation("one", 3),
+                context_through_sequence: 1,
+                context_input_tokens: 100,
+                local_request_estimate_tokens: 120,
+                source: ContextUsageSource::Provider,
+            },
+        };
+        let projected =
+            ContextOccupancy::project_estimate(Some(&anchor), invocation("two", 3), 2, 90);
 
-        assert_eq!(decoded.request_id, None);
-        assert_eq!(decoded.model_turn_id, None);
-        assert_eq!(decoded.round, None);
-        assert_eq!(decoded.request_fingerprint, None);
-        assert_eq!(decoded.turn_id, None);
-        assert_eq!(decoded.auth_profile, None);
-        assert_eq!(decoded.estimated_input_tokens, None);
-        assert_eq!(decoded.context_format_version, None);
-        assert_eq!(decoded.compatibility_key, None);
+        assert_eq!(projected.context_input_tokens, 70);
     }
 
     #[test]
