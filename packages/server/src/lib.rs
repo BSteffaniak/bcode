@@ -214,6 +214,7 @@ pub struct ServerState {
     pending_interactive_tools: Mutex<BTreeMap<String, PendingInteractiveToolRequest>>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
+    active_plugin_visuals: Arc<StdMutex<BTreeMap<(SessionId, String), ToolInvocationStreamEvent>>>,
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
@@ -1076,6 +1077,7 @@ impl ServerState {
             pending_interactive_tools: Mutex::default(),
             active_plugin_invocations: Arc::default(),
             active_artifacts: Arc::default(),
+            active_plugin_visuals: Arc::default(),
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
             client_runtime_contexts: Mutex::default(),
@@ -5147,6 +5149,7 @@ struct ActivePluginInvocation {
 struct ActivePluginInvocationRegistration {
     invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
+    active_plugin_visuals: Arc<StdMutex<BTreeMap<(SessionId, String), ToolInvocationStreamEvent>>>,
     key: (SessionId, String),
 }
 
@@ -5154,6 +5157,9 @@ impl ActivePluginInvocationRegistration {
     fn register(
         invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
         active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
+        active_plugin_visuals: Arc<
+            StdMutex<BTreeMap<(SessionId, String), ToolInvocationStreamEvent>>,
+        >,
         session_id: SessionId,
         tool_call_id: &str,
         invocation: ActivePluginInvocation,
@@ -5170,6 +5176,7 @@ impl ActivePluginInvocationRegistration {
         Ok(Self {
             invocations,
             active_artifacts,
+            active_plugin_visuals,
             key,
         })
     }
@@ -5184,6 +5191,9 @@ impl Drop for ActivePluginInvocationRegistration {
             artifacts.retain(|key, artifact| {
                 key.session_id != self.key.0 || key.tool_call_id != self.key.1 || artifact.finalized
             });
+        }
+        if let Ok(mut visuals) = self.active_plugin_visuals.lock() {
+            visuals.remove(&self.key);
         }
     }
 }
@@ -9801,6 +9811,7 @@ enum ToolOutputLivePublisherEvent {
 struct ToolOutputLivePublisher {
     pending_output: Option<ToolOutputStreamAccumulator>,
     pending_artifacts: BTreeMap<(String, String, String), ToolInvocationStreamEvent>,
+    pending_visuals: BTreeMap<String, ToolInvocationStreamEvent>,
     flush_generation: u64,
     flush_tx: mpsc::UnboundedSender<ToolOutputLivePublisherEvent>,
     flush_rx: mpsc::UnboundedReceiver<ToolOutputLivePublisherEvent>,
@@ -9812,6 +9823,7 @@ impl ToolOutputLivePublisher {
         Self {
             pending_output: None,
             pending_artifacts: BTreeMap::new(),
+            pending_visuals: BTreeMap::new(),
             flush_generation: 0,
             flush_tx,
             flush_rx,
@@ -9828,6 +9840,14 @@ impl ToolOutputLivePublisher {
         session_id: SessionId,
         event: ToolInvocationStreamEvent,
     ) {
+        if matches!(event, ToolInvocationStreamEvent::VisualUpdate { .. }) {
+            let was_empty = self.pending_visuals.is_empty();
+            self.enqueue_visual_update(event);
+            if was_empty {
+                self.schedule_flush();
+            }
+            return;
+        }
         if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
             let (was_empty, finalized) = self.enqueue_artifact_update(event);
             if finalized {
@@ -9875,6 +9895,13 @@ impl ToolOutputLivePublisher {
         {
             self.flush(state, session_id).await;
         }
+    }
+
+    fn enqueue_visual_update(&mut self, event: ToolInvocationStreamEvent) {
+        let ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. } = &event else {
+            unreachable!("visual enqueue requires a visual update");
+        };
+        self.pending_visuals.insert(tool_call_id.clone(), event);
     }
 
     fn enqueue_artifact_update(&mut self, event: ToolInvocationStreamEvent) -> (bool, bool) {
@@ -9926,6 +9953,10 @@ impl ToolOutputLivePublisher {
         flush_tool_output_stream(state, session_id, &mut self.pending_output).await;
         let artifacts = std::mem::take(&mut self.pending_artifacts);
         for event in artifacts.into_values() {
+            append_tool_stream_event(state, session_id, event).await;
+        }
+        let visuals = std::mem::take(&mut self.pending_visuals);
+        for event in visuals.into_values() {
             append_tool_stream_event(state, session_id, event).await;
         }
     }
@@ -15843,6 +15874,7 @@ async fn invoke_model_tool(
     let _action_registration = ActivePluginInvocationRegistration::register(
         Arc::clone(&state.active_plugin_invocations),
         Arc::clone(&state.active_artifacts),
+        Arc::clone(&state.active_plugin_visuals),
         session_id,
         &call.id,
         ActivePluginInvocation {
@@ -16206,7 +16238,7 @@ fn active_artifact_snapshot_events(
         .active_artifacts
         .lock()
         .map_err(|_| "active artifact registry poisoned".to_owned())?;
-    Ok(artifacts
+    let mut events = artifacts
         .iter()
         .filter(|(key, _)| key.session_id == session_id)
         .map(|(key, artifact)| bcode_session_models::SessionLiveEvent {
@@ -16215,16 +16247,53 @@ fn active_artifact_snapshot_events(
                 event: artifact.stream_event(key),
             },
         })
-        .collect())
+        .collect::<Vec<_>>();
+    drop(artifacts);
+    let visuals = state
+        .active_plugin_visuals
+        .lock()
+        .map_err(|_| "active plugin visual registry poisoned".to_owned())?;
+    events.extend(
+        visuals
+            .iter()
+            .filter(|((visual_session_id, _), _)| *visual_session_id == session_id)
+            .map(|(_, event)| bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolOutputDelta {
+                    event: event.clone(),
+                },
+            }),
+    );
+    drop(visuals);
+    Ok(events)
+}
+
+fn update_active_plugin_visual(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_call_id: &str,
+    event: &ToolInvocationStreamEvent,
+) -> Result<(), String> {
+    state
+        .active_plugin_visuals
+        .lock()
+        .map_err(|_| "active plugin visual registry poisoned".to_owned())?
+        .insert((session_id, tool_call_id.to_owned()), event.clone());
+    Ok(())
+}
+
+fn remove_active_plugin_visual(state: &ServerState, session_id: SessionId, tool_call_id: &str) {
+    if let Ok(mut visuals) = state.active_plugin_visuals.lock() {
+        visuals.remove(&(session_id, tool_call_id.to_owned()));
+    }
 }
 
 /// Publish ephemeral tool output and visuals, or append bounded lifecycle events.
 ///
-/// `OutputDelta` carries raw live tool output, including PTY bytes, and is intentionally
-/// transient. `VisualUpdate` currently carries plugin-owned replaceable state to attached clients
-/// and remains durable for active-reattach compatibility until generic active-artifact snapshots
-/// replace the cumulative payload. Durable history otherwise stores the tool request, bounded
-/// stream lifecycle metadata, final status, and final bounded tool result.
+/// `OutputDelta` carries raw live tool output, including PTY bytes. `VisualUpdate` carries
+/// replaceable plugin presentation state. Both are transient and broadcast only to attached
+/// clients; the latest active visual is retained in memory for reattach. Durable history stores
+/// the request, bounded lifecycle metadata, final status, and bounded final result.
 async fn append_tool_stream_event(
     state: &ServerState,
     session_id: SessionId,
@@ -16237,6 +16306,20 @@ async fn append_tool_stream_event(
         return;
     }
     let progress = runtime_work_progress_from_tool_stream_event(&event);
+    if let ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. } = &event {
+        if let Err(error) = update_active_plugin_visual(state, session_id, tool_call_id, &event) {
+            eprintln!("failed to update active plugin visual registry: {error}");
+            return;
+        }
+        let _ = state
+            .sessions
+            .publish_live_event(session_id, SessionLiveEventKind::ToolOutputDelta { event })
+            .await;
+        return;
+    }
+    if let ToolInvocationStreamEvent::Finished { tool_call_id, .. } = &event {
+        remove_active_plugin_visual(state, session_id, tool_call_id);
+    }
     if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
         if let Err(error) = update_active_artifact(state, session_id, &event) {
             eprintln!("failed to update active artifact: {error}");
@@ -19452,6 +19535,7 @@ mod tests {
         let registration = ActivePluginInvocationRegistration::register(
             Arc::clone(&invocations),
             Arc::clone(&active_artifacts),
+            Arc::new(StdMutex::new(BTreeMap::new())),
             session_id,
             "call-1",
             ActivePluginInvocation {
@@ -19471,6 +19555,7 @@ mod tests {
             ActivePluginInvocationRegistration::register(
                 Arc::clone(&invocations),
                 Arc::clone(&active_artifacts),
+                Arc::new(StdMutex::new(BTreeMap::new())),
                 session_id,
                 "call-1",
                 ActivePluginInvocation {
@@ -19499,6 +19584,7 @@ mod tests {
         let registration = ActivePluginInvocationRegistration::register(
             Arc::clone(&state.active_plugin_invocations),
             Arc::clone(&state.active_artifacts),
+            Arc::clone(&state.active_plugin_visuals),
             session_id,
             tool_call_id,
             ActivePluginInvocation {
@@ -23302,6 +23388,32 @@ mod tests {
     }
 
     #[test]
+    fn tool_output_publisher_coalesces_visual_updates_by_tool_call() {
+        let mut publisher = ToolOutputLivePublisher::new();
+        let update = |sequence| ToolInvocationStreamEvent::VisualUpdate {
+            tool_call_id: "call".to_owned(),
+            sequence,
+            visual: bcode_session_models::PluginVisualDescriptor {
+                visual_id: None,
+                producer_plugin_id: Some("plugin".to_owned()),
+                schema: "plugin.visual".to_owned(),
+                schema_version: 1,
+                title: None,
+                subtitle: None,
+                payload: serde_json::json!({"sequence": sequence}),
+            },
+            streaming: true,
+        };
+        publisher.enqueue_visual_update(update(1));
+        publisher.enqueue_visual_update(update(2));
+        assert_eq!(publisher.pending_visuals.len(), 1);
+        assert!(matches!(
+            publisher.pending_visuals.values().next(),
+            Some(ToolInvocationStreamEvent::VisualUpdate { sequence: 2, .. })
+        ));
+    }
+
+    #[test]
     fn tool_output_publisher_coalesces_artifact_revisions_by_identity() {
         let mut publisher = ToolOutputLivePublisher::new();
         let update =
@@ -23389,6 +23501,59 @@ mod tests {
             event.kind,
             SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::OutputDelta { .. }
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn tool_visual_update_is_live_only_and_available_to_reattach_snapshot() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
+        let update = ToolInvocationStreamEvent::VisualUpdate {
+            tool_call_id: "call-1".to_owned(),
+            sequence: 1,
+            visual: bcode_session_models::PluginVisualDescriptor {
+                visual_id: None,
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                schema: "test.visual".to_owned(),
+                schema_version: 1,
+                title: None,
+                subtitle: None,
+                payload: serde_json::json!({"replaceable": "state"}),
+            },
+            streaming: true,
+        };
+        append_tool_stream_event(&state, session_id, update.clone()).await;
+        let received = attachment.live_events.recv().await.expect("live visual");
+        assert_eq!(
+            received.kind,
+            SessionLiveEventKind::ToolOutputDelta {
+                event: update.clone()
+            }
+        );
+        let snapshots = active_artifact_snapshot_events(&state, session_id).expect("snapshots");
+        assert!(snapshots.iter().any(|snapshot| matches!(
+            &snapshot.kind,
+            SessionLiveEventKind::ToolOutputDelta { event } if event == &update
+        )));
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::VisualUpdate { .. }
             }
         )));
     }

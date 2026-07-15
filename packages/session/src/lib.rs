@@ -56,6 +56,7 @@ const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'stati
         SessionEventKind::ToolInvocationStream {
             event:
                 bcode_session_models::ToolInvocationStreamEvent::OutputDelta { .. }
+                | bcode_session_models::ToolInvocationStreamEvent::VisualUpdate { .. }
                 | bcode_session_models::ToolInvocationStreamEvent::ArtifactUpdate { .. }
                 | bcode_session_models::ToolInvocationStreamEvent::LegacyPresentation { .. },
         } => Some("tool_invocation_stream"),
@@ -63,17 +64,38 @@ const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'stati
     }
 }
 
+const MAX_DURABLE_TOOL_STREAM_EVENT_BYTES: usize = 64 * 1024;
+
 fn ensure_durable_session_event_kind(
     kind: &SessionEventKind,
     metrics: Option<&MetricsRegistry>,
 ) -> Result<(), SessionError> {
-    let Some(event_kind) = live_only_session_event_kind(kind) else {
-        return Ok(());
-    };
-    if let Some(metrics) = metrics {
-        metrics.increment_counter("session.event.live_persistence_rejected");
+    if let Some(event_kind) = live_only_session_event_kind(kind) {
+        if let Some(metrics) = metrics {
+            metrics.increment_counter("session.event.live_persistence_rejected");
+        }
+        return Err(SessionError::LiveEventPersistenceRejected { event_kind });
     }
-    Err(SessionError::LiveEventPersistenceRejected { event_kind })
+    if matches!(kind, SessionEventKind::ToolInvocationStream { .. }) {
+        let payload_bytes = serde_json::to_vec(kind)
+            .map_err(|error| SessionError::EventSerialization(error.to_string()))?
+            .len();
+        if payload_bytes > MAX_DURABLE_TOOL_STREAM_EVENT_BYTES {
+            if let Some(metrics) = metrics {
+                metrics.increment_counter("session.event.oversized_persistence_rejected");
+                metrics.record_histogram(
+                    "session.event.rejected_payload_bytes",
+                    u64::try_from(payload_bytes).unwrap_or(u64::MAX),
+                );
+            }
+            return Err(SessionError::DurableEventPayloadTooLarge {
+                event_kind: "tool_invocation_stream",
+                payload_bytes,
+                max_bytes: MAX_DURABLE_TOOL_STREAM_EVENT_BYTES,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &SessionEvent) {
@@ -153,6 +175,18 @@ pub enum SessionError {
     /// A live-only event was passed to the durable append boundary.
     #[error("live-only session event cannot be persisted: {event_kind}")]
     LiveEventPersistenceRejected { event_kind: &'static str },
+    /// A bounded durable event exceeded its event-kind-specific payload limit.
+    #[error(
+        "durable session event payload is too large: {event_kind} payload={payload_bytes} max={max_bytes}"
+    )]
+    DurableEventPayloadTooLarge {
+        event_kind: &'static str,
+        payload_bytes: usize,
+        max_bytes: usize,
+    },
+    /// A durable event could not be measured before persistence.
+    #[error("session event serialization failed before persistence: {0}")]
+    EventSerialization(String),
     #[error("unsupported session projection window request")]
     UnsupportedProjectionWindow,
     #[error(
@@ -3387,8 +3421,8 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendToolCallRequestedInput, SessionError, SessionHealth, SessionLeaseOwnerContext,
-        SessionManager, db,
+        AppendToolCallRequestedInput, MAX_DURABLE_TOOL_STREAM_EVENT_BYTES, SessionError,
+        SessionHealth, SessionLeaseOwnerContext, SessionManager, db,
     };
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
@@ -3453,6 +3487,57 @@ mod tests {
                 checkpoint: None,
                 expected: 0,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_tool_stream_payload_limit_rejects_oversized_status_only() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("payload-limit".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        let error = manager
+            .append_event(
+                session.id,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::Status {
+                        tool_call_id: "call".to_owned(),
+                        sequence: 1,
+                        message: "x".repeat(MAX_DURABLE_TOOL_STREAM_EVENT_BYTES),
+                    },
+                },
+            )
+            .await
+            .expect_err("oversized status must be rejected");
+        assert!(matches!(
+            error,
+            SessionError::DurableEventPayloadTooLarge {
+                event_kind: "tool_invocation_stream",
+                ..
+            }
+        ));
+
+        let large_semantic_message = "y".repeat(MAX_DURABLE_TOOL_STREAM_EVENT_BYTES + 1);
+        manager
+            .append_event(
+                session.id,
+                SessionEventKind::AssistantMessage {
+                    text: large_semantic_message.clone(),
+                },
+            )
+            .await
+            .expect("semantic message is governed by its own domain, not the stream limit");
+        assert!(
+            manager
+                .session_history(session.id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::AssistantMessage { text } if text == &large_semantic_message
+                ))
         );
     }
 
