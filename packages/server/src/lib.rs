@@ -22647,6 +22647,62 @@ mod tests {
     }
 
     #[test]
+    fn no_biscuit_catalog_pattern_matches_stream_error() {
+        let state = test_server_state(SessionManager::default());
+        let pattern = bcode_model_catalog_models::RecoverableErrorPattern {
+            id: "bcode.openai-compatible.no-biscuit-no-service".to_string(),
+            enabled_by_default: true,
+            scope: bcode_model_catalog_models::RecoverableErrorPatternScope {
+                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                ..bcode_model_catalog_models::RecoverableErrorPatternScope::default()
+            },
+            r#match: bcode_model_catalog_models::RecoverableErrorPatternMatch {
+                code: Some("responses_stream_failed".to_string()),
+                message_contains: Some("no_biscuit_no_service".to_string()),
+                ..bcode_model_catalog_models::RecoverableErrorPatternMatch::default()
+            },
+        };
+        let rule = remote_pattern_retry_rule(&pattern).expect("pattern should convert");
+        let error = bcode_model::ProviderError {
+            code: "responses_stream_failed".to_string(),
+            category: bcode_model::ProviderErrorCategory::InvalidRequest,
+            message: "no_biscuit_no_service".to_string(),
+            retryable: false,
+            provider_message: None,
+            retry: None,
+        };
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+            ..SessionModelSelection::default()
+        };
+
+        let policy = matching_provider_retry_policy(
+            &state,
+            &error,
+            &selection,
+            &[],
+            std::slice::from_ref(&rule),
+        )
+        .expect("catalog retry pattern should match");
+
+        assert_eq!(
+            policy.id,
+            "custom.bcode.openai-compatible.no-biscuit-no-service"
+        );
+        assert_eq!(policy.max_retries, 3);
+
+        let unrelated_error = bcode_model::ProviderError {
+            message: "different stream failure".to_string(),
+            ..error
+        };
+        assert!(!custom_retry_rule_matches(
+            &rule,
+            &unrelated_error,
+            &selection
+        ));
+    }
+
+    #[test]
     fn user_retry_rule_deep_merges_over_provider_rule() {
         let provider_rule = bcode_model::ProviderRetryRule {
             id: "provider.rule".to_string(),

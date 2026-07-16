@@ -1482,6 +1482,20 @@ mod tests {
                 .recoverable_error_patterns
                 .iter()
                 .any(|pattern| {
+                    pattern.id == "bcode.openai-compatible.no-biscuit-no-service"
+                        && pattern.scope.provider_plugin_id.as_deref()
+                            == Some("bcode.openai-compatible")
+                        && pattern.r#match.code.as_deref() == Some("responses_stream_failed")
+                        && pattern.r#match.message_contains.as_deref()
+                            == Some("no_biscuit_no_service")
+                })
+        );
+        assert!(
+            provider
+                .error_handling
+                .recoverable_error_patterns
+                .iter()
+                .any(|pattern| {
                     pattern.id == "bcode.openai-compatible.unsupported-content-type"
                         && pattern.scope.provider_plugin_id.as_deref()
                             == Some("bcode.openai-compatible")

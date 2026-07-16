@@ -57,6 +57,17 @@ code = "http_507"
 message_contains = "exceeded request buffer limit while retrying upstream"
 
 [[error_handling.recoverable_error_patterns]]
+id = "bcode.openai-compatible.no-biscuit-no-service"
+enabled_by_default = true
+
+[error_handling.recoverable_error_patterns.scope]
+provider_plugin_id = "bcode.openai-compatible"
+
+[error_handling.recoverable_error_patterns.match]
+code = "responses_stream_failed"
+message_contains = "no_biscuit_no_service"
+
+[[error_handling.recoverable_error_patterns]]
 id = "bcode.openai-compatible.unsupported-content-type"
 enabled_by_default = true
 
