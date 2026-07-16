@@ -7,10 +7,11 @@
 
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacyToolRequestPresentationMetadata,
-    ModelTurnOutcome, ProviderContextSnapshot, RequestContextObservation, RuntimeWorkKind,
-    RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind,
-    SessionId, SessionTokenUsage, SessionTraceEvent, ToolArtifact, ToolInvocationResult,
-    ToolInvocationStreamEvent, TraceBlobRef, TurnOrigin, WorkId, current_unix_timestamp_ms,
+    ModelRequestIdentity, ModelTurnOutcome, ProviderContextSnapshot, RequestContextObservation,
+    RequestContextTokenCount, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
+    ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, TurnOrigin,
+    WorkId, current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -447,6 +448,9 @@ enum PersistedSessionEventKind {
     RequestContextObserved {
         observation: RequestContextObservation,
     },
+    ContextUsageObserved {
+        snapshot: LegacyContextUsageSnapshot,
+    },
     PluginStatusNote {
         plugin_id: String,
         note_id: String,
@@ -471,6 +475,77 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         message: Option<String>,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyContextUsageSnapshot {
+    invocation: LegacyModelInvocationIdentity,
+    context_through_sequence: u64,
+    #[serde(alias = "input_tokens")]
+    context_input_tokens: u64,
+    #[serde(alias = "estimated_input_tokens")]
+    local_request_estimate_tokens: u64,
+    source: LegacyContextUsageSource,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyModelInvocationIdentity {
+    provider_plugin_id: String,
+    #[serde(default)]
+    requested_model_id: Option<String>,
+    effective_model_id: String,
+    request_id: String,
+    model_turn_id: String,
+    round: u32,
+    request_fingerprint: String,
+    #[serde(default)]
+    effective_auth_profile: Option<String>,
+    #[serde(default)]
+    context_format_version: Option<u16>,
+    #[serde(default)]
+    compatibility_key: Option<String>,
+    #[serde(default)]
+    context_epoch: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyContextUsageSource {
+    Provider,
+    Estimated,
+}
+
+impl LegacyContextUsageSnapshot {
+    fn into_observation(self) -> RequestContextObservation {
+        RequestContextObservation {
+            request: ModelRequestIdentity {
+                provider_plugin_id: self.invocation.provider_plugin_id,
+                requested_model_id: self.invocation.requested_model_id,
+                effective_model_id: self.invocation.effective_model_id,
+                request_id: self.invocation.request_id,
+                model_turn_id: self.invocation.model_turn_id,
+                round: self.invocation.round,
+                request_fingerprint: self.invocation.request_fingerprint,
+                effective_auth_profile: self.invocation.effective_auth_profile,
+                context_format_version: self.invocation.context_format_version,
+                compatibility_key: self.invocation.compatibility_key,
+                context_epoch: self.invocation.context_epoch,
+            },
+            context_through_sequence: self.context_through_sequence,
+            context_tokens: match self.source {
+                LegacyContextUsageSource::Provider => {
+                    RequestContextTokenCount::ProviderExact(self.context_input_tokens)
+                }
+                LegacyContextUsageSource::Estimated => {
+                    RequestContextTokenCount::Estimated(self.context_input_tokens)
+                }
+            },
+            local_estimate: bcode_session_models::LocalContextEstimate {
+                tokens: self.local_request_estimate_tokens,
+                algorithm_version: 1,
+            },
+        }
+    }
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -1217,6 +1292,9 @@ impl PersistedSessionEventKind {
             Self::RequestContextObserved { observation } => {
                 SessionEventKind::RequestContextObserved { observation }
             }
+            Self::ContextUsageObserved { snapshot } => SessionEventKind::RequestContextObserved {
+                observation: snapshot.into_observation(),
+            },
             Self::PluginStatusNote {
                 plugin_id,
                 note_id,
@@ -1319,6 +1397,28 @@ impl CurrentPersistedToolInvocationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_context_usage_observation_decodes_to_request_context_observation() {
+        let payload = r#"{"schema_version":31,"sequence":7,"timestamp_ms":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"context_usage_observed":{"snapshot":{"invocation":{"provider_plugin_id":"provider","requested_model_id":"requested","effective_model_id":"effective","request_id":"request","model_turn_id":"turn","round":2,"request_fingerprint":"fingerprint","effective_auth_profile":"profile","context_format_version":3,"compatibility_key":"key","context_epoch":5},"context_through_sequence":6,"context_input_tokens":123,"local_request_estimate_tokens":100,"source":"provider"}}}}"#;
+
+        let event = decode_session_event(payload).expect("legacy context usage should decode");
+        let SessionEventKind::RequestContextObserved { observation } = event.kind else {
+            panic!("legacy context usage should map to request context observation");
+        };
+        assert_eq!(
+            observation.request.requested_model_id.as_deref(),
+            Some("requested")
+        );
+        assert_eq!(observation.request.context_epoch, 5);
+        assert_eq!(observation.context_through_sequence, 6);
+        assert_eq!(
+            observation.context_tokens,
+            RequestContextTokenCount::ProviderExact(123)
+        );
+        assert_eq!(observation.local_estimate.tokens, 100);
+        assert_eq!(observation.local_estimate.algorithm_version, 1);
+    }
 
     #[test]
     fn legacy_user_message_defaults_missing_turn_origin() {

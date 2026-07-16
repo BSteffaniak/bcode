@@ -42,7 +42,7 @@ const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
-const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 3;
+const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 4;
 const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
 
 /// Errors returned by Switchy-backed session database operations.
@@ -1364,7 +1364,9 @@ impl SessionDb {
             let payload = required_string(&row, "payload")?;
             let event = decode_session_event(&payload)?;
             if event.sequence != event_seq
-                || model_context_event_kind_name(&event.kind) != event_type
+                || (model_context_event_kind_name(&event.kind) != event_type
+                    && !(event_type == "context_usage_observed"
+                        && matches!(event.kind, SessionEventKind::RequestContextObserved { .. })))
                 || !is_model_context_event_type(&event_type)
             {
                 return Err(SessionDbError::InvalidRow {
@@ -1959,6 +1961,12 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "023_reset_legacy_context_occupancy_projection",
         "UPDATE context_occupancy_projection SET schema_version = 3, occupancy_json = NULL WHERE schema_version < 3",
         "UPDATE context_occupancy_projection SET schema_version = 2, occupancy_json = NULL WHERE schema_version = 3",
+    );
+    add_sql_migration(
+        source,
+        "024_reset_request_context_occupancy_projection",
+        "UPDATE context_occupancy_projection SET schema_version = 4, occupancy_json = NULL WHERE schema_version < 4",
+        "UPDATE context_occupancy_projection SET schema_version = 3, occupancy_json = NULL WHERE schema_version = 4",
     );
 }
 
@@ -2746,6 +2754,7 @@ const MODEL_CONTEXT_EVENT_TYPES: &[&str] = &[
     "working_directory_changed",
     "context_compacted",
     "provider_context_compacted",
+    "context_usage_observed",
     "request_context_observed",
 ];
 
@@ -2760,6 +2769,7 @@ const fn is_model_context_event_type(event_type: &str) -> bool {
             | b"working_directory_changed"
             | b"context_compacted"
             | b"provider_context_compacted"
+            | b"context_usage_observed"
             | b"request_context_observed"
     )
 }
@@ -3631,6 +3641,11 @@ mod tests {
         assert!(values.contains(&&seq_to_value(42)));
     }
 
+    #[test]
+    fn legacy_context_usage_is_a_model_context_event_type() {
+        assert!(is_model_context_event_type("context_usage_observed"));
+    }
+
     #[tokio::test]
     #[ignore = "requires BCODE_MODEL_CONTEXT_BENCHMARK_DB and BCODE_MODEL_CONTEXT_BENCHMARK_SESSION_ID"]
     async fn benchmark_model_context_events_from_database_copy() {
@@ -4258,7 +4273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_legacy_context_occupancy_resets_incompatible_derived_state() {
+    async fn opening_schema_v3_context_occupancy_resets_incompatible_derived_state() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
@@ -4276,7 +4291,7 @@ mod tests {
         .expect("append model boundary");
         db.database()
             .update("context_occupancy_projection")
-            .value("schema_version", DatabaseValue::Int32(2))
+            .value("schema_version", DatabaseValue::Int32(3))
             .value(
                 "occupancy_json",
                 r#"{"context_epoch":0,"observation_sequence":1,"snapshot":{"invocation":{},"context_through_sequence":0}}"#,
@@ -4284,10 +4299,10 @@ mod tests {
             .where_eq("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
             .execute(db.database())
             .await
-            .expect("install legacy occupancy");
+            .expect("install schema v3 occupancy");
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
-            .where_eq("id", "023_reset_legacy_context_occupancy_projection")
+            .where_eq("id", "024_reset_request_context_occupancy_projection")
             .execute(db.database())
             .await
             .expect("mark compatibility migration pending");
