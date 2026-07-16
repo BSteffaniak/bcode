@@ -40,6 +40,8 @@ use super::{
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 const ACTIVE_ARTIFACT_FETCH_BYTES: u32 = 256 * 1024;
+const ACTIVE_ARTIFACT_RETRY_BASE: Duration = Duration::from_millis(100);
+const ACTIVE_ARTIFACT_RETRY_MAX: Duration = Duration::from_secs(2);
 
 type ActiveArtifactKey = (bcode_session_models::SessionId, String, String, String);
 
@@ -59,6 +61,9 @@ struct ActiveArtifactFetchState {
     next_offset: u64,
     target: Option<ActiveArtifactTarget>,
     fetching: bool,
+    retry_at: Option<Instant>,
+    consecutive_failures: u32,
+    terminal_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -240,7 +245,13 @@ impl ChatLoopState {
         let Some(target) = state.target.as_ref() else {
             return;
         };
-        if state.fetching || state.next_offset >= target.committed_bytes {
+        if state.fetching
+            || state.next_offset >= target.committed_bytes
+            || state.terminal_error.is_some()
+            || state
+                .retry_at
+                .is_some_and(|retry_at| retry_at > Instant::now())
+        {
             return;
         }
         let requested_offset = state.next_offset;
@@ -250,6 +261,7 @@ impl ChatLoopState {
             .min(ACTIVE_ARTIFACT_FETCH_BYTES);
         let target_revision = target.revision;
         state.fetching = true;
+        state.retry_at = None;
         let client = self.passive_client.clone();
         let sender = self.artifact_fetch_sender.clone();
         let task_key = key.clone();
@@ -273,53 +285,82 @@ impl ChatLoopState {
         });
     }
 
+    #[allow(clippy::too_many_lines)] // Keeps response validation, delivery, retry, and scheduling as one state transition.
     fn drain_active_artifact_fetches(
         &mut self,
         current_session_id: Option<bcode_session_models::SessionId>,
     ) -> bool {
         let mut redraw = false;
         while let Ok(completion) = self.artifact_fetch_receiver.try_recv() {
-            let Some(state) = self.artifact_fetches.get_mut(&completion.key) else {
-                continue;
-            };
-            state.fetching = false;
-            if Some(completion.session_id) != current_session_id
-                || completion.requested_offset != state.next_offset
-            {
-                continue;
-            }
-            let Ok(range) = completion.result else {
-                continue;
-            };
-            if range.offset != state.next_offset {
-                continue;
-            }
-            let Some(target) = state.target.clone() else {
-                continue;
-            };
-            if completion.target_revision > target.revision
-                || range.reference_revision < completion.target_revision
-            {
-                continue;
-            }
-            state.next_offset = state
-                .next_offset
-                .saturating_add(u64::try_from(range.bytes.len()).unwrap_or(u64::MAX));
-            if !range.bytes.is_empty() {
-                let chunk = bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
-                    tool_call_id: completion.key.1.clone(),
-                    artifact_id: completion.key.2.clone(),
-                    reference_key: completion.key.3.clone(),
-                    producer_plugin_id: target.producer_plugin_id.clone(),
-                    schema: target.schema.clone(),
-                    schema_version: target.schema_version,
-                    content_type: target.content_type.clone(),
-                    offset: range.offset,
-                    total_bytes: range.total_bytes,
-                    revision: range.reference_revision,
-                    finalized: range.finalized || target.finalized,
-                    bytes: range.bytes,
+            let key = completion.key.clone();
+            let chunk = {
+                let Some(state) = self.artifact_fetches.get_mut(&key) else {
+                    continue;
                 };
+                state.fetching = false;
+                if Some(completion.session_id) != current_session_id
+                    || completion.requested_offset != state.next_offset
+                {
+                    continue;
+                }
+                let range = match completion.result {
+                    Ok(range) => range,
+                    Err(error) => {
+                        Self::defer_active_artifact_fetch(state, error.to_string());
+                        continue;
+                    }
+                };
+                let Some(target) = state.target.clone() else {
+                    continue;
+                };
+                let bytes_len = u64::try_from(range.bytes.len()).unwrap_or(u64::MAX);
+                let expected_end = range.offset.saturating_add(bytes_len);
+                let invalid_range = range.offset != state.next_offset
+                    || range.total_bytes < expected_end
+                    || range.total_bytes > target.committed_bytes
+                    || completion.target_revision > target.revision
+                    || range.reference_revision < completion.target_revision;
+                if invalid_range {
+                    Self::defer_active_artifact_fetch(
+                        state,
+                        "artifact range response did not match the requested committed prefix"
+                            .to_owned(),
+                    );
+                    continue;
+                }
+                if range.bytes.is_empty() && state.next_offset < target.committed_bytes {
+                    Self::defer_active_artifact_fetch(
+                        state,
+                        "artifact range response ended before the committed boundary".to_owned(),
+                    );
+                    continue;
+                }
+                if range.bytes.is_empty() {
+                    state.consecutive_failures = 0;
+                    state.retry_at = None;
+                    None
+                } else {
+                    Some((
+                        bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
+                            tool_call_id: key.1.clone(),
+                            artifact_id: key.2.clone(),
+                            reference_key: key.3.clone(),
+                            producer_plugin_id: target.producer_plugin_id,
+                            schema: target.schema,
+                            schema_version: target.schema_version,
+                            content_type: target.content_type,
+                            offset: range.offset,
+                            total_bytes: range.total_bytes,
+                            revision: range.reference_revision,
+                            finalized: range.finalized || target.finalized,
+                            bytes: range.bytes,
+                        },
+                        expected_end,
+                    ))
+                }
+            };
+
+            if let Some((chunk, expected_end)) = chunk {
                 let runtime = self.plugin_runtime.get_or_insert_with(|| {
                     super::plugin_tui::load_default_runtime_with_static_bundled(
                         &bcode_bundled_plugins::static_bundled_plugins(),
@@ -327,18 +368,57 @@ impl ChatLoopState {
                     .expect("load plugin runtime for artifact chunks")
                 });
                 let producer = Some(chunk.producer_plugin_id.as_str());
-                if let Some(route) =
-                    runtime.visual_adapter(&chunk.schema, chunk.schema_version, "tui", producer)
-                    && crate::plugin_tui::tui_registry(&route.plugin_id)
-                        .is_some_and(|registry| registry.visual_artifact_chunk(&chunk))
-                {
-                    redraw = true;
+                let delivery = runtime
+                    .visual_adapter(&chunk.schema, chunk.schema_version, "tui", producer)
+                    .and_then(|route| crate::plugin_tui::tui_registry(&route.plugin_id))
+                    .ok_or_else(|| "artifact visual adapter is unavailable".to_owned())
+                    .and_then(|registry| registry.visual_artifact_chunk(&chunk));
+                let state = self
+                    .artifact_fetches
+                    .get_mut(&key)
+                    .expect("artifact fetch state remains registered during delivery");
+                match delivery {
+                    Ok(true) => {
+                        state.next_offset = expected_end;
+                        state.consecutive_failures = 0;
+                        state.retry_at = None;
+                        redraw = true;
+                    }
+                    Ok(false) => {
+                        state.terminal_error =
+                            Some("artifact schema has no owning visual adapter".to_owned());
+                    }
+                    Err(error) => state.terminal_error = Some(error),
                 }
             }
-            let key = completion.key;
             self.schedule_active_artifact_fetch(completion.session_id, &key);
         }
+        let due = self
+            .artifact_fetches
+            .iter()
+            .filter(|(_, state)| {
+                !state.fetching
+                    && state.terminal_error.is_none()
+                    && state
+                        .retry_at
+                        .is_some_and(|retry_at| retry_at <= Instant::now())
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in due {
+            self.schedule_active_artifact_fetch(key.0, &key);
+        }
         redraw
+    }
+
+    fn defer_active_artifact_fetch(state: &mut ActiveArtifactFetchState, _error: String) {
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let exponent = state.consecutive_failures.saturating_sub(1).min(4);
+        let multiplier = 1_u32 << exponent;
+        let delay = ACTIVE_ARTIFACT_RETRY_BASE
+            .saturating_mul(multiplier)
+            .min(ACTIVE_ARTIFACT_RETRY_MAX);
+        state.retry_at = Some(Instant::now() + delay);
     }
 
     fn drain_pending_effects(&mut self, chat: &mut ActiveChat) -> bool {

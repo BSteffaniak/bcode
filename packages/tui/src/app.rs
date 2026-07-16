@@ -3324,6 +3324,7 @@ impl BmuxApp {
                     "output".to_owned(),
                     serde_json::Value::String(String::new()),
                 );
+                runtime.insert("streaming".to_owned(), serde_json::Value::Bool(true));
             }
             if let Some(context) = self.tool_call_contexts.get_mut(tool_call_id) {
                 context.request_visual = Some(visual.clone());
@@ -4628,6 +4629,84 @@ mod tests {
             },
         });
         assert!(app.context_occupancy.is_none());
+    }
+
+    #[test]
+    fn tool_started_enriches_request_visual_for_artifact_driven_live_rendering() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let session_id = SessionId::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        app.absorb_session_event(&event(
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: r#"{"command":"printf hello"}"#.to_owned(),
+                working_directory: None,
+                request_visual: Some(bcode_session_models::PluginVisualDescriptor {
+                    visual_id: None,
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    schema: "bcode.tool.request.shell.run".to_owned(),
+                    schema_version: 1,
+                    title: Some("Shell command".to_owned()),
+                    subtitle: None,
+                    payload: serde_json::json!({"command": "printf hello"}),
+                }),
+                legacy_request_presentation: None,
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 1,
+                    terminal: true,
+                    columns: Some(91),
+                    rows: Some(37),
+                    started_at_ms: None,
+                },
+            },
+        ));
+        let visuals = app.active_plugin_visuals();
+        let runtime = visuals[0]
+            .1
+            .payload
+            .get("_bcode_runtime")
+            .expect("runtime metadata");
+        assert_eq!(
+            runtime
+                .get("live_state_key")
+                .and_then(serde_json::Value::as_str),
+            Some("call")
+        );
+        assert_eq!(
+            runtime.get("columns").and_then(serde_json::Value::as_u64),
+            Some(91)
+        );
+        assert_eq!(
+            runtime.get("rows").and_then(serde_json::Value::as_u64),
+            Some(37)
+        );
+        assert_eq!(
+            runtime
+                .get("streaming")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            runtime.get("output").and_then(serde_json::Value::as_str),
+            Some("")
+        );
     }
 
     #[test]

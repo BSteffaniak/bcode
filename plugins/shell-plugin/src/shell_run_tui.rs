@@ -35,6 +35,10 @@ struct LiveTerminalReplay {
     initial_rows: u16,
     columns: u16,
     rows: u16,
+    exit_code: Option<i32>,
+    signal: Option<String>,
+    timed_out: bool,
+    cancelled: bool,
 }
 
 #[derive(Default)]
@@ -119,20 +123,28 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         })
     }
 
-    fn artifact_chunk(&self, chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk) {
+    fn artifact_chunk(
+        &self,
+        chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk,
+    ) -> Result<(), String> {
         if chunk.reference_key != SHELL_RECORDING_REF_KEY || chunk.offset > chunk.total_bytes {
-            return;
+            return Err("invalid shell recording artifact range metadata".to_owned());
         }
-        let Ok(mut artifacts) = self.artifact_replays.lock() else {
-            return;
-        };
+        let mut artifacts = self
+            .artifact_replays
+            .lock()
+            .map_err(|_| "shell artifact replay state poisoned".to_owned())?;
         let artifact = artifacts.entry(chunk.tool_call_id.clone()).or_default();
         if chunk.offset != artifact.next_offset {
-            return;
+            return Err(format!(
+                "shell recording range is not contiguous: expected {} got {}",
+                artifact.next_offset, chunk.offset
+            ));
         }
-        let Ok(frames) = artifact.decoder.push(chunk.offset, &chunk.bytes) else {
-            return;
-        };
+        let frames = artifact
+            .decoder
+            .push(chunk.offset, &chunk.bytes)
+            .map_err(|error| error.to_string())?;
         artifact.next_offset = artifact
             .next_offset
             .saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX));
@@ -140,9 +152,10 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         let dimensions = artifact.decoder.dimensions();
         drop(artifacts);
 
-        let Ok(mut replays) = self.live_replays.lock() else {
-            return;
-        };
+        let mut replays = self
+            .live_replays
+            .lock()
+            .map_err(|_| "shell live replay state poisoned".to_owned())?;
         let replay = replays.entry(chunk.tool_call_id.clone()).or_default();
         if let Some((columns, rows)) = dimensions
             && (replay.initial_columns == 0 || replay.initial_rows == 0)
@@ -165,12 +178,25 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                         .frames
                         .push(TerminalReplayFrame::Resize { columns, rows });
                 }
+                crate::recording::ShellRecordingFrame::Finish {
+                    exit_code,
+                    signal,
+                    timed_out,
+                    cancelled,
+                    ..
+                } => {
+                    replay.exit_code = exit_code;
+                    replay.signal = signal;
+                    replay.timed_out = timed_out;
+                    replay.cancelled = cancelled;
+                }
                 crate::recording::ShellRecordingFrame::Start { .. }
-                | crate::recording::ShellRecordingFrame::Finish { .. }
                 | crate::recording::ShellRecordingFrame::Unknown { .. }
                 | crate::recording::ShellRecordingFrame::Output { .. } => {}
             }
         }
+        drop(replays);
+        Ok(())
     }
 
     fn rows(
@@ -325,14 +351,14 @@ impl ShellRunTuiVisualAdapter {
             sizing: TerminalViewerSizing::Compact,
         };
         if streaming {
-            let visible_rows = self.live_visible_rows(key, input);
+            let visible_rows = self.live_visible_rows(key, input, &frames);
             input.sizing = TerminalViewerSizing::Live {
                 visible_rows,
                 max_rows: MAX_INLINE_TERMINAL_ROWS,
             };
         }
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
-        lines.extend(shell_status_rows(runtime));
+        lines.extend(self.live_replay_status_rows(key, runtime));
         lines.extend(shell_terminal_frame_rows(input, &frames, width));
         lines
     }
@@ -409,12 +435,50 @@ impl ShellRunTuiVisualAdapter {
         frames
     }
 
-    fn live_visible_rows(&self, key: &str, input: TerminalViewerInput<'_>) -> usize {
+    fn live_replay_status_rows(&self, key: &str, fallback: &serde_json::Value) -> Vec<Line> {
+        self.live_replays
+            .lock()
+            .ok()
+            .and_then(|replays| {
+                replays.get(key).map(|replay| {
+                    shell_replay_status_rows(&TerminalReplayData {
+                        output: String::new(),
+                        frames: None,
+                        columns: replay.columns,
+                        rows: replay.rows,
+                        initial_columns: replay.initial_columns,
+                        initial_rows: replay.initial_rows,
+                        exit_code: replay.exit_code,
+                        signal: replay.signal.clone(),
+                        timed_out: replay.timed_out,
+                        cancelled: replay.cancelled,
+                    })
+                })
+            })
+            .filter(|rows| !rows.is_empty())
+            .unwrap_or_else(|| shell_status_rows(fallback))
+    }
+
+    fn live_visible_rows(
+        &self,
+        key: &str,
+        input: TerminalViewerInput<'_>,
+        frames: &[TerminalReplayFrame],
+    ) -> usize {
         let Ok(mut states) = self.live_states.lock() else {
             return 1;
         };
         let state = states.entry(key.to_owned()).or_default();
-        state.update(input, MAX_INLINE_TERMINAL_ROWS);
+        let content_rows = shell_terminal_stream(input.columns, input.rows, frames).map_or_else(
+            || terminal_viewer_rows(input, u16::MAX).len(),
+            |stream| {
+                stream
+                    .grid()
+                    .main_content_tail_rows(MAX_INLINE_TERMINAL_ROWS)
+                    .len()
+            },
+        );
+        state.update_rows(content_rows.max(1), MAX_INLINE_TERMINAL_ROWS);
         state.visible_rows()
     }
 }
@@ -1004,6 +1068,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Covers chunk ordering, decoding, lifecycle, rendering, and duplicate rejection together.
     fn artifact_chunks_incrementally_feed_shell_owned_live_replay_once() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("live-artifact.bcsr");
@@ -1039,7 +1104,8 @@ mod tests {
                     finalized: offset == split,
                     bytes: range.to_vec(),
                 },
-            );
+            )
+            .expect("artifact chunk");
         }
         let replays = adapter.live_replays.lock().expect("live replays");
         let replay = replays.get("call").expect("artifact replay");
@@ -1056,7 +1122,60 @@ mod tests {
             ]
         );
         assert_eq!((replay.initial_columns, replay.initial_rows), (12, 3));
+        assert_eq!((replay.columns, replay.rows), (9, 4));
+        assert_eq!(replay.exit_code, Some(0));
+        assert!(!replay.timed_out);
+        assert!(!replay.cancelled);
         drop(replays);
+
+        let duplicate = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::artifact_chunk(
+            &adapter,
+            &bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
+                tool_call_id: "call".to_owned(),
+                artifact_id: "artifact".to_owned(),
+                reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
+                producer_plugin_id: "bcode.shell".to_owned(),
+                schema: "bcode.tool.request.shell.run".to_owned(),
+                schema_version: 1,
+                content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
+                offset: 0,
+                total_bytes: u64::try_from(bytes.len()).expect("length"),
+                revision: 3,
+                finalized: true,
+                bytes,
+            },
+        );
+        assert!(duplicate.is_err(), "duplicate ranges must fail closed");
+
+        let payload = serde_json::json!({
+            "command": "printf first",
+            "_bcode_runtime": {
+                "live_state_key": "call",
+                "columns": 12,
+                "rows": 3,
+                "output": "",
+                "streaming": true
+            }
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &adapter,
+            "bcode.tool.request.shell.run",
+            &payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            ),
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("❯ printf first"), "{rendered}");
+        assert!(rendered.contains("first"), "{rendered}");
+        assert!(rendered.contains("second"), "{rendered}");
+        assert!(rendered.contains("exit code 0"), "{rendered}");
+        assert!(
+            rows.len() >= 4,
+            "live sizing should preserve terminal height"
+        );
     }
 
     #[test]

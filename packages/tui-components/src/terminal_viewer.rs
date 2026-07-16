@@ -24,10 +24,15 @@ impl TerminalViewerLiveState {
         self.visible_rows
     }
 
+    /// Grow the reserved live terminal rows from an already-decoded row count.
+    pub fn update_rows(&mut self, content_rows: usize, max_rows: usize) {
+        self.visible_rows = self.visible_rows.max(content_rows).min(max_rows);
+    }
+
     /// Grow the reserved live terminal rows to fit `input`, capped by `max_rows`.
     pub fn update(&mut self, input: TerminalViewerInput<'_>, max_rows: usize) {
         let content_rows = terminal_viewer_content_row_count(input, max_rows);
-        self.visible_rows = self.visible_rows.max(content_rows).min(max_rows);
+        self.update_rows(content_rows, max_rows);
     }
 }
 

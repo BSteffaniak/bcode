@@ -269,7 +269,13 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
     ///
     /// The host may redeliver metadata revisions but does not redeliver byte ranges. Adapters must
     /// interpret bytes only for artifact schemas they own.
-    fn artifact_chunk(&self, _chunk: &PluginTuiArtifactChunk) {}
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the chunk metadata, byte range, or plugin-owned payload is invalid.
+    fn artifact_chunk(&self, _chunk: &PluginTuiArtifactChunk) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Build transcript rows for the artifact/view payload at the given width.
     fn rows(
@@ -564,17 +570,20 @@ impl PluginTuiRegistry {
     }
 
     /// Deliver opaque artifact bytes through the adapter that owns the artifact schema.
-    #[must_use]
-    pub fn visual_artifact_chunk(&self, chunk: &PluginTuiArtifactChunk) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the owning adapter rejects malformed or non-contiguous bytes.
+    pub fn visual_artifact_chunk(&self, chunk: &PluginTuiArtifactChunk) -> Result<bool, String> {
         let Some(adapter) = self
             .visual_adapters
             .iter()
             .find(|adapter| adapter.supports(&chunk.schema))
         else {
-            return false;
+            return Ok(false);
         };
-        adapter.artifact_chunk(chunk);
-        true
+        adapter.artifact_chunk(chunk)?;
+        Ok(true)
     }
 
     /// Build transcript rows with host-owned presentation preferences.
