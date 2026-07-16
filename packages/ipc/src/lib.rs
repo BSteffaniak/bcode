@@ -2327,7 +2327,18 @@ mod tests {
                     }),
                     visibility: bcode_model::ModelVisibility::Visible,
                 }],
-                catalog: bcode_model::ModelCatalogHints::default(),
+                catalog: bcode_model::ModelCatalogHints {
+                    policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
+                        provider_id: "openai".to_string(),
+                        target: bcode_model::ModelCatalogSupportHint {
+                            provider: "openai".to_string(),
+                            auth_mode: "api_key".to_string(),
+                            api_surface: "responses".to_string(),
+                            integration: None,
+                        },
+                        authority: bcode_model::ModelListAuthority::Partial,
+                    },
+                },
             },
         });
 

@@ -269,8 +269,7 @@ pub enum ModelListAuthority {
 }
 
 /// Provider-neutral catalog resolution policy.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ModelCatalogPolicy {
     /// Provider has no catalog mapping.
     #[default]
@@ -278,7 +277,6 @@ pub enum ModelCatalogPolicy {
     /// Enrich existing models without expanding membership.
     EnrichOnly {
         provider_id: String,
-        #[serde(default)]
         target: Option<ModelCatalogSupportHint>,
         authority: ModelListAuthority,
     },
@@ -290,6 +288,163 @@ pub enum ModelCatalogPolicy {
     },
     /// Expand with every model in the provider catalog.
     ExpandAll { provider_id: String },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HumanReadableModelCatalogPolicy {
+    Unmapped,
+    EnrichOnly {
+        provider_id: String,
+        #[serde(default)]
+        target: Option<ModelCatalogSupportHint>,
+        authority: ModelListAuthority,
+    },
+    ExpandSupported {
+        provider_id: String,
+        target: ModelCatalogSupportHint,
+        authority: ModelListAuthority,
+    },
+    ExpandAll {
+        provider_id: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireModelCatalogPolicy {
+    Unmapped,
+    EnrichOnly {
+        provider_id: String,
+        target: Option<ModelCatalogSupportHint>,
+        authority: ModelListAuthority,
+    },
+    ExpandSupported {
+        provider_id: String,
+        target: ModelCatalogSupportHint,
+        authority: ModelListAuthority,
+    },
+    ExpandAll {
+        provider_id: String,
+    },
+}
+
+impl From<&ModelCatalogPolicy> for HumanReadableModelCatalogPolicy {
+    fn from(policy: &ModelCatalogPolicy) -> Self {
+        match policy {
+            ModelCatalogPolicy::Unmapped => Self::Unmapped,
+            ModelCatalogPolicy::EnrichOnly {
+                provider_id,
+                target,
+                authority,
+            } => Self::EnrichOnly {
+                provider_id: provider_id.clone(),
+                target: target.clone(),
+                authority: *authority,
+            },
+            ModelCatalogPolicy::ExpandSupported {
+                provider_id,
+                target,
+                authority,
+            } => Self::ExpandSupported {
+                provider_id: provider_id.clone(),
+                target: target.clone(),
+                authority: *authority,
+            },
+            ModelCatalogPolicy::ExpandAll { provider_id } => Self::ExpandAll {
+                provider_id: provider_id.clone(),
+            },
+        }
+    }
+}
+
+impl From<&ModelCatalogPolicy> for WireModelCatalogPolicy {
+    fn from(policy: &ModelCatalogPolicy) -> Self {
+        match policy {
+            ModelCatalogPolicy::Unmapped => Self::Unmapped,
+            ModelCatalogPolicy::EnrichOnly {
+                provider_id,
+                target,
+                authority,
+            } => Self::EnrichOnly {
+                provider_id: provider_id.clone(),
+                target: target.clone(),
+                authority: *authority,
+            },
+            ModelCatalogPolicy::ExpandSupported {
+                provider_id,
+                target,
+                authority,
+            } => Self::ExpandSupported {
+                provider_id: provider_id.clone(),
+                target: target.clone(),
+                authority: *authority,
+            },
+            ModelCatalogPolicy::ExpandAll { provider_id } => Self::ExpandAll {
+                provider_id: provider_id.clone(),
+            },
+        }
+    }
+}
+
+macro_rules! impl_model_catalog_policy_from_helper {
+    ($helper:ident) => {
+        impl From<$helper> for ModelCatalogPolicy {
+            fn from(policy: $helper) -> Self {
+                match policy {
+                    $helper::Unmapped => Self::Unmapped,
+                    $helper::EnrichOnly {
+                        provider_id,
+                        target,
+                        authority,
+                    } => Self::EnrichOnly {
+                        provider_id,
+                        target,
+                        authority,
+                    },
+                    $helper::ExpandSupported {
+                        provider_id,
+                        target,
+                        authority,
+                    } => Self::ExpandSupported {
+                        provider_id,
+                        target,
+                        authority,
+                    },
+                    $helper::ExpandAll { provider_id } => Self::ExpandAll { provider_id },
+                }
+            }
+        }
+    };
+}
+
+impl_model_catalog_policy_from_helper!(HumanReadableModelCatalogPolicy);
+impl_model_catalog_policy_from_helper!(WireModelCatalogPolicy);
+
+impl Serialize for ModelCatalogPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            HumanReadableModelCatalogPolicy::from(self).serialize(serializer)
+        } else {
+            WireModelCatalogPolicy::from(self).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelCatalogPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            HumanReadableModelCatalogPolicy::deserialize(deserializer).map(Self::from)
+        } else {
+            WireModelCatalogPolicy::deserialize(deserializer).map(Self::from)
+        }
+    }
 }
 
 /// Provider-neutral catalog support target.
@@ -1625,8 +1780,9 @@ pub enum ProviderErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelInfo, ModelList, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
-        ModelTokenPrice, ModelVisibility, ModelVisibilitySource, ProviderErrorCategory, TokenUsage,
+        ModelCatalogPolicy, ModelCatalogSupportHint, ModelInfo, ModelList, ModelListAuthority,
+        ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelVisibility,
+        ModelVisibilitySource, ProviderErrorCategory, TokenUsage,
     };
 
     #[test]
@@ -1700,6 +1856,28 @@ mod tests {
         let decoded: ProviderErrorCategory =
             serde_json::from_str(&encoded).expect("category should decode");
         assert_eq!(decoded, ProviderErrorCategory::Overloaded);
+    }
+
+    #[test]
+    fn model_catalog_policy_preserves_tagged_json_shape() {
+        let policy = ModelCatalogPolicy::ExpandSupported {
+            provider_id: "openai".to_owned(),
+            target: ModelCatalogSupportHint {
+                provider: "openai".to_owned(),
+                auth_mode: "api_key".to_owned(),
+                api_surface: "responses".to_owned(),
+                integration: None,
+            },
+            authority: ModelListAuthority::Partial,
+        };
+
+        let encoded = serde_json::to_value(&policy).expect("policy should encode");
+        assert_eq!(encoded["kind"], "expand_supported");
+        assert_eq!(encoded["provider_id"], "openai");
+
+        let decoded: ModelCatalogPolicy =
+            serde_json::from_value(encoded).expect("policy should decode");
+        assert_eq!(decoded, policy);
     }
 
     #[test]
