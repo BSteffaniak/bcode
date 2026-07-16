@@ -9525,10 +9525,12 @@ async fn handle_compact_session(
             )
             .await
         }
-        Err(
-            CompactionError::NothingToCompact(message)
-            | CompactionError::InsufficientProgress { message, .. },
-        ) => send_compaction_noop_response(writer, request_id, message).await,
+        Err(CompactionError::PlanUnavailable(reason)) => {
+            send_compaction_noop_response(writer, request_id, reason.to_string()).await
+        }
+        Err(CompactionError::InsufficientProgress { message, .. }) => {
+            send_compaction_noop_response(writer, request_id, message).await
+        }
         Err(CompactionError::Session(error)) => {
             send_response(
                 writer,
@@ -11046,7 +11048,7 @@ async fn run_model_turn_inner(
                 request = prepared.request;
                 context_projection = prepared.context_projection;
             }
-            Ok(None) | Err(CompactionError::NothingToCompact(_)) => {}
+            Ok(None) | Err(CompactionError::PlanUnavailable(_)) => {}
             Err(CompactionError::Cancelled) => {
                 return ModelTurnCompletion::with_message(
                     ModelTurnOutcome::Cancelled,
@@ -22078,6 +22080,103 @@ library = "test"
     }
 
     #[test]
+    fn new_model_turn_releases_abandoned_tool_chain() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "old turn".into(),
+                    origin: None,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "orphan".into(),
+                    tool_name: "shell.run".into(),
+                    arguments_json: "{}".into(),
+                    producer_plugin_id: None,
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::ModelTurnStarted {
+                    turn_id: "next".into(),
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "new turn".into(),
+                    origin: None,
+                },
+            ),
+        ];
+
+        let units = conversational_units(&history, 1_000);
+
+        assert_eq!(units.len(), 3);
+        assert!(units[0].interrupted_tool_chain);
+        assert!(matches!(
+            units[1].events[0].kind,
+            SessionEventKind::ModelTurnStarted { .. }
+        ));
+        assert!(units[2].begins_with_user);
+    }
+
+    #[test]
+    fn overflow_planning_compacts_a_single_large_historical_unit() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "historical turn".repeat(1_000),
+                    origin: None,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "historical answer".repeat(1_000),
+                },
+            ),
+        ];
+
+        assert!(matches!(
+            structural_compaction_plan_with_policy(
+                &history,
+                1_000,
+                CompactionPlanningPolicy::Proactive {
+                    keep_recent_tokens: 20_000,
+                },
+            ),
+            Err(CompactionPlanUnavailable::ProtectedTailConsumesAllHistory)
+        ));
+        let plan = structural_compaction_plan_with_policy(
+            &history,
+            1_000,
+            CompactionPlanningPolicy::OverflowRecovery,
+        )
+        .expect("overflow recovery must compact one historical unit");
+        assert_eq!(plan.compacted_through_sequence, 2);
+        assert!(plan.retained_tail.is_empty());
+    }
+
+    #[test]
     fn provider_marker_portable_summary_is_plan_base() {
         let session_id = SessionId::new();
         let snapshot = bcode_session_models::ProviderContextSnapshot {
@@ -22127,7 +22226,14 @@ library = "test"
                 },
             ),
         ];
-        let plan = structural_compaction_plan(&history, 1_000, 0).expect("plan");
+        let plan = structural_compaction_plan_with_policy(
+            &history,
+            1_000,
+            CompactionPlanningPolicy::Proactive {
+                keep_recent_tokens: 0,
+            },
+        )
+        .expect("plan");
         assert_eq!(plan.prior_boundary, Some(7));
         assert_eq!(plan.portable_fallback, "portable provider summary");
     }
@@ -22464,7 +22570,14 @@ library = "test"
                 },
             ),
         ];
-        let plan = structural_compaction_plan(&history, 1_000, 0).expect("structural plan");
+        let plan = structural_compaction_plan_with_policy(
+            &history,
+            1_000,
+            CompactionPlanningPolicy::Proactive {
+                keep_recent_tokens: 0,
+            },
+        )
+        .expect("structural plan");
         assert_eq!(plan.compacted_through_sequence, 2);
         assert_eq!(plan.compactable_prefix.len(), 2);
         assert_eq!(plan.retained_tail.len(), 2);
@@ -22579,7 +22692,14 @@ library = "test"
                 },
             ),
         ];
-        let plan = structural_compaction_plan(&history, 1_000, 0).expect("structural plan");
+        let plan = structural_compaction_plan_with_policy(
+            &history,
+            1_000,
+            CompactionPlanningPolicy::Proactive {
+                keep_recent_tokens: 0,
+            },
+        )
+        .expect("structural plan");
         assert_eq!(plan.compacted_through_sequence, 2);
         assert_eq!(plan.retained_tail[0].sequence, 3);
         let units = conversational_units(&history, 1_000);
@@ -22653,7 +22773,14 @@ library = "test"
         assert!(!units[0].interrupted_tool_chain);
         assert_eq!(units[1].events[0].sequence, 4);
 
-        let plan = structural_compaction_plan(&history, 1_000, 0).expect("structural plan");
+        let plan = structural_compaction_plan_with_policy(
+            &history,
+            1_000,
+            CompactionPlanningPolicy::Proactive {
+                keep_recent_tokens: 0,
+            },
+        )
+        .expect("structural plan");
         assert_eq!(plan.compacted_through_sequence, 5);
         assert_eq!(plan.retained_tail[0].sequence, 6);
     }
@@ -22704,7 +22831,14 @@ library = "test"
                 },
             ),
         ];
-        let plan = structural_compaction_plan(&history, 1_000, 0).expect("structural plan");
+        let plan = structural_compaction_plan_with_policy(
+            &history,
+            1_000,
+            CompactionPlanningPolicy::Proactive {
+                keep_recent_tokens: 0,
+            },
+        )
+        .expect("structural plan");
         assert_eq!(plan.prior_boundary, Some(1));
         assert_eq!(plan.portable_fallback, "new summary");
         assert_eq!(plan.compactable_prefix[0].sequence, 3);
@@ -24814,6 +24948,52 @@ library = "test"
             )
             .await
             .expect("select fake provider");
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "historical turn with an abandoned tool call".to_string(),
+                    origin: None,
+                },
+            )
+            .await
+            .expect("append abandoned-turn user history");
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "abandoned-call".to_string(),
+                    tool_name: "shell.run".to_string(),
+                    arguments_json: r#"{"command":"false"}"#.to_string(),
+                    producer_plugin_id: None,
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            )
+            .await
+            .expect("append abandoned tool call");
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: "abandoned-turn".to_string(),
+                    outcome: ModelTurnOutcome::Cancelled,
+                    message: None,
+                },
+            )
+            .await
+            .expect("append abandoned turn boundary");
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::ModelTurnStarted {
+                    turn_id: "later-turn".to_string(),
+                },
+            )
+            .await
+            .expect("append later turn boundary");
         for index in 0..8 {
             sessions
                 .append_event(

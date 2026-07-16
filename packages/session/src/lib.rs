@@ -5308,7 +5308,7 @@ mod tests {
             SessionEventKind::UserMessage { text, .. }
                 if event.sequence == user_sequence && text == "carry on"
         )));
-        assert!(!context.iter().any(|event| matches!(
+        assert!(context.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ModelTurnStarted { turn_id } if turn_id == "turn-1"
         )));

@@ -40,7 +40,7 @@ const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 1;
+const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 2;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
 const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 4;
 const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
@@ -1364,9 +1364,7 @@ impl SessionDb {
             let payload = required_string(&row, "payload")?;
             let event = decode_session_event(&payload)?;
             if event.sequence != event_seq
-                || (model_context_event_kind_name(&event.kind) != event_type
-                    && !(event_type == "context_usage_observed"
-                        && matches!(event.kind, SessionEventKind::RequestContextObserved { .. })))
+                || model_context_event_kind_name(&event.kind) != event_type
                 || !is_model_context_event_type(&event_type)
             {
                 return Err(SessionDbError::InvalidRow {
@@ -2051,7 +2049,10 @@ async fn project_model_context_event(
     }
 
     let event_type = model_context_event_kind_name(&event.kind);
-    if is_model_context_event_type(event_type) {
+    if !matches!(
+        context_history_role(&event.kind),
+        ContextHistoryRole::Excluded
+    ) {
         if let Some(boundary) = compaction_boundary(event)? {
             db.delete("model_context_entries")
                 .where_lte("event_seq", seq_to_value(boundary))
@@ -2745,6 +2746,13 @@ fn model_context_events_query(
     select
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextHistoryRole {
+    ModelVisible,
+    Structural,
+    Excluded,
+}
+
 const MODEL_CONTEXT_EVENT_TYPES: &[&str] = &[
     "user_message",
     "assistant_message",
@@ -2754,23 +2762,46 @@ const MODEL_CONTEXT_EVENT_TYPES: &[&str] = &[
     "working_directory_changed",
     "context_compacted",
     "provider_context_compacted",
-    "context_usage_observed",
-    "request_context_observed",
+    "model_turn_started",
+    "model_turn_finished",
 ];
 
-const fn is_model_context_event_type(event_type: &str) -> bool {
-    matches!(
-        event_type.as_bytes(),
+const fn context_history_role(kind: &SessionEventKind) -> ContextHistoryRole {
+    match kind {
+        SessionEventKind::UserMessage { .. }
+        | SessionEventKind::AssistantMessage { .. }
+        | SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::ToolCallFinished { .. }
+        | SessionEventKind::SystemMessage { .. }
+        | SessionEventKind::WorkingDirectoryChanged { .. }
+        | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::ProviderContextCompacted { .. } => ContextHistoryRole::ModelVisible,
+        SessionEventKind::ModelTurnStarted { .. } | SessionEventKind::ModelTurnFinished { .. } => {
+            ContextHistoryRole::Structural
+        }
+        _ => ContextHistoryRole::Excluded,
+    }
+}
+
+const fn context_history_role_from_name(event_type: &str) -> ContextHistoryRole {
+    match event_type.as_bytes() {
         b"user_message"
-            | b"assistant_message"
-            | b"tool_call_requested"
-            | b"tool_call_finished"
-            | b"system_message"
-            | b"working_directory_changed"
-            | b"context_compacted"
-            | b"provider_context_compacted"
-            | b"context_usage_observed"
-            | b"request_context_observed"
+        | b"assistant_message"
+        | b"tool_call_requested"
+        | b"tool_call_finished"
+        | b"system_message"
+        | b"working_directory_changed"
+        | b"context_compacted"
+        | b"provider_context_compacted" => ContextHistoryRole::ModelVisible,
+        b"model_turn_started" | b"model_turn_finished" => ContextHistoryRole::Structural,
+        _ => ContextHistoryRole::Excluded,
+    }
+}
+
+const fn is_model_context_event_type(event_type: &str) -> bool {
+    !matches!(
+        context_history_role_from_name(event_type),
+        ContextHistoryRole::Excluded
     )
 }
 
@@ -2836,6 +2867,8 @@ const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static str 
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
         SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
+        SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
         SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
         _ => "non_model_context",
     }
@@ -3642,8 +3675,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_context_usage_is_a_model_context_event_type() {
-        assert!(is_model_context_event_type("context_usage_observed"));
+    fn context_history_roles_separate_model_visible_structural_and_excluded_events() {
+        assert!(is_model_context_event_type("model_turn_started"));
+        assert!(is_model_context_event_type("model_turn_finished"));
+        assert!(!is_model_context_event_type("context_usage_observed"));
+        assert!(!is_model_context_event_type("request_context_observed"));
     }
 
     #[tokio::test]
@@ -3979,11 +4015,28 @@ mod tests {
                     origin: None,
                 },
             ),
+            (
+                5,
+                SessionEventKind::ModelTurnStarted {
+                    turn_id: "turn-1".to_string(),
+                },
+            ),
+            (
+                6,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: "turn-1".to_string(),
+                    outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            ),
         ] {
             db.append_event(&event(session_id, sequence, kind))
                 .await
                 .expect("append projected event");
         }
+        db.append_event(&request_context_event(session_id, 7))
+            .await
+            .expect("append excluded occupancy event");
 
         let state = db
             .database()
@@ -3997,12 +4050,20 @@ mod tests {
             required_i64(&state, "schema_version").expect("version"),
             i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)
         );
-        assert_eq!(required_i64(&state, "last_event_seq").expect("last"), 4);
+        assert_eq!(required_i64(&state, "last_event_seq").expect("last"), 7);
 
         let context = db.model_context_events().await.expect("projected context");
-        assert_eq!(context.len(), 2);
+        assert_eq!(context.len(), 4);
         assert_eq!(context[0].sequence, 3);
         assert_eq!(context[1].sequence, 4);
+        assert!(matches!(
+            context[2].kind,
+            SessionEventKind::ModelTurnStarted { .. }
+        ));
+        assert!(matches!(
+            context[3].kind,
+            SessionEventKind::ModelTurnFinished { .. }
+        ));
 
         db.database()
             .delete("model_context_projection_state")
@@ -4081,10 +4142,7 @@ mod tests {
 
         db.database()
             .update("model_context_projection_state")
-            .value(
-                "schema_version",
-                DatabaseValue::Int64(i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION + 1)),
-            )
+            .value("schema_version", DatabaseValue::Int64(1))
             .execute(db.database())
             .await
             .expect("set incompatible version");
@@ -4092,7 +4150,10 @@ mod tests {
             db.model_context_events()
                 .await
                 .expect_err("incompatible version must surface"),
-            SessionDbError::ModelContextProjectionVersion { .. }
+            SessionDbError::ModelContextProjectionVersion {
+                actual: 1,
+                expected: 2,
+            }
         ));
 
         db.database()

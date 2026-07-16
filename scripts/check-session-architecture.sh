@@ -57,4 +57,26 @@ if ! grep -q 'finalized_artifact_reference' <<<"$artifact_read_body"; then
   violations=1
 fi
 
+if ! rg -q 'SessionEventKind::ModelTurnStarted.*=> "model_turn_started"' packages/session/src/db.rs \
+  || ! rg -q 'SessionEventKind::ModelTurnFinished.*=> "model_turn_finished"' packages/session/src/db.rs; then
+  echo "Session model-context projection violation: model-turn lifecycle boundaries must remain structural context events." >&2
+  violations=1
+fi
+
+model_context_types="$(sed -n '/const MODEL_CONTEXT_EVENT_TYPES:/,/^];/p' packages/session/src/db.rs)"
+if grep -Eq 'context_usage_observed|request_context_observed' <<<"$model_context_types"; then
+  echo "Session model-context projection violation: context occupancy belongs only in its dedicated projection." >&2
+  violations=1
+fi
+
+if ! rg -q 'CompactionPlanningPolicy::OverflowRecovery' packages/server/src/context_compaction.rs; then
+  echo "Session compaction violation: overflow recovery must use its explicit planning policy." >&2
+  violations=1
+fi
+
+if rg -q 'Option<CompactionPlan>' packages/server/src/context_compaction.rs; then
+  echo "Session compaction violation: planners must return typed unavailability reasons." >&2
+  violations=1
+fi
+
 exit "$violations"

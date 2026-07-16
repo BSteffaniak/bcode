@@ -11,8 +11,8 @@ use super::*;
 
 #[derive(Debug, Error)]
 pub enum CompactionError {
-    #[error("nothing to compact: {0}")]
-    NothingToCompact(String),
+    #[error("compaction plan unavailable: {0}")]
+    PlanUnavailable(CompactionPlanUnavailable),
     #[error("insufficient compaction progress through #{compacted_through_sequence}: {message}")]
     InsufficientProgress {
         message: String,
@@ -45,6 +45,35 @@ pub enum CompactionError {
 pub struct CompactionCompletion {
     pub message: String,
     pub compacted_through_sequence: u64,
+}
+
+/// Selects how much structurally complete history a compaction attempt may retain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionPlanningPolicy {
+    /// Preserve complete recent units up to the configured token target.
+    Proactive { keep_recent_tokens: usize },
+    /// Compact every eligible event before the protected current-turn cutoff.
+    OverflowRecovery,
+}
+
+/// Explains why structurally safe compaction could not produce a plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionPlanUnavailable {
+    /// No eligible context exists after the latest durable compaction boundary.
+    NoHistoryAfterPriorBoundary,
+    /// The proactive retention policy protects every available unit.
+    ProtectedTailConsumesAllHistory,
+}
+
+impl std::fmt::Display for CompactionPlanUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoHistoryAfterPriorBoundary => formatter.write_str("nothing new to compact"),
+            Self::ProtectedTailConsumesAllHistory => {
+                formatter.write_str("only the protected recent context remains")
+            }
+        }
+    }
 }
 
 pub struct CompactionPlan {
@@ -106,7 +135,7 @@ pub async fn compact_session_context_before_sequence(
     first_kept_sequence: u64,
     cancel_state: &TurnCancelState,
 ) -> Result<CompactionCompletion, CompactionError> {
-    compact_session_context_with_limit(
+    compact_session_context_with_policy(
         state,
         session_id,
         selection,
@@ -114,6 +143,7 @@ pub async fn compact_session_context_before_sequence(
         None,
         cancel_state,
         None,
+        CompactionPlanningPolicy::OverflowRecovery,
     )
     .await
 }
@@ -127,6 +157,33 @@ pub async fn compact_session_context_with_limit(
     command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
     progress_requirement: Option<CompactionProgressRequirement>,
+) -> Result<CompactionCompletion, CompactionError> {
+    compact_session_context_with_policy(
+        state,
+        session_id,
+        selection,
+        first_kept_sequence,
+        command_context,
+        cancel_state,
+        progress_requirement,
+        CompactionPlanningPolicy::Proactive {
+            keep_recent_tokens: usize::try_from(state.auto_compaction.keep_recent_tokens)
+                .unwrap_or(usize::MAX),
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn compact_session_context_with_policy(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    first_kept_sequence: Option<u64>,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+    progress_requirement: Option<CompactionProgressRequirement>,
+    planning_policy: CompactionPlanningPolicy,
 ) -> Result<CompactionCompletion, CompactionError> {
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
@@ -143,23 +200,31 @@ pub async fn compact_session_context_with_limit(
                 .collect()
         },
     );
-    let Some(plan) = structural_compaction_plan(
+    let plan = match structural_compaction_plan_with_policy(
         &transcript_history,
         state.tool_output_context_chars,
-        usize::try_from(state.auto_compaction.keep_recent_tokens).unwrap_or(usize::MAX),
-    ) else {
-        let message = "nothing new to compact".to_string();
-        append_context_compaction_trace(
-            state,
-            session_id,
-            CompactionTraceKind::Skipped,
-            "nothing_to_compact",
-            0,
-            false,
-            Some(message.clone()),
-        )
-        .await;
-        return Err(CompactionError::NothingToCompact(message));
+        planning_policy,
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            let message = reason.to_string();
+            append_context_compaction_trace(
+                state,
+                session_id,
+                CompactionTraceKind::Skipped,
+                match reason {
+                    CompactionPlanUnavailable::NoHistoryAfterPriorBoundary => "nothing_to_compact",
+                    CompactionPlanUnavailable::ProtectedTailConsumesAllHistory => {
+                        "protected_tail_consumes_history"
+                    }
+                },
+                0,
+                false,
+                Some(message.clone()),
+            )
+            .await;
+            return Err(CompactionError::PlanUnavailable(reason));
+        }
     };
     let transcript = compaction_transcript_from_plan(&plan);
     debug_assert!(
@@ -1383,6 +1448,18 @@ pub fn conversational_units(
     let mut pending_tool_calls = BTreeSet::new();
 
     for event in events {
+        let starts_turn_boundary = matches!(event.kind, SessionEventKind::ModelTurnStarted { .. })
+            && !pending_tool_calls.is_empty();
+        if matches!(event.kind, SessionEventKind::ModelTurnStarted { .. }) {
+            // A newly-started model turn proves that unresolved calls from an earlier turn were
+            // abandoned. Keep the lifecycle marker as a structural boundary, never as model text.
+            if !pending_tool_calls.is_empty()
+                && let Some(unit) = units.last_mut()
+            {
+                unit.interrupted_tool_chain = true;
+            }
+            pending_tool_calls.clear();
+        }
         let starts_user_unit = matches!(event.kind, SessionEventKind::UserMessage { .. })
             && pending_tool_calls.is_empty();
         let starts_orphan_assistant_unit =
@@ -1391,7 +1468,8 @@ pub fn conversational_units(
                 && units
                     .last()
                     .is_some_and(|unit| !unit.begins_with_user && !unit.events.is_empty());
-        let starts_unit = starts_user_unit
+        let starts_unit = starts_turn_boundary
+            || starts_user_unit
             || starts_orphan_assistant_unit
             || units.is_empty()
             || (pending_tool_calls.is_empty()
@@ -1443,11 +1521,16 @@ pub fn conversational_units(
     units
 }
 
-pub fn structural_compaction_plan(
+/// Build a structurally safe compaction plan under the supplied retention policy.
+///
+/// # Errors
+///
+/// Returns a typed reason when no eligible prefix can be compacted.
+pub fn structural_compaction_plan_with_policy(
     history: &[bcode_session_models::SessionEvent],
     tool_output_context_chars: usize,
-    keep_recent_tokens: usize,
-) -> Option<CompactionPlan> {
+    policy: CompactionPlanningPolicy,
+) -> Result<CompactionPlan, CompactionPlanUnavailable> {
     let history = compact_attach_history(history.to_vec());
     let latest_marker =
         history
@@ -1475,22 +1558,31 @@ pub fn structural_compaction_plan(
         .map_or_else(String::new, |(_, _, summary)| summary.clone());
     let start_index = latest_marker.map_or(0, |(index, _, _)| index.saturating_add(1));
     let units = conversational_units(&history[start_index..], tool_output_context_chars);
-    if units.len() <= 1 {
-        return None;
+    if units.is_empty() {
+        return Err(CompactionPlanUnavailable::NoHistoryAfterPriorBoundary);
     }
 
-    let mut retained_tokens = 0_u64;
-    let mut retained_start = units.len().saturating_sub(1);
-    for (index, unit) in units.iter().enumerate().rev() {
-        if retained_tokens >= u64::try_from(keep_recent_tokens).unwrap_or(u64::MAX) {
-            break;
+    let retained_start = match policy {
+        CompactionPlanningPolicy::Proactive { keep_recent_tokens } => {
+            if units.len() <= 1 {
+                return Err(CompactionPlanUnavailable::ProtectedTailConsumesAllHistory);
+            }
+            let mut retained_tokens = 0_u64;
+            let mut retained_start = units.len().saturating_sub(1);
+            for (index, unit) in units.iter().enumerate().rev() {
+                if retained_tokens >= u64::try_from(keep_recent_tokens).unwrap_or(u64::MAX) {
+                    break;
+                }
+                retained_tokens = retained_tokens.saturating_add(unit.estimated_tokens);
+                retained_start = index;
+            }
+            if retained_start == 0 {
+                return Err(CompactionPlanUnavailable::ProtectedTailConsumesAllHistory);
+            }
+            retained_start
         }
-        retained_tokens = retained_tokens.saturating_add(unit.estimated_tokens);
-        retained_start = index;
-    }
-    if retained_start == 0 {
-        return None;
-    }
+        CompactionPlanningPolicy::OverflowRecovery => units.len(),
+    };
     // An interrupted tool chain and the active newest user turn are retained as complete units.
     let compactable_units = &units[..retained_start];
     let retained_units = &units[retained_start..];
@@ -1502,7 +1594,10 @@ pub fn structural_compaction_plan(
         .iter()
         .flat_map(|unit| unit.events.iter().cloned())
         .collect::<Vec<_>>();
-    let compacted_through_sequence = compactable_prefix.last()?.sequence;
+    let compacted_through_sequence = compactable_prefix
+        .last()
+        .ok_or(CompactionPlanUnavailable::NoHistoryAfterPriorBoundary)?
+        .sequence;
     let summary_input = compactable_units
         .iter()
         .flat_map(|unit| unit.summary_input.iter().cloned())
@@ -1516,7 +1611,7 @@ pub fn structural_compaction_plan(
         total.saturating_add(unit.estimated_tokens)
     });
 
-    Some(CompactionPlan {
+    Ok(CompactionPlan {
         prior_boundary,
         compactable_prefix,
         retained_tail,
@@ -1547,7 +1642,12 @@ pub fn compaction_transcript(
     tool_output_context_chars: usize,
     keep_recent_tokens: usize,
 ) -> Option<CompactionTranscript> {
-    let plan = structural_compaction_plan(history, tool_output_context_chars, keep_recent_tokens)?;
+    let plan = structural_compaction_plan_with_policy(
+        history,
+        tool_output_context_chars,
+        CompactionPlanningPolicy::Proactive { keep_recent_tokens },
+    )
+    .ok()?;
     Some(compaction_transcript_from_plan(&plan))
 }
 
