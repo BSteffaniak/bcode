@@ -34,6 +34,7 @@ use bcode_tool::{
 use futures::{StreamExt, stream};
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
@@ -1025,8 +1026,8 @@ impl AgentRuntime {
     /// Execute an ordered tool-call batch through neutral preparation and authorization contracts.
     ///
     /// The complete batch is prepared and authorized before invocation begins. When parallel mode
-    /// is enabled, approved calls from this provider batch may overlap up to `max_concurrency`;
-    /// dependencies belong in later provider rounds. Results retain provider order regardless of
+    /// is enabled, approved calls from this provider batch overlap without a default limit, or up
+    /// to an explicitly configured `max_concurrency`; dependencies belong in later provider rounds. Results retain provider order regardless of
     /// completion order. `host_context` remains opaque to the runtime and is forwarded unchanged
     /// to every preparation request.
     ///
@@ -1054,9 +1055,7 @@ impl AgentRuntime {
         I: ToolInvoker + Sync + ?Sized,
     {
         if calls.is_empty() {
-            return Ok(ToolBatchExecutionOutput {
-                results: Vec::new(),
-            });
+            return Ok(empty_batch_output());
         }
         rounds.begin_round()?;
         if !scope.control().accepts_normal_output() {
@@ -1138,13 +1137,14 @@ impl AgentRuntime {
                 }
                 continue;
             }
+            let concurrency = batch_concurrency(options, group.len());
             let group_indices = group.iter().map(|call| call.index);
             let executions = stream::iter(group.iter().cloned().map(|prepared| async move {
                 let index = prepared.index;
                 let result = invoke_prepared_tool(invoker, prepared, scope).await;
                 (index, result)
             }))
-            .buffer_unordered(options.max_concurrency.get())
+            .buffer_unordered(concurrency)
             .collect::<Vec<_>>();
             let cancellation = scope.control().cancellation();
             let completions = tokio::select! {
@@ -1190,7 +1190,7 @@ impl AgentRuntime {
             std::num::NonZeroUsize::new(max_concurrency).unwrap_or(std::num::NonZeroUsize::MIN);
         let options = ToolExecutionOptions {
             parallel: max_concurrency.get() > 1,
-            max_concurrency,
+            max_concurrency: Some(max_concurrency),
             ..ToolExecutionOptions::default()
         };
         let scope = TurnScope::without_events("legacy-tool-batch", TurnGeneration::new(0));
@@ -1740,6 +1740,12 @@ fn legacy_tool_invocation_request(invocation: &ToolInvocationDescriptor) -> Tool
     }
 }
 
+fn batch_concurrency(options: ToolExecutionOptions, batch_len: usize) -> usize {
+    options
+        .max_concurrency
+        .map_or_else(|| batch_len.max(1), NonZeroUsize::get)
+}
+
 fn provider_batch_execution_groups(
     prepared: Vec<PreparedRuntimeToolCall>,
     parallel: bool,
@@ -1833,6 +1839,12 @@ fn ordered_batch_output(
                     .unwrap_or(Err(RuntimeError::Cancelled))
             })
             .collect(),
+    }
+}
+
+const fn empty_batch_output() -> ToolBatchExecutionOutput {
+    ToolBatchExecutionOutput {
+        results: Vec::new(),
     }
 }
 
@@ -2776,7 +2788,7 @@ mod tests {
                     &mut rounds,
                     &RuntimePermissionContext::default(),
                     ToolExecutionOptions {
-                        max_concurrency: std::num::NonZeroUsize::MIN,
+                        max_concurrency: Some(std::num::NonZeroUsize::MIN),
                         ..ToolExecutionOptions::default()
                     },
                     &task_scope,
@@ -2842,7 +2854,7 @@ mod tests {
                     &mut rounds,
                     &RuntimePermissionContext::default(),
                     ToolExecutionOptions {
-                        max_concurrency: std::num::NonZeroUsize::MIN,
+                        max_concurrency: Some(std::num::NonZeroUsize::MIN),
                         ..ToolExecutionOptions::default()
                     },
                     &task_scope,
@@ -2959,6 +2971,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_concurrency_starts_the_complete_provider_batch() {
+        let mut catalog = UnifiedToolCatalog::new();
+        let calls = (0..8)
+            .map(|index| {
+                let name = format!("tool-{index}");
+                catalog = std::mem::take(&mut catalog).with_inline_tool(tool_definition(&name));
+                ToolCall {
+                    id: format!("call-{index}"),
+                    name,
+                    arguments: serde_json::json!({}),
+                }
+            })
+            .collect::<Vec<_>>();
+        let invoker = ContractTestInvoker::new(calls.len());
+        let mut rounds = ToolRoundState::new(1);
+
+        AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &TurnScope::without_events("turn", TurnGeneration::new(12)),
+            )
+            .await
+            .expect("default-unlimited batch should execute");
+
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), calls.len());
+    }
+
+    #[tokio::test]
     async fn neutral_batch_never_exceeds_configured_concurrency() {
         let catalog = UnifiedToolCatalog::new()
             .with_inline_tool(tool_definition("first"))
@@ -2994,7 +3040,7 @@ mod tests {
                 &RuntimePermissionContext::default(),
                 ToolExecutionOptions {
                     parallel: true,
-                    max_concurrency: std::num::NonZeroUsize::new(2).expect("two is non-zero"),
+                    max_concurrency: Some(std::num::NonZeroUsize::new(2).expect("two is non-zero")),
                     ..ToolExecutionOptions::default()
                 },
                 &TurnScope::without_events("turn", TurnGeneration::new(14)),
@@ -3161,7 +3207,9 @@ mod tests {
                 &RuntimePermissionContext::default(),
                 ToolExecutionOptions {
                     parallel: false,
-                    max_concurrency: std::num::NonZeroUsize::new(8).expect("eight is non-zero"),
+                    max_concurrency: Some(
+                        std::num::NonZeroUsize::new(8).expect("eight is non-zero"),
+                    ),
                     ..ToolExecutionOptions::default()
                 },
                 &TurnScope::without_events("turn", TurnGeneration::new(12)),
@@ -3436,7 +3484,7 @@ mod tests {
             &context,
             ToolExecutionOptions {
                 parallel: true,
-                max_concurrency: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+                max_concurrency: Some(std::num::NonZeroUsize::new(1).expect("one is non-zero")),
                 ..ToolExecutionOptions::default()
             },
             &scope,

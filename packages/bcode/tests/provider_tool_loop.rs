@@ -194,7 +194,7 @@ fn agent(invoker: Arc<ParallelInvoker>) -> Agent {
     Agent::builder()
         .max_tool_rounds(1)
         .execution_options(bcode::ToolExecutionOptions {
-            max_concurrency: NonZeroUsize::new(2).expect("two is non-zero"),
+            max_concurrency: Some(NonZeroUsize::new(2).expect("two is non-zero")),
             ..bcode::ToolExecutionOptions::default()
         })
         .inline_tool(definition("first"), |_| {

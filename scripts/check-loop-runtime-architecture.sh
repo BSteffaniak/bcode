@@ -173,6 +173,14 @@ if rg -n -i 'bcode\.(shell|filesystem|question|vim-edit|web-search)|shell-plugin
   violations=1
 fi
 
+if rg -n 'default_tool_execution_max_concurrency|max_concurrency: NonZeroUsize::new\(4\)|tool_execution\.max_concurrency\.get\(\)' \
+  packages/config/src/lib.rs packages/tool/src/contracts.rs packages/server/src/lib.rs \
+  >/tmp/bcode-default-concurrency-limit.txt; then
+  echo "Runtime architecture violation: an artificial default tool concurrency limit was reintroduced." >&2
+  cat /tmp/bcode-default-concurrency-limit.txt >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

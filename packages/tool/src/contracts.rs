@@ -12,8 +12,11 @@ use std::num::{NonZeroU64, NonZeroUsize};
 pub struct ToolExecutionOptions {
     /// Whether approved invocations from one provider batch may overlap.
     pub parallel: bool,
-    /// Maximum number of invocations that may execute concurrently.
-    pub max_concurrency: NonZeroUsize,
+    /// Optional maximum number of invocations that may execute concurrently.
+    ///
+    /// `None` allows every approved call in the provider batch to overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<NonZeroUsize>,
     /// Maximum duration of one side-effect-free preparation operation, in milliseconds.
     pub preparation_timeout_ms: NonZeroU64,
 }
@@ -22,7 +25,7 @@ impl Default for ToolExecutionOptions {
     fn default() -> Self {
         Self {
             parallel: true,
-            max_concurrency: NonZeroUsize::new(4).expect("four is non-zero"),
+            max_concurrency: None,
             preparation_timeout_ms: NonZeroU64::new(30_000).expect("thirty thousand is non-zero"),
         }
     }
@@ -321,6 +324,28 @@ pub struct ToolInvocationLifecycleEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_options_omit_unlimited_concurrency_and_preserve_explicit_limit() {
+        let unlimited = serde_json::to_value(ToolExecutionOptions::default())
+            .expect("unlimited execution options should encode");
+        assert!(
+            !unlimited
+                .as_object()
+                .expect("options object")
+                .contains_key("max_concurrency")
+        );
+
+        let limited = serde_json::to_value(ToolExecutionOptions {
+            max_concurrency: NonZeroUsize::new(8),
+            ..ToolExecutionOptions::default()
+        })
+        .expect("limited execution options should encode");
+        assert_eq!(limited["max_concurrency"], 8);
+        let decoded: ToolExecutionOptions = serde_json::from_value(unlimited)
+            .expect("omitted concurrency should decode as unlimited");
+        assert_eq!(decoded.max_concurrency, None);
+    }
 
     #[test]
     fn contribution_payload_round_trips_without_renderer_knowledge() {

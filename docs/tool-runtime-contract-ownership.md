@@ -54,7 +54,7 @@ Server, SDK, static-plugin, dynamic-plugin, remote, TUI, web, and headless hosts
 
 ### Provider-batch parallel intent
 
-One provider tool-call batch is the model's declaration that its calls may overlap. After complete-batch authorization, approved calls execute concurrently up to the host's configured bound. If one call depends on another, the provider must emit it in a later tool round after receiving the earlier result. Core and domain plugins do not infer command, path, repository, or resource conflicts for scheduling.
+One provider tool-call batch is the model's declaration that its calls may overlap. After complete-batch authorization, approved calls execute concurrently without a default limit, or up to an explicitly configured positive host bound. If one call depends on another, the provider must emit it in a later tool round after receiving the earlier result. Core and domain plugins do not infer command, path, repository, or resource conflicts for scheduling.
 
 A host may explicitly disable parallel execution, and a non-reentrant adapter may serialize internally as a mechanical implementation constraint. Neither case introduces tool-domain policy into canonical orchestration.
 

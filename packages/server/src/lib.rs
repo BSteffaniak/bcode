@@ -15000,17 +15000,19 @@ async fn execute_model_tool_batch(
 
     if !ready.is_empty() {
         let authorization_gate = BatchAuthorizationGate::new(ready.len());
-        let concurrency = if state.tool_execution.parallel {
-            state.tool_execution.max_concurrency.get()
+        let invocation_permits = if state.tool_execution.parallel {
+            state
+                .tool_execution
+                .max_concurrency
+                .map(|limit| Arc::new(Semaphore::new(limit.get())))
         } else {
-            1
+            Some(Arc::new(Semaphore::new(1)))
         };
-        let invocation_permits = Arc::new(Semaphore::new(concurrency));
         let execution_count = ready.len();
         let executions = stream::iter(ready.into_iter().map(|(index, call, working_directory)| {
             let cancel_state = Arc::clone(&cancel_state);
             let authorization = authorization_gate.participant();
-            let invocation_permits = Arc::clone(&invocation_permits);
+            let invocation_permits = invocation_permits.clone();
             async move {
                 (
                     index,
@@ -15021,7 +15023,7 @@ async fn execute_model_tool_batch(
                         working_directory,
                         cancel_state,
                         Some(authorization),
-                        Some(invocation_permits),
+                        invocation_permits,
                     )
                     .await,
                 )
@@ -23221,8 +23223,6 @@ mod tests {
         let mut state = test_server_state_with_shell_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
         state.tool_execution.parallel = true;
-        state.tool_execution.max_concurrency =
-            std::num::NonZeroUsize::new(5).expect("five is non-zero");
         let state = Arc::new(state);
         let calls = (0..5)
             .map(|index| bcode_model::ToolCall {

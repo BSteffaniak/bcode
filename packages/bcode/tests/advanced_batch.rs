@@ -38,7 +38,7 @@ async fn advanced_batch_api_schedules_once_and_preserves_provider_order() {
         .max_tool_rounds(1)
         .execution_options(ToolExecutionOptions {
             parallel: true,
-            max_concurrency: NonZeroUsize::new(2).expect("two is non-zero"),
+            max_concurrency: Some(NonZeroUsize::new(2).expect("two is non-zero")),
             preparation_timeout_ms: NonZeroU64::new(1_000).expect("one thousand is non-zero"),
         })
         .inline_tool(definition("first"), move |_| {

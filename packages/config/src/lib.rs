@@ -1865,10 +1865,6 @@ const fn default_tool_execution_parallel() -> bool {
     true
 }
 
-const fn default_tool_execution_max_concurrency() -> usize {
-    4
-}
-
 const fn default_tool_preparation_timeout_ms() -> u64 {
     30_000
 }
@@ -1880,9 +1876,10 @@ pub struct ToolExecutionConfig {
     /// Whether approved tool calls from one provider batch may execute concurrently.
     #[serde(default = "default_tool_execution_parallel")]
     pub parallel: bool,
-    /// Maximum number of approved same-batch tool calls executing concurrently. Zero is normalized to one.
-    #[serde(default = "default_tool_execution_max_concurrency")]
-    pub max_concurrency: usize,
+    /// Optional maximum number of approved same-batch tool calls executing concurrently.
+    /// Omit this setting to allow the complete approved batch to overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<std::num::NonZeroUsize>,
     /// Maximum duration of one side-effect-free preparation operation, in milliseconds. Zero is normalized to one.
     #[serde(default = "default_tool_preparation_timeout_ms")]
     pub preparation_timeout_ms: u64,
@@ -1894,8 +1891,7 @@ impl ToolExecutionConfig {
     pub fn runtime_options(&self) -> bcode_tool::ToolExecutionOptions {
         bcode_tool::ToolExecutionOptions {
             parallel: self.parallel,
-            max_concurrency: std::num::NonZeroUsize::new(self.max_concurrency)
-                .unwrap_or(std::num::NonZeroUsize::MIN),
+            max_concurrency: self.max_concurrency,
             preparation_timeout_ms: std::num::NonZeroU64::new(self.preparation_timeout_ms)
                 .unwrap_or(std::num::NonZeroU64::MIN),
         }
@@ -1906,7 +1902,7 @@ impl Default for ToolExecutionConfig {
     fn default() -> Self {
         Self {
             parallel: default_tool_execution_parallel(),
-            max_concurrency: default_tool_execution_max_concurrency(),
+            max_concurrency: None,
             preparation_timeout_ms: default_tool_preparation_timeout_ms(),
         }
     }
@@ -5646,6 +5642,36 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn tool_execution_concurrency_is_unlimited_by_default_and_optionally_bounded() {
+        let default = super::ToolExecutionConfig::default();
+        assert_eq!(default.max_concurrency, None);
+        assert_eq!(default.runtime_options().max_concurrency, None);
+        let omitted: super::ToolExecutionConfig =
+            toml::from_str("parallel = true\npreparation_timeout_ms = 30000\n")
+                .expect("omitted concurrency should parse as unlimited");
+        assert_eq!(omitted.max_concurrency, None);
+        let encoded = toml::to_string(&omitted).expect("unlimited config should encode");
+        assert!(!encoded.contains("max_concurrency"));
+
+        let configured: super::ToolExecutionConfig = toml::from_str(
+            "parallel = true\nmax_concurrency = 8\npreparation_timeout_ms = 30000\n",
+        )
+        .expect("positive concurrency limit should parse");
+        assert_eq!(configured.max_concurrency, std::num::NonZeroUsize::new(8));
+        assert_eq!(
+            configured.runtime_options().max_concurrency,
+            std::num::NonZeroUsize::new(8)
+        );
+
+        assert!(
+            toml::from_str::<super::ToolExecutionConfig>(
+                "parallel = true\nmax_concurrency = 0\npreparation_timeout_ms = 30000\n"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn client_request_timeout_defaults_to_fifteen_seconds() {
