@@ -1290,12 +1290,14 @@ where
         let replay_chunk = replay_gate.write(chunk);
         let clean = clean_gate.write(chunk);
         if let Some(writer) = &mut recording_writer {
-            let _queued = writer.try_write_output_with(
-                u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                chunk,
-                Some(&live),
-                || {},
-            );
+            writer
+                .write_output_with(
+                    u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    chunk,
+                    Some(&live),
+                    || {},
+                )
+                .map_err(|error| error.to_string())?;
         }
         write_stream_outputs(
             StreamOutputs {
@@ -1322,12 +1324,14 @@ where
     if !live.is_empty()
         && let Some(writer) = &mut recording_writer
     {
-        let _queued = writer.try_write_output_with(
-            u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            &[],
-            Some(&live),
-            || {},
-        );
+        writer
+            .write_output_with(
+                u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                &[],
+                Some(&live),
+                || {},
+            )
+            .map_err(|error| error.to_string())?;
     }
     let prelude_suppressed = live_gate.suppressed_prelude()
         || replay_gate.suppressed_prelude()
@@ -2682,6 +2686,99 @@ mod tests {
         assert!(!status.cancelled);
         assert!(!status.success);
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    struct FixedChunkReader {
+        remaining_chunks: usize,
+        chunk: Vec<u8>,
+    }
+
+    impl Read for FixedChunkReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.remaining_chunks == 0 {
+                return Ok(0);
+            }
+            let len = self.chunk.len().min(buffer.len());
+            buffer[..len].copy_from_slice(&self.chunk[..len]);
+            self.remaining_chunks = self.remaining_chunks.saturating_sub(1);
+            Ok(len)
+        }
+    }
+
+    #[test]
+    fn thousands_of_small_pty_chunks_emit_only_linear_artifact_notifications() {
+        const CHUNKS: usize = 4_096;
+        const CHUNK_BYTES: usize = 17;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("many-chunks.bcsr");
+        let events = Mutex::new(Vec::<Vec<u8>>::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(capture_service_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let mut output = read_limited_streaming(
+            FixedChunkReader {
+                remaining_chunks: CHUNKS,
+                chunk: vec![b'x'; CHUNK_BYTES],
+            },
+            emitter,
+            "many-chunks",
+            &ShellVisualStreamContext {
+                columns: 80,
+                rows: 24,
+                prelude_markers: PreludeGateMarkers::default(),
+            },
+            TerminalStreamPaths {
+                clean: None,
+                raw: None,
+                replay: None,
+                recording: Some(path.clone()),
+                recording_ready: None,
+            },
+        )
+        .expect("stream chunks");
+        output
+            .recording_writer
+            .take()
+            .expect("recording writer")
+            .finish(u64::MAX, Some(0), None, false, false)
+            .expect("finish recording");
+
+        let events = events.lock().expect("events");
+        let mut committed = 0_u64;
+        let mut revisions = 0_usize;
+        let mut ipc_bytes = 0_usize;
+        for payload in events.iter() {
+            ipc_bytes = ipc_bytes.saturating_add(payload.len());
+            let event: ToolInvocationStreamEvent =
+                serde_json::from_slice(payload).expect("artifact notification");
+            let ToolInvocationStreamEvent::ArtifactUpdate {
+                committed_bytes,
+                revision,
+                ..
+            } = event
+            else {
+                panic!("shell live path emitted a non-artifact event");
+            };
+            assert!(committed_bytes >= committed);
+            committed = committed_bytes;
+            revisions = revisions.max(usize::try_from(revision).unwrap_or(usize::MAX));
+        }
+        drop(events);
+        let recording_bytes = std::fs::metadata(&path).expect("recording metadata").len();
+        let raw_bytes = CHUNKS.saturating_mul(CHUNK_BYTES);
+        assert!(revisions <= CHUNKS.saturating_mul(2).saturating_add(2));
+        assert!(recording_bytes <= u64::try_from(raw_bytes.saturating_mul(6)).unwrap_or(u64::MAX));
+        assert!(ipc_bytes <= raw_bytes.saturating_mul(64));
+        let (_, frames) = recording::read_recording(&path).expect("recording");
+        let exact_output_bytes = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                recording::ShellRecordingFrame::Output { bytes, .. } => Some(bytes.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(exact_output_bytes, raw_bytes);
     }
 
     #[test]

@@ -354,6 +354,42 @@ impl AsyncShellRecordingWriter {
         }
     }
 
+    /// Queue exact PTY bytes with bounded backpressure.
+    ///
+    /// This is intended for the dedicated PTY reader thread: it may wait for recording queue
+    /// capacity, preserving every ordered byte while keeping filesystem I/O on the writer thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when ordering state is poisoned or the writer queue is disconnected.
+    pub fn write_output_with(
+        &mut self,
+        offset_micros: u64,
+        bytes: &[u8],
+        replay_bytes: Option<&[u8]>,
+        queued: impl FnOnce(),
+    ) -> io::Result<()> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(io::Error::other("shell recording writer previously failed"));
+        }
+        let _sequence = self.sequence.lock().map_err(|_| {
+            self.failed.store(true, Ordering::SeqCst);
+            io::Error::other("shell recording sequence lock poisoned")
+        })?;
+        self.sender
+            .send(AsyncRecordingCommand::Output {
+                offset_micros,
+                bytes: bytes.to_vec(),
+                replay_bytes: replay_bytes.map(<[u8]>::to_vec),
+            })
+            .map_err(|_| {
+                self.failed.store(true, Ordering::SeqCst);
+                io::Error::other("shell recording queue disconnected")
+            })?;
+        queued();
+        Ok(())
+    }
+
     /// Queue exact PTY bytes without waiting for filesystem I/O.
     ///
     /// Returns `false` if ordering is contended or the bounded writer queue cannot accept the
