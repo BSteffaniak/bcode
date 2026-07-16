@@ -13,8 +13,10 @@ pub enum TuiDaemonIssue {
     Unavailable,
     /// The daemon accepted work but did not respond in time.
     Timeout,
-    /// The daemon speaks an incompatible protocol or produced undecodable IPC.
+    /// The daemon speaks an incompatible protocol version.
     StaleOrIncompatible,
+    /// The daemon response could not be decoded or converted.
+    InvalidDaemonResponse(String),
     /// The requested session is unavailable.
     SessionUnavailable,
     /// The requested session needs explicit repair before normal use.
@@ -56,10 +58,17 @@ impl TuiDaemonIssue {
                 ),
             },
             Self::StaleOrIncompatible => TuiDaemonIssueMessage {
-                status: format!("{label}: stale/incompatible daemon; restart recommended"),
+                status: format!("{label}: incompatible daemon protocol; restart recommended"),
                 detail: Some(
-                    "The daemon response could not be decoded by this client. This usually means an older daemon is still running after an update. Restart the daemon and retry.".to_owned(),
+                    "The daemon uses a protocol version this client does not support. Restart the daemon and retry."
+                        .to_owned(),
                 ),
+            },
+            Self::InvalidDaemonResponse(error) => TuiDaemonIssueMessage {
+                status: format!("{label}: daemon response decode failed"),
+                detail: Some(format!(
+                    "The daemon response could not be decoded or converted. This does not necessarily mean the daemon is stale.\n\nDecode error: {error}"
+                )),
             },
             Self::SessionUnavailable => TuiDaemonIssueMessage {
                 status: format!("{label}: session unavailable"),
@@ -108,11 +117,12 @@ pub fn classify_client_error(error: &ClientError) -> TuiDaemonIssue {
     }
     match error {
         ClientError::RequestTimeout { .. } => TuiDaemonIssue::Timeout,
+        ClientError::Codec(CodecError::UnsupportedVersion { .. }) => {
+            TuiDaemonIssue::StaleOrIncompatible
+        }
         ClientError::Codec(
-            CodecError::Deserialize(_)
-            | CodecError::EventConversion(_)
-            | CodecError::UnsupportedVersion { .. },
-        ) => TuiDaemonIssue::StaleOrIncompatible,
+            error @ (CodecError::Deserialize(_) | CodecError::EventConversion(_)),
+        ) => TuiDaemonIssue::InvalidDaemonResponse(error.to_string()),
         ClientError::Server { code, message } => classify_server_error(code, message),
         ClientError::UnexpectedResponse | ClientError::UnexpectedEnvelope => {
             TuiDaemonIssue::UnexpectedDaemonResponse
@@ -144,16 +154,30 @@ pub const fn is_nonfatal_tui_error(error: &TuiError) -> bool {
     )
 }
 
-/// Return the status text for a recoverable client error.
+/// Return the status text for a recoverable client error, including the underlying error.
 #[must_use]
 pub fn client_issue_status(label: &str, error: &ClientError) -> String {
-    classify_client_error(error).message(label).status
+    let status = classify_client_error(error).message(label).status;
+    format!("{status}: {}", error_diagnostic(error).replace('\n', "; "))
+}
+
+/// Format an error and its complete source chain for diagnostics.
+#[must_use]
+pub fn error_diagnostic(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut diagnostic = format!("Underlying error: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        diagnostic.push_str("\nCaused by: ");
+        diagnostic.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    diagnostic
 }
 
 /// Report a recoverable client error to the app.
 pub fn report_client_issue(app: &mut BmuxApp, label: &str, error: &ClientError) {
     let issue = classify_client_error(error);
-    report_issue(app, &issue, label);
+    report_issue(app, &issue, label, error);
 }
 
 /// Report a recoverable TUI error to the app.
@@ -176,30 +200,52 @@ pub fn report_tui_issue(app: &mut BmuxApp, label: &str, error: &TuiError) {
         _ => None,
     };
     if let Some(message) = message {
-        app.set_status(message.status.clone());
-        if let Some(detail) = message.detail {
-            app.push_system_note(format!("{}\n\n{detail}", message.status));
-        }
+        app.set_status(format!(
+            "{}: {}",
+            message.status,
+            error_diagnostic(error).replace('\n', "; ")
+        ));
+        let diagnostic = error_diagnostic(error);
+        let note = message.detail.map_or_else(
+            || format!("{}\n\n{diagnostic}", message.status),
+            |detail| format!("{}\n\n{detail}\n\n{diagnostic}", message.status),
+        );
+        app.push_system_note(note);
         return;
     }
-    let message = format!("{label}: {error}");
-    app.set_status(message.clone());
-    app.push_system_note(message);
+    let diagnostic = error_diagnostic(error);
+    app.set_status(format!("{label}: {}", diagnostic.replace('\n', "; ")));
+    app.push_system_note(format!("{label}\n\n{diagnostic}"));
 }
 
-fn report_issue(app: &mut BmuxApp, issue: &TuiDaemonIssue, label: &str) {
+fn report_issue(
+    app: &mut BmuxApp,
+    issue: &TuiDaemonIssue,
+    label: &str,
+    error: &(dyn std::error::Error + 'static),
+) {
     let message = issue.message(label);
-    app.set_status(message.status.clone());
-    if let Some(detail) = message.detail {
-        app.push_system_note(format!("{}\n\n{detail}", message.status));
-    }
+    app.set_status(format!(
+        "{}: {}",
+        message.status,
+        error_diagnostic(error).replace('\n', "; ")
+    ));
+    let diagnostic = error_diagnostic(error);
+    let note = message.detail.map_or_else(
+        || format!("{}\n\n{diagnostic}", message.status),
+        |detail| format!("{}\n\n{detail}\n\n{diagnostic}", message.status),
+    );
+    app.push_system_note(note);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::time::Duration;
 
-    use super::{TuiDaemonIssue, classify_client_error};
+    use bcode_ipc::CodecError;
+
+    use super::{TuiDaemonIssue, classify_client_error, client_issue_status, error_diagnostic};
 
     #[test]
     fn request_timeout_is_recoverable_timeout() {
@@ -221,5 +267,49 @@ mod tests {
             classify_client_error(&error),
             TuiDaemonIssue::SessionRepairRequired
         );
+    }
+
+    #[test]
+    fn only_unsupported_protocol_is_classified_as_incompatible() {
+        let unsupported = bcode_client::ClientError::Codec(CodecError::UnsupportedVersion {
+            actual: 8,
+            expected: 9,
+        });
+        let conversion = bcode_client::ClientError::Codec(CodecError::EventConversion(
+            "invalid model metadata".to_owned(),
+        ));
+
+        assert_eq!(
+            classify_client_error(&unsupported),
+            TuiDaemonIssue::StaleOrIncompatible
+        );
+        assert_eq!(
+            classify_client_error(&conversion),
+            TuiDaemonIssue::InvalidDaemonResponse(
+                "event conversion failed: invalid model metadata".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn diagnostic_preserves_complete_error_source_chain() {
+        let error =
+            bcode_client::ClientError::Codec(CodecError::Io(io::Error::other("socket exploded")));
+
+        assert_eq!(
+            error_diagnostic(&error),
+            "Underlying error: IPC codec error: I/O error: socket exploded\nCaused by: I/O error: socket exploded\nCaused by: socket exploded"
+        );
+    }
+
+    #[test]
+    fn status_only_diagnostics_retain_the_underlying_error() {
+        let error = bcode_client::ClientError::Codec(CodecError::EventConversion(
+            "invalid model metadata".to_owned(),
+        ));
+        let status = client_issue_status("model list unavailable", &error);
+
+        assert!(status.contains("daemon response decode failed"));
+        assert!(status.contains("event conversion failed: invalid model metadata"));
     }
 }

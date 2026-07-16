@@ -565,8 +565,7 @@ async fn handle_agent_command(
 }
 
 fn slash_client_issue(label: &str, error: &bcode_client::ClientError) -> SlashCommandOutcome {
-    let issue = daemon_issue::classify_client_error(error);
-    SlashCommandOutcome::Handled(issue.message(label).status)
+    SlashCommandOutcome::Handled(daemon_issue::client_issue_status(label, error))
 }
 
 /// Execute a slash command.

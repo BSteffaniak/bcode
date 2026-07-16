@@ -626,8 +626,7 @@ fn set_picker_client_issue(
     label: &str,
     error: &bcode_client::ClientError,
 ) {
-    let issue = daemon_issue::classify_client_error(error);
-    picker.set_status(issue.message(label).status);
+    picker.set_status(daemon_issue::client_issue_status(label, error));
     picker.set_idle_empty_message();
 }
 
