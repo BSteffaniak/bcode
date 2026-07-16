@@ -2182,6 +2182,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_skill_models",
  "bmux_codec",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

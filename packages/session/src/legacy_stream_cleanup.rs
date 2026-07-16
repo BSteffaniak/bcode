@@ -8,12 +8,12 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyTransientStreamKind, SessionEvent,
     SessionEventKind, SessionEventProvenance, SessionId, ToolInvocationStreamEvent,
 };
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use switchy::database::query::FilterableQuery as _;
-use switchy::database::{DatabaseError, DatabaseValue};
+use switchy::database::DatabaseError;
 use thiserror::Error;
 
 /// Whether cleanup only reports changes or applies them.
@@ -79,6 +79,10 @@ pub enum LegacyStreamCleanupError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    BlockingTask(#[from] tokio::task::JoinError),
+    #[error(transparent)]
     Lease(#[from] lease::SessionLeaseError),
     #[error("filesystem operation failed for {path}: {source}")]
     Io {
@@ -99,8 +103,6 @@ pub enum LegacyStreamCleanupError {
 
 #[derive(Debug)]
 struct Replacement {
-    sequence: u64,
-    payload: String,
     before_bytes: usize,
     after_bytes: usize,
 }
@@ -142,7 +144,7 @@ pub fn discover_session_ids(root: &Path) -> Result<Vec<SessionId>, LegacyStreamC
 /// Inspect or clean one session's historically persisted transient stream payloads.
 ///
 /// Apply mode refuses sessions with any live owner, creates a complete session-directory backup,
-/// updates eligible rows in one transaction, strictly validates every event, and compacts the DB.
+/// builds a compact replacement database from transformed events, validates it, and installs it.
 ///
 /// # Errors
 ///
@@ -179,8 +181,10 @@ pub async fn cleanup_session(
     });
     let database_bytes_before = database_family_bytes(&db_path)?;
     let session_db = db::SessionDb::open_turso(session_id, &db_path).await?;
-    let (total, replacements) = scan_replacements(&session_db, session_id, &mut progress).await?;
+    let draft = session_db.session_composer_draft().await?;
     drop(session_db);
+    let (total, replacements, transformed_events) =
+        scan_replacements(&db_path, session_id, &mut progress).await?;
 
     let payload_bytes_before = replacements
         .iter()
@@ -225,6 +229,8 @@ pub async fn cleanup_session(
         &db_path,
         total,
         &replacements,
+        &transformed_events,
+        draft.as_deref(),
         &mut progress,
         payload_bytes_before,
         payload_bytes_after,
@@ -240,6 +246,8 @@ async fn apply_replacements(
     db_path: &Path,
     total: usize,
     replacements: &[Replacement],
+    transformed_events: &[SessionEvent],
+    draft: Option<&str>,
     progress: &mut impl FnMut(CleanupProgress),
     payload_bytes_before: u64,
     payload_bytes_after: u64,
@@ -252,40 +260,19 @@ async fn apply_replacements(
     progress(CleanupProgress::PhaseChanged {
         phase: CleanupPhase::ReplacingEvents,
     });
-    let session_db = db::SessionDb::open_turso(session_id, db_path).await?;
-    let transaction = session_db.database().begin_transaction().await?;
-    for replacement in replacements {
-        transaction
-            .update("events")
-            .value(
-                "schema_version",
-                i64::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            )
-            .value("payload", replacement.payload.clone())
-            .where_eq(
-                "event_seq",
-                DatabaseValue::Int64(i64::try_from(replacement.sequence).unwrap_or(i64::MAX)),
-            )
-            .execute(&*transaction)
-            .await?;
-    }
-    transaction.commit().await?;
-    progress(CleanupProgress::PhaseChanged {
-        phase: CleanupPhase::Validating,
-    });
-    let validated = session_db.all_events_strict().await?;
-    if validated.len() != total {
+    if transformed_events.len() != total {
         return Err(LegacyStreamCleanupError::SequenceMismatch {
             session_id,
             row_sequence: u64::MAX,
         });
     }
     progress(CleanupProgress::PhaseChanged {
+        phase: CleanupPhase::Validating,
+    });
+    progress(CleanupProgress::PhaseChanged {
         phase: CleanupPhase::Compacting,
     });
-    let draft = session_db.session_composer_draft().await?;
-    drop(session_db);
-    rebuild_compact_database(root, session_id, &validated, draft.as_deref()).await?;
+    rebuild_compact_database(root, session_id, transformed_events, draft).await?;
     Ok(SessionCleanupReport {
         session_id,
         outcome: CleanupOutcome::Cleaned,
@@ -301,65 +288,79 @@ async fn apply_replacements(
 }
 
 async fn scan_replacements(
-    session_db: &db::SessionDb,
+    db_path: &Path,
     session_id: SessionId,
     progress: &mut impl FnMut(CleanupProgress),
-) -> Result<(usize, Vec<Replacement>), LegacyStreamCleanupError> {
-    const PAGE_SIZE: usize = 256;
-    let Some(last_sequence) = session_db.last_event_sequence().await? else {
-        return Ok((0, Vec::new()));
-    };
-    let total = usize::try_from(last_sequence.saturating_add(1)).unwrap_or(usize::MAX);
-    let mut replacements = Vec::new();
-    let mut processed = 0_usize;
-    while processed < total {
-        let rows = session_db
-            .database()
-            .select("events")
-            .columns(&["event_seq", "payload"])
-            .where_gt(
-                "event_seq",
-                DatabaseValue::Int64(i64::try_from(processed).unwrap_or(i64::MAX) - 1),
-            )
-            .sort("event_seq", switchy::database::query::SortDirection::Asc)
-            .limit(PAGE_SIZE)
-            .execute(session_db.database())
-            .await?;
-        if rows.is_empty() {
-            return Err(LegacyStreamCleanupError::SequenceMismatch {
-                session_id,
-                row_sequence: u64::try_from(processed).unwrap_or(u64::MAX),
-            });
-        }
-        for row in rows {
-            let expected_sequence = u64::try_from(processed).unwrap_or(u64::MAX);
-            let sequence = row
-                .get("event_seq")
-                .and_then(|value| value.as_i64())
-                .and_then(|value| u64::try_from(value).ok())
-                .ok_or(LegacyStreamCleanupError::SequenceMismatch {
-                    session_id,
-                    row_sequence: expected_sequence,
-                })?;
-            if sequence != expected_sequence {
-                return Err(LegacyStreamCleanupError::SequenceMismatch {
-                    session_id,
-                    row_sequence: sequence,
-                });
+) -> Result<(usize, Vec<Replacement>, Vec<SessionEvent>), LegacyStreamCleanupError> {
+    let path = db_path.to_path_buf();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut task =
+        tokio::task::spawn_blocking(move || scan_replacements_blocking(&path, session_id, &sender));
+    loop {
+        tokio::select! {
+            result = &mut task => {
+                while let Ok(event) = receiver.try_recv() {
+                    progress(event);
+                }
+                return result?;
             }
-            let payload = row
-                .get("payload")
-                .and_then(|value| value.as_str().map(ToOwned::to_owned))
-                .ok_or(LegacyStreamCleanupError::SequenceMismatch {
-                    session_id,
-                    row_sequence: sequence,
-                })?;
-            collect_replacement(session_id, sequence, &payload, &mut replacements)?;
-            processed += 1;
-            progress(CleanupProgress::EventsProcessed { processed, total });
+            Some(event) = receiver.recv() => progress(event),
         }
     }
-    Ok((total, replacements))
+}
+
+fn scan_replacements_blocking(
+    db_path: &Path,
+    session_id: SessionId,
+    progress: &tokio::sync::mpsc::UnboundedSender<CleanupProgress>,
+) -> Result<(usize, Vec<Replacement>, Vec<SessionEvent>), LegacyStreamCleanupError> {
+    let connection = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let last_sequence = connection.query_row("SELECT MAX(event_seq) FROM events", [], |row| {
+        row.get::<_, Option<i64>>(0)
+    })?;
+    let Some(last_sequence) = last_sequence else {
+        return Ok((0, Vec::new(), Vec::new()));
+    };
+    let total = usize::try_from(last_sequence.saturating_add(1)).unwrap_or(usize::MAX);
+    let _ = progress.send(CleanupProgress::EventsProcessed {
+        processed: 0,
+        total,
+    });
+    let mut statement =
+        connection.prepare("SELECT event_seq, payload FROM events ORDER BY event_seq ASC")?;
+    let mut rows = statement.query([])?;
+    let mut replacements = Vec::new();
+    let mut transformed_events = Vec::with_capacity(total);
+    let mut processed = 0_usize;
+    while let Some(row) = rows.next()? {
+        let sequence = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(u64::MAX);
+        let expected = u64::try_from(processed).unwrap_or(u64::MAX);
+        if sequence != expected {
+            return Err(LegacyStreamCleanupError::SequenceMismatch {
+                session_id,
+                row_sequence: sequence,
+            });
+        }
+        let payload = row.get::<_, String>(1)?;
+        transformed_events.push(collect_replacement(
+            session_id,
+            sequence,
+            &payload,
+            &mut replacements,
+        )?);
+        processed += 1;
+        let _ = progress.send(CleanupProgress::EventsProcessed { processed, total });
+    }
+    if processed != total {
+        return Err(LegacyStreamCleanupError::SequenceMismatch {
+            session_id,
+            row_sequence: u64::try_from(processed).unwrap_or(u64::MAX),
+        });
+    }
+    Ok((total, replacements, transformed_events))
 }
 
 #[derive(Deserialize)]
@@ -378,7 +379,7 @@ fn collect_replacement(
     sequence: u64,
     payload: &str,
     replacements: &mut Vec<Replacement>,
-) -> Result<(), LegacyStreamCleanupError> {
+) -> Result<SessionEvent, LegacyStreamCleanupError> {
     if let Some((tool_call_id, original_kind)) = raw_transient_kind(payload) {
         let envelope = serde_json::from_str::<LightweightEventEnvelope>(payload)?;
         if envelope.sequence != sequence || envelope.session_id != session_id {
@@ -402,16 +403,14 @@ fn collect_replacement(
         };
         let replacement = persisted::encode_session_event(&event)?;
         replacements.push(Replacement {
-            sequence,
             before_bytes: payload.len(),
             after_bytes: replacement.len(),
-            payload: replacement,
         });
+        Ok(event)
     } else {
         persisted::decode_session_event(payload)
-            .map_err(|source| LegacyStreamCleanupError::StrictDecode { sequence, source })?;
+            .map_err(|source| LegacyStreamCleanupError::StrictDecode { sequence, source })
     }
-    Ok(())
 }
 
 fn raw_transient_kind(payload: &str) -> Option<(String, LegacyTransientStreamKind)> {
