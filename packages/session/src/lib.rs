@@ -3557,9 +3557,37 @@ mod tests {
                 text: "live".to_owned(),
                 byte_len: 4,
             },
-            ToolInvocationStreamEvent::LegacyPresentation {
+            ToolInvocationStreamEvent::VisualUpdate {
                 tool_call_id: "call".to_owned(),
                 sequence: 2,
+                visual: bcode_session_models::PluginVisualDescriptor {
+                    visual_id: None,
+                    producer_plugin_id: Some("fixture.plugin".to_owned()),
+                    schema: "fixture.visual".to_owned(),
+                    schema_version: 1,
+                    title: None,
+                    subtitle: None,
+                    payload: serde_json::json!({"cumulative": "live"}),
+                },
+                streaming: true,
+            },
+            ToolInvocationStreamEvent::ArtifactUpdate {
+                tool_call_id: "call".to_owned(),
+                sequence: 3,
+                artifact_id: "artifact".to_owned(),
+                reference_key: "recording".to_owned(),
+                producer_plugin_id: "fixture.plugin".to_owned(),
+                schema: "fixture.recording".to_owned(),
+                schema_version: 1,
+                content_type: Some("application/octet-stream".to_owned()),
+                storage_uri: "recording.bin".to_owned(),
+                committed_bytes: 4,
+                revision: 1,
+                finalized: false,
+            },
+            ToolInvocationStreamEvent::LegacyPresentation {
+                tool_call_id: "call".to_owned(),
+                sequence: 4,
                 presentation: bcode_session_models::LegacyToolPresentationEvent::Card(
                     bcode_session_models::LegacyToolCardPresentation {
                         target: bcode_session_models::LegacyToolPresentationTarget::Result,
@@ -3592,6 +3620,66 @@ mod tests {
             !history
                 .iter()
                 .any(|event| matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_boundary_blocks_thousands_of_cumulative_visual_snapshots() {
+        const SNAPSHOTS: usize = 4_096;
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(
+                Some("visual-growth-guard".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        let mut cumulative = String::new();
+        for sequence in 1..=SNAPSHOTS {
+            cumulative.push('x');
+            let error = manager
+                .append_event(
+                    session.id,
+                    SessionEventKind::ToolInvocationStream {
+                        event: ToolInvocationStreamEvent::VisualUpdate {
+                            tool_call_id: "shell-call".to_owned(),
+                            sequence: u64::try_from(sequence).expect("sequence"),
+                            visual: bcode_session_models::PluginVisualDescriptor {
+                                visual_id: None,
+                                producer_plugin_id: Some("fixture.shell".to_owned()),
+                                schema: "fixture.shell".to_owned(),
+                                schema_version: 1,
+                                title: None,
+                                subtitle: None,
+                                payload: serde_json::json!({"output": cumulative}),
+                            },
+                            streaming: true,
+                        },
+                    },
+                )
+                .await
+                .expect_err("every cumulative visual snapshot must be rejected");
+            assert!(matches!(
+                error,
+                SessionError::LiveEventPersistenceRejected {
+                    event_kind: "tool_invocation_stream"
+                }
+            ));
+        }
+
+        let history = manager
+            .session_history(session.id)
+            .await
+            .expect("history should read");
+        assert_eq!(history.len(), 1, "only session creation may be durable");
+        assert_eq!(
+            serde_json::to_vec(&history)
+                .expect("history encoding")
+                .len(),
+            serde_json::to_vec(&history[..1])
+                .expect("creation encoding")
+                .len(),
+            "canonical payload bytes must be independent of visual snapshot count"
         );
     }
 

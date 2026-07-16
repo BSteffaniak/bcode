@@ -5422,6 +5422,49 @@ fn remove_finalized_active_artifact(
     }
 }
 
+async fn read_active_artifact_range(
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+    offset: u64,
+    length: u32,
+    active: ActiveArtifactReference,
+) -> Result<ResponsePayload, String> {
+    let artifact_root = default_session_artifact_dir(session_id);
+    let path = active.path.clone();
+    let committed_bytes = active.committed_bytes;
+    let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
+        read_artifact_file_range_at_length(
+            &path,
+            &artifact_root,
+            offset,
+            length,
+            Some(committed_bytes),
+        )
+    })
+    .await
+    .map_err(|error| format!("active artifact range reader task failed: {error}"))??;
+    Ok(ResponsePayload::SessionArtifactRange {
+        artifact_id: artifact_id.to_owned(),
+        reference_key: reference_key.to_owned(),
+        content_type: active.content_type,
+        offset,
+        total_bytes,
+        reference_bytes: Some(active.committed_bytes),
+        reference_revision: active.revision,
+        finalized: active.finalized,
+        finalized_event_seq: None,
+        availability: Some(if active.finalized {
+            "complete".to_owned()
+        } else {
+            "active".to_owned()
+        }),
+        complete: Some(active.finalized),
+        checksum_sha256: None,
+        bytes,
+    })
+}
+
 async fn read_session_artifact_range(
     state: &ServerState,
     session_id: SessionId,
@@ -5435,48 +5478,62 @@ async fn read_session_artifact_range(
             "artifact range length must be between 1 and {MAX_ARTIFACT_RANGE_BYTES} bytes"
         ));
     }
-    if let Some(active) = active_artifact_reference(state, session_id, artifact_id, reference_key)?
-    {
-        let artifact_root = default_session_artifact_dir(session_id);
-        let path = active.path.clone();
-        let committed_bytes = active.committed_bytes;
-        let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
-            read_artifact_file_range_at_length(
-                &path,
-                &artifact_root,
-                offset,
-                length,
-                Some(committed_bytes),
-            )
-        })
-        .await
-        .map_err(|error| format!("active artifact range reader task failed: {error}"))??;
-        return Ok(ResponsePayload::SessionArtifactRange {
-            artifact_id: artifact_id.to_owned(),
-            reference_key: reference_key.to_owned(),
-            content_type: active.content_type,
+    let active = active_artifact_reference(state, session_id, artifact_id, reference_key)?;
+    if let Some(active) = active.as_ref().filter(|reference| !reference.finalized) {
+        return read_active_artifact_range(
+            session_id,
+            artifact_id,
+            reference_key,
             offset,
-            total_bytes,
-            reference_bytes: Some(active.committed_bytes),
-            reference_revision: active.revision,
-            finalized: active.finalized,
-            finalized_event_seq: None,
-            availability: Some(if active.finalized {
-                "complete".to_owned()
-            } else {
-                "active".to_owned()
-            }),
-            complete: Some(active.finalized),
-            checksum_sha256: None,
-            bytes,
-        });
+            length,
+            active.clone(),
+        )
+        .await;
     }
-    let reference = state
+
+    // A finalized live registration remains readable until its transactional durable projection
+    // is visible. Once the projection is visible, reads switch to it and retire the live entry
+    // only after a successful canonical read. This closes the producer-finish/projection race
+    // without exposing a missing-reference window.
+    let reference = match state
         .sessions
         .finalized_artifact_reference(session_id, artifact_id, reference_key)
         .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "artifact reference was not found in the finalized projection".to_owned())?;
+    {
+        Ok(reference) => reference,
+        Err(
+            error @ (bcode_session::SessionError::ProjectionStale { .. }
+            | bcode_session::SessionError::DbUnavailable(_)),
+        ) => {
+            if let Some(active) = active {
+                return read_active_artifact_range(
+                    session_id,
+                    artifact_id,
+                    reference_key,
+                    offset,
+                    length,
+                    active,
+                )
+                .await;
+            }
+            return Err(error.to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let Some(reference) = reference else {
+        if let Some(active) = active {
+            return read_active_artifact_range(
+                session_id,
+                artifact_id,
+                reference_key,
+                offset,
+                length,
+                active,
+            )
+            .await;
+        }
+        return Err("artifact reference was not found in the finalized projection".to_owned());
+    };
     if let Some(error) =
         artifact_reference_unavailability(reference.availability.as_deref(), reference.complete)
     {
@@ -19593,8 +19650,12 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Exercises registration, revision, range, finalization, and cleanup as one lifecycle.
     async fn active_artifact_registry_enforces_owner_revision_commit_and_snapshot() {
         let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("active-artifact".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
         let state = test_server_state(sessions);
-        let session_id = SessionId::new();
         let tool_call_id = "call-active";
         let artifact_dir = default_session_artifact_dir(session_id);
         std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
@@ -19693,6 +19754,32 @@ mod tests {
         assert_eq!(
             active_artifact_snapshot_events(&state, session_id)
                 .expect("finalized snapshot")
+                .len(),
+            1
+        );
+        let ResponsePayload::SessionArtifactRange {
+            total_bytes,
+            reference_revision,
+            finalized,
+            availability,
+            complete,
+            bytes,
+            ..
+        } = read_session_artifact_range(&state, session_id, "artifact-active", "recording", 9, 64)
+            .await
+            .expect("finalized live range remains readable before projection")
+        else {
+            panic!("expected artifact range");
+        };
+        assert_eq!(total_bytes, 20);
+        assert_eq!(reference_revision, 2);
+        assert!(finalized);
+        assert_eq!(availability.as_deref(), Some("complete"));
+        assert_eq!(complete, Some(true));
+        assert_eq!(bytes, b"-uncommitte");
+        assert_eq!(
+            active_artifact_snapshot_events(&state, session_id)
+                .expect("snapshot remains until durable projection")
                 .len(),
             1
         );
