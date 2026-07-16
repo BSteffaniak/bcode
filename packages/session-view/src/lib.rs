@@ -359,7 +359,7 @@ impl SessionView {
                 self.upsert_tool_item(tool_call_id, 0, None);
             }
             SessionLiveEventKind::ProviderStreamProgress { .. }
-            | SessionLiveEventKind::ContextOccupancyChanged { .. } => {}
+            | SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
         }
     }
 

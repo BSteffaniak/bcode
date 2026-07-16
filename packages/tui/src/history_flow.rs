@@ -234,7 +234,7 @@ fn resynchronization_events(attached: bcode_client::AttachedSessionHistory) -> V
                     | bcode_session_models::SessionEventKind::ReasoningChanged { .. }
                     | bcode_session_models::SessionEventKind::SkillActivated { .. }
                     | bcode_session_models::SessionEventKind::SkillDeactivated { .. }
-                    | bcode_session_models::SessionEventKind::ContextUsageObserved { .. }
+                    | bcode_session_models::SessionEventKind::RequestContextObserved { .. }
                     | bcode_session_models::SessionEventKind::PermissionRequested { .. }
                     | bcode_session_models::SessionEventKind::PermissionResolved { .. }
                     | bcode_session_models::SessionEventKind::RuntimeWorkStarted { .. }

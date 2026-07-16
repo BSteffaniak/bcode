@@ -6,12 +6,11 @@
 //! non-self-describing `bmux_codec` wire format.
 
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ContextUsageSnapshot,
-    LegacyToolRequestPresentationMetadata, ModelTurnOutcome, ProviderContextSnapshot,
-    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
-    SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent, ToolArtifact,
-    ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, TurnOrigin, WorkId,
-    current_unix_timestamp_ms,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacyToolRequestPresentationMetadata,
+    ModelTurnOutcome, ProviderContextSnapshot, RequestContextObservation, RuntimeWorkKind,
+    RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind,
+    SessionId, SessionTokenUsage, SessionTraceEvent, ToolArtifact, ToolInvocationResult,
+    ToolInvocationStreamEvent, TraceBlobRef, TurnOrigin, WorkId, current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -26,53 +25,10 @@ use thiserror::Error;
 /// Returns an error when the event is not a supported persisted session-event
 /// shape or cannot be converted into the current domain model.
 pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
-    let mut value = serde_json::from_str::<serde_json::Value>(payload)?;
-    normalize_legacy_context_usage_snapshot(&mut value);
+    let value = serde_json::from_str::<serde_json::Value>(payload)?;
     reject_unsupported_future_shape(&value)?;
     let persisted = serde_json::from_value::<PersistedSessionEvent>(value)?;
     persisted.into_domain()
-}
-
-fn normalize_legacy_context_usage_snapshot(value: &mut serde_json::Value) {
-    let Some(snapshot) = value
-        .get_mut("kind")
-        .and_then(|kind| kind.get_mut("context_usage_observed"))
-        .and_then(|event| event.get_mut("snapshot"))
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-    if snapshot.contains_key("invocation") {
-        return;
-    }
-    let string = |key: &str| {
-        snapshot
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let optional_string = |key: &str| {
-        snapshot
-            .get(key)
-            .cloned()
-            .unwrap_or(serde_json::Value::Null)
-    };
-    let invocation = serde_json::json!({
-        "provider_plugin_id": string("provider_plugin_id"),
-        "requested_model_id": optional_string("model_id"),
-        "effective_model_id": string("model_id"),
-        "request_id": string("request_id"),
-        "model_turn_id": string("model_turn_id"),
-        "round": snapshot.get("round").cloned().unwrap_or_else(|| serde_json::json!(0)),
-        "request_fingerprint": string("request_fingerprint"),
-        "provider_turn_id": string("turn_id"),
-        "effective_auth_profile": optional_string("auth_profile"),
-        "context_format_version": optional_string("context_format_version"),
-        "compatibility_key": optional_string("compatibility_key"),
-        "context_epoch": 0,
-    });
-    snapshot.insert("invocation".to_owned(), invocation);
 }
 
 /// Encode a session event into the durable JSON persistence DTO shape.
@@ -488,8 +444,8 @@ enum PersistedSessionEventKind {
         snapshot: ProviderContextSnapshot,
         compacted_through_sequence: u64,
     },
-    ContextUsageObserved {
-        snapshot: ContextUsageSnapshot,
+    RequestContextObserved {
+        observation: RequestContextObservation,
     },
     PluginStatusNote {
         plugin_id: String,
@@ -867,9 +823,11 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 snapshot: snapshot.clone(),
                 compacted_through_sequence: *compacted_through_sequence,
             },
-            SessionEventKind::ContextUsageObserved { snapshot } => Self::ContextUsageObserved {
-                snapshot: snapshot.clone(),
-            },
+            SessionEventKind::RequestContextObserved { observation } => {
+                Self::RequestContextObserved {
+                    observation: observation.clone(),
+                }
+            }
             SessionEventKind::PluginStatusNote {
                 plugin_id,
                 note_id,
@@ -1256,8 +1214,8 @@ impl PersistedSessionEventKind {
                 snapshot,
                 compacted_through_sequence,
             },
-            Self::ContextUsageObserved { snapshot } => {
-                SessionEventKind::ContextUsageObserved { snapshot }
+            Self::RequestContextObserved { observation } => {
+                SessionEventKind::RequestContextObserved { observation }
             }
             Self::PluginStatusNote {
                 plugin_id,

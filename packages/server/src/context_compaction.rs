@@ -623,6 +623,7 @@ pub async fn request_exceeds_compaction_capacity(
     session_id: SessionId,
     selection: &SessionModelSelection,
     request: &ModelTurnRequest,
+    projected_input_tokens: u64,
 ) -> Option<(u64, CompactionCapacity)> {
     let model_status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
     let context_window = model_status.context_window?;
@@ -632,14 +633,7 @@ pub async fn request_exceeds_compaction_capacity(
         request.parameters.max_output_tokens,
         model_status.max_output_tokens,
     );
-    let estimated_tokens = projected_context_usage(
-        state,
-        session_id,
-        selection.provider_plugin_id.as_deref(),
-        request,
-    )
-    .await
-    .context_input_tokens;
+    let estimated_tokens = projected_input_tokens;
     (estimated_tokens > capacity.available_input_tokens).then_some((estimated_tokens, capacity))
 }
 
@@ -1357,6 +1351,7 @@ pub async fn handle_compaction_events(
                 );
             }
             ProviderTurnEvent::TurnStarted
+            | ProviderTurnEvent::ExactRequestInputTokens { .. }
             | ProviderTurnEvent::ReasoningDelta { .. }
             | ProviderTurnEvent::RequestProjection { .. }
             | ProviderTurnEvent::ContextCompacted { .. }

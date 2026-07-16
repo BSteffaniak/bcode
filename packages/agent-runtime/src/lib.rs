@@ -271,6 +271,8 @@ pub enum AgentRuntimeEvent {
     ToolResult(ToolResult),
     /// Token usage snapshot.
     Usage(TokenUsage),
+    /// Provider confirmed complete request-input context usage.
+    ExactRequestInputTokens(bcode_model::ExactRequestInputTokens),
     /// Provider reported actual request projection metadata.
     RequestProjection(ProviderRequestProjection),
     /// Provider compacted the active context while serving the turn.
@@ -1959,6 +1961,9 @@ fn normalize_provider_event(
             *usage_buffer = Some(usage.clone());
             Ok(EventDisposition::Continue(AgentRuntimeEvent::Usage(usage)))
         }
+        ProviderTurnEvent::ExactRequestInputTokens { tokens } => Ok(EventDisposition::Continue(
+            AgentRuntimeEvent::ExactRequestInputTokens(tokens),
+        )),
         ProviderTurnEvent::RequestProjection { projection } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::RequestProjection(projection),
         )),

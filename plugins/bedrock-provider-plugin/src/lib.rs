@@ -508,10 +508,10 @@ impl StreamAccumulator {
             },
             ConverseStreamOutput::Metadata(event) => {
                 if let Some(usage) = event.usage() {
+                    let exact_input_tokens = nonnegative_u32(usage.input_tokens());
                     turn.push(ProviderTurnEvent::Usage {
                         usage: TokenUsage {
                             input_tokens: nonnegative_u32(usage.input_tokens()),
-                            context_input_tokens: nonnegative_u32(usage.input_tokens()),
                             output_tokens: nonnegative_u32(usage.output_tokens()),
                             cached_input_tokens: usage
                                 .cache_read_input_tokens()
@@ -522,6 +522,11 @@ impl StreamAccumulator {
                             ..TokenUsage::default()
                         },
                     });
+                    if let Some(tokens) = exact_input_tokens {
+                        turn.push(ProviderTurnEvent::ExactRequestInputTokens {
+                            tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
+                        });
+                    }
                 }
             }
             ConverseStreamOutput::MessageStop(event) => {

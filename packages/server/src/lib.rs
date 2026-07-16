@@ -15,8 +15,8 @@ mod model_ignores;
 mod runtime_work;
 
 use context_accounting::{
-    estimated_model_messages_tokens, estimated_tokens_from_chars, model_message_context_chars,
-    projected_model_context_chars,
+    LOCAL_CONTEXT_ESTIMATOR_VERSION, estimated_model_messages_tokens, local_request_estimate,
+    model_message_context_chars, projected_model_context_chars,
 };
 use context_compaction::{
     AutomaticCompactionPolicy, AutomaticCompactionStrategy, COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
@@ -538,24 +538,14 @@ impl TurnCancelState {
 
 #[derive(Debug, Clone)]
 struct ModelRequestAttempt {
-    request_id: String,
-    model_turn_id: String,
-    round: u32,
-    request_fingerprint: String,
-    provider_plugin_id: Option<String>,
+    identity: bcode_session_models::ModelRequestIdentity,
     provider_turn_id: String,
     reuse_key: Option<String>,
     request_message_count: usize,
     /// Exact canonical event boundary captured while this request was projected.
     context_through_sequence: u64,
-    model_id: String,
-    auth_profile: Option<String>,
-    context_format_version: Option<u16>,
-    compatibility_key: Option<String>,
-    requested_model_id: Option<String>,
-    context_epoch: u64,
     portable_context: String,
-    local_request_estimate_tokens: u64,
+    local_estimate: bcode_session_models::LocalContextEstimate,
     managed_compaction_persisted: bool,
 }
 
@@ -8345,7 +8335,7 @@ async fn model_status_for_selection(
         .reasoning_capabilities
         .clone()
         .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone()));
-    let (context_occupancy, context_usage_error) = if let Some(session_id) = session_id {
+    let (context_occupancy, request_context_error) = if let Some(session_id) = session_id {
         match state.sessions.current_context_occupancy(session_id).await {
             Ok(occupancy) => (occupancy, None),
             Err(error) => (None, Some(error.to_string())),
@@ -8364,7 +8354,7 @@ async fn model_status_for_selection(
         model_id,
         context_window,
         context_occupancy: context_occupancy.map(Box::new),
-        context_usage_error,
+        request_context_error,
         auth_profile: selection.provider_context.auth_profile,
         context_format_version: context_format.as_ref().map(|format| format.version),
         compatibility_key: context_format.map(|format| format.compatibility_key),
@@ -9171,7 +9161,7 @@ async fn request_session_turn_cancellation(
     if current_turn.kind == RuntimeOperationKind::ModelTurn
         && let Some(model) = current_turn.model.as_ref()
     {
-        let provider_plugin_id = model.provider_plugin_id.clone().or_else(|| {
+        let provider_plugin_id = Some(model.identity.provider_plugin_id.clone()).or_else(|| {
             state
                 .plugins
                 .registry()
@@ -10853,7 +10843,7 @@ async fn run_model_turn_inner(
                 "model turn cancelled",
             );
         }
-        let mut request = match build_model_turn_request(
+        let prepared = match build_model_turn_request(
             state,
             session_id,
             trigger_event,
@@ -10874,6 +10864,10 @@ async fn run_model_turn_inner(
                 return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
             }
         };
+        let PreparedModelRequest {
+            mut request,
+            mut context_projection,
+        } = prepared;
         let should_evaluate_proactive =
             compaction_decision.strategy == AutomaticCompactionStrategy::LocalProactive;
         if should_evaluate_proactive {
@@ -10887,14 +10881,7 @@ async fn run_model_turn_inner(
                 cancel_state.as_ref(),
                 command_context,
                 ProactiveCompactionEvaluation {
-                    candidate_input_tokens: projected_context_usage(
-                        state,
-                        session_id,
-                        provider_plugin_id.as_deref(),
-                        &request,
-                    )
-                    .await
-                    .context_input_tokens,
+                    candidate_input_tokens: context_projection.context_tokens.tokens(),
                     requested_max_output_tokens: request.parameters.max_output_tokens,
                     decision: compaction_decision,
                     previous_compacted_through_sequence: last_proactive_attempt_boundary,
@@ -10921,7 +10908,7 @@ async fn run_model_turn_inner(
                 }
                 last_proactive_attempt_boundary = Some(compacted_through_sequence);
                 last_proactive_compaction_boundary = Some(compacted_through_sequence);
-                request = match build_model_turn_request(
+                let prepared = match build_model_turn_request(
                     state,
                     session_id,
                     trigger_event,
@@ -10935,13 +10922,15 @@ async fn run_model_turn_inner(
                 )
                 .await
                 {
-                    Ok(request) => request,
+                    Ok(prepared) => prepared,
                     Err(error) => {
                         let message = format!("model request error after compaction: {error}");
                         append_system_event(state, session_id, message.clone()).await;
                         return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
                     }
                 };
+                request = prepared.request;
+                context_projection = prepared.context_projection;
             }
             Ok(None) | Err(CompactionError::NothingToCompact(_)) => {}
             Err(CompactionError::Cancelled) => {
@@ -10966,8 +10955,14 @@ async fn run_model_turn_inner(
             }
         }
         if should_evaluate_proactive
-            && let Some((estimated_tokens, capacity)) =
-                request_exceeds_compaction_capacity(state, session_id, &selection, &request).await
+            && let Some((estimated_tokens, capacity)) = request_exceeds_compaction_capacity(
+                state,
+                session_id,
+                &selection,
+                &request,
+                context_projection.context_tokens.tokens(),
+            )
+            .await
         {
             let error = CompactionError::RequestStillTooLarge {
                 estimated_tokens,
@@ -10993,8 +10988,7 @@ async fn run_model_turn_inner(
                 "model turn cancelled",
             );
         }
-        append_estimated_context_usage(state, session_id, provider_plugin_id.as_deref(), &request)
-            .await;
+        append_estimated_request_context(state, session_id, context_projection.clone()).await;
         append_model_request_trace(
             state,
             session_id,
@@ -11008,6 +11002,7 @@ async fn run_model_turn_inner(
             session_id,
             provider_plugin_id.as_deref(),
             &request,
+            &context_projection,
             Arc::clone(&cancel_state),
             command_context,
         ))
@@ -11800,6 +11795,7 @@ async fn run_model_turn_round(
     session_id: SessionId,
     provider_plugin_id: Option<&str>,
     request: &ModelTurnRequest,
+    context_projection: &bcode_session_models::RequestContextObservation,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> Result<ModelPollOutcome, ModelTurnCompletion> {
@@ -11875,39 +11871,14 @@ async fn run_model_turn_round(
         }
     };
 
-    let request_fingerprint = stable_json_hash(request);
     let active_model_turn = ModelRequestAttempt {
-        request_id: request.turn_id.clone(),
-        model_turn_id: request
-            .turn_id
-            .rsplit_once('-')
-            .map_or_else(|| request.turn_id.clone(), |(turn, _)| turn.to_string()),
-        round: model_round_from_turn_id(&request.turn_id).unwrap_or_default(),
-        request_fingerprint,
-        provider_plugin_id: provider_plugin_id.map(ToString::to_string),
+        identity: context_projection.request.clone(),
         provider_turn_id: start.provider_turn_id.clone(),
         reuse_key: request.conversation_reuse.key.clone(),
         request_message_count: request.messages.len(),
-        context_through_sequence: request
-            .metadata
-            .get("bcode_context_through_sequence")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_default(),
-        model_id: request.model_id.clone(),
-        auth_profile: request.provider_context.auth_profile.clone(),
-        context_format_version: request
-            .metadata
-            .get("bcode_context_format_version")
-            .and_then(|value| value.parse().ok()),
-        compatibility_key: request.metadata.get("bcode_compatibility_key").cloned(),
-        requested_model_id: request.metadata.get("bcode_requested_model_id").cloned(),
-        context_epoch: state
-            .sessions
-            .current_context_epoch(session_id)
-            .await
-            .unwrap_or_default(),
+        context_through_sequence: context_projection.context_through_sequence,
         portable_context: bounded_portable_context(&request.messages),
-        local_request_estimate_tokens: local_model_request_estimate_tokens(request),
+        local_estimate: context_projection.local_estimate,
         managed_compaction_persisted: false,
     };
     begin_provider_round(command_context, active_model_turn).await;
@@ -12013,7 +11984,7 @@ async fn run_model_turn_round(
             bcode_model::AckResponse,
         >(
             state,
-            active_turn.and_then(|turn| turn.provider_plugin_id),
+            active_turn.map(|turn| turn.identity.provider_plugin_id),
             OP_FINISH_TURN,
             finish,
         )),
@@ -12270,6 +12241,7 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
         | ProviderTurnEvent::ContextCompacted { .. }
         | ProviderTurnEvent::TurnStarted
         | ProviderTurnEvent::Usage { .. }
+        | ProviderTurnEvent::ExactRequestInputTokens { .. }
         | ProviderTurnEvent::Warning { .. }
         | ProviderTurnEvent::RetryScheduled { .. }
         | ProviderTurnEvent::ProviderMetadata { .. }
@@ -12477,16 +12449,18 @@ async fn handle_provider_turn_event(
         ProviderTurnEvent::Usage { usage } => {
             append_provider_event_trace(state, session_id, turn_id, "usage", None).await;
             update_provider_usage_state(state, session_id, &usage).await;
+            append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
+        }
+        ProviderTurnEvent::ExactRequestInputTokens { tokens } => {
             let active_turn = state
                 .session_current_turn(session_id)
                 .await
                 .and_then(|turn| turn.model)
                 .filter(|turn| turn.provider_turn_id == turn_id);
-            append_model_usage_event(state, session_id, turn_id.to_string(), usage.clone()).await;
-            append_provider_context_usage_observation(
+            append_exact_request_context_observation(
                 state,
                 session_id,
-                &usage,
+                tokens,
                 active_turn.as_ref(),
             )
             .await;
@@ -12524,14 +12498,12 @@ async fn handle_provider_turn_event(
             };
             let snapshot = bcode_session_models::ProviderContextSnapshot {
                 format_version: context_format.version,
-                request_fingerprint: Some(active_turn.request_fingerprint.clone()),
-                request_id: Some(active_turn.request_id.clone()),
-                provider_plugin_id: active_turn
-                    .provider_plugin_id
-                    .unwrap_or_else(|| "<auto>".to_string()),
-                model_id: active_turn.model_id,
+                request_fingerprint: Some(active_turn.identity.request_fingerprint.clone()),
+                request_id: Some(active_turn.identity.request_id.clone()),
+                provider_plugin_id: active_turn.identity.provider_plugin_id,
+                model_id: active_turn.identity.effective_model_id,
                 compatibility_key: context_format.compatibility_key,
-                auth_profile: active_turn.auth_profile,
+                auth_profile: active_turn.identity.effective_auth_profile,
                 origin: bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
                 messages_json,
                 portable_summary: active_turn.portable_context,
@@ -13419,6 +13391,12 @@ fn provider_managed_context_request(
     }
 }
 
+#[derive(Debug, Clone)]
+struct PreparedModelRequest {
+    request: ModelTurnRequest,
+    context_projection: bcode_session_models::RequestContextObservation,
+}
+
 #[derive(Clone)]
 struct StaticModelTurnContext {
     system_prompt: String,
@@ -13504,7 +13482,7 @@ async fn build_model_turn_request(
     selection: &SessionModelSelection,
     compaction_policy: &AutomaticCompactionPolicy,
     static_context: &StaticModelTurnContext,
-) -> Result<ModelTurnRequest, bcode_session::SessionError> {
+) -> Result<PreparedModelRequest, bcode_session::SessionError> {
     let metric_labels =
         model_request_metric_labels(session_id, provider_plugin_id, selected_model_id, round);
     let build_timer = state.metrics.timer();
@@ -13735,7 +13713,12 @@ async fn build_model_turn_request(
         build_timer.elapsed_ms(),
         metric_labels,
     );
-    Ok(request)
+    let context_projection =
+        projected_request_context(state, session_id, provider_plugin_id, &request).await;
+    Ok(PreparedModelRequest {
+        request,
+        context_projection,
+    })
 }
 
 async fn publish_context_occupancy(state: &ServerState, session_id: SessionId) {
@@ -13746,32 +13729,32 @@ async fn publish_context_occupancy(state: &ServerState, session_id: SessionId) {
         .sessions
         .publish_live_event(
             session_id,
-            SessionLiveEventKind::ContextOccupancyChanged {
+            SessionLiveEventKind::RequestContextOccupancyChanged {
                 occupancy: Box::new(occupancy),
             },
         )
         .await;
 }
 
-async fn projected_context_usage(
+async fn projected_request_context(
     state: &ServerState,
     session_id: SessionId,
     provider_plugin_id: Option<&str>,
     request: &ModelTurnRequest,
-) -> bcode_session_models::ContextUsageSnapshot {
+) -> bcode_session_models::RequestContextObservation {
     let context_epoch = state
         .sessions
         .current_context_epoch(session_id)
         .await
         .unwrap_or_default();
-    let local_request_estimate_tokens = local_model_request_estimate_tokens(request);
+    let local_estimate = local_request_estimate(request);
     let context_through_sequence = request
         .metadata
         .get("bcode_context_through_sequence")
         .and_then(|value| value.parse().ok())
         .unwrap_or_default();
     let request_id = request.turn_id.clone();
-    let invocation = bcode_session_models::ModelInvocationIdentity {
+    let invocation = bcode_session_models::ModelRequestIdentity {
         provider_plugin_id: provider_plugin_id.unwrap_or("<auto>").to_string(),
         requested_model_id: request.metadata.get("bcode_requested_model_id").cloned(),
         effective_model_id: request.model_id.clone(),
@@ -13781,7 +13764,6 @@ async fn projected_context_usage(
             .map_or_else(|| request_id.clone(), |(turn, _)| turn.to_string()),
         round: model_round_from_turn_id(&request_id).unwrap_or_default(),
         request_fingerprint: stable_json_hash(request),
-        provider_turn_id: request_id,
         effective_auth_profile: request.provider_context.auth_profile.clone(),
         context_format_version: request
             .metadata
@@ -13796,24 +13778,22 @@ async fn projected_context_usage(
         .await
         .ok()
         .flatten();
-    bcode_session_models::ContextOccupancy::project_estimate(
+    bcode_session_models::RequestContextOccupancy::project_estimate(
         current.as_ref(),
         invocation,
         context_through_sequence,
-        local_request_estimate_tokens,
+        local_estimate,
     )
 }
 
-async fn append_estimated_context_usage(
+async fn append_estimated_request_context(
     state: &ServerState,
     session_id: SessionId,
-    provider_plugin_id: Option<&str>,
-    request: &ModelTurnRequest,
+    snapshot: bcode_session_models::RequestContextObservation,
 ) {
-    let snapshot = projected_context_usage(state, session_id, provider_plugin_id, request).await;
     if let Ok(event) = state
         .sessions
-        .append_context_usage_observed(session_id, snapshot)
+        .append_request_context_observed(session_id, snapshot)
         .await
     {
         publish_session_event(state, &event).await;
@@ -13870,23 +13850,6 @@ fn portable_content_block(block: &ContentBlock) -> String {
             "[provider-specific context omitted from portable fallback]".to_string()
         }
     }
-}
-
-fn local_model_request_estimate_tokens(request: &ModelTurnRequest) -> u64 {
-    // Estimate only model-visible content. Host routing, auth, request identity, metrics metadata,
-    // and retry bookkeeping are not tokenized by the provider.
-    serde_json::to_string(&(
-        request.system_prompt.as_ref(),
-        &request.messages,
-        &request.tools,
-        &request.parameters,
-        request.structured_output.as_ref(),
-        &request.provider_context.request,
-        request.conversation_reuse.provider_state.as_ref(),
-    ))
-    .map_or(u64::MAX, |serialized| {
-        estimated_tokens_from_chars(serialized.chars().count())
-    })
 }
 
 fn model_request_metric_labels(
@@ -18290,45 +18253,40 @@ async fn append_model_turn_finished_event(
     }
 }
 
-async fn append_provider_context_usage_observation(
+async fn append_exact_request_context_observation(
     state: &ServerState,
     session_id: SessionId,
-    usage: &TokenUsage,
+    tokens: bcode_model::ExactRequestInputTokens,
     attempt: Option<&ModelRequestAttempt>,
 ) {
-    let Some(context_input_tokens) = usage.context_input_tokens() else {
-        return;
-    };
     let Some(attempt) = attempt else {
         eprintln!("provider usage was not associated with the active request");
         return;
     };
-    let snapshot = bcode_session_models::ContextUsageSnapshot {
-        invocation: bcode_session_models::ModelInvocationIdentity {
-            provider_plugin_id: attempt
-                .provider_plugin_id
-                .clone()
-                .unwrap_or_else(|| "<auto>".to_string()),
-            requested_model_id: attempt.requested_model_id.clone(),
-            effective_model_id: attempt.model_id.clone(),
-            request_id: attempt.request_id.clone(),
-            model_turn_id: attempt.model_turn_id.clone(),
-            round: attempt.round,
-            request_fingerprint: attempt.request_fingerprint.clone(),
-            provider_turn_id: attempt.provider_turn_id.clone(),
-            effective_auth_profile: attempt.auth_profile.clone(),
-            context_format_version: attempt.context_format_version,
-            compatibility_key: attempt.compatibility_key.clone(),
-            context_epoch: attempt.context_epoch,
+    let snapshot = bcode_session_models::RequestContextObservation {
+        request: bcode_session_models::ModelRequestIdentity {
+            provider_plugin_id: attempt.identity.provider_plugin_id.clone(),
+            requested_model_id: attempt.identity.requested_model_id.clone(),
+            effective_model_id: attempt.identity.effective_model_id.clone(),
+            request_id: attempt.identity.request_id.clone(),
+            model_turn_id: attempt.identity.model_turn_id.clone(),
+            round: attempt.identity.round,
+            request_fingerprint: attempt.identity.request_fingerprint.clone(),
+            effective_auth_profile: attempt.identity.effective_auth_profile.clone(),
+            context_format_version: attempt.identity.context_format_version,
+            compatibility_key: attempt.identity.compatibility_key.clone(),
+            context_epoch: attempt.identity.context_epoch,
         },
         context_through_sequence: attempt.context_through_sequence,
-        context_input_tokens: u64::from(context_input_tokens),
-        local_request_estimate_tokens: attempt.local_request_estimate_tokens,
-        source: bcode_session_models::ContextUsageSource::Provider,
+        context_tokens: bcode_session_models::RequestContextTokenCount::ProviderExact(tokens.get()),
+        local_estimate: bcode_session_models::LocalContextEstimate {
+            tokens: attempt.local_estimate.tokens,
+            algorithm_version: LOCAL_CONTEXT_ESTIMATOR_VERSION,
+        },
     };
     match state
         .sessions
-        .append_context_usage_observed(session_id, snapshot)
+        .append_request_context_observed(session_id, snapshot)
         .await
     {
         Ok(event) => {
@@ -18607,7 +18565,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ModelUsage { .. } => "model_usage",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
         SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
-        SessionEventKind::ContextUsageObserved { .. } => "context_usage_observed",
+        SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
         SessionEventKind::SessionRenamed { .. } => "session_renamed",
         SessionEventKind::TraceEvent { .. } => "trace_event",
         SessionEventKind::SkillInvoked { .. } => "skill_invoked",
@@ -19938,11 +19896,11 @@ mod tests {
     #[test]
     fn request_estimate_accounts_for_every_serialized_request_component() {
         let baseline = request_for_accounting_tests();
-        let baseline_tokens = local_model_request_estimate_tokens(&baseline);
+        let baseline_tokens = local_request_estimate(&baseline).tokens;
         let assert_increases = |mutate: fn(&mut ModelTurnRequest)| {
             let mut request = baseline.clone();
             mutate(&mut request);
-            assert!(local_model_request_estimate_tokens(&request) > baseline_tokens);
+            assert!(local_request_estimate(&request).tokens > baseline_tokens);
         };
 
         assert_increases(|request| {
@@ -19975,16 +19933,23 @@ mod tests {
         assert_increases(|request| {
             request.parameters.stop_sequences = vec!["stop sequence ".repeat(100)];
         });
-        assert_increases(|request| {
-            request.conversation_reuse.provider_state =
-                Some(serde_json::json!({"reuse": "state ".repeat(100)}));
-        });
+    }
+
+    #[test]
+    fn opaque_provider_state_does_not_affect_request_estimate() {
+        let baseline = request_for_accounting_tests();
+        let baseline_tokens = local_request_estimate(&baseline).tokens;
+        let mut with_state = baseline;
+        with_state.conversation_reuse.provider_state =
+            Some(serde_json::json!({"opaque": "encrypted ".repeat(1_000)}));
+
+        assert_eq!(local_request_estimate(&with_state).tokens, baseline_tokens);
     }
 
     #[test]
     fn tool_schema_and_provider_extension_can_cross_a_fit_threshold() {
         let baseline = request_for_accounting_tests();
-        let baseline_tokens = local_model_request_estimate_tokens(&baseline);
+        let baseline_tokens = local_request_estimate(&baseline).tokens;
 
         let mut with_tool = baseline.clone();
         with_tool.tools.push(bcode_model::ToolDefinition {
@@ -19995,7 +19960,7 @@ mod tests {
                 "properties": {"large": {"description": "schema ".repeat(500)}}
             }),
         });
-        let tool_tokens = local_model_request_estimate_tokens(&with_tool);
+        let tool_tokens = local_request_estimate(&with_tool).tokens;
         assert!(baseline_tokens < tool_tokens);
         let tool_threshold = baseline_tokens + (tool_tokens - baseline_tokens) / 2;
         assert!(baseline_tokens <= tool_threshold && tool_tokens > tool_threshold);
@@ -20005,7 +19970,7 @@ mod tests {
             "extension".to_string(),
             serde_json::json!({"payload": "extension ".repeat(1_000)}).into(),
         );
-        let extension_tokens = local_model_request_estimate_tokens(&with_extension);
+        let extension_tokens = local_request_estimate(&with_extension).tokens;
         assert!(baseline_tokens < extension_tokens);
         let extension_threshold = baseline_tokens + (extension_tokens - baseline_tokens) / 2;
         assert!(baseline_tokens <= extension_threshold && extension_tokens > extension_threshold);
@@ -23044,7 +23009,6 @@ mod tests {
     fn session_token_usage_preserves_normalized_fields() {
         let usage = session_token_usage(&TokenUsage {
             input_tokens: Some(10),
-            context_input_tokens: Some(15),
             output_tokens: Some(5),
             total_tokens: Some(15),
             cached_input_tokens: Some(3),
@@ -26174,23 +26138,28 @@ mod tests {
         assert!(current_turn.lock().await.is_some());
 
         let model_turn = ModelRequestAttempt {
-            request_id: "request-test".to_string(),
-            model_turn_id: "model-turn-test".to_string(),
-            round: 0,
-            request_fingerprint: "fingerprint-test".to_string(),
-            provider_plugin_id: Some("provider-test".to_owned()),
+            identity: bcode_session_models::ModelRequestIdentity {
+                provider_plugin_id: "provider-test".to_owned(),
+                requested_model_id: None,
+                effective_model_id: "model-test".to_owned(),
+                request_id: "request-test".to_owned(),
+                model_turn_id: "model-turn-test".to_owned(),
+                round: 0,
+                request_fingerprint: "fingerprint-test".to_owned(),
+                effective_auth_profile: None,
+                context_format_version: None,
+                compatibility_key: None,
+                context_epoch: 0,
+            },
             provider_turn_id: "provider-turn-test".to_owned(),
             reuse_key: None,
             request_message_count: 1,
             context_through_sequence: 1,
-            model_id: "model-test".to_string(),
-            auth_profile: None,
-            context_format_version: None,
-            compatibility_key: None,
-            requested_model_id: None,
-            context_epoch: 0,
-            portable_context: "context".to_string(),
-            local_request_estimate_tokens: 1,
+            portable_context: "context".to_owned(),
+            local_estimate: bcode_session_models::LocalContextEstimate {
+                tokens: 1,
+                algorithm_version: LOCAL_CONTEXT_ESTIMATOR_VERSION,
+            },
             managed_compaction_persisted: false,
         };
         begin_provider_round(&context, model_turn.clone()).await;
@@ -26212,7 +26181,7 @@ mod tests {
         let managed = take_managed_compaction_attempt(&context, "provider-turn-test")
             .await
             .expect("first managed compaction should own the request attempt");
-        assert_eq!(managed.request_id, model_turn.request_id);
+        assert_eq!(managed.identity.request_id, model_turn.identity.request_id);
         assert!(
             take_managed_compaction_attempt(&context, "provider-turn-test")
                 .await

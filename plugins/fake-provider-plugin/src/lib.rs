@@ -205,6 +205,7 @@ impl FakeProviderPlugin {
             .expect("fake provider state lock should not be poisoned");
         state.next_turn += 1;
         let provider_turn_id = format!("fake-turn-{}", state.next_turn);
+        let request_input_tokens = fake_request_input_tokens(&request);
         let user_text = last_user_text(&request.messages);
         let tool_result = last_tool_result(&request.messages);
         let tool_call = if tool_result.is_none() {
@@ -269,9 +270,17 @@ impl FakeProviderPlugin {
             .map(Duration::from_millis)
             .or_else(fake_delay)
         {
-            std::thread::spawn(move || FakeTurnWorker { turn, text, delay }.run());
+            std::thread::spawn(move || {
+                FakeTurnWorker {
+                    turn,
+                    text,
+                    delay,
+                    request_input_tokens,
+                }
+                .run();
+            });
         } else {
-            finish_fake_turn(&turn, text);
+            finish_fake_turn(&turn, text, request_input_tokens);
         }
         json_response(&StartTurnResponse { provider_turn_id })
     }
@@ -331,32 +340,48 @@ struct FakeTurnWorker {
     turn: FakeTurn,
     text: String,
     delay: Duration,
+    request_input_tokens: u64,
 }
 
 impl FakeTurnWorker {
     fn run(self) {
         std::thread::sleep(self.delay);
         if !self.turn.is_cancelled() {
-            finish_fake_turn(&self.turn, self.text);
+            finish_fake_turn(&self.turn, self.text, self.request_input_tokens);
         }
     }
 }
 
-fn finish_fake_turn(turn: &FakeTurn, text: String) {
+fn finish_fake_turn(turn: &FakeTurn, text: String, request_input_tokens: u64) {
     let output_tokens = u32::try_from(text.split_whitespace().count()).unwrap_or(u32::MAX);
     turn.push(ProviderTurnEvent::TextDelta { text });
     turn.push(ProviderTurnEvent::Usage {
         usage: TokenUsage {
             input_tokens: Some(1),
-            context_input_tokens: Some(1),
             output_tokens: Some(output_tokens),
             total_tokens: Some(output_tokens.saturating_add(1)),
             ..TokenUsage::default()
         },
     });
+    turn.push(ProviderTurnEvent::ExactRequestInputTokens {
+        tokens: bcode_model::ExactRequestInputTokens::new(request_input_tokens),
+    });
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::EndTurn,
     });
+}
+
+fn fake_request_input_tokens(request: &ModelTurnRequest) -> u64 {
+    let visible = serde_json::to_string(&(
+        request.system_prompt.as_ref(),
+        &request.messages,
+        &request.tools,
+        &request.parameters,
+        request.structured_output.as_ref(),
+        &request.provider_context.request,
+    ))
+    .unwrap_or_default();
+    u64::try_from(visible.split_whitespace().count()).unwrap_or(u64::MAX)
 }
 
 fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall) {

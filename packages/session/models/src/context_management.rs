@@ -12,11 +12,36 @@ use serde::{Deserialize, Serialize};
 /// Source and confidence of a context occupancy observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ContextUsageSource {
-    /// Exact usage reported by the active provider surface.
-    Provider,
+pub enum RequestContextTokenCount {
     /// Conservative local projection of the model-visible request.
-    Estimated,
+    Estimated(u64),
+    /// Exact complete request-input usage reported by the provider.
+    ProviderExact(u64),
+}
+
+impl RequestContextTokenCount {
+    /// Return the represented request input token count.
+    #[must_use]
+    pub const fn tokens(self) -> u64 {
+        match self {
+            Self::Estimated(tokens) | Self::ProviderExact(tokens) => tokens,
+        }
+    }
+
+    /// Return whether this count is a local estimate.
+    #[must_use]
+    pub const fn is_estimated(self) -> bool {
+        matches!(self, Self::Estimated(_))
+    }
+}
+
+/// Versioned local estimate of one complete model-visible request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalContextEstimate {
+    /// Estimated request input tokens.
+    pub tokens: u64,
+    /// Accounting algorithm version used to produce `tokens`.
+    pub algorithm_version: u16,
 }
 
 /// Exact identity of one assembled provider request.
@@ -24,7 +49,7 @@ pub enum ContextUsageSource {
 /// Requested and effective model ids are deliberately distinct: the requested id is the
 /// user-facing selection (and may be an alias), while the effective id is sent to the provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelInvocationIdentity {
+pub struct ModelRequestIdentity {
     /// Provider plugin used for the request.
     pub provider_plugin_id: String,
     /// User-facing model selection, before alias/default resolution.
@@ -40,8 +65,6 @@ pub struct ModelInvocationIdentity {
     pub round: u32,
     /// Stable fingerprint of the exact assembled request.
     pub request_fingerprint: String,
-    /// Provider turn identifier.
-    pub provider_turn_id: String,
     /// Effective non-secret auth profile chosen by routing.
     #[serde(default)]
     pub effective_auth_profile: Option<String>,
@@ -58,91 +81,87 @@ pub struct ModelInvocationIdentity {
 
 /// Durable context occupancy observation tied to a model request boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextUsageSnapshot {
+pub struct RequestContextObservation {
     /// Exact request identity for this observation.
-    pub invocation: ModelInvocationIdentity,
+    pub request: ModelRequestIdentity,
     /// Last canonical event represented by the observed request.
     pub context_through_sequence: u64,
-    /// Full active input-context occupancy.
-    #[serde(alias = "input_tokens")]
-    pub context_input_tokens: u64,
+    /// Complete request-input occupancy, exact or estimated.
+    pub context_tokens: RequestContextTokenCount,
     /// Local estimate of the complete model-visible request before calibration.
-    #[serde(alias = "estimated_input_tokens")]
-    pub local_request_estimate_tokens: u64,
-    /// Observation source.
-    pub source: ContextUsageSource,
+    pub local_estimate: LocalContextEstimate,
 }
 
-impl ContextUsageSnapshot {
+impl RequestContextObservation {
     /// Return whether this observation belongs to the supplied context generation.
     #[must_use]
     pub const fn belongs_to_context_epoch(&self, context_epoch: u64) -> bool {
-        self.invocation.context_epoch == context_epoch
+        self.request.context_epoch == context_epoch
     }
 
     /// Return whether this observation came from the same exact request as `other`.
     #[must_use]
     pub fn matches_request_attempt(&self, other: &Self) -> bool {
-        self.invocation.request_id == other.invocation.request_id
-            && self.invocation.request_fingerprint == other.invocation.request_fingerprint
+        self.request.request_id == other.request.request_id
+            && self.request.request_fingerprint == other.request.request_fingerprint
     }
 
     /// Return whether this observation can calibrate an estimate for `invocation`.
     #[must_use]
-    pub fn is_compatible_anchor(&self, invocation: &ModelInvocationIdentity) -> bool {
-        let current = &self.invocation;
-        current.context_epoch == invocation.context_epoch
-            && current.provider_plugin_id == invocation.provider_plugin_id
-            && current.effective_model_id == invocation.effective_model_id
-            && current.effective_auth_profile == invocation.effective_auth_profile
-            && current.context_format_version == invocation.context_format_version
-            && current.compatibility_key == invocation.compatibility_key
+    pub fn is_compatible_anchor(&self, request: &ModelRequestIdentity) -> bool {
+        let current = &self.request;
+        current.context_epoch == request.context_epoch
+            && current.provider_plugin_id == request.provider_plugin_id
+            && current.effective_model_id == request.effective_model_id
+            && current.effective_auth_profile == request.effective_auth_profile
+            && current.context_format_version == request.context_format_version
+            && current.compatibility_key == request.compatibility_key
     }
 }
 
 /// Authoritative current context occupancy projected from canonical session events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextOccupancy {
+pub struct RequestContextOccupancy {
     /// Context generation to which this value belongs.
     pub context_epoch: u64,
     /// Event sequence of the accepted observation.
     pub observation_sequence: u64,
     /// Accepted observation.
-    pub snapshot: ContextUsageSnapshot,
+    pub observation: RequestContextObservation,
 }
 
-impl ContextOccupancy {
+impl RequestContextOccupancy {
     /// Build a calibrated estimate from the current compatible occupancy when possible.
     #[must_use]
     pub fn project_estimate(
         current: Option<&Self>,
-        invocation: ModelInvocationIdentity,
+        request: ModelRequestIdentity,
         context_through_sequence: u64,
-        local_request_estimate_tokens: u64,
-    ) -> ContextUsageSnapshot {
+        local_estimate: LocalContextEstimate,
+    ) -> RequestContextObservation {
         let context_input_tokens = current
             .filter(|occupancy| {
-                occupancy.context_epoch == invocation.context_epoch
-                    && occupancy.snapshot.is_compatible_anchor(&invocation)
+                occupancy.context_epoch == request.context_epoch
+                    && occupancy.observation.is_compatible_anchor(&request)
+                    && occupancy.observation.local_estimate.algorithm_version
+                        == local_estimate.algorithm_version
             })
-            .map_or(local_request_estimate_tokens, |occupancy| {
-                let anchor = &occupancy.snapshot;
-                if local_request_estimate_tokens >= anchor.local_request_estimate_tokens {
-                    anchor.context_input_tokens.saturating_add(
-                        local_request_estimate_tokens - anchor.local_request_estimate_tokens,
-                    )
+            .map_or(local_estimate.tokens, |occupancy| {
+                let anchor = &occupancy.observation;
+                let anchor_tokens = anchor.context_tokens.tokens();
+                if local_estimate.tokens >= anchor.local_estimate.tokens {
+                    anchor_tokens
+                        .saturating_add(local_estimate.tokens - anchor.local_estimate.tokens)
                 } else {
-                    anchor.context_input_tokens.saturating_sub(
-                        anchor.local_request_estimate_tokens - local_request_estimate_tokens,
-                    )
+                    anchor_tokens
+                        .saturating_sub(anchor.local_estimate.tokens - local_estimate.tokens)
                 }
             });
-        ContextUsageSnapshot {
-            invocation,
+        RequestContextObservation {
+            request,
             context_through_sequence,
-            context_input_tokens,
-            local_request_estimate_tokens,
-            source: ContextUsageSource::Estimated,
+            context_tokens: RequestContextTokenCount::Estimated(context_input_tokens),
+            local_estimate,
         }
     }
 
@@ -152,23 +171,23 @@ impl ContextOccupancy {
         current: Option<&Self>,
         context_epoch: u64,
         observation_sequence: u64,
-        snapshot: ContextUsageSnapshot,
+        observation: RequestContextObservation,
     ) -> Option<Self> {
-        if !snapshot.belongs_to_context_epoch(context_epoch) {
+        if !observation.belongs_to_context_epoch(context_epoch) {
             return current.cloned();
         }
-        let accept = match snapshot.source {
-            ContextUsageSource::Estimated => true,
-            ContextUsageSource::Provider => current.is_some_and(|occupancy| {
+        let accept = match observation.context_tokens {
+            RequestContextTokenCount::Estimated(_) => true,
+            RequestContextTokenCount::ProviderExact(_) => current.is_some_and(|occupancy| {
                 occupancy.context_epoch == context_epoch
-                    && occupancy.snapshot.matches_request_attempt(&snapshot)
+                    && occupancy.observation.matches_request_attempt(&observation)
             }),
         };
         accept
             .then_some(Self {
                 context_epoch,
                 observation_sequence,
-                snapshot,
+                observation,
             })
             .or_else(|| current.cloned())
     }

@@ -29,12 +29,12 @@ use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 
-fn context_occupancy(tokens: u64) -> bcode_session_models::ContextOccupancy {
-    bcode_session_models::ContextOccupancy {
+fn context_occupancy(tokens: u64) -> bcode_session_models::RequestContextOccupancy {
+    bcode_session_models::RequestContextOccupancy {
         context_epoch: 0,
         observation_sequence: 1,
-        snapshot: bcode_session_models::ContextUsageSnapshot {
-            invocation: bcode_session_models::ModelInvocationIdentity {
+        observation: bcode_session_models::RequestContextObservation {
+            request: bcode_session_models::ModelRequestIdentity {
                 provider_plugin_id: "provider.example".to_owned(),
                 requested_model_id: None,
                 effective_model_id: "model-example".to_owned(),
@@ -42,16 +42,17 @@ fn context_occupancy(tokens: u64) -> bcode_session_models::ContextOccupancy {
                 model_turn_id: "turn-1".to_owned(),
                 round: 0,
                 request_fingerprint: "fingerprint".to_owned(),
-                provider_turn_id: "provider-turn".to_owned(),
                 effective_auth_profile: None,
                 context_format_version: None,
                 compatibility_key: None,
                 context_epoch: 0,
             },
             context_through_sequence: 1,
-            context_input_tokens: tokens,
-            local_request_estimate_tokens: tokens,
-            source: bcode_session_models::ContextUsageSource::Provider,
+            context_tokens: bcode_session_models::RequestContextTokenCount::ProviderExact(tokens),
+            local_estimate: bcode_session_models::LocalContextEstimate {
+                tokens,
+                algorithm_version: 1,
+            },
         },
     }
 }
@@ -1293,7 +1294,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
         model_id: Some("very-long-model-id".to_owned()),
         context_window: None,
         context_occupancy: None,
-        context_usage_error: None,
+        request_context_error: None,
         auth_profile: None,
         context_format_version: None,
         compatibility_key: None,
@@ -1504,7 +1505,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
         model_id: Some("model-example".to_owned()),
         context_window: Some(1024),
         context_occupancy: Some(Box::new(context_occupancy(512))),
-        context_usage_error: None,
+        request_context_error: None,
         auth_profile: None,
         context_format_version: None,
         compatibility_key: None,
@@ -1590,7 +1591,7 @@ fn status_line_prioritizes_context_over_spent_tokens() {
         model_id: Some("model-example".to_owned()),
         context_window: Some(128_000),
         context_occupancy: Some(Box::new(context_occupancy(512))),
-        context_usage_error: None,
+        request_context_error: None,
         auth_profile: None,
         context_format_version: None,
         compatibility_key: None,
@@ -5702,7 +5703,7 @@ fn thinking_label_uses_effective_values() {
         model_id: None,
         context_window: None,
         context_occupancy: None,
-        context_usage_error: None,
+        request_context_error: None,
         auth_profile: None,
         context_format_version: None,
         compatibility_key: None,
@@ -5745,7 +5746,7 @@ fn thinking_dialog_cycles_supported_values() {
         model_id: None,
         context_window: None,
         context_occupancy: None,
-        context_usage_error: None,
+        request_context_error: None,
         auth_profile: None,
         context_format_version: None,
         compatibility_key: None,
@@ -5791,7 +5792,7 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
         model_id: None,
         context_window: None,
         context_occupancy: None,
-        context_usage_error: None,
+        request_context_error: None,
         auth_profile: None,
         context_format_version: None,
         compatibility_key: None,
@@ -5841,7 +5842,7 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
         model_id: None,
         context_window: None,
         context_occupancy: None,
-        context_usage_error: None,
+        request_context_error: None,
         auth_profile: None,
         context_format_version: None,
         compatibility_key: None,

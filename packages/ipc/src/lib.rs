@@ -720,10 +720,10 @@ pub struct SessionModelStatus {
     pub context_window: Option<u32>,
     /// Authoritative active context occupancy.
     #[serde(default)]
-    pub context_occupancy: Option<Box<bcode_session_models::ContextOccupancy>>,
+    pub context_occupancy: Option<Box<bcode_session_models::RequestContextOccupancy>>,
     /// Projection error preventing a trustworthy occupancy value.
     #[serde(default)]
-    pub context_usage_error: Option<String>,
+    pub request_context_error: Option<String>,
     #[serde(default)]
     pub auth_profile: Option<String>,
     #[serde(default)]

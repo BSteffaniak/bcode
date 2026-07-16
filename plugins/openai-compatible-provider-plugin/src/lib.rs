@@ -3037,6 +3037,10 @@ async fn read_responses_stream_events(
         context_format,
         name_map: &name_map,
         suppress_provider_reuse_state,
+        uses_previous_response: request
+            .conversation_reuse
+            .previous_provider_response_id
+            .is_some(),
         completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
     };
     loop {
@@ -3071,6 +3075,7 @@ struct ResponsesStreamProcessor<'a> {
     context_format: ProviderContextFormat,
     name_map: &'a BTreeMap<String, String>,
     suppress_provider_reuse_state: bool,
+    uses_previous_response: bool,
     completed_compaction_items: std::cell::RefCell<BTreeSet<(u32, String)>>,
 }
 
@@ -3182,8 +3187,20 @@ fn process_responses_stream_line(
             process_responses_function_arguments_done(&event, tool_calls);
         }
         "response.completed" | "response.done" | "response.incomplete" => {
-            if let Some(usage) = token_usage_from_responses_event(&event, processor.dialect) {
-                processor.turn.push(ProviderTurnEvent::Usage { usage });
+            if let Some(usage) = openai_usage_from_responses_event(&event) {
+                let exact_input = (!processor.uses_previous_response)
+                    .then(|| usage.prompt_tokens.or(usage.input_tokens))
+                    .flatten();
+                processor.turn.push(ProviderTurnEvent::Usage {
+                    usage: token_usage_from_openai_usage(usage, processor.dialect),
+                });
+                if let Some(tokens) = exact_input {
+                    processor
+                        .turn
+                        .push(ProviderTurnEvent::ExactRequestInputTokens {
+                            tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
+                        });
+                }
             }
             let outcome = if *saw_tool_call {
                 finish_tool_calls(
@@ -3469,9 +3486,15 @@ fn process_stream_line(
         )
     })?;
     if let Some(usage) = chunk.usage {
+        let exact_input = usage.prompt_tokens.or(usage.input_tokens);
         turn.push(ProviderTurnEvent::Usage {
             usage: token_usage_from_openai_usage(usage, OpenAiCompatibleDialect::ChatCompletions),
         });
+        if let Some(tokens) = exact_input {
+            turn.push(ProviderTurnEvent::ExactRequestInputTokens {
+                tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
+            });
+        }
     }
     for choice in chunk.choices {
         if let Some(content) = choice.delta.content
@@ -3519,7 +3542,6 @@ fn token_usage_from_openai_usage(
     let total_tokens = usage.total_tokens;
     TokenUsage {
         input_tokens,
-        context_input_tokens: input_tokens,
         output_tokens: usage.completion_tokens.or(usage.output_tokens),
         total_tokens,
         cached_input_tokens,
@@ -3528,16 +3550,20 @@ fn token_usage_from_openai_usage(
     }
 }
 
-fn token_usage_from_responses_event(
-    event: &serde_json::Value,
-    dialect: OpenAiCompatibleDialect,
-) -> Option<TokenUsage> {
+fn openai_usage_from_responses_event(event: &serde_json::Value) -> Option<OpenAiUsage> {
     let usage = event
         .get("response")
         .and_then(|response| response.get("usage"))
         .or_else(|| event.get("usage"))?;
-    serde_json::from_value::<OpenAiUsage>(usage.clone())
-        .ok()
+    serde_json::from_value(usage.clone()).ok()
+}
+
+#[cfg(test)]
+fn token_usage_from_responses_event(
+    event: &serde_json::Value,
+    dialect: OpenAiCompatibleDialect,
+) -> Option<TokenUsage> {
+    openai_usage_from_responses_event(event)
         .map(|usage| token_usage_from_openai_usage(usage, dialect))
 }
 
@@ -7191,7 +7217,6 @@ mod tests {
         let usage = token_usage_from_openai_usage(usage, OpenAiCompatibleDialect::ChatCompletions);
 
         assert_eq!(usage.input_tokens, Some(10));
-        assert_eq!(usage.context_input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.total_tokens, Some(15));
         assert_eq!(usage.cached_input_tokens, Some(3));
@@ -7217,7 +7242,6 @@ mod tests {
             .expect("usage should parse");
 
         assert_eq!(usage.input_tokens, Some(20));
-        assert_eq!(usage.context_input_tokens, Some(20));
         assert_eq!(usage.output_tokens, Some(7));
         assert_eq!(usage.total_tokens, Some(27));
         assert_eq!(usage.cached_input_tokens, Some(4));
@@ -7658,8 +7682,65 @@ mod tests {
             },
             name_map,
             suppress_provider_reuse_state: false,
+            uses_previous_response: false,
             completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         }
+    }
+
+    #[test]
+    fn responses_continuation_usage_never_claims_exact_context() {
+        let turn = TurnState::default();
+        let name_map = BTreeMap::new();
+        let mut processor = test_responses_stream_processor(&turn, &name_map);
+        processor.uses_previous_response = true;
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+
+        process_responses_stream_line(
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":20,"output_tokens":7,"total_tokens":27}}}"#,
+            &processor,
+            &mut tool_calls,
+            &mut reasoning_items,
+            &mut saw_tool_call,
+        )
+        .expect("usage event should process");
+        let events = turn.drain();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::Usage { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ExactRequestInputTokens { .. }))
+        );
+    }
+
+    #[test]
+    fn responses_full_request_usage_emits_exact_context() {
+        let turn = TurnState::default();
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+
+        process_responses_stream_line(
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":20,"output_tokens":7,"total_tokens":27}}}"#,
+            &processor,
+            &mut tool_calls,
+            &mut reasoning_items,
+            &mut saw_tool_call,
+        )
+        .expect("usage event should process");
+
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 20
+        )));
     }
 
     #[test]
@@ -7803,6 +7884,7 @@ mod tests {
             },
             name_map: &name_map,
             suppress_provider_reuse_state: false,
+            uses_previous_response: false,
             completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         };
 
@@ -7877,6 +7959,7 @@ mod tests {
             },
             name_map: &name_map,
             suppress_provider_reuse_state: false,
+            uses_previous_response: false,
             completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         };
 

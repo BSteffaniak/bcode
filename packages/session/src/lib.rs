@@ -113,7 +113,7 @@ fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &Sessio
             | SessionEventKind::WorkingDirectoryChanged { .. }
             | SessionEventKind::ContextCompacted { .. }
             | SessionEventKind::ProviderContextCompacted { .. }
-            | SessionEventKind::ContextUsageObserved { .. }
+            | SessionEventKind::RequestContextObserved { .. }
     ) {
         metrics.increment_counter("session.event.semantic_rows");
     }
@@ -589,7 +589,7 @@ pub(crate) struct SessionState {
     current_agent: Option<String>,
     latest_compaction_sequence: Option<u64>,
     context_epoch: u64,
-    context_occupancy: Option<bcode_session_models::ContextOccupancy>,
+    context_occupancy: Option<bcode_session_models::RequestContextOccupancy>,
     total_metered_tokens: u64,
     load_status: SessionLoadStatusKind,
     sender: broadcast::Sender<SessionEvent>,
@@ -2005,7 +2005,7 @@ impl SessionManager {
     pub async fn current_context_occupancy(
         &self,
         session_id: SessionId,
-    ) -> Result<Option<bcode_session_models::ContextOccupancy>, SessionError> {
+    ) -> Result<Option<bcode_session_models::RequestContextOccupancy>, SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.current_context_occupancy().await
     }
@@ -2847,14 +2847,14 @@ impl SessionManager {
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the event cannot be persisted.
-    pub async fn append_context_usage_observed(
+    pub async fn append_request_context_observed(
         &self,
         session_id: SessionId,
-        snapshot: bcode_session_models::ContextUsageSnapshot,
+        observation: bcode_session_models::RequestContextObservation,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
-            SessionEventKind::ContextUsageObserved { snapshot },
+            SessionEventKind::RequestContextObserved { observation },
         )
         .await
     }
@@ -3165,12 +3165,12 @@ impl SessionState {
                 self.context_epoch = event.sequence;
                 self.context_occupancy = None;
             }
-            SessionEventKind::ContextUsageObserved { snapshot } => {
-                self.context_occupancy = bcode_session_models::ContextOccupancy::reconcile(
+            SessionEventKind::RequestContextObserved { observation } => {
+                self.context_occupancy = bcode_session_models::RequestContextOccupancy::reconcile(
                     self.context_occupancy.as_ref(),
                     self.context_epoch,
                     event.sequence,
-                    snapshot.clone(),
+                    observation.clone(),
                 );
             }
             SessionEventKind::ModelUsage { usage, .. } => {

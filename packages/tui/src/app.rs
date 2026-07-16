@@ -266,7 +266,7 @@ pub struct BmuxApp {
     selected_auth_profile: Option<String>,
     selected_context_format_version: Option<u16>,
     selected_compatibility_key: Option<String>,
-    context_usage_sequence: Option<u64>,
+    context_occupancy: Option<bcode_session_models::RequestContextOccupancy>,
     current_agent_id: String,
     current_agent_accent: Option<String>,
     pending_agent_id: Option<String>,
@@ -483,7 +483,7 @@ impl BmuxApp {
             selected_auth_profile: None,
             selected_context_format_version: None,
             selected_compatibility_key: None,
-            context_usage_sequence: None,
+            context_occupancy: None,
             current_agent_id: "build".to_owned(),
             current_agent_accent: None,
             pending_agent_id: None,
@@ -892,7 +892,8 @@ impl BmuxApp {
     /// Return the token/context footer summary.
     #[must_use]
     pub fn token_summary(&self) -> String {
-        self.token_usage.footer_summary()
+        self.token_usage
+            .footer_summary(self.context_occupancy.as_ref())
     }
 
     /// Return the composer content area from the latest render.
@@ -1110,17 +1111,7 @@ impl BmuxApp {
                 visibility: bcode_model::ModelVisibility::Visible,
             });
         self.token_usage.apply_model_info(model.as_ref());
-        if let Some(occupancy) = status.context_occupancy
-            && self
-                .context_usage_sequence
-                .is_none_or(|current| occupancy.observation_sequence >= current)
-        {
-            self.token_usage.observe_context_usage(
-                occupancy.snapshot.context_input_tokens,
-                occupancy.snapshot.source == bcode_session_models::ContextUsageSource::Estimated,
-            );
-            self.context_usage_sequence = Some(occupancy.observation_sequence);
-        }
+        self.apply_context_occupancy(status.context_occupancy.map(|occupancy| *occupancy));
     }
 
     /// Return pending submissions that have not been committed by the session stream.
@@ -2167,17 +2158,8 @@ impl BmuxApp {
                     preview,
                 );
             }
-            SessionLiveEventKind::ContextOccupancyChanged { occupancy } => {
-                if let Some(occupancy) = &**occupancy {
-                    self.token_usage.observe_context_usage(
-                        occupancy.snapshot.context_input_tokens,
-                        occupancy.snapshot.source
-                            == bcode_session_models::ContextUsageSource::Estimated,
-                    );
-                    self.context_usage_sequence = Some(occupancy.observation_sequence);
-                } else {
-                    self.clear_context_occupancy();
-                }
+            SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
+                self.apply_context_occupancy((**occupancy).clone());
             }
             SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
                 self.apply_provider_stream_event(event);
@@ -3553,9 +3535,21 @@ impl BmuxApp {
         }
     }
 
-    const fn clear_context_occupancy(&mut self) {
-        self.token_usage.clear_context_occupancy();
-        self.context_usage_sequence = None;
+    fn apply_context_occupancy(
+        &mut self,
+        occupancy: Option<bcode_session_models::RequestContextOccupancy>,
+    ) {
+        if occupancy.as_ref().is_none_or(|next| {
+            self.context_occupancy
+                .as_ref()
+                .is_none_or(|current| next.observation_sequence >= current.observation_sequence)
+        }) {
+            self.context_occupancy = occupancy;
+        }
+    }
+
+    fn clear_context_occupancy(&mut self) {
+        self.context_occupancy = None;
     }
 
     fn push_compaction(&mut self, summary: &str) {
@@ -4022,8 +4016,6 @@ fn tool_request_status(arguments_json: &str) -> Option<String> {
 struct TokenUsageMeter {
     session_tokens: u64,
     session_cost_micros: Option<u64>,
-    latest_context_input_tokens: Option<u32>,
-    context_usage_estimated: bool,
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
     provider_reuse_active: bool,
@@ -4042,7 +4034,6 @@ impl TokenUsageMeter {
         if let Some(pricing) = &self.pricing {
             let usage = bcode_model::TokenUsage {
                 input_tokens: usage.input_tokens,
-                context_input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 total_tokens: usage.total_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
@@ -4061,19 +4052,6 @@ impl TokenUsageMeter {
         self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
 
-    fn observe_context_usage(&mut self, input_tokens: u64, estimated: bool) {
-        let input_tokens = u32::try_from(input_tokens).unwrap_or(u32::MAX);
-        self.latest_context_input_tokens = Some(input_tokens);
-        self.context_usage_estimated = estimated;
-    }
-
-    const fn clear_context_occupancy(&mut self) {
-        self.latest_context_input_tokens = None;
-        self.context_usage_estimated = false;
-        self.latest_cached_input_tokens = None;
-        self.latest_cache_write_input_tokens = None;
-    }
-
     fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
         if let Some(model) = model {
             self.context_window = model.context_window;
@@ -4082,8 +4060,6 @@ impl TokenUsageMeter {
     }
 
     fn clear_model_info(&mut self) {
-        self.latest_context_input_tokens = None;
-        self.context_usage_estimated = false;
         self.latest_cached_input_tokens = None;
         self.latest_cache_write_input_tokens = None;
         self.context_window = None;
@@ -4103,8 +4079,11 @@ impl TokenUsageMeter {
         self.latest_prompt_cache_points = metadata_prompt_cache_points;
     }
 
-    fn footer_summary(&self) -> String {
-        let mut parts = vec![self.context_summary()];
+    fn footer_summary(
+        &self,
+        occupancy: Option<&bcode_session_models::RequestContextOccupancy>,
+    ) -> String {
+        let mut parts = vec![self.context_summary(occupancy)];
         if self.provider_reuse_active {
             parts.push("reuse on".to_string());
         }
@@ -4140,13 +4119,18 @@ impl TokenUsageMeter {
         parts.join(" · ")
     }
 
-    fn context_summary(&self) -> String {
-        match (self.latest_context_input_tokens, self.context_window) {
-            (Some(input), Some(window)) if window > 0 => {
+    fn context_summary(
+        &self,
+        occupancy: Option<&bcode_session_models::RequestContextOccupancy>,
+    ) -> String {
+        match (occupancy, self.context_window) {
+            (Some(occupancy), Some(window)) if window > 0 => {
+                let input = u32::try_from(occupancy.observation.context_tokens.tokens())
+                    .unwrap_or(u32::MAX);
                 let percentage = context_window_percentage(input, window);
                 format!(
                     "{}{}/{} {}",
-                    if self.context_usage_estimated {
+                    if occupancy.observation.context_tokens.is_estimated() {
                         "~"
                     } else {
                         ""
@@ -4409,7 +4393,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ModelUsage { .. }
         | SessionEventKind::ContextCompacted { .. }
         | SessionEventKind::ProviderContextCompacted { .. }
-        | SessionEventKind::ContextUsageObserved { .. }
+        | SessionEventKind::RequestContextObserved { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SkillInvoked { .. }
         | SessionEventKind::SkillInvocationFailed { .. }
@@ -4474,11 +4458,11 @@ mod tests {
     use super::*;
 
     fn snapshot(
-        source: bcode_session_models::ContextUsageSource,
+        estimated: bool,
         input_tokens: u64,
-    ) -> bcode_session_models::ContextUsageSnapshot {
-        bcode_session_models::ContextUsageSnapshot {
-            invocation: bcode_session_models::ModelInvocationIdentity {
+    ) -> bcode_session_models::RequestContextObservation {
+        bcode_session_models::RequestContextObservation {
+            request: bcode_session_models::ModelRequestIdentity {
                 provider_plugin_id: "provider".to_string(),
                 requested_model_id: None,
                 effective_model_id: "effective-model".to_string(),
@@ -4486,16 +4470,21 @@ mod tests {
                 model_turn_id: "turn".to_string(),
                 round: 0,
                 request_fingerprint: "fingerprint".to_string(),
-                provider_turn_id: "provider-turn".to_string(),
                 effective_auth_profile: Some("routed-profile".to_string()),
                 context_format_version: None,
                 compatibility_key: None,
                 context_epoch: 3,
             },
             context_through_sequence: 1,
-            context_input_tokens: input_tokens,
-            local_request_estimate_tokens: input_tokens,
-            source,
+            context_tokens: if estimated {
+                bcode_session_models::RequestContextTokenCount::Estimated(input_tokens)
+            } else {
+                bcode_session_models::RequestContextTokenCount::ProviderExact(input_tokens)
+            },
+            local_estimate: bcode_session_models::LocalContextEstimate {
+                tokens: input_tokens,
+                algorithm_version: 1,
+            },
         }
     }
 
@@ -4568,75 +4557,50 @@ mod tests {
     #[test]
     fn context_summary_marks_estimated_overflow_without_exceeding_one_hundred_percent() {
         let meter = TokenUsageMeter {
-            latest_context_input_tokens: Some(407_295),
-            context_usage_estimated: true,
             context_window: Some(372_000),
             ..TokenUsageMeter::default()
         };
-
-        assert_eq!(meter.context_summary(), "~407,295/372k 100%+");
-    }
-
-    #[test]
-    fn context_summary_replaces_estimate_with_provider_observation() {
-        let mut meter = TokenUsageMeter {
-            context_window: Some(372_000),
-            ..TokenUsageMeter::default()
+        let occupancy = bcode_session_models::RequestContextOccupancy {
+            context_epoch: 3,
+            observation_sequence: 7,
+            observation: snapshot(true, 407_295),
         };
-        meter.observe_context_usage(47_295, true);
-        assert_eq!(meter.context_summary(), "~47,295/372k 12%");
 
-        meter.observe_context_usage(43_000, false);
-        assert_eq!(meter.context_summary(), "43,000/372k 11%");
-    }
-
-    #[test]
-    fn raw_context_observations_never_drive_footer_state() {
-        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-        app.apply_session_event(
-            &SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 7,
-                timestamp_ms: 7,
-                session_id: SessionId::new(),
-                provenance: None,
-                kind: SessionEventKind::ContextUsageObserved {
-                    snapshot: snapshot(bcode_session_models::ContextUsageSource::Estimated, 2_500),
-                },
-            },
-            SessionEventApplication::Live,
+        assert_eq!(
+            meter.context_summary(Some(&occupancy)),
+            "~407,295/372k 100%+"
         );
-
-        assert_eq!(app.token_usage.latest_context_input_tokens, None);
     }
 
     #[test]
     fn authoritative_live_occupancy_drives_and_clears_footer_state() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-        let occupancy = bcode_session_models::ContextOccupancy {
+        let occupancy = bcode_session_models::RequestContextOccupancy {
             context_epoch: 3,
             observation_sequence: 7,
-            snapshot: snapshot(bcode_session_models::ContextUsageSource::Estimated, 2_500),
+            observation: snapshot(true, 2_500),
         };
         app.absorb_session_live_event(&SessionLiveEvent {
             session_id: SessionId::new(),
-            kind: SessionLiveEventKind::ContextOccupancyChanged {
+            kind: SessionLiveEventKind::RequestContextOccupancyChanged {
                 occupancy: Box::new(Some(occupancy)),
             },
         });
 
-        assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
-        assert!(app.token_usage.context_usage_estimated);
-        assert_eq!(app.context_usage_sequence, Some(7));
+        assert_eq!(
+            app.context_occupancy
+                .as_ref()
+                .map(|value| value.observation.context_tokens.tokens()),
+            Some(2_500)
+        );
 
         app.absorb_session_live_event(&SessionLiveEvent {
             session_id: SessionId::new(),
-            kind: SessionLiveEventKind::ContextOccupancyChanged {
+            kind: SessionLiveEventKind::RequestContextOccupancyChanged {
                 occupancy: Box::new(None),
             },
         });
-        assert_eq!(app.token_usage.latest_context_input_tokens, None);
-        assert_eq!(app.context_usage_sequence, None);
+        assert!(app.context_occupancy.is_none());
     }
 
     #[test]

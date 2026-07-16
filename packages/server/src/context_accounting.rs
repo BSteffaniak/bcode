@@ -4,7 +4,36 @@
 //! for the current round. Structural retention uses canonical serialized model-message accounting
 //! so cuts include protocol overhead rather than raw content character counts.
 
-use super::{ContentBlock, ModelMessage, session_events_to_model_messages_with_limit};
+use super::{
+    ContentBlock, ModelMessage, ModelTurnRequest, session_events_to_model_messages_with_limit,
+};
+
+/// Current version of the local semantic request-context estimator.
+pub const LOCAL_CONTEXT_ESTIMATOR_VERSION: u16 = 1;
+
+/// Estimate the complete semantic model-visible request context.
+///
+/// Host metadata, prompt-cache controls, continuation identifiers, and opaque provider state are
+/// excluded because they are not semantic active context.
+pub fn local_request_estimate(
+    request: &ModelTurnRequest,
+) -> bcode_session_models::LocalContextEstimate {
+    let tokens = serde_json::to_string(&(
+        request.system_prompt.as_ref(),
+        &request.messages,
+        &request.tools,
+        &request.parameters,
+        request.structured_output.as_ref(),
+        &request.provider_context.request,
+    ))
+    .map_or(u64::MAX, |serialized| {
+        estimated_tokens_from_chars(serialized.chars().count())
+    });
+    bcode_session_models::LocalContextEstimate {
+        tokens,
+        algorithm_version: LOCAL_CONTEXT_ESTIMATOR_VERSION,
+    }
+}
 
 pub fn projected_model_context_chars(
     history: &[bcode_session_models::SessionEvent],

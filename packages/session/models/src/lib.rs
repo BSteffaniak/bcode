@@ -21,8 +21,9 @@ use uuid::Uuid;
 
 mod context_management;
 pub use context_management::{
-    ContextOccupancy, ContextUsageSnapshot, ContextUsageSource, ModelInvocationIdentity,
-    ProviderContextSnapshot, ProviderContextSnapshotOrigin,
+    LocalContextEstimate, ModelRequestIdentity, ProviderContextSnapshot,
+    ProviderContextSnapshotOrigin, RequestContextObservation, RequestContextOccupancy,
+    RequestContextTokenCount,
 };
 
 /// Renderer-neutral state for one tool invocation reconstructed from raw session events.
@@ -236,7 +237,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 31;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 32;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -641,9 +642,9 @@ pub enum SessionLiveEventKind {
         preview: LiveToolArgumentPreview,
     },
     /// Authoritative current context occupancy after a durable projection update.
-    ContextOccupancyChanged {
+    RequestContextOccupancyChanged {
         /// Current occupancy, or `None` when a model/compaction boundary cleared it.
-        occupancy: Box<Option<ContextOccupancy>>,
+        occupancy: Box<Option<RequestContextOccupancy>>,
     },
     /// Live-only provider stream progress for active model turns.
     ProviderStreamProgress {
@@ -1880,8 +1881,8 @@ pub enum SessionEventKind {
         compacted_through_sequence: u64,
     },
     /// Exact or estimated context occupancy associated with a request boundary.
-    ContextUsageObserved {
-        snapshot: ContextUsageSnapshot,
+    RequestContextObserved {
+        observation: RequestContextObservation,
     },
     /// Compact plugin-owned status note; presentation-only and excluded from model context.
     PluginStatusNote {
@@ -1930,8 +1931,8 @@ mod tests {
         );
     }
 
-    fn invocation(request_id: &str, context_epoch: u64) -> ModelInvocationIdentity {
-        ModelInvocationIdentity {
+    fn invocation(request_id: &str, context_epoch: u64) -> ModelRequestIdentity {
+        ModelRequestIdentity {
             provider_plugin_id: "provider".to_string(),
             requested_model_id: Some("alias".to_string()),
             effective_model_id: "model".to_string(),
@@ -1939,7 +1940,6 @@ mod tests {
             model_turn_id: "turn".to_string(),
             round: 0,
             request_fingerprint: format!("fingerprint-{request_id}"),
-            provider_turn_id: format!("provider-{request_id}"),
             effective_auth_profile: Some("openai-2".to_string()),
             context_format_version: None,
             compatibility_key: None,
@@ -1947,63 +1947,82 @@ mod tests {
         }
     }
 
-    #[test]
-    fn legacy_context_usage_token_fields_decode_without_changing_current_encoding() {
-        let legacy = serde_json::json!({
-            "invocation": invocation("legacy", 1),
-            "context_through_sequence": 42,
-            "input_tokens": 1234,
-            "estimated_input_tokens": 1200,
-            "source": "estimated"
-        });
-
-        let snapshot: ContextUsageSnapshot =
-            serde_json::from_value(legacy).expect("legacy context usage should decode");
-        assert_eq!(snapshot.context_input_tokens, 1234);
-        assert_eq!(snapshot.local_request_estimate_tokens, 1200);
-
-        let encoded = serde_json::to_value(snapshot).expect("current context usage should encode");
-        assert_eq!(encoded["context_input_tokens"], 1234);
-        assert_eq!(encoded["local_request_estimate_tokens"], 1200);
-        assert!(encoded.get("input_tokens").is_none());
-        assert!(encoded.get("estimated_input_tokens").is_none());
+    const fn estimate(tokens: u64, algorithm_version: u16) -> LocalContextEstimate {
+        LocalContextEstimate {
+            tokens,
+            algorithm_version,
+        }
     }
 
     #[test]
     fn context_estimate_calibrates_from_compatible_anchor() {
-        let estimate = ContextOccupancy::project_estimate(None, invocation("one", 3), 1, 42);
-        let current = ContextOccupancy::reconcile(None, 3, 4, estimate.clone())
+        let projected = RequestContextOccupancy::project_estimate(
+            None,
+            invocation("one", 3),
+            1,
+            estimate(42, 1),
+        );
+        let current = RequestContextOccupancy::reconcile(None, 3, 4, projected.clone())
             .expect("estimate should establish occupancy");
-        let mut exact = estimate;
-        exact.source = ContextUsageSource::Provider;
-        exact.context_input_tokens = 40;
-        let confirmed = ContextOccupancy::reconcile(Some(&current), 3, 5, exact)
+        let exact = RequestContextObservation {
+            context_tokens: RequestContextTokenCount::ProviderExact(40),
+            ..projected
+        };
+        let confirmed = RequestContextOccupancy::reconcile(Some(&current), 3, 5, exact)
             .expect("same request should confirm occupancy");
-        let projected =
-            ContextOccupancy::project_estimate(Some(&confirmed), invocation("two", 3), 2, 52);
+        let next = RequestContextOccupancy::project_estimate(
+            Some(&confirmed),
+            invocation("two", 3),
+            2,
+            estimate(52, 1),
+        );
 
-        assert_eq!(confirmed.snapshot.context_input_tokens, 40);
-        assert_eq!(projected.context_input_tokens, 50);
-        assert_eq!(projected.local_request_estimate_tokens, 52);
+        assert_eq!(confirmed.observation.context_tokens.tokens(), 40);
+        assert_eq!(next.context_tokens.tokens(), 50);
+    }
+
+    #[test]
+    fn estimator_version_change_disables_calibration() {
+        let anchor = RequestContextOccupancy {
+            context_epoch: 3,
+            observation_sequence: 5,
+            observation: RequestContextObservation {
+                request: invocation("one", 3),
+                context_through_sequence: 1,
+                context_tokens: RequestContextTokenCount::ProviderExact(100),
+                local_estimate: estimate(120, 1),
+            },
+        };
+        let projected = RequestContextOccupancy::project_estimate(
+            Some(&anchor),
+            invocation("two", 3),
+            2,
+            estimate(90, 2),
+        );
+
+        assert_eq!(projected.context_tokens.tokens(), 90);
     }
 
     #[test]
     fn context_estimate_supports_negative_delta() {
-        let anchor = ContextOccupancy {
+        let anchor = RequestContextOccupancy {
             context_epoch: 3,
             observation_sequence: 5,
-            snapshot: ContextUsageSnapshot {
-                invocation: invocation("one", 3),
+            observation: RequestContextObservation {
+                request: invocation("one", 3),
                 context_through_sequence: 1,
-                context_input_tokens: 100,
-                local_request_estimate_tokens: 120,
-                source: ContextUsageSource::Provider,
+                context_tokens: RequestContextTokenCount::ProviderExact(100),
+                local_estimate: estimate(120, 1),
             },
         };
-        let projected =
-            ContextOccupancy::project_estimate(Some(&anchor), invocation("two", 3), 2, 90);
+        let projected = RequestContextOccupancy::project_estimate(
+            Some(&anchor),
+            invocation("two", 3),
+            2,
+            estimate(90, 1),
+        );
 
-        assert_eq!(projected.context_input_tokens, 70);
+        assert_eq!(projected.context_tokens.tokens(), 70);
     }
 
     #[test]

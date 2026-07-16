@@ -137,7 +137,7 @@ pub enum MaterializedProjection {
     /// Runtime-work lifecycle rows.
     RuntimeWork,
     /// Authoritative current context occupancy.
-    ContextOccupancy,
+    RequestContextOccupancy,
 }
 
 impl MaterializedProjection {
@@ -148,7 +148,7 @@ impl MaterializedProjection {
         Self::ToolRuns,
         Self::ArtifactReferences,
         Self::RuntimeWork,
-        Self::ContextOccupancy,
+        Self::RequestContextOccupancy,
     ];
 
     /// Return all checkpointed materialized projections.
@@ -167,7 +167,7 @@ impl MaterializedProjection {
             Self::ToolRuns => "tool_runs",
             Self::ArtifactReferences => "artifact_references",
             Self::RuntimeWork => "runtime_work",
-            Self::ContextOccupancy => "context_occupancy",
+            Self::RequestContextOccupancy => "context_occupancy",
         }
     }
 }
@@ -1430,7 +1430,7 @@ impl SessionDb {
         let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
         if schema_version != u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION) {
             return Err(SessionDbError::ProjectionIncompatible {
-                projection: MaterializedProjection::ContextOccupancy.as_str(),
+                projection: MaterializedProjection::RequestContextOccupancy.as_str(),
                 actual: schema_version,
                 expected: u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION),
             });
@@ -1445,14 +1445,14 @@ impl SessionDb {
     /// Returns an error when the projection is stale, incompatible, or malformed.
     pub async fn current_context_occupancy(
         &self,
-    ) -> SessionDbResult<Option<bcode_session_models::ContextOccupancy>> {
+    ) -> SessionDbResult<Option<bcode_session_models::RequestContextOccupancy>> {
         let expected = self.last_event_sequence().await?.unwrap_or_default();
         let checkpoint = self
-            .materialized_projection_checkpoint(MaterializedProjection::ContextOccupancy)
+            .materialized_projection_checkpoint(MaterializedProjection::RequestContextOccupancy)
             .await?;
         if checkpoint != Some(expected) {
             return Err(SessionDbError::ProjectionStale {
-                projection: MaterializedProjection::ContextOccupancy.as_str(),
+                projection: MaterializedProjection::RequestContextOccupancy.as_str(),
                 checkpoint,
                 expected,
             });
@@ -1470,7 +1470,7 @@ impl SessionDb {
         let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
         if schema_version != u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION) {
             return Err(SessionDbError::ProjectionIncompatible {
-                projection: MaterializedProjection::ContextOccupancy.as_str(),
+                projection: MaterializedProjection::RequestContextOccupancy.as_str(),
                 actual: schema_version,
                 expected: u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION),
             });
@@ -2084,7 +2084,7 @@ async fn project_context_occupancy_event(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    use bcode_session_models::{ContextOccupancy, SessionEventKind};
+    use bcode_session_models::{RequestContextOccupancy, SessionEventKind};
 
     let row = db
         .select("context_occupancy_projection")
@@ -2099,7 +2099,7 @@ async fn project_context_occupancy_event(
         }
         let context_epoch = required_i64(row, "context_epoch").map(i64_to_u64)?;
         let current = optional_string(row, "occupancy_json")
-            .map(|json| serde_json::from_str::<ContextOccupancy>(&json))
+            .map(|json| serde_json::from_str::<RequestContextOccupancy>(&json))
             .transpose()?;
         (context_epoch, current)
     } else {
@@ -2110,13 +2110,13 @@ async fn project_context_occupancy_event(
         SessionEventKind::ModelChanged { .. }
         | SessionEventKind::ContextCompacted { .. }
         | SessionEventKind::ProviderContextCompacted { .. } => (event.sequence, None),
-        SessionEventKind::ContextUsageObserved { snapshot } => (
+        SessionEventKind::RequestContextObserved { observation } => (
             context_epoch,
-            ContextOccupancy::reconcile(
+            RequestContextOccupancy::reconcile(
                 current.as_ref(),
                 context_epoch,
                 event.sequence,
-                snapshot.clone(),
+                observation.clone(),
             ),
         ),
         _ => (context_epoch, current),
@@ -2493,7 +2493,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ModelUsage { .. } => "model_usage",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
         SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
-        SessionEventKind::ContextUsageObserved { .. } => "context_usage_observed",
+        SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
         SessionEventKind::SessionRenamed { .. } => "session_renamed",
         SessionEventKind::TraceEvent { .. } => "trace_event",
         SessionEventKind::SkillInvoked { .. } => "skill_invoked",
@@ -2746,7 +2746,7 @@ const MODEL_CONTEXT_EVENT_TYPES: &[&str] = &[
     "working_directory_changed",
     "context_compacted",
     "provider_context_compacted",
-    "context_usage_observed",
+    "request_context_observed",
 ];
 
 const fn is_model_context_event_type(event_type: &str) -> bool {
@@ -2760,7 +2760,7 @@ const fn is_model_context_event_type(event_type: &str) -> bool {
             | b"working_directory_changed"
             | b"context_compacted"
             | b"provider_context_compacted"
-            | b"context_usage_observed"
+            | b"request_context_observed"
     )
 }
 
@@ -2826,7 +2826,7 @@ const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static str 
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
         SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
-        SessionEventKind::ContextUsageObserved { .. } => "context_usage_observed",
+        SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
         _ => "non_model_context",
     }
 }
@@ -2927,16 +2927,17 @@ const fn bool_to_value(value: bool) -> DatabaseValue {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ContextUsageSnapshot, ContextUsageSource,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, RequestContextObservation,
+        RequestContextTokenCount,
     };
 
-    fn context_usage_event(session_id: SessionId, sequence: u64) -> SessionEvent {
+    fn request_context_event(session_id: SessionId, sequence: u64) -> SessionEvent {
         event(
             session_id,
             sequence,
-            SessionEventKind::ContextUsageObserved {
-                snapshot: ContextUsageSnapshot {
-                    invocation: bcode_session_models::ModelInvocationIdentity {
+            SessionEventKind::RequestContextObserved {
+                observation: RequestContextObservation {
+                    request: bcode_session_models::ModelRequestIdentity {
                         provider_plugin_id: "provider".to_string(),
                         requested_model_id: Some("alias".to_string()),
                         effective_model_id: "model".to_string(),
@@ -2944,16 +2945,17 @@ mod tests {
                         model_turn_id: format!("turn-{sequence}"),
                         round: 0,
                         request_fingerprint: format!("fingerprint-{sequence}"),
-                        provider_turn_id: format!("provider-turn-{sequence}"),
                         effective_auth_profile: None,
                         context_format_version: None,
                         compatibility_key: None,
                         context_epoch: 0,
                     },
                     context_through_sequence: sequence.saturating_sub(1),
-                    context_input_tokens: sequence,
-                    local_request_estimate_tokens: sequence,
-                    source: ContextUsageSource::Estimated,
+                    context_tokens: RequestContextTokenCount::Estimated(sequence),
+                    local_estimate: bcode_session_models::LocalContextEstimate {
+                        tokens: sequence,
+                        algorithm_version: 1,
+                    },
                 },
             },
         )
@@ -4229,7 +4231,7 @@ mod tests {
         ))
         .await
         .expect("append model boundary");
-        db.append_event(&context_usage_event(session_id, 1))
+        db.append_event(&request_context_event(session_id, 1))
             .await
             .expect("append estimate");
         let occupancy = db
@@ -4300,7 +4302,7 @@ mod tests {
             None
         );
 
-        db.append_event(&context_usage_event(session_id, 1))
+        db.append_event(&request_context_event(session_id, 1))
             .await
             .expect("append current usage");
         assert!(

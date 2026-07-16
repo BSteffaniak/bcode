@@ -183,8 +183,9 @@ impl SessionHandle {
 
     pub async fn current_context_occupancy(
         &self,
-    ) -> Result<Option<bcode_session_models::ContextOccupancy>, SessionError> {
-        self.send(SessionCommand::CurrentContextOccupancy).await?
+    ) -> Result<Option<bcode_session_models::RequestContextOccupancy>, SessionError> {
+        self.send(SessionCommand::CurrentRequestContextOccupancy)
+            .await?
     }
 
     pub async fn model_context_events(&self) -> Result<Vec<SessionEvent>, SessionError> {
@@ -318,8 +319,10 @@ enum SessionCommand {
     },
     InputHistory(oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>),
     CurrentContextEpoch(oneshot::Sender<Result<u64, SessionError>>),
-    CurrentContextOccupancy(
-        oneshot::Sender<Result<Option<bcode_session_models::ContextOccupancy>, SessionError>>,
+    CurrentRequestContextOccupancy(
+        oneshot::Sender<
+            Result<Option<bcode_session_models::RequestContextOccupancy>, SessionError>,
+        >,
     ),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
@@ -455,7 +458,7 @@ impl SessionActor {
                 };
                 let _ = reply.send(result);
             }
-            SessionCommand::CurrentContextOccupancy(reply) => {
+            SessionCommand::CurrentRequestContextOccupancy(reply) => {
                 let _ = reply.send(self.current_context_occupancy().await);
             }
             SessionCommand::ModelContextEvents(reply) => {
@@ -1095,7 +1098,7 @@ impl SessionActor {
 
     async fn current_context_occupancy(
         &mut self,
-    ) -> Result<Option<bcode_session_models::ContextOccupancy>, SessionError> {
+    ) -> Result<Option<bcode_session_models::RequestContextOccupancy>, SessionError> {
         if let Some(db) = self.existing_session_db().await? {
             return Ok(db.current_context_occupancy().await?);
         }

@@ -135,6 +135,7 @@ Minimum expected validation once Rust crates exist:
 - `scripts/check-session-architecture.sh` for session persistence changes
 - `scripts/check-loop-runtime-architecture.sh` for generic runtime, turn scheduling, cancellation, plugin/tool domain isolation, or `/loop` changes
 - `scripts/check-model-catalog-architecture.sh` for model catalog/provider resolution changes
+- `scripts/check-context-accounting-architecture.sh` for model request context estimation, provider usage, occupancy, or context display changes
 - relevant `cargo test` commands for changed packages
 - relevant plugin rebuild/check commands when plugin crates exist
 
