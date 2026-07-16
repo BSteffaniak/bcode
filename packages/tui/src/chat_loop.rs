@@ -38,9 +38,6 @@ use super::{
 
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
-const PERMISSION_POLL_INTERVAL: Duration = Duration::from_millis(750);
-const SESSION_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const PERMISSION_POLL_DAEMON_DOWN_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 struct DraftAutosave {
@@ -117,8 +114,6 @@ struct ChatLoopState {
     effects: TuiEffectRunner,
     daemon_connection: DaemonConnectionMonitor,
     permission_dialog: Option<PermissionDialogState>,
-    permission_poll: PermissionPollSchedule,
-    next_session_status_poll_at: Instant,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     interactive_surface: Option<InteractiveSurfaceState>,
@@ -138,8 +133,6 @@ impl ChatLoopState {
             effects: TuiEffectRunner::new(foreground_client, passive_client, daemon_host),
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
-            permission_poll: PermissionPollSchedule::new(Instant::now()),
-            next_session_status_poll_at: Instant::now(),
             thinking_dialog: None,
             timeline_dialog: None,
             interactive_surface: None,
@@ -178,18 +171,6 @@ impl ChatLoopState {
         }
     }
 
-    fn maybe_start_session_status_poll(&mut self, chat: &ActiveChat) {
-        let Some(session_id) = chat.session_id else {
-            return;
-        };
-        if Instant::now() < self.next_session_status_poll_at {
-            return;
-        }
-        if self.start_effect(TuiEffect::LoadSessionStatus { session_id }) {
-            self.next_session_status_poll_at = Instant::now() + SESSION_STATUS_POLL_INTERVAL;
-        }
-    }
-
     const fn has_blocking_surface(&self) -> bool {
         self.palette.is_some()
             || self.slash_palette.is_some()
@@ -207,18 +188,6 @@ impl ChatLoopState {
         self.automation_hold
             .sync(client, session_id, self.has_blocking_surface())
             .await
-    }
-
-    fn maybe_start_permission_poll(&mut self, chat: &ActiveChat) {
-        if self.permission_dialog.is_some()
-            || Instant::now() < self.permission_poll.next_poll_at
-            || chat.session_id.is_none()
-        {
-            return;
-        }
-        if self.start_effect(TuiEffect::ListPermissions) {
-            self.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
-        }
     }
 }
 
@@ -300,17 +269,6 @@ impl DaemonConnectionMonitor {
                 })
             }
         }
-    }
-}
-
-#[derive(Debug)]
-struct PermissionPollSchedule {
-    next_poll_at: Instant,
-}
-
-impl PermissionPollSchedule {
-    const fn new(now: Instant) -> Self {
-        Self { next_poll_at: now }
     }
 }
 
@@ -564,8 +522,6 @@ async fn handle_loop_housekeeping(
     needs_redraw |= loop_state.drain_pending_effects(chat);
     needs_redraw |= maybe_start_older_history_load(chat, loop_state);
     needs_redraw |= maybe_start_newer_history_load(chat, loop_state);
-    loop_state.maybe_start_permission_poll(chat);
-    loop_state.maybe_start_session_status_poll(chat);
     needs_redraw
 }
 
@@ -652,7 +608,7 @@ fn apply_effect_result(
             daemon_connected: _,
             session_id,
             model,
-            active_skill_count,
+            active_skills,
             runtime_work,
             plugin_status,
             error,
@@ -661,11 +617,45 @@ fn apply_effect_result(
                 chat,
                 session_id,
                 model,
-                active_skill_count,
+                active_skills,
                 runtime_work,
                 plugin_status,
                 error,
             );
+        }
+        TuiEffectResult::SessionModelStatusLoaded { session_id, result } => {
+            if chat.session_id == Some(session_id) {
+                match result {
+                    Ok(status)
+                        if status
+                            .requested_model_id
+                            .as_deref()
+                            .or(status.model_id.as_deref())
+                            == chat.app.selected_model_id() =>
+                    {
+                        chat.app.apply_model_status(status);
+                    }
+                    Ok(_stale) => {}
+                    Err(error) => report_nonfatal_client_error(
+                        chat,
+                        "model metadata refresh unavailable",
+                        &error,
+                    ),
+                }
+            }
+        }
+        TuiEffectResult::PluginStatusLoaded {
+            session_id,
+            plugin_status,
+            error,
+        } => {
+            if chat.session_id == Some(session_id) {
+                chat.app.set_plugin_status(plugin_status);
+                if let Some(error) = error {
+                    chat.app
+                        .set_status(format!("Plugin status unavailable: {error}"));
+                }
+            }
         }
         TuiEffectResult::AgentCatalogLoaded { agents } => {
             apply_agent_catalog_result(chat, agents);
@@ -825,7 +815,7 @@ fn apply_session_status_result(
     chat: &mut ActiveChat,
     session_id: bcode_session_models::SessionId,
     model: Option<bcode_ipc::SessionModelStatus>,
-    active_skill_count: Option<usize>,
+    active_skills: Option<Vec<bcode_skill_models::SkillContextResponse>>,
     runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
     plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
     error: Option<String>,
@@ -845,10 +835,13 @@ fn apply_session_status_result(
     if let Some(model) = model {
         chat.app.apply_model_status(model);
     }
+    if let Some(skills) = active_skills {
+        chat.app.set_active_skills(&skills);
+    }
     if let Some(work) = runtime_work {
         chat.app.apply_runtime_work_snapshots(&work);
     }
-    let skill_count = active_skill_count.unwrap_or(0);
+    let skill_count = chat.app.active_skill_count();
     if let Some(error) = error {
         chat.app
             .set_status(format!("Session status unavailable: {error}"));
@@ -928,12 +921,7 @@ fn apply_permission_list_result(
                 loop_state.permission_dialog = Some(PermissionDialogState::new(permission));
             }
         }
-        Err(error) => {
-            if error.is_daemon_unavailable() {
-                loop_state.permission_poll.next_poll_at =
-                    Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;
-            }
-        }
+        Err(_error) => {}
     }
 }
 
@@ -1544,6 +1532,36 @@ async fn absorb_bcode_event(
                 chat.agents
                     .apply_agent_to_app(&mut chat.app, agent_id.clone());
             } else {
+                if matches!(event.kind, SessionEventKind::PermissionRequested { .. }) {
+                    loop_state.replace_effect(TuiEffect::ListPermissions);
+                }
+                if matches!(event.kind, SessionEventKind::ModelChanged { .. }) {
+                    loop_state.abort_matching_effect(&TuiEffect::LoadSessionStatus {
+                        session_id: event.session_id,
+                    });
+                    loop_state.replace_effect(TuiEffect::LoadSessionModelStatus {
+                        session_id: event.session_id,
+                    });
+                }
+                if matches!(
+                    event.kind,
+                    SessionEventKind::RalphLifecycle { .. }
+                        | SessionEventKind::PluginStatusNote { .. }
+                        | SessionEventKind::PluginAutomationTurnStarted { .. }
+                        | SessionEventKind::PluginAutomationTurnFinished { .. }
+                ) {
+                    loop_state.replace_effect(TuiEffect::LoadPluginStatus {
+                        session_id: event.session_id,
+                    });
+                }
+                if let SessionEventKind::PermissionResolved { permission_id, .. } = &event.kind
+                    && loop_state
+                        .permission_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.permission_id() == permission_id)
+                {
+                    loop_state.permission_dialog = None;
+                }
                 maybe_open_interactive_surface(loop_state, &event.kind).await;
                 chat.app.absorb_session_event(&event);
             }
@@ -1553,9 +1571,21 @@ async fn absorb_bcode_event(
             chat.app.absorb_session_live_event(&event);
             true
         }
+        BcodeEvent::RuntimeWork(event) if Some(event.session_id) == chat.session_id => {
+            chat.app.absorb_session_event(&event);
+            true
+        }
+        BcodeEvent::SessionViewResyncRequired { session_id }
+            if Some(session_id) == chat.session_id =>
+        {
+            loop_state.replace_effect(TuiEffect::LoadSessionStatus { session_id });
+            loop_state.replace_effect(TuiEffect::ListPermissions);
+            true
+        }
         BcodeEvent::Session(_)
         | BcodeEvent::SessionLive(_)
         | BcodeEvent::RuntimeWork(_)
+        | BcodeEvent::SessionViewResyncRequired { .. }
         | BcodeEvent::SessionCatalogUpdated { .. } => false,
     }
 }

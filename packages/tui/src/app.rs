@@ -321,6 +321,7 @@ pub struct BmuxApp {
     daemon_connection: DaemonConnectionState,
     status: String,
     plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
+    active_skills: BTreeSet<bcode_skill_models::SkillId>,
     key_hints: String,
     jump_to_latest_key_label: String,
     tui_config: TuiConfig,
@@ -537,6 +538,7 @@ impl BmuxApp {
             daemon_connection: DaemonConnectionState::Connecting,
             status: String::from("Connecting to daemon… Enter submits; Esc/Ctrl-C exits."),
             plugin_status: Vec::new(),
+            active_skills: BTreeSet::new(),
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
             tui_config: TuiConfig::default(),
@@ -1298,6 +1300,17 @@ impl BmuxApp {
     #[must_use]
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    /// Replace active skills from the bounded attach/reconnect snapshot.
+    pub fn set_active_skills(&mut self, skills: &[bcode_skill_models::SkillContextResponse]) {
+        self.active_skills = skills.iter().map(|skill| skill.skill_id.clone()).collect();
+    }
+
+    /// Return the number of active skills maintained by session events.
+    #[must_use]
+    pub fn active_skill_count(&self) -> usize {
+        self.active_skills.len()
     }
 
     /// Return active plugin-owned session status contributions.
@@ -2334,6 +2347,11 @@ impl BmuxApp {
             SessionEventKind::ModelChanged { provider, model } => {
                 self.apply_model_changed(provider, model);
             }
+            SessionEventKind::ReasoningChanged { effort, summary } => {
+                self.reasoning_effort.clone_from(effort);
+                self.reasoning_summary.clone_from(summary);
+                self.refresh_thinking_label();
+            }
             SessionEventKind::ModelTurnStarted { .. } if application.live_activity() => {
                 self.set_activity(ActivityState::PreparingModelRequest);
             }
@@ -2374,9 +2392,11 @@ impl BmuxApp {
                 skill_id, reason, ..
             } => self.push_skill_suggested(skill_id, reason.as_deref()),
             SessionEventKind::SkillActivated { skill_id, .. } => {
+                self.active_skills.insert(skill_id.clone());
                 self.status = format!("activated skill: {skill_id}");
             }
             SessionEventKind::SkillDeactivated { skill_id, .. } => {
+                self.active_skills.remove(skill_id);
                 self.status = format!("deactivated skill: {skill_id}");
             }
             SessionEventKind::SkillContextLoaded {
@@ -4477,6 +4497,72 @@ mod tests {
             local_request_estimate_tokens: input_tokens,
             source,
         }
+    }
+
+    #[test]
+    fn history_with_reasoning_change_builds_without_recursive_rebuild() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = vec![bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ReasoningChanged {
+                effort: Some("high".to_owned()),
+                summary: Some("detailed".to_owned()),
+            },
+        }];
+
+        let app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+        assert_eq!(app.reasoning_effort(), Some("high"));
+        assert_eq!(app.reasoning_summary(), Some("detailed"));
+    }
+
+    #[test]
+    fn reasoning_and_skill_projections_are_event_driven() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let skill_id = bcode_skill_models::SkillId::new("event-skill");
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+
+        app.absorb_session_event(&event(
+            1,
+            bcode_session_models::SessionEventKind::ReasoningChanged {
+                effort: Some("high".to_owned()),
+                summary: Some("detailed".to_owned()),
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            bcode_session_models::SessionEventKind::SkillActivated {
+                skill_id: skill_id.clone(),
+                source: None,
+                mode: bcode_skill_models::SkillActivationMode::Explicit,
+                activated_at_ms: 2,
+            },
+        ));
+
+        assert_eq!(app.reasoning_effort(), Some("high"));
+        assert_eq!(app.reasoning_summary(), Some("detailed"));
+        assert_eq!(app.active_skill_count(), 1);
+
+        app.absorb_session_event(&event(
+            3,
+            bcode_session_models::SessionEventKind::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms: 3,
+            },
+        ));
+        assert_eq!(app.active_skill_count(), 0);
     }
 
     #[test]

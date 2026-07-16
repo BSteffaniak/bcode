@@ -1431,6 +1431,10 @@ pub enum Event {
     Session(SessionEvent),
     SessionLive(SessionLiveEvent),
     RuntimeWork(SessionEvent),
+    /// Local/client signal that a reattached session view needs one bounded snapshot refresh.
+    SessionViewResyncRequired {
+        session_id: SessionId,
+    },
     SessionCatalogUpdated {
         #[serde(default)]
         revision: u64,

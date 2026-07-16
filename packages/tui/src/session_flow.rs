@@ -203,6 +203,7 @@ pub fn complete_switch_session(
                 .apply_runtime_selection(attached.runtime_selection.clone());
             chat.app.set_status("session opened".to_owned());
             chat.replace_effect(super::effects::TuiEffect::LoadSessionStatus { session_id });
+            chat.start_effect(super::effects::TuiEffect::ListPermissions);
         }
         Err(error) => {
             chat.app.set_status(format!("session open failed: {error}"));

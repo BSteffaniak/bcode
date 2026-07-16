@@ -25,6 +25,12 @@ impl PermissionDialogState {
         &self.permission
     }
 
+    /// Return the pending permission identity.
+    #[must_use]
+    pub fn permission_id(&self) -> &str {
+        &self.permission.permission_id
+    }
+
     /// Return whether the focused action should remember the policy decision.
     #[must_use]
     pub const fn focused_remember(&self) -> bool {

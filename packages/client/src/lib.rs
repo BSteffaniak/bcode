@@ -631,7 +631,8 @@ impl SessionCatalogWatcher {
                 Event::SessionCatalogUpdated { .. }
                 | Event::Session(_)
                 | Event::SessionLive(_)
-                | Event::RuntimeWork(_) => {}
+                | Event::RuntimeWork(_)
+                | Event::SessionViewResyncRequired { .. } => {}
             }
         }
     }
@@ -672,7 +673,9 @@ impl SessionWatcher {
                 Event::SessionLive(event) => {
                     return Ok(SessionWatchEvent::Live(Box::new(event)));
                 }
-                Event::RuntimeWork(_) | Event::SessionCatalogUpdated { .. } => {}
+                Event::RuntimeWork(_)
+                | Event::SessionViewResyncRequired { .. }
+                | Event::SessionCatalogUpdated { .. } => {}
             }
         }
     }
@@ -694,8 +697,10 @@ impl RuntimeWorkWatcher {
         loop {
             match self.connection.recv_event().await? {
                 Event::RuntimeWork(event) => return Ok(event),
-                Event::Session(_) | Event::SessionLive(_) | Event::SessionCatalogUpdated { .. } => {
-                }
+                Event::Session(_)
+                | Event::SessionLive(_)
+                | Event::SessionViewResyncRequired { .. }
+                | Event::SessionCatalogUpdated { .. } => {}
             }
         }
     }

@@ -330,6 +330,7 @@ const fn client_event_kind(event: &Event) -> &'static str {
         Event::Session(_) => "session",
         Event::SessionLive(_) => "session_live",
         Event::RuntimeWork(_) => "runtime_work",
+        Event::SessionViewResyncRequired { .. } => "session_view_resync_required",
         Event::SessionCatalogUpdated { .. } => "session_catalog_updated",
     }
 }
@@ -16953,6 +16954,27 @@ async fn request_tool_permission(
     );
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
     let agent_id = session_agent_selection(state, session_id).await;
+    let pending = PendingPermission {
+        summary: PermissionSummary {
+            permission_id: permission_id.clone(),
+            session_id,
+            tool_call_id: call.id.clone(),
+            tool_name: definition.name.clone(),
+            arguments_json: arguments_json.clone(),
+            agent_id,
+            policy_source: policy_context.source.clone(),
+            policy_reason: policy_context.reason.clone(),
+            can_remember_policy: policy_context.skill_decision_key.is_some(),
+        },
+        decision: Arc::new(Mutex::new(None)),
+        notify: Arc::new(Notify::new()),
+        skill_decision_key: policy_context.skill_decision_key,
+    };
+    state
+        .pending_permissions
+        .lock()
+        .await
+        .insert(permission_id.clone(), pending.clone());
     append_permission_requested_event(
         state,
         session_id,
@@ -16961,10 +16983,10 @@ async fn request_tool_permission(
             tool_call_id: call.id.clone(),
             producer_plugin_id: Some(producer_plugin_id.to_owned()),
             tool_name: definition.name.clone(),
-            arguments_json: arguments_json.clone(),
+            arguments_json,
             legacy_request_presentation: None,
-            policy_source: policy_context.source.clone(),
-            policy_reason: policy_context.reason.clone(),
+            policy_source: policy_context.source,
+            policy_reason: policy_context.reason,
         },
     )
     .await;
@@ -16982,27 +17004,6 @@ async fn request_tool_permission(
     )
     .await;
     let wait_start = Instant::now();
-    let pending = PendingPermission {
-        summary: PermissionSummary {
-            permission_id: permission_id.clone(),
-            session_id,
-            tool_call_id: call.id.clone(),
-            tool_name: definition.name.clone(),
-            arguments_json,
-            agent_id,
-            policy_source: policy_context.source,
-            policy_reason: policy_context.reason,
-            can_remember_policy: policy_context.skill_decision_key.is_some(),
-        },
-        decision: Arc::new(Mutex::new(None)),
-        notify: Arc::new(Notify::new()),
-        skill_decision_key: policy_context.skill_decision_key,
-    };
-    state
-        .pending_permissions
-        .lock()
-        .await
-        .insert(permission_id, pending.clone());
     loop {
         let decision = *pending.decision.lock().await;
         if let Some(decision) = decision {
@@ -18720,13 +18721,17 @@ fn forward_session_events(
             let event = tokio::select! {
                 durable = events.recv() => match durable {
                     Ok(event) => Event::Session(event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(
+                        tokio::sync::broadcast::error::RecvError::Lagged(_)
+                        | tokio::sync::broadcast::error::RecvError::Closed,
+                    ) => break,
                 },
                 live = live_events.recv() => match live {
                     Ok(event) => Event::SessionLive(event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(
+                        tokio::sync::broadcast::error::RecvError::Lagged(_)
+                        | tokio::sync::broadcast::error::RecvError::Closed,
+                    ) => break,
                 },
             };
             if let Err(error) = sink.send(event).await {

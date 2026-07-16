@@ -103,6 +103,10 @@ pub enum TuiEffect {
         /// Session to hydrate.
         session_id: SessionId,
     },
+    /// Refresh resolved model metadata after a model event.
+    LoadSessionModelStatus { session_id: SessionId },
+    /// Refresh plugin-owned status after a plugin lifecycle event.
+    LoadPluginStatus { session_id: SessionId },
     /// Load agent metadata.
     LoadAgentCatalog,
     /// Load an older history page before the currently displayed timeline.
@@ -119,7 +123,7 @@ pub enum TuiEffect {
         /// Pagination cursor.
         cursor: SessionHistoryCursor,
     },
-    /// Poll pending permission requests.
+    /// Load the bounded pending-permission snapshot during attach/reconnect.
     ListPermissions,
     /// Save composer draft text for a scope.
     SaveDraft {
@@ -336,13 +340,24 @@ pub enum TuiEffectResult {
         session_id: SessionId,
         /// Model status, if available.
         model: Option<bcode_ipc::SessionModelStatus>,
-        /// Active skill count, if available.
-        active_skill_count: Option<usize>,
+        /// Active skills captured during bounded attach hydration.
+        active_skills: Option<Vec<bcode_skill_models::SkillContextResponse>>,
         /// Runtime work snapshots, if available.
         runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
         /// Active plugin-owned status contributions, replacing the previous set atomically.
         plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
         /// First non-critical error encountered.
+        error: Option<String>,
+    },
+    /// Targeted model projection refresh completed.
+    SessionModelStatusLoaded {
+        session_id: SessionId,
+        result: Result<bcode_ipc::SessionModelStatus, ClientError>,
+    },
+    /// Targeted plugin status projection refresh completed.
+    PluginStatusLoaded {
+        session_id: SessionId,
+        plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
         error: Option<String>,
     },
     /// Agent metadata load completed.
@@ -512,6 +527,14 @@ impl TuiEffectResult {
                 error,
                 ..
             } => DaemonObservation::from_optional_error(*daemon_connected, error.as_deref()),
+            Self::SessionModelStatusLoaded { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
+            Self::PluginStatusLoaded { error, .. } => {
+                error.as_ref().map_or(DaemonObservation::Success, |error| {
+                    DaemonObservation::Failed(error.clone())
+                })
+            }
             Self::AgentCatalogLoaded { agents } => match agents {
                 Ok(_) => DaemonObservation::Success,
                 Err(error) => DaemonObservation::Unavailable(error.clone()),
@@ -594,6 +617,8 @@ enum EffectKey {
     AuthSecurity,
     DraftStatus,
     SessionStatus,
+    SessionModelStatus,
+    PluginStatus,
     AgentCatalog,
     OlderHistory,
     NewerHistory,
@@ -651,8 +676,19 @@ impl TuiEffect {
                 daemon_connected: false,
                 session_id,
                 model: None,
-                active_skill_count: None,
+                active_skills: None,
                 runtime_work: None,
+                plugin_status: Vec::new(),
+                error: Some(client_error.to_string()),
+            },
+            Self::LoadSessionModelStatus { session_id } => {
+                TuiEffectResult::SessionModelStatusLoaded {
+                    session_id,
+                    result: Err(client_error),
+                }
+            }
+            Self::LoadPluginStatus { session_id } => TuiEffectResult::PluginStatusLoaded {
+                session_id,
                 plugin_status: Vec::new(),
                 error: Some(client_error.to_string()),
             },
@@ -777,6 +813,8 @@ impl TuiEffect {
             }
             | Self::LoadConfig
             | Self::ReconcileAuthSecurity { .. }
+            | Self::LoadSessionModelStatus { .. }
+            | Self::LoadPluginStatus { .. }
             | Self::LoadOlderHistory { .. }
             | Self::LoadNewerHistory { .. }
             | Self::ListPermissions
@@ -982,6 +1020,8 @@ impl TuiEffect {
             Self::ReconcileAuthSecurity { .. } => EffectKey::AuthSecurity,
             Self::LoadDraftStatus { .. } => EffectKey::DraftStatus,
             Self::LoadSessionStatus { .. } => EffectKey::SessionStatus,
+            Self::LoadSessionModelStatus { .. } => EffectKey::SessionModelStatus,
+            Self::LoadPluginStatus { .. } => EffectKey::PluginStatus,
             Self::LoadAgentCatalog => EffectKey::AgentCatalog,
             Self::LoadOlderHistory { .. } => EffectKey::OlderHistory,
             Self::LoadNewerHistory { .. } => EffectKey::NewerHistory,
@@ -1039,6 +1079,20 @@ impl TuiEffect {
             } => load_draft_status(&client, launch_working_directory).await,
             Self::LoadSessionStatus { session_id } => {
                 Box::pin(load_session_status(&client, session_id)).await
+            }
+            Self::LoadSessionModelStatus { session_id } => {
+                TuiEffectResult::SessionModelStatusLoaded {
+                    session_id,
+                    result: client.session_model_status(session_id).await,
+                }
+            }
+            Self::LoadPluginStatus { session_id } => {
+                let (plugin_status, error) = load_plugin_session_status(&client, session_id).await;
+                TuiEffectResult::PluginStatusLoaded {
+                    session_id,
+                    plugin_status,
+                    error,
+                }
             }
             Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
                 agents: AgentCatalog::load(&client)
@@ -1472,7 +1526,7 @@ async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> Tui
         daemon_connected: model.is_some() || active_skills.is_some() || runtime_work.is_some(),
         session_id,
         model,
-        active_skill_count: active_skills.map(|skills| skills.len()),
+        active_skills,
         runtime_work,
         plugin_status,
         error: model_error

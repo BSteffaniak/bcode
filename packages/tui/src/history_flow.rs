@@ -188,7 +188,7 @@ fn spawn_reconnecting_recent_event_stream(
                     connection
                         .attach_session_recent_with_input_history(session_id, limit)
                         .await
-                        .map(|_| ())
+                        .map(resynchronization_events)
                 })
             },
         )
@@ -215,12 +215,36 @@ fn spawn_reconnecting_window_event_stream(
                     connection
                         .attach_session_projection_window_with_input_history(session_id, request)
                         .await
-                        .map(|_| ())
+                        .map(resynchronization_events)
                 })
             },
         )
         .await;
     })
+}
+
+fn resynchronization_events(attached: bcode_client::AttachedSessionHistory) -> Vec<BcodeEvent> {
+    attached
+        .history
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                bcode_session_models::SessionEventKind::ModelChanged { .. }
+                    | bcode_session_models::SessionEventKind::ReasoningChanged { .. }
+                    | bcode_session_models::SessionEventKind::SkillActivated { .. }
+                    | bcode_session_models::SessionEventKind::SkillDeactivated { .. }
+                    | bcode_session_models::SessionEventKind::ContextUsageObserved { .. }
+                    | bcode_session_models::SessionEventKind::PermissionRequested { .. }
+                    | bcode_session_models::SessionEventKind::PermissionResolved { .. }
+                    | bcode_session_models::SessionEventKind::RuntimeWorkStarted { .. }
+                    | bcode_session_models::SessionEventKind::RuntimeWorkCancelRequested { .. }
+                    | bcode_session_models::SessionEventKind::RuntimeWorkProgress { .. }
+                    | bcode_session_models::SessionEventKind::RuntimeWorkFinished { .. }
+            )
+        })
+        .map(BcodeEvent::Session)
+        .collect()
 }
 
 async fn reconnecting_event_stream<F>(
@@ -235,7 +259,9 @@ async fn reconnecting_event_stream<F>(
             SessionId,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<(), bcode_client::ClientError>> + Send + 'a,
+                dyn std::future::Future<Output = Result<Vec<BcodeEvent>, bcode_client::ClientError>>
+                    + Send
+                    + 'a,
             >,
         > + Send
         + 'static,
@@ -255,7 +281,18 @@ async fn reconnecting_event_stream<F>(
                 }
                 match client.connect("bcode-tui-bmux").await {
                     Ok(mut next_connection) => {
-                        if attach(&mut next_connection, session_id).await.is_ok() {
+                        if let Ok(events) = attach(&mut next_connection, session_id).await {
+                            if event_sender
+                                .send(BcodeEvent::SessionViewResyncRequired { session_id })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            for event in events {
+                                if event_sender.send(event).is_err() {
+                                    return;
+                                }
+                            }
                             connection = next_connection;
                             break;
                         }

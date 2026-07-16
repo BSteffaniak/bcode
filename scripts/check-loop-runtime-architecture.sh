@@ -6,6 +6,18 @@ cd "$root"
 
 violations=0
 
+if rg -n 'SESSION_STATUS_POLL_INTERVAL|PERMISSION_POLL_INTERVAL|maybe_start_(session_status|permission)_poll|PermissionPollSchedule' packages/tui/src --glob '*.rs' >/tmp/bcode-tui-sync-polling.txt; then
+  echo "Runtime architecture violation: TUI state synchronization must be snapshot/event-driven, not polling-driven." >&2
+  cat /tmp/bcode-tui-sync-polling.txt >&2
+  violations=1
+fi
+
+if rg -n 'RecvError::Lagged\(_\) => continue' packages/server/src packages/client/src --glob '*.rs' >/tmp/bcode-silent-event-lag.txt; then
+  echo "Runtime architecture violation: event-stream lag must trigger explicit resynchronization, not silent continuation." >&2
+  cat /tmp/bcode-silent-event-lag.txt >&2
+  violations=1
+fi
+
 expected_feature_files="$(cat <<'EOF'
 packages/cli/src/lib.rs
 packages/client/src/lib.rs
@@ -23,7 +35,7 @@ plugins/loop-plugin/src/lib.rs
 EOF
 )"
 actual_feature_files="$(
-  rg -l 'PluginAutomation|plugin_automation|PluginStatusNote|clone_session_at_generation|SESSION_STATUS_POLL_INTERVAL|automation_hold' \
+  rg -l 'PluginAutomation|plugin_automation|PluginStatusNote|clone_session_at_generation|automation_hold' \
     packages plugins --glob '*.rs' | sort
 )"
 if [[ "$actual_feature_files" != "$expected_feature_files" ]]; then

@@ -151,6 +151,7 @@ async fn stream_plugin_session_events_inner(
             BcodeEvent::Session(_)
             | BcodeEvent::SessionLive(_)
             | BcodeEvent::RuntimeWork(_)
+            | BcodeEvent::SessionViewResyncRequired { .. }
             | BcodeEvent::SessionCatalogUpdated { .. } => None,
         };
         let Some(plugin_event) = plugin_event else {
