@@ -26075,6 +26075,134 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Verifies one complete durable result/reference/projection boundary.
+    async fn finalized_artifact_result_is_durable_and_projected_without_live_payloads() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join("sessions");
+        let sessions = SessionManager::persistent(&root).expect("persistent sessions");
+        let summary = sessions
+            .create_session(Some("artifact-result".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+        state
+            .sessions
+            .append_tool_call_requested(
+                session_id,
+                bcode_session::AppendToolCallRequestedInput {
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "fixture.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    producer_plugin_id: Some("fixture.plugin".to_owned()),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            )
+            .await
+            .expect("append tool request");
+        let semantic_result = ToolInvocationResult::Artifact {
+            artifact: Box::new(bcode_session_models::ToolArtifact {
+                artifact_id: "artifact-1".to_owned(),
+                producer_plugin_id: "fixture.plugin".to_owned(),
+                schema: "fixture.recording".to_owned(),
+                schema_version: 1,
+                tool_call_id: Some("call-1".to_owned()),
+                title: Some("Recording".to_owned()),
+                metadata: serde_json::json!({"summary": "bounded"}),
+                refs: vec![bcode_session_models::ToolArtifactRef {
+                    key: "recording".to_owned(),
+                    content_type: Some("application/octet-stream".to_owned()),
+                    storage_uri: Some("recording.bin".to_owned()),
+                    byte_len: Some(42),
+                    metadata: Some(serde_json::json!({
+                        "availability": "complete",
+                        "complete": true,
+                        "checksum_sha256": "abc123"
+                    })),
+                }],
+            }),
+        };
+        let event = append_tool_finished_event_inner(
+            &state,
+            session_id,
+            ToolFinishedEventInput {
+                tool_call_id: "call-1".to_owned(),
+                result: "bounded final result".to_owned(),
+                is_error: false,
+                content: Vec::new(),
+                output: None,
+                semantic_result: Some(semantic_result.clone()),
+            },
+        )
+        .await
+        .expect("append final artifact result");
+        assert!(matches!(
+            event.kind,
+            SessionEventKind::ToolCallFinished {
+                semantic_result: Some(ref result),
+                ..
+            } if result == &semantic_result
+        ));
+        let reference = state
+            .sessions
+            .finalized_artifact_reference(session_id, "artifact-1", "recording")
+            .await
+            .expect("bounded artifact lookup")
+            .expect("projected reference");
+        assert_eq!(reference.byte_len, Some(42));
+        assert_eq!(reference.checksum_sha256.as_deref(), Some("abc123"));
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::VisualUpdate { .. }
+                    | ToolInvocationStreamEvent::OutputDelta { .. }
+                    | ToolInvocationStreamEvent::ArtifactUpdate { .. }
+            }
+        )));
+        let projection = state
+            .sessions
+            .session_projection_window(
+                session_id,
+                bcode_session_models::ProjectionWindowRequest {
+                    projection: bcode_session_models::SessionProjectionKind::Transcript,
+                    anchor: bcode_session_models::ProjectionWindowAnchor::Latest,
+                    direction: bcode_session_models::ProjectionWindowDirection::Backward,
+                    target: bcode_session_models::ProjectionWindowTarget {
+                        min_items: Some(2),
+                        min_estimated_rows: None,
+                        min_bytes: None,
+                        width_columns: None,
+                    },
+                    limits: bcode_session_models::ProjectionWindowLimits {
+                        max_items: 10,
+                        max_events_scanned: 10,
+                        max_bytes: 4_096,
+                    },
+                },
+            )
+            .await
+            .expect("transcript projection");
+        assert_eq!(projection.transcript_items.len(), 2);
+        assert!(projection.transcript_items.iter().any(|item| {
+            item.kind == bcode_session_models::TranscriptProjectionItemKind::ToolInvocation
+                && item.source_range.end_sequence == event.sequence
+        }));
+        assert!(projection.transcript_items.iter().all(|item| {
+            item.source_range.start_sequence <= item.source_range.end_sequence
+                && item.content_bytes <= 4_096
+        }));
+        remove_session_artifact_dir(&root).expect("session cleanup");
+    }
+
+    #[tokio::test]
     async fn append_tool_finished_event_inner_persists_semantic_result() {
         let sessions = SessionManager::default();
         let summary = sessions

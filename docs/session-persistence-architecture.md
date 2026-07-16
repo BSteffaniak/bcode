@@ -91,6 +91,25 @@ Normal artifact range reads must use this projection and bounded file ranges. Th
 
 Range responses include current file length, projected reference length, finalizing sequence, availability/completeness, checksum, and returned bytes. Current relative references are resolved beneath the session artifact root. Supported legacy absolute/file references remain readable only after canonical path confinement verifies that the target remains beneath that root. Blocking metadata, seek, and read operations run outside async runtime workers.
 
+### Finalized artifact reference projection
+
+Finalized plugin artifact references are materialized transactionally from semantic
+`ToolCallFinished` events into the per-session `artifact_references` table. The projection is keyed
+by `(artifact_id, reference_key)` and contains only generic producer/schema identity, confined
+storage URI, content type, byte length, availability/completeness, checksum, and the canonical
+finalizing sequence. Its materialized-projection checkpoint must equal the canonical event tail;
+missing or stale checkpoints fail with `ProjectionStale` rather than triggering replay or repair.
+
+Normal artifact range reads resolve this projection with one keyed lookup and perform a bounded
+file seek/read behind a blocking boundary. They must never call `session_history()`, scan
+`ToolCallFinished` events, rebuild indexes, or infer shell-specific meaning. Active artifacts use
+the separate in-memory live registry until the durable projection becomes visible; finalized live
+registrations remain available during that handoff so readers do not observe a missing-reference
+window.
+
+The architecture guard verifies that the checkpointed projection exists, normal server artifact
+reads call `finalized_artifact_reference()`, and those reads do not call `session_history()`.
+
 ## Architecture guardrails
 
 Run the session architecture guard before finishing session persistence changes:

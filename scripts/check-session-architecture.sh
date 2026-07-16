@@ -41,4 +41,20 @@ if rg -n "SessionDb::open_turso_in_root" packages/server/src --glob '*.rs' >/tmp
   violations=1
 fi
 
+if ! rg -q 'CREATE TABLE IF NOT EXISTS artifact_references' packages/session/src/db.rs \
+  || ! rg -q 'MaterializedProjection::ArtifactReferences' packages/session/src/db.rs; then
+  echo "Session artifact projection violation: finalized references require a checkpointed bounded projection." >&2
+  violations=1
+fi
+
+artifact_read_body="$(sed -n '/async fn read_session_artifact_range(/,/^async fn handle_delete_session(/p' packages/server/src/lib.rs)"
+if grep -q 'session_history' <<<"$artifact_read_body"; then
+  echo "Session artifact lookup violation: normal range reads must not scan session history." >&2
+  violations=1
+fi
+if ! grep -q 'finalized_artifact_reference' <<<"$artifact_read_body"; then
+  echo "Session artifact lookup violation: finalized reads must use the bounded reference projection." >&2
+  violations=1
+fi
+
 exit "$violations"
