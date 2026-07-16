@@ -15,7 +15,6 @@ pub use contracts::{
     ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution, ToolPreparationRequest, ToolPreparationResponse,
-    ToolResourceAccess, ToolResourceClaim, ToolSchedulingContract,
 };
 
 pub use interaction::{

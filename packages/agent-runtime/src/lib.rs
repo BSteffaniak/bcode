@@ -29,7 +29,7 @@ use bcode_tool::{
     PreparedToolInvocation, ToolAuthorizationFact, ToolDefinition, ToolExecutionOptions,
     ToolInvocationDescriptor, ToolInvocationRequest, ToolInvocationResponse,
     ToolPreparationRequest, ToolPreparationResponse,
-    ToolResultContent as InvocationToolResultContent, ToolSchedulingContract,
+    ToolResultContent as InvocationToolResultContent,
 };
 use futures::{StreamExt, stream};
 use std::collections::BTreeMap;
@@ -575,7 +575,7 @@ pub struct LegacyToolInvoker<'a, E> {
 }
 
 impl<'a, E> LegacyToolInvoker<'a, E> {
-    /// Wrap an existing executor with conservative isolated preparation.
+    /// Wrap an existing executor with empty preparation metadata.
     #[must_use]
     pub const fn new(executor: &'a E) -> Self {
         Self { executor }
@@ -1024,10 +1024,11 @@ impl AgentRuntime {
 
     /// Execute an ordered tool-call batch through neutral preparation and authorization contracts.
     ///
-    /// The complete batch is prepared and authorized before invocation begins. Scheduling uses
-    /// only tool-owner-produced opaque resource claims; missing contracts remain isolated. Results
-    /// retain provider order regardless of completion order. `host_context` remains opaque to the
-    /// runtime and is forwarded unchanged to every preparation request.
+    /// The complete batch is prepared and authorized before invocation begins. When parallel mode
+    /// is enabled, approved calls from this provider batch may overlap up to `max_concurrency`;
+    /// dependencies belong in later provider rounds. Results retain provider order regardless of
+    /// completion order. `host_context` remains opaque to the runtime and is forwarded unchanged
+    /// to every preparation request.
     ///
     /// # Errors
     ///
@@ -1130,7 +1131,7 @@ impl AgentRuntime {
             return Ok(ordered_batch_output(calls.len(), terminal));
         }
 
-        for group in scheduling_groups(approved, options.parallel) {
+        for group in provider_batch_execution_groups(approved, options.parallel) {
             if !scope.control().accepts_normal_output() {
                 for call in group {
                     terminal.insert(call.index, Err(RuntimeError::Cancelled));
@@ -1161,8 +1162,8 @@ impl AgentRuntime {
 
     /// Execute an ordered batch through compatibility adapters.
     ///
-    /// Legacy executors do not expose preparation contracts, so every call is safely isolated.
-    /// The complete permission batch is still evaluated before any invocation begins.
+    /// Legacy executors do not expose preparation metadata. The provider batch still declares
+    /// parallel intent, and the complete permission batch is evaluated before any invocation begins.
     ///
     /// # Errors
     ///
@@ -1739,37 +1740,15 @@ fn legacy_tool_invocation_request(invocation: &ToolInvocationDescriptor) -> Tool
     }
 }
 
-fn scheduling_groups(
+fn provider_batch_execution_groups(
     prepared: Vec<PreparedRuntimeToolCall>,
     parallel: bool,
 ) -> Vec<Vec<PreparedRuntimeToolCall>> {
-    if !parallel {
-        return prepared.into_iter().map(|call| vec![call]).collect();
+    if parallel && !prepared.is_empty() {
+        vec![prepared]
+    } else {
+        prepared.into_iter().map(|call| vec![call]).collect()
     }
-
-    let mut groups: Vec<Vec<PreparedRuntimeToolCall>> = Vec::new();
-    for call in prepared {
-        let isolated = matches!(
-            call.invocation.preparation.scheduling,
-            ToolSchedulingContract::Isolated
-        );
-        let conflicts = groups.last().is_none_or(|group| {
-            isolated
-                || group.iter().any(|active| {
-                    active
-                        .invocation
-                        .preparation
-                        .scheduling
-                        .conflicts_with(&call.invocation.preparation.scheduling)
-                })
-        });
-        if conflicts {
-            groups.push(vec![call]);
-        } else if let Some(group) = groups.last_mut() {
-            group.push(call);
-        }
-    }
-    groups
 }
 
 async fn invoke_prepared_tool<I>(
@@ -2013,7 +1992,7 @@ mod tests {
         ToolExchangeResolution, ToolExchangeResponsePolicy, ToolInvocationInput,
         ToolInvocationInputResolution, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
         ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolPolicyMetadata,
-        ToolResourceAccess, ToolResourceClaim, ToolSideEffect, ToolUiMetadata,
+        ToolSideEffect, ToolUiMetadata,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
@@ -2135,7 +2114,6 @@ mod tests {
         ) -> RuntimeFuture<'a, ToolPreparationResponse> {
             Box::pin(async move {
                 Ok(ToolPreparationResponse {
-                    scheduling: ToolSchedulingContract::Concurrent { claims: Vec::new() },
                     authorization: Vec::new(),
                     descriptor: serde_json::Value::Null,
                 })
@@ -2166,38 +2144,21 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct PerCallContractInvoker {
+    struct BatchOverlapInvoker {
         prepared: AtomicUsize,
         active: AtomicUsize,
         max_active: AtomicUsize,
     }
 
-    impl ToolInvoker for PerCallContractInvoker {
+    impl ToolInvoker for BatchOverlapInvoker {
         fn prepare_tool<'a>(
             &'a self,
             _tool: &'a RegisteredTool,
-            request: &'a ToolPreparationRequest,
+            _request: &'a ToolPreparationRequest,
             _scope: &'a PreparationScope,
         ) -> RuntimeFuture<'a, ToolPreparationResponse> {
             self.prepared.fetch_add(1, Ordering::SeqCst);
-            let access = if request.invocation.tool_name == "exclusive" {
-                ToolResourceAccess::Exclusive
-            } else {
-                ToolResourceAccess::Shared
-            };
-            Box::pin(async move {
-                Ok(ToolPreparationResponse {
-                    scheduling: ToolSchedulingContract::Concurrent {
-                        claims: vec![ToolResourceClaim {
-                            namespace: "synthetic".to_string(),
-                            resource: "same".to_string(),
-                            access,
-                        }],
-                    },
-                    authorization: Vec::new(),
-                    descriptor: serde_json::Value::Null,
-                })
-            })
+            Box::pin(async move { Ok(ToolPreparationResponse::default()) })
         }
 
         fn invoke_tool<'a>(
@@ -2319,18 +2280,16 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         expected_prepared_before_start: usize,
-        scheduling: ToolSchedulingContract,
     }
 
     impl ContractTestInvoker {
-        fn new(expected_prepared_before_start: usize, scheduling: ToolSchedulingContract) -> Self {
+        fn new(expected_prepared_before_start: usize) -> Self {
             Self {
                 prepared: AtomicUsize::new(0),
                 started: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 expected_prepared_before_start,
-                scheduling,
             }
         }
     }
@@ -2343,10 +2302,8 @@ mod tests {
             _scope: &'a PreparationScope,
         ) -> RuntimeFuture<'a, ToolPreparationResponse> {
             self.prepared.fetch_add(1, Ordering::SeqCst);
-            let scheduling = self.scheduling.clone();
             Box::pin(async move {
                 Ok(ToolPreparationResponse {
-                    scheduling,
                     authorization: Vec::new(),
                     descriptor: serde_json::Value::Null,
                 })
@@ -2382,16 +2339,6 @@ mod tests {
                     result: None,
                 })
             })
-        }
-    }
-
-    fn concurrent_contract(resource: &str) -> ToolSchedulingContract {
-        ToolSchedulingContract::Concurrent {
-            claims: vec![ToolResourceClaim {
-                namespace: "synthetic".to_string(),
-                resource: resource.to_string(),
-                access: ToolResourceAccess::Shared,
-            }],
         }
     }
 
@@ -2551,7 +2498,6 @@ mod tests {
             Box::pin(async move {
                 assert!(scope.accepts_work());
                 Ok(ToolPreparationResponse {
-                    scheduling: ToolSchedulingContract::Concurrent { claims: Vec::new() },
                     authorization: Vec::new(),
                     descriptor: serde_json::json!({"prepared": true}),
                 })
@@ -2746,7 +2692,6 @@ mod tests {
         ) -> RuntimeFuture<'a, ToolPreparationResponse> {
             Box::pin(async {
                 Ok(ToolPreparationResponse {
-                    scheduling: ToolSchedulingContract::Concurrent { claims: Vec::new() },
                     authorization: Vec::new(),
                     descriptor: serde_json::Value::Null,
                 })
@@ -3036,7 +2981,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         ];
-        let invoker = ContractTestInvoker::new(3, concurrent_contract("shared"));
+        let invoker = ContractTestInvoker::new(3);
         let mut rounds = ToolRoundState::new(1);
 
         AgentRuntime::new()
@@ -3128,29 +3073,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn neutral_batch_conflicting_claim_is_an_ordering_barrier() {
+    async fn one_provider_batch_declares_parallel_intent_without_domain_conflict_inference() {
         let catalog = UnifiedToolCatalog::new()
-            .with_inline_tool(tool_definition("shared-before"))
-            .with_inline_tool(tool_definition("exclusive"))
-            .with_inline_tool(tool_definition("shared-after"));
+            .with_inline_tool(tool_definition("alpha"))
+            .with_inline_tool(tool_definition("beta"))
+            .with_inline_tool(tool_definition("gamma"));
         let calls = [
             ToolCall {
                 id: "call-1".to_string(),
-                name: "shared-before".to_string(),
+                name: "alpha".to_string(),
                 arguments: serde_json::json!({}),
             },
             ToolCall {
                 id: "call-2".to_string(),
-                name: "exclusive".to_string(),
+                name: "beta".to_string(),
                 arguments: serde_json::json!({}),
             },
             ToolCall {
                 id: "call-3".to_string(),
-                name: "shared-after".to_string(),
+                name: "gamma".to_string(),
                 arguments: serde_json::json!({}),
             },
         ];
-        let invoker = PerCallContractInvoker {
+        let invoker = BatchOverlapInvoker {
             prepared: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
@@ -3170,7 +3115,7 @@ mod tests {
             .await
             .expect("batch should execute");
 
-        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 3);
         assert_eq!(
             output
                 .results
@@ -3203,7 +3148,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         ];
-        let invoker = ContractTestInvoker::new(2, concurrent_contract("shared"));
+        let invoker = ContractTestInvoker::new(2);
         let mut rounds = ToolRoundState::new(1);
 
         AgentRuntime::new()
@@ -3286,7 +3231,7 @@ mod tests {
             name: "first".to_string(),
             arguments: serde_json::json!({}),
         }];
-        let invoker = ContractTestInvoker::new(1, concurrent_contract("shared"));
+        let invoker = ContractTestInvoker::new(1);
         let authorization = BlockingAuthorization::default();
         let scope = TurnScope::without_events("turn", TurnGeneration::new(10));
         let control = scope.control();
@@ -3333,7 +3278,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         ];
-        let invoker = ContractTestInvoker::new(2, concurrent_contract("shared"));
+        let invoker = ContractTestInvoker::new(2);
         let authorization = BlockingAuthorization::default();
         let scope = TurnScope::without_events("turn", TurnGeneration::new(8));
         let mut rounds = ToolRoundState::new(1);
@@ -3379,7 +3324,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         ];
-        let invoker = ContractTestInvoker::new(2, concurrent_contract("shared"));
+        let invoker = ContractTestInvoker::new(2);
         let authorization = AllowBatchAuthorization::default();
         let scope = TurnScope::without_events("turn", TurnGeneration::new(1));
         let mut rounds = ToolRoundState::new(1);
@@ -3416,7 +3361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn neutral_batch_isolates_missing_scheduling_contracts() {
+    async fn parallel_batch_overlaps_without_per_tool_scheduling_metadata() {
         let catalog = UnifiedToolCatalog::new()
             .with_inline_tool(tool_definition("first"))
             .with_inline_tool(tool_definition("second"));
@@ -3432,7 +3377,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         ];
-        let invoker = ContractTestInvoker::new(2, ToolSchedulingContract::Isolated);
+        let invoker = ContractTestInvoker::new(2);
         let mut rounds = ToolRoundState::new(1);
 
         AgentRuntime::new()
@@ -3449,7 +3394,7 @@ mod tests {
             .await
             .expect("batch should execute");
 
-        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -3469,7 +3414,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         ];
-        let invoker = ContractTestInvoker::new(2, concurrent_contract("shared"));
+        let invoker = ContractTestInvoker::new(2);
         let scope = TurnScope::without_events("turn", TurnGeneration::new(3));
         let control = scope.control();
         let mut rounds = ToolRoundState::new(1);
@@ -3622,14 +3567,14 @@ mod tests {
     #[tokio::test]
     async fn unified_tool_catalog_preserves_plugin_routing_source() {
         let catalog = UnifiedToolCatalog::new()
-            .with_plugin_tool(tool_definition("search"), "web-search-plugin");
+            .with_plugin_tool(tool_definition("search"), "synthetic-plugin");
         let tool = catalog
             .find_tool("search")
             .expect("plugin tool should be registered");
 
         assert!(matches!(
             tool.source,
-            ToolSource::Plugin { ref plugin_id } if plugin_id == "web-search-plugin"
+            ToolSource::Plugin { ref plugin_id } if plugin_id == "synthetic-plugin"
         ));
     }
 

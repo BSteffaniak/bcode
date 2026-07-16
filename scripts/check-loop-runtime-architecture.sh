@@ -152,13 +152,26 @@ if [[ -n "$native_search_implementations" ]] && grep -Ev '^plugins/[^/]*provider
   violations=1
 fi
 
-for removed_symbol in HostModelNativeWebSearchRequest cancellation_path invocation_action_path; do
+for removed_symbol in HostModelNativeWebSearchRequest cancellation_path invocation_action_path ToolSchedulingContract ToolResourceClaim ToolResourceAccess; do
   if rg -n "\\b${removed_symbol}\\b" packages plugins examples --glob '*.rs' >/tmp/bcode-removed-runtime-symbol.txt; then
     echo "Runtime architecture violation: removed symbol ${removed_symbol} was reintroduced." >&2
     cat /tmp/bcode-removed-runtime-symbol.txt >&2
     violations=1
   fi
 done
+
+if rg -n 'definition\.side_effect == ToolSideEffect::ReadOnly|!definition\.requires_permission' packages/server/src/lib.rs >/tmp/bcode-server-parallel-heuristic.txt; then
+  echo "Runtime architecture violation: server concurrency was tied to side-effect or permission metadata." >&2
+  cat /tmp/bcode-server-parallel-heuristic.txt >&2
+  violations=1
+fi
+
+if rg -n -i 'bcode\.(shell|filesystem|question|vim-edit|web-search)|shell-plugin|filesystem-plugin|question-plugin|vim-edit-plugin|web-search-plugin' \
+  packages/agent-runtime/src packages/tool/src/contracts.rs >/tmp/bcode-core-test-domain-leakage.txt; then
+  echo "Runtime architecture violation: tool-domain assumptions appeared in core runtime/contracts." >&2
+  cat /tmp/bcode-core-test-domain-leakage.txt >&2
+  violations=1
+fi
 
 if (( violations != 0 )); then
   exit 1

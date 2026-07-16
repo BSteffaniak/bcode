@@ -11,7 +11,7 @@ use bcode_model::{
 use bcode_tool::{
     ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationResponse,
-    ToolPolicyMetadata, ToolSchedulingContract, ToolSideEffect, ToolUiMetadata,
+    ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
 };
 use std::collections::VecDeque;
 use std::future::pending;
@@ -144,7 +144,6 @@ impl ToolInvoker for ParallelInvoker {
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
         Box::pin(async {
             Ok(ToolPreparationResponse {
-                scheduling: ToolSchedulingContract::Concurrent { claims: Vec::new() },
                 ..ToolPreparationResponse::default()
             })
         })
@@ -307,7 +306,6 @@ impl ToolInvoker for BlockingInvoker {
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
         Box::pin(async {
             Ok(ToolPreparationResponse {
-                scheduling: ToolSchedulingContract::Concurrent { claims: Vec::new() },
                 ..ToolPreparationResponse::default()
             })
         })
@@ -364,4 +362,168 @@ async fn generic_stream_cancellation_terminates_blocked_provider_batch_immediate
         terminal,
         bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled)
     ));
+}
+
+#[derive(Debug, Default)]
+struct DependentRoundProvider {
+    next_round: usize,
+    events: VecDeque<ProviderTurnEvent>,
+}
+
+impl ModelProviderInvoker for DependentRoundProvider {
+    fn start_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        request: &'a ModelTurnRequest,
+    ) -> RuntimeFuture<'a, StartTurnResponse> {
+        let round = self.next_round;
+        self.next_round += 1;
+        match round {
+            0 => {
+                assert!(!request.messages.iter().any(|message| {
+                    message
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, ModelContentBlock::ToolResult { .. }))
+                }));
+                self.events = [
+                    ProviderTurnEvent::ToolCallFinished {
+                        call: call("call-first", "first"),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ]
+                .into();
+            }
+            1 => {
+                assert!(request.messages.iter().any(|message| {
+                    message.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            ModelContentBlock::ToolResult { result }
+                                if result.call_id == "call-first"
+                        )
+                    })
+                }));
+                self.events = [
+                    ProviderTurnEvent::ToolCallFinished {
+                        call: call("call-second", "second"),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ]
+                .into();
+            }
+            2 => {
+                assert!(request.messages.iter().any(|message| {
+                    message.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            ModelContentBlock::ToolResult { result }
+                                if result.call_id == "call-second"
+                        )
+                    })
+                }));
+                self.events = [
+                    ProviderTurnEvent::TextDelta {
+                        text: "dependent done".to_string(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ]
+                .into();
+            }
+            _ => panic!("unexpected dependent provider round {round}"),
+        }
+        Box::pin(async move {
+            Ok(StartTurnResponse {
+                provider_turn_id: format!("dependent-round-{round}"),
+            })
+        })
+    }
+
+    fn poll_turn_events<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a PollTurnEventsRequest,
+    ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+        let events = self.events.drain(..).collect();
+        Box::pin(async move { Ok(PollTurnEventsResponse { events }) })
+    }
+
+    fn cancel_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a CancelTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        Box::pin(async { Ok(AckResponse::default()) })
+    }
+
+    fn finish_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a FinishTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        Box::pin(async { Ok(AckResponse::default()) })
+    }
+}
+
+#[tokio::test]
+async fn dependent_calls_in_later_provider_rounds_wait_for_prior_results() {
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&invocations);
+    let agent = Agent::builder()
+        .max_tool_rounds(2)
+        .scoped_inline_tool(definition("first"), move |invocation, _scope| {
+            let observed = Arc::clone(&observed);
+            async move {
+                observed
+                    .lock()
+                    .expect("invocation order lock")
+                    .push(invocation.invocation_id.clone());
+                Ok(ToolInvocationResponse {
+                    output: "first complete".to_string(),
+                    is_error: false,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                })
+            }
+        })
+        .scoped_inline_tool(definition("second"), {
+            let invocations = Arc::clone(&invocations);
+            move |invocation, _scope| {
+                let invocations = Arc::clone(&invocations);
+                async move {
+                    invocations
+                        .lock()
+                        .expect("invocation order lock")
+                        .push(invocation.invocation_id.clone());
+                    Ok(ToolInvocationResponse {
+                        output: "second complete".to_string(),
+                        is_error: false,
+                        content: Vec::new(),
+                        full_output: None,
+                        host_action: None,
+                        result: None,
+                    })
+                }
+            }
+        })
+        .build();
+    let mut provider = DependentRoundProvider::default();
+    let response = agent
+        .run(&mut provider, "run dependent tools")
+        .await
+        .expect("dependent provider rounds should complete");
+
+    assert_eq!(response.text, "dependent done");
+    assert_eq!(
+        *invocations.lock().expect("invocation order lock"),
+        ["call-first", "call-second"]
+    );
 }

@@ -1877,10 +1877,10 @@ const fn default_tool_preparation_timeout_ms() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "execution")]
 pub struct ToolExecutionConfig {
-    /// Whether scheduler-compatible tool calls may execute concurrently.
+    /// Whether approved tool calls from one provider batch may execute concurrently.
     #[serde(default = "default_tool_execution_parallel")]
     pub parallel: bool,
-    /// Maximum number of scheduler-compatible tool calls executing concurrently. Zero is normalized to one.
+    /// Maximum number of approved same-batch tool calls executing concurrently. Zero is normalized to one.
     #[serde(default = "default_tool_execution_max_concurrency")]
     pub max_concurrency: usize,
     /// Maximum duration of one side-effect-free preparation operation, in milliseconds. Zero is normalized to one.

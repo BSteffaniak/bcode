@@ -11,7 +11,7 @@ Owns serializable, transport-free tool protocol models:
 * invocation identity and arguments
 * opaque preparation host context
 * prepared invocation descriptors
-* scheduling claims and execution options
+* provider-batch execution options
 * authorization facts
 * lifecycle and contribution envelopes
 * exchange, input, nested-service, and artifact request/result envelopes
@@ -27,7 +27,7 @@ Owns orchestration behavior:
 * final scope acceptance checks
 * cancellation registration and fan-out
 * complete-batch preparation and authorization
-* opaque-claim scheduling
+* provider-batch bounded scheduling
 * ordered result collection
 * host capability traits for exchanges, inputs, services, and artifacts
 
@@ -41,7 +41,6 @@ Owns provider-neutral model request/response types. Provider-visible tool defini
 
 Own domain semantics and produce opaque contracts understood by matching adapters:
 
-* resource identities and scheduling claims
 * authorization fact schemas
 * contribution and exchange schemas
 * cancellation implementation
@@ -52,6 +51,12 @@ Shell, filesystem, web, question, Vim, document, and other semantics stay in the
 ### Host adapters
 
 Server, SDK, static-plugin, dynamic-plugin, remote, TUI, web, and headless hosts implement neutral runtime traits. They may persist, route, render, or resolve opaque envelopes, but they must not require core orchestration to decode domain payloads.
+
+### Provider-batch parallel intent
+
+One provider tool-call batch is the model's declaration that its calls may overlap. After complete-batch authorization, approved calls execute concurrently up to the host's configured bound. If one call depends on another, the provider must emit it in a later tool round after receiving the earlier result. Core and domain plugins do not infer command, path, repository, or resource conflicts for scheduling.
+
+A host may explicitly disable parallel execution, and a non-reentrant adapter may serialize internally as a mechanical implementation constraint. Neither case introduces tool-domain policy into canonical orchestration.
 
 ## Dependency direction
 
@@ -68,8 +73,8 @@ Forbidden direction includes:
 
 * `bcode_tool` depending on runtime or product packages
 * `bcode_agent_runtime` depending on server, plugin host, session implementation, IPC, TUI, web, or bundled plugins
-* `bcode_model` depending on tool policy, scheduling, or renderer metadata
-* domain plugins requiring new scheduler branches for new resource or payload schemas
+* `bcode_model` depending on tool policy, provider-batch execution policy, or renderer metadata
+* domain plugins requiring new scheduler branches for tool, command, path, or resource semantics
 * tools selecting a concrete renderer or persistence representation
 
 ## Compatibility boundary

@@ -120,7 +120,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
-use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 const CLIENT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -14881,6 +14881,66 @@ fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
     }
 }
 
+#[derive(Debug)]
+struct BatchAuthorizationGate {
+    remaining: AtomicUsize,
+    ready: Notify,
+}
+
+impl BatchAuthorizationGate {
+    fn new(participants: usize) -> Arc<Self> {
+        assert!(participants > 0, "authorization gate requires participants");
+        Arc::new(Self {
+            remaining: AtomicUsize::new(participants),
+            ready: Notify::new(),
+        })
+    }
+
+    fn participant(self: &Arc<Self>) -> BatchAuthorizationParticipant {
+        BatchAuthorizationParticipant {
+            gate: Arc::clone(self),
+            arrived: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BatchAuthorizationParticipant {
+    gate: Arc<BatchAuthorizationGate>,
+    arrived: bool,
+}
+
+impl BatchAuthorizationParticipant {
+    async fn arrive_and_wait(mut self) {
+        self.arrive();
+        loop {
+            let ready = self.gate.ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if self.gate.remaining.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            ready.await;
+        }
+    }
+
+    fn arrive(&mut self) {
+        if self.arrived {
+            return;
+        }
+        self.arrived = true;
+        if self.gate.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.gate.ready.notify_waiters();
+        }
+    }
+}
+
+impl Drop for BatchAuthorizationParticipant {
+    fn drop(&mut self) {
+        self.arrive();
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_model_tool_batch(
     state: &ServerState,
@@ -14889,14 +14949,9 @@ async fn execute_model_tool_batch(
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> bool {
-    let active_skills = state
-        .active_skills
-        .lock()
-        .await
-        .get(&session_id)
-        .is_some_and(|skills| !skills.is_empty());
-    let mut groups: Vec<(bool, Vec<(bcode_model::ToolCall, std::path::PathBuf)>)> = Vec::new();
-    for call in calls {
+    let mut ready = Vec::new();
+    let mut results = Vec::new();
+    for (index, call) in calls.into_iter().enumerate() {
         if cancel_state.is_cancelled() {
             return false;
         }
@@ -14913,23 +14968,19 @@ async fn execute_model_tool_batch(
                 .as_ref()
                 .map(|(_, definition)| definition.side_effect),
         ) {
-            let result = ToolFinishedEventInput {
-                tool_call_id: call.id,
-                result: "tool denied by read-only inspection policy".to_owned(),
-                is_error: true,
-                content: Vec::new(),
-                output: None,
-                semantic_result: None,
-            };
-            append_tool_finished_event(state, session_id, result).await;
+            results.push((
+                index,
+                Some(ToolFinishedEventInput {
+                    tool_call_id: call.id,
+                    result: "tool denied by read-only inspection policy".to_owned(),
+                    is_error: true,
+                    content: Vec::new(),
+                    output: None,
+                    semantic_result: None,
+                }),
+            ));
             continue;
         }
-        let parallel = state.tool_execution.parallel
-            && !active_skills
-            && provider.as_ref().is_some_and(|(_, definition)| {
-                definition.side_effect == ToolSideEffect::ReadOnly
-                    && !definition.requires_permission
-            });
         let Ok(working_directory) = state.sessions.session_working_directory(session_id).await
         else {
             return false;
@@ -14944,83 +14995,58 @@ async fn execute_model_tool_batch(
             &working_directory,
         )
         .await;
-        if let Some((group_parallel, group)) = groups.last_mut()
-            && *group_parallel == parallel
-            && parallel
-        {
-            group.push((call, working_directory));
-        } else {
-            groups.push((parallel, vec![(call, working_directory)]));
-        }
+        ready.push((index, call, working_directory));
     }
 
-    for (parallel, group) in groups {
-        if cancel_state.is_cancelled() {
-            return false;
-        }
-        if parallel {
-            let executions = stream::iter(group.into_iter().enumerate().map(
-                |(index, (call, working_directory))| {
-                    let cancel_state = Arc::clone(&cancel_state);
-                    async move {
-                        (
-                            index,
-                            execute_model_tool(
-                                state,
-                                session_id,
-                                call,
-                                working_directory,
-                                cancel_state,
-                            )
-                            .await,
-                        )
-                    }
-                },
-            ))
-            .buffer_unordered(state.tool_execution.max_concurrency.get())
-            .collect::<Vec<_>>();
-            let ProviderCallWait::Completed(mut results) = wait_for_provider_call(
-                state,
-                session_id,
-                command_context,
-                cancel_state.as_ref(),
-                Box::pin(executions),
-            )
-            .await
-            else {
-                return false;
-            };
-            results.sort_by_key(|(index, _)| *index);
-            for (_, result) in results {
-                if let Some(result) = result {
-                    append_tool_finished_event(state, session_id, result).await;
-                }
-            }
+    if !ready.is_empty() {
+        let authorization_gate = BatchAuthorizationGate::new(ready.len());
+        let concurrency = if state.tool_execution.parallel {
+            state.tool_execution.max_concurrency.get()
         } else {
-            for (call, working_directory) in group {
-                let execution = execute_model_tool(
-                    state,
-                    session_id,
-                    call,
-                    working_directory,
-                    Arc::clone(&cancel_state),
-                );
-                match wait_for_provider_call(
-                    state,
-                    session_id,
-                    command_context,
-                    cancel_state.as_ref(),
-                    Box::pin(execution),
+            1
+        };
+        let invocation_permits = Arc::new(Semaphore::new(concurrency));
+        let execution_count = ready.len();
+        let executions = stream::iter(ready.into_iter().map(|(index, call, working_directory)| {
+            let cancel_state = Arc::clone(&cancel_state);
+            let authorization = authorization_gate.participant();
+            let invocation_permits = Arc::clone(&invocation_permits);
+            async move {
+                (
+                    index,
+                    execute_model_tool(
+                        state,
+                        session_id,
+                        call,
+                        working_directory,
+                        cancel_state,
+                        Some(authorization),
+                        Some(invocation_permits),
+                    )
+                    .await,
                 )
-                .await
-                {
-                    ProviderCallWait::Completed(Some(result)) => {
-                        append_tool_finished_event(state, session_id, result).await;
-                    }
-                    ProviderCallWait::Completed(None) => {}
-                    ProviderCallWait::Cancelled => return false,
-                }
             }
+        }))
+        .buffer_unordered(execution_count)
+        .collect::<Vec<_>>();
+        let ProviderCallWait::Completed(executed) = wait_for_provider_call(
+            state,
+            session_id,
+            command_context,
+            cancel_state.as_ref(),
+            Box::pin(executions),
+        )
+        .await
+        else {
+            return false;
+        };
+        results.extend(executed);
+    }
+
+    results.sort_by_key(|(index, _)| *index);
+    for (_, result) in results {
+        if let Some(result) = result {
+            append_tool_finished_event(state, session_id, result).await;
         }
     }
     !cancel_state.is_cancelled()
@@ -15033,6 +15059,8 @@ async fn execute_model_tool(
     call: bcode_model::ToolCall,
     working_directory: std::path::PathBuf,
     cancel_state: Arc<TurnCancelState>,
+    authorization: Option<BatchAuthorizationParticipant>,
+    invocation_permits: Option<Arc<Semaphore>>,
 ) -> Option<ToolFinishedEventInput> {
     let producer_plugin_id = find_tool_provider(state, &call.name)
         .await
@@ -15066,6 +15094,8 @@ async fn execute_model_tool(
         &call,
         &working_directory,
         cancel_state.as_ref(),
+        authorization,
+        invocation_permits,
     )
     .await
     .unwrap_or_else(|error| ToolInvocationResponse {
@@ -15658,6 +15688,8 @@ async fn invoke_model_tool(
     call: &bcode_model::ToolCall,
     working_directory: &std::path::Path,
     cancel_state: &TurnCancelState,
+    authorization: Option<BatchAuthorizationParticipant>,
+    invocation_permits: Option<Arc<Semaphore>>,
 ) -> Result<ToolInvocationResponse, String> {
     let (plugin_id, definition) = find_tool_provider(state, &call.name)
         .await?
@@ -15672,32 +15704,6 @@ async fn invoke_model_tool(
             result: None,
         });
     }
-    let argument_blob = (state.observability.persist_tool_io
-        || state.observability.debug_enabled())
-    .then(|| {
-        state.trace_store.write_json_blob(
-            session_id,
-            &format!("tool-arguments-{}", call.id),
-            &call.arguments,
-            state.observability.max_blob_bytes,
-        )
-    })
-    .flatten();
-    append_trace_event(
-        state,
-        session_id,
-        None,
-        SessionTracePhase::ToolInvocationStarted,
-        SessionTracePayload::ToolInvocationStarted {
-            tool_call_id: call.id.clone(),
-            plugin_id: plugin_id.clone(),
-            tool_name: definition.name.clone(),
-            side_effect: side_effect_name(definition.side_effect).to_string(),
-            requires_permission: definition.requires_permission,
-            arguments: argument_blob,
-        },
-    )
-    .await;
     let agent_decision = evaluate_agent_tool_policy(state, session_id, call, &definition).await;
     append_trace_event(
         state,
@@ -15857,6 +15863,57 @@ async fn invoke_model_tool(
             }
         }
     }
+    if let Some(authorization) = authorization {
+        tokio::select! {
+            biased;
+            () = cancel_state.cancelled() => {
+                return Ok(tool_error("tool cancelled while awaiting batch authorization"));
+            }
+            () = authorization.arrive_and_wait() => {}
+        }
+    }
+    let _invocation_permit = if let Some(permits) = invocation_permits {
+        Some(tokio::select! {
+            biased;
+            () = cancel_state.cancelled() => {
+                return Ok(tool_error("tool cancelled before invocation admission"));
+            }
+            permit = permits.acquire_owned() => {
+                permit.map_err(|_| "tool invocation admission closed".to_string())?
+            }
+        })
+    } else {
+        None
+    };
+    if cancel_state.is_cancelled() {
+        return Ok(tool_error("tool cancelled before invocation"));
+    }
+    let argument_blob = (state.observability.persist_tool_io
+        || state.observability.debug_enabled())
+    .then(|| {
+        state.trace_store.write_json_blob(
+            session_id,
+            &format!("tool-arguments-{}", call.id),
+            &call.arguments,
+            state.observability.max_blob_bytes,
+        )
+    })
+    .flatten();
+    append_trace_event(
+        state,
+        session_id,
+        None,
+        SessionTracePhase::ToolInvocationStarted,
+        SessionTracePayload::ToolInvocationStarted {
+            tool_call_id: call.id.clone(),
+            plugin_id: plugin_id.clone(),
+            tool_name: definition.name.clone(),
+            side_effect: side_effect_name(definition.side_effect).to_string(),
+            requires_permission: definition.requires_permission,
+            arguments: argument_blob,
+        },
+    )
+    .await;
     let working_directory = working_directory.to_path_buf();
     let (input_sender, input_receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
     let input_receiver = Mutex::new(input_receiver);
@@ -23102,6 +23159,157 @@ mod tests {
         state
     }
 
+    #[tokio::test]
+    async fn batch_authorization_gate_releases_when_participant_exits_without_waiting() {
+        let gate = BatchAuthorizationGate::new(2);
+        let waiting = gate.participant();
+        let denied = gate.participant();
+        let waiter = tokio::spawn(waiting.arrive_and_wait());
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        drop(denied);
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("denied participant should release the complete-batch gate")
+            .expect("authorization waiter should not panic");
+    }
+
+    #[tokio::test]
+    async fn batch_authorization_gate_does_not_miss_last_arrival_notification() {
+        for _ in 0..1_000 {
+            let gate = BatchAuthorizationGate::new(2);
+            let first = gate.participant();
+            let second = gate.participant();
+            let first = tokio::spawn(first.arrive_and_wait());
+            let second = tokio::spawn(second.arrive_and_wait());
+            tokio::time::timeout(Duration::from_millis(100), async {
+                first.await.expect("first authorization participant");
+                second.await.expect("second authorization participant");
+            })
+            .await
+            .expect("authorization gate must not miss the final arrival");
+        }
+    }
+
+    async fn approve_pending_permission_for_test(
+        state: &ServerState,
+        permission: &PendingPermission,
+    ) {
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .remove(&permission.summary.permission_id);
+        *permission.decision.lock().await = Some(true);
+        permission.notify.notify_waiters();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_same_batch_shell_calls_overlap_after_complete_authorization() {
+        let sessions = SessionManager::default();
+        let workspace = tempfile::tempdir().expect("parallel shell workspace");
+        let summary = sessions
+            .create_session(
+                Some("parallel shell batch".to_string()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("parallel shell session");
+        let session_id = summary.id;
+        let mut state = test_server_state_with_shell_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        state.tool_execution.parallel = true;
+        state.tool_execution.max_concurrency =
+            std::num::NonZeroUsize::new(5).expect("five is non-zero");
+        let state = Arc::new(state);
+        let calls = (0..5)
+            .map(|index| bcode_model::ToolCall {
+                id: format!("parallel-shell-{index}"),
+                name: "shell.run".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!(
+                        "touch .parallel-{index}; while [ \"$(find . -maxdepth 1 -name '.parallel-*' | wc -l | tr -d ' ')\" -lt 5 ]; do sleep 0.02; done; printf 'call-{index}\\n'"
+                    ),
+                    "timeout_ms": 2_000
+                }),
+            })
+            .collect::<Vec<_>>();
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let task_state = Arc::clone(&state);
+        let task_cancel = Arc::clone(&cancel_state);
+        let task = tokio::spawn(async move {
+            let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+            let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+            let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+            let queued_followups = AtomicUsize::new(0);
+            let current_turn = Arc::new(Mutex::new(None));
+            let mut command_context = RuntimeCommandContext::new(
+                &mut followup_rx,
+                &mut steering_rx,
+                &mut cancel_rx,
+                &queued_followups,
+                current_turn,
+            );
+            execute_model_tool_batch(
+                task_state.as_ref(),
+                session_id,
+                calls,
+                task_cancel,
+                &mut command_context,
+            )
+            .await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pending = state.pending_permissions.lock().await;
+                if pending.len() == 5 {
+                    break pending.values().cloned().collect::<Vec<_>>();
+                }
+                drop(pending);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all shell permissions should resolve before invocation starts");
+        assert!(
+            state
+                .active_plugin_invocations
+                .lock()
+                .expect("active invocation registry")
+                .is_empty(),
+            "no shell invocation may start before the complete batch is authorized"
+        );
+        let mut pending = pending.into_iter();
+        for permission in pending.by_ref().take(4) {
+            approve_pending_permission_for_test(state.as_ref(), &permission).await;
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            state
+                .active_plugin_invocations
+                .lock()
+                .expect("active invocation registry")
+                .is_empty(),
+            "no shell invocation may start while one batch decision remains unresolved"
+        );
+        let final_permission = pending.next().expect("fifth shell permission");
+        approve_pending_permission_for_test(state.as_ref(), &final_permission).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("parallel shell batch should finish")
+                .expect("parallel shell batch task should not panic")
+        );
+        assert!(
+            (0..5).all(|index| workspace.path().join(format!(".parallel-{index}")).exists()),
+            "every shell command must start before any can complete"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -23138,6 +23346,8 @@ mod tests {
                 &task_call,
                 &working_directory,
                 task_cancel.as_ref(),
+                None,
+                None,
             )
             .await
         });
@@ -23270,6 +23480,8 @@ mod tests {
                 &task_call,
                 &working_directory,
                 task_cancel.as_ref(),
+                None,
+                None,
             )
             .await
         });
