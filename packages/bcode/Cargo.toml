@@ -47,6 +47,8 @@ tokio                   = { workspace = true, features = ["macros", "rt-multi-th
 bcode_hello_plugin    = { workspace = true }
 bcode_plugin          = { workspace = true }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_shell_plugin    = { workspace = true, features = ["static-bundled"] }
+tempfile              = { workspace = true }
 tokio                 = { workspace = true, features = ["macros", "rt"] }
 
 [features]

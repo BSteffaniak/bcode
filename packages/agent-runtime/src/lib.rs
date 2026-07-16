@@ -949,9 +949,9 @@ impl AgentRuntime {
         call: &ToolCall,
     ) -> Result<ToolExecutionOutput>
     where
-        C: ToolCatalog,
+        C: ToolCatalog + Sync,
         P: PermissionPolicy + ?Sized,
-        E: ToolExecutor,
+        E: ToolExecutor + Sync,
     {
         let context = RuntimePermissionContext::default();
         self.execute_tool_call_with_context(catalog, policy, executor, call, &context)
@@ -973,9 +973,9 @@ impl AgentRuntime {
         context: &RuntimePermissionContext,
     ) -> Result<ToolExecutionOutput>
     where
-        C: ToolCatalog,
+        C: ToolCatalog + Sync,
         P: PermissionPolicy + ?Sized,
-        E: ToolExecutor,
+        E: ToolExecutor + Sync,
     {
         let mut rounds = ToolRoundState::new(u32::MAX);
         self.execute_tool_call_with_round_state_and_context(
@@ -1081,51 +1081,9 @@ impl AgentRuntime {
             return Ok(ordered_batch_output(calls.len(), terminal));
         }
 
-        let requests = prepared
-            .iter()
-            .map(|prepared| ToolAuthorizationRequest {
-                index: prepared.index,
-                call: prepared.call.clone(),
-                tool: prepared.tool.clone(),
-                facts: prepared.invocation.preparation.authorization.clone(),
-                context: context.clone(),
-            })
-            .collect::<Vec<_>>();
-        let authorization_future = authorization.authorize_batch(&requests, scope);
-        let cancellation = scope.control().cancellation();
-        let decisions = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                for call in &prepared {
-                    terminal.insert(call.index, Err(RuntimeError::Cancelled));
-                }
-                return Ok(ordered_batch_output(calls.len(), terminal));
-            }
-            decisions = authorization_future => decisions?,
-        };
-        if decisions.len() != prepared.len() {
-            return Err(RuntimeError::InvalidBatchResponse {
-                component: "authorization",
-                expected: prepared.len(),
-                actual: decisions.len(),
-            });
-        }
-
-        let mut approved = Vec::with_capacity(prepared.len());
-        for (prepared, decision) in prepared.into_iter().zip(decisions) {
-            match decision {
-                ToolAuthorizationDecision::Allow => approved.push(prepared),
-                ToolAuthorizationDecision::Ask(reason) => {
-                    terminal.insert(
-                        prepared.index,
-                        Err(RuntimeError::PermissionRequired(reason)),
-                    );
-                }
-                ToolAuthorizationDecision::Deny(reason) => {
-                    terminal.insert(prepared.index, Err(RuntimeError::PermissionDenied(reason)));
-                }
-            }
-        }
+        let approved =
+            authorize_runtime_tool_batch(authorization, prepared, context, scope, &mut terminal)
+                .await?;
 
         if !scope.control().accepts_normal_output() {
             insert_cancelled_calls(&mut terminal, &approved);
@@ -1224,9 +1182,9 @@ impl AgentRuntime {
         rounds: &mut ToolRoundState,
     ) -> Result<ToolExecutionOutput>
     where
-        C: ToolCatalog,
+        C: ToolCatalog + Sync,
         P: PermissionPolicy + ?Sized,
-        E: ToolExecutor,
+        E: ToolExecutor + Sync,
     {
         let context = RuntimePermissionContext::default();
         self.execute_tool_call_with_round_state_and_context(
@@ -1251,59 +1209,30 @@ impl AgentRuntime {
         context: &RuntimePermissionContext,
     ) -> Result<ToolExecutionOutput>
     where
-        C: ToolCatalog,
+        C: ToolCatalog + Sync,
         P: PermissionPolicy + ?Sized,
-        E: ToolExecutor,
+        E: ToolExecutor + Sync,
     {
-        rounds.begin_round()?;
-        let tool = catalog
-            .find_tool(&call.name)
-            .ok_or_else(|| RuntimeError::ToolNotFound(call.name.clone()))?;
-        let permission_request = RuntimePermissionRequest {
-            context: context.clone(),
-            call: call.clone(),
-            tool: tool.clone(),
-        };
-        match policy.evaluate_tool_call(&permission_request).await? {
-            PermissionDecision::Allow => {}
-            PermissionDecision::Ask(reason) => {
-                return Err(RuntimeError::PermissionRequired(reason));
-            }
-            PermissionDecision::Deny(reason) => return Err(RuntimeError::PermissionDenied(reason)),
-        }
-        let request = ToolInvocationRequest {
-            tool_call_id: call.id.clone(),
-            name: call.name.clone(),
-            arguments: call.arguments.clone(),
-            cwd: None,
-            artifact_dir: None,
-        };
-        let invocation = executor
-            .execute_tool(&tool, &request)
-            .await
-            .map_err(|error| RuntimeError::ToolExecution {
-                tool_name: call.name.clone(),
-                message: error.to_string(),
-            })?;
-        let model_result = ToolResult {
-            call_id: call.id.clone(),
-            output: invocation.output.clone(),
-            is_error: invocation.is_error,
-            content: invocation
-                .content
-                .iter()
-                .cloned()
-                .map(model_tool_result_content)
-                .collect(),
-        };
-        Ok(ToolExecutionOutput {
-            model_result: model_result.clone(),
-            invocation,
-            events: vec![
-                AgentRuntimeEvent::ToolCallFinished(call.clone()),
-                AgentRuntimeEvent::ToolResult(model_result),
-            ],
-        })
+        let output = self
+            .execute_tool_batch_with_round_state_and_context(
+                catalog,
+                policy,
+                executor,
+                std::slice::from_ref(call),
+                rounds,
+                context,
+                1,
+            )
+            .await?;
+        output
+            .results
+            .into_iter()
+            .next()
+            .ok_or(RuntimeError::InvalidBatchResponse {
+                component: "single-call compatibility adapter",
+                expected: 1,
+                actual: 0,
+            })?
     }
 
     /// Run a stateless text-generation turn through a provider invoker.
@@ -1663,6 +1592,62 @@ fn insert_cancelled_calls(
             .iter()
             .map(|call| (call.index, Err(RuntimeError::Cancelled))),
     );
+}
+
+async fn authorize_runtime_tool_batch<A>(
+    authorization: &A,
+    prepared: Vec<PreparedRuntimeToolCall>,
+    context: &RuntimePermissionContext,
+    scope: &TurnScope,
+    terminal: &mut BTreeMap<usize, Result<ToolExecutionOutput>>,
+) -> Result<Vec<PreparedRuntimeToolCall>>
+where
+    A: ToolAuthorizationCoordinator + ?Sized,
+{
+    let requests = prepared
+        .iter()
+        .map(|prepared| ToolAuthorizationRequest {
+            index: prepared.index,
+            call: prepared.call.clone(),
+            tool: prepared.tool.clone(),
+            facts: prepared.invocation.preparation.authorization.clone(),
+            context: context.clone(),
+        })
+        .collect::<Vec<_>>();
+    let authorization_future = authorization.authorize_batch(&requests, scope);
+    let cancellation = scope.control().cancellation();
+    let decisions = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            insert_cancelled_calls(terminal, &prepared);
+            return Ok(Vec::new());
+        }
+        decisions = authorization_future => decisions?,
+    };
+    if decisions.len() != prepared.len() {
+        return Err(RuntimeError::InvalidBatchResponse {
+            component: "authorization",
+            expected: prepared.len(),
+            actual: decisions.len(),
+        });
+    }
+
+    let mut approved = Vec::with_capacity(prepared.len());
+    for (prepared, decision) in prepared.into_iter().zip(decisions) {
+        match decision {
+            ToolAuthorizationDecision::Allow => approved.push(prepared),
+            ToolAuthorizationDecision::Ask(reason) => {
+                terminal.insert(
+                    prepared.index,
+                    Err(RuntimeError::PermissionRequired(reason)),
+                );
+            }
+            ToolAuthorizationDecision::Deny(reason) => {
+                terminal.insert(prepared.index, Err(RuntimeError::PermissionDenied(reason)));
+            }
+        }
+    }
+    Ok(approved)
 }
 
 async fn prepare_runtime_tool_batch<C, I>(

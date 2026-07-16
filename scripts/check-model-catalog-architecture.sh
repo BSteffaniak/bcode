@@ -31,4 +31,31 @@ if [[ "$count" != "1" ]]; then
   exit 1
 fi
 
+if rg -n 'fn (native_web_search|native_web_search_inner)|impl .*NativeWebSearch' packages \
+  >/tmp/bcode-host-native-web-search-implementation.txt; then
+  echo "provider-native web search implementation must remain behind provider plugin interfaces" >&2
+  cat /tmp/bcode-host-native-web-search-implementation.txt >&2
+  exit 1
+fi
+
+native_search_implementations="$(
+  rg -l 'fn (native_web_search|native_web_search_inner)' plugins/*-provider-plugin/src/lib.rs | sort
+)"
+expected_native_search_implementations="$(cat <<'EOF'
+plugins/fake-provider-plugin/src/lib.rs
+plugins/openai-compatible-provider-plugin/src/lib.rs
+EOF
+)"
+if [[ "$native_search_implementations" != "$expected_native_search_implementations" ]]; then
+  echo "provider-native web search implementations moved outside the audited provider plugins" >&2
+  diff -u <(printf '%s\n' "$expected_native_search_implementations") <(printf '%s\n' "$native_search_implementations") >&2 || true
+  exit 1
+fi
+
+count="$(grep -c 'OP_NATIVE_WEB_SEARCH,' packages/server/src/lib.rs)"
+if [[ "$count" != "2" ]]; then
+  echo "expected one server provider-interface native search route plus its import, found $count references" >&2
+  exit 1
+fi
+
 echo "model catalog architecture guard passed"

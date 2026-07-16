@@ -193,6 +193,60 @@ if rg -n 'default_tool_execution_max_concurrency|max_concurrency: NonZeroUsize::
   violations=1
 fi
 
+legacy_executor_invocations="$(rg -n 'self\.executor\.execute_tool\(' packages/agent-runtime/src/lib.rs | wc -l | tr -d ' ')"
+if [[ "$legacy_executor_invocations" != "1" ]]; then
+  echo "Runtime architecture violation: expected one executor invocation confined to LegacyToolInvoker, found $legacy_executor_invocations." >&2
+  violations=1
+fi
+
+if rg -n '\b(PathBuf|cwd|artifact_dir|cancellation_path|invocation_action_path)\b' packages/tool/src/contracts.rs >/tmp/bcode-preparation-transport-leakage.txt; then
+  echo "Runtime architecture violation: transport/path fields appeared in canonical tool contracts." >&2
+  cat /tmp/bcode-preparation-transport-leakage.txt >&2
+  violations=1
+fi
+
+provider_tool_definition="$(
+  awk '/^pub struct ToolDefinition \{/{capture=1} capture{print} capture && /^\}/{exit}' packages/model/src/lib.rs
+)"
+expected_provider_tool_definition="$(cat <<'EOF'
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+EOF
+)"
+if [[ "$provider_tool_definition" != "$expected_provider_tool_definition" ]]; then
+  echo "Runtime architecture violation: provider-visible tool definition gained policy/presentation metadata." >&2
+  diff -u <(printf '%s\n' "$expected_provider_tool_definition") <(printf '%s\n' "$provider_tool_definition") >&2 || true
+  violations=1
+fi
+
+prepared_invocation_fields="$(
+  awk '/^pub struct PreparedToolInvocation \{/{capture=1; next} capture && /^\}/{exit} capture && /^    pub /{print}' packages/tool/src/contracts.rs
+)"
+expected_prepared_invocation_fields="$(cat <<'EOF'
+    pub invocation: ToolInvocationDescriptor,
+    pub preparation: ToolPreparationResponse,
+EOF
+)"
+if [[ "$prepared_invocation_fields" != "$expected_prepared_invocation_fields" ]]; then
+  echo "Runtime architecture violation: prepared invocation representation gained transport or adapter fields." >&2
+  diff -u <(printf '%s\n' "$expected_prepared_invocation_fields") <(printf '%s\n' "$prepared_invocation_fields") >&2 || true
+  violations=1
+fi
+
+
+if ! awk '
+  /^\[concurrency\]$/ { in_concurrency = 1; next }
+  /^\[/ { in_concurrency = 0 }
+  in_concurrency && $0 ~ /^type[[:space:]]*=[[:space:]]*"exclusive"/ { found = 1 }
+  END { exit found ? 0 : 1 }
+' examples/hello-plugin/bcode-plugin.toml; then
+  echo "Runtime architecture violation: the non-reentrant hello ABI fixture must declare exclusive execution." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

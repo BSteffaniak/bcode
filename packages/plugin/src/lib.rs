@@ -3034,10 +3034,8 @@ fn spawn_exclusive_plugin_executor(
         let mut active = true;
         while let Some(message) = receiver.blocking_recv() {
             match message {
-                PluginExecutorMessage::Service(invocation) => {
+                PluginExecutorMessage::Service(mut invocation) => {
                     metrics.dequeue(invocation.class);
-                    metrics.running.fetch_add(1, Ordering::Relaxed);
-                    let started_at = Instant::now();
                     let queue_wait_ms = elapsed_ms(invocation.enqueued_at);
                     metrics.registry().record_histogram_with_labels(
                         "plugin.queue_wait.duration_ms",
@@ -3050,46 +3048,16 @@ fn spawn_exclusive_plugin_executor(
                             &invocation.scope,
                         ),
                     );
-                    tracing::debug!(
-                        target: "bcode_plugin::runtime",
-                        plugin_id = %plugin.manifest.id,
-                        invocation_id = invocation.id.get(),
-                        class = ?invocation.class,
-                        scope = ?invocation.scope,
-                        queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
-                        interface_id = %invocation.interface_id,
-                        operation = %invocation.operation,
-                        "plugin service invocation started"
-                    );
+                    let (unused_response, _) = oneshot::channel();
+                    let response_sender =
+                        std::mem::replace(&mut invocation.response, unused_response);
                     let response = if active {
-                        plugin.invoke_service_with_events(
-                            invocation.interface_id,
-                            invocation.operation,
-                            invocation.payload,
-                            |event| {
-                                if let Some(sender) = &invocation.event_sender {
-                                    let _ = sender.send(event);
-                                }
-                            },
-                        )
-                    } else {
-                        Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
-                    };
-                    metrics.running.fetch_sub(1, Ordering::Relaxed);
-                    if response.is_ok() {
-                        metrics.completed.fetch_add(1, Ordering::Relaxed);
+                        execute_plugin_service_invocation(&plugin, invocation, &metrics)
                     } else {
                         metrics.failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                    tracing::debug!(
-                        target: "bcode_plugin::runtime",
-                        plugin_id = %plugin.manifest.id,
-                        invocation_id = invocation.id.get(),
-                        duration_ms = started_at.elapsed().as_millis(),
-                        success = response.is_ok(),
-                        "plugin service invocation finished"
-                    );
-                    let _ = invocation.response.send(response);
+                        Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
+                    };
+                    let _ = response_sender.send(response);
                 }
                 PluginExecutorMessage::Event(invocation) => {
                     metrics.dequeue(invocation.class);
