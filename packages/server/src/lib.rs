@@ -22605,6 +22605,48 @@ mod tests {
     }
 
     #[test]
+    fn upstream_retry_buffer_catalog_pattern_matches_provider_error() {
+        let state = test_server_state(SessionManager::default());
+        let pattern = bcode_model_catalog_models::RecoverableErrorPattern {
+            id: "bcode.openai-compatible.upstream-retry-buffer-limit".to_string(),
+            enabled_by_default: true,
+            scope: bcode_model_catalog_models::RecoverableErrorPatternScope {
+                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                ..bcode_model_catalog_models::RecoverableErrorPatternScope::default()
+            },
+            r#match: bcode_model_catalog_models::RecoverableErrorPatternMatch {
+                code: Some("http_507".to_string()),
+                message_contains: Some(
+                    "exceeded request buffer limit while retrying upstream".to_string(),
+                ),
+                ..bcode_model_catalog_models::RecoverableErrorPatternMatch::default()
+            },
+        };
+        let rule = remote_pattern_retry_rule(&pattern).expect("pattern should convert");
+        let error = bcode_model::ProviderError {
+            code: "http_507".to_string(),
+            category: bcode_model::ProviderErrorCategory::ProviderInternal,
+            message: "exceeded request buffer limit while retrying upstream".to_string(),
+            retryable: true,
+            provider_message: None,
+            retry: None,
+        };
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+            ..SessionModelSelection::default()
+        };
+
+        let policy = matching_provider_retry_policy(&state, &error, &selection, &[], &[rule])
+            .expect("catalog retry pattern should match");
+
+        assert_eq!(
+            policy.id,
+            "custom.bcode.openai-compatible.upstream-retry-buffer-limit"
+        );
+        assert_eq!(policy.max_retries, 3);
+    }
+
+    #[test]
     fn user_retry_rule_deep_merges_over_provider_rule() {
         let provider_rule = bcode_model::ProviderRetryRule {
             id: "provider.rule".to_string(),

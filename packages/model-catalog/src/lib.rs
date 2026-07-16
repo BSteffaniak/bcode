@@ -1468,6 +1468,20 @@ mod tests {
                 .recoverable_error_patterns
                 .iter()
                 .any(|pattern| {
+                    pattern.id == "bcode.openai-compatible.upstream-retry-buffer-limit"
+                        && pattern.scope.provider_plugin_id.as_deref()
+                            == Some("bcode.openai-compatible")
+                        && pattern.r#match.code.as_deref() == Some("http_507")
+                        && pattern.r#match.message_contains.as_deref()
+                            == Some("exceeded request buffer limit while retrying upstream")
+                })
+        );
+        assert!(
+            provider
+                .error_handling
+                .recoverable_error_patterns
+                .iter()
+                .any(|pattern| {
                     pattern.id == "bcode.openai-compatible.unsupported-content-type"
                         && pattern.scope.provider_plugin_id.as_deref()
                             == Some("bcode.openai-compatible")
