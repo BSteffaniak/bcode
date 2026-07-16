@@ -202,6 +202,7 @@ impl ChatLoopState {
             content_type,
             committed_bytes,
             revision,
+            availability,
             finalized,
             ..
         } = event
@@ -215,6 +216,15 @@ impl ChatLoopState {
             reference_key.clone(),
         );
         let state = self.artifact_fetches.entry(key.clone()).or_default();
+        if availability.as_deref() == Some("incomplete") {
+            state.fetching = false;
+            state.retry_at = None;
+            state.terminal_error = Some(
+                "active artifact is incomplete because its producer stopped before finalization"
+                    .to_owned(),
+            );
+            return;
+        }
         if state
             .target
             .as_ref()

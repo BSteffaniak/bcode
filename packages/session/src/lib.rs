@@ -3583,6 +3583,7 @@ mod tests {
                 storage_uri: "recording.bin".to_owned(),
                 committed_bytes: 4,
                 revision: 1,
+                availability: None,
                 finalized: false,
             },
             ToolInvocationStreamEvent::LegacyPresentation {

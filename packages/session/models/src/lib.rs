@@ -1032,6 +1032,8 @@ pub enum ToolInvocationStreamEvent {
         storage_uri: String,
         committed_bytes: u64,
         revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<String>,
         #[serde(default)]
         finalized: bool,
     },

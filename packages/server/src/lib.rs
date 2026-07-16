@@ -5114,6 +5114,7 @@ struct ActiveArtifactReference {
     committed_bytes: u64,
     revision: u64,
     finalized: bool,
+    abandoned: bool,
 }
 
 impl ActiveArtifactReference {
@@ -5130,6 +5131,7 @@ impl ActiveArtifactReference {
             storage_uri: String::new(),
             committed_bytes: self.committed_bytes,
             revision: self.revision,
+            availability: self.abandoned.then(|| "incomplete".to_owned()),
             finalized: self.finalized,
         }
     }
@@ -5187,9 +5189,18 @@ impl Drop for ActivePluginInvocationRegistration {
             entries.remove(&self.key);
         }
         if let Ok(mut artifacts) = self.active_artifacts.lock() {
-            artifacts.retain(|key, artifact| {
-                key.session_id != self.key.0 || key.tool_call_id != self.key.1 || artifact.finalized
-            });
+            for artifact in artifacts
+                .iter_mut()
+                .filter(|(key, artifact)| {
+                    key.session_id == self.key.0
+                        && key.tool_call_id == self.key.1
+                        && !artifact.finalized
+                })
+                .map(|(_, artifact)| artifact)
+            {
+                artifact.abandoned = true;
+                artifact.revision = artifact.revision.saturating_add(1);
+            }
         }
         if let Ok(mut visuals) = self.active_plugin_visuals.lock() {
             visuals.remove(&self.key);
@@ -5438,6 +5449,12 @@ async fn read_active_artifact_range(
     length: u32,
     active: ActiveArtifactReference,
 ) -> Result<ResponsePayload, String> {
+    if active.abandoned {
+        return Err(
+            "active artifact is incomplete because its producer stopped before finalization"
+                .to_owned(),
+        );
+    }
     let artifact_root = default_session_artifact_dir(session_id);
     let path = active.path.clone();
     let committed_bytes = active.committed_bytes;
@@ -16272,6 +16289,7 @@ async fn handle_interactive_tool_request(
         .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_lines)] // Validates and commits one complete active-artifact state transition.
 fn update_active_artifact(
     state: &ServerState,
     session_id: SessionId,
@@ -16343,6 +16361,9 @@ fn update_active_artifact(
         .lock()
         .map_err(|_| "active artifact registry poisoned".to_owned())?;
     if let Some(existing) = artifacts.get(&key) {
+        if existing.abandoned {
+            return Err("active artifact producer is no longer available".to_owned());
+        }
         let path_changed_on_finalization = *finalized
             && existing.path != canonical_path
             && existing.path.parent() == canonical_path.parent();
@@ -16372,6 +16393,7 @@ fn update_active_artifact(
             committed_bytes: *committed_bytes,
             revision: *revision,
             finalized: *finalized,
+            abandoned: false,
         },
     );
     drop(artifacts);
@@ -16568,6 +16590,7 @@ fn normalize_tool_stream_event_sequence(
     set_tool_stream_event_sequence(event, sequence)
 }
 
+#[allow(clippy::too_many_lines)] // Exhaustively rewrites every generic stream variant's sequence.
 fn set_tool_stream_event_sequence(
     event: ToolInvocationStreamEvent,
     sequence: u64,
@@ -16625,6 +16648,7 @@ fn set_tool_stream_event_sequence(
             storage_uri,
             committed_bytes,
             revision,
+            availability,
             finalized,
             ..
         } => ToolInvocationStreamEvent::ArtifactUpdate {
@@ -16639,6 +16663,7 @@ fn set_tool_stream_event_sequence(
             storage_uri,
             committed_bytes,
             revision,
+            availability,
             finalized,
         },
         ToolInvocationStreamEvent::Status {
@@ -16750,6 +16775,7 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             storage_uri,
             committed_bytes,
             revision,
+            availability: None,
             finalized,
         },
         ServiceToolInvocationStreamEvent::Status {
@@ -20017,6 +20043,9 @@ library = "test"
         );
         drop(registration);
         assert!(invocations.lock().expect("registry").is_empty());
+        let artifacts = active_artifacts.lock().expect("artifact registry");
+        assert!(artifacts.is_empty());
+        drop(artifacts);
     }
 
     #[tokio::test]
@@ -20061,6 +20090,7 @@ library = "test"
                 .to_string(),
             committed_bytes: 9,
             revision: 1,
+            availability: None,
             finalized: false,
         };
         update_active_artifact(&state, session_id, &update).expect("register artifact");
@@ -20163,6 +20193,85 @@ library = "test"
                 .is_empty()
         );
         remove_session_artifact_dir(&artifact_dir).expect("artifact cleanup");
+    }
+
+    #[tokio::test]
+    async fn unfinished_active_artifact_becomes_explicitly_incomplete_after_producer_drop() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("abandoned-artifact".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        let artifact_dir = default_session_artifact_dir(session_id);
+        std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
+        let path = artifact_dir.join("abandoned.bin");
+        std::fs::write(&path, b"committed").expect("artifact");
+        let registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            Arc::clone(&state.active_plugin_visuals),
+            session_id,
+            "call-abandoned",
+            ActivePluginInvocation {
+                producer_plugin_id: "fixture.plugin".to_owned(),
+                inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
+                next_input_id: Arc::new(AtomicU64::new(1)),
+            },
+        )
+        .expect("registration");
+        update_active_artifact(
+            &state,
+            session_id,
+            &ToolInvocationStreamEvent::ArtifactUpdate {
+                tool_call_id: "call-abandoned".to_owned(),
+                sequence: 1,
+                artifact_id: "artifact-abandoned".to_owned(),
+                reference_key: "recording".to_owned(),
+                producer_plugin_id: "fixture.plugin".to_owned(),
+                schema: "fixture.recording".to_owned(),
+                schema_version: 1,
+                content_type: Some("application/octet-stream".to_owned()),
+                storage_uri: url::Url::from_file_path(&path)
+                    .expect("file URL")
+                    .to_string(),
+                committed_bytes: 9,
+                revision: 1,
+                availability: None,
+                finalized: false,
+            },
+        )
+        .expect("active artifact");
+        drop(registration);
+
+        let error = read_session_artifact_range(
+            &state,
+            session_id,
+            "artifact-abandoned",
+            "recording",
+            0,
+            9,
+        )
+        .await
+        .expect_err("abandoned artifact must not appear complete");
+        assert!(error.contains("incomplete") && error.contains("producer stopped"));
+        let snapshots = active_artifact_snapshot_events(&state, session_id).expect("snapshot");
+        assert_eq!(snapshots.len(), 1, "reattach retains degraded identity");
+        assert!(matches!(
+            &snapshots[0].kind,
+            SessionLiveEventKind::ToolOutputDelta {
+                event: ToolInvocationStreamEvent::ArtifactUpdate {
+                    availability: Some(availability),
+                    finalized: false,
+                    ..
+                }
+            } if availability == "incomplete"
+        ));
+        remove_session_artifact_dir(&artifact_dir).expect("cleanup");
     }
 
     #[test]
@@ -24205,6 +24314,7 @@ library = "test"
                 storage_uri: String::new(),
                 committed_bytes,
                 revision,
+                availability: None,
                 finalized,
             };
 

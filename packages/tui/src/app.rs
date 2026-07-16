@@ -4727,6 +4727,7 @@ mod tests {
                     storage_uri: String::new(),
                     committed_bytes: revision,
                     revision,
+                    availability: None,
                     finalized: false,
                 },
             },
