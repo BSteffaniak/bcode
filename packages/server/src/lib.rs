@@ -522,9 +522,17 @@ struct TurnCancelState {
 }
 
 impl TurnCancelState {
-    async fn cancel(&self) {
-        let _commit = self.marker_commit.lock().await;
+    fn close(&self) {
         self.token.cancel();
+    }
+
+    async fn wait_for_commit_boundary(&self) {
+        let _commit = self.marker_commit.lock().await;
+    }
+
+    async fn cancel(&self) {
+        self.close();
+        self.wait_for_commit_boundary().await;
     }
 
     fn is_cancelled(&self) -> bool {
@@ -6619,16 +6627,14 @@ async fn run_session_runtime(
         };
         let command = match command {
             RuntimeQueueCommand::Cancel(command) => {
-                let cancelled = process_cancel_turn_command(
+                process_cancel_turn_command(
                     &state,
                     session_id,
                     &mut followup_commands,
                     queued_followups.as_ref(),
-                    command.clear_queue,
-                    command.requested_by,
+                    command,
                 )
                 .await;
-                let _sent = command.response.send(cancelled);
                 continue;
             }
             RuntimeQueueCommand::Followup(command) => *command,
@@ -6810,16 +6816,14 @@ async fn service_cancel_commands(
     queued_followups: &AtomicUsize,
 ) {
     while let Ok(command) = cancel_commands.try_recv() {
-        let cancelled = process_cancel_turn_command(
+        process_cancel_turn_command(
             state,
             session_id,
             followup_commands,
             queued_followups,
-            command.clear_queue,
-            command.requested_by,
+            command,
         )
         .await;
-        let _sent = command.response.send(cancelled);
     }
 }
 
@@ -6828,17 +6832,26 @@ async fn process_cancel_turn_command(
     session_id: SessionId,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
     queued_followups: &AtomicUsize,
-    clear_queue: bool,
-    requested_by: Option<ClientId>,
-) -> bool {
-    let cancelled = request_session_turn_cancellation(state, session_id, requested_by).await;
-    if clear_queue {
+    command: CancelCommand,
+) {
+    let current_turn = close_session_turn(state, session_id).await;
+    if command.clear_queue {
         let cleared = drain_followup_commands(followup_commands);
         if cleared > 0 {
             queued_followups.fetch_sub(cleared, Ordering::AcqRel);
         }
     }
-    cancelled
+    let cancelled = current_turn.is_some();
+    let requested_by = acknowledge_cancel_command(command, cancelled);
+    if let Some(current_turn) = current_turn {
+        finish_session_turn_cancellation(state, session_id, current_turn, requested_by).await;
+    }
+}
+
+fn acknowledge_cancel_command(command: CancelCommand, cancelled: bool) -> Option<ClientId> {
+    let requested_by = command.requested_by;
+    let _sent = command.response.send(cancelled);
+    requested_by
 }
 
 async fn process_steering_message_command(
@@ -6881,16 +6894,14 @@ where
             result = &mut provider_call => return FinalizedProviderCall::Completed(result),
             cancel_command = context.cancel_commands.recv() => {
                 if let Some(command) = cancel_command {
-                    let cancelled = process_cancel_turn_command(
+                    process_cancel_turn_command(
                         state,
                         session_id,
                         context.followup_commands,
                         context.queued_followups,
-                        command.clear_queue,
-                        command.requested_by,
+                        command,
                     )
                     .await;
-                    let _sent = command.response.send(cancelled);
                 }
                 if cancel_state.is_cancelled() {
                     return FinalizedProviderCall::Cancelled(provider_call.await);
@@ -6933,16 +6944,14 @@ where
             result = &mut provider_call => return ProviderCallWait::Completed(result),
             cancel_command = context.cancel_commands.recv() => {
                 if let Some(command) = cancel_command {
-                    let cancelled = process_cancel_turn_command(
+                    process_cancel_turn_command(
                         state,
                         session_id,
                         context.followup_commands,
                         context.queued_followups,
-                        command.clear_queue,
-                        command.requested_by,
+                        command,
                     )
                     .await;
-                    let _sent = command.response.send(cancelled);
                 }
                 if cancel_state.is_cancelled() {
                     return ProviderCallWait::Cancelled;
@@ -9205,16 +9214,22 @@ async fn handle_set_session_agent(
     }
 }
 
-async fn request_session_turn_cancellation(
+async fn close_session_turn(
     state: &ServerState,
     session_id: SessionId,
-    requested_by: Option<ClientId>,
-) -> bool {
-    let Some(current_turn) = state.session_current_turn(session_id).await else {
-        return false;
-    };
+) -> Option<RuntimeCurrentTurn> {
+    let current_turn = state.session_current_turn(session_id).await?;
+    current_turn.cancel_state.close();
+    Some(current_turn)
+}
 
-    current_turn.cancel_state.cancel().await;
+async fn finish_session_turn_cancellation(
+    state: &ServerState,
+    session_id: SessionId,
+    current_turn: RuntimeCurrentTurn,
+    requested_by: Option<ClientId>,
+) {
+    current_turn.cancel_state.wait_for_commit_boundary().await;
     if current_turn.kind == RuntimeOperationKind::ModelTurn
         && let Some(model) = current_turn.model.as_ref()
     {
@@ -9258,7 +9273,6 @@ async fn request_session_turn_cancellation(
         )
         .await;
     }
-    true
 }
 
 async fn handle_cancel_session_turn(
@@ -12361,16 +12375,14 @@ async fn wait_for_model_progress_or_timeout(
         () = tokio::time::sleep(MODEL_POLL_INTERVAL) => Some(idle_for),
         cancel_command = command_context.cancel_commands.recv() => {
             if let Some(command) = cancel_command {
-                let cancelled = process_cancel_turn_command(
+                process_cancel_turn_command(
                     state,
                     session_id,
                     command_context.followup_commands,
                     command_context.queued_followups,
-                    command.clear_queue,
-                    command.requested_by,
+                    command,
                 )
                 .await;
-                let _sent = command.response.send(cancelled);
             }
             Some(idle_for)
         }
@@ -19273,6 +19285,54 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolCardPresentation,
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
+
+    #[tokio::test]
+    async fn cancel_acknowledgement_precedes_commit_bookkeeping() {
+        let cancel_state = TurnCancelState::default();
+        let commit = cancel_state.marker_commit.lock().await;
+        cancel_state.close();
+        let (response, completion) = oneshot::channel();
+        let requested_by = acknowledge_cancel_command(
+            CancelCommand {
+                clear_queue: true,
+                requested_by: None,
+                response,
+            },
+            true,
+        );
+
+        assert_eq!(requested_by, None);
+        assert!(completion.await.expect("cancellation acknowledgement"));
+        let bookkeeping = cancel_state.wait_for_commit_boundary();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), bookkeeping)
+                .await
+                .is_err(),
+            "commit bookkeeping should still be independently blocked"
+        );
+        drop(commit);
+    }
+
+    #[tokio::test]
+    async fn turn_local_closure_precedes_persistence_commit_barrier() {
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let commit = cancel_state.marker_commit.lock().await;
+        let cancelling = Arc::clone(&cancel_state);
+        let cancel = tokio::spawn(async move {
+            cancelling.cancel().await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), cancel_state.cancelled())
+            .await
+            .expect("local cancellation token must close before commit coordination");
+        assert!(!cancel.is_finished());
+
+        drop(commit);
+        tokio::time::timeout(Duration::from_millis(100), cancel)
+            .await
+            .expect("cancellation should finish after commit coordination")
+            .expect("cancellation task should not panic");
+    }
 
     #[tokio::test]
     async fn server_input_router_delivers_owned_input_and_wakes_on_cancellation() {

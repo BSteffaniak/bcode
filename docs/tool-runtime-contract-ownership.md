@@ -58,6 +58,20 @@ One provider tool-call batch is the model's declaration that its calls may overl
 
 A host may explicitly disable parallel execution, and a non-reentrant adapter may serialize internally as a mechanical implementation constraint. Neither case introduces tool-domain policy into canonical orchestration.
 
+## Artifact write contract
+
+Artifact ABI v1 is a bounded atomic write rather than an allocate/write/finalize protocol. One `ToolArtifactWriteRequest` carries the complete bytes, content type, producer metadata, invocation identity, and invocation-local artifact ID. The host validates identity and size before publication and returns exactly one terminal `ToolArtifactWriteResolution`.
+
+This shape is intentional:
+
+* no incomplete allocation survives cancellation or plugin failure
+* the host chooses and enforces its byte bound
+* duplicate invocation-local IDs cannot overwrite prior artifacts
+* host sinks publish transactionally and return opaque references
+* larger or streaming artifacts require a future versioned contract rather than unbounded v1 buffering
+
+Allocation and finalize operations are therefore not part of the stable bounded v1 API.
+
 ## Dependency direction
 
 Allowed direction:

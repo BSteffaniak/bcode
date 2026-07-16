@@ -1,7 +1,6 @@
 use bcode_ipc::RuntimeWorkSnapshot;
 use bcode_plugin::PluginInvocationCancelHandle;
 use bcode_session_models::{RuntimeWorkKind, RuntimeWorkStatus, SessionId, WorkId};
-use futures::{StreamExt, stream};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -25,6 +24,9 @@ pub enum CancellationHandle {
     /// Test/no-op cancellation hook.
     #[cfg(test)]
     Test(Arc<std::sync::atomic::AtomicUsize>),
+    /// Test cancellation hook that never returns.
+    #[cfg(test)]
+    TestBlocked(Arc<tokio::sync::Notify>),
 }
 
 impl CancellationHandle {
@@ -40,6 +42,8 @@ impl CancellationHandle {
             Self::Test(count) => {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
+            #[cfg(test)]
+            Self::TestBlocked(blocked) => blocked.notified().await,
         }
     }
 
@@ -48,7 +52,7 @@ impl CancellationHandle {
         match self {
             Self::SessionTurn(_) | Self::PluginInvocation(_) | Self::RalphRun { .. } => true,
             #[cfg(test)]
-            Self::Test(_) => true,
+            Self::Test(_) | Self::TestBlocked(_) => true,
         }
     }
 }
@@ -178,11 +182,11 @@ impl RuntimeWorkManager {
             pending.extend(children);
         }
         drop(active);
-        stream::iter(cancellations)
-            .for_each_concurrent(None, |cancellation| async move {
+        for cancellation in cancellations {
+            tokio::spawn(async move {
                 cancellation.cancel().await;
-            })
-            .await;
+            });
+        }
         cancelled_work_ids
     }
 
@@ -222,6 +226,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    async fn wait_for_count(count: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while count.load(Ordering::SeqCst) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cancellation should be dispatched");
+    }
+
     fn test_spec(work_id: &str, count: Arc<AtomicUsize>) -> RuntimeWorkSpec {
         RuntimeWorkSpec::new(
             WorkId::new(work_id),
@@ -250,7 +264,7 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        wait_for_count(&count, 1).await;
         assert_eq!(
             manager.active_for_session(session_id).await[0].status,
             RuntimeWorkStatus::Cancelling
@@ -281,7 +295,7 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        wait_for_count(&count, 1).await;
     }
 
     #[tokio::test]
@@ -311,7 +325,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(first.load(Ordering::SeqCst), 0);
-        assert_eq!(second.load(Ordering::SeqCst), 1);
+        wait_for_count(&second, 1).await;
     }
     #[tokio::test]
     async fn cancelling_parent_cancels_child() {
@@ -339,8 +353,8 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert_eq!(parent_count.load(Ordering::SeqCst), 1);
-        assert_eq!(child_count.load(Ordering::SeqCst), 1);
+        wait_for_count(&parent_count, 1).await;
+        wait_for_count(&child_count, 1).await;
         assert_eq!(
             manager
                 .active_for_session(session_id)
@@ -349,6 +363,36 @@ mod tests {
                 .find(|work| work.work_id == child_id)
                 .expect("child remains active until finished")
                 .status,
+            RuntimeWorkStatus::Cancelling
+        );
+    }
+    #[tokio::test]
+    async fn non_returning_cleanup_cannot_delay_local_cancellation() {
+        let manager = RuntimeWorkManager::default();
+        let session_id = SessionId::new();
+        let work_id = WorkId::new("blocked");
+        manager
+            .start(
+                session_id,
+                RuntimeWorkSpec::new(
+                    work_id.clone(),
+                    RuntimeWorkKind::Tool,
+                    "blocked cleanup".to_string(),
+                    CancellationHandle::TestBlocked(Arc::new(tokio::sync::Notify::new())),
+                ),
+            )
+            .await;
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            manager.cancel_with_children(session_id, &work_id),
+        )
+        .await
+        .expect("local cancellation must not await cleanup");
+
+        assert_eq!(cancelled, vec![work_id]);
+        assert_eq!(
+            manager.active_for_session(session_id).await[0].status,
             RuntimeWorkStatus::Cancelling
         );
     }

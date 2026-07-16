@@ -236,6 +236,54 @@ if [[ "$prepared_invocation_fields" != "$expected_prepared_invocation_fields" ]]
   violations=1
 fi
 
+runtime_production="$(mktemp)"
+awk '/^#\[cfg\(test\)\]/{exit} {print}' packages/agent-runtime/src/lib.rs >"$runtime_production"
+for primitive in 'invoker.prepare_tool(' 'authorization.authorize_batch(' '.invoke_tool(&prepared.tool'; do
+  count="$(grep -F -c "$primitive" "$runtime_production")"
+  if [[ "$count" != "1" ]]; then
+    echo "Runtime architecture violation: canonical primitive '$primitive' has $count production call sites; expected one." >&2
+    violations=1
+  fi
+done
+rm -f "$runtime_production"
+
+artifact_request_fields="$(
+  awk '/^pub struct ToolArtifactWriteRequest \{/{capture=1; next} capture && /^\}/{exit} capture && /^    pub /{print}' packages/tool/src/contracts.rs
+)"
+expected_artifact_request_fields="$(cat <<'EOF'
+    pub invocation_id: String,
+    pub artifact_id: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    pub metadata: serde_json::Value,
+EOF
+)"
+if [[ "$artifact_request_fields" != "$expected_artifact_request_fields" ]]; then
+  echo "Runtime architecture violation: bounded atomic artifact request shape changed unexpectedly." >&2
+  diff -u <(printf '%s\n' "$expected_artifact_request_fields") <(printf '%s\n' "$artifact_request_fields") >&2 || true
+  violations=1
+fi
+if rg -n 'Artifact(Allocate|Finalize)|artifact_(allocate|finalize)|ArtifactWriteChunk' packages/tool/src packages/agent-runtime/src packages/plugin-sdk/src >/tmp/bcode-artifact-v1-streaming.txt; then
+  echo "Runtime architecture violation: unversioned allocation/finalize state was added to bounded artifact ABI v1." >&2
+  cat /tmp/bcode-artifact-v1-streaming.txt >&2
+  violations=1
+fi
+
+if rg -n 'stream::iter\(cancellations\)|for_each_concurrent\(' packages/server/src/runtime_work.rs \
+  >/tmp/bcode-awaited-runtime-cleanup.txt; then
+  echo "Runtime architecture violation: registered runtime cleanup is awaited at the local cancellation boundary." >&2
+  cat /tmp/bcode-awaited-runtime-cleanup.txt >&2
+  violations=1
+fi
+if ! rg -U 'for cancellation in cancellations \{\n[[:space:]]+tokio::spawn\(async move \{\n[[:space:]]+cancellation\.cancel\(\)\.await;' packages/server/src/runtime_work.rs >/dev/null; then
+  echo "Runtime architecture violation: registered runtime cleanup handles are not detached after capture." >&2
+  violations=1
+fi
+
+if ! rg -U 'let current_turn = close_session_turn\(state, session_id\)\.await;[\s\S]*acknowledge_cancel_command\(command, cancelled\);[\s\S]*finish_session_turn_cancellation\(' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: cancellation acknowledgement no longer precedes durable bookkeeping/cleanup." >&2
+  violations=1
+fi
 
 if ! awk '
   /^\[concurrency\]$/ { in_concurrency = 1; next }

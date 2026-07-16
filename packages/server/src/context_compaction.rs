@@ -1188,16 +1188,14 @@ pub async fn wait_for_compaction_progress_actor_aware(
         () = tokio::time::sleep(MODEL_POLL_INTERVAL) => Ok(idle_for),
         cancel_command = command_context.cancel_commands.recv() => {
             if let Some(command) = cancel_command {
-                let cancelled = process_cancel_turn_command(
+                process_cancel_turn_command(
                     state,
                     session_id,
                     command_context.followup_commands,
                     command_context.queued_followups,
-                    command.clear_queue,
-                    command.requested_by,
+                    command,
                 )
                 .await;
-                let _sent = command.response.send(cancelled);
             }
             if cancel_state.is_cancelled() {
                 Err(CompactionError::Cancelled)
