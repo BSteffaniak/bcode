@@ -5,10 +5,10 @@
 
 use crate::{db, lease, persisted};
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyTransientStreamKind, SessionEventKind, SessionId,
-    ToolInvocationStreamEvent,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyTransientStreamKind, SessionEvent,
+    SessionEventKind, SessionEventProvenance, SessionId, ToolInvocationStreamEvent,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -84,6 +84,11 @@ pub enum LegacyStreamCleanupError {
     Io {
         path: PathBuf,
         source: std::io::Error,
+    },
+    #[error("event #{sequence} failed strict persisted decoding: {source}")]
+    StrictDecode {
+        sequence: u64,
+        source: persisted::PersistedSessionEventError,
     },
     #[error("session {session_id} contains a mismatched event at row #{row_sequence}")]
     SequenceMismatch {
@@ -357,25 +362,42 @@ async fn scan_replacements(
     Ok((total, replacements))
 }
 
+#[derive(Deserialize)]
+struct LightweightEventEnvelope {
+    sequence: u64,
+    timestamp_ms: u64,
+    session_id: SessionId,
+    #[serde(default)]
+    provenance: Option<SessionEventProvenance>,
+    #[serde(rename = "kind")]
+    _kind: serde::de::IgnoredAny,
+}
+
 fn collect_replacement(
     session_id: SessionId,
     sequence: u64,
     payload: &str,
     replacements: &mut Vec<Replacement>,
 ) -> Result<(), LegacyStreamCleanupError> {
-    let mut event = persisted::decode_session_event(payload)?;
-    if event.sequence != sequence {
-        return Err(LegacyStreamCleanupError::SequenceMismatch {
+    if let Some((tool_call_id, original_kind)) = raw_transient_kind(payload) {
+        let envelope = serde_json::from_str::<LightweightEventEnvelope>(payload)?;
+        if envelope.sequence != sequence || envelope.session_id != session_id {
+            return Err(LegacyStreamCleanupError::SequenceMismatch {
+                session_id,
+                row_sequence: sequence,
+            });
+        }
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: envelope.timestamp_ms,
             session_id,
-            row_sequence: sequence,
-        });
-    }
-    if let Some((tool_call_id, original_kind)) = transient_kind(&event.kind) {
-        event.schema_version = CURRENT_SESSION_EVENT_SCHEMA_VERSION;
-        event.kind = SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::LegacyTransientPruned {
-                tool_call_id,
-                original_kind,
+            provenance: envelope.provenance,
+            kind: SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::LegacyTransientPruned {
+                    tool_call_id,
+                    original_kind,
+                },
             },
         };
         let replacement = persisted::encode_session_event(&event)?;
@@ -385,8 +407,40 @@ fn collect_replacement(
             after_bytes: replacement.len(),
             payload: replacement,
         });
+    } else {
+        persisted::decode_session_event(payload)
+            .map_err(|source| LegacyStreamCleanupError::StrictDecode { sequence, source })?;
     }
     Ok(())
+}
+
+fn raw_transient_kind(payload: &str) -> Option<(String, LegacyTransientStreamKind)> {
+    if !payload.contains("\"kind\":{\"tool_invocation_stream\":{\"event\":{") {
+        return None;
+    }
+    let (variant, original_kind) = [
+        ("\"output_delta\":", LegacyTransientStreamKind::OutputDelta),
+        (
+            "\"visual_update\":",
+            LegacyTransientStreamKind::VisualUpdate,
+        ),
+        (
+            "\"artifact_update\":",
+            LegacyTransientStreamKind::ArtifactUpdate,
+        ),
+        (
+            "\"presentation\":",
+            LegacyTransientStreamKind::LegacyPresentation,
+        ),
+    ]
+    .into_iter()
+    .find(|(variant, _)| payload.contains(variant))?;
+    let variant_tail = payload.split_once(variant)?.1;
+    let tool_call_tail = variant_tail.split_once("\"tool_call_id\"")?.1;
+    let string_value = tool_call_tail.split_once(':')?.1.trim_start();
+    let mut deserializer = serde_json::Deserializer::from_str(string_value);
+    let tool_call_id = String::deserialize(&mut deserializer).ok()?;
+    Some((tool_call_id, original_kind))
 }
 
 async fn rebuild_compact_database(
@@ -487,33 +541,6 @@ fn unix_time_millis() -> u64 {
         })
 }
 
-fn transient_kind(kind: &SessionEventKind) -> Option<(String, LegacyTransientStreamKind)> {
-    match kind {
-        SessionEventKind::ToolInvocationStream { event } => match event {
-            ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. } => {
-                Some((tool_call_id.clone(), LegacyTransientStreamKind::OutputDelta))
-            }
-            ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. } => Some((
-                tool_call_id.clone(),
-                LegacyTransientStreamKind::VisualUpdate,
-            )),
-            ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. } => Some((
-                tool_call_id.clone(),
-                LegacyTransientStreamKind::ArtifactUpdate,
-            )),
-            ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. } => Some((
-                tool_call_id.clone(),
-                LegacyTransientStreamKind::LegacyPresentation,
-            )),
-            ToolInvocationStreamEvent::LegacyTransientPruned { .. }
-            | ToolInvocationStreamEvent::Started { .. }
-            | ToolInvocationStreamEvent::Status { .. }
-            | ToolInvocationStreamEvent::Finished { .. } => None,
-        },
-        _ => None,
-    }
-}
-
 fn create_backup(root: &Path, session_id: SessionId) -> Result<PathBuf, LegacyStreamCleanupError> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -581,7 +608,9 @@ fn database_family_bytes(path: &Path) -> Result<u64, LegacyStreamCleanupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_models::{SessionEvent, ToolOutputStream};
+    use bcode_session_models::{
+        SessionEvent, SessionEventKind, ToolInvocationStreamEvent, ToolOutputStream,
+    };
 
     #[tokio::test]
     async fn cleanup_is_backed_up_sequence_preserving_and_idempotent() {

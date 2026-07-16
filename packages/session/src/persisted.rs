@@ -26,10 +26,53 @@ use thiserror::Error;
 /// Returns an error when the event is not a supported persisted session-event
 /// shape or cannot be converted into the current domain model.
 pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
-    let value = serde_json::from_str::<serde_json::Value>(payload)?;
+    let mut value = serde_json::from_str::<serde_json::Value>(payload)?;
+    normalize_legacy_context_usage_snapshot(&mut value);
     reject_unsupported_future_shape(&value)?;
     let persisted = serde_json::from_value::<PersistedSessionEvent>(value)?;
     persisted.into_domain()
+}
+
+fn normalize_legacy_context_usage_snapshot(value: &mut serde_json::Value) {
+    let Some(snapshot) = value
+        .get_mut("kind")
+        .and_then(|kind| kind.get_mut("context_usage_observed"))
+        .and_then(|event| event.get_mut("snapshot"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if snapshot.contains_key("invocation") {
+        return;
+    }
+    let string = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let optional_string = |key: &str| {
+        snapshot
+            .get(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let invocation = serde_json::json!({
+        "provider_plugin_id": string("provider_plugin_id"),
+        "requested_model_id": optional_string("model_id"),
+        "effective_model_id": string("model_id"),
+        "request_id": string("request_id"),
+        "model_turn_id": string("model_turn_id"),
+        "round": snapshot.get("round").cloned().unwrap_or_else(|| serde_json::json!(0)),
+        "request_fingerprint": string("request_fingerprint"),
+        "provider_turn_id": string("turn_id"),
+        "effective_auth_profile": optional_string("auth_profile"),
+        "context_format_version": optional_string("context_format_version"),
+        "compatibility_key": optional_string("compatibility_key"),
+        "context_epoch": 0,
+    });
+    snapshot.insert("invocation".to_owned(), invocation);
 }
 
 /// Encode a session event into the durable JSON persistence DTO shape.

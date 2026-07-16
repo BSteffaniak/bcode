@@ -202,10 +202,8 @@ async fn execute(
                 reports.push(report);
             }
             Err(error) => {
-                if !progress_enabled && !json {
-                    eprintln!("{id}: failed: {error}");
-                }
                 renderer.finish(None);
+                eprintln!("{id}: failed: {error}");
                 failures.push(CleanupFailure {
                     session_id: id,
                     error: error.to_string(),
@@ -267,6 +265,9 @@ async fn execute(
                     .as_ref()
                     .map_or_else(|| "-".to_owned(), |path| path.display().to_string())
             );
+        }
+        for failure in &run_report.failures {
+            println!("{}: FAILED — {}", failure.session_id, failure.error);
         }
     }
     Ok(())
