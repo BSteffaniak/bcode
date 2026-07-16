@@ -9223,6 +9223,40 @@ async fn close_session_turn(
     Some(current_turn)
 }
 
+fn dispatch_provider_turn_cleanup(
+    plugins: bcode_plugin::PluginRuntimeHost,
+    provider_plugin_id: String,
+    request: CancelTurnRequest,
+    scope: PluginInvocationScope,
+) {
+    tokio::spawn(async move {
+        let result = plugins
+            .invoke_service_json_scoped::<_, bcode_model::AckResponse>(
+                &provider_plugin_id,
+                MODEL_PROVIDER_INTERFACE_ID,
+                OP_CANCEL_TURN,
+                &request,
+                scope,
+            )
+            .await;
+        match result {
+            Ok(_) => tracing::debug!(
+                target: "bcode_server::cleanup",
+                plugin_id = %provider_plugin_id,
+                provider_turn_id = %request.provider_turn_id,
+                "detached provider cleanup completed"
+            ),
+            Err(error) => tracing::warn!(
+                target: "bcode_server::cleanup",
+                plugin_id = %provider_plugin_id,
+                provider_turn_id = %request.provider_turn_id,
+                %error,
+                "detached provider cleanup failed"
+            ),
+        }
+    });
+}
+
 async fn finish_session_turn_cancellation(
     state: &ServerState,
     session_id: SessionId,
@@ -9243,22 +9277,14 @@ async fn finish_session_turn_cancellation(
                 .map(ToString::to_string)
         });
         if let Some(provider_plugin_id) = provider_plugin_id {
-            let plugins = state.plugins.clone();
-            let request = CancelTurnRequest {
-                provider_turn_id: model.provider_turn_id.clone(),
-            };
-            let scope = current_turn.plugin_scope_for_provider(session_id);
-            tokio::spawn(async move {
-                let _ = plugins
-                    .invoke_service_json_scoped::<_, bcode_model::AckResponse>(
-                        &provider_plugin_id,
-                        MODEL_PROVIDER_INTERFACE_ID,
-                        OP_CANCEL_TURN,
-                        &request,
-                        scope,
-                    )
-                    .await;
-            });
+            dispatch_provider_turn_cleanup(
+                state.plugins.clone(),
+                provider_plugin_id,
+                CancelTurnRequest {
+                    provider_turn_id: model.provider_turn_id.clone(),
+                },
+                current_turn.plugin_scope_for_provider(session_id),
+            );
         }
     }
     let turn_id = current_turn.turn_id;
@@ -15375,6 +15401,25 @@ fn write_session_invocation_artifact(
     request: &ToolArtifactWriteRequest,
     cancel_state: &TurnCancelState,
 ) -> Result<serde_json::Value, (String, String)> {
+    write_session_invocation_artifact_with_publish_hook(
+        root,
+        invocation_id,
+        request,
+        cancel_state,
+        || {},
+    )
+}
+
+fn write_session_invocation_artifact_with_publish_hook<F>(
+    root: &Path,
+    invocation_id: &str,
+    request: &ToolArtifactWriteRequest,
+    cancel_state: &TurnCancelState,
+    after_publish: F,
+) -> Result<serde_json::Value, (String, String)>
+where
+    F: FnOnce(),
+{
     use sha2::{Digest as _, Sha256};
 
     let invocation_key = format!("{:x}", Sha256::digest(invocation_id.as_bytes()));
@@ -15433,6 +15478,15 @@ fn write_session_invocation_artifact(
         } else {
             Err(("artifact_publish_failed".to_string(), error.to_string()))
         };
+    }
+    after_publish();
+    if cancel_state.is_cancelled() {
+        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(&destination);
+        return Err((
+            "cancelled".to_string(),
+            "artifact publication cancelled".to_string(),
+        ));
     }
     let _ = std::fs::remove_file(&temporary);
     if let Err(error) = sync_artifact_directory(&canonical_directory) {
@@ -15530,14 +15584,23 @@ impl InvocationServiceRouter for ServerServiceRouter<'_> {
                         };
                     }
                 };
-            match invoke_host_provider_native_search_response(
+            let service = invoke_host_provider_native_search_response(
                 self.state,
                 self.session_id,
                 &self.call.id,
                 request,
-            )
-            .await
-            {
+            );
+            let response = tokio::select! {
+                biased;
+                () = self.cancel_state.cancelled() => {
+                    return ToolInvocationServiceResolution::Cancelled;
+                }
+                response = service => response,
+            };
+            if self.cancel_state.is_cancelled() {
+                return ToolInvocationServiceResolution::Cancelled;
+            }
+            match response {
                 Ok(response) => match serde_json::to_value(response) {
                     Ok(payload) => ToolInvocationServiceResolution::Responded { payload },
                     Err(error) => ToolInvocationServiceResolution::Failed {
@@ -19286,6 +19349,220 @@ mod tests {
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
 
+    #[derive(Default)]
+    struct NonReturningCancelProvider;
+
+    static NON_RETURNING_CANCEL_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static NON_RETURNING_CANCEL_RELEASED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    impl bcode_plugin_sdk::RustPlugin for NonReturningCancelProvider {
+        fn invoke_service(
+            &mut self,
+            context: bcode_plugin_sdk::NativeServiceContext,
+        ) -> bcode_plugin_sdk::ServiceResponse {
+            if context.request.operation == OP_CANCEL_TURN {
+                NON_RETURNING_CANCEL_STARTED.store(true, Ordering::SeqCst);
+                while !NON_RETURNING_CANCEL_RELEASED.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                return bcode_plugin_sdk::ServiceResponse::json(
+                    &bcode_model::AckResponse::default(),
+                )
+                .expect("ack response should encode");
+            }
+            bcode_plugin_sdk::ServiceResponse::error(
+                "unsupported_operation",
+                "only cancellation is supported",
+            )
+        }
+    }
+
+    fn non_returning_cancel_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
+        const MANIFEST: &str = r#"
+id = "test.non-returning-provider"
+name = "Non-returning Cancel Provider"
+version = "0.0.1"
+
+[[services]]
+interface_id = "bcode.model-provider/v1"
+name = "Test Provider"
+
+[concurrency]
+type = "exclusive"
+
+[runtime]
+type = "native"
+abi_version = 2
+library = "test"
+"#;
+        bcode_plugin::StaticBundledPlugin::new(
+            MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(NonReturningCancelProvider, MANIFEST),
+        )
+    }
+
+    #[tokio::test]
+    async fn non_returning_provider_cleanup_cannot_delay_local_completion() {
+        NON_RETURNING_CANCEL_STARTED.store(false, Ordering::SeqCst);
+        NON_RETURNING_CANCEL_RELEASED.store(false, Ordering::SeqCst);
+        let plugin = non_returning_cancel_provider_plugin();
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["test.non-returning-provider".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("blocking provider should load");
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            dispatch_provider_turn_cleanup(
+                plugins,
+                "test.non-returning-provider".to_string(),
+                CancelTurnRequest {
+                    provider_turn_id: "provider-turn".to_string(),
+                },
+                PluginInvocationScope::Global,
+            );
+        })
+        .await
+        .expect("provider cleanup dispatch must return locally");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !NON_RETURNING_CANCEL_STARTED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider cancellation callback should start");
+        assert!(!NON_RETURNING_CANCEL_RELEASED.load(Ordering::SeqCst));
+        NON_RETURNING_CANCEL_RELEASED.store(true, Ordering::SeqCst);
+    }
+
+    #[derive(Default)]
+    struct NonReturningSearchProvider;
+
+    static NON_RETURNING_SEARCH_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static NON_RETURNING_SEARCH_RELEASED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static NON_RETURNING_SEARCH_FINISHED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    impl bcode_plugin_sdk::RustPlugin for NonReturningSearchProvider {
+        fn invoke_service(
+            &mut self,
+            context: bcode_plugin_sdk::NativeServiceContext,
+        ) -> bcode_plugin_sdk::ServiceResponse {
+            if context.request.operation == OP_NATIVE_WEB_SEARCH {
+                NON_RETURNING_SEARCH_STARTED.store(true, Ordering::SeqCst);
+                while !NON_RETURNING_SEARCH_RELEASED.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                NON_RETURNING_SEARCH_FINISHED.store(true, Ordering::SeqCst);
+                return bcode_plugin_sdk::ServiceResponse::json(
+                    &NativeWebSearchResponse::default(),
+                )
+                .expect("search response should encode");
+            }
+            bcode_plugin_sdk::ServiceResponse::error(
+                "unsupported_operation",
+                "only native search is supported",
+            )
+        }
+    }
+
+    fn non_returning_search_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
+        const MANIFEST: &str = r#"
+id = "test.non-returning-search-provider"
+name = "Non-returning Search Provider"
+version = "0.0.1"
+
+[[services]]
+interface_id = "bcode.model-provider/v1"
+name = "Test Provider"
+
+[concurrency]
+type = "exclusive"
+
+[runtime]
+type = "native"
+abi_version = 2
+library = "test"
+"#;
+        bcode_plugin::StaticBundledPlugin::new(
+            MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(NonReturningSearchProvider, MANIFEST),
+        )
+    }
+
+    #[tokio::test]
+    async fn server_nested_service_router_aborts_blocked_provider_call_on_cancellation() {
+        NON_RETURNING_SEARCH_STARTED.store(false, Ordering::SeqCst);
+        NON_RETURNING_SEARCH_RELEASED.store(false, Ordering::SeqCst);
+        NON_RETURNING_SEARCH_FINISHED.store(false, Ordering::SeqCst);
+        let plugin = non_returning_search_provider_plugin();
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["test.non-returning-search-provider".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("blocking search provider should load");
+        let mut state = test_server_state(SessionManager::default());
+        state.plugins = plugins;
+        state.selected_provider_plugin_id = Some("test.non-returning-search-provider".to_string());
+        let session_id = SessionId::new();
+        let call = bcode_model::ToolCall {
+            id: "search-call".to_string(),
+            name: "web.search".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let task_state = Arc::new(state);
+        let task_cancel = Arc::clone(&cancel_state);
+        let task = tokio::spawn(async move {
+            ServerServiceRouter::new(task_state.as_ref(), session_id, &call, task_cancel.as_ref())
+                .invoke(ToolInvocationServiceRequest {
+                    invocation_id: "search-call".to_string(),
+                    request_id: "search-request".to_string(),
+                    interface_id: MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE.to_string(),
+                    operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
+                    payload: serde_json::json!({"query": "rust"}),
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !NON_RETURNING_SEARCH_STARTED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("nested provider service should start");
+        cancel_state.close();
+        let resolution = tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("nested service router must abort locally")
+            .expect("router task should not panic");
+        assert_eq!(resolution, ToolInvocationServiceResolution::Cancelled);
+        assert!(!NON_RETURNING_SEARCH_FINISHED.load(Ordering::SeqCst));
+
+        NON_RETURNING_SEARCH_RELEASED.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !NON_RETURNING_SEARCH_FINISHED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider worker should finish after release");
+    }
+
     #[tokio::test]
     async fn cancel_acknowledgement_precedes_commit_bookkeeping() {
         let cancel_state = TurnCancelState::default();
@@ -19443,6 +19720,42 @@ mod tests {
             sink.write(request).await,
             ToolArtifactWriteResolution::Failed { code, .. } if code == "duplicate_artifact"
         ));
+    }
+
+    #[test]
+    fn session_artifact_write_rolls_back_publication_when_cancellation_wins() {
+        let root = tempfile::tempdir().expect("artifact sink root");
+        let cancel_state = TurnCancelState::default();
+        let request = ToolArtifactWriteRequest {
+            invocation_id: "artifact-call".to_string(),
+            artifact_id: "cancelled-result".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            bytes: b"artifact bytes".to_vec(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let result = write_session_invocation_artifact_with_publish_hook(
+            root.path(),
+            "artifact-call",
+            &request,
+            &cancel_state,
+            || cancel_state.close(),
+        );
+
+        assert!(matches!(result, Err((code, _)) if code == "cancelled"));
+        let invocation_directory = root.path().join("invocation-artifacts");
+        let published_files = std::fs::read_dir(invocation_directory)
+            .expect("invocation artifact root")
+            .flat_map(|entry| {
+                std::fs::read_dir(entry.expect("invocation directory").path())
+                    .expect("artifact directory")
+            })
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert!(
+            published_files.is_empty(),
+            "cancelled publication leaked files"
+        );
     }
 
     #[tokio::test]
@@ -23421,11 +23734,63 @@ mod tests {
         permission.notify.notify_waiters();
     }
 
+    async fn wait_for_pending_permissions(
+        state: &ServerState,
+        expected: usize,
+    ) -> Vec<PendingPermission> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = state.pending_permissions.lock().await;
+                if pending.len() == expected {
+                    break pending.values().cloned().collect();
+                }
+                drop(pending);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all permissions should resolve before invocation starts")
+    }
+
+    async fn assert_persisted_tool_results_in_order(
+        state: &ServerState,
+        session_id: SessionId,
+        expected: &[String],
+    ) {
+        let history = state
+            .sessions
+            .session_history_page(
+                session_id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: None,
+                    limit: 100,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                },
+            )
+            .await
+            .expect("tool batch history");
+        let persisted_results = history
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolCallFinished { tool_call_id, .. } => {
+                    Some(tool_call_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_results, expected,
+            "persisted results must retain provider order despite reverse completion"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn server_same_batch_shell_calls_overlap_after_complete_authorization() {
-        let sessions = SessionManager::default();
         let workspace = tempfile::tempdir().expect("parallel shell workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent parallel shell sessions");
         let summary = sessions
             .create_session(
                 Some("parallel shell batch".to_string()),
@@ -23444,7 +23809,8 @@ mod tests {
                 name: "shell.run".to_string(),
                 arguments: serde_json::json!({
                     "command": format!(
-                        "touch .parallel-{index}; while [ \"$(find . -maxdepth 1 -name '.parallel-*' | wc -l | tr -d ' ')\" -lt 5 ]; do sleep 0.02; done; printf 'call-{index}\\n'"
+                        "touch .parallel-{index}; while [ \"$(find . -maxdepth 1 -name '.parallel-*' | wc -l | tr -d ' ')\" -lt 5 ]; do sleep 0.02; done; sleep {delay}; printf 'call-{index}\\n'",
+                        delay = f64::from(4 - index) * 0.05,
                     ),
                     "timeout_ms": 2_000
                 }),
@@ -23476,18 +23842,7 @@ mod tests {
             .await
         });
 
-        let pending = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let pending = state.pending_permissions.lock().await;
-                if pending.len() == 5 {
-                    break pending.values().cloned().collect::<Vec<_>>();
-                }
-                drop(pending);
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all shell permissions should resolve before invocation starts");
+        let pending = wait_for_pending_permissions(state.as_ref(), 5).await;
         assert!(
             state
                 .active_plugin_invocations
@@ -23513,7 +23868,7 @@ mod tests {
         approve_pending_permission_for_test(state.as_ref(), &final_permission).await;
 
         assert!(
-            tokio::time::timeout(Duration::from_secs(3), task)
+            tokio::time::timeout(Duration::from_secs(10), task)
                 .await
                 .expect("parallel shell batch should finish")
                 .expect("parallel shell batch task should not panic")
@@ -23522,6 +23877,14 @@ mod tests {
             (0..5).all(|index| workspace.path().join(format!(".parallel-{index}")).exists()),
             "every shell command must start before any can complete"
         );
+        assert_persisted_tool_results_in_order(
+            state.as_ref(),
+            session_id,
+            &(0..5)
+                .map(|index| format!("parallel-shell-{index}"))
+                .collect::<Vec<_>>(),
+        )
+        .await;
     }
 
     #[cfg(unix)]

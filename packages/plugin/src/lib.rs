@@ -5118,10 +5118,30 @@ library = "libexample_plugin.dylib"
                 ],
             });
             let slow = runtime.clone();
-            let slow_task = tokio::spawn(async move {
+            let first_slow_task = tokio::spawn(async move {
                 slow.invoke_service("slow", "slow", "run", Vec::new()).await
             });
             tokio::time::sleep(Duration::from_millis(25)).await;
+            let slow = runtime.clone();
+            let second_slow_task = tokio::spawn(async move {
+                slow.invoke_service("slow", "slow", "run", Vec::new()).await
+            });
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    let status = runtime
+                        .executor_statuses()
+                        .into_iter()
+                        .find(|status| status.plugin_id == "slow")
+                        .expect("slow executor status");
+                    if status.running == 1 && status.queued == 1 {
+                        assert_eq!(status.concurrency, PluginConcurrency::Exclusive);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("exclusive plugin should expose one queued invocation");
             let fast_start = Instant::now();
             let fast = runtime
                 .invoke_service("fast", "fast", "run", Vec::new())
@@ -5135,13 +5155,18 @@ library = "libexample_plugin.dylib"
                     .into_iter()
                     .any(|status| status.plugin_id == "slow" && status.running == 1)
             );
-            let slow = slow_task
+            let first_slow = first_slow_task
                 .await
-                .expect("slow task joins")
-                .expect("slow returns");
-            assert_eq!(slow.payload, b"slow");
+                .expect("first slow task joins")
+                .expect("first slow returns");
+            let second_slow = second_slow_task
+                .await
+                .expect("second slow task joins")
+                .expect("second slow returns");
+            assert_eq!(first_slow.payload, b"slow");
+            assert_eq!(second_slow.payload, b"slow");
         });
-        assert_eq!(SLOW_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(SLOW_CALLS.load(Ordering::SeqCst), 2);
         assert_eq!(FAST_CALLS.load(Ordering::SeqCst), 1);
     }
 

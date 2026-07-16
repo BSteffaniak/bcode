@@ -27,23 +27,41 @@ pub enum CancellationHandle {
     /// Test cancellation hook that never returns.
     #[cfg(test)]
     TestBlocked(Arc<tokio::sync::Notify>),
+    /// Test cancellation hook that reports cleanup failure.
+    #[cfg(test)]
+    TestFailed(Arc<std::sync::atomic::AtomicUsize>),
 }
 
 impl CancellationHandle {
     /// Request cancellation through the underlying handle.
-    pub async fn cancel(&self) {
+    pub async fn cancel(&self) -> Result<(), String> {
         match self {
-            Self::SessionTurn(cancel_state) => cancel_state.cancel().await,
-            Self::PluginInvocation(cancel) => cancel.cancel(),
-            Self::RalphRun { store, run_id } => {
-                let _ = store.request_run_cancel(run_id);
+            Self::SessionTurn(cancel_state) => {
+                cancel_state.cancel().await;
+                Ok(())
             }
+            Self::PluginInvocation(cancel) => {
+                cancel.cancel();
+                Ok(())
+            }
+            Self::RalphRun { store, run_id } => store
+                .request_run_cancel(run_id)
+                .map_err(|error| error.to_string()),
             #[cfg(test)]
             Self::Test(count) => {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
             }
             #[cfg(test)]
-            Self::TestBlocked(blocked) => blocked.notified().await,
+            Self::TestBlocked(blocked) => {
+                blocked.notified().await;
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::TestFailed(count) => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("test cleanup failed".to_string())
+            }
         }
     }
 
@@ -52,7 +70,7 @@ impl CancellationHandle {
         match self {
             Self::SessionTurn(_) | Self::PluginInvocation(_) | Self::RalphRun { .. } => true,
             #[cfg(test)]
-            Self::Test(_) | Self::TestBlocked(_) => true,
+            Self::Test(_) | Self::TestBlocked(_) | Self::TestFailed(_) => true,
         }
     }
 }
@@ -170,7 +188,7 @@ impl RuntimeWorkManager {
             }
             work.cancelled = true;
             cancelled_work_ids.push(next_work_id.clone());
-            cancellations.push(work.spec.cancellation.clone());
+            cancellations.push((next_work_id.clone(), work.spec.cancellation.clone()));
             let children = active
                 .iter()
                 .filter(|((child_session_id, _), child)| {
@@ -182,9 +200,24 @@ impl RuntimeWorkManager {
             pending.extend(children);
         }
         drop(active);
-        for cancellation in cancellations {
+        for (cleanup_work_id, cancellation) in cancellations {
             tokio::spawn(async move {
-                cancellation.cancel().await;
+                let result = cancellation.cancel().await;
+                match result {
+                    Ok(()) => tracing::debug!(
+                        target: "bcode_server::cleanup",
+                        %session_id,
+                        work_id = %cleanup_work_id,
+                        "detached runtime cleanup completed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "bcode_server::cleanup",
+                        %session_id,
+                        work_id = %cleanup_work_id,
+                        %error,
+                        "detached runtime cleanup failed"
+                    ),
+                }
             });
         }
         cancelled_work_ids
@@ -394,6 +427,37 @@ mod tests {
         assert_eq!(
             manager.active_for_session(session_id).await[0].status,
             RuntimeWorkStatus::Cancelling
+        );
+    }
+    #[tokio::test]
+    async fn cleanup_failure_is_diagnostic_only_after_local_cancellation() {
+        let manager = RuntimeWorkManager::default();
+        let session_id = SessionId::new();
+        let work_id = WorkId::new("failed-cleanup");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        manager
+            .start(
+                session_id,
+                RuntimeWorkSpec::new(
+                    work_id.clone(),
+                    RuntimeWorkKind::Tool,
+                    "failed cleanup".to_string(),
+                    CancellationHandle::TestFailed(Arc::clone(&attempts)),
+                ),
+            )
+            .await;
+
+        let cancelled = manager.cancel_with_children(session_id, &work_id).await;
+        assert_eq!(cancelled, vec![work_id]);
+        assert_eq!(
+            manager.active_for_session(session_id).await[0].status,
+            RuntimeWorkStatus::Cancelling
+        );
+        wait_for_count(&attempts, 1).await;
+        assert_eq!(
+            manager.active_for_session(session_id).await[0].status,
+            RuntimeWorkStatus::Cancelling,
+            "cleanup failure must not reverse local cancellation"
         );
     }
 }

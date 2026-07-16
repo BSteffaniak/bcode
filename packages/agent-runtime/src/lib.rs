@@ -3109,6 +3109,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_group_cancellation_returns_exactly_one_outcome_per_invocation() {
+        let mut catalog = UnifiedToolCatalog::new();
+        let mut calls = Vec::new();
+        let mut cancellation_counts = BTreeMap::new();
+        for index in 0..5 {
+            let name = format!("tool-{index}");
+            catalog = catalog.with_inline_tool(tool_definition(&name));
+            calls.push(ToolCall {
+                id: format!("call-{index}"),
+                name: name.clone(),
+                arguments: serde_json::Value::Null,
+            });
+            cancellation_counts.insert(name, Arc::new(AtomicUsize::new(0)));
+        }
+        let invoker = CancellationHandleInvoker {
+            started: AtomicUsize::new(0),
+            cancellations: cancellation_counts.clone(),
+        };
+        let scope = TurnScope::without_events("turn", TurnGeneration::new(15));
+        let control = scope.control();
+        let mut rounds = ToolRoundState::new(1);
+        let runtime = AgentRuntime::new();
+        let authorization = AllowBatchAuthorization::default();
+        let context = RuntimePermissionContext::default();
+        let execution = runtime.execute_prepared_tool_batch(
+            &catalog,
+            &authorization,
+            &invoker,
+            &calls,
+            &mut rounds,
+            &context,
+            ToolExecutionOptions {
+                parallel: true,
+                max_concurrency: NonZeroUsize::new(2),
+                ..ToolExecutionOptions::default()
+            },
+            &scope,
+        );
+        let cancellation = async {
+            while invoker.started.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+            assert!(control.begin_cancellation());
+        };
+        let (output, ()) = tokio::join!(execution, cancellation);
+        let output = output.expect("cancelled group should return ordered outcomes");
+
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 2);
+        assert_eq!(output.results.len(), calls.len());
+        assert!(
+            output
+                .results
+                .iter()
+                .all(|result| matches!(result, Err(RuntimeError::Cancelled)))
+        );
+        assert_eq!(cancellation_counts["tool-0"].load(Ordering::SeqCst), 1);
+        assert_eq!(cancellation_counts["tool-1"].load(Ordering::SeqCst), 1);
+        for index in 2..5 {
+            assert_eq!(
+                cancellation_counts[&format!("tool-{index}")].load(Ordering::SeqCst),
+                0,
+                "queued invocation must not activate or receive an active-handle signal"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn one_provider_batch_declares_parallel_intent_without_domain_conflict_inference() {
         let catalog = UnifiedToolCatalog::new()
             .with_inline_tool(tool_definition("alpha"))

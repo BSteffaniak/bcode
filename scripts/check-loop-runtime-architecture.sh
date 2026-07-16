@@ -275,13 +275,60 @@ if rg -n 'stream::iter\(cancellations\)|for_each_concurrent\(' packages/server/s
   cat /tmp/bcode-awaited-runtime-cleanup.txt >&2
   violations=1
 fi
-if ! rg -U 'for cancellation in cancellations \{\n[[:space:]]+tokio::spawn\(async move \{\n[[:space:]]+cancellation\.cancel\(\)\.await;' packages/server/src/runtime_work.rs >/dev/null; then
+if ! rg -U 'for \(cleanup_work_id, cancellation\) in cancellations \{\n[[:space:]]+tokio::spawn\(async move \{\n[[:space:]]+let result = cancellation\.cancel\(\)\.await;' packages/server/src/runtime_work.rs >/dev/null; then
   echo "Runtime architecture violation: registered runtime cleanup handles are not detached after capture." >&2
+  violations=1
+fi
+
+if ! grep -F 'parallel_group_cancellation_returns_exactly_one_outcome_per_invocation' packages/agent-runtime/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: mixed active/queued cancellation cardinality proof was removed." >&2
+  violations=1
+fi
+
+if ! rg -U 'let service = invoke_host_provider_native_search_response\([\s\S]*tokio::select! \{[\s\S]*cancel_state\.cancelled\(\)[\s\S]*ToolInvocationServiceResolution::Cancelled' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: server nested service routing is not cancellation-bounded." >&2
+  violations=1
+fi
+if ! rg -U 'after_publish\(\);[\s\S]*cancel_state\.is_cancelled\(\)[\s\S]*remove_file\(&destination\)[\s\S]*"cancelled"' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: cancelled artifact publication is not rolled back." >&2
+  violations=1
+fi
+
+if ! rg -U 'let result = cancellation\.cancel\(\)\.await;[\s\S]*detached runtime cleanup completed[\s\S]*detached runtime cleanup failed' packages/server/src/runtime_work.rs >/dev/null; then
+  echo "Runtime architecture violation: detached runtime cleanup completion/failure diagnostics were removed." >&2
+  violations=1
+fi
+if ! rg -U 'let result = plugins[\s\S]*OP_CANCEL_TURN[\s\S]*detached provider cleanup completed[\s\S]*detached provider cleanup failed' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: detached provider cleanup completion/failure diagnostics were removed." >&2
+  violations=1
+fi
+
+if ! rg -U 'fn dispatch_provider_turn_cleanup\([\s\S]*tokio::spawn\(async move[\s\S]*OP_CANCEL_TURN' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: provider cleanup is no longer detached from local cancellation." >&2
   violations=1
 fi
 
 if ! rg -U 'let current_turn = close_session_turn\(state, session_id\)\.await;[\s\S]*acknowledge_cancel_command\(command, cancelled\);[\s\S]*finish_session_turn_cancellation\(' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: cancellation acknowledgement no longer precedes durable bookkeeping/cleanup." >&2
+  violations=1
+fi
+
+if ! rg -U 'persisted results must retain provider order despite reverse completion' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: production overlap test no longer proves provider-ordered persistence." >&2
+  violations=1
+fi
+
+if ! rg -U 'SlashCommandOutcome::CancelTurn[\s\S]*TuiEffect::CancelTurn[\s\S]*set_cancelling\(\)' packages/tui/src/composer_flow.rs >/dev/null; then
+  echo "Runtime architecture violation: composer cancellation does not enter immediate Cancelling UI state." >&2
+  violations=1
+fi
+if ! rg -U 'Ok\(true\)[\s\S]*set_cancelling\(\)[\s\S]*turn cancellation requested' packages/tui/src/chat_loop.rs >/dev/null; then
+  echo "Runtime architecture violation: positive cancellation acknowledgement does not preserve Cancelling UI state." >&2
+  violations=1
+fi
+
+if ! grep -F 'runtime_status_tracks_plugin_local_queueing' packages/plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: exclusive adapter queueing/serialization proof was removed." >&2
   violations=1
 fi
 

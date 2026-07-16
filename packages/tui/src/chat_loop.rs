@@ -1578,6 +1578,7 @@ fn apply_cancel_turn_result(
 ) {
     match result {
         Ok(true) if Some(session_id) == chat.app.session_id() => {
+            chat.app.set_cancelling();
             chat.app
                 .set_status("turn cancellation requested".to_owned());
         }

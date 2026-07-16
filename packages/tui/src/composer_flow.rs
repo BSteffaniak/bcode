@@ -284,6 +284,7 @@ async fn handle_slash_command<W: Write>(
         slash_commands::SlashCommandOutcome::CancelTurn { session_id } => {
             chat.app.clear_pending_submission(message);
             chat.start_effect(TuiEffect::CancelTurn { session_id });
+            chat.app.set_cancelling();
             chat.app.set_status("requesting cancellation…".to_owned());
         }
         slash_commands::SlashCommandOutcome::CancelRuntimeWork {

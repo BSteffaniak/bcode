@@ -72,6 +72,12 @@ This shape is intentional:
 
 Allocation and finalize operations are therefore not part of the stable bounded v1 API.
 
+## Detached cleanup completion
+
+Local cancellation changes active runtime work to `Cancelling` before cleanup begins. Detached cleanup completion does not remove or finish that work item; only termination of the owning operation does. Cleanup completion and failure are emitted as diagnostic tracing with session/work or provider/turn identity. Failures never reverse local cancellation and are never returned through the cancellation acknowledgement.
+
+This separation keeps runtime-work state truthful: `Cancelling` means the owning operation has not yet reported terminal completion, regardless of whether its best-effort cleanup signal succeeded.
+
 ## Dependency direction
 
 Allowed direction:
