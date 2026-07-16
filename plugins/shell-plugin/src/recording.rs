@@ -40,6 +40,201 @@ const FRAME_START: u8 = 4;
 const FRAME_REPLAY_OUTPUT: u8 = 5;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const ASYNC_RECORDING_QUEUE_CAPACITY: usize = 256;
+const RECORDING_HEADER_BYTES: usize = 14;
+const RECORDING_FRAME_HEADER_BYTES: usize = 13;
+
+/// Incremental decoder for ordered committed prefixes of an active version-three recording.
+///
+/// The decoder retains only an incomplete header/frame tail. Complete frames are returned once,
+/// preserving exact payload bytes and frame order across arbitrary range boundaries.
+#[derive(Debug, Default)]
+pub struct IncrementalShellRecordingDecoder {
+    buffer: Vec<u8>,
+    stream_offset: u64,
+    columns: Option<u16>,
+    rows: Option<u16>,
+    previous_frame_offset: Option<u64>,
+    saw_start: bool,
+    saw_finish: bool,
+}
+
+impl IncrementalShellRecordingDecoder {
+    /// Append the next contiguous recording range and decode all newly complete frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-contiguous range, invalid header, malformed or oversized frame,
+    /// non-monotonic frame time, invalid lifecycle ordering, or replay checksum mismatch.
+    pub fn push(&mut self, offset: u64, bytes: &[u8]) -> io::Result<Vec<ShellRecordingFrame>> {
+        let buffered = u64::try_from(self.buffer.len()).unwrap_or(u64::MAX);
+        if offset != self.stream_offset.saturating_add(buffered) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recording range is not contiguous",
+            ));
+        }
+        self.buffer.extend_from_slice(bytes);
+        let mut consumed = if self.columns.is_none() {
+            if self.buffer.len() < RECORDING_HEADER_BYTES {
+                return Ok(Vec::new());
+            }
+            if &self.buffer[..8] != MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid recording magic",
+                ));
+            }
+            let version = u16::from_le_bytes([self.buffer[8], self.buffer[9]]);
+            if version != FORMAT_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active recording version is unsupported",
+                ));
+            }
+            self.columns = Some(u16::from_le_bytes([self.buffer[10], self.buffer[11]]));
+            self.rows = Some(u16::from_le_bytes([self.buffer[12], self.buffer[13]]));
+            RECORDING_HEADER_BYTES
+        } else {
+            0
+        };
+        let mut frames = Vec::new();
+        loop {
+            let remaining = &self.buffer[consumed..];
+            if remaining.len() < RECORDING_FRAME_HEADER_BYTES {
+                break;
+            }
+            let kind = remaining[0];
+            let frame_offset = u64::from_le_bytes(
+                remaining[1..9]
+                    .try_into()
+                    .map_err(|_| io::Error::other("recording frame offset slice"))?,
+            );
+            let payload_len = usize::try_from(u32::from_le_bytes(
+                remaining[9..13]
+                    .try_into()
+                    .map_err(|_| io::Error::other("recording frame length slice"))?,
+            ))
+            .unwrap_or(usize::MAX);
+            if payload_len > MAX_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recording frame exceeds limit",
+                ));
+            }
+            let frame_len = RECORDING_FRAME_HEADER_BYTES.saturating_add(payload_len);
+            if remaining.len() < frame_len {
+                break;
+            }
+            if self.saw_finish {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recording contains frames after finish",
+                ));
+            }
+            if self
+                .previous_frame_offset
+                .is_some_and(|previous| frame_offset < previous)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recording frame offsets are not monotonic",
+                ));
+            }
+            let payload = remaining[RECORDING_FRAME_HEADER_BYTES..frame_len].to_vec();
+            let frame = self.decode_frame(kind, frame_offset, &payload)?;
+            self.previous_frame_offset = Some(frame_offset);
+            frames.push(frame);
+            consumed = consumed.saturating_add(frame_len);
+        }
+        if consumed > 0 {
+            self.buffer.drain(..consumed);
+            self.stream_offset = self
+                .stream_offset
+                .saturating_add(u64::try_from(consumed).unwrap_or(u64::MAX));
+        }
+        Ok(frames)
+    }
+
+    /// Return initial recording dimensions once the header has arrived.
+    #[must_use]
+    pub const fn dimensions(&self) -> Option<(u16, u16)> {
+        match (self.columns, self.rows) {
+            (Some(columns), Some(rows)) => Some((columns, rows)),
+            _ => None,
+        }
+    }
+
+    fn decode_frame(
+        &mut self,
+        kind: u8,
+        offset_micros: u64,
+        payload: &[u8],
+    ) -> io::Result<ShellRecordingFrame> {
+        let frame = match kind {
+            FRAME_START if !self.saw_start && payload.is_empty() => {
+                self.saw_start = true;
+                ShellRecordingFrame::Start { offset_micros }
+            }
+            FRAME_OUTPUT if self.saw_start => ShellRecordingFrame::Output {
+                offset_micros,
+                bytes: payload.to_vec(),
+            },
+            FRAME_REPLAY_OUTPUT if self.saw_start && payload.len() >= 32 => {
+                let (expected, bytes) = payload.split_at(32);
+                if Sha256::digest(bytes).as_slice() != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "recording replay-output checksum mismatch",
+                    ));
+                }
+                ShellRecordingFrame::ReplayOutput {
+                    offset_micros,
+                    bytes: bytes.to_vec(),
+                }
+            }
+            FRAME_RESIZE if self.saw_start && payload.len() == 4 => ShellRecordingFrame::Resize {
+                offset_micros,
+                columns: u16::from_le_bytes([payload[0], payload[1]]),
+                rows: u16::from_le_bytes([payload[2], payload[3]]),
+            },
+            FRAME_FINISH if self.saw_start && payload.len() >= 40 => {
+                let signal_length = usize::from(u16::from_le_bytes([payload[6], payload[7]]));
+                let checksum_start = 8_usize.saturating_add(signal_length);
+                if payload.len() != checksum_start.saturating_add(32) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid recording finish frame",
+                    ));
+                }
+                let signal = std::str::from_utf8(&payload[8..checksum_start]).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid signal name")
+                })?;
+                self.saw_finish = true;
+                ShellRecordingFrame::Finish {
+                    offset_micros,
+                    exit_code: (payload[0] != 0).then(|| {
+                        i32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
+                    }),
+                    signal: (!signal.is_empty()).then(|| signal.to_owned()),
+                    timed_out: payload[5] & 1 != 0,
+                    cancelled: payload[5] & 2 != 0,
+                }
+            }
+            kind if self.saw_start => ShellRecordingFrame::Unknown {
+                kind,
+                offset_micros,
+                payload: payload.to_vec(),
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid active recording lifecycle or frame",
+                ));
+            }
+        };
+        Ok(frame)
+    }
+}
 
 enum AsyncRecordingCommand {
     Output {
@@ -805,6 +1000,38 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_decoder_preserves_exact_frames_across_single_byte_ranges() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("incremental.bcsr");
+        let mut writer = ShellRecordingWriter::create(&path, 80, 24).expect("writer");
+        let first = b"\xffsplit-utf8:\xe7\x95";
+        let second = b"\x8c\0tail";
+        writer.write_output(1, first).expect("first output");
+        writer.write_resize(2, 132, 40).expect("resize");
+        writer.write_output(3, second).expect("second output");
+        writer
+            .finish(4, Some(0), None, false, false)
+            .expect("finish");
+        let bytes = std::fs::read(&path).expect("recording bytes");
+        let (_, expected) = read_recording(&path).expect("complete recording");
+        let mut decoder = IncrementalShellRecordingDecoder::default();
+        let mut actual = Vec::new();
+        for (offset, byte) in bytes.iter().enumerate() {
+            actual.extend(
+                decoder
+                    .push(
+                        u64::try_from(offset).expect("offset"),
+                        std::slice::from_ref(byte),
+                    )
+                    .expect("incremental byte"),
+            );
+        }
+        assert_eq!(decoder.dimensions(), Some((80, 24)));
+        assert_eq!(actual, expected);
+        assert!(decoder.push(0, b"duplicate").is_err());
+    }
 
     #[test]
     fn round_trip_preserves_exact_bytes_resize_timing_and_finish() {

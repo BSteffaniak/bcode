@@ -4,7 +4,6 @@
 //! that may interpret shell artifact schemas and terminal recording references; generic TUI and
 //! transcript code routes opaque plugin visuals without understanding those values.
 
-use base64::Engine as _;
 use bcode_tui_components::terminal_viewer::{
     MAX_INLINE_TERMINAL_ROWS, TerminalViewerInput, TerminalViewerLiveState, TerminalViewerSizing,
     terminal_viewer_rows,
@@ -38,11 +37,19 @@ struct LiveTerminalReplay {
     rows: u16,
 }
 
+#[derive(Default)]
+struct LiveArtifactReplay {
+    decoder: crate::recording::IncrementalShellRecordingDecoder,
+    next_offset: u64,
+    finalized: bool,
+}
+
 /// Native TUI visual adapter for shell run artifacts.
 #[derive(Default)]
 pub struct ShellRunTuiVisualAdapter {
     live_states: Mutex<BTreeMap<String, TerminalViewerLiveState>>,
     live_replays: Mutex<BTreeMap<String, LiveTerminalReplay>>,
+    artifact_replays: Mutex<BTreeMap<String, LiveArtifactReplay>>,
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
@@ -110,6 +117,60 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 "rows": size.height,
             }),
         })
+    }
+
+    fn artifact_chunk(&self, chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk) {
+        if chunk.reference_key != SHELL_RECORDING_REF_KEY || chunk.offset > chunk.total_bytes {
+            return;
+        }
+        let Ok(mut artifacts) = self.artifact_replays.lock() else {
+            return;
+        };
+        let artifact = artifacts.entry(chunk.tool_call_id.clone()).or_default();
+        if chunk.offset != artifact.next_offset {
+            return;
+        }
+        let Ok(frames) = artifact.decoder.push(chunk.offset, &chunk.bytes) else {
+            return;
+        };
+        artifact.next_offset = artifact
+            .next_offset
+            .saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX));
+        artifact.finalized |= chunk.finalized;
+        let dimensions = artifact.decoder.dimensions();
+        drop(artifacts);
+
+        let Ok(mut replays) = self.live_replays.lock() else {
+            return;
+        };
+        let replay = replays.entry(chunk.tool_call_id.clone()).or_default();
+        if let Some((columns, rows)) = dimensions
+            && (replay.initial_columns == 0 || replay.initial_rows == 0)
+        {
+            replay.initial_columns = columns;
+            replay.initial_rows = rows;
+            replay.columns = columns;
+            replay.rows = rows;
+        }
+        for frame in frames {
+            match frame {
+                crate::recording::ShellRecordingFrame::ReplayOutput { bytes, .. } => {
+                    replay.output.extend_from_slice(&bytes);
+                    replay.frames.push(TerminalReplayFrame::Output(bytes));
+                }
+                crate::recording::ShellRecordingFrame::Resize { columns, rows, .. } => {
+                    replay.columns = columns;
+                    replay.rows = rows;
+                    replay
+                        .frames
+                        .push(TerminalReplayFrame::Resize { columns, rows });
+                }
+                crate::recording::ShellRecordingFrame::Start { .. }
+                | crate::recording::ShellRecordingFrame::Finish { .. }
+                | crate::recording::ShellRecordingFrame::Unknown { .. }
+                | crate::recording::ShellRecordingFrame::Output { .. } => {}
+            }
+        }
     }
 
     fn rows(
@@ -242,28 +303,8 @@ impl ShellRunTuiVisualAdapter {
             .unwrap_or("shell-live-terminal");
         let initial_columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
         let initial_rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
-        let live_frames = decode_live_frames(runtime);
-        let live_bytes = live_frames.as_deref().map_or_else(
-            || output.as_bytes().to_vec(),
-            |frames| {
-                frames
-                    .iter()
-                    .filter_map(|(_, frame)| match frame {
-                        TerminalReplayFrame::Output(bytes) => Some(bytes.as_slice()),
-                        TerminalReplayFrame::Resize { .. } => None,
-                    })
-                    .flatten()
-                    .copied()
-                    .collect()
-            },
-        );
-        let frames = self.update_live_replay(
-            key,
-            &live_bytes,
-            live_frames.as_deref(),
-            initial_columns,
-            initial_rows,
-        );
+        let live_bytes = output.as_bytes().to_vec();
+        let frames = self.update_live_replay(key, &live_bytes, None, initial_columns, initial_rows);
         let streaming = runtime
             .get("streaming")
             .and_then(serde_json::Value::as_bool)
@@ -341,14 +382,14 @@ impl ShellRunTuiVisualAdapter {
                 replay.frames.push(frame.clone());
                 replay.last_frame_sequence = *sequence;
             }
-        } else if output.starts_with(&replay.output) {
+        } else if !output.is_empty() && output.starts_with(&replay.output) {
             let appended = &output[replay.output.len()..];
             if !appended.is_empty() {
                 replay
                     .frames
                     .push(TerminalReplayFrame::Output(appended.to_vec()));
             }
-        } else if output != replay.output {
+        } else if !output.is_empty() && output != replay.output {
             replay.frames.clear();
             replay.pending_resizes.clear();
             replay
@@ -359,8 +400,10 @@ impl ShellRunTuiVisualAdapter {
             replay.columns = initial_columns;
             replay.rows = initial_rows;
         }
-        replay.output.clear();
-        replay.output.extend_from_slice(output);
+        if !output.is_empty() {
+            replay.output.clear();
+            replay.output.extend_from_slice(output);
+        }
         let mut frames = replay.frames.clone();
         frames.extend(replay.pending_resizes.iter().cloned());
         frames
@@ -546,38 +589,6 @@ const fn operator_style() -> Style {
 
 const fn argument_style() -> Style {
     Style::new()
-}
-
-pub(crate) fn decode_live_frames(
-    runtime: &serde_json::Value,
-) -> Option<Vec<(u64, TerminalReplayFrame)>> {
-    let frames = runtime.get("frames")?.as_array()?;
-    let mut decoded = Vec::with_capacity(frames.len());
-    for (index, frame) in frames.iter().enumerate() {
-        let sequence = u64::try_from(index).ok()?.saturating_add(1);
-        match frame.get("type").and_then(serde_json::Value::as_str)? {
-            "output" => {
-                let bytes = frame
-                    .get("bytes_base64")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|encoded| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(encoded)
-                            .ok()
-                    })?;
-                decoded.push((sequence, TerminalReplayFrame::Output(bytes)));
-            }
-            "resize" => decoded.push((
-                sequence,
-                TerminalReplayFrame::Resize {
-                    columns: payload_u16(frame, "columns")?,
-                    rows: payload_u16(frame, "rows")?,
-                },
-            )),
-            _ => return None,
-        }
-    }
-    Some(decoded)
 }
 
 fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {
@@ -990,6 +1001,62 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[test]
+    fn artifact_chunks_incrementally_feed_shell_owned_live_replay_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("live-artifact.bcsr");
+        let mut writer =
+            crate::recording::ShellRecordingWriter::create(&path, 12, 3).expect("recording writer");
+        writer
+            .write_replay_output(1, b"first\r\n")
+            .expect("first replay");
+        writer.write_resize(2, 9, 4).expect("resize");
+        writer
+            .write_replay_output(3, b"\xffsecond")
+            .expect("second replay");
+        writer
+            .finish(4, Some(0), None, false, false)
+            .expect("finish");
+        let bytes = std::fs::read(path).expect("recording bytes");
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let split = bytes.len() / 2;
+        for (offset, range) in [(0_usize, &bytes[..split]), (split, &bytes[split..])] {
+            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::artifact_chunk(
+                &adapter,
+                &bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
+                    tool_call_id: "call".to_owned(),
+                    artifact_id: "artifact".to_owned(),
+                    reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
+                    producer_plugin_id: "bcode.shell".to_owned(),
+                    schema: "bcode.tool.request.shell.run".to_owned(),
+                    schema_version: 1,
+                    content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
+                    offset: u64::try_from(offset).expect("offset"),
+                    total_bytes: u64::try_from(bytes.len()).expect("length"),
+                    revision: u64::try_from(offset + range.len()).expect("revision"),
+                    finalized: offset == split,
+                    bytes: range.to_vec(),
+                },
+            );
+        }
+        let replays = adapter.live_replays.lock().expect("live replays");
+        let replay = replays.get("call").expect("artifact replay");
+        assert_eq!(replay.output, b"first\r\n\xffsecond");
+        assert_eq!(
+            replay.frames,
+            vec![
+                TerminalReplayFrame::Output(b"first\r\n".to_vec()),
+                TerminalReplayFrame::Resize {
+                    columns: 9,
+                    rows: 4,
+                },
+                TerminalReplayFrame::Output(b"\xffsecond".to_vec()),
+            ]
+        );
+        assert_eq!((replay.initial_columns, replay.initial_rows), (12, 3));
+        drop(replays);
     }
 
     #[test]

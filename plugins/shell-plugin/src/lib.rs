@@ -16,7 +16,6 @@ pub mod recording;
 pub mod shell_run_tui;
 mod terminal_clean;
 
-use base64::Engine as _;
 use bcode_config::{
     ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
     ShellToolOutputConfig, ShellToolPreludeGateTarget, default_config_paths_from_with_environment,
@@ -27,8 +26,8 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolArtifactRef, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolOutputStream,
-    ToolPluginVisualMetadata, ToolSideEffect, ToolStreamVisualUpdate,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolPluginVisualMetadata,
+    ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -605,12 +604,6 @@ enum ShellInvocationAction {
     Resize { columns: u16, rows: u16 },
 }
 
-#[derive(Debug, Clone)]
-enum ShellLiveFrame {
-    Output(Vec<u8>),
-    Resize { columns: u16, rows: u16 },
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ShellAppliedResize {
     columns: u16,
@@ -623,7 +616,6 @@ struct ShellInvocationActionReader {
     started: Instant,
     recording: Option<recording::AsyncShellRecordingResizeSender>,
     applied_resizes: Arc<StdMutex<Vec<ShellAppliedResize>>>,
-    live_frames: Arc<StdMutex<Vec<ShellLiveFrame>>>,
 }
 
 impl ShellInvocationActionReader {
@@ -670,7 +662,6 @@ impl ShellInvocationActionReader {
                         pixel_height: 0,
                     };
                     if let Some(recording) = &self.recording {
-                        let live_frames = Arc::clone(&self.live_frames);
                         recording
                             .write_resize_with(
                                 u64::try_from(self.started.elapsed().as_micros())
@@ -681,23 +672,12 @@ impl ShellInvocationActionReader {
                                     master
                                         .resize(size)
                                         .map_err(|error| io::Error::other(error.to_string()))?;
-                                    live_frames
-                                        .lock()
-                                        .map_err(|_| {
-                                            io::Error::other("shell live frame state poisoned")
-                                        })?
-                                        .push(ShellLiveFrame::Resize { columns, rows });
                                     Ok(())
                                 },
                             )
                             .map_err(|error| error.to_string())?;
                     } else {
-                        let mut live_frames = self
-                            .live_frames
-                            .lock()
-                            .map_err(|_| "shell live frame state poisoned".to_owned())?;
                         master.resize(size).map_err(|error| error.to_string())?;
-                        live_frames.push(ShellLiveFrame::Resize { columns, rows });
                     }
                     self.applied_resizes
                         .lock()
@@ -879,26 +859,19 @@ fn run_terminal_shell_command_inner(
     let raw_artifact_path = raw_artifact_path(paths.artifact_dir, tool_call_id)?;
     let replay_artifact_path = replay_artifact_path(paths.artifact_dir, tool_call_id)?;
     let recording_path = recording_artifact_path(paths.artifact_dir, tool_call_id)?;
-    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let (recording_ready_tx, recording_ready_rx) = std::sync::mpsc::channel();
-    let live_frames = Arc::new(StdMutex::new(Vec::new()));
     let started = Instant::now();
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
-        let live_frames = Arc::clone(&live_frames);
         move || {
             read_limited_streaming(
                 &mut reader,
                 events,
                 &tool_call_id,
                 &ShellVisualStreamContext {
-                    arguments: &arguments_json,
-                    stream: ToolOutputStream::Pty,
                     columns,
                     rows,
-                    timeout_ms: Some(timeout_ms),
                     prelude_markers,
-                    live_frames: Some(live_frames),
                 },
                 TerminalStreamPaths {
                     clean: clean_artifact_path,
@@ -923,7 +896,6 @@ fn run_terminal_shell_command_inner(
             started,
             recording,
             applied_resizes: Arc::clone(&applied_resizes),
-            live_frames: Arc::clone(&live_frames),
         });
     let status = wait_for_terminal_shell_status(
         &mut child,
@@ -1103,14 +1075,10 @@ struct PreludeGateMarkers {
 }
 
 #[derive(Clone)]
-struct ShellVisualStreamContext<'a> {
-    arguments: &'a serde_json::Value,
-    stream: ToolOutputStream,
+struct ShellVisualStreamContext {
     columns: u16,
     rows: u16,
-    timeout_ms: Option<u64>,
     prelude_markers: PreludeGateMarkers,
-    live_frames: Option<Arc<StdMutex<Vec<ShellLiveFrame>>>>,
 }
 
 const PRELUDE_GATE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
@@ -1268,7 +1236,7 @@ fn read_limited_streaming<R>(
     mut reader: R,
     events: ServiceEventEmitter,
     tool_call_id: &str,
-    visual_context: &ShellVisualStreamContext<'_>,
+    visual_context: &ShellVisualStreamContext,
     paths: TerminalStreamPaths,
 ) -> Result<TerminalStreamOutput, String>
 where
@@ -1305,17 +1273,10 @@ where
         MAX_INLINE_TERMINAL_OUTPUT_BYTES,
     );
     let mut buffer = [0_u8; STREAM_READ_BUFFER_BYTES];
-    let mut sequence = 0_u64;
-    let mut visual_output = Vec::new();
     let recording_started = Instant::now();
     let mut live_gate = PreludeGate::new(visual_context.prelude_markers.live.clone());
     let mut replay_gate = PreludeGate::new(visual_context.prelude_markers.replay.clone());
     let mut clean_gate = PreludeGate::new(visual_context.prelude_markers.clean.clone());
-    let emit = StreamChunkEmit {
-        events,
-        tool_call_id,
-        visual_context,
-    };
     loop {
         let read = reader
             .read(&mut buffer)
@@ -1323,89 +1284,50 @@ where
         if read == 0 {
             break;
         }
-        sequence = sequence.saturating_add(1);
         let chunk = &buffer[..read];
         raw.write_chunk(&mut *raw_writer, chunk, DEFAULT_MAX_OUTPUT_BYTES)?;
         let live = live_gate.write(chunk);
         let replay_chunk = replay_gate.write(chunk);
         let clean = clean_gate.write(chunk);
         if let Some(writer) = &mut recording_writer {
-            let live_frames = visual_context.live_frames.as_ref().map(Arc::clone);
-            let queued = writer.try_write_output_with(
+            let _queued = writer.try_write_output_with(
                 u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 chunk,
                 Some(&live),
-                || {
-                    if let Some(live_frames) = live_frames
-                        && let Ok(mut frames) = live_frames.lock()
-                        && !live.is_empty()
-                    {
-                        frames.push(ShellLiveFrame::Output(live.clone()));
-                    }
-                },
+                || {},
             );
-            if !queued
-                && let Some(live_frames) = &visual_context.live_frames
-                && let Ok(mut frames) = live_frames.lock()
-                && !live.is_empty()
-            {
-                frames.push(ShellLiveFrame::Output(live.clone()));
-            }
-        } else if let Some(live_frames) = &visual_context.live_frames
-            && let Ok(mut frames) = live_frames.lock()
-            && !live.is_empty()
-        {
-            frames.push(ShellLiveFrame::Output(live.clone()));
         }
         write_stream_outputs(
             StreamOutputs {
-                live: &live,
                 replay: &replay_chunk,
                 clean: &clean,
             },
             &mut replay,
             &mut *replay_writer,
             &mut cleaner,
-            &mut visual_output,
-            emit.with_sequence(sequence),
         )?;
     }
-    sequence = sequence.saturating_add(1);
     let live = live_gate.finish();
     let replay_chunk = replay_gate.finish();
     let clean = clean_gate.finish();
     write_stream_outputs(
         StreamOutputs {
-            live: &live,
             replay: &replay_chunk,
             clean: &clean,
         },
         &mut replay,
         &mut *replay_writer,
         &mut cleaner,
-        &mut visual_output,
-        emit.with_sequence(sequence),
     )?;
-    if !live.is_empty() {
-        if let Some(writer) = &mut recording_writer {
-            let live_frames = visual_context.live_frames.as_ref().map(Arc::clone);
-            let _ = writer.try_write_output_with(
-                u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                &[],
-                Some(&live),
-                || {
-                    if let Some(live_frames) = live_frames
-                        && let Ok(mut frames) = live_frames.lock()
-                    {
-                        frames.push(ShellLiveFrame::Output(live.clone()));
-                    }
-                },
-            );
-        } else if let Some(live_frames) = &visual_context.live_frames
-            && let Ok(mut frames) = live_frames.lock()
-        {
-            frames.push(ShellLiveFrame::Output(live));
-        }
+    if !live.is_empty()
+        && let Some(writer) = &mut recording_writer
+    {
+        let _queued = writer.try_write_output_with(
+            u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            &[],
+            Some(&live),
+            || {},
+        );
     }
     let prelude_suppressed = live_gate.suppressed_prelude()
         || replay_gate.suppressed_prelude()
@@ -1434,35 +1356,8 @@ where
 
 #[derive(Clone, Copy)]
 struct StreamOutputs<'a> {
-    live: &'a [u8],
     replay: &'a [u8],
     clean: &'a [u8],
-}
-
-#[derive(Clone, Copy)]
-struct StreamChunkEmit<'a, 'b> {
-    events: ServiceEventEmitter,
-    tool_call_id: &'a str,
-    visual_context: &'a ShellVisualStreamContext<'b>,
-}
-
-impl<'a, 'b> StreamChunkEmit<'a, 'b> {
-    const fn with_sequence(self, sequence: u64) -> SequencedStreamChunkEmit<'a, 'b> {
-        SequencedStreamChunkEmit {
-            events: self.events,
-            tool_call_id: self.tool_call_id,
-            visual_context: self.visual_context,
-            sequence,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct SequencedStreamChunkEmit<'a, 'b> {
-    events: ServiceEventEmitter,
-    tool_call_id: &'a str,
-    visual_context: &'a ShellVisualStreamContext<'b>,
-    sequence: u64,
 }
 
 fn write_stream_outputs<W: Write>(
@@ -1470,19 +1365,7 @@ fn write_stream_outputs<W: Write>(
     replay: &mut RetainedStream,
     replay_writer: &mut dyn Write,
     cleaner: &mut terminal_clean::TerminalCleanWriter<&mut W>,
-    visual_output: &mut Vec<u8>,
-    emit: SequencedStreamChunkEmit<'_, '_>,
 ) -> Result<(), String> {
-    if !outputs.live.is_empty() {
-        visual_output.extend_from_slice(outputs.live);
-        emit_tool_output_delta(
-            emit.events,
-            emit.tool_call_id,
-            emit.visual_context,
-            emit.sequence,
-            visual_output,
-        );
-    }
     if !outputs.replay.is_empty() {
         replay.write_chunk(replay_writer, outputs.replay, DEFAULT_MAX_OUTPUT_BYTES)?;
     }
@@ -1573,28 +1456,6 @@ fn current_unix_millis() -> u64 {
         })
 }
 
-fn shell_live_frames_json(frames: &StdMutex<Vec<ShellLiveFrame>>) -> serde_json::Value {
-    let Ok(frames) = frames.lock() else {
-        return serde_json::Value::Array(Vec::new());
-    };
-    serde_json::Value::Array(
-        frames
-            .iter()
-            .map(|frame| match frame {
-                ShellLiveFrame::Output(bytes) => json!({
-                    "type": "output",
-                    "bytes_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-                }),
-                ShellLiveFrame::Resize { columns, rows } => json!({
-                    "type": "resize",
-                    "columns": columns,
-                    "rows": rows,
-                }),
-            })
-            .collect(),
-    )
-}
-
 fn shell_recording_commit_observer(
     events: ServiceEventEmitter,
     tool_call_id: &str,
@@ -1624,49 +1485,6 @@ fn shell_recording_commit_observer(
             },
         );
     })
-}
-
-fn emit_tool_output_delta(
-    events: ServiceEventEmitter,
-    tool_call_id: &str,
-    visual_context: &ShellVisualStreamContext<'_>,
-    sequence: u64,
-    bytes: &[u8],
-) {
-    let text = String::from_utf8_lossy(bytes).into_owned();
-    let live_frames = visual_context.live_frames.as_deref().map_or_else(
-        || serde_json::Value::Array(Vec::new()),
-        shell_live_frames_json,
-    );
-    emit_tool_stream_event(
-        events,
-        &ToolInvocationStreamEvent::VisualUpdate {
-            tool_call_id: tool_call_id.to_owned(),
-            sequence,
-            visual: ToolStreamVisualUpdate {
-                visual_id: None,
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                schema: "bcode.tool.request.shell.run".to_owned(),
-                schema_version: 1,
-                title: Some("Shell command".to_owned()),
-                subtitle: None,
-                payload: json!({
-                    "arguments": visual_context.arguments,
-                    "_bcode_runtime": {
-                        "output": text,
-                        "frames": live_frames,
-                        "columns": visual_context.columns,
-                        "rows": visual_context.rows,
-                        "timeout_ms": visual_context.timeout_ms,
-                        "live_state_key": tool_call_id,
-                        "streaming": true,
-                    }
-                }),
-            },
-            streaming: true,
-        },
-    );
-    let _ = visual_context.stream;
 }
 
 fn emit_tool_status(
@@ -2164,40 +1982,6 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.output.contains("\"exit_code\":1"));
-    }
-
-    #[cfg(feature = "static-bundled")]
-    #[test]
-    fn live_frame_payload_preserves_non_utf8_bytes_and_order() {
-        let frames = StdMutex::new(vec![
-            ShellLiveFrame::Output(vec![0xff, b'A']),
-            ShellLiveFrame::Resize {
-                columns: 90,
-                rows: 35,
-            },
-            ShellLiveFrame::Output(vec![0xc3]),
-        ]);
-        let runtime = json!({"frames": shell_live_frames_json(&frames)});
-        assert_eq!(
-            crate::shell_run_tui::decode_live_frames(&runtime),
-            Some(vec![
-                (
-                    1,
-                    crate::shell_run_tui::TerminalReplayFrame::Output(vec![0xff, b'A'])
-                ),
-                (
-                    2,
-                    crate::shell_run_tui::TerminalReplayFrame::Resize {
-                        columns: 90,
-                        rows: 35,
-                    },
-                ),
-                (
-                    3,
-                    crate::shell_run_tui::TerminalReplayFrame::Output(vec![0xc3])
-                ),
-            ])
-        );
     }
 
     #[cfg(unix)]
@@ -2759,15 +2543,10 @@ mod tests {
         const BYTES: usize = 4 * 1024 * 1024;
         const ROUNDS: usize = 9;
         let input = vec![b'x'; BYTES];
-        let arguments = json!({});
         let context = ShellVisualStreamContext {
-            arguments: &arguments,
-            stream: ToolOutputStream::Pty,
             columns: 120,
             rows: 30,
-            timeout_ms: None,
             prelude_markers: PreludeGateMarkers::default(),
-            live_frames: None,
         };
         let mut baseline = Vec::with_capacity(ROUNDS);
         let mut recorded = Vec::with_capacity(ROUNDS);
@@ -2905,127 +2684,13 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    struct FixedChunkReader {
-        bytes: Vec<u8>,
-        offset: usize,
-        chunk_bytes: usize,
-    }
-
-    impl std::io::Read for FixedChunkReader {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if self.offset == self.bytes.len() {
-                return Ok(0);
-            }
-            let end = self
-                .offset
-                .saturating_add(self.chunk_bytes)
-                .min(self.bytes.len());
-            let len = end.saturating_sub(self.offset).min(buffer.len());
-            buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
-            self.offset = self.offset.saturating_add(len);
-            Ok(len)
-        }
-    }
-
-    fn cumulative_live_visual_payload_measurement(
-        chunk_count: usize,
-        chunk_bytes: usize,
-    ) -> (usize, usize, usize) {
-        let arguments = json!({});
-        let live_frames = Arc::new(StdMutex::new(Vec::new()));
-        let context = ShellVisualStreamContext {
-            arguments: &arguments,
-            stream: ToolOutputStream::Pty,
-            columns: 80,
-            rows: 24,
-            timeout_ms: None,
-            prelude_markers: PreludeGateMarkers::default(),
-            live_frames: Some(Arc::clone(&live_frames)),
-        };
-        let events = Mutex::new(Vec::<Vec<u8>>::new());
-        let emitter = ServiceEventEmitter::new(
-            Some(capture_service_event),
-            std::ptr::from_ref(&events).cast_mut().cast(),
-        );
-        read_limited_streaming(
-            FixedChunkReader {
-                bytes: vec![b'x'; chunk_count.saturating_mul(chunk_bytes)],
-                offset: 0,
-                chunk_bytes,
-            },
-            emitter,
-            "growth-call",
-            &context,
-            TerminalStreamPaths {
-                clean: None,
-                raw: None,
-                replay: None,
-                recording: None,
-                recording_ready: None,
-            },
-        )
-        .expect("stream measurement");
-        let events = events.lock().expect("event lock");
-        let payload_bytes = events.iter().map(Vec::len).sum();
-        let base64_bytes = events
-            .iter()
-            .map(|payload| {
-                let event: ToolInvocationStreamEvent =
-                    serde_json::from_slice(payload).expect("stream event");
-                let ToolInvocationStreamEvent::VisualUpdate { visual, .. } = event else {
-                    panic!("expected visual update");
-                };
-                visual
-                    .payload
-                    .pointer("/_bcode_runtime/frames")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|frame| frame.get("bytes_base64"))
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::len)
-                    .sum::<usize>()
-            })
-            .sum();
-        (events.len(), payload_bytes, base64_bytes)
-    }
-
     #[test]
-    fn cumulative_live_visual_fixture_proves_superlinear_payload_and_base64_growth() {
-        let small = cumulative_live_visual_payload_measurement(64, 32);
-        let large = cumulative_live_visual_payload_measurement(128, 32);
-
-        assert_eq!(small.0, 64);
-        assert_eq!(large.0, 128);
-        assert!(large.1 > small.1.saturating_mul(3));
-        assert!(large.2 > small.2.saturating_mul(3));
-    }
-
-    #[test]
-    #[ignore = "release benchmark for the known interim cumulative live-visual transport"]
-    fn benchmark_cumulative_live_visual_growth() {
-        let started = Instant::now();
-        let (event_count, payload_bytes, base64_bytes) =
-            cumulative_live_visual_payload_measurement(2_000, 32);
-        eprintln!(
-            "events={event_count} payload_bytes={payload_bytes} base64_bytes={base64_bytes} elapsed_ms={}",
-            started.elapsed().as_millis()
-        );
-        assert_eq!(event_count, 2_000);
-    }
-
-    #[test]
-    fn recording_does_not_change_live_output_event_payloads() {
+    fn recording_emits_only_bounded_artifact_notifications() {
         let bytes = b"first\rsecond\n\x1b[31mred\x1b[0m\n";
-        let arguments = json!({});
         let context = ShellVisualStreamContext {
-            arguments: &arguments,
-            stream: ToolOutputStream::Pty,
             columns: 80,
             rows: 24,
-            timeout_ms: None,
             prelude_markers: PreludeGateMarkers::default(),
-            live_frames: None,
         };
         let baseline_events = Mutex::new(Vec::<Vec<u8>>::new());
         let baseline_emitter = ServiceEventEmitter::new(
@@ -3074,22 +2739,14 @@ mod tests {
             .finish(1, Some(0), None, false, false)
             .expect("finish recording");
 
-        let recorded_non_artifact_events = recorded_events
-            .lock()
-            .expect("recorded lock")
-            .iter()
-            .filter(|payload| {
-                !matches!(
-                    serde_json::from_slice::<ToolInvocationStreamEvent>(payload),
-                    Ok(ToolInvocationStreamEvent::ArtifactUpdate { .. })
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            recorded_non_artifact_events,
-            *baseline_events.lock().expect("baseline lock")
-        );
+        assert!(baseline_events.lock().expect("baseline lock").is_empty());
+        let recorded_events = recorded_events.lock().expect("recorded lock");
+        assert!(!recorded_events.is_empty());
+        assert!(recorded_events.iter().all(|payload| matches!(
+            serde_json::from_slice::<ToolInvocationStreamEvent>(payload),
+            Ok(ToolInvocationStreamEvent::ArtifactUpdate { .. })
+        )));
+        drop(recorded_events);
     }
 
     #[cfg(feature = "static-bundled")]
@@ -3102,17 +2759,13 @@ mod tests {
             ServiceEventEmitter::default(),
             "call",
             &ShellVisualStreamContext {
-                arguments: &json!({}),
-                stream: ToolOutputStream::Pty,
                 columns: 80,
                 rows: 24,
-                timeout_ms: None,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_owned()],
                     replay: vec!["__MARK__".to_owned()],
                     clean: vec!["__MARK__".to_owned()],
                 },
-                live_frames: None,
             },
             TerminalStreamPaths {
                 clean: None,
@@ -3143,17 +2796,13 @@ mod tests {
             ServiceEventEmitter::default(),
             "call",
             &ShellVisualStreamContext {
-                arguments: &json!({}),
-                stream: ToolOutputStream::Pty,
                 columns: 80,
                 rows: 24,
-                timeout_ms: None,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_string()],
                     replay: vec!["__MARK__".to_string()],
                     clean: Vec::new(),
                 },
-                live_frames: None,
             },
             TerminalStreamPaths {
                 clean: None,
@@ -3176,17 +2825,13 @@ mod tests {
             ServiceEventEmitter::default(),
             "call",
             &ShellVisualStreamContext {
-                arguments: &json!({}),
-                stream: ToolOutputStream::Pty,
                 columns: 80,
                 rows: 24,
-                timeout_ms: None,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_string()],
                     replay: Vec::new(),
                     clean: vec!["__MARK__".to_string()],
                 },
-                live_frames: None,
             },
             TerminalStreamPaths {
                 clean: None,

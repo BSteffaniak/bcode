@@ -3296,11 +3296,38 @@ impl BmuxApp {
         context.rows = rows.unwrap_or(context.rows);
         context.started_at_ms = started_at_ms;
         self.active_tool_calls.insert(tool_call_id.to_owned());
-        if let Some(visual) = self
+        if let Some(mut visual) = self
             .tool_call_contexts
             .get(tool_call_id)
             .and_then(|context| context.request_visual.clone())
         {
+            let runtime = visual
+                .payload
+                .as_object_mut()
+                .map(|payload| {
+                    payload
+                        .entry("_bcode_runtime")
+                        .or_insert_with(|| serde_json::json!({}))
+                })
+                .and_then(serde_json::Value::as_object_mut);
+            if let Some(runtime) = runtime {
+                runtime.insert(
+                    "live_state_key".to_owned(),
+                    serde_json::Value::String(tool_call_id.to_owned()),
+                );
+                runtime.insert(
+                    "columns".to_owned(),
+                    serde_json::json!(columns.unwrap_or(0)),
+                );
+                runtime.insert("rows".to_owned(), serde_json::json!(rows.unwrap_or(0)));
+                runtime.insert(
+                    "output".to_owned(),
+                    serde_json::Value::String(String::new()),
+                );
+            }
+            if let Some(context) = self.tool_call_contexts.get_mut(tool_call_id) {
+                context.request_visual = Some(visual.clone());
+            }
             self.active_plugin_visuals
                 .entry(tool_call_id.to_owned())
                 .or_insert(visual);

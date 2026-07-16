@@ -42,6 +42,14 @@ if ! grep -q 'LiveEventPersistenceRejected' packages/session/src/lib.rs; then
   exit 1
 fi
 
+# The shell live path must remain artifact-range based. Cumulative visual buffers/JSON frames and
+# base64 transport are forbidden in shell-owned producer and adapter code.
+if grep -R --include='*.rs' -nE 'visual_output|shell_live_frames_json|bytes_base64|base64::' \
+  plugins/shell-plugin/src; then
+  echo "shell live transport must not rebuild cumulative/base64 visual state" >&2
+  exit 1
+fi
+
 # Domain words alone are too broad for UI components, but core production code must not branch on
 # terminal recording concepts. Generic names such as terminal dimensions in a generic stream event
 # remain allowed; shell-owned recording/replay identifiers do not.

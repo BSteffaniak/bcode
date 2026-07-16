@@ -228,6 +228,23 @@ impl PluginTuiVisualRenderContext {
     }
 }
 
+/// Opaque bounded artifact bytes delivered asynchronously to a plugin-owned visual adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginTuiArtifactChunk {
+    pub tool_call_id: String,
+    pub artifact_id: String,
+    pub reference_key: String,
+    pub producer_plugin_id: String,
+    pub schema: String,
+    pub schema_version: u32,
+    pub content_type: Option<String>,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub revision: u64,
+    pub finalized: bool,
+    pub bytes: Vec<u8>,
+}
+
 /// Native Rust plugin artifact/view renderer for inline transcript content.
 pub trait PluginTuiVisualAdapter: Send + Sync {
     /// Return whether this adapter can render the artifact/view kind.
@@ -247,6 +264,12 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
     ) -> Option<bcode_tool::PluginInvocationAction> {
         None
     }
+
+    /// Consume one ordered opaque artifact range fetched by the host outside rendering.
+    ///
+    /// The host may redeliver metadata revisions but does not redeliver byte ranges. Adapters must
+    /// interpret bytes only for artifact schemas they own.
+    fn artifact_chunk(&self, _chunk: &PluginTuiArtifactChunk) {}
 
     /// Build transcript rows for the artifact/view payload at the given width.
     fn rows(
@@ -538,6 +561,20 @@ impl PluginTuiRegistry {
             .iter()
             .find(|adapter| adapter.supports(kind))
             .and_then(|adapter| adapter.invocation_event_action(kind, payload, event))
+    }
+
+    /// Deliver opaque artifact bytes through the adapter that owns the artifact schema.
+    #[must_use]
+    pub fn visual_artifact_chunk(&self, chunk: &PluginTuiArtifactChunk) -> bool {
+        let Some(adapter) = self
+            .visual_adapters
+            .iter()
+            .find(|adapter| adapter.supports(&chunk.schema))
+        else {
+            return false;
+        };
+        adapter.artifact_chunk(chunk);
+        true
     }
 
     /// Build transcript rows with host-owned presentation preferences.

@@ -1,6 +1,7 @@
 //! Main chat event loop for the TUI.
 
 use bcode_plugin_sdk::path::display_from_current_dir;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -38,6 +39,36 @@ use super::{
 
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
+const ACTIVE_ARTIFACT_FETCH_BYTES: u32 = 256 * 1024;
+
+type ActiveArtifactKey = (bcode_session_models::SessionId, String, String, String);
+
+#[derive(Debug, Clone)]
+struct ActiveArtifactTarget {
+    producer_plugin_id: String,
+    schema: String,
+    schema_version: u32,
+    content_type: Option<String>,
+    committed_bytes: u64,
+    revision: u64,
+    finalized: bool,
+}
+
+#[derive(Debug, Default)]
+struct ActiveArtifactFetchState {
+    next_offset: u64,
+    target: Option<ActiveArtifactTarget>,
+    fetching: bool,
+}
+
+#[derive(Debug)]
+struct ActiveArtifactFetchCompletion {
+    session_id: bcode_session_models::SessionId,
+    key: ActiveArtifactKey,
+    requested_offset: u64,
+    target_revision: u64,
+    result: Result<bcode_client::SessionArtifactRange, ClientError>,
+}
 
 #[derive(Debug, Clone)]
 struct DraftAutosave {
@@ -118,6 +149,10 @@ struct ChatLoopState {
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     interactive_surface: Option<InteractiveSurfaceState>,
     plugin_runtime: Option<PluginRuntimeHost>,
+    artifact_fetches: BTreeMap<ActiveArtifactKey, ActiveArtifactFetchState>,
+    artifact_fetch_sender: tokio::sync::mpsc::UnboundedSender<ActiveArtifactFetchCompletion>,
+    artifact_fetch_receiver: tokio::sync::mpsc::UnboundedReceiver<ActiveArtifactFetchCompletion>,
+    passive_client: BcodeClient,
     automation_hold: ModalAutomationHold,
 }
 
@@ -127,6 +162,8 @@ impl ChatLoopState {
         passive_client: &BcodeClient,
         daemon_host: TuiDaemonHost,
     ) -> Self {
+        let (artifact_fetch_sender, artifact_fetch_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         Self {
             palette: None,
             slash_palette: None,
@@ -137,8 +174,171 @@ impl ChatLoopState {
             timeline_dialog: None,
             interactive_surface: None,
             plugin_runtime: None,
+            artifact_fetches: BTreeMap::new(),
+            artifact_fetch_sender,
+            artifact_fetch_receiver,
+            passive_client: passive_client.clone(),
             automation_hold: ModalAutomationHold::new(),
         }
+    }
+
+    fn observe_active_artifact(
+        &mut self,
+        session_id: bcode_session_models::SessionId,
+        event: &bcode_session_models::ToolInvocationStreamEvent,
+    ) {
+        let bcode_session_models::ToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id,
+            artifact_id,
+            reference_key,
+            producer_plugin_id,
+            schema,
+            schema_version,
+            content_type,
+            committed_bytes,
+            revision,
+            finalized,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let key = (
+            session_id,
+            tool_call_id.clone(),
+            artifact_id.clone(),
+            reference_key.clone(),
+        );
+        let state = self.artifact_fetches.entry(key.clone()).or_default();
+        if state
+            .target
+            .as_ref()
+            .is_some_and(|target| *revision <= target.revision)
+        {
+            return;
+        }
+        state.target = Some(ActiveArtifactTarget {
+            producer_plugin_id: producer_plugin_id.clone(),
+            schema: schema.clone(),
+            schema_version: *schema_version,
+            content_type: content_type.clone(),
+            committed_bytes: *committed_bytes,
+            revision: *revision,
+            finalized: *finalized,
+        });
+        self.schedule_active_artifact_fetch(session_id, &key);
+    }
+
+    fn schedule_active_artifact_fetch(
+        &mut self,
+        session_id: bcode_session_models::SessionId,
+        key: &ActiveArtifactKey,
+    ) {
+        let Some(state) = self.artifact_fetches.get_mut(key) else {
+            return;
+        };
+        let Some(target) = state.target.as_ref() else {
+            return;
+        };
+        if state.fetching || state.next_offset >= target.committed_bytes {
+            return;
+        }
+        let requested_offset = state.next_offset;
+        let remaining = target.committed_bytes.saturating_sub(requested_offset);
+        let length = u32::try_from(remaining)
+            .unwrap_or(u32::MAX)
+            .min(ACTIVE_ARTIFACT_FETCH_BYTES);
+        let target_revision = target.revision;
+        state.fetching = true;
+        let client = self.passive_client.clone();
+        let sender = self.artifact_fetch_sender.clone();
+        let task_key = key.clone();
+        tokio::spawn(async move {
+            let result = client
+                .session_artifact_range(
+                    session_id,
+                    task_key.2.clone(),
+                    task_key.3.clone(),
+                    requested_offset,
+                    length,
+                )
+                .await;
+            let _ = sender.send(ActiveArtifactFetchCompletion {
+                session_id,
+                key: task_key,
+                requested_offset,
+                target_revision,
+                result,
+            });
+        });
+    }
+
+    fn drain_active_artifact_fetches(
+        &mut self,
+        current_session_id: Option<bcode_session_models::SessionId>,
+    ) -> bool {
+        let mut redraw = false;
+        while let Ok(completion) = self.artifact_fetch_receiver.try_recv() {
+            let Some(state) = self.artifact_fetches.get_mut(&completion.key) else {
+                continue;
+            };
+            state.fetching = false;
+            if Some(completion.session_id) != current_session_id
+                || completion.requested_offset != state.next_offset
+            {
+                continue;
+            }
+            let Ok(range) = completion.result else {
+                continue;
+            };
+            if range.offset != state.next_offset {
+                continue;
+            }
+            let Some(target) = state.target.clone() else {
+                continue;
+            };
+            if completion.target_revision > target.revision
+                || range.reference_revision < completion.target_revision
+            {
+                continue;
+            }
+            state.next_offset = state
+                .next_offset
+                .saturating_add(u64::try_from(range.bytes.len()).unwrap_or(u64::MAX));
+            if !range.bytes.is_empty() {
+                let chunk = bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
+                    tool_call_id: completion.key.1.clone(),
+                    artifact_id: completion.key.2.clone(),
+                    reference_key: completion.key.3.clone(),
+                    producer_plugin_id: target.producer_plugin_id.clone(),
+                    schema: target.schema.clone(),
+                    schema_version: target.schema_version,
+                    content_type: target.content_type.clone(),
+                    offset: range.offset,
+                    total_bytes: range.total_bytes,
+                    revision: range.reference_revision,
+                    finalized: range.finalized || target.finalized,
+                    bytes: range.bytes,
+                };
+                let runtime = self.plugin_runtime.get_or_insert_with(|| {
+                    super::plugin_tui::load_default_runtime_with_static_bundled(
+                        &bcode_bundled_plugins::static_bundled_plugins(),
+                    )
+                    .expect("load plugin runtime for artifact chunks")
+                });
+                let producer = Some(chunk.producer_plugin_id.as_str());
+                if let Some(route) =
+                    runtime.visual_adapter(&chunk.schema, chunk.schema_version, "tui", producer)
+                    && crate::plugin_tui::tui_registry(&route.plugin_id)
+                        .is_some_and(|registry| registry.visual_artifact_chunk(&chunk))
+                {
+                    redraw = true;
+                }
+            }
+            let key = completion.key;
+            self.schedule_active_artifact_fetch(completion.session_id, &key);
+        }
+        redraw
     }
 
     fn drain_pending_effects(&mut self, chat: &mut ActiveChat) -> bool {
@@ -520,6 +720,7 @@ async fn handle_loop_housekeeping(
     let mut needs_redraw = false;
     needs_redraw |= poll_finished_effects(settings, chat, draft_autosave, loop_state).await;
     needs_redraw |= loop_state.drain_pending_effects(chat);
+    needs_redraw |= loop_state.drain_active_artifact_fetches(chat.session_id);
     needs_redraw |= maybe_start_older_history_load(chat, loop_state);
     needs_redraw |= maybe_start_newer_history_load(chat, loop_state);
     needs_redraw
@@ -1568,6 +1769,11 @@ async fn absorb_bcode_event(
             true
         }
         BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.session_id => {
+            if let bcode_session_models::SessionLiveEventKind::ToolOutputDelta { event: stream } =
+                &event.kind
+            {
+                loop_state.observe_active_artifact(event.session_id, stream);
+            }
             chat.app.absorb_session_live_event(&event);
             true
         }
