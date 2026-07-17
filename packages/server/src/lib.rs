@@ -18034,6 +18034,29 @@ fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolIn
     }
 }
 
+fn transition_finalized_active_artifacts(
+    state: &ServerState,
+    session_id: SessionId,
+    semantic_result: Option<&ToolInvocationResult>,
+) {
+    let Some(ToolInvocationResult::Artifact { artifact }) = semantic_result else {
+        return;
+    };
+    let reference_keys = artifact
+        .refs
+        .iter()
+        .map(|reference| reference.key.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Ok(mut active) = state.active_artifacts.lock() {
+        active.retain(|key, reference| {
+            key.session_id != session_id
+                || key.artifact_id != artifact.artifact_id
+                || !reference_keys.contains(key.reference_key.as_str())
+                || !reference.finalized
+        });
+    }
+}
+
 struct ToolFinishedEventInput {
     tool_call_id: String,
     result: String,
@@ -18073,6 +18096,7 @@ async fn append_tool_finished_event_inner(
         .finish(session_id, &runtime_work_id)
         .await;
     let content_note = tool_result_content_model_note(&tool_call_id, &content);
+    let semantic_result_for_transition = semantic_result.clone();
     let event = state
         .sessions
         .append_tool_call_finished(
@@ -18084,6 +18108,11 @@ async fn append_tool_finished_event_inner(
             semantic_result,
         )
         .await?;
+    transition_finalized_active_artifacts(
+        state,
+        session_id,
+        semantic_result_for_transition.as_ref(),
+    );
     publish_session_event(state, &event).await;
     if let Ok(runtime_event) = state
         .sessions
@@ -20195,6 +20224,149 @@ library = "test"
                 .is_empty()
         );
         remove_session_artifact_dir(&artifact_dir).expect("artifact cleanup");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Covers the committed projection/live-registry handoff as one race boundary.
+    async fn committed_artifact_projection_atomically_retires_finalized_live_registration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp.path()).expect("persistent sessions");
+        let session_id = sessions
+            .create_session(
+                Some("artifact-transition".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        state
+            .sessions
+            .append_tool_call_requested(
+                session_id,
+                bcode_session::AppendToolCallRequestedInput {
+                    tool_call_id: "call-transition".to_owned(),
+                    tool_name: "fixture.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    producer_plugin_id: Some("fixture.plugin".to_owned()),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            )
+            .await
+            .expect("tool request");
+        let artifact_dir = default_session_artifact_dir(session_id);
+        std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
+        let path = artifact_dir.join("transition.bin");
+        std::fs::write(&path, b"canonical").expect("artifact");
+        let registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            Arc::clone(&state.active_plugin_visuals),
+            session_id,
+            "call-transition",
+            ActivePluginInvocation {
+                producer_plugin_id: "fixture.plugin".to_owned(),
+                inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
+                next_input_id: Arc::new(AtomicU64::new(1)),
+            },
+        )
+        .expect("registration");
+        update_active_artifact(
+            &state,
+            session_id,
+            &ToolInvocationStreamEvent::ArtifactUpdate {
+                tool_call_id: "call-transition".to_owned(),
+                sequence: 1,
+                artifact_id: "artifact-transition".to_owned(),
+                reference_key: "recording".to_owned(),
+                producer_plugin_id: "fixture.plugin".to_owned(),
+                schema: "fixture.recording".to_owned(),
+                schema_version: 1,
+                content_type: Some("application/octet-stream".to_owned()),
+                storage_uri: url::Url::from_file_path(&path)
+                    .expect("file URL")
+                    .to_string(),
+                committed_bytes: 9,
+                revision: 1,
+                availability: None,
+                finalized: true,
+            },
+        )
+        .expect("finalized live artifact");
+        assert_eq!(
+            active_artifact_snapshot_events(&state, session_id)
+                .expect("live snapshot")
+                .len(),
+            1
+        );
+        let semantic_result = ToolInvocationResult::Artifact {
+            artifact: Box::new(bcode_session_models::ToolArtifact {
+                artifact_id: "artifact-transition".to_owned(),
+                producer_plugin_id: "fixture.plugin".to_owned(),
+                schema: "fixture.recording".to_owned(),
+                schema_version: 1,
+                tool_call_id: Some("call-transition".to_owned()),
+                title: None,
+                metadata: serde_json::Value::Null,
+                refs: vec![bcode_session_models::ToolArtifactRef {
+                    key: "recording".to_owned(),
+                    content_type: Some("application/octet-stream".to_owned()),
+                    storage_uri: url::Url::from_file_path(&path)
+                        .expect("file URL")
+                        .to_string()
+                        .into(),
+                    byte_len: Some(9),
+                    metadata: Some(serde_json::json!({
+                        "availability": "complete",
+                        "complete": true
+                    })),
+                }],
+            }),
+        };
+        append_tool_finished_event_inner(
+            &state,
+            session_id,
+            ToolFinishedEventInput {
+                tool_call_id: "call-transition".to_owned(),
+                result: "done".to_owned(),
+                is_error: false,
+                content: Vec::new(),
+                output: None,
+                semantic_result: Some(semantic_result),
+            },
+        )
+        .await
+        .expect("committed final result");
+        assert!(
+            active_artifact_snapshot_events(&state, session_id)
+                .expect("post-commit snapshot")
+                .is_empty(),
+            "live registration must retire only after the durable projection commits"
+        );
+        let ResponsePayload::SessionArtifactRange {
+            bytes,
+            finalized,
+            finalized_event_seq,
+            ..
+        } = read_session_artifact_range(
+            &state,
+            session_id,
+            "artifact-transition",
+            "recording",
+            0,
+            9,
+        )
+        .await
+        .expect("canonical range")
+        else {
+            panic!("expected artifact range");
+        };
+        assert_eq!(bytes, b"canonical");
+        assert!(finalized && finalized_event_seq.is_some());
+        drop(registration);
+        remove_session_artifact_dir(&artifact_dir).expect("cleanup");
     }
 
     #[tokio::test]
