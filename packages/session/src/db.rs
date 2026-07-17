@@ -1164,6 +1164,49 @@ impl SessionDb {
         )
         .await
     }
+    /// Validate that the next canonical append can begin without mutating the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed writer/projection error when append preconditions are not satisfied.
+    pub async fn validate_write_readiness(&self) -> SessionDbResult<()> {
+        validate_storage_writer_contract(&**self.db).await?;
+        let next_sequence = self
+            .last_event_sequence()
+            .await?
+            .map_or(0, |sequence| sequence.saturating_add(1));
+        let probe = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: next_sequence,
+            timestamp_ms: 0,
+            session_id: self.session_id,
+            provenance: None,
+            kind: SessionEventKind::SessionRenamed { name: None },
+        };
+        validate_append_preconditions_without_writer(&**self.db, &probe).await
+    }
+
+    /// Return a materialized projection's stored schema version, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or its row is invalid.
+    pub async fn materialized_projection_schema_version(
+        &self,
+        projection: MaterializedProjection,
+    ) -> SessionDbResult<Option<u64>> {
+        let row = self
+            .db
+            .select("projection_checkpoints")
+            .columns(&["projection_version"])
+            .where_eq("projection_name", projection.as_str())
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(|row| required_i64(row, "projection_version").map(i64_to_u64))
+            .transpose()
+    }
+
     /// Return the last event sequence processed by a materialized projection, if known.
     ///
     /// # Errors

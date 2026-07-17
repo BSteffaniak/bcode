@@ -178,10 +178,16 @@ pub async fn cleanup_session(
         });
     }
 
-    let _maintenance = match mode {
+    let maintenance = match mode {
         CleanupMode::DryRun => None,
         CleanupMode::Apply => Some(lease::acquire_session_maintenance_guard(root, session_id)?),
     };
+    let _write = maintenance
+        .as_ref()
+        .map(|maintenance| {
+            lease::acquire_maintenance_session_write_lock(maintenance, root, session_id)
+        })
+        .transpose()?;
     progress(CleanupProgress::PhaseChanged {
         phase: CleanupPhase::Scanning,
     });

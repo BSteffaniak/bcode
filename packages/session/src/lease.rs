@@ -201,6 +201,39 @@ impl Drop for CatalogLockGuard {
     }
 }
 
+/// Return live owner metadata for one session without mutating owner records.
+///
+/// # Errors
+///
+/// Returns an error when the owner directory cannot be inspected.
+pub fn active_session_owners(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<Vec<SessionLeaseOwner>, SessionLeaseError> {
+    let access_dir = session_owner_dir(root, session_id);
+    let Ok(entries) = fs::read_dir(&access_dir) else {
+        return Ok(Vec::new());
+    };
+    let mut owners = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| SessionLeaseError::Io {
+            path: access_dir.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(owner) = read_owner_metadata(&path)
+            && process_is_alive(owner.pid)
+        {
+            owners.push(owner);
+        }
+    }
+    owners.sort_by(|left, right| left.lease_token.cmp(&right.lease_token));
+    Ok(owners)
+}
+
 /// Register compatible access for a session.
 ///
 /// This is not an exclusive session lock. It briefly takes a coordinator lock, removes dead

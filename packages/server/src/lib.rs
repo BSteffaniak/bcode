@@ -7505,6 +7505,10 @@ async fn append_turn_user_message(
     client_id: ClientId,
     text: String,
 ) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    state
+        .sessions
+        .require_write_readiness(permit.session_id())
+        .await?;
     let events = state
         .sessions
         .append_user_message(permit.enter_turn(), client_id, text)
@@ -7929,6 +7933,10 @@ async fn persist_plugin_automation_acceptance(
     if let Some(operation) = lookup_plugin_automation_operation(state, &lookup).await? {
         return Ok(Err(operation));
     }
+    state
+        .sessions
+        .require_write_readiness(request.session_id)
+        .await?;
     let events = state
         .sessions
         .append_user_message_with_origin(
@@ -8123,6 +8131,7 @@ async fn append_steering_user_message(
     client_id: ClientId,
     text: String,
 ) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    state.sessions.require_write_readiness(session_id).await?;
     let events = state
         .sessions
         .append_user_message(session_id, client_id, text)

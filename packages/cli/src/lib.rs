@@ -6396,12 +6396,29 @@ async fn paged_session_history(session_id: SessionId) -> Result<Vec<SessionEvent
 #[derive(Debug, Clone, Serialize)]
 struct SessionDiagnosis {
     session_id: SessionId,
+    database_path: PathBuf,
+    writer_epoch: Option<u64>,
+    expected_writer_epoch: u64,
+    canonical_tail: Option<u64>,
+    write_readiness: String,
+    model_context_status: String,
+    projections: Vec<SessionProjectionDiagnosis>,
+    active_owners: Vec<bcode_session::lease::SessionLeaseOwner>,
+    recovery_guidance: Option<String>,
     event_count: usize,
     trace_event_count: usize,
     first_sequence: Option<u64>,
     last_sequence: Option<u64>,
     latest_events: Vec<SessionDiagnosisEvent>,
     latest_traces: Vec<SessionDiagnosisTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionProjectionDiagnosis {
+    projection: String,
+    schema_version: Option<u64>,
+    expected_schema_version: u32,
+    checkpoint: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6420,8 +6437,47 @@ struct SessionDiagnosisTrace {
 }
 
 async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliError> {
-    let history = paged_session_history(session_id).await?;
-    let diagnosis = SessionDiagnosis::from_history(session_id, &history);
+    let root = bcode_config::default_state_dir().join("sessions");
+    let database_path = bcode_session::db::session_db_path(&root, session_id);
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+    let writer_epoch = db.storage_writer_epoch().await.ok();
+    let canonical_tail = db.last_event_sequence().await?;
+    let write_readiness = db
+        .validate_write_readiness()
+        .await
+        .map_or_else(|error| error.to_string(), |()| "ready".to_string());
+    let model_context_status = format!("{:?}", db.model_context_projection_status().await?);
+    let mut projections = Vec::new();
+    for projection in bcode_session::db::MaterializedProjection::all() {
+        projections.push(SessionProjectionDiagnosis {
+            projection: projection.as_str().to_string(),
+            schema_version: db
+                .materialized_projection_schema_version(*projection)
+                .await?,
+            expected_schema_version: projection.schema_version(),
+            checkpoint: db.materialized_projection_checkpoint(*projection).await?,
+        });
+    }
+    let recovery_guidance = (write_readiness != "ready").then(|| {
+        format!(
+            "Run `bcode session doctor {session_id}` first; if canonical history is healthy and projections require rebuilding, run `bcode session reindex {session_id}`."
+        )
+    });
+    let history = db.all_events_strict().await?;
+    let diagnosis = SessionDiagnosis::from_history(
+        session_id,
+        &history,
+        SessionStorageDiagnosis {
+            database_path,
+            writer_epoch,
+            canonical_tail,
+            write_readiness,
+            model_context_status,
+            projections,
+            active_owners: bcode_session::lease::active_session_owners(&root, session_id)?,
+            recovery_guidance,
+        },
+    );
     if json {
         println!("{}", serde_json::to_string_pretty(&diagnosis)?);
     } else {
@@ -6581,9 +6637,24 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
     )
     .await?;
     let event_count = db.reindex_model_context(&maintenance, &write).await?;
+    let canonical_tail = db.last_event_sequence().await?;
+    let model_context = db.model_context_projection_status().await?;
+    let verified = matches!(
+        model_context,
+        bcode_session::db::ModelContextProjectionStatus::Fresh { checkpoint }
+            if Some(checkpoint) == canonical_tail
+    );
     println!(
         "Reindexed model context for session {session_id} from {event_count} canonical events"
     );
+    println!(
+        "verification: canonical_tail={canonical_tail:?} model_context={model_context:?} verified={verified}"
+    );
+    if !verified {
+        return Err(CliError::PluginCli(
+            "model-context reindex verification failed".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -6710,8 +6781,23 @@ fn repair_target_label(target: &bcode_session::repair::RepairTarget) -> String {
     }
 }
 
+struct SessionStorageDiagnosis {
+    database_path: PathBuf,
+    writer_epoch: Option<u64>,
+    canonical_tail: Option<u64>,
+    write_readiness: String,
+    model_context_status: String,
+    projections: Vec<SessionProjectionDiagnosis>,
+    active_owners: Vec<bcode_session::lease::SessionLeaseOwner>,
+    recovery_guidance: Option<String>,
+}
+
 impl SessionDiagnosis {
-    fn from_history(session_id: SessionId, history: &[SessionEvent]) -> Self {
+    fn from_history(
+        session_id: SessionId,
+        history: &[SessionEvent],
+        storage: SessionStorageDiagnosis,
+    ) -> Self {
         let trace_event_count = history
             .iter()
             .filter(|event| matches!(event.kind, SessionEventKind::TraceEvent { .. }))
@@ -6742,6 +6828,17 @@ impl SessionDiagnosis {
             .collect::<Vec<_>>();
         Self {
             session_id,
+            database_path: storage.database_path,
+            writer_epoch: storage.writer_epoch,
+            expected_writer_epoch: u64::from(
+                bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            ),
+            canonical_tail: storage.canonical_tail,
+            write_readiness: storage.write_readiness,
+            model_context_status: storage.model_context_status,
+            projections: storage.projections,
+            active_owners: storage.active_owners,
+            recovery_guidance: storage.recovery_guidance,
             event_count: history.len(),
             trace_event_count,
             first_sequence: history.first().map(|event| event.sequence),
@@ -6754,6 +6851,41 @@ impl SessionDiagnosis {
 
 fn print_session_diagnosis(diagnosis: &SessionDiagnosis) {
     println!("session: {}", diagnosis.session_id);
+    println!(
+        "database: {}",
+        display_from_current_dir(&diagnosis.database_path)
+    );
+    println!(
+        "writer epoch: {:?} (expected {})",
+        diagnosis.writer_epoch, diagnosis.expected_writer_epoch
+    );
+    println!("canonical tail: {:?}", diagnosis.canonical_tail);
+    println!("write readiness: {}", diagnosis.write_readiness);
+    println!("model context: {}", diagnosis.model_context_status);
+    println!("projections:");
+    for projection in &diagnosis.projections {
+        println!(
+            "  {} schema={:?}/{} checkpoint={:?}",
+            projection.projection,
+            projection.schema_version,
+            projection.expected_schema_version,
+            projection.checkpoint
+        );
+    }
+    println!("active owners: {}", diagnosis.active_owners.len());
+    for owner in &diagnosis.active_owners {
+        println!(
+            "  pid={} namespace={:?} build={:?} writer_epoch={:?} endpoint={:?}",
+            owner.pid,
+            owner.daemon_namespace,
+            owner.build_fingerprint,
+            owner.storage_writer_epoch,
+            owner.endpoint
+        );
+    }
+    if let Some(guidance) = &diagnosis.recovery_guidance {
+        println!("recovery: {guidance}");
+    }
     println!("events: {}", diagnosis.event_count);
     println!("trace events: {}", diagnosis.trace_event_count);
     println!(

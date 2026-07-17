@@ -1281,6 +1281,23 @@ impl SessionManager {
         }
     }
 
+    /// Require this session to be ready for a durable turn-admission append.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session-specific lease, writer-contract, projection, or database error before
+    /// user input is persisted.
+    pub async fn require_write_readiness(&self, session_id: SessionId) -> Result<(), SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::DbUnavailable(session_id))?;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        db.validate_write_readiness().await?;
+        Ok(())
+    }
+
     /// Create a new session.
     ///
     /// # Errors
