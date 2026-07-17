@@ -720,6 +720,39 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prunes_dead_owner_before_compatibility_check() {
+        use std::process::Command;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived process");
+        let dead_pid = child.id();
+        assert!(child.wait().expect("wait for child").success());
+        assert!(
+            !process_is_alive(dead_pid),
+            "child pid must be dead for test"
+        );
+
+        let access_dir = session_owner_dir(temp_dir.path(), session_id);
+        let owner = SessionLeaseOwner {
+            lease_token: format!("dead-owner-{dead_pid}"),
+            pid: dead_pid,
+            ..SessionLeaseOwner::new(session_id, &context("dead-incompatible", 1))
+        };
+        let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
+        write_owner_metadata(&owner_path, &owner).expect("write dead owner record");
+
+        let live = acquire_session_lease(temp_dir.path(), session_id, &context("live-current", 2))
+            .expect("dead incompatible owner must be pruned");
+        assert!(!owner_path.exists(), "dead owner record must be removed");
+        assert_eq!(live.owner().storage_writer_epoch, Some(2));
+    }
+
     #[test]
     fn maintenance_refuses_any_live_session_owner() {
         let temp_dir = tempfile::tempdir().expect("temp dir");

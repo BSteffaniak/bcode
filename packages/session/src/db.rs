@@ -5425,6 +5425,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_migration_refuses_malformed_canonical_history_without_mutation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "canonical".to_string(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ))
+        .await
+        .expect("append canonical event");
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
+            )
+            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+            .execute(db.database())
+            .await
+            .expect("set legacy writer epoch");
+        db.database()
+            .update("model_context_projection_state")
+            .value("schema_version", DatabaseValue::Int64(1))
+            .execute(db.database())
+            .await
+            .expect("set legacy projection schema");
+        db.database()
+            .update("events")
+            .value("payload", "{not-valid-json")
+            .where_eq("event_seq", seq_to_value(0))
+            .execute(db.database())
+            .await
+            .expect("corrupt canonical payload");
+        drop(db);
+
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
+        SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+            .await
+            .expect_err("malformed canonical history must reject migration");
+        drop(write);
+        drop(maintenance);
+
+        let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("reopen rejected migration");
+        assert_eq!(
+            reopened.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        assert!(matches!(
+            reopened
+                .model_context_projection_status()
+                .await
+                .expect("projection status"),
+            ModelContextProjectionStatus::Incompatible { actual: 1, .. }
+        ));
+        reopened
+            .all_events_strict()
+            .await
+            .expect_err("malformed canonical payload must remain visible");
+    }
+
+    #[tokio::test]
     async fn failed_explicit_migration_preserves_projection_and_writer_contract() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
