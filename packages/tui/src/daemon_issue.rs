@@ -18,7 +18,7 @@ pub enum TuiDaemonIssue {
     /// The daemon response could not be decoded or converted.
     InvalidDaemonResponse(String),
     /// The requested session is unavailable.
-    SessionUnavailable,
+    SessionUnavailable { message: String },
     /// The requested session needs explicit repair before normal use.
     SessionRepairRequired,
     /// The requested projection/index is stale.
@@ -70,11 +70,11 @@ impl TuiDaemonIssue {
                     "The daemon response could not be decoded or converted. This does not necessarily mean the daemon is stale.\n\nDecode error: {error}"
                 )),
             },
-            Self::SessionUnavailable => TuiDaemonIssueMessage {
+            Self::SessionUnavailable { message } => TuiDaemonIssueMessage {
                 status: format!("{label}: session unavailable"),
-                detail: Some(
-                    "The requested session could not be opened. It may have been deleted, moved, or the daemon catalog may be stale. Retry after refreshing or run `bcode doctor`.".to_owned(),
-                ),
+                detail: Some(format!(
+                    "The daemon rejected this session request.\n\nDaemon error: {message}\n\nRefresh the session catalog and retry. If the error reports writer or projection incompatibility, run `bcode session diagnose <session-id>` for exact recovery guidance."
+                )),
             },
             Self::SessionRepairRequired => TuiDaemonIssueMessage {
                 status: format!("{label}: session repair required"),
@@ -137,7 +137,9 @@ fn classify_server_error(code: &str, message: &str) -> TuiDaemonIssue {
     match code {
         "session_repair_required" => TuiDaemonIssue::SessionRepairRequired,
         "projection_stale" => TuiDaemonIssue::ProjectionStale,
-        "session_not_found" | "session_unavailable" => TuiDaemonIssue::SessionUnavailable,
+        "session_not_found" | "session_unavailable" => TuiDaemonIssue::SessionUnavailable {
+            message: message.to_owned(),
+        },
         _ => TuiDaemonIssue::ServerRejected {
             code: code.to_owned(),
             message: message.to_owned(),
@@ -194,9 +196,12 @@ pub fn report_tui_issue(app: &mut BmuxApp, label: &str, error: &TuiError) {
             }
             .message(label),
         ),
-        TuiError::SessionUnavailable { reason, .. } => {
-            Some(TuiDaemonIssue::SessionUnavailable.message(&format!("{label}: {reason}")))
-        }
+        TuiError::SessionUnavailable { reason, .. } => Some(
+            TuiDaemonIssue::SessionUnavailable {
+                message: reason.clone(),
+            }
+            .message(&format!("{label}: {reason}")),
+        ),
         _ => None,
     };
     if let Some(message) = message {

@@ -5860,10 +5860,8 @@ async fn send_incompatible_active_session_response(
 fn server_session_error_response(error: &ServerError) -> ErrorResponse {
     match error {
         ServerError::Session(error) => session_error_response(error),
-        ServerError::SessionDb(error) if database_error_requires_repair(error) => {
-            ErrorResponse::new("session_repair_required", error.to_string())
-        }
-        _ => ErrorResponse::new("session_not_found", error.to_string()),
+        ServerError::SessionDb(error) => session_db_error_response(error),
+        _ => ErrorResponse::new("session_unavailable", error.to_string()),
     }
 }
 
@@ -5872,10 +5870,30 @@ fn session_error_response(error: &bcode_session::SessionError) -> ErrorResponse 
         bcode_session::SessionError::Lease(
             bcode_session::lease::SessionLeaseError::OwnedByOtherDaemon { .. },
         ) => ErrorResponse::new("session_active_elsewhere", error.to_string()),
-        bcode_session::SessionError::Db(error) if database_error_requires_repair(error) => {
+        bcode_session::SessionError::ProjectionStale { .. } => {
+            ErrorResponse::new("projection_stale", error.to_string())
+        }
+        bcode_session::SessionError::Db(db_error) => session_db_error_response(db_error),
+        bcode_session::SessionError::NotFound(_) => {
+            ErrorResponse::new("session_not_found", error.to_string())
+        }
+        _ => ErrorResponse::new("session_unavailable", error.to_string()),
+    }
+}
+
+fn session_db_error_response(error: &bcode_session::db::SessionDbError) -> ErrorResponse {
+    match error {
+        bcode_session::db::SessionDbError::WriterIncompatible { .. }
+        | bcode_session::db::SessionDbError::ProjectionIncompatible { .. }
+        | bcode_session::db::SessionDbError::ProjectionStale { .. }
+        | bcode_session::db::SessionDbError::ModelContextProjectionVersion { .. }
+        | bcode_session::db::SessionDbError::ModelContextProjectionStale { .. } => {
+            ErrorResponse::new("projection_stale", error.to_string())
+        }
+        _ if database_error_requires_repair(error) => {
             ErrorResponse::new("session_repair_required", error.to_string())
         }
-        _ => ErrorResponse::new("session_not_found", error.to_string()),
+        _ => ErrorResponse::new("session_unavailable", error.to_string()),
     }
 }
 
