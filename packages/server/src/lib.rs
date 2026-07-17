@@ -93,13 +93,14 @@ use bcode_skill_models::{
 };
 use bcode_tool::{
     InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolArtifactWriteRequest,
-    ToolArtifactWriteResolution, ToolDefinition as ServiceToolDefinition, ToolExchangeRequest,
-    ToolExchangeResolution, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationRequest, ToolInvocationResponse,
+    OP_LIST_TOOLS, OP_PREPARE_TOOL, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID,
+    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolDefinition as ServiceToolDefinition,
+    ToolExchangeRequest, ToolExchangeResolution, ToolInvocationDescriptor, ToolInvocationInput,
+    ToolInvocationInputResolution, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
-    ToolList, ToolOutputStream, ToolResultContent, ToolSideEffect,
+    ToolList, ToolOutputStream, ToolPolicyAuthorizationMetadata, ToolPreparationRequest,
+    ToolPreparationResponse, ToolResultContent, ToolSideEffect, tool_policy_authorization_metadata,
 };
 use futures::{StreamExt, stream};
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
@@ -15019,6 +15020,36 @@ impl Drop for BatchAuthorizationParticipant {
     }
 }
 
+async fn prepare_server_tool(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+) -> Result<(String, ServiceToolDefinition, ToolPreparationResponse), String> {
+    let (plugin_id, definition) = find_tool_provider(state, &call.name)
+        .await?
+        .ok_or_else(|| format!("tool not found: {}", call.name))?;
+    let request = ToolPreparationRequest {
+        invocation: ToolInvocationDescriptor {
+            invocation_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        },
+        host_context: Vec::new(),
+    };
+    let preparation = state
+        .plugins
+        .invoke_service_json_scoped::<_, ToolPreparationResponse>(
+            &plugin_id,
+            TOOL_SERVICE_INTERFACE_ID,
+            OP_PREPARE_TOOL,
+            &request,
+            active_plugin_scope_for_tool_call(state, session_id, &call.id).await,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((plugin_id, definition, preparation))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_model_tool_batch(
     state: &ServerState,
@@ -15033,19 +15064,70 @@ async fn execute_model_tool_batch(
         if cancel_state.is_cancelled() {
             return false;
         }
-        let provider = find_tool_provider(state, &call.name).await.ok().flatten();
+        let preparation = tokio::select! {
+            biased;
+            () = cancel_state.cancelled() => return false,
+            preparation = tokio::time::timeout(
+                Duration::from_millis(state.tool_execution.preparation_timeout_ms.get()),
+                prepare_server_tool(state, session_id, &call),
+            ) => preparation,
+        };
+        let (plugin_id, definition, preparation) = match preparation {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(message)) => {
+                results.push((
+                    index,
+                    Some(ToolFinishedEventInput {
+                        tool_call_id: call.id,
+                        result: format!("tool preparation failed: {message}"),
+                        is_error: true,
+                        content: Vec::new(),
+                        output: None,
+                        semantic_result: None,
+                    }),
+                ));
+                continue;
+            }
+            Err(_) => {
+                results.push((
+                    index,
+                    Some(ToolFinishedEventInput {
+                        tool_call_id: call.id,
+                        result: "tool preparation timed out".to_string(),
+                        is_error: true,
+                        content: Vec::new(),
+                        output: None,
+                        semantic_result: None,
+                    }),
+                ));
+                continue;
+            }
+        };
+        let policy_metadata =
+            match tool_policy_authorization_metadata(&preparation.authorization, &call.name) {
+                Ok(metadata) => metadata,
+                Err(message) => {
+                    results.push((
+                        index,
+                        Some(ToolFinishedEventInput {
+                            tool_call_id: call.id,
+                            result: format!("tool authorization facts invalid: {message}"),
+                            is_error: true,
+                            content: Vec::new(),
+                            output: None,
+                            semantic_result: None,
+                        }),
+                    ));
+                    continue;
+                }
+            };
         let policy = state
             .plugin_automation_policies
             .lock()
             .await
             .get(&session_id)
             .copied();
-        if read_only_policy_denies_tool(
-            policy,
-            provider
-                .as_ref()
-                .map(|(_, definition)| definition.side_effect),
-        ) {
+        if read_only_policy_denies_tool(policy, Some(policy_metadata.side_effect)) {
             results.push((
                 index,
                 Some(ToolFinishedEventInput {
@@ -15069,11 +15151,18 @@ async fn execute_model_tool_batch(
             call.id.clone(),
             call.name.clone(),
             serde_json::to_string(&call.arguments).unwrap_or_default(),
-            provider.map(|(plugin_id, _)| plugin_id),
+            Some(plugin_id.clone()),
             &working_directory,
         )
         .await;
-        ready.push((index, call, working_directory));
+        ready.push((
+            index,
+            call,
+            working_directory,
+            plugin_id,
+            definition,
+            policy_metadata,
+        ));
     }
 
     if !ready.is_empty() {
@@ -15087,26 +15176,31 @@ async fn execute_model_tool_batch(
             Some(Arc::new(Semaphore::new(1)))
         };
         let execution_count = ready.len();
-        let executions = stream::iter(ready.into_iter().map(|(index, call, working_directory)| {
-            let cancel_state = Arc::clone(&cancel_state);
-            let authorization = authorization_gate.participant();
-            let invocation_permits = invocation_permits.clone();
-            async move {
-                (
-                    index,
-                    execute_model_tool(
-                        state,
-                        session_id,
-                        call,
-                        working_directory,
-                        cancel_state,
-                        Some(authorization),
-                        invocation_permits,
+        let executions = stream::iter(ready.into_iter().map(
+            |(index, call, working_directory, plugin_id, definition, policy_metadata)| {
+                let cancel_state = Arc::clone(&cancel_state);
+                let authorization = authorization_gate.participant();
+                let invocation_permits = invocation_permits.clone();
+                async move {
+                    (
+                        index,
+                        execute_model_tool(
+                            state,
+                            session_id,
+                            call,
+                            working_directory,
+                            plugin_id,
+                            definition,
+                            policy_metadata,
+                            cancel_state,
+                            Some(authorization),
+                            invocation_permits,
+                        )
+                        .await,
                     )
-                    .await,
-                )
-            }
-        }))
+                }
+            },
+        ))
         .buffer_unordered(execution_count)
         .collect::<Vec<_>>();
         let ProviderCallWait::Completed(executed) = wait_for_provider_call(
@@ -15132,21 +15226,20 @@ async fn execute_model_tool_batch(
     !cancel_state.is_cancelled()
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_model_tool(
     state: &ServerState,
     session_id: SessionId,
     call: bcode_model::ToolCall,
     working_directory: std::path::PathBuf,
+    plugin_id: String,
+    definition: ServiceToolDefinition,
+    policy_metadata: ToolPolicyAuthorizationMetadata,
     cancel_state: Arc<TurnCancelState>,
     authorization: Option<BatchAuthorizationParticipant>,
     invocation_permits: Option<Arc<Semaphore>>,
 ) -> Option<ToolFinishedEventInput> {
-    let producer_plugin_id = find_tool_provider(state, &call.name)
-        .await
-        .ok()
-        .flatten()
-        .map(|(plugin_id, _definition)| plugin_id);
+    let producer_plugin_id = Some(plugin_id.clone());
     if cancel_state.is_cancelled() {
         cancel_registered_runtime_work(
             state,
@@ -15173,6 +15266,9 @@ async fn execute_model_tool(
         session_id,
         &call,
         &working_directory,
+        &plugin_id,
+        &definition,
+        &policy_metadata,
         cancel_state.as_ref(),
         authorization,
         invocation_permits,
@@ -15798,19 +15894,19 @@ async fn resolve_server_exchange(
     })
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn invoke_model_tool(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     working_directory: &std::path::Path,
+    plugin_id: &str,
+    definition: &ServiceToolDefinition,
+    policy_metadata: &ToolPolicyAuthorizationMetadata,
     cancel_state: &TurnCancelState,
     authorization: Option<BatchAuthorizationParticipant>,
     invocation_permits: Option<Arc<Semaphore>>,
 ) -> Result<ToolInvocationResponse, String> {
-    let (plugin_id, definition) = find_tool_provider(state, &call.name)
-        .await?
-        .ok_or_else(|| format!("tool not found: {}", call.name))?;
     if cancel_state.is_cancelled() {
         return Ok(ToolInvocationResponse {
             output: "tool cancelled before invocation".to_string(),
@@ -15821,7 +15917,8 @@ async fn invoke_model_tool(
             result: None,
         });
     }
-    let agent_decision = evaluate_agent_tool_policy(state, session_id, call, &definition).await;
+    let agent_decision =
+        evaluate_agent_tool_policy_with_metadata(state, session_id, call, policy_metadata).await;
     append_trace_event(
         state,
         session_id,
@@ -15835,7 +15932,13 @@ async fn invoke_model_tool(
         },
     )
     .await;
-    let skill_decision = evaluate_active_skill_tool_policy(state, session_id, &definition).await;
+    let skill_decision = evaluate_active_skill_tool_policy_with_metadata(
+        state,
+        session_id,
+        &definition.name,
+        policy_metadata,
+    )
+    .await;
     append_trace_event(
         state,
         session_id,
@@ -15878,8 +15981,8 @@ async fn invoke_model_tool(
                 state,
                 session_id,
                 call,
-                &definition,
-                &plugin_id,
+                definition,
+                plugin_id,
                 cancel_state,
                 PermissionPolicyContext {
                     source: None,
@@ -15955,8 +16058,8 @@ async fn invoke_model_tool(
                             state,
                             session_id,
                             call,
-                            &definition,
-                            &plugin_id,
+                            definition,
+                            plugin_id,
                             cancel_state,
                             PermissionPolicyContext {
                                 source: Some("skill".to_string()),
@@ -16023,10 +16126,10 @@ async fn invoke_model_tool(
         SessionTracePhase::ToolInvocationStarted,
         SessionTracePayload::ToolInvocationStarted {
             tool_call_id: call.id.clone(),
-            plugin_id: plugin_id.clone(),
+            plugin_id: plugin_id.to_string(),
             tool_name: definition.name.clone(),
-            side_effect: side_effect_name(definition.side_effect).to_string(),
-            requires_permission: definition.requires_permission,
+            side_effect: side_effect_name(policy_metadata.side_effect).to_string(),
+            requires_permission: policy_metadata.requires_permission,
             arguments: argument_blob,
         },
     )
@@ -16041,7 +16144,7 @@ async fn invoke_model_tool(
         session_id,
         &call.id,
         ActivePluginInvocation {
-            producer_plugin_id: plugin_id.clone(),
+            producer_plugin_id: plugin_id.to_string(),
             inputs: input_sender,
             next_input_id: Arc::new(AtomicU64::new(1)),
         },
@@ -16061,7 +16164,7 @@ async fn invoke_model_tool(
     let mut invocation = state
         .plugins
         .invoke_service_with_events_and_bridge_scoped(
-            &plugin_id,
+            plugin_id,
             TOOL_SERVICE_INTERFACE_ID,
             OP_INVOKE_TOOL,
             payload,
@@ -16161,7 +16264,7 @@ async fn invoke_model_tool(
             state,
             session_id,
             call,
-            &plugin_id,
+            plugin_id,
             request,
             cancel_state,
         )
@@ -16811,11 +16914,11 @@ const fn convert_tool_output_stream(stream: ToolOutputStream) -> SessionToolOutp
     }
 }
 
-async fn evaluate_agent_tool_policy(
+async fn evaluate_agent_tool_policy_with_metadata(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
-    definition: &ServiceToolDefinition,
+    metadata: &ToolPolicyAuthorizationMetadata,
 ) -> EvaluateToolCallResponse {
     let agent_id = session_agent_selection(state, session_id).await;
     let cwd = state
@@ -16827,10 +16930,10 @@ async fn evaluate_agent_tool_policy(
     let request = EvaluateToolCallRequest {
         session_id,
         agent_id,
-        tool_name: definition.name.clone(),
-        side_effect: definition.side_effect,
-        policy: definition.policy.clone(),
-        arguments: call.arguments.clone(),
+        tool_name: call.name.clone(),
+        side_effect: metadata.side_effect,
+        policy: metadata.policy.clone(),
+        arguments: metadata.arguments.clone(),
         cwd,
     };
     state
@@ -16843,7 +16946,7 @@ async fn evaluate_agent_tool_policy(
         .await
         .ok()
         .unwrap_or(EvaluateToolCallResponse {
-            decision: if definition.requires_permission {
+            decision: if metadata.requires_permission {
                 AgentDecision::Ask
             } else {
                 AgentDecision::Allow
@@ -16962,10 +17065,11 @@ async fn list_service_tools(state: &ServerState) -> Vec<ServiceToolDefinition> {
     tools
 }
 
-async fn evaluate_active_skill_tool_policy(
+async fn evaluate_active_skill_tool_policy_with_metadata(
     state: &ServerState,
     session_id: SessionId,
-    definition: &ServiceToolDefinition,
+    tool_name: &str,
+    metadata: &ToolPolicyAuthorizationMetadata,
 ) -> SkillToolPolicyOutcome {
     let Some(registry) = &state.skills else {
         return SkillToolPolicyOutcome::NoOpinion;
@@ -16988,8 +17092,17 @@ async fn evaluate_active_skill_tool_policy(
             resolve_skill_permission_policy(&manifest.permission_policy, &available_tools)
         })
         .collect();
+    let definition = ServiceToolDefinition {
+        name: tool_name.to_string(),
+        description: String::new(),
+        input_schema: serde_json::Value::Null,
+        side_effect: metadata.side_effect,
+        requires_permission: metadata.requires_permission,
+        policy: metadata.policy.clone(),
+        ui: bcode_tool::ToolUiMetadata::default(),
+    };
     evaluate_skill_tool_call(&SkillToolPolicyRequest {
-        tool: definition.clone(),
+        tool: definition,
         active_policies,
     })
 }
@@ -24326,6 +24439,13 @@ library = "test"
                 "timeout_ms": 5000
             }),
         };
+        let (plugin_id, definition, preparation) =
+            prepare_server_tool(state.as_ref(), session_id, &call)
+                .await
+                .expect("tool preparation");
+        let policy_metadata =
+            tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+                .expect("tool policy fact");
         let working_directory = test_working_directory();
         let cancel_state = Arc::new(TurnCancelState::default());
         let task_state = Arc::clone(&state);
@@ -24337,6 +24457,9 @@ library = "test"
                 session_id,
                 &task_call,
                 &working_directory,
+                &plugin_id,
+                &definition,
+                &policy_metadata,
                 task_cancel.as_ref(),
                 None,
                 None,
@@ -24460,6 +24583,13 @@ library = "test"
                 }]
             }),
         };
+        let (plugin_id, definition, preparation) =
+            prepare_server_tool(state.as_ref(), session_id, &call)
+                .await
+                .expect("tool preparation");
+        let policy_metadata =
+            tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+                .expect("tool policy fact");
         let working_directory = test_working_directory();
         let cancel_state = Arc::new(TurnCancelState::default());
         let task_state = Arc::clone(&state);
@@ -24471,6 +24601,9 @@ library = "test"
                 session_id,
                 &task_call,
                 &working_directory,
+                &plugin_id,
+                &definition,
+                &policy_metadata,
                 task_cancel.as_ref(),
                 None,
                 None,

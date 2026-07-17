@@ -139,15 +139,18 @@ struct ParallelInvoker {
 impl ToolInvoker for ParallelInvoker {
     fn prepare_tool<'a>(
         &'a self,
-        _tool: &'a RegisteredTool,
-        _request: &'a ToolPreparationRequest,
+        tool: &'a RegisteredTool,
+        request: &'a ToolPreparationRequest,
         _scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
-        Box::pin(async {
-            Ok(ToolPreparationResponse {
-                ..ToolPreparationResponse::default()
-            })
-        })
+        let result =
+            bcode_tool::prepare_tool_invocation(request, &tool.definition).map_err(|message| {
+                bcode::RuntimeError::ToolPreparation {
+                    tool_name: request.invocation.tool_name.clone(),
+                    message,
+                }
+            });
+        Box::pin(async move { result })
     }
 
     fn invoke_tool<'a>(
@@ -399,15 +402,18 @@ struct BlockingInvoker {
 impl ToolInvoker for BlockingInvoker {
     fn prepare_tool<'a>(
         &'a self,
-        _tool: &'a RegisteredTool,
-        _request: &'a ToolPreparationRequest,
+        tool: &'a RegisteredTool,
+        request: &'a ToolPreparationRequest,
         _scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
-        Box::pin(async {
-            Ok(ToolPreparationResponse {
-                ..ToolPreparationResponse::default()
-            })
-        })
+        let result =
+            bcode_tool::prepare_tool_invocation(request, &tool.definition).map_err(|message| {
+                bcode::RuntimeError::ToolPreparation {
+                    tool_name: request.invocation.tool_name.clone(),
+                    message,
+                }
+            });
+        Box::pin(async move { result })
     }
 
     fn invoke_tool<'a>(

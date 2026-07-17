@@ -758,6 +758,44 @@ impl ServiceRequest {
     }
 }
 
+/// Prepare a plugin-owned tool from its current definitions.
+///
+/// # Errors
+///
+/// Returns an error when the request payload is invalid, the tool is unknown, or authorization
+/// metadata cannot be encoded.
+pub fn prepare_tool_from_definitions(
+    request: &ServiceRequest,
+    definitions: impl IntoIterator<Item = bcode_tool::ToolDefinition>,
+) -> Result<bcode_tool::ToolPreparationResponse, String> {
+    let preparation = request
+        .payload_json::<bcode_tool::ToolPreparationRequest>()
+        .map_err(|error| error.to_string())?;
+    let definition = definitions
+        .into_iter()
+        .find(|definition| definition.name == preparation.invocation.tool_name)
+        .ok_or_else(|| {
+            format!(
+                "tool not found during preparation: {}",
+                preparation.invocation.tool_name
+            )
+        })?;
+    bcode_tool::prepare_tool_invocation(&preparation, &definition)
+}
+
+/// Encode plugin tool preparation as a standard service response.
+#[must_use]
+pub fn prepare_tool_service_response(
+    request: &ServiceRequest,
+    definitions: impl IntoIterator<Item = bcode_tool::ToolDefinition>,
+) -> ServiceResponse {
+    match prepare_tool_from_definitions(request, definitions) {
+        Ok(response) => ServiceResponse::json(&response)
+            .unwrap_or_else(|error| ServiceResponse::error("encode_failed", error.to_string())),
+        Err(message) => ServiceResponse::error("invalid_preparation", message),
+    }
+}
+
 /// Service response returned by plugins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceResponse {
@@ -1622,8 +1660,8 @@ pub mod prelude {
         ServiceBridge, ServiceBridgeCallback, ServiceBridgeError, ServiceBridgeRequest,
         ServiceBridgeResponse, ServiceError, ServiceEventCallback, ServiceEventEmitter,
         ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn,
-        export_concurrent_plugin, export_plugin, static_concurrent_plugin_vtable,
-        static_plugin_vtable,
+        export_concurrent_plugin, export_plugin, prepare_tool_from_definitions,
+        prepare_tool_service_response, static_concurrent_plugin_vtable, static_plugin_vtable,
     };
 }
 

@@ -1487,11 +1487,42 @@ impl fmt::Debug for SdkToolInvoker {
 impl ToolInvoker for SdkToolInvoker {
     fn prepare_tool<'a>(
         &'a self,
-        _tool: &'a RegisteredTool,
-        _request: &'a ToolPreparationRequest,
+        tool: &'a RegisteredTool,
+        request: &'a ToolPreparationRequest,
         _scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
-        Box::pin(async { Ok(ToolPreparationResponse::default()) })
+        match &tool.source {
+            ToolSource::Inline => {
+                let result = bcode_tool::prepare_tool_invocation(request, &tool.definition)
+                    .map_err(|message| RuntimeError::ToolPreparation {
+                        tool_name: request.invocation.tool_name.clone(),
+                        message,
+                    });
+                Box::pin(async move { result })
+            }
+            ToolSource::Plugin { plugin_id } => {
+                #[cfg(feature = "embedded-plugins")]
+                {
+                    Box::pin(prepare_plugin_tool(
+                        self.plugins.as_ref(),
+                        plugin_id,
+                        request,
+                        self.session_id,
+                    ))
+                }
+                #[cfg(not(feature = "embedded-plugins"))]
+                {
+                    Box::pin(async move {
+                        Err(RuntimeError::ToolPreparation {
+                            tool_name: request.invocation.tool_name.clone(),
+                            message: format!(
+                                "plugin-backed preparation for plugin '{plugin_id}' requires embedded-plugins"
+                            ),
+                        })
+                    })
+                }
+            }
+        }
     }
 
     fn invoke_tool<'a>(
@@ -1542,6 +1573,33 @@ impl ToolInvoker for SdkToolInvoker {
             }
         })
     }
+}
+
+#[cfg(feature = "embedded-plugins")]
+async fn prepare_plugin_tool(
+    plugins: Option<&bcode_plugin::PluginRuntimeHost>,
+    plugin_id: &str,
+    request: &ToolPreparationRequest,
+    session_id: SessionId,
+) -> std::result::Result<ToolPreparationResponse, RuntimeError> {
+    let plugins = plugins.ok_or_else(|| RuntimeError::ToolPreparation {
+        tool_name: request.invocation.tool_name.clone(),
+        message: "embedded plugin runtime is not configured".to_string(),
+    })?;
+    plugins
+        .invoke_service_json_scoped(
+            plugin_id,
+            bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+            bcode_tool::OP_PREPARE_TOOL,
+            request,
+            bcode_plugin::PluginInvocationScope::session(session_id.to_string())
+                .with_work_id(request.invocation.invocation_id.clone()),
+        )
+        .await
+        .map_err(|error| RuntimeError::ToolPreparation {
+            tool_name: request.invocation.tool_name.clone(),
+            message: error.to_string(),
+        })
 }
 
 #[cfg(feature = "embedded-plugins")]

@@ -45,11 +45,18 @@ struct CountingInvoker(Arc<AtomicUsize>);
 impl ToolInvoker for CountingInvoker {
     fn prepare_tool<'a>(
         &'a self,
-        _tool: &'a RegisteredTool,
-        _request: &'a ToolPreparationRequest,
+        tool: &'a RegisteredTool,
+        request: &'a ToolPreparationRequest,
         _scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
-        Box::pin(async { Ok(ToolPreparationResponse::default()) })
+        let result =
+            bcode_tool::prepare_tool_invocation(request, &tool.definition).map_err(|message| {
+                bcode::RuntimeError::ToolPreparation {
+                    tool_name: request.invocation.tool_name.clone(),
+                    message,
+                }
+            });
+        Box::pin(async move { result })
     }
 
     fn invoke_tool<'a>(

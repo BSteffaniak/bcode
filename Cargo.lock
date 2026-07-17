@@ -1335,6 +1335,9 @@ dependencies = [
  "bcode_agent_policy",
  "bcode_agent_profile",
  "bcode_agent_runtime",
+ "bcode_model",
+ "bcode_tool",
+ "serde_json",
 ]
 
 [[package]]

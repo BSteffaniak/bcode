@@ -36,6 +36,8 @@ impl Default for ToolExecutionOptions {
 pub struct ToolAuthorizationFact {
     /// Tool-owner-defined fact namespace.
     pub namespace: String,
+    /// Version of the fact schema named by `namespace`.
+    pub schema_version: u32,
     /// Tool-owner-defined action within `namespace`.
     pub action: String,
     /// Optional opaque resource identity relevant to the action.

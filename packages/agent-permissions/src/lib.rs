@@ -12,6 +12,7 @@ use bcode_agent_policy::{
 };
 use bcode_agent_profile::{AgentDecision, EvaluateToolCallRequest, EvaluateToolCallResponse};
 use bcode_agent_runtime::{PermissionDecision, PermissionPolicy, RuntimePermissionRequest};
+use bcode_tool::tool_policy_authorization_metadata;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -100,7 +101,8 @@ impl PermissionPolicy for AgentPermissionPolicy {
         request: &'a RuntimePermissionRequest,
     ) -> bcode_agent_runtime::RuntimeFuture<'a, PermissionDecision> {
         Box::pin(async move {
-            let profile_request = runtime_permission_request_to_profile_request(request, &self.cwd);
+            let profile_request =
+                runtime_permission_request_to_profile_request(request, &self.cwd)?;
             let evaluation = evaluate_profile_tool_call(&self.config, &profile_request, &self.cwd);
             Ok(self.runtime_decision(request, evaluation))
         })
@@ -133,21 +135,27 @@ impl AgentPermissionPolicy {
     }
 }
 
-/// Convert a runtime permission request into the shared agent-profile policy request.
-#[must_use]
+/// Convert owner-produced authorization facts into the shared agent-profile policy request.
+///
+/// # Errors
+///
+/// Returns an error when the tool owner omitted, duplicated, or malformed the standard policy
+/// authorization fact, or when its identity does not match the correlated runtime call.
 pub fn runtime_permission_request_to_profile_request(
     request: &RuntimePermissionRequest,
     cwd: &std::path::Path,
-) -> EvaluateToolCallRequest {
-    EvaluateToolCallRequest {
+) -> bcode_agent_runtime::Result<EvaluateToolCallRequest> {
+    let metadata = tool_policy_authorization_metadata(&request.facts, &request.call.name)
+        .map_err(bcode_agent_runtime::RuntimeError::HostExtension)?;
+    Ok(EvaluateToolCallRequest {
         session_id: request.context.session_id,
         agent_id: request.context.agent_id.clone(),
         tool_name: request.call.name.clone(),
-        side_effect: request.tool.definition.side_effect,
-        policy: request.tool.definition.policy.clone(),
-        arguments: request.call.arguments.clone(),
+        side_effect: metadata.side_effect,
+        policy: metadata.policy,
+        arguments: metadata.arguments,
         cwd: Some(cwd.to_string_lossy().into_owned()),
-    }
+    })
 }
 
 /// Evaluate an agent-profile tool-call request against a resolved agent config.

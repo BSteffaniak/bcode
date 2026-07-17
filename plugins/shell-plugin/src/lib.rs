@@ -113,6 +113,9 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
 
     match context.request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(&context.request),
+        bcode_tool::OP_PREPARE_TOOL => {
+            prepare_tool_service_response(&context.request, [shell_tool_definition()])
+        }
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
@@ -152,78 +155,82 @@ impl ShellRunArguments {
     }
 }
 
+fn shell_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+                name: "shell.run".to_string(),
+                description: "Run a non-interactive shell command in pseudo-terminal mode. Commands must complete without user input: avoid editors, REPLs, watchers, pagers, and prompts; use non-interactive flags and disable paging (for example, `git --no-pager`). Interactive commands will time out.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": { "type": "string" },
+                        "cwd": { "type": "string" },
+                        "timeout_ms": { "type": "integer", "minimum": 1 },
+                        "columns": { "type": "integer", "minimum": 1 },
+                        "rows": { "type": "integer", "minimum": 1 },
+                        "format_commands": {
+                            "type": "boolean",
+                            "description": "Format the displayed shell command for readability. Defaults to shell output configuration."
+                        }
+                    }
+                }),
+                side_effect: ToolSideEffect::ExecuteProcess,
+                requires_permission: true,
+                policy: bcode_tool::ToolPolicyMetadata {
+                    aliases: Vec::new(),
+                    compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
+                    capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
+                    permission_category: Some("command".to_string()),
+                    argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                        kind: bcode_tool::ToolArgumentKind::Command,
+                        argument: "command".to_string(),
+                    }],
+                },
+                ui: bcode_tool::ToolUiMetadata {
+                    activity_label: Some("running".to_string()),
+                    request_visual: Some(ToolPluginVisualMetadata {
+                        producer_plugin_id: Some("bcode.shell".to_string()),
+                        schema: "bcode.tool.request.shell.run".to_string(),
+                        schema_version: 1,
+                        title: Some("Shell command".to_string()),
+                        subtitle: Some("shell command · {bytes}".to_string()),
+                        payload: BTreeMap::from([
+                            (
+                                "command".to_string(),
+                                bcode_tool::ToolVisualPayloadSelector {
+                                    fields: vec!["command".to_string()],
+                                    literal: None,
+                                    required: true,
+                                },
+                            ),
+                            (
+                                "cwd".to_string(),
+                                bcode_tool::ToolVisualPayloadSelector {
+                                    fields: vec!["cwd".to_string()],
+                                    literal: None,
+                                    required: false,
+                                },
+                            ),
+                            (
+                                "format_commands".to_string(),
+                                bcode_tool::ToolVisualPayloadSelector {
+                                    fields: vec!["format_commands".to_string()],
+                                    literal: None,
+                                    required: false,
+                                },
+                            ),
+                        ]),
+                    }),
+                },
+            }
+}
+
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
     }
     json_response(&ToolList {
-        tools: vec![ToolDefinition {
-            name: "shell.run".to_string(),
-            description: "Run a non-interactive shell command in pseudo-terminal mode. Commands must complete without user input: avoid editors, REPLs, watchers, pagers, and prompts; use non-interactive flags and disable paging (for example, `git --no-pager`). Interactive commands will time out.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["command"],
-                "properties": {
-                    "command": { "type": "string" },
-                    "cwd": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 1 },
-                    "columns": { "type": "integer", "minimum": 1 },
-                    "rows": { "type": "integer", "minimum": 1 },
-                    "format_commands": {
-                        "type": "boolean",
-                        "description": "Format the displayed shell command for readability. Defaults to shell output configuration."
-                    }
-                }
-            }),
-            side_effect: ToolSideEffect::ExecuteProcess,
-            requires_permission: true,
-            policy: bcode_tool::ToolPolicyMetadata {
-                aliases: Vec::new(),
-                compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
-                capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
-                permission_category: Some("command".to_string()),
-                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                    kind: bcode_tool::ToolArgumentKind::Command,
-                    argument: "command".to_string(),
-                }],
-            },
-            ui: bcode_tool::ToolUiMetadata {
-                activity_label: Some("running".to_string()),
-                request_visual: Some(ToolPluginVisualMetadata {
-                    producer_plugin_id: Some("bcode.shell".to_string()),
-                    schema: "bcode.tool.request.shell.run".to_string(),
-                    schema_version: 1,
-                    title: Some("Shell command".to_string()),
-                    subtitle: Some("shell command · {bytes}".to_string()),
-                    payload: BTreeMap::from([
-                        (
-                            "command".to_string(),
-                            bcode_tool::ToolVisualPayloadSelector {
-                                fields: vec!["command".to_string()],
-                                literal: None,
-                                required: true,
-                            },
-                        ),
-                        (
-                            "cwd".to_string(),
-                            bcode_tool::ToolVisualPayloadSelector {
-                                fields: vec!["cwd".to_string()],
-                                literal: None,
-                                required: false,
-                            },
-                        ),
-                        (
-                            "format_commands".to_string(),
-                            bcode_tool::ToolVisualPayloadSelector {
-                                fields: vec!["format_commands".to_string()],
-                                literal: None,
-                                required: false,
-                            },
-                        ),
-                    ]),
-                }),
-            },
-        }],
+        tools: vec![shell_tool_definition()],
     })
 }
 

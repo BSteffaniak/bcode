@@ -31,8 +31,19 @@ pub const TOOL_SERVICE_INTERFACE_ID: &str = "bcode.tool/v1";
 /// Operation for listing tools provided by a plugin.
 pub const OP_LIST_TOOLS: &str = "list_tools";
 
+/// Operation for preparing a tool without performing side effects.
+pub const OP_PREPARE_TOOL: &str = "prepare_tool";
+
 /// Operation for invoking a tool.
 pub const OP_INVOKE_TOOL: &str = "invoke_tool";
+
+/// Namespace for the standard tool-owner-produced policy authorization fact.
+pub const TOOL_POLICY_AUTHORIZATION_NAMESPACE: &str = "bcode.tool.policy";
+
+pub const TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
+
+/// Action for invoking a tool under the standard policy authorization fact.
+pub const TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE: &str = "invoke";
 
 /// Operation for resuming a suspended interactive tool invocation.
 pub const OP_RESUME_INTERACTIVE_TOOL: &str = "resume_interactive_tool";
@@ -61,6 +72,82 @@ pub struct ToolDefinition {
     pub policy: ToolPolicyMetadata,
     #[serde(default)]
     pub ui: ToolUiMetadata,
+}
+
+/// Tool-owner-produced metadata consumed by Bcode's domain policy adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicyAuthorizationMetadata {
+    /// Tool-owner classification used by policy adapters.
+    pub side_effect: ToolSideEffect,
+    /// Whether the owner requires explicit permission absent a stronger policy decision.
+    pub requires_permission: bool,
+    /// Owner-declared policy metadata.
+    pub policy: ToolPolicyMetadata,
+    /// Opaque invocation arguments available to domain policy adapters.
+    pub arguments: serde_json::Value,
+}
+
+/// Decode and validate the standard tool-owner-produced policy authorization fact.
+///
+/// # Errors
+///
+/// Returns an error when the fact is missing, duplicated, malformed, or names a different tool.
+pub fn tool_policy_authorization_metadata(
+    facts: &[ToolAuthorizationFact],
+    tool_name: &str,
+) -> Result<ToolPolicyAuthorizationMetadata, String> {
+    let mut matching = facts.iter().filter(|fact| {
+        fact.namespace == TOOL_POLICY_AUTHORIZATION_NAMESPACE
+            && fact.schema_version == TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION
+            && fact.action == TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE
+    });
+    let fact = matching
+        .next()
+        .ok_or_else(|| "tool owner omitted the standard policy authorization fact".to_string())?;
+    if matching.next().is_some() {
+        return Err("tool owner emitted duplicate standard policy authorization facts".to_string());
+    }
+    if fact.resource.as_deref() != Some(tool_name) {
+        return Err(
+            "authorization fact resource does not match the correlated tool call".to_string(),
+        );
+    }
+    serde_json::from_value(fact.metadata.clone())
+        .map_err(|error| format!("invalid standard policy authorization fact: {error}"))
+}
+
+/// Prepare a tool invocation using one owner-supplied definition.
+///
+/// # Errors
+///
+/// Returns an error when the requested tool name does not match `definition` or the standard
+/// authorization metadata cannot be encoded.
+pub fn prepare_tool_invocation(
+    request: &ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<ToolPreparationResponse, String> {
+    if request.invocation.tool_name != definition.name {
+        return Err(format!(
+            "tool not found during preparation: {}",
+            request.invocation.tool_name
+        ));
+    }
+    let metadata = ToolPolicyAuthorizationMetadata {
+        side_effect: definition.side_effect,
+        requires_permission: definition.requires_permission,
+        policy: definition.policy.clone(),
+        arguments: request.invocation.arguments.clone(),
+    };
+    Ok(ToolPreparationResponse {
+        authorization: vec![ToolAuthorizationFact {
+            namespace: TOOL_POLICY_AUTHORIZATION_NAMESPACE.to_string(),
+            schema_version: TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION,
+            action: TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE.to_string(),
+            resource: Some(definition.name.clone()),
+            metadata: serde_json::to_value(metadata).map_err(|error| error.to_string())?,
+        }],
+        descriptor: serde_json::Value::Null,
+    })
 }
 
 /// Plugin-owned policy metadata for a model-callable tool.

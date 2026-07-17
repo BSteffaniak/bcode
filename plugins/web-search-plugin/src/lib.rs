@@ -98,6 +98,10 @@ impl WebSearchPlugin {
     fn invoke_tool_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         match context.request.operation.as_str() {
             OP_LIST_TOOLS => list_tools(&context.request, &context.config),
+            bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
+                &context.request,
+                web_tool_definitions(&context.config),
+            ),
             OP_INVOKE_TOOL => self.invoke_tool(context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
@@ -1548,13 +1552,7 @@ fn fetch_rendered(
         prompt_response,
     })
 }
-fn list_tools(
-    request: &ServiceRequest,
-    config: &bcode_plugin_sdk::PluginConfigContext,
-) -> ServiceResponse {
-    if let Err(error) = request.payload_json::<ListToolsRequest>() {
-        return invalid_request(&error);
-    }
+fn web_tool_definitions(config: &bcode_plugin_sdk::PluginConfigContext) -> Vec<ToolDefinition> {
     let plugin_config = config
         .typed_or_default::<WebSearchConfig>()
         .unwrap_or_else(|_| WebSearchConfig::default());
@@ -1565,7 +1563,19 @@ fn list_tools(
     tools.push(fetch_tool_definition());
     tools.push(status_tool_definition());
     tools.push(inspect_tool_definition());
-    json_response(&ToolList { tools })
+    tools
+}
+
+fn list_tools(
+    request: &ServiceRequest,
+    config: &bcode_plugin_sdk::PluginConfigContext,
+) -> ServiceResponse {
+    if let Err(error) = request.payload_json::<ListToolsRequest>() {
+        return invalid_request(&error);
+    }
+    json_response(&ToolList {
+        tools: web_tool_definitions(config),
+    })
 }
 
 fn query_request_visual(

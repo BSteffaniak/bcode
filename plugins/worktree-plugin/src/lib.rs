@@ -111,6 +111,10 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     let request = &context.request;
     match request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(request),
+        bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
+            request,
+            [list_definition(), create_definition(), remove_definition()],
+        ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",

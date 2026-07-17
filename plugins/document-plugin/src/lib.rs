@@ -103,6 +103,10 @@ impl DocumentPlugin {
         let request = &context.request;
         match request.operation.as_str() {
             OP_LIST_TOOLS => list_tools(request),
+            bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
+                request,
+                [extract_tool_definition(), status_tool_definition()],
+            ),
             OP_INVOKE_TOOL => self.invoke_tool(context),
             _ => ServiceResponse::error(
                 "unsupported_operation",

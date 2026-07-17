@@ -873,6 +873,7 @@ where
             context: request.context.clone(),
             call: request.call.clone(),
             tool: request.tool.clone(),
+            facts: request.facts.clone(),
         };
         decisions.push(
             match policy.evaluate_tool_call(&permission_request).await? {
@@ -950,10 +951,12 @@ impl Default for RuntimePermissionContext {
 pub struct RuntimePermissionRequest {
     /// Stable permission context for this execution path.
     pub context: RuntimePermissionContext,
-    /// Requested provider tool call.
+    /// Requested provider tool call, retained for host correlation only.
     pub call: ToolCall,
-    /// Resolved tool registration and metadata.
+    /// Resolved tool registration, retained for host correlation only.
     pub tool: RegisteredTool,
+    /// Tool-owner-produced authorization facts consumed by domain policy adapters.
+    pub facts: Vec<ToolAuthorizationFact>,
 }
 
 /// Tool permission hook used before sensitive execution.

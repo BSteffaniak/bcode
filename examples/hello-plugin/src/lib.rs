@@ -23,6 +23,11 @@ impl RustPlugin for HelloPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID
+            && context.request.operation == bcode_tool::OP_PREPARE_TOOL
+        {
+            return prepare_tool_service_response(&context.request, [hello_bridge_definition()]);
+        }
+        if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID
             && context.request.operation == bcode_tool::OP_INVOKE_TOOL
         {
             let request = match context
@@ -137,6 +142,18 @@ fn bridge_responses(context: &NativeServiceContext, invocation_id: &str) -> Serv
             ServiceResponse::error("bridge_response_encode_failed", error.to_string())
         }),
         Err(error) => ServiceResponse::error("bridge_failed", error.to_string()),
+    }
+}
+
+fn hello_bridge_definition() -> bcode_tool::ToolDefinition {
+    bcode_tool::ToolDefinition {
+        name: "hello_bridge".to_string(),
+        description: "Exercise every generic invocation capability".to_string(),
+        input_schema: serde_json::json!({"type": "object"}),
+        side_effect: bcode_tool::ToolSideEffect::ReadOnly,
+        requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 
