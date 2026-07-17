@@ -2241,40 +2241,60 @@ mod tests {
     }
 
     #[test]
-    fn artifact_replay_survives_fresh_process() {
+    fn live_final_state_matches_fresh_process_finalized_replay() {
         const CHILD_PATH_ENV: &str = "BCODE_TEST_FRESH_RECORDING_PATH";
-        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
-            let payload = authoritative_recording_payload(std::path::Path::new(&path));
-            let rendered = render_rows(&payload)
-                .iter()
-                .map(line_text)
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(rendered.contains("fresh process sentinel"), "{rendered}");
-            assert!(
-                !rendered.contains("forbidden fallback sentinel"),
-                "{rendered}"
-            );
+        const EXPECTED_PATH_ENV: &str = "BCODE_TEST_FRESH_RECORDING_EXPECTED_PATH";
+        if let (Some(path), Some(expected_path)) = (
+            std::env::var_os(CHILD_PATH_ENV),
+            std::env::var_os(EXPECTED_PATH_ENV),
+        ) {
+            let bytes = std::fs::read(path).expect("fresh process recording bytes");
+            let adapter = ShellRunTuiVisualAdapter::default();
+            deliver_recording_range(&adapter, "fresh-call", &bytes, 0, bytes.len(), true);
+            let rendered = format!("{:?}", render_hydrated_recording(&adapter, "fresh-call"));
+            let expected = std::fs::read_to_string(expected_path).expect("expected live rendering");
+            assert_eq!(rendered, expected);
             return;
         }
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("recording.bcsr");
-        let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
-            .expect("recording writer");
+        let expected_path = temp_dir.path().join("expected-render.txt");
+        let mut writer =
+            crate::recording::ShellRecordingWriter::create(&path, 16, 4).expect("recording writer");
         writer
-            .write_output(1, b"fresh process sentinel\n")
-            .expect("record output");
+            .write_output(1, b"fresh \x1b[31mred\x1b[0m \xe7\x95\x8c\r\n")
+            .expect("first output");
+        writer.write_resize(2, 12, 3).expect("resize");
         writer
-            .finish(2, Some(0), None, false, false)
+            .write_output(
+                3,
+                b"second\r\n\x1b[?1049halt\x1b[32mgreen\x1b[0m\x1b[?1049l",
+            )
+            .expect("second output");
+        writer
+            .finish(4, Some(0), None, false, false)
             .expect("finish recording");
+        let bytes = std::fs::read(&path).expect("recording bytes");
+        let split = bytes.len() / 2;
+        let live = ShellRunTuiVisualAdapter::default();
+        deliver_recording_range(&live, "fresh-call", &bytes, 0, split, false);
+        deliver_recording_range(&live, "fresh-call", &bytes, split, bytes.len(), true);
+        std::fs::write(
+            &expected_path,
+            format!("{:?}", render_hydrated_recording(&live, "fresh-call")),
+        )
+        .expect("expected live rendering");
 
         let status =
             std::process::Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
-                .arg("shell_run_tui::tests::artifact_replay_survives_fresh_process")
+                .arg(
+                    "shell_run_tui::tests::live_final_state_matches_fresh_process_finalized_replay",
+                )
                 .arg("--nocapture")
                 .env(CHILD_PATH_ENV, &path)
+                .env(EXPECTED_PATH_ENV, &expected_path)
                 .status()
                 .expect("fresh test process");
         assert!(status.success(), "fresh process replay failed: {status}");
