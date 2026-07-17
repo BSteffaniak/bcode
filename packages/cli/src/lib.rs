@@ -64,6 +64,8 @@ pub enum CliError {
     SessionLease(#[from] bcode_session::lease::SessionLeaseError),
     #[error("session store error: {0}")]
     SessionStore(#[from] bcode_session::SessionStoreError),
+    #[error("session error: {0}")]
+    Session(#[from] bcode_session::SessionError),
     #[error("session repair error: {0}")]
     SessionRepair(#[from] bcode_session::repair::SessionRepairError),
     #[error("semantic migration audit error: {0}")]
@@ -891,9 +893,25 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    Legacy {
+        #[command(subcommand)]
+        command: LegacySessionCommand,
+    },
     Import {
         #[command(subcommand)]
         command: SessionImportCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum LegacySessionCommand {
+    /// List sessions in the pre-contract storage domain without mutating them.
+    List,
+    /// Copy a strict canonical snapshot into the current writer-epoch domain with a new id.
+    Snapshot {
+        session_id: SessionId,
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -1418,6 +1436,7 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
         SessionCommand::MigrateSemanticResults { root, json } => {
             audit_semantic_result_migration(root, json).await?;
         }
+        SessionCommand::Legacy { command } => handle_legacy_session_command(command).await?,
         SessionCommand::Import { command } => handle_session_import_command(command).await?,
     }
     Ok(())
@@ -6563,6 +6582,100 @@ const fn repair_cli_output(json: bool) -> SessionRepairCliOutput {
     } else {
         SessionRepairCliOutput::Text
     }
+}
+
+async fn handle_legacy_session_command(command: LegacySessionCommand) -> Result<(), CliError> {
+    let state_dir = bcode_config::default_state_dir();
+    let legacy_root = bcode_session::legacy_session_storage_root(&state_dir);
+    match command {
+        LegacySessionCommand::List => {
+            let session_ids = discover_session_ids(&legacy_root)?;
+            if session_ids.is_empty() {
+                println!("No legacy sessions found");
+                return Ok(());
+            }
+            println!(
+                "Legacy sessions (read-only; use `bcode session legacy snapshot <id>` to copy):"
+            );
+            for session_id in session_ids {
+                match legacy_session_snapshot(&legacy_root, session_id).await {
+                    Ok(snapshot) => println!(
+                        "{}\t{}\tevents={}\tlegacy/migration-required",
+                        session_id,
+                        snapshot.title.as_deref().unwrap_or("Untitled session"),
+                        snapshot.events.len()
+                    ),
+                    Err(error) => println!("{session_id}\tunreadable\t{error}"),
+                }
+            }
+        }
+        LegacySessionCommand::Snapshot { session_id, name } => {
+            let snapshot = legacy_session_snapshot(&legacy_root, session_id).await?;
+            let current_root = bcode_session::current_session_storage_root(&state_dir);
+            let manager = bcode_session::SessionManager::persistent(current_root)?;
+            let summary = manager
+                .snapshot_external_session(
+                    session_id,
+                    snapshot.title,
+                    snapshot.working_directory,
+                    snapshot.events,
+                    name,
+                )
+                .await?;
+            println!("{}", summary.id);
+            println!("Snapshot copied from legacy session {session_id}; original was not modified");
+        }
+    }
+    Ok(())
+}
+
+struct LegacySessionSnapshot {
+    title: Option<String>,
+    working_directory: PathBuf,
+    events: Vec<bcode_session_models::SessionEvent>,
+}
+
+async fn legacy_session_snapshot(
+    legacy_root: &Path,
+    session_id: SessionId,
+) -> Result<LegacySessionSnapshot, CliError> {
+    let db =
+        bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, legacy_root).await?;
+    let events = db.all_events_strict().await?;
+    for (index, event) in events.iter().enumerate() {
+        let expected = u64::try_from(index).unwrap_or(u64::MAX);
+        if event.sequence != expected {
+            return Err(
+                bcode_session::db::SessionDbError::InvalidCanonicalSequence {
+                    expected,
+                    actual: event.sequence,
+                }
+                .into(),
+            );
+        }
+    }
+    let mut title = None;
+    let mut working_directory = PathBuf::new();
+    for event in &events {
+        match &event.kind {
+            bcode_session_models::SessionEventKind::SessionCreated {
+                name,
+                working_directory: created_in,
+            } => {
+                title.clone_from(name);
+                working_directory.clone_from(created_in);
+            }
+            bcode_session_models::SessionEventKind::SessionRenamed { name } => {
+                title.clone_from(name);
+            }
+            _ => {}
+        }
+    }
+    Ok(LegacySessionSnapshot {
+        title,
+        working_directory,
+        events,
+    })
 }
 
 async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliError> {

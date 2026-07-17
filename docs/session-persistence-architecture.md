@@ -79,6 +79,13 @@ Each daemon registry record advertises its writer epoch for diagnostics and opti
 used before an explicit identity-preserving legacy migration, where the non-cooperating legacy
 writer must be quiescent; unrelated old daemons do not block startup or current-domain work.
 
+Legacy sessions remain in the pre-contract `sessions/` root and are never opened by current runtime
+paths. `bcode session legacy list` performs strict, non-mutating discovery there. `bcode session
+legacy snapshot <id>` strictly reads one canonical snapshot and copies it into the current epoch
+domain under a new session id with clone lineage; it leaves the source untouched and does not
+require legacy daemon retirement. This is a point-in-time fork, not synchronization. Preserving the
+same identity still requires a separate target-quiesced migration.
+
 ## Projection append invariants
 
 A canonical append and all required projections are one transaction. Before insertion, the append

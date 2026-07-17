@@ -16,6 +16,12 @@
 
 use std::path::{Path, PathBuf};
 
+/// Return the pre-contract session-storage root used by legacy daemon generations.
+#[must_use]
+pub fn legacy_session_storage_root(state_dir: &Path) -> PathBuf {
+    state_dir.join("sessions")
+}
+
 /// Return the session-storage root for a specific durable writer epoch.
 ///
 /// Storage is shared by all builds implementing the same writer contract and isolated from
@@ -1944,6 +1950,44 @@ impl SessionManager {
         })
     }
 
+    /// Snapshot canonical events from an external storage domain into a new current-domain session.
+    ///
+    /// The source is never mutated. The returned session has a new identity and records clone
+    /// lineage through its `SessionForked` marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when creating the destination or copying a canonical event fails.
+    pub async fn snapshot_external_session(
+        &self,
+        source_session_id: SessionId,
+        source_title: Option<String>,
+        working_directory: PathBuf,
+        events: Vec<SessionEvent>,
+        name: Option<String>,
+    ) -> Result<SessionSummary, SessionError> {
+        let source_cutoff_sequence = events.last().map(|event| event.sequence);
+        let display_title = source_title
+            .clone()
+            .unwrap_or_else(|| source_session_id.to_string());
+        let clone_name = normalize_session_name(name)
+            .or_else(|| Some(format!("[legacy snapshot] {display_title}")));
+        self.copy_session_events(
+            clone_name,
+            working_directory,
+            events,
+            SessionEventKind::SessionForked {
+                source_session_id,
+                source_title,
+                source_cutoff_sequence,
+                source_prompt_sequence: None,
+                forked_at_ms: self.next_activity_timestamp_ms(),
+                kind: SessionForkKind::Clone,
+            },
+        )
+        .await
+    }
+
     async fn copy_session_events(
         &self,
         name: Option<String>,
@@ -1952,20 +1996,30 @@ impl SessionManager {
         marker: SessionEventKind,
     ) -> Result<SessionSummary, SessionError> {
         let session = self.create_session(name, working_directory).await?;
+        let handle = self.session_handle(session.id).await?;
         let mut sequence_map = BTreeMap::new();
         for event in events {
             if !is_copyable_fork_event(&event.kind) {
                 continue;
             }
             let kind = rewrite_copied_event_kind(event.kind.clone(), &sequence_map);
-            let copied = self
-                .append_event_with_provenance(session.id, kind, Some(copy_event_provenance(&event)))
+            let copied = handle
+                .append_event_with_provenance(
+                    kind,
+                    Some(copy_event_provenance(&event)),
+                    self.next_activity_timestamp_ms(),
+                )
                 .await?;
             sequence_map.insert(event.sequence, copied.sequence);
         }
-        self.append_event(session.id, marker.clone()).await?;
-        let mut summary = self.session_summary(session.id).await?;
+        let marker_event = handle
+            .append_event(marker.clone(), self.next_activity_timestamp_ms())
+            .await?;
+        let mut summary = handle.summary().await?;
+        self.release_persistent_idle_session_resources(session.id)
+            .await;
         summary.fork = session_fork_summary_from_marker(&marker);
+        self.publish_committed_mutation(marker_event, summary.clone());
         Ok(summary)
     }
 
