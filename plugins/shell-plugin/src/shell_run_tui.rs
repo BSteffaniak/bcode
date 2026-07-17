@@ -1107,6 +1107,98 @@ mod tests {
             .join("")
     }
 
+    fn deliver_recording_range(
+        adapter: &ShellRunTuiVisualAdapter,
+        key: &str,
+        all_bytes: &[u8],
+        offset: usize,
+        end: usize,
+        finalized: bool,
+    ) {
+        bcode_plugin_sdk::tui::PluginTuiVisualAdapter::artifact_chunk(
+            adapter,
+            &bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
+                tool_call_id: key.to_owned(),
+                artifact_id: format!("{key}-artifact"),
+                reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
+                producer_plugin_id: "bcode.shell".to_owned(),
+                schema: "bcode.tool.request.shell.run".to_owned(),
+                schema_version: 1,
+                content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
+                offset: u64::try_from(offset).expect("offset"),
+                total_bytes: u64::try_from(all_bytes.len()).expect("length"),
+                revision: u64::try_from(end).expect("revision"),
+                finalized,
+                bytes: all_bytes[offset..end].to_vec(),
+            },
+        )
+        .expect("recording range");
+    }
+
+    fn render_hydrated_recording(adapter: &ShellRunTuiVisualAdapter, key: &str) -> Vec<Line> {
+        let payload = serde_json::json!({
+            "command": "fixture",
+            "mode": "terminal",
+            "_bcode_runtime": {"live_state_key": key},
+            "_artifact_refs": [{
+                "key": SHELL_RECORDING_REF_KEY,
+                "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                "metadata": {"availability": "complete", "complete": true}
+            }]
+        });
+        bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            adapter,
+            "bcode.shell.run",
+            &payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            ),
+        )
+    }
+
+    #[test]
+    fn uninterrupted_reconnect_and_fresh_finalized_hydration_render_identically() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("reconnect-parity.bcsr");
+        let mut writer =
+            crate::recording::ShellRecordingWriter::create(&path, 16, 4).expect("recording writer");
+        writer
+            .write_output(1, b"\x1b[31mred\x1b[0m wide \xe7\x95\x8c\r\n")
+            .expect("first output");
+        writer.write_resize(2, 12, 3).expect("resize");
+        writer
+            .write_output(3, b"second\r\n\x1b[?1049halternate\x1b[?1049l")
+            .expect("second output");
+        writer
+            .finish(4, Some(0), None, false, false)
+            .expect("finish recording");
+        let bytes = std::fs::read(path).expect("recording bytes");
+        let first = bytes.len() / 3;
+        let second = first.saturating_mul(2);
+
+        let uninterrupted = ShellRunTuiVisualAdapter::default();
+        deliver_recording_range(&uninterrupted, "call", &bytes, 0, first, false);
+        deliver_recording_range(&uninterrupted, "call", &bytes, first, second, false);
+        deliver_recording_range(&uninterrupted, "call", &bytes, second, bytes.len(), true);
+
+        let reconnected = ShellRunTuiVisualAdapter::default();
+        deliver_recording_range(&reconnected, "call", &bytes, 0, bytes.len(), true);
+
+        let fresh_finalized = ShellRunTuiVisualAdapter::default();
+        deliver_recording_range(&fresh_finalized, "call", &bytes, 0, bytes.len(), true);
+
+        assert_eq!(
+            render_hydrated_recording(&uninterrupted, "call"),
+            render_hydrated_recording(&reconnected, "call")
+        );
+        assert_eq!(
+            render_hydrated_recording(&uninterrupted, "call"),
+            render_hydrated_recording(&fresh_finalized, "call")
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // Covers chunk ordering, decoding, lifecycle, rendering, and duplicate rejection together.
     fn artifact_chunks_incrementally_feed_shell_owned_live_replay_once() {
