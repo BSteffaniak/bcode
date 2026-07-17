@@ -63,6 +63,12 @@ its compatibility lease while idle even if it drops cached database and event st
 incompatible daemon from claiming the session between model/tool operations. Catalog discovery and
 listing remain lease-free.
 
+Before binding its endpoint, a daemon enumerates registry records and probes their IPC endpoints.
+Any live daemon in another namespace that advertises a different writer epoch—or has a legacy
+record with no epoch—blocks startup with an actionable error containing namespace, PID, build,
+writer epoch, and endpoint. Stale records do not block startup. This is transition fencing, not a
+replacement for per-session leases or the durable database contract.
+
 The initial rollout of this contract must explicitly retire pre-contract daemon processes before
 upgrading session writer epochs, because already-running legacy binaries cannot retroactively honor
 the durable check.

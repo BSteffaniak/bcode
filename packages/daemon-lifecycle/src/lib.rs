@@ -101,6 +101,9 @@ pub struct DaemonRecord {
     pub protocol_version: u32,
     /// Build fingerprint included in the namespace.
     pub build_fingerprint: String,
+    /// Durable session-storage writer epoch supported by this daemon, when known.
+    #[serde(default)]
+    pub storage_writer_epoch: Option<u32>,
     /// Process identifier, when available.
     pub pid: Option<u32>,
     /// IPC endpoint for this daemon.
@@ -135,6 +138,7 @@ impl DaemonRecord {
             namespace: daemon_namespace(),
             protocol_version: u32::from(CURRENT_PROTOCOL_VERSION),
             build_fingerprint: BUILD_FINGERPRINT.to_string(),
+            storage_writer_epoch: None,
             pid: Some(std::process::id()),
             endpoint: endpoint_record(endpoint),
             log_path,
@@ -256,6 +260,40 @@ pub fn remove_record_if_instance(
         remove_record_path(path)?;
     }
     Ok(())
+}
+
+/// Return daemon registry records whose IPC endpoints currently respond.
+///
+/// Stale or malformed records are excluded. This function does not mutate registry files.
+pub async fn live_records(state_dir: &Path) -> Vec<(PathBuf, DaemonRecord)> {
+    let mut live = Vec::new();
+    for (path, record) in read_records(state_dir) {
+        let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
+            continue;
+        };
+        if probe_daemon_ready(&endpoint).await {
+            live.push((path, record));
+        }
+    }
+    live
+}
+
+fn storage_writer_is_incompatible(record: &DaemonRecord, storage_writer_epoch: u32) -> bool {
+    record.storage_writer_epoch != Some(storage_writer_epoch)
+}
+
+/// Return live daemons that do not advertise `storage_writer_epoch`.
+///
+/// Legacy records with no writer epoch are incompatible by default.
+pub async fn incompatible_storage_writer_records(
+    state_dir: &Path,
+    storage_writer_epoch: u32,
+) -> Vec<(PathBuf, DaemonRecord)> {
+    live_records(state_dir)
+        .await
+        .into_iter()
+        .filter(|(_, record)| storage_writer_is_incompatible(record, storage_writer_epoch))
+        .collect()
 }
 
 /// Return the directory that stores cached exact-build daemon executables.
@@ -409,6 +447,41 @@ fn endpoint_record(endpoint: &IpcEndpoint) -> DaemonEndpointRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record_with_writer_epoch(storage_writer_epoch: Option<u32>) -> DaemonRecord {
+        DaemonRecord {
+            schema_version: DAEMON_RECORD_SCHEMA_VERSION,
+            namespace: "test".to_string(),
+            protocol_version: u32::from(CURRENT_PROTOCOL_VERSION),
+            build_fingerprint: "test-build".to_string(),
+            storage_writer_epoch,
+            pid: Some(std::process::id()),
+            endpoint: DaemonEndpointRecord::Unknown {
+                debug: "test".to_string(),
+            },
+            log_path: PathBuf::from("test.log"),
+            executable_path: None,
+            started_at_unix_ms: 0,
+            last_seen_unix_ms: 0,
+            instance_id: "test-instance".to_string(),
+        }
+    }
+
+    #[test]
+    fn storage_writer_compatibility_fails_closed_for_legacy_records() {
+        assert!(storage_writer_is_incompatible(
+            &record_with_writer_epoch(None),
+            2
+        ));
+        assert!(storage_writer_is_incompatible(
+            &record_with_writer_epoch(Some(1)),
+            2
+        ));
+        assert!(!storage_writer_is_incompatible(
+            &record_with_writer_epoch(Some(2)),
+            2
+        ));
+    }
 
     #[test]
     fn cached_daemon_executable_path_is_namespace_scoped() {

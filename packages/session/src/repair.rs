@@ -586,6 +586,51 @@ fn unix_time_millis() -> u64 {
 mod tests {
     use super::*;
 
+    fn session_storage_files(root: &Path, session_id: SessionId) -> Vec<(String, Vec<u8>)> {
+        let session_dir = root.join(session_id.to_string());
+        let mut files = std::fs::read_dir(session_dir)
+            .expect("session directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).expect("session storage bytes"),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[tokio::test]
+    async fn doctor_session_public_path_is_byte_for_byte_non_mutating() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = db::SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&session_event(
+            session_id,
+            0,
+            bcode_session_models::SessionEventKind::SessionCreated {
+                name: Some("doctor immutability".to_string()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append event");
+        drop(db);
+        let before = session_storage_files(temp_dir.path(), session_id);
+
+        let report = doctor_session(temp_dir.path(), session_id)
+            .await
+            .expect("doctor report");
+        assert_eq!(report.status, RepairStatus::Ok);
+        let after = session_storage_files(temp_dir.path(), session_id);
+        assert_eq!(after, before, "doctor must not mutate DB or sidecars");
+    }
+
     #[tokio::test]
     async fn destructive_repair_dry_run_is_non_mutating_and_execution_creates_backup() {
         let temp_dir = tempfile::tempdir().expect("temp dir");

@@ -3521,6 +3521,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_health_is_byte_for_byte_non_mutating() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("health immutability".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = session_database_files(&root, session.id);
+
+        assert_eq!(
+            manager.session_health(session.id).await,
+            SessionHealth::Ready
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = session_database_files(&root, session.id);
+        assert_eq!(
+            after, before,
+            "session health must not mutate DB or sidecars"
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn session_health_reports_incompatible_storage_writer_epoch() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");

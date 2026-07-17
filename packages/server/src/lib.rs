@@ -162,6 +162,17 @@ pub enum ServerError {
     /// Registry I/O error: {0}
     #[error("daemon lifecycle error: {0}")]
     DaemonLifecycle(#[from] bcode_daemon_lifecycle::DaemonLifecycleError),
+    /// A live daemon cannot safely share session storage with this writer.
+    #[error(
+        "incompatible live daemon blocks session storage access: namespace={namespace}, pid={pid:?}, build={build_fingerprint}, writer_epoch={storage_writer_epoch:?}, endpoint={endpoint}"
+    )]
+    IncompatibleDaemonStorage {
+        namespace: String,
+        pid: Option<u32>,
+        build_fingerprint: String,
+        storage_writer_epoch: Option<u32>,
+        endpoint: String,
+    },
     #[error("blocking task join error: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
     #[error("model catalog error: {0}")]
@@ -1559,16 +1570,39 @@ fn catalog_status_to_ipc(status: CatalogLoadStatus) -> SessionCatalogStatus {
     }
 }
 
+async fn ensure_daemon_storage_compatibility() -> Result<(), ServerError> {
+    let state_dir = bcode_config::default_state_dir();
+    let current_namespace = bcode_ipc::daemon_namespace();
+    if let Some((_, record)) = bcode_daemon_lifecycle::incompatible_storage_writer_records(
+        &state_dir,
+        bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+    )
+    .await
+    .into_iter()
+    .find(|(_, record)| record.namespace != current_namespace)
+    {
+        return Err(ServerError::IncompatibleDaemonStorage {
+            namespace: record.namespace,
+            pid: record.pid,
+            build_fingerprint: record.build_fingerprint,
+            storage_writer_epoch: record.storage_writer_epoch,
+            endpoint: format!("{:?}", record.endpoint),
+        });
+    }
+    Ok(())
+}
+
 fn register_daemon(
     endpoint: &IpcEndpoint,
 ) -> Result<bcode_daemon_lifecycle::DaemonRecord, ServerError> {
     let instance_id = daemon_instance_id()?;
-    let record = bcode_daemon_lifecycle::DaemonRecord::current(
+    let mut record = bcode_daemon_lifecycle::DaemonRecord::current(
         endpoint,
         daemon_log_path(),
         std::env::current_exe().ok(),
         instance_id,
     )?;
+    record.storage_writer_epoch = Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
     bcode_daemon_lifecycle::write_record(&bcode_config::default_state_dir(), &record)?;
     Ok(record)
 }
@@ -1785,6 +1819,7 @@ pub async fn run_with_static_bundled(
         plugin_configs,
     )?;
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");
+    ensure_daemon_storage_compatibility().await?;
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;
     let daemon_record = register_daemon(&endpoint)?;
