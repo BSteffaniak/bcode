@@ -1325,6 +1325,84 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Builds all three published wire formats in one session fixture.
+    fn mixed_recording_versions_in_one_session_remain_replayable() {
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let output = b"mixed version output";
+
+        let version_one = session_dir.path().join("version-one.bcsr");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&LEGACY_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&80_u16.to_le_bytes());
+        bytes.extend_from_slice(&24_u16.to_le_bytes());
+        bytes.push(FRAME_OUTPUT);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(output.len()).expect("length").to_le_bytes());
+        bytes.extend_from_slice(output);
+        let mut legacy_finish = [0_u8; 38];
+        legacy_finish[0] = 1;
+        legacy_finish[1..5].copy_from_slice(&0_i32.to_le_bytes());
+        legacy_finish[6..].copy_from_slice(&Sha256::digest(output));
+        bytes.push(FRAME_FINISH);
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&38_u32.to_le_bytes());
+        bytes.extend_from_slice(&legacy_finish);
+        fs::write(&version_one, bytes).expect("version one");
+
+        let version_two = session_dir.path().join("version-two.bcsr");
+        let signal = b"SIGTERM";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&SIGNAL_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&80_u16.to_le_bytes());
+        bytes.extend_from_slice(&24_u16.to_le_bytes());
+        bytes.push(FRAME_OUTPUT);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(output.len()).expect("length").to_le_bytes());
+        bytes.extend_from_slice(output);
+        let mut signal_finish = Vec::new();
+        signal_finish.push(1);
+        signal_finish.extend_from_slice(&1_i32.to_le_bytes());
+        signal_finish.push(0);
+        signal_finish.extend_from_slice(
+            &u16::try_from(signal.len())
+                .expect("signal length")
+                .to_le_bytes(),
+        );
+        signal_finish.extend_from_slice(signal);
+        signal_finish.extend_from_slice(&Sha256::digest(output));
+        bytes.push(FRAME_FINISH);
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(signal_finish.len())
+                .expect("length")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&signal_finish);
+        fs::write(&version_two, bytes).expect("version two");
+
+        let version_three = session_dir.path().join("version-three.bcsr");
+        let mut writer = ShellRecordingWriter::create(&version_three, 80, 24).expect("writer");
+        writer.write_output(1, output).expect("output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
+
+        for path in [&version_one, &version_two, &version_three] {
+            let (_, frames) = read_recording(path).expect("supported recording");
+            assert!(frames.iter().any(|frame| matches!(
+                frame,
+                ShellRecordingFrame::Output { bytes, .. } if bytes == output
+            )));
+            assert!(matches!(
+                frames.last(),
+                Some(ShellRecordingFrame::Finish { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn malformed_lifecycle_frames_are_rejected() {
         let dir = tempfile::tempdir().expect("temp dir");
         for (name, mutation, expected) in [
