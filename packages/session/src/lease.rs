@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Durable session-storage writer contract supported by this Bcode build.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 1;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 2;
 
 /// Serializable metadata describing one process currently accessing a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -626,6 +626,49 @@ mod tests {
             error,
             SessionLeaseError::MissingStorageWriterEpoch { .. }
         ));
+    }
+
+    #[test]
+    fn maintenance_refuses_any_live_session_owner() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let _owner = acquire_session_lease(temp_dir.path(), session_id, &context("owner", 7))
+            .expect("session owner");
+        assert!(matches!(
+            acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect_err("maintenance must refuse live owner"),
+            SessionLeaseError::OwnedByOtherDaemon { .. }
+        ));
+    }
+
+    #[test]
+    fn maintenance_coordinator_blocks_new_session_lease_until_release() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let maintenance = acquire_session_maintenance_guard(temp_dir.path(), session_id)
+            .expect("maintenance guard");
+        let root = temp_dir.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            started_tx.send(()).expect("started signal");
+            let result = acquire_session_lease(&root, session_id, &context("writer", 7));
+            finished_tx.send(result.is_ok()).expect("finished signal");
+        });
+        started_rx.recv().expect("lease attempt started");
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "lease acquisition must remain blocked while maintenance owns the coordinator"
+        );
+        drop(maintenance);
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("lease attempt should finish after maintenance release")
+        );
+        join.join().expect("lease thread");
     }
 
     #[test]

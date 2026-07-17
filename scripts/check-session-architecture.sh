@@ -18,7 +18,7 @@ if rg -n "handle\.state" packages/session/src/lib.rs >/tmp/bcode-session-actor-v
 fi
 
 if rg -n "std::fs|OpenOptions|fs::File|File::open|File::create" packages/session/src --glob '*.rs' \
-  | rg -v 'packages/session/src/(lib|index|reader|migration|semantic_migration|event_migration|legacy_stream_cleanup|derived|lease|repair)\.rs' \
+  | rg -v 'packages/session/src/(lib|index|reader|migration|semantic_migration|event_migration|legacy_stream_cleanup|derived|db|lease|repair)\.rs' \
   >/tmp/bcode-session-fs-violations.txt; then
   echo "Session persistence architecture violation: direct filesystem access outside approved store modules." >&2
   cat /tmp/bcode-session-fs-violations.txt >&2
@@ -118,15 +118,28 @@ if grep -Eq 'run_session_migrations|migrate_model_context_projection|rebuild_mod
   violations=1
 fi
 
-migration_call_count="$(rg -n 'migrate_model_context_projection\(' packages/session/src/db.rs | wc -l | tr -d ' ')"
+migration_call_count="$( (rg -n 'migrate_session_storage\(' packages/session/src/db.rs || true) | wc -l | tr -d ' ')"
 if [[ "$migration_call_count" != "2" ]]; then
-  echo "Session migration violation: model-context migration must only be defined and called by explicit migration open." >&2
+  echo "Session migration violation: storage migration must only be defined and called by explicit migration open." >&2
   violations=1
 fi
 
 if rg -n 'open_turso_in_root\(session_id, root\)' packages/session/src/repair.rs >/tmp/bcode-repair-mutating-open-violations.txt; then
   echo "Session repair violation: doctor/validation paths must use existing non-migrating opens." >&2
   cat /tmp/bcode-repair-mutating-open-violations.txt >&2
+  violations=1
+fi
+
+if ! rg -q 'migrate_session_storage\(&\*\*db\.db\)' packages/session/src/db.rs \
+  || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs; then
+  echo "Session migration violation: projection rebuild and writer-epoch update must share explicit migration transaction." >&2
+  violations=1
+fi
+
+if ! rg -q 'pub async fn reindex_model_context\(' packages/session/src/db.rs \
+  || ! sed -n '/pub async fn reindex_model_context(/,/^    }/p' packages/session/src/db.rs \
+      | grep -q 'SessionMaintenanceGuard'; then
+  echo "Session reindex capability violation: low-level reindex must require maintenance ownership." >&2
   violations=1
 fi
 

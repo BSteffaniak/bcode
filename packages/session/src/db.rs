@@ -43,10 +43,10 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Durable storage writer epoch understood by this session database implementation.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
     crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
+const LEGACY_SESSION_STORAGE_WRITER_EPOCH: u32 = 1;
 const SESSION_STORAGE_CONTRACT_ID: i32 = 1;
 const SESSION_STORAGE_CONTRACT_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 2;
-const LEGACY_MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u64 = 1;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
 const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 4;
 const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
@@ -704,7 +704,7 @@ impl SessionDb {
         let db = Self::open_existing_turso_observed(session_id, &path, MetricsRegistry::disabled())
             .await?;
         run_session_migrations(&**db.db).await?;
-        migrate_model_context_projection(&**db.db).await?;
+        migrate_session_storage(&**db.db).await?;
         Ok(db)
     }
 
@@ -773,6 +773,7 @@ impl SessionDb {
     ) -> SessionDbResult<Self> {
         let db = Self::connect_turso_observed(session_id, path, metrics).await?;
         run_session_migrations(&**db.db).await?;
+        initialize_current_storage_contract(&**db.db).await?;
         Ok(db)
     }
 
@@ -1064,7 +1065,9 @@ impl SessionDb {
     ///
     /// # Errors
     ///
-    /// Returns an error if the contract row is missing or malformed.
+    /// Returns an error if the contract row is malformed. A missing row is reported as the known
+    /// legacy writer epoch so diagnostics can distinguish migration-required legacy state from an
+    /// unknown future writer.
     pub async fn storage_writer_epoch(&self) -> SessionDbResult<u64> {
         let row = self
             .db
@@ -1072,12 +1075,11 @@ impl SessionDb {
             .columns(&["writer_epoch"])
             .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
             .execute_first(&**self.db)
-            .await?
-            .ok_or(SessionDbError::WriterIncompatible {
-                actual: None,
-                expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
-            })?;
-        required_i64(&row, "writer_epoch").map(i64_to_u64)
+            .await?;
+        row.as_ref().map_or_else(
+            || Ok(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
+            |row| required_i64(row, "writer_epoch").map(i64_to_u64),
+        )
     }
 
     /// Return a turn receipt by producer-scoped idempotency identity.
@@ -1935,36 +1937,87 @@ async fn run_session_migrations(db: &dyn Database) -> Result<(), MigrationError>
     runner.run(db).await
 }
 
-async fn migrate_model_context_projection(db: &dyn Database) -> SessionDbResult<()> {
-    let Some(state) = db
-        .select("model_context_projection_state")
-        .columns(&["schema_version"])
-        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
-        .execute_first(db)
-        .await?
-    else {
+async fn set_storage_writer_contract(db: &dyn Database, writer_epoch: u32) -> SessionDbResult<()> {
+    db.upsert("session_storage_contract")
+        .value("contract_id", SESSION_STORAGE_CONTRACT_ID)
+        .value(
+            "schema_version",
+            DatabaseValue::Int64(i64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION)),
+        )
+        .value(
+            "writer_epoch",
+            DatabaseValue::Int64(i64::from(writer_epoch)),
+        )
+        .value(
+            "updated_by_build",
+            option_env!("BCODE_BUILD_FINGERPRINT").map(str::to_owned),
+        )
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn initialize_current_storage_contract(db: &dyn Database) -> SessionDbResult<()> {
+    let tx = db.begin_transaction().await?;
+    set_storage_writer_contract(&*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn validate_all_projection_checkpoints_at_tail(
+    db: &dyn Database,
+    expected: Option<u64>,
+) -> SessionDbResult<()> {
+    let Some(expected) = expected else {
         return Ok(());
     };
-    let schema_version = required_i64(&state, "schema_version").map(i64_to_u64)?;
-    if schema_version != LEGACY_MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION {
-        return Ok(());
+    for projection in MaterializedProjection::all() {
+        validate_materialized_projection_version(db, *projection).await?;
+        let checkpoint = projection_checkpoint_from_database(db, *projection).await?;
+        if checkpoint != Some(expected) {
+            return Err(SessionDbError::ProjectionStale {
+                projection: projection.as_str(),
+                checkpoint,
+                expected,
+            });
+        }
     }
+    Ok(())
+}
 
+async fn migrate_session_storage(db: &dyn Database) -> SessionDbResult<()> {
     let tx = db.begin_transaction().await?;
-    let state = tx
-        .select("model_context_projection_state")
-        .columns(&["schema_version"])
-        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
-        .execute_first(&*tx)
-        .await?;
-    if state
-        .as_ref()
-        .map(|row| required_i64(row, "schema_version").map(i64_to_u64))
-        .transpose()?
-        == Some(LEGACY_MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)
-    {
-        rebuild_model_context_projection(&*tx).await?;
+    let canonical_tail = last_event_sequence_from_database(&*tx).await?;
+    rebuild_model_context_projection(&*tx).await?;
+    if let Some(expected) = canonical_tail {
+        let model_state = tx
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+            .execute_first(&*tx)
+            .await?
+            .ok_or(SessionDbError::ProjectionStale {
+                projection: "model_context",
+                checkpoint: None,
+                expected,
+            })?;
+        let schema_version = required_i64(&model_state, "schema_version").map(i64_to_u64)?;
+        if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
+            return Err(SessionDbError::ModelContextProjectionVersion {
+                actual: schema_version,
+                expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
+            });
+        }
+        let checkpoint = required_i64(&model_state, "last_event_seq").map(i64_to_u64)?;
+        if checkpoint != expected {
+            return Err(SessionDbError::ModelContextProjectionStale {
+                checkpoint,
+                expected,
+            });
+        }
     }
+    validate_all_projection_checkpoints_at_tail(&*tx, canonical_tail).await?;
+    set_storage_writer_contract(&*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -2226,7 +2279,7 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
         .await?;
     let Some(row) = row.as_ref() else {
         return Err(SessionDbError::WriterIncompatible {
-            actual: None,
+            actual: Some(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
             expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
         });
     };
@@ -3517,6 +3570,21 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, RequestContextObservation,
         RequestContextTokenCount,
     };
+    use std::collections::BTreeMap;
+
+    fn session_storage_files(root: &Path, session_id: SessionId) -> BTreeMap<String, Vec<u8>> {
+        let session_dir = root.join(session_id.to_string());
+        std::fs::read_dir(session_dir)
+            .expect("session directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes = std::fs::read(entry.path()).expect("read session storage file");
+                (name, bytes)
+            })
+            .collect()
+    }
 
     async fn reindex_model_context_for_test(
         db: &SessionDb,
@@ -4747,10 +4815,17 @@ mod tests {
         assert!(matches!(
             error,
             SessionDbError::WriterIncompatible {
-                actual: None,
+                actual: Some(actual),
                 expected
-            } if expected == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+            } if actual == u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+                && expected == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
         ));
+        assert_eq!(
+            db.storage_writer_epoch()
+                .await
+                .expect("legacy writer epoch"),
+            u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+        );
         assert_eq!(
             db.last_event_sequence().await.expect("canonical tail"),
             None
@@ -4960,6 +5035,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_open_and_reads_leave_database_and_sidecars_byte_identical() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("initialize session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("read immutability".to_string()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append event");
+        drop(db);
+        let before = session_storage_files(temp_dir.path(), session_id);
+
+        let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open existing session");
+        assert_eq!(reopened.last_event_sequence().await.expect("tail"), Some(0));
+        assert_eq!(reopened.all_events().await.expect("history").len(), 1);
+        assert_eq!(
+            reopened
+                .model_context_projection_status()
+                .await
+                .expect("projection status"),
+            ModelContextProjectionStatus::Fresh { checkpoint: 0 }
+        );
+        drop(reopened);
+
+        let after = session_storage_files(temp_dir.path(), session_id);
+        assert_eq!(
+            after, before,
+            "existing open/read paths must not mutate DB or sidecars"
+        );
+    }
+
+    #[tokio::test]
     async fn normal_existing_open_does_not_run_pending_projection_migrations() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -5030,6 +5146,16 @@ mod tests {
         .await
         .expect("append projected event");
         db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
+            )
+            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+            .execute(db.database())
+            .await
+            .expect("set legacy writer epoch");
+        db.database()
             .update("model_context_projection_state")
             .value("schema_version", DatabaseValue::Int64(1))
             .execute(db.database())
@@ -5047,7 +5173,20 @@ mod tests {
             None,
         )
         .await
-        .expect("append canonical tail without projection");
+        .expect("append canonical tail without model-context projection");
+        let tail_event = event(
+            session_id,
+            1,
+            SessionEventKind::AssistantMessage {
+                text: "canonical tail".to_string(),
+            },
+        );
+        project_materialized_event(db.database(), &tail_event)
+            .await
+            .expect("project non-model read models");
+        project_context_occupancy_event(db.database(), &tail_event)
+            .await
+            .expect("project occupancy read model");
         drop(db);
 
         let maintenance =
@@ -5059,6 +5198,13 @@ mod tests {
             SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
                 .await
                 .expect("explicitly migrate session db");
+        assert_eq!(
+            migrated
+                .storage_writer_epoch()
+                .await
+                .expect("migrated writer epoch"),
+            u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
         assert_eq!(
             migrated
                 .model_context_projection_status()
@@ -5084,6 +5230,90 @@ mod tests {
                 .expect("projection status after reopen"),
             ModelContextProjectionStatus::Fresh { checkpoint: 1 }
         );
+    }
+
+    #[tokio::test]
+    async fn failed_explicit_migration_preserves_projection_and_writer_contract() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "projected".to_string(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ))
+        .await
+        .expect("append projected event");
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
+            )
+            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+            .execute(db.database())
+            .await
+            .expect("set legacy writer epoch");
+        db.database()
+            .update("model_context_projection_state")
+            .value("schema_version", DatabaseValue::Int64(1))
+            .execute(db.database())
+            .await
+            .expect("set legacy projection schema");
+        insert_event(
+            db.database(),
+            &event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "gapped tail".to_string(),
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("insert gapped canonical tail");
+        drop(db);
+
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
+            .expect("write guard");
+        assert!(matches!(
+            SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                .await
+                .expect_err("gapped migration must fail"),
+            SessionDbError::InvalidCanonicalSequence {
+                expected: 1,
+                actual: 2
+            }
+        ));
+
+        let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("reopen failed migration");
+        assert_eq!(
+            reopened.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        let state = reopened
+            .database()
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+            .execute_first(reopened.database())
+            .await
+            .expect("projection query")
+            .expect("projection state");
+        assert_eq!(required_i64(&state, "schema_version").expect("schema"), 1);
+        assert_eq!(required_i64(&state, "last_event_seq").expect("tail"), 0);
     }
 
     #[tokio::test]

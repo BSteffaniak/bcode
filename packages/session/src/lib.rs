@@ -5400,6 +5400,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_persistent_manager_releases_loaded_session_lease() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent_with_metrics_and_lease_owner(
+                &root,
+                MetricsRegistry::default(),
+                SessionLeaseOwnerContext {
+                    storage_writer_epoch: Some(7),
+                    build_fingerprint: Some("first-build".to_string()),
+                    ..SessionLeaseOwnerContext::default()
+                },
+            )
+            .expect("first manager");
+            let session = manager
+                .create_session(Some("lease release".to_string()), test_working_directory())
+                .await
+                .expect("session should create");
+            assert!(manager.inner.lock().await.leases.contains_key(&session.id));
+            session.id
+        };
+
+        let next = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                storage_writer_epoch: Some(8),
+                build_fingerprint: Some("next-build".to_string()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("next manager");
+        next.ensure_session_loaded(session_id)
+            .await
+            .expect("manager drop must release lease");
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn restored_model_context_uses_relevant_canonical_db_events_without_checkpoint() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");

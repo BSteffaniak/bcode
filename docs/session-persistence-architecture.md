@@ -44,6 +44,13 @@ canonical event. Missing and unknown/future epochs fail closed with a migration-
 IPC protocol and build fingerprint are diagnostic metadata, not storage compatibility proofs.
 Non-event session mutations such as composer drafts perform the same durable check.
 
+The current contract-aware baseline uses writer epoch `2`. Databases with no contract row are
+reported diagnostically as known legacy epoch `1`, but mutation fails closed until explicit guarded
+migration installs epoch `2`. Explicit migration rebuilds and validates model context, verifies all
+required projection checkpoints at the canonical tail, and updates the writer contract in the same
+database transaction. Any validation/rebuild failure rolls the entire transaction back, preserving
+the previous projection and writer epoch.
+
 The writer epoch must be bumped whenever a released writer would be unable to preserve canonical
 append atomicity under the new code: adding or changing a required projector, changing required
 projection semantics/schema, adding writer-required tables or constraints (including turn-receipt
