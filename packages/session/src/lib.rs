@@ -2269,8 +2269,9 @@ impl SessionManager {
 
     /// Release cached per-session resources when no clients remain attached.
     ///
-    /// The session stays visible through its lightweight summary, but the actor drops any cached
-    /// database connection so older daemon instances do not hold contentious WAL files while idle.
+    /// The session stays visible through its lightweight summary, and its compatibility lease
+    /// remains held for the loaded actor lifetime. Only cached database/event state is released;
+    /// this prevents an incompatible daemon from claiming the session between idle operations.
     ///
     /// # Errors
     ///
@@ -2289,9 +2290,6 @@ impl SessionManager {
             .cloned()
             .ok_or(SessionError::NotFound(session_id))?;
         let released = handle.release_idle_resources().await?;
-        if released {
-            self.inner.lock().await.leases.remove(&session_id);
-        }
         self.metrics.record_histogram(
             "session.manager.release_idle.duration_ms",
             elapsed_ms(started_at),
@@ -5267,9 +5265,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_idle_session_resources_drops_loaded_state_until_next_use() {
+    async fn release_idle_session_resources_drops_loaded_state_but_retains_lease() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                build_fingerprint: Some("current-test-build".to_string()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("manager should initialize");
         let session = manager
             .create_session(Some("idle".to_string()), test_working_directory())
             .await
@@ -5298,6 +5304,27 @@ mod tests {
                 .await
                 .expect("idle resources should release")
         );
+
+        assert!(
+            manager.inner.lock().await.leases.contains_key(&session.id),
+            "idle resource release must retain compatibility ownership"
+        );
+
+        let incompatible = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                build_fingerprint: Some("incompatible-test-build".to_string()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("incompatible manager should initialize lazily");
+        assert!(matches!(
+            incompatible.ensure_session_loaded(session.id).await,
+            Err(SessionError::Lease(
+                crate::lease::SessionLeaseError::OwnedByOtherDaemon { .. }
+            ))
+        ));
 
         manager
             .append_user_message(session.id, ClientId::new(), "after release".to_owned())

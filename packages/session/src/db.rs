@@ -78,6 +78,9 @@ pub enum SessionDbError {
     /// The durable model-context projection schema is unsupported.
     #[error("unsupported model-context projection schema version {actual}; expected {expected}")]
     ModelContextProjectionVersion { actual: u64, expected: u64 },
+    /// Canonical append attempted a sequence other than the next contiguous event.
+    #[error("invalid canonical append sequence: expected #{expected}, found #{actual}")]
+    InvalidCanonicalAppendSequence { expected: u64, actual: u64 },
     /// Canonical event sequences cannot produce a trustworthy incremental projection.
     #[error("invalid canonical event sequence for reindex: expected #{expected}, found #{actual}")]
     InvalidCanonicalSequence { expected: u64, actual: u64 },
@@ -156,6 +159,20 @@ impl MaterializedProjection {
     #[must_use]
     pub const fn all() -> &'static [Self] {
         &Self::ALL
+    }
+
+    /// Return the schema version stored with this projection's checkpoint.
+    #[must_use]
+    pub const fn schema_version(self) -> u32 {
+        match self {
+            Self::RequestContextOccupancy => CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION,
+            Self::SessionState
+            | Self::InputHistory
+            | Self::Transcript
+            | Self::ToolRuns
+            | Self::ArtifactReferences
+            | Self::RuntimeWork => 1,
+        }
     }
 
     /// Return the stable projection checkpoint name.
@@ -992,12 +1009,13 @@ impl SessionDb {
         activity_timestamp_ms: Option<u64>,
     ) -> SessionDbResult<()> {
         let tx = self.db.begin_transaction().await?;
+        validate_append_preconditions(&*tx, event).await?;
         insert_event(&*tx, event, activity_timestamp_ms).await?;
-        project_event(&*tx, event).await?;
+        project_materialized_event(&*tx, event).await?;
         project_model_context_event(&*tx, event).await?;
         project_context_occupancy_event(&*tx, event).await?;
         project_turn_receipt(&*tx, event).await?;
-        update_projection_checkpoints(&*tx, event).await?;
+        validate_append_postconditions(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2061,6 +2079,227 @@ fn add_sql_migration(
     ));
 }
 
+async fn last_event_sequence_from_database(db: &dyn Database) -> SessionDbResult<Option<u64>> {
+    let row = db
+        .select("events")
+        .columns(&["event_seq"])
+        .sort("event_seq", SortDirection::Desc)
+        .limit(1)
+        .execute_first(db)
+        .await?;
+    row.as_ref()
+        .map(|row| required_i64(row, "event_seq").map(i64_to_u64))
+        .transpose()
+}
+
+async fn projection_checkpoint_from_database(
+    db: &dyn Database,
+    projection: MaterializedProjection,
+) -> SessionDbResult<Option<u64>> {
+    let row = db
+        .select("projection_checkpoints")
+        .columns(&["last_event_seq"])
+        .where_eq("projection_name", projection.as_str())
+        .execute_first(db)
+        .await?;
+    row.as_ref()
+        .map(|row| required_i64(row, "last_event_seq").map(i64_to_u64))
+        .transpose()
+}
+
+async fn projection_version_from_database(
+    db: &dyn Database,
+    projection: MaterializedProjection,
+) -> SessionDbResult<Option<u64>> {
+    let row = db
+        .select("projection_checkpoints")
+        .columns(&["projection_version"])
+        .where_eq("projection_name", projection.as_str())
+        .execute_first(db)
+        .await?;
+    row.as_ref()
+        .map(|row| required_i64(row, "projection_version").map(i64_to_u64))
+        .transpose()
+}
+
+async fn validate_materialized_projection_version(
+    db: &dyn Database,
+    projection: MaterializedProjection,
+) -> SessionDbResult<()> {
+    let actual = projection_version_from_database(db, projection).await?;
+    let expected = u64::from(projection.schema_version());
+    if let Some(actual) = actual
+        && actual != expected
+    {
+        return Err(SessionDbError::ProjectionIncompatible {
+            projection: projection.as_str(),
+            actual,
+            expected,
+        });
+    }
+    Ok(())
+}
+
+async fn validate_model_context_precondition(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    let state = db
+        .select("model_context_projection_state")
+        .columns(&["schema_version", "last_event_seq"])
+        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+        .execute_first(db)
+        .await?;
+    let Some(state) = state.as_ref() else {
+        if event.sequence == 0 {
+            return Ok(());
+        }
+        return Err(SessionDbError::ProjectionStale {
+            projection: "model_context",
+            checkpoint: None,
+            expected: event.sequence.saturating_sub(1),
+        });
+    };
+    let schema_version = required_i64(state, "schema_version").map(i64_to_u64)?;
+    if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
+        return Err(SessionDbError::ModelContextProjectionVersion {
+            actual: schema_version,
+            expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
+        });
+    }
+    let checkpoint = required_i64(state, "last_event_seq").map(i64_to_u64)?;
+    let expected = event.sequence.saturating_sub(1);
+    if event.sequence == 0 || checkpoint != expected {
+        return Err(SessionDbError::ModelContextProjectionStale {
+            checkpoint,
+            expected,
+        });
+    }
+    Ok(())
+}
+
+async fn validate_context_occupancy_precondition(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    let row = db
+        .select("context_occupancy_projection")
+        .columns(&["schema_version"])
+        .where_eq("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
+        .execute_first(db)
+        .await?;
+    let Some(row) = row.as_ref() else {
+        if event.sequence == 0 {
+            return Ok(());
+        }
+        return Err(SessionDbError::ProjectionStale {
+            projection: MaterializedProjection::RequestContextOccupancy.as_str(),
+            checkpoint: None,
+            expected: event.sequence.saturating_sub(1),
+        });
+    };
+    let actual = required_i64(row, "schema_version").map(i64_to_u64)?;
+    let expected = u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION);
+    if actual != expected {
+        return Err(SessionDbError::ProjectionIncompatible {
+            projection: MaterializedProjection::RequestContextOccupancy.as_str(),
+            actual,
+            expected,
+        });
+    }
+    Ok(())
+}
+
+async fn validate_append_preconditions(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    let canonical_tail = last_event_sequence_from_database(db).await?;
+    let expected_sequence = canonical_tail.map_or(0, |tail| tail.saturating_add(1));
+    if event.sequence != expected_sequence {
+        return Err(SessionDbError::InvalidCanonicalAppendSequence {
+            expected: expected_sequence,
+            actual: event.sequence,
+        });
+    }
+    validate_model_context_precondition(db, event).await?;
+    validate_context_occupancy_precondition(db, event).await?;
+    if let Some(expected) = canonical_tail {
+        for projection in MaterializedProjection::all() {
+            validate_materialized_projection_version(db, *projection).await?;
+            let checkpoint = projection_checkpoint_from_database(db, *projection).await?;
+            if checkpoint != Some(expected) {
+                return Err(SessionDbError::ProjectionStale {
+                    projection: projection.as_str(),
+                    checkpoint,
+                    expected,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_append_postconditions(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    let canonical_tail = last_event_sequence_from_database(db).await?;
+    if canonical_tail != Some(event.sequence) {
+        return Err(SessionDbError::InvalidCanonicalAppendSequence {
+            expected: event.sequence,
+            actual: canonical_tail.unwrap_or_default(),
+        });
+    }
+    for projection in MaterializedProjection::all() {
+        validate_materialized_projection_version(db, *projection).await?;
+        let checkpoint = projection_checkpoint_from_database(db, *projection).await?;
+        if checkpoint != Some(event.sequence) {
+            return Err(SessionDbError::ProjectionStale {
+                projection: projection.as_str(),
+                checkpoint,
+                expected: event.sequence,
+            });
+        }
+    }
+    let model_context = db
+        .select("model_context_projection_state")
+        .columns(&["schema_version", "last_event_seq"])
+        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+        .execute_first(db)
+        .await?
+        .ok_or(SessionDbError::ProjectionStale {
+            projection: "model_context",
+            checkpoint: None,
+            expected: event.sequence,
+        })?;
+    let schema_version = required_i64(&model_context, "schema_version").map(i64_to_u64)?;
+    if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
+        return Err(SessionDbError::ModelContextProjectionVersion {
+            actual: schema_version,
+            expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
+        });
+    }
+    let checkpoint = required_i64(&model_context, "last_event_seq").map(i64_to_u64)?;
+    if checkpoint != event.sequence {
+        return Err(SessionDbError::ModelContextProjectionStale {
+            checkpoint,
+            expected: event.sequence,
+        });
+    }
+    let occupancy_checkpoint =
+        projection_checkpoint_from_database(db, MaterializedProjection::RequestContextOccupancy)
+            .await?;
+    if occupancy_checkpoint != Some(event.sequence) {
+        return Err(SessionDbError::ProjectionStale {
+            projection: MaterializedProjection::RequestContextOccupancy.as_str(),
+            checkpoint: occupancy_checkpoint,
+            expected: event.sequence,
+        });
+    }
+    validate_context_occupancy_precondition(db, event).await
+}
+
 async fn insert_event(
     db: &dyn Database,
     event: &SessionEvent,
@@ -2116,14 +2355,28 @@ async fn project_model_context_event(
         .await?;
     match state.as_ref() {
         None if event.sequence == 0 => {}
-        None => return Ok(()),
+        None => {
+            return Err(SessionDbError::ProjectionStale {
+                projection: "model_context",
+                checkpoint: None,
+                expected: event.sequence.saturating_sub(1),
+            });
+        }
         Some(row) => {
             let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
-            let last_event_seq = required_i64(row, "last_event_seq").map(i64_to_u64)?;
-            if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)
-                || event.sequence != last_event_seq.saturating_add(1)
-            {
-                return Ok(());
+            if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
+                return Err(SessionDbError::ModelContextProjectionVersion {
+                    actual: schema_version,
+                    expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
+                });
+            }
+            let checkpoint = required_i64(row, "last_event_seq").map(i64_to_u64)?;
+            let expected = event.sequence.saturating_sub(1);
+            if event.sequence == 0 || checkpoint != expected {
+                return Err(SessionDbError::ModelContextProjectionStale {
+                    checkpoint,
+                    expected,
+                });
             }
         }
     }
@@ -2184,7 +2437,11 @@ async fn project_context_occupancy_event(
     let (context_epoch, current) = if let Some(row) = row.as_ref() {
         let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
         if schema_version != u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION) {
-            return Ok(());
+            return Err(SessionDbError::ProjectionIncompatible {
+                projection: MaterializedProjection::RequestContextOccupancy.as_str(),
+                actual: schema_version,
+                expected: u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION),
+            });
         }
         let context_epoch = required_i64(row, "context_epoch").map(i64_to_u64)?;
         let current = optional_string(row, "occupancy_json")
@@ -2223,6 +2480,8 @@ async fn project_context_occupancy_event(
         )
         .execute(db)
         .await?;
+    update_projection_checkpoint(db, MaterializedProjection::RequestContextOccupancy, event)
+        .await?;
     Ok(())
 }
 
@@ -2246,6 +2505,26 @@ async fn project_turn_receipt(db: &dyn Database, event: &SessionEvent) -> Sessio
         .value("work_id", receipt.work_id.to_string())
         .execute(db)
         .await?;
+    Ok(())
+}
+
+const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 6] = [
+    MaterializedProjection::SessionState,
+    MaterializedProjection::InputHistory,
+    MaterializedProjection::Transcript,
+    MaterializedProjection::ToolRuns,
+    MaterializedProjection::ArtifactReferences,
+    MaterializedProjection::RuntimeWork,
+];
+
+async fn project_materialized_event(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    project_event(db, event).await?;
+    for projection in BASE_MATERIALIZED_PROJECTIONS {
+        update_projection_checkpoint(db, projection, event).await?;
+    }
     Ok(())
 }
 
@@ -2703,21 +2982,13 @@ fn finalized_artifact_reference_from_row(
     })
 }
 
-async fn update_projection_checkpoints(
-    db: &dyn Database,
-    event: &SessionEvent,
-) -> SessionDbResult<()> {
-    for projection in MaterializedProjection::all() {
-        update_projection_checkpoint(db, projection.as_str(), event).await?;
-    }
-    Ok(())
-}
-
 async fn update_projection_checkpoint(
     db: &dyn Database,
-    projection_name: &str,
+    projection: MaterializedProjection,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
+    let projection_name = projection.as_str();
+    let projection_version = projection.schema_version();
     let existing = db
         .select("projection_checkpoints")
         .columns(&["projection_name"])
@@ -2728,23 +2999,22 @@ async fn update_projection_checkpoint(
     if existing.is_some() {
         db.update("projection_checkpoints")
             .value("last_event_seq", seq_to_value(event.sequence))
-            .value("projection_version", DatabaseValue::Int32(1))
+            .value(
+                "projection_version",
+                DatabaseValue::Int64(i64::from(projection_version)),
+            )
             .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
             .where_eq("projection_name", projection_name)
             .execute(db)
             .await?;
-    } else if projection_name == MaterializedProjection::ArtifactReferences.as_str()
-        && (!matches!(event.kind, SessionEventKind::SessionCreated { .. }) || event.sequence != 0)
-    {
-        // A missing checkpoint on a non-empty session means this projection predates the
-        // canonical history. Do not make a partial projection appear current; explicit reindex
-        // or migration must populate the historical prefix first.
-        return Ok(());
     } else {
         db.insert("projection_checkpoints")
             .value("projection_name", projection_name)
             .value("last_event_seq", seq_to_value(event.sequence))
-            .value("projection_version", DatabaseValue::Int32(1))
+            .value(
+                "projection_version",
+                DatabaseValue::Int64(i64::from(projection_version)),
+            )
             .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
             .execute(db)
             .await?;
@@ -3255,11 +3525,11 @@ mod tests {
             .await
             .expect("db");
         let source = vec![
-            message(id, 1, "old"),
-            local_marker(id, 3, 1),
-            message(id, 4, "retained"),
-            provider_marker(id, 6, 2),
-            message(id, 7, "after"),
+            message(id, 0, "old"),
+            local_marker(id, 1, 0),
+            message(id, 2, "retained"),
+            provider_marker(id, 3, 1),
+            message(id, 4, "after"),
         ];
         for item in &source {
             db.append_event(item).await.expect("append");
@@ -3409,15 +3679,19 @@ mod tests {
             .execute(db.database())
             .await
             .expect("insert corrupt event");
-        db.append_event(&event(
-            session_id,
-            3,
-            SessionEventKind::AssistantMessage {
-                text: "still readable".to_string(),
-            },
-        ))
+        insert_event(
+            db.database(),
+            &event(
+                session_id,
+                3,
+                SessionEventKind::AssistantMessage {
+                    text: "still readable".to_string(),
+                },
+            ),
+            None,
+        )
         .await
-        .expect("append second valid event");
+        .expect("insert second valid event");
 
         let history = db.all_events().await.expect("history should degrade");
         assert_eq!(history.len(), 2);
@@ -4181,6 +4455,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_model_context_projection_rejects_append_atomically() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "projected".to_string(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ))
+        .await
+        .expect("append projected event");
+        db.database()
+            .update("model_context_projection_state")
+            .value("last_event_seq", seq_to_value(1))
+            .execute(db.database())
+            .await
+            .expect("make model context checkpoint invalid");
+
+        let error = db
+            .append_event(&event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "must roll back".to_string(),
+                },
+            ))
+            .await
+            .expect_err("stale projection must reject append");
+        assert!(matches!(
+            error,
+            SessionDbError::ModelContextProjectionStale {
+                checkpoint: 1,
+                expected: 0
+            }
+        ));
+        assert_eq!(
+            db.last_event_sequence().await.expect("canonical tail"),
+            Some(0)
+        );
+        for projection in MaterializedProjection::all() {
+            assert_eq!(
+                db.materialized_projection_checkpoint(*projection)
+                    .await
+                    .expect("projection checkpoint"),
+                Some(0)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incompatible_context_occupancy_rejects_append_atomically() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("projection".to_string()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append initial event");
+        db.database()
+            .update("context_occupancy_projection")
+            .value("schema_version", DatabaseValue::Int64(3))
+            .execute(db.database())
+            .await
+            .expect("make occupancy schema incompatible");
+
+        let error = db
+            .append_event(&event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "must roll back".to_string(),
+                },
+            ))
+            .await
+            .expect_err("incompatible projection must reject append");
+        assert!(matches!(
+            error,
+            SessionDbError::ProjectionIncompatible {
+                projection: "context_occupancy",
+                actual: 3,
+                expected: 4
+            }
+        ));
+        assert_eq!(
+            db.last_event_sequence().await.expect("canonical tail"),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_turn_receipt_rolls_back_canonical_and_projection_updates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let admission = bcode_session_models::TurnAdmissionMetadata {
+            origin: Some(bcode_session_models::TurnOrigin {
+                producer: "test.producer".to_string(),
+                correlation_id: None,
+                display_label: None,
+            }),
+            idempotency_key: Some("same-key".to_string()),
+            ..bcode_session_models::TurnAdmissionMetadata::default()
+        };
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "accepted".to_string(),
+                admission: admission.clone(),
+            },
+        ))
+        .await
+        .expect("append accepted turn");
+
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "duplicate".to_string(),
+                admission,
+            },
+        ))
+        .await
+        .expect_err("duplicate receipt must roll back append");
+        assert_eq!(
+            db.last_event_sequence().await.expect("canonical tail"),
+            Some(0)
+        );
+        assert_eq!(db.input_history().await.expect("input history").len(), 1);
+        for projection in MaterializedProjection::all() {
+            assert_eq!(
+                db.materialized_projection_checkpoint(*projection)
+                    .await
+                    .expect("projection checkpoint"),
+                Some(0)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_compaction_does_not_advance_canonical_or_projected_state() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -4896,7 +5328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_session_does_not_mark_partial_artifact_projection_fresh() {
+    async fn legacy_session_rejects_append_before_creating_partial_artifact_projection() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
@@ -4926,28 +5358,34 @@ mod tests {
             .execute(db.database())
             .await
             .expect("insert legacy canonical event");
-        db.append_event(&event(
-            session_id,
-            1,
-            SessionEventKind::AssistantMessage {
-                text: "new tail".to_owned(),
-            },
-        ))
-        .await
-        .expect("append new tail");
-
         let error = db
-            .finalized_artifact_reference("artifact", "recording")
+            .append_event(&event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "new tail".to_owned(),
+                },
+            ))
             .await
-            .expect_err("partial projection must remain stale");
+            .expect_err("append must reject incomplete legacy projections");
         assert!(matches!(
             error,
             SessionDbError::ProjectionStale {
-                projection: "artifact_references",
+                projection: "model_context",
                 checkpoint: None,
-                expected: 1
+                expected: 0
             }
         ));
+        assert_eq!(
+            db.last_event_sequence().await.expect("canonical tail"),
+            Some(0)
+        );
+        assert_eq!(
+            db.materialized_projection_checkpoint(MaterializedProjection::ArtifactReferences)
+                .await
+                .expect("artifact checkpoint"),
+            None
+        );
     }
 
     #[tokio::test]
