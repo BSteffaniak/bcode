@@ -6588,7 +6588,11 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
     ensure_session_maintenance_daemon_compatibility().await?;
     let root = bcode_config::default_state_dir().join("sessions");
     let maintenance = bcode_session::lease::acquire_session_maintenance_guard(&root, session_id)?;
-    let write = bcode_session::lease::acquire_session_write_lock(&root, session_id)?;
+    let write = bcode_session::lease::acquire_maintenance_session_write_lock(
+        &maintenance,
+        &root,
+        session_id,
+    )?;
     let db = bcode_session::db::SessionDb::migrate_turso_in_root(
         session_id,
         &root,

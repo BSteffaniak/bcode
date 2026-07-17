@@ -177,11 +177,15 @@ impl Drop for SessionMaintenanceGuard {
 #[derive(Debug)]
 pub struct SessionWriteGuard {
     file: File,
+    coordinator: Option<File>,
 }
 
 impl Drop for SessionWriteGuard {
     fn drop(&mut self) {
         let _ = unlock_file(&self.file);
+        if let Some(coordinator) = &self.coordinator {
+            let _ = unlock_file(coordinator);
+        }
     }
 }
 
@@ -347,13 +351,40 @@ pub fn acquire_session_write_lock(
     root: &Path,
     session_id: SessionId,
 ) -> Result<SessionWriteGuard, SessionLeaseError> {
+    let coordinator_path = session_lock_path(root, session_id);
+    let coordinator = open_lock_file(&coordinator_path)?;
+    lock_file_shared(&coordinator).map_err(|source| SessionLeaseError::Io {
+        path: coordinator_path,
+        source,
+    })?;
+    acquire_session_write_lock_inner(root, session_id, Some(coordinator))
+}
+
+/// Acquire the session write lock while exclusive maintenance coordination is already held.
+///
+/// # Errors
+///
+/// Returns an error if the write lock file cannot be opened or locked.
+pub fn acquire_maintenance_session_write_lock(
+    _maintenance: &SessionMaintenanceGuard,
+    root: &Path,
+    session_id: SessionId,
+) -> Result<SessionWriteGuard, SessionLeaseError> {
+    acquire_session_write_lock_inner(root, session_id, None)
+}
+
+fn acquire_session_write_lock_inner(
+    root: &Path,
+    session_id: SessionId,
+    coordinator: Option<File>,
+) -> Result<SessionWriteGuard, SessionLeaseError> {
     let lock_path = session_write_lock_path(root, session_id);
     let file = open_lock_file(&lock_path)?;
     lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
         path: lock_path,
         source,
     })?;
-    Ok(SessionWriteGuard { file })
+    Ok(SessionWriteGuard { file, coordinator })
 }
 
 /// Acquire exclusive short-lived access to the global catalog database.
@@ -551,6 +582,30 @@ const fn process_is_alive(_pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+fn lock_file_shared(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    const LOCK_SH: i32 = 1;
+
+    // SAFETY: `file.as_raw_fd()` is a valid descriptor for the lifetime of this call, and flock
+    // does not retain the pointer or require additional invariants.
+    let result = unsafe { flock(file.as_raw_fd(), LOCK_SH) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file_shared(_file: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        SessionLeaseError::Unsupported.to_string(),
+    ))
+}
+
+#[cfg(unix)]
 fn lock_file_exclusive(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -700,6 +755,117 @@ mod tests {
         drop(lease);
         acquire_session_lease(temp_dir.path(), session_id, &context("next", 8))
             .expect("new epoch may claim after runtime lease release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_lock_helper() {
+        let Ok(action) = std::env::var("BCODE_SESSION_LOCK_TEST_ACTION") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os("BCODE_SESSION_LOCK_TEST_ROOT").expect("root"));
+        let session_id = std::env::var("BCODE_SESSION_LOCK_TEST_ID")
+            .expect("session id")
+            .parse::<SessionId>()
+            .expect("valid session id");
+        let ready =
+            PathBuf::from(std::env::var_os("BCODE_SESSION_LOCK_TEST_READY").expect("ready"));
+        let acquired =
+            PathBuf::from(std::env::var_os("BCODE_SESSION_LOCK_TEST_ACQUIRED").expect("acquired"));
+        fs::write(&ready, b"ready").expect("write ready marker");
+        match action.as_str() {
+            "lease" => {
+                let _guard = acquire_session_lease(&root, session_id, &context("subprocess", 7))
+                    .expect("acquire subprocess lease");
+                fs::write(acquired, b"acquired").expect("write acquired marker");
+            }
+            "write" => {
+                let _guard = acquire_session_write_lock(&root, session_id)
+                    .expect("acquire subprocess write lock");
+                fs::write(acquired, b"acquired").expect("write acquired marker");
+            }
+            other => panic!("unknown subprocess lock action {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_subprocess_blocked_by_maintenance(action: &str) {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let maintenance = acquire_session_maintenance_guard(temp_dir.path(), session_id)
+            .expect("maintenance guard");
+        let ready = temp_dir.path().join(format!("{action}-ready"));
+        let acquired = temp_dir.path().join(format!("{action}-acquired"));
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "lease::tests::subprocess_lock_helper",
+                "--nocapture",
+            ])
+            .env("BCODE_SESSION_LOCK_TEST_ACTION", action)
+            .env("BCODE_SESSION_LOCK_TEST_ROOT", temp_dir.path())
+            .env("BCODE_SESSION_LOCK_TEST_ID", session_id.to_string())
+            .env("BCODE_SESSION_LOCK_TEST_READY", &ready)
+            .env("BCODE_SESSION_LOCK_TEST_ACQUIRED", &acquired)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn lock subprocess");
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "subprocess did not become ready"
+            );
+            assert!(
+                child.try_wait().expect("inspect subprocess").is_none(),
+                "subprocess exited before attempting the lock"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(150));
+        assert!(!acquired.exists(), "subprocess bypassed maintenance lock");
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect blocked subprocess")
+                .is_none(),
+            "subprocess exited while maintenance still held the lock"
+        );
+        drop(maintenance);
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for subprocess") {
+                assert!(status.success(), "subprocess lock helper failed: {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < exit_deadline,
+                "subprocess remained blocked after release"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            acquired.exists(),
+            "subprocess did not acquire released lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_blocks_session_lease_in_another_process() {
+        assert_subprocess_blocked_by_maintenance("lease");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_blocks_session_write_lock_in_another_process() {
+        assert_subprocess_blocked_by_maintenance("write");
     }
 
     #[test]

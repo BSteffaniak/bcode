@@ -145,7 +145,7 @@ pub async fn repair_session(
         return Ok(report);
     }
 
-    let _maintenance = if options.dry_run {
+    let maintenance = if options.dry_run {
         None
     } else {
         match lease::acquire_session_maintenance_guard(root, session_id) {
@@ -158,11 +158,12 @@ pub async fn repair_session(
             Err(error) => return Err(error.into()),
         }
     };
-    let _write = if options.dry_run {
-        None
-    } else {
-        Some(lease::acquire_session_write_lock(root, session_id)?)
-    };
+    let _write = maintenance
+        .as_ref()
+        .map(|maintenance| {
+            lease::acquire_maintenance_session_write_lock(maintenance, root, session_id)
+        })
+        .transpose()?;
 
     let initial_error = match validate_session_db(root, session_id).await {
         Ok(()) => {

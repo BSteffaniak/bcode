@@ -32,8 +32,12 @@ Health, doctor, validation, and semantic audit paths use the existing non-migrat
 reindex also requires borrowed maintenance and write guards in its API, preventing an uncoordinated
 caller from invoking it accidentally.
 
-Lock acquisition order for mutating maintenance is always session maintenance coordinator, session
-write lock, database connection/transaction. Never acquire these in reverse order.
+Lock acquisition order for ordinary mutation is the shared session maintenance coordinator, session
+write lock, then database connection/transaction. Mutating maintenance first holds the coordinator
+exclusively, then obtains its capability-bound write lock, then opens the database/transaction.
+Never acquire these in reverse order. The shared coordinator lock is retained with every ordinary
+write guard, so exclusive maintenance waits for in-flight writes and blocks new write critical
+sections as well as new session leases.
 
 ## Durable storage writer contract
 

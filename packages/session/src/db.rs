@@ -3621,7 +3621,8 @@ mod tests {
         let maintenance = crate::lease::acquire_session_maintenance_guard(root, session_id)
             .expect("maintenance guard");
         let write =
-            crate::lease::acquire_session_write_lock(root, session_id).expect("write guard");
+            crate::lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)
+                .expect("write guard");
         db.reindex_model_context(&maintenance, &write)
             .await
             .expect("explicit reindex")
@@ -4556,8 +4557,12 @@ mod tests {
                 let maintenance =
                     crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
                         .expect("maintenance guard");
-                let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
-                    .expect("write guard");
+                let write = crate::lease::acquire_maintenance_session_write_lock(
+                    &maintenance,
+                    temp_dir.path(),
+                    session_id,
+                )
+                .expect("write guard");
                 db.reindex_model_context(&maintenance, &write)
                     .await
                     .expect_err("gap must reject reindex")
@@ -4786,8 +4791,12 @@ mod tests {
         let maintenance =
             crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
                 .expect("maintenance guard");
-        let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
-            .expect("write guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
         let migrated =
             SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
                 .await
@@ -5306,6 +5315,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn explicit_legacy_model_context_migration_is_atomic() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -5370,8 +5380,12 @@ mod tests {
         let maintenance =
             crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
                 .expect("maintenance guard");
-        let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
-            .expect("write guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
         let migrated =
             SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
                 .await
@@ -5462,8 +5476,12 @@ mod tests {
         let maintenance =
             crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
                 .expect("maintenance guard");
-        let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
-            .expect("write guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
         assert!(matches!(
             SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
                 .await
@@ -5745,8 +5763,12 @@ mod tests {
         let maintenance =
             crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
                 .expect("maintenance guard");
-        let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
-            .expect("write guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
         let db =
             SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
                 .await
