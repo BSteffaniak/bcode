@@ -6432,7 +6432,9 @@ async fn audit_semantic_result_migration(
     root: Option<PathBuf>,
     json: bool,
 ) -> Result<(), CliError> {
-    let root = root.unwrap_or_else(|| bcode_config::default_state_dir().join("sessions"));
+    let root = root.unwrap_or_else(|| {
+        bcode_session::current_session_storage_root(&bcode_config::default_state_dir())
+    });
     let report = bcode_session::semantic_migration::audit_semantic_result_migration(&root).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -6563,30 +6565,8 @@ const fn repair_cli_output(json: bool) -> SessionRepairCliOutput {
     }
 }
 
-async fn ensure_session_maintenance_daemon_compatibility() -> Result<(), CliError> {
-    if let Some((_, record)) = bcode_daemon_lifecycle::incompatible_storage_writer_records(
-        &bcode_config::default_state_dir(),
-        bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-    )
-    .await
-    .into_iter()
-    .next()
-    {
-        return Err(CliError::IncompatibleDaemonStorage(format!(
-            "namespace={}, pid={:?}, build={}, writer_epoch={:?}, endpoint={:?}; stop this daemon before retrying maintenance",
-            record.namespace,
-            record.pid,
-            record.build_fingerprint,
-            record.storage_writer_epoch,
-            record.endpoint
-        )));
-    }
-    Ok(())
-}
-
 async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliError> {
-    ensure_session_maintenance_daemon_compatibility().await?;
-    let root = bcode_config::default_state_dir().join("sessions");
+    let root = bcode_session::current_session_storage_root(&bcode_config::default_state_dir());
     let maintenance = bcode_session::lease::acquire_session_maintenance_guard(&root, session_id)?;
     let write = bcode_session::lease::acquire_maintenance_session_write_lock(
         &maintenance,
@@ -6608,7 +6588,7 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
 }
 
 async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<(), CliError> {
-    let root = bcode_config::default_state_dir().join("sessions");
+    let root = bcode_session::current_session_storage_root(&bcode_config::default_state_dir());
     let dry_run = matches!(options.mode, SessionRepairCliMode::DryRun);
     let mut reports = Vec::new();
     match options.target {
@@ -6653,7 +6633,6 @@ async fn repair_session_report(
     if dry_run {
         Ok(bcode_session::repair::doctor_session(root, session_id).await?)
     } else {
-        ensure_session_maintenance_daemon_compatibility().await?;
         Ok(bcode_session::repair::repair_session(
             root,
             session_id,

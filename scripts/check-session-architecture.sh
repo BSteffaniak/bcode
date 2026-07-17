@@ -3,6 +3,20 @@ set -euo pipefail
 
 violations=0
 
+if rg -n 'incompatible_storage_writer_records|ensure_daemon_storage_compatibility' packages/server/src/lib.rs \
+  >/tmp/bcode-global-daemon-storage-fence-violations.txt; then
+  echo "Session storage-domain violation: daemon startup must not globally fence other fingerprints or writer epochs." >&2
+  cat /tmp/bcode-global-daemon-storage-fence-violations.txt >&2
+  violations=1
+fi
+
+if rg -n 'default_state_dir\(\)\.join\("sessions"\)' packages/server/src packages/cli/src --glob '*.rs' \
+  >/tmp/bcode-legacy-session-root-mutation-violations.txt; then
+  echo "Session storage-domain violation: current server/CLI paths must use the writer-epoch storage root." >&2
+  cat /tmp/bcode-legacy-session-root-mutation-violations.txt >&2
+  violations=1
+fi
+
 if ! scripts/check-no-normal-full-scans.sh; then
   violations=1
 fi
@@ -143,14 +157,13 @@ if ! rg -q 'pub async fn reindex_model_context\(' packages/session/src/db.rs \
   violations=1
 fi
 
-if ! rg -q 'ensure_session_maintenance_daemon_compatibility\(\)\.await' packages/cli/src/lib.rs; then
-  echo "Session maintenance fencing violation: CLI mutations must reject incompatible live daemons." >&2
+if rg -q 'ensure_session_maintenance_daemon_compatibility\(\)\.await' packages/cli/src/lib.rs; then
+  echo "Session maintenance domain violation: target maintenance must not globally reject unrelated daemon generations." >&2
   violations=1
 fi
 
-if ! rg -q 'storage_writer_epoch: Some\(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/server/src/lib.rs \
-  || ! rg -q 'ensure_daemon_storage_compatibility\(\)\.await' packages/server/src/lib.rs; then
-  echo "Daemon storage fencing violation: startup records and startup checks must carry writer epoch." >&2
+if ! rg -q 'storage_writer_epoch: Some\(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/server/src/lib.rs; then
+  echo "Daemon storage identity violation: startup records must advertise the current writer epoch." >&2
   violations=1
 fi
 

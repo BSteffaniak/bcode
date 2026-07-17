@@ -161,7 +161,7 @@ pub struct RunOptions {
 
 /// Run the isolated one-time cleanup command.
 pub async fn run(options: RunOptions) -> Result<(), CliError> {
-    let root = bcode_config::default_state_dir().join("sessions");
+    let root = bcode_session::current_session_storage_root(&bcode_config::default_state_dir());
     let ids = match options.target {
         RunTarget::All => discover_session_ids(&root)?,
         RunTarget::Session(session_id) => vec![session_id],

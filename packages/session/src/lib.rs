@@ -14,6 +14,25 @@
 //! Normal model-context reads return that marker plus later semantic events without replaying or
 //! repairing the complete event log.
 
+use std::path::{Path, PathBuf};
+
+/// Return the session-storage root for a specific durable writer epoch.
+///
+/// Storage is shared by all builds implementing the same writer contract and isolated from
+/// incompatible or legacy writers.
+#[must_use]
+pub fn session_storage_root(state_dir: &Path, writer_epoch: u32) -> PathBuf {
+    state_dir
+        .join("session-storage")
+        .join(format!("writer-epoch-{writer_epoch}"))
+}
+
+/// Return the session-storage root owned by this build's writer contract.
+#[must_use]
+pub fn current_session_storage_root(state_dir: &Path) -> PathBuf {
+    session_storage_root(state_dir, lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+}
+
 mod actor;
 pub mod db;
 pub mod lease;
@@ -40,7 +59,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -5424,6 +5442,30 @@ mod tests {
         )));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn writer_epochs_have_stable_isolated_storage_roots() {
+        let state_dir = std::path::Path::new("state");
+        assert_eq!(
+            crate::session_storage_root(state_dir, 1),
+            state_dir.join("session-storage/writer-epoch-1")
+        );
+        assert_eq!(
+            crate::session_storage_root(state_dir, 2),
+            state_dir.join("session-storage/writer-epoch-2")
+        );
+        assert_ne!(
+            crate::session_storage_root(state_dir, 1),
+            crate::session_storage_root(state_dir, 2)
+        );
+        assert_eq!(
+            crate::current_session_storage_root(state_dir),
+            crate::session_storage_root(
+                state_dir,
+                crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH
+            )
+        );
     }
 
     #[tokio::test]

@@ -19,12 +19,27 @@ fn main() {
     println!("cargo:rerun-if-changed=../../plugins");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
+    emit_repository_rerun_paths();
 
     let input = git_fingerprint_input().unwrap_or_else(|| FALLBACK_INPUT.to_string());
     println!(
         "cargo:rustc-env=BCODE_BUILD_FINGERPRINT={}",
         short_sha256(&input)
     );
+}
+
+fn emit_repository_rerun_paths() {
+    let Some(files) = git_output(["ls-files"]) else {
+        return;
+    };
+    for path in files.lines().filter(|path| {
+        matches!(*path, "Cargo.toml" | "Cargo.lock")
+            || path.starts_with("catalog/")
+            || path.starts_with("packages/")
+            || path.starts_with("plugins/")
+    }) {
+        println!("cargo:rerun-if-changed=../../{path}");
+    }
 }
 
 fn git_fingerprint_input() -> Option<String> {
