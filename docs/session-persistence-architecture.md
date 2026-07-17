@@ -69,6 +69,12 @@ record with no epoch—blocks startup with an actionable error containing namesp
 writer epoch, and endpoint. Stale records do not block startup. This is transition fencing, not a
 replacement for per-session leases or the durable database contract.
 
+Use `bcode server retire-incompatible` during the initial rollout to enumerate identity-verified
+incompatible daemons, revalidate each responding instance, request graceful `ServerStop`, wait
+boundedly for that exact instance to disappear, and remove its registry record only when the
+instance token still matches. The command refuses endpoint reuse or identity drift rather than
+stopping an unverified process.
+
 The initial rollout of this contract must explicitly retire pre-contract daemon processes before
 upgrading session writer epochs, because already-running legacy binaries cannot retroactively honor
 the durable check.

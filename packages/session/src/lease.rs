@@ -280,6 +280,43 @@ pub fn acquire_session_maintenance_guard(
     Ok(SessionMaintenanceGuard { coordinator })
 }
 
+/// Atomically replace exclusive maintenance ownership with a compatible session lease.
+///
+/// The maintenance coordinator remains locked while owner metadata is written, so another writer
+/// cannot claim the session between migration completion and runtime ownership registration.
+///
+/// # Errors
+///
+/// Returns an error if writer identity is missing or owner metadata cannot be written.
+pub fn transition_session_maintenance_to_lease(
+    maintenance: SessionMaintenanceGuard,
+    root: &Path,
+    session_id: SessionId,
+    context: &SessionLeaseOwnerContext,
+) -> Result<SessionLeaseGuard, SessionLeaseError> {
+    if context.storage_writer_epoch.is_none() {
+        return Err(SessionLeaseError::MissingStorageWriterEpoch { session_id });
+    }
+    let access_dir = session_owner_dir(root, session_id);
+    fs::create_dir_all(&access_dir).map_err(|source| SessionLeaseError::Io {
+        path: access_dir.clone(),
+        source,
+    })?;
+    prune_dead_owner_records(&access_dir)?;
+    if let Some(owner) = first_owner(&access_dir)? {
+        return Err(SessionLeaseError::OwnedByOtherDaemon {
+            session_id,
+            owner_summary: format!(": {}", format_owner(&owner)),
+            owner: Some(Box::new(owner)),
+        });
+    }
+    let owner = SessionLeaseOwner::new(session_id, context);
+    let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
+    write_owner_metadata(&owner_path, &owner)?;
+    drop(maintenance);
+    Ok(SessionLeaseGuard { owner_path, owner })
+}
+
 fn first_owner(access_dir: &Path) -> Result<Option<SessionLeaseOwner>, SessionLeaseError> {
     for entry in fs::read_dir(access_dir).map_err(|source| SessionLeaseError::Io {
         path: access_dir.to_path_buf(),
@@ -639,6 +676,30 @@ mod tests {
                 .expect_err("maintenance must refuse live owner"),
             SessionLeaseError::OwnedByOtherDaemon { .. }
         ));
+    }
+
+    #[test]
+    fn maintenance_to_lease_transition_prevents_incompatible_handoff_race() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let maintenance = acquire_session_maintenance_guard(temp_dir.path(), session_id)
+            .expect("maintenance guard");
+        let lease = transition_session_maintenance_to_lease(
+            maintenance,
+            temp_dir.path(),
+            session_id,
+            &context("current", 7),
+        )
+        .expect("transition to runtime lease");
+        assert_eq!(lease.owner().storage_writer_epoch, Some(7));
+        assert!(matches!(
+            acquire_session_lease(temp_dir.path(), session_id, &context("incompatible", 8))
+                .expect_err("incompatible writer must not claim transitioned session"),
+            SessionLeaseError::OwnedByOtherDaemon { .. }
+        ));
+        drop(lease);
+        acquire_session_lease(temp_dir.path(), session_id, &context("next", 8))
+            .expect("new epoch may claim after runtime lease release");
     }
 
     #[test]

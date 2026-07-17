@@ -50,6 +50,8 @@ const SESSION_CLI_PAGE_LIMIT: usize = 500;
 pub enum CliError {
     #[error("client error: {0}")]
     Client(#[from] ClientError),
+    #[error("daemon lifecycle error: {0}")]
+    DaemonLifecycle(#[from] bcode_daemon_lifecycle::DaemonLifecycleError),
     #[error("daemon start error: {0}")]
     DaemonStart(#[from] bcode_daemon_lifecycle::DaemonStartError),
     #[error("config error: {0}")]
@@ -812,6 +814,8 @@ enum ServerCommand {
     Stop,
     Cleanup,
     StopAll,
+    /// Gracefully stop every live daemon whose storage writer epoch is incompatible.
+    RetireIncompatible,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1334,6 +1338,7 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         ServerCommand::Stop => server_stop().await?,
         ServerCommand::Cleanup => server_cleanup(false).await?,
         ServerCommand::StopAll => server_cleanup(true).await?,
+        ServerCommand::RetireIncompatible => retire_incompatible_daemons().await?,
     }
     Ok(())
 }
@@ -6145,7 +6150,10 @@ fn daemon_status_matches(
     record: &bcode_daemon_lifecycle::DaemonRecord,
     status: &bcode_ipc::DaemonStatus,
 ) -> bool {
-    status.namespace == record.namespace && status.instance_id == record.instance_id
+    status.namespace == record.namespace
+        && status.instance_id == record.instance_id
+        && status.build_fingerprint == record.build_fingerprint
+        && status.storage_writer_epoch == record.storage_writer_epoch
 }
 
 fn remove_stale_socket(record: &bcode_daemon_lifecycle::DaemonRecord) {
@@ -6173,6 +6181,61 @@ fn is_bcode_socket_path(path: &Path) -> bool {
 #[cfg(unix)]
 fn unix_socket_has_listener(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+async fn retire_incompatible_daemons() -> Result<(), CliError> {
+    let state_dir = bcode_config::default_state_dir();
+    let incompatible = bcode_daemon_lifecycle::incompatible_storage_writer_records(
+        &state_dir,
+        bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+    )
+    .await;
+    if incompatible.is_empty() {
+        println!("No incompatible live Bcode daemons found");
+        return Ok(());
+    }
+    for (record_path, record) in incompatible {
+        let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
+            CliError::IncompatibleDaemonStorage(format!(
+                "cannot retire namespace {}: unsupported endpoint {:?}",
+                record.namespace, record.endpoint
+            ))
+        })?;
+        let client = BcodeClient::new(endpoint)
+            .with_request_timeout(Duration::from_secs(2))
+            .with_daemon_availability(DaemonAvailability::RequireRunning);
+        let status = client.server_status().await?;
+        if !daemon_status_matches(&record, &status.daemon) {
+            return Err(CliError::IncompatibleDaemonStorage(format!(
+                "refusing to stop namespace {}: registry instance no longer matches the responding daemon",
+                record.namespace
+            )));
+        }
+        client.server_stop().await?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let still_live = bcode_daemon_lifecycle::live_records(&state_dir)
+                .await
+                .into_iter()
+                .any(|(_, live)| live.instance_id == record.instance_id);
+            if !still_live {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(CliError::IncompatibleDaemonStorage(format!(
+                    "daemon {} ({}) did not stop within 5 seconds",
+                    record.namespace, record.instance_id
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        bcode_daemon_lifecycle::remove_record_if_instance(&record_path, &record.instance_id)?;
+        println!(
+            "Retired incompatible daemon {} (pid {:?}, build {}, writer epoch {:?})",
+            record.namespace, record.pid, record.build_fingerprint, record.storage_writer_epoch
+        );
+    }
+    Ok(())
 }
 
 async fn server_stop() -> Result<(), CliError> {
@@ -6524,16 +6587,16 @@ async fn ensure_session_maintenance_daemon_compatibility() -> Result<(), CliErro
 async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliError> {
     ensure_session_maintenance_daemon_compatibility().await?;
     let root = bcode_config::default_state_dir().join("sessions");
-    let _maintenance = bcode_session::lease::acquire_session_maintenance_guard(&root, session_id)?;
-    let _write = bcode_session::lease::acquire_session_write_lock(&root, session_id)?;
+    let maintenance = bcode_session::lease::acquire_session_maintenance_guard(&root, session_id)?;
+    let write = bcode_session::lease::acquire_session_write_lock(&root, session_id)?;
     let db = bcode_session::db::SessionDb::migrate_turso_in_root(
         session_id,
         &root,
-        &_maintenance,
-        &_write,
+        &maintenance,
+        &write,
     )
     .await?;
-    let event_count = db.reindex_model_context(&_maintenance, &_write).await?;
+    let event_count = db.reindex_model_context(&maintenance, &write).await?;
     println!(
         "Reindexed model context for session {session_id} from {event_count} canonical events"
     );
@@ -7596,6 +7659,62 @@ fn print_model_usage_event(
 #[cfg(test)]
 mod web_command_tests {
     use super::*;
+
+    #[test]
+    fn retire_incompatible_server_command_parses() {
+        let cli = Cli::try_parse_from(["bcode", "server", "retire-incompatible"])
+            .expect("retirement command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Server {
+                command: ServerCommand::RetireIncompatible
+            })
+        ));
+    }
+
+    #[test]
+    fn daemon_status_match_requires_full_storage_identity() {
+        let record = bcode_daemon_lifecycle::DaemonRecord {
+            schema_version: bcode_daemon_lifecycle::DAEMON_RECORD_SCHEMA_VERSION,
+            namespace: "namespace".to_string(),
+            protocol_version: 9,
+            build_fingerprint: "build".to_string(),
+            storage_writer_epoch: Some(2),
+            pid: Some(1),
+            endpoint: bcode_daemon_lifecycle::DaemonEndpointRecord::Unknown {
+                debug: "test".to_string(),
+            },
+            log_path: PathBuf::from("test.log"),
+            executable_path: None,
+            started_at_unix_ms: 0,
+            last_seen_unix_ms: 0,
+            instance_id: "instance".to_string(),
+        };
+        let matching = bcode_ipc::DaemonStatus {
+            namespace: "namespace".to_string(),
+            protocol_version: 9,
+            build_fingerprint: "build".to_string(),
+            storage_writer_epoch: Some(2),
+            pid: Some(1),
+            instance_id: "instance".to_string(),
+            started_at_unix_ms: 0,
+        };
+        assert!(daemon_status_matches(&record, &matching));
+        assert!(!daemon_status_matches(
+            &record,
+            &bcode_ipc::DaemonStatus {
+                instance_id: "reused-endpoint".to_string(),
+                ..matching.clone()
+            }
+        ));
+        assert!(!daemon_status_matches(
+            &record,
+            &bcode_ipc::DaemonStatus {
+                storage_writer_epoch: Some(1),
+                ..matching
+            }
+        ));
+    }
 
     #[test]
     fn web_command_defaults_to_loopback_without_external_opt_in() {
