@@ -187,6 +187,63 @@ impl ChatLoopState {
         }
     }
 
+    fn observe_finalized_artifact(
+        &mut self,
+        session_id: bcode_session_models::SessionId,
+        sequence: u64,
+        event: &bcode_session_models::SessionEventKind,
+    ) {
+        let bcode_session_models::SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            semantic_result: Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }),
+            ..
+        } = event
+        else {
+            return;
+        };
+        for reference in &artifact.refs {
+            let Some(committed_bytes) = reference.byte_len else {
+                continue;
+            };
+            let availability = reference
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("availability"))
+                .and_then(serde_json::Value::as_str);
+            if matches!(
+                availability,
+                Some("missing" | "incomplete" | "corrupt" | "evicted" | "unavailable")
+            ) {
+                continue;
+            }
+            let key = (
+                session_id,
+                tool_call_id.clone(),
+                artifact.artifact_id.clone(),
+                reference.key.clone(),
+            );
+            let state = self.artifact_fetches.entry(key.clone()).or_default();
+            if state
+                .target
+                .as_ref()
+                .is_some_and(|target| sequence < target.revision)
+            {
+                continue;
+            }
+            state.terminal_error = None;
+            state.target = Some(ActiveArtifactTarget {
+                producer_plugin_id: artifact.producer_plugin_id.clone(),
+                schema: artifact.schema.clone(),
+                schema_version: artifact.schema_version,
+                content_type: reference.content_type.clone(),
+                committed_bytes,
+                revision: sequence,
+                finalized: true,
+            });
+            self.schedule_active_artifact_fetch(session_id, &key);
+        }
+    }
+
     fn observe_active_artifact(
         &mut self,
         session_id: bcode_session_models::SessionId,
@@ -1820,6 +1877,7 @@ async fn absorb_bcode_event(
 ) -> bool {
     match event {
         BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
+            loop_state.observe_finalized_artifact(event.session_id, event.sequence, &event.kind);
             if let SessionEventKind::AgentChanged { agent_id } = &event.kind {
                 chat.agents
                     .apply_agent_to_app(&mut chat.app, agent_id.clone());

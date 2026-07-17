@@ -76,7 +76,26 @@ impl CanonicalToolVisual {
     /// Build a canonical plugin visual from a final semantic artifact.
     #[must_use]
     pub fn from_artifact(artifact: &ToolArtifact) -> Self {
-        let mut payload = artifact.metadata.clone();
+        let mut payload = if artifact.metadata.is_object() {
+            artifact.metadata.clone()
+        } else {
+            serde_json::json!({})
+        };
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "_bcode_artifact".to_owned(),
+                serde_json::json!({
+                    "artifact_id": artifact.artifact_id,
+                    "tool_call_id": artifact.tool_call_id,
+                }),
+            );
+            if let Some(tool_call_id) = &artifact.tool_call_id {
+                object.insert(
+                    "_bcode_runtime".to_owned(),
+                    serde_json::json!({"live_state_key": tool_call_id}),
+                );
+            }
+        }
         if let Some(title) = &artifact.title
             && let Some(object) = payload.as_object_mut()
         {

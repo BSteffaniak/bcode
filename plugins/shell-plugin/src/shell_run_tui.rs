@@ -209,6 +209,15 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         if kind == "bcode.tool.request.shell.run" {
             return self.shell_request_rows(payload, width, context);
         }
+        if kind == "bcode.shell.run"
+            && let Some(key) = payload
+                .get("_bcode_runtime")
+                .and_then(|runtime| runtime.get("live_state_key"))
+                .and_then(serde_json::Value::as_str)
+            && let Some(replay) = self.live_replay_data(key)
+        {
+            return Self::shell_result_rows(payload, width, context, &replay, None);
+        }
         let mode = payload
             .get("mode")
             .and_then(serde_json::Value::as_str)
@@ -267,9 +276,39 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 None,
             ),
         };
+        Self::shell_result_rows(payload, width, context, &replay, replay_error)
+    }
+}
 
+impl ShellRunTuiVisualAdapter {
+    fn live_replay_data(&self, key: &str) -> Option<TerminalReplayData> {
+        self.live_replays
+            .lock()
+            .ok()?
+            .get(key)
+            .map(|replay| TerminalReplayData {
+                output: String::from_utf8_lossy(&replay.output).into_owned(),
+                frames: Some(replay.frames.clone()),
+                columns: replay.columns,
+                rows: replay.rows,
+                initial_columns: replay.initial_columns,
+                initial_rows: replay.initial_rows,
+                exit_code: replay.exit_code,
+                signal: replay.signal.clone(),
+                timed_out: replay.timed_out,
+                cancelled: replay.cancelled,
+            })
+    }
+
+    fn shell_result_rows(
+        payload: &serde_json::Value,
+        width: u16,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        replay: &TerminalReplayData,
+        replay_error: Option<String>,
+    ) -> Vec<Line> {
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
-        lines.extend(shell_replay_status_rows(&replay));
+        lines.extend(shell_replay_status_rows(replay));
         if let Some(error) = replay_error {
             lines.push(Line::from_spans(vec![Span::styled(
                 format!("  durable shell recording unavailable: {error}; inline output was not substituted"),
@@ -298,12 +337,10 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             show_status: false,
             sizing: TerminalViewerSizing::Compact,
         };
-        append_terminal_replay_rows(&mut lines, &replay, input, width);
+        append_terminal_replay_rows(&mut lines, replay, input, width);
         lines
     }
-}
 
-impl ShellRunTuiVisualAdapter {
     fn shell_request_rows(
         &self,
         payload: &serde_json::Value,
@@ -1142,7 +1179,7 @@ mod tests {
                 total_bytes: u64::try_from(bytes.len()).expect("length"),
                 revision: 3,
                 finalized: true,
-                bytes,
+                bytes: bytes.clone(),
             },
         );
         assert!(duplicate.is_err(), "duplicate ranges must fail closed");
@@ -1176,6 +1213,40 @@ mod tests {
             rows.len() >= 4,
             "live sizing should preserve terminal height"
         );
+
+        let final_payload = serde_json::json!({
+            "command": "printf first",
+            "mode": "terminal",
+            "output_tail": "must-not-be-rendered-again",
+            "_bcode_runtime": {"live_state_key": "call"},
+            "_artifact_refs": [{
+                "key": SHELL_RECORDING_REF_KEY,
+                "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                "storage_uri": "file:///definitely/missing/recording.bcsr",
+                "byte_len": bytes.len(),
+                "metadata": {"availability": "complete", "complete": true}
+            }]
+        });
+        let final_rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &adapter,
+            "bcode.shell.run",
+            &final_payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            ),
+        );
+        let final_rendered = final_rows
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(final_rendered.contains("first"), "{final_rendered}");
+        assert!(final_rendered.contains("second"), "{final_rendered}");
+        assert!(final_rendered.contains("exit code 0"), "{final_rendered}");
+        assert!(!final_rendered.contains("must-not-be-rendered-again"));
+        assert!(!final_rendered.contains("recording unavailable"));
     }
 
     #[test]
