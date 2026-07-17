@@ -1219,6 +1219,30 @@ mod tests {
     }
 
     #[test]
+    fn complete_reader_preserves_unknown_frames_for_forward_compatibility() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("unknown-frame.bcsr");
+        let mut writer = ShellRecordingWriter::create(&path, 80, 24).expect("writer");
+        writer.write_output(1, b"before").expect("output");
+        writer
+            .write_frame(99, 2, b"future-payload")
+            .expect("unknown frame");
+        writer
+            .finish(3, Some(0), None, false, false)
+            .expect("finish");
+
+        let (_, frames) = read_recording(&path).expect("recording with unknown frame");
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            ShellRecordingFrame::Unknown {
+                kind: 99,
+                offset_micros: 2,
+                payload,
+            } if payload == b"future-payload"
+        )));
+    }
+
+    #[test]
     fn legacy_version_one_recording_remains_readable() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("legacy.bcsr");
