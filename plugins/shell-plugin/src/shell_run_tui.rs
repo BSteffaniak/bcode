@@ -15,6 +15,7 @@ use bmux_terminal_grid::{
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use bmux_tui::style::Modifier;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
 use std::sync::Mutex;
 
@@ -224,57 +225,36 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             .unwrap_or("unknown");
         let payload_columns = payload_u16(payload, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
         let payload_rows = payload_u16(payload, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
-        let (replay, replay_error) = match terminal_replay_output(payload) {
-            TerminalReplayOutput::Ready(replay) => (replay, None),
-            TerminalReplayOutput::Unavailable(message) => (
-                TerminalReplayData {
-                    output: String::new(),
-                    frames: None,
-                    columns: payload_columns,
-                    rows: payload_rows,
-                    initial_columns: payload_columns,
-                    initial_rows: payload_rows,
-                    exit_code: payload_exit_code(payload),
-                    signal: None,
-                    timed_out: payload
-                        .get("timed_out")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                    cancelled: payload
-                        .get("cancelled")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                },
-                Some(message),
-            ),
-            TerminalReplayOutput::Absent => (
-                TerminalReplayData {
-                    output: match mode {
-                        "terminal" => payload
-                            .get("output_tail")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
-                    },
-                    frames: None,
-                    columns: payload_columns,
-                    rows: payload_rows,
-                    initial_columns: payload_columns,
-                    initial_rows: payload_rows,
-                    exit_code: payload_exit_code(payload),
-                    signal: None,
-                    timed_out: payload
-                        .get("timed_out")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                    cancelled: payload
-                        .get("cancelled")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                },
-                None,
-            ),
+        let replay_error = terminal_replay_unavailable_reason(payload);
+        let has_artifact_reference = terminal_replay_ref(payload).is_some();
+        let replay = TerminalReplayData {
+            output: if has_artifact_reference {
+                String::new()
+            } else {
+                match mode {
+                    "terminal" => payload
+                        .get("output_tail")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
+                }
+            },
+            frames: None,
+            columns: payload_columns,
+            rows: payload_rows,
+            initial_columns: payload_columns,
+            initial_rows: payload_rows,
+            exit_code: payload_exit_code(payload),
+            signal: None,
+            timed_out: payload
+                .get("timed_out")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            cancelled: payload
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         };
         Self::shell_result_rows(payload, width, context, &replay, replay_error)
     }
@@ -876,7 +856,9 @@ pub(crate) enum TerminalReplayFrame {
 pub(crate) struct TerminalReplayData {
     pub(crate) output: String,
     frames: Option<Vec<TerminalReplayFrame>>,
+    #[cfg_attr(not(test), allow(dead_code))] // Retained for replay-fidelity validation.
     columns: u16,
+    #[cfg_attr(not(test), allow(dead_code))] // Retained for replay-fidelity validation.
     rows: u16,
     initial_columns: u16,
     initial_rows: u16,
@@ -886,12 +868,14 @@ pub(crate) struct TerminalReplayData {
     cancelled: bool,
 }
 
+#[cfg(test)]
 enum TerminalReplayOutput {
     Ready(TerminalReplayData),
     Unavailable(String),
     Absent,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Also validates recording fidelity in crate tests.
 pub(crate) fn decode_recording_replay(
     summary: &crate::recording::ShellRecordingSummary,
     frames: Vec<crate::recording::ShellRecordingFrame>,
@@ -954,6 +938,7 @@ pub(crate) fn decode_recording_replay(
     replay
 }
 
+#[cfg(test)]
 fn local_recording_path(uri: &str) -> Result<std::path::PathBuf, String> {
     if let Ok(url) = url::Url::parse(uri) {
         if url.scheme() != "file" {
@@ -974,6 +959,7 @@ fn local_recording_path(uri: &str) -> Result<std::path::PathBuf, String> {
     }
 }
 
+#[cfg(test)]
 fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
     let Some(reference) = terminal_replay_ref(payload) else {
         return TerminalReplayOutput::Absent;
@@ -1037,6 +1023,23 @@ fn terminal_replay_output(payload: &serde_json::Value) -> TerminalReplayOutput {
                 .unwrap_or(false),
         })
     })
+}
+
+fn terminal_replay_unavailable_reason(payload: &serde_json::Value) -> Option<String> {
+    let reference = terminal_replay_ref(payload)?;
+    let authoritative =
+        reference.get("key").and_then(serde_json::Value::as_str) == Some(SHELL_RECORDING_REF_KEY);
+    if authoritative
+        && reference
+            .get("metadata")
+            .and_then(|metadata| metadata.get("availability"))
+            .and_then(serde_json::Value::as_str)
+            == Some("evicted")
+    {
+        Some("recording was explicitly evicted by artifact retention policy".to_owned())
+    } else {
+        None
+    }
 }
 
 fn terminal_replay_truncated(payload: &serde_json::Value) -> Option<bool> {
@@ -1487,15 +1490,55 @@ mod tests {
     }
 
     fn render_rows(payload: &serde_json::Value) -> Vec<Line> {
-        bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter::default(),
-            "bcode.shell.run",
+        let columns = payload_u16(payload, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
+        let rows = payload_u16(payload, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
+        let (replay, error) = match terminal_replay_output(payload) {
+            TerminalReplayOutput::Ready(replay) => (replay, None),
+            TerminalReplayOutput::Unavailable(error) => (
+                TerminalReplayData {
+                    output: String::new(),
+                    frames: None,
+                    columns,
+                    rows,
+                    initial_columns: columns,
+                    initial_rows: rows,
+                    exit_code: payload_exit_code(payload),
+                    signal: None,
+                    timed_out: false,
+                    cancelled: false,
+                },
+                Some(error),
+            ),
+            TerminalReplayOutput::Absent => (
+                TerminalReplayData {
+                    output: payload
+                        .get("output_tail")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    frames: None,
+                    columns,
+                    rows,
+                    initial_columns: columns,
+                    initial_rows: rows,
+                    exit_code: payload_exit_code(payload),
+                    signal: None,
+                    timed_out: false,
+                    cancelled: false,
+                },
+                None,
+            ),
+        };
+        ShellRunTuiVisualAdapter::shell_result_rows(
             payload,
+            100,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
                 100,
                 bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
                 None,
             ),
+            &replay,
+            error,
         )
     }
 
@@ -1515,17 +1558,11 @@ mod tests {
     }
 
     fn assert_recording_unavailable(payload: &serde_json::Value, expected: &str) {
-        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter::default(),
-            "bcode.shell.run",
-            payload,
-            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
-                100,
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
-                None,
-            ),
-        );
-        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        let rendered = render_rows(payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             rendered.contains("durable shell recording unavailable"),
             "{rendered}"
@@ -1844,21 +1881,11 @@ mod tests {
                 "metadata": {"complete": true}
             }]
         });
-        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter::default(),
-            "bcode.shell.run",
-            &payload,
-            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
-                100,
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
-                None,
-            ),
-        );
-        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(
-            rendered.contains("durable shell recording unavailable"),
-            "{rendered}"
-        );
+        let rendered = render_rows(&payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rendered.contains("could not be validated"), "{rendered}");
         assert!(
             !rendered.contains("forbidden fallback sentinel"),
@@ -2127,17 +2154,11 @@ mod tests {
                 "metadata": {"complete": true}
             }]
         });
-        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter::default(),
-            "bcode.shell.run",
-            &payload,
-            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
-                100,
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
-                None,
-            ),
-        );
-        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        let rendered = render_rows(&payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rendered.contains("second"), "{rendered}");
         assert!(!rendered.contains("first"), "{rendered}");
         assert!(!rendered.contains("fallback"), "{rendered}");
@@ -2161,17 +2182,11 @@ mod tests {
                 "metadata": {"stream": "pty", "tail_truncated": false}
             }]
         });
-        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter::default(),
-            "bcode.shell.run",
-            &payload,
-            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
-                100,
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
-                None,
-            ),
-        );
-        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        let rendered = render_rows(&payload)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(rendered.contains("second"), "{rendered}");
         assert!(!rendered.contains("first"), "{rendered}");

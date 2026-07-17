@@ -4890,7 +4890,7 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
 }
 
 #[test]
-fn replayed_shell_artifact_renders_terminal_replay_ref_through_terminal_grid() {
+fn replayed_legacy_shell_artifact_does_not_read_files_during_render() {
     let session_id = SessionId::new();
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let pty_path = temp_dir.path().join("raw-pty.txt");
@@ -4929,7 +4929,7 @@ fn replayed_shell_artifact_renders_terminal_replay_ref_through_terminal_grid() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("second"), "{rendered}");
+    assert!(!rendered.contains("second"), "{rendered}");
     assert!(!rendered.contains("first"), "{rendered}");
     assert!(!rendered.contains("artifact raw fallback"), "{rendered}");
 }
