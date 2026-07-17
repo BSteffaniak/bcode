@@ -7,7 +7,12 @@ Bcode keeps session `*.events` files as the canonical append-only history, but n
 * `sessions/index/<session-id>.entries.jsonl` is the primary entry sidecar for sequence-to-offset lookup.
 * Derived sidecars under `sessions/index/<session-id>/` store projection-specific data such as transcript spans and input history.
 
-The event log is authoritative, but normal runtime paths must not automatically rebuild indexes from it. Full event-log replay belongs to explicit maintenance operations such as doctor-with-fix, reindex, repair, or migrations.
+The event log is authoritative, but normal runtime paths must not automatically rebuild indexes from it. Full event-log replay belongs to explicit maintenance operations such as doctor-with-fix, reindex,
+repair, or a versioned data migration. Known projection schema upgrades may rebuild derived state
+automatically when a session database is opened, provided the migration strictly validates canonical
+history, replaces the projection atomically, and leaves canonical events unchanged. Unknown schema
+versions and same-version stale or corrupt projections remain repair-required rather than being
+silently rebuilt.
 
 ## Current implementation direction
 

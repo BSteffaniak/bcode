@@ -41,6 +41,7 @@ const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 2;
+const LEGACY_MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u64 = 1;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
 const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 4;
 const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
@@ -673,6 +674,7 @@ impl SessionDb {
         let db: Box<dyn Database> =
             Box::new(ObservedDatabase::new(db, metrics, "session", "turso"));
         run_session_migrations(&*db).await?;
+        migrate_model_context_projection(&*db).await?;
         Ok(Self {
             session_id,
             db: Arc::new(db),
@@ -1076,20 +1078,7 @@ impl SessionDb {
     ///
     /// Returns an error if the query or event deserialization fails.
     pub async fn all_events_strict(&self) -> SessionDbResult<Vec<SessionEvent>> {
-        let rows = self
-            .db
-            .select("events")
-            .columns(&["payload"])
-            .sort("event_seq", SortDirection::Asc)
-            .execute(&**self.db)
-            .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                let payload = required_string(&row, "payload")?;
-                Ok(decode_session_event(&payload)?)
-            })
-            .collect()
+        strict_events_from_database(&**self.db).await
     }
 
     /// Return a bounded history page from canonical DB events.
@@ -1302,26 +1291,10 @@ impl SessionDb {
     ///
     /// Returns an error if canonical history is invalid or projection replacement fails.
     pub async fn reindex_model_context(&self) -> SessionDbResult<usize> {
-        let events = self.all_events_strict().await?;
-        for (index, event) in events.iter().enumerate() {
-            let expected = u64::try_from(index).unwrap_or(u64::MAX);
-            if event.sequence != expected {
-                return Err(SessionDbError::InvalidCanonicalSequence {
-                    expected,
-                    actual: event.sequence,
-                });
-            }
-        }
         let tx = self.db.begin_transaction().await?;
-        tx.delete("model_context_entries").execute(&*tx).await?;
-        tx.delete("model_context_projection_state")
-            .execute(&*tx)
-            .await?;
-        for event in &events {
-            project_model_context_event(&*tx, event).await?;
-        }
+        let event_count = rebuild_model_context_projection(&*tx).await?;
         tx.commit().await?;
-        Ok(events.len())
+        Ok(event_count)
     }
 
     async fn projected_model_context_events(&self) -> SessionDbResult<Option<Vec<SessionEvent>>> {
@@ -1786,6 +1759,77 @@ async fn run_session_migrations(db: &dyn Database) -> Result<(), MigrationError>
     let runner = MigrationRunner::new(Box::new(session_migrations()))
         .with_table_name(SESSION_MIGRATIONS_TABLE.to_string());
     runner.run(db).await
+}
+
+async fn migrate_model_context_projection(db: &dyn Database) -> SessionDbResult<()> {
+    let Some(state) = db
+        .select("model_context_projection_state")
+        .columns(&["schema_version"])
+        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+        .execute_first(db)
+        .await?
+    else {
+        return Ok(());
+    };
+    let schema_version = required_i64(&state, "schema_version").map(i64_to_u64)?;
+    if schema_version != LEGACY_MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let tx = db.begin_transaction().await?;
+    let state = tx
+        .select("model_context_projection_state")
+        .columns(&["schema_version"])
+        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+        .execute_first(&*tx)
+        .await?;
+    if state
+        .as_ref()
+        .map(|row| required_i64(row, "schema_version").map(i64_to_u64))
+        .transpose()?
+        == Some(LEGACY_MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)
+    {
+        rebuild_model_context_projection(&*tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn strict_events_from_database(db: &dyn Database) -> SessionDbResult<Vec<SessionEvent>> {
+    let rows = db
+        .select("events")
+        .columns(&["payload"])
+        .sort("event_seq", SortDirection::Asc)
+        .execute(db)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let payload = required_string(&row, "payload")?;
+            Ok(decode_session_event(&payload)?)
+        })
+        .collect()
+}
+
+async fn rebuild_model_context_projection(db: &dyn Database) -> SessionDbResult<usize> {
+    let events = strict_events_from_database(db).await?;
+    for (index, event) in events.iter().enumerate() {
+        let expected = u64::try_from(index).unwrap_or(u64::MAX);
+        if event.sequence != expected {
+            return Err(SessionDbError::InvalidCanonicalSequence {
+                expected,
+                actual: event.sequence,
+            });
+        }
+    }
+
+    db.delete("model_context_entries").execute(db).await?;
+    db.delete("model_context_projection_state")
+        .execute(db)
+        .await?;
+    for event in &events {
+        project_model_context_event(db, event).await?;
+    }
+    Ok(events.len())
 }
 
 fn global_migrations() -> CodeMigrationSource<'static> {
@@ -4119,6 +4163,75 @@ mod tests {
             .expect("projection state")
             .expect("projection state row");
         assert_eq!(required_i64(&state, "last_event_seq").expect("last"), 0);
+    }
+
+    #[tokio::test]
+    async fn opening_legacy_model_context_projection_migrates_it_atomically() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "projected".to_string(),
+                origin: None,
+            },
+        ))
+        .await
+        .expect("append projected event");
+        db.database()
+            .update("model_context_projection_state")
+            .value("schema_version", DatabaseValue::Int64(1))
+            .execute(db.database())
+            .await
+            .expect("set legacy version");
+        insert_event(
+            db.database(),
+            &event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "canonical tail".to_string(),
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("append canonical tail without projection");
+        drop(db);
+
+        let migrated = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open and migrate session db");
+        assert_eq!(
+            migrated
+                .model_context_projection_status()
+                .await
+                .expect("projection status"),
+            ModelContextProjectionStatus::Fresh { checkpoint: 1 }
+        );
+        let context = migrated
+            .model_context_events()
+            .await
+            .expect("migrated context");
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[1].sequence, 1);
+
+        drop(migrated);
+        let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("reopen migrated session db");
+        assert_eq!(
+            reopened
+                .model_context_projection_status()
+                .await
+                .expect("projection status after reopen"),
+            ModelContextProjectionStatus::Fresh { checkpoint: 1 }
+        );
     }
 
     #[tokio::test]
