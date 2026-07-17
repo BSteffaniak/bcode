@@ -2561,6 +2561,54 @@ mod artifact_fetch_tests {
     }
 
     #[test]
+    fn each_attached_client_accepts_every_artifact_byte_exactly_once() {
+        let session = bcode_session_models::SessionId::new();
+        let target = target(10, 4, true);
+        let pages = [
+            range(0, 10, 2, b"abc"),
+            range(3, 10, 3, b"defg"),
+            range(7, 10, 4, b"hij"),
+        ];
+
+        for _client in 0..2 {
+            let mut next_offset = 0_u64;
+            let mut accepted_bytes = 0_usize;
+            for page in &pages {
+                assert!(active_artifact_completion_is_current(
+                    session,
+                    Some(session),
+                    page.offset,
+                    next_offset,
+                ));
+                let expected_end = validate_active_artifact_range(
+                    page,
+                    next_offset,
+                    &target,
+                    page.reference_revision,
+                )
+                .expect("contiguous page");
+                accepted_bytes = accepted_bytes.saturating_add(page.bytes.len());
+                next_offset = expected_end;
+
+                assert!(
+                    !active_artifact_completion_is_current(
+                        session,
+                        Some(session),
+                        page.offset,
+                        next_offset,
+                    ),
+                    "a completed page must be rejected as a duplicate"
+                );
+            }
+            assert_eq!(next_offset, target.committed_bytes);
+            assert_eq!(
+                accepted_bytes,
+                usize::try_from(target.committed_bytes).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn lagged_duplicate_and_cross_session_completions_are_ignored() {
         let session = bcode_session_models::SessionId::new();
         let other = bcode_session_models::SessionId::new();

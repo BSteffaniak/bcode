@@ -3,6 +3,18 @@
 //! The format is append-friendly while a command runs and atomically published on completion.
 //! Readers reject incomplete files, validate the complete frame stream, and skip unknown frame
 //! kinds by their declared payload length for forward compatibility.
+//!
+//! Read compatibility is deliberate and permanent for every published version:
+//!
+//! * Version 1 preserves output, resize, legacy finish status flags, and checksum validation.
+//! * Version 2 additionally preserves the optional signal name in the finish frame.
+//! * Version 3 requires a start frame and supports replay-output frames used after shell-owned
+//!   presentation filtering. Active incremental decoding accepts version 3 only.
+//!
+//! Complete readers must continue accepting versions 1 through 3, rejecting malformed,
+//! incomplete, checksum-mismatched, non-monotonic, or post-finish frame streams. Unknown frame
+//! kinds remain skippable by declared length so newer optional frames do not invalidate otherwise
+//! complete recordings.
 
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
