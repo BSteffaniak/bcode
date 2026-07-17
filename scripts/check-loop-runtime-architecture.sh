@@ -247,6 +247,21 @@ for primitive in 'invoker.prepare_tool(' 'authorization.authorize_batch(' '.invo
 done
 rm -f "$runtime_production"
 
+for legacy_sdk_loop in 'run_provider_tool_loop_in_scope' 'append_provider_tool_calls' 'append_tool_results' 'ToolRoundState::new(request.max_tool_rounds)'; do
+  if grep -F "$legacy_sdk_loop" packages/bcode/src/lib.rs >/dev/null; then
+    echo "Runtime architecture violation: SDK reintroduced duplicate provider/tool loop fragment '$legacy_sdk_loop'." >&2
+    violations=1
+  fi
+done
+if ! rg -U 'fn run_provider_tool_loop<P>\([\s\S]*\.run_provider_tool_loop\(' packages/bcode/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: SDK provider/tool orchestration no longer delegates to AgentRuntime." >&2
+  violations=1
+fi
+if ! rg -U 'pub async fn run_provider_tool_loop_in_scope[\s\S]*run_text_turn_in_scope[\s\S]*execute_prepared_tool_batch_with_host_context' packages/agent-runtime/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: canonical provider/tool continuation loop was removed from AgentRuntime." >&2
+  violations=1
+fi
+
 artifact_request_fields="$(
   awk '/^pub struct ToolArtifactWriteRequest \{/{capture=1; next} capture && /^\}/{exit} capture && /^    pub /{print}' packages/tool/src/contracts.rs
 )"

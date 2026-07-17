@@ -1,5 +1,5 @@
 use bcode::{
-    Agent, AgentEvent, ModelContentBlock, ModelProviderInvoker, PreparationScope,
+    Agent, AgentEvent, BcodeError, ModelContentBlock, ModelProviderInvoker, PreparationScope,
     PreparedToolInvocation, RegisteredTool, RuntimeFuture, ScopedAgentStreamItem, ScopedTurnEvent,
     ToolCall, ToolDefinition, ToolInvoker, ToolPreparationRequest, ToolPreparationResponse,
 };
@@ -190,7 +190,7 @@ impl ToolInvoker for ParallelInvoker {
     }
 }
 
-fn agent(invoker: Arc<ParallelInvoker>) -> Agent {
+fn agent_builder(invoker: Arc<ParallelInvoker>) -> bcode::AgentBuilder {
     Agent::builder()
         .max_tool_rounds(1)
         .execution_options(bcode::ToolExecutionOptions {
@@ -204,7 +204,10 @@ fn agent(invoker: Arc<ParallelInvoker>) -> Agent {
             unreachable!("custom invoker routes tools")
         })
         .tool_invoker(invoker)
-        .build()
+}
+
+fn agent(invoker: Arc<ParallelInvoker>) -> Agent {
+    agent_builder(invoker).build()
 }
 
 fn invoker() -> (Arc<ParallelInvoker>, Arc<AtomicUsize>) {
@@ -254,6 +257,54 @@ async fn high_level_run_executes_provider_batch_once_and_returns_results_in_prov
         })
         .collect::<Vec<_>>();
     assert_eq!(result_ids, ["call-first", "call-second"]);
+}
+
+#[tokio::test]
+async fn high_level_run_preserves_tool_hooks_through_canonical_runtime_observer() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = BatchProvider::new(requests);
+    let (invoker, _) = invoker();
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let before_count = Arc::clone(&before);
+    let after_count = Arc::clone(&after);
+    let agent = agent_builder(invoker)
+        .on_before_tool(move |_| {
+            before_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .on_after_tool(move |_, _| {
+            after_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .build();
+
+    let response = agent
+        .run(&mut provider, "run tools")
+        .await
+        .expect("canonical observer should preserve hooks");
+
+    assert_eq!(response.text, "done");
+    assert_eq!(before.load(Ordering::SeqCst), 2);
+    assert_eq!(after.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failing_before_tool_hook_prevents_canonical_batch_invocation() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = BatchProvider::new(requests);
+    let (invoker, maximum) = invoker();
+    let agent = agent_builder(invoker)
+        .on_before_tool(|_| Err(BcodeError::Hook("blocked".to_string())))
+        .build();
+
+    let error = agent
+        .run(&mut provider, "run tools")
+        .await
+        .expect_err("failing hook should reject the tool batch");
+
+    assert!(matches!(error, BcodeError::Hook(message) if message == "blocked"));
+    assert_eq!(maximum.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

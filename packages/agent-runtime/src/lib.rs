@@ -77,6 +77,12 @@ pub enum RuntimeError {
         /// Configured timeout for the turn.
         timeout: Duration,
     },
+    /// Provider completed a tool-call round without supplying any completed calls.
+    #[error("provider finished with tool_call but emitted no completed tool calls")]
+    EmptyProviderToolRound,
+    /// A host extension failed while observing canonical orchestration.
+    #[error("host extension failed: {0}")]
+    HostExtension(String),
     /// A tool was requested but no executor could handle it.
     #[error("tool not found: {0}")]
     ToolNotFound(String),
@@ -484,6 +490,33 @@ pub struct ToolBatchExecutionOutput {
     /// Per-call execution results in the same order as the requested calls.
     pub results: Vec<Result<ToolExecutionOutput>>,
 }
+
+/// Host observer for product behavior around canonical tool rounds.
+pub trait ToolRoundObserver: Send + Sync {
+    /// Observe one complete provider tool-call batch before preparation begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when host-owned pre-invocation behavior rejects the batch.
+    fn before_tool_batch(&self, _calls: &[ToolCall]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Observe one successful tool result before it is added to provider continuation context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when host-owned post-invocation behavior fails.
+    fn after_tool_call(&self, _call: &ToolCall, _output: &ToolExecutionOutput) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Tool-round observer that performs no host-specific work.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopToolRoundObserver;
+
+impl ToolRoundObserver for NoopToolRoundObserver {}
 
 #[derive(Debug, Clone)]
 struct PreparedRuntimeToolCall {
@@ -992,6 +1025,183 @@ impl AgentRuntime {
         .await
     }
 
+    /// Run a complete provider/tool conversation through one canonical turn scope.
+    ///
+    /// Provider rounds, complete-batch preparation and authorization, ordered tool results, and
+    /// continuation all share the same lifecycle and whole-turn timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider execution, tool orchestration, host observation, scope
+    /// completion, cancellation, or the whole-turn timeout fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_provider_tool_loop<P, C, A, I, O>(
+        &self,
+        provider: &mut P,
+        request: AgentTurnRequest,
+        catalog: &C,
+        authorization: &A,
+        invoker: &I,
+        context: &RuntimePermissionContext,
+        host_context: &[bcode_tool::ToolHostContextEntry],
+        options: ToolExecutionOptions,
+        events: Arc<dyn TurnEventSink>,
+        capabilities: InvocationCapabilities,
+        observer: &O,
+    ) -> Result<AgentTurnResponse>
+    where
+        P: ModelProviderInvoker + ?Sized,
+        C: ToolCatalog + Sync,
+        A: ToolAuthorizationCoordinator + ?Sized,
+        I: ToolInvoker + Sync + ?Sized,
+        O: ToolRoundObserver + ?Sized,
+    {
+        let scope = self.begin_turn_scope(
+            format!("agent-turn:{}", context.session_id),
+            events,
+            capabilities,
+        );
+        let result = self
+            .run_provider_tool_loop_in_scope(
+                provider,
+                request,
+                catalog,
+                authorization,
+                invoker,
+                context,
+                host_context,
+                options,
+                &scope,
+                observer,
+            )
+            .await;
+        match result {
+            Ok(response) if self.complete_turn_scope(&scope) => Ok(response),
+            Ok(_) => Err(RuntimeError::Cancelled),
+            Err(error) => {
+                let _ = self.cancel_turn_scope(&scope);
+                Err(error)
+            }
+        }
+    }
+
+    /// Run a complete provider/tool conversation inside an existing canonical scope.
+    ///
+    /// This lower-level entry point is intended for hosts that own scope allocation. It contains
+    /// the same provider-round and tool-continuation loop as [`Self::run_provider_tool_loop`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::run_provider_tool_loop`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_provider_tool_loop_in_scope<P, C, A, I, O>(
+        &self,
+        provider: &mut P,
+        mut request: AgentTurnRequest,
+        catalog: &C,
+        authorization: &A,
+        invoker: &I,
+        context: &RuntimePermissionContext,
+        host_context: &[bcode_tool::ToolHostContextEntry],
+        options: ToolExecutionOptions,
+        scope: &TurnScope,
+        observer: &O,
+    ) -> Result<AgentTurnResponse>
+    where
+        P: ModelProviderInvoker + ?Sized,
+        C: ToolCatalog + Sync,
+        A: ToolAuthorizationCoordinator + ?Sized,
+        I: ToolInvoker + Sync + ?Sized,
+        O: ToolRoundObserver + ?Sized,
+    {
+        validate_tool_host_context(host_context)?;
+        let mut rounds = ToolRoundState::new(request.max_tool_rounds);
+        let started = Instant::now();
+        let timeout = request.timeout;
+        let mut all_events = Vec::new();
+        let mut messages = request.messages.clone();
+        if request.append_prompt {
+            messages.push(ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: request.prompt.clone(),
+                }],
+            });
+        }
+
+        loop {
+            request.timeout = timeout
+                .checked_sub(started.elapsed())
+                .ok_or(RuntimeError::Timeout { timeout })?;
+            let response = self
+                .run_text_turn_in_scope(provider, &request, scope)
+                .await?;
+            all_events.extend(response.events.iter().cloned());
+            let calls = response
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentRuntimeEvent::ToolCallFinished(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            if response.stop_reason != Some(StopReason::ToolCall) {
+                return Ok(AgentTurnResponse {
+                    text: response.text,
+                    stop_reason: response.stop_reason,
+                    usage: response.usage,
+                    latency_ms: started.elapsed().as_millis(),
+                    events: all_events,
+                });
+            }
+            if calls.is_empty() {
+                return Err(RuntimeError::EmptyProviderToolRound);
+            }
+
+            append_provider_tool_calls(&mut messages, &response, &calls);
+            observer.before_tool_batch(&calls)?;
+            let cancellation = request.cancellation.clone();
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .ok_or(RuntimeError::Timeout { timeout })?;
+            let batch = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    let _ = self.cancel_turn_scope(scope);
+                    return Err(RuntimeError::Cancelled);
+                }
+                () = tokio::time::sleep(remaining) => {
+                    let _ = self.cancel_turn_scope(scope);
+                    return Err(RuntimeError::Timeout { timeout });
+                }
+                batch = self.execute_prepared_tool_batch_with_host_context(
+                    catalog,
+                    authorization,
+                    invoker,
+                    &calls,
+                    &mut rounds,
+                    context,
+                    host_context,
+                    options,
+                    scope,
+                ) => batch?,
+            };
+
+            append_tool_batch_results(
+                &mut messages,
+                &mut all_events,
+                &calls,
+                batch,
+                scope,
+                observer,
+            )?;
+            request.messages.clone_from(&messages);
+            request.prompt.clear();
+            request.append_prompt = false;
+        }
+    }
+
     /// Execute an ordered tool-call batch with no additional host preparation context.
     ///
     /// # Errors
@@ -1354,48 +1564,33 @@ impl AgentRuntime {
             .await?;
             let should_sleep = poll.events.is_empty();
             for event in poll.events {
-                match normalize_provider_event(event, &mut text, &mut usage)? {
-                    EventDisposition::Continue(event) => {
-                        if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
-                            cancel_and_finish(
-                                provider,
-                                provider_plugin_id,
-                                &cancel_request,
-                                &finish_request,
-                            )
-                            .await;
-                            return Err(RuntimeError::Cancelled);
-                        }
-                        events.push(event);
-                    }
-                    EventDisposition::Finished { stop_reason } => {
-                        provider
-                            .finish_turn(provider_plugin_id, &finish_request)
-                            .await?;
-                        let finished_event =
-                            finished_event(usage.as_ref(), start.elapsed(), stop_reason);
-                        if !scope.emit(ScopedTurnEvent::Runtime(finished_event.clone())) {
-                            return Err(RuntimeError::Cancelled);
-                        }
-                        events.push(finished_event);
-                        return Ok(AgentTurnResponse {
-                            text,
-                            stop_reason: Some(stop_reason),
-                            usage,
-                            latency_ms: start.elapsed().as_millis(),
-                            events,
-                        });
-                    }
-                    EventDisposition::Cancelled(event) => {
-                        if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
-                            return Err(RuntimeError::Cancelled);
-                        }
-                        events.push(event);
-                        provider
-                            .finish_turn(provider_plugin_id, &finish_request)
-                            .await?;
-                        return Err(RuntimeError::Cancelled);
-                    }
+                let disposition = normalize_provider_event_or_cleanup(
+                    provider,
+                    provider_plugin_id,
+                    &cancel_request,
+                    &finish_request,
+                    event,
+                    &mut text,
+                    &mut usage,
+                )
+                .await?;
+                if let Some(response) = apply_provider_event_disposition(
+                    provider,
+                    &ProviderEventContext {
+                        provider_plugin_id,
+                        cancel_request: &cancel_request,
+                        finish_request: &finish_request,
+                        scope,
+                        start,
+                    },
+                    disposition,
+                    &mut text,
+                    &mut usage,
+                    &mut events,
+                )
+                .await?
+                {
+                    return Ok(response);
                 }
             }
             sleep_after_empty_poll(should_sleep, self.poll_interval).await;
@@ -1479,6 +1674,95 @@ where
     Err(RuntimeError::Cancelled)
 }
 
+struct ProviderEventContext<'a> {
+    provider_plugin_id: Option<&'a str>,
+    cancel_request: &'a CancelTurnRequest,
+    finish_request: &'a FinishTurnRequest,
+    scope: &'a TurnScope,
+    start: Instant,
+}
+
+async fn apply_provider_event_disposition<P>(
+    provider: &mut P,
+    context: &ProviderEventContext<'_>,
+    disposition: EventDisposition,
+    text: &mut String,
+    usage: &mut Option<TokenUsage>,
+    events: &mut Vec<AgentRuntimeEvent>,
+) -> Result<Option<AgentTurnResponse>>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    match disposition {
+        EventDisposition::Continue(event) => {
+            if !context.scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
+                cancel_and_finish(
+                    provider,
+                    context.provider_plugin_id,
+                    context.cancel_request,
+                    context.finish_request,
+                )
+                .await;
+                return Err(RuntimeError::Cancelled);
+            }
+            events.push(event);
+            Ok(None)
+        }
+        EventDisposition::Finished { stop_reason } => {
+            provider
+                .finish_turn(context.provider_plugin_id, context.finish_request)
+                .await?;
+            let finished_event =
+                finished_event(usage.as_ref(), context.start.elapsed(), stop_reason);
+            if !context
+                .scope
+                .emit(ScopedTurnEvent::Runtime(finished_event.clone()))
+            {
+                return Err(RuntimeError::Cancelled);
+            }
+            events.push(finished_event);
+            Ok(Some(AgentTurnResponse {
+                text: std::mem::take(text),
+                stop_reason: Some(stop_reason),
+                usage: usage.take(),
+                latency_ms: context.start.elapsed().as_millis(),
+                events: std::mem::take(events),
+            }))
+        }
+        EventDisposition::Cancelled(event) => {
+            if !context.scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
+                return Err(RuntimeError::Cancelled);
+            }
+            events.push(event);
+            provider
+                .finish_turn(context.provider_plugin_id, context.finish_request)
+                .await?;
+            Err(RuntimeError::Cancelled)
+        }
+    }
+}
+
+async fn normalize_provider_event_or_cleanup<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    cancel_request: &CancelTurnRequest,
+    finish_request: &FinishTurnRequest,
+    event: ProviderTurnEvent,
+    text: &mut String,
+    usage: &mut Option<TokenUsage>,
+) -> Result<EventDisposition>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    match normalize_provider_event(event, text, usage) {
+        Ok(disposition) => Ok(disposition),
+        Err(error) => {
+            cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
+            Err(error)
+        }
+    }
+}
+
 async fn start_provider_turn<P>(
     provider: &mut P,
     provider_plugin_id: Option<&str>,
@@ -1556,7 +1840,20 @@ where
             ).await;
             Err(RuntimeError::Timeout { timeout: context.request.timeout })
         }
-        poll = provider.poll_turn_events(context.provider_plugin_id, context.poll_request) => poll,
+        poll = provider.poll_turn_events(context.provider_plugin_id, context.poll_request) => {
+            match poll {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    cancel_and_finish(
+                        provider,
+                        context.provider_plugin_id,
+                        context.cancel_request,
+                        context.finish_request,
+                    ).await;
+                    Err(error)
+                }
+            }
+        },
     }
 }
 
@@ -1712,6 +2009,79 @@ where
         }
     }
     prepared
+}
+
+fn append_provider_tool_calls(
+    messages: &mut Vec<ModelMessage>,
+    response: &AgentTurnResponse,
+    calls: &[ToolCall],
+) {
+    let mut content = Vec::with_capacity(calls.len() + usize::from(!response.text.is_empty()));
+    if !response.text.is_empty() {
+        content.push(ContentBlock::Text {
+            text: response.text.clone(),
+        });
+    }
+    content.extend(
+        calls
+            .iter()
+            .cloned()
+            .map(|call| ContentBlock::ToolCall { call }),
+    );
+    messages.push(ModelMessage {
+        role: MessageRole::Assistant,
+        content,
+    });
+}
+
+fn append_tool_batch_results<O>(
+    messages: &mut Vec<ModelMessage>,
+    all_events: &mut Vec<AgentRuntimeEvent>,
+    calls: &[ToolCall],
+    batch: ToolBatchExecutionOutput,
+    scope: &TurnScope,
+    observer: &O,
+) -> Result<()>
+where
+    O: ToolRoundObserver + ?Sized,
+{
+    for (call, result) in calls.iter().zip(batch.results) {
+        let model_result = match result {
+            Ok(output) => {
+                observer.after_tool_call(call, &output)?;
+                if let Some(event) = output
+                    .events
+                    .iter()
+                    .find(|event| matches!(event, AgentRuntimeEvent::ToolResult(_)))
+                    .cloned()
+                {
+                    all_events.push(event);
+                }
+                output.model_result
+            }
+            Err(error) => {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: error.to_string(),
+                    is_error: true,
+                    content: Vec::new(),
+                };
+                let event = AgentRuntimeEvent::ToolResult(result.clone());
+                if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
+                    return Err(RuntimeError::Cancelled);
+                }
+                all_events.push(event);
+                result
+            }
+        };
+        messages.push(ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: model_result,
+            }],
+        });
+    }
+    Ok(())
 }
 
 const TOOL_HOST_CONTEXT_MAX_ENTRIES: usize = 32;
@@ -2068,6 +2438,7 @@ mod tests {
     struct FakeProvider {
         events: VecDeque<ProviderTurnEvent>,
         finished: bool,
+        cancelled: bool,
     }
 
     impl FakeProvider {
@@ -2075,6 +2446,7 @@ mod tests {
             Self {
                 events: events.into_iter().collect(),
                 finished: false,
+                cancelled: false,
             }
         }
     }
@@ -2109,6 +2481,7 @@ mod tests {
             _provider_plugin_id: Option<&'a str>,
             _request: &'a CancelTurnRequest,
         ) -> RuntimeFuture<'a, AckResponse> {
+            self.cancelled = true;
             Box::pin(async { Ok(AckResponse::default()) })
         }
 
@@ -2430,6 +2803,268 @@ mod tests {
         ) -> RuntimeFuture<'a, ToolInvocationResponse> {
             unreachable!("timed-out preparation must not invoke the tool")
         }
+    }
+
+    #[tokio::test]
+    async fn provider_error_event_cancels_and_finishes_active_provider_turn() {
+        let mut provider = FakeProvider::new([ProviderTurnEvent::Error {
+            error: ProviderError {
+                code: "failed".to_string(),
+                category: bcode_model::ProviderErrorCategory::ProviderInternal,
+                message: "synthetic failure".to_string(),
+                retryable: false,
+                provider_message: None,
+                retry: None,
+            },
+        }]);
+
+        let error = AgentRuntime::new()
+            .run_text_turn(&mut provider, AgentTurnRequest::new("model", "prompt"))
+            .await
+            .expect_err("provider error should fail the turn");
+
+        assert!(matches!(
+            error,
+            RuntimeError::Provider { code, .. } if code == "failed"
+        ));
+        assert!(provider.cancelled);
+        assert!(provider.finished);
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingRoundObserver {
+        batches: AtomicUsize,
+        results: AtomicUsize,
+    }
+
+    impl ToolRoundObserver for CountingRoundObserver {
+        fn before_tool_batch(&self, calls: &[ToolCall]) -> Result<()> {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(calls.len(), 2);
+            Ok(())
+        }
+
+        fn after_tool_call(&self, _call: &ToolCall, _output: &ToolExecutionOutput) -> Result<()> {
+            self.results.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct MultiRoundProvider {
+        rounds: VecDeque<VecDeque<ProviderTurnEvent>>,
+        active: VecDeque<ProviderTurnEvent>,
+        requests: Arc<StdMutex<Vec<ModelTurnRequest>>>,
+        next_turn: usize,
+    }
+
+    impl MultiRoundProvider {
+        fn new(
+            rounds: impl IntoIterator<Item = Vec<ProviderTurnEvent>>,
+            requests: Arc<StdMutex<Vec<ModelTurnRequest>>>,
+        ) -> Self {
+            Self {
+                rounds: rounds
+                    .into_iter()
+                    .map(VecDeque::from)
+                    .collect::<VecDeque<_>>(),
+                active: VecDeque::new(),
+                requests,
+                next_turn: 0,
+            }
+        }
+    }
+
+    impl ModelProviderInvoker for MultiRoundProvider {
+        fn start_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            request: &'a ModelTurnRequest,
+        ) -> RuntimeFuture<'a, StartTurnResponse> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            self.active = self.rounds.pop_front().expect("configured provider round");
+            self.next_turn += 1;
+            let provider_turn_id = format!("turn-{}", self.next_turn);
+            Box::pin(async move { Ok(StartTurnResponse { provider_turn_id }) })
+        }
+
+        fn poll_turn_events<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a PollTurnEventsRequest,
+        ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+            Box::pin(async move {
+                Ok(PollTurnEventsResponse {
+                    events: self.active.pop_front().into_iter().collect(),
+                })
+            })
+        }
+
+        fn cancel_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a CancelTurnRequest,
+        ) -> RuntimeFuture<'a, AckResponse> {
+            Box::pin(async { Ok(AckResponse::default()) })
+        }
+
+        fn finish_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a FinishTurnRequest,
+        ) -> RuntimeFuture<'a, AckResponse> {
+            Box::pin(async { Ok(AckResponse::default()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_loop_runs_provider_batch_and_ordered_continuation() {
+        let first = ToolCall {
+            id: "call-1".to_string(),
+            name: "first".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let second = ToolCall {
+            id: "call-2".to_string(),
+            name: "second".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![
+                    ProviderTurnEvent::ToolCallFinished {
+                        call: first.clone(),
+                    },
+                    ProviderTurnEvent::ToolCallFinished {
+                        call: second.clone(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ],
+                vec![
+                    ProviderTurnEvent::TextDelta {
+                        text: "done".to_string(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+            ],
+            Arc::clone(&requests),
+        );
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("first"))
+            .with_inline_tool(tool_definition("second"));
+        let invoker = ContractTestInvoker::new(2);
+        let observer = CountingRoundObserver::default();
+        let mut request = AgentTurnRequest::new("model", "run tools");
+        request.max_tool_rounds = 1;
+
+        let response = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink { sender: None }),
+                InvocationCapabilities::default(),
+                &observer,
+            )
+            .await
+            .expect("canonical provider/tool loop should complete");
+
+        assert_eq!(response.text, "done");
+        assert_eq!(invoker.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(observer.batches.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.results.load(Ordering::SeqCst), 2);
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(requests[1].messages[0].role, MessageRole::User));
+        assert!(matches!(
+            requests[1].messages[1].role,
+            MessageRole::Assistant
+        ));
+        let result_ids = requests[1].messages[2..]
+            .iter()
+            .map(|message| match &message.content[0] {
+                ContentBlock::ToolResult { result } => result.call_id.as_str(),
+                other => panic!("expected tool result, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids, ["call-1", "call-2"]);
+        drop(requests);
+    }
+
+    #[tokio::test]
+    async fn canonical_loop_stops_at_tool_round_limit() {
+        let first = ToolCall {
+            id: "call-1".to_string(),
+            name: "first".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![
+                    ProviderTurnEvent::ToolCallFinished {
+                        call: first.clone(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ],
+                vec![
+                    ProviderTurnEvent::ToolCallFinished {
+                        call: first.clone(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ],
+            ],
+            Arc::clone(&requests),
+        );
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("first"));
+        let invoker = ContractTestInvoker::new(1);
+        let mut request = AgentTurnRequest::new("model", "run tools");
+        request.max_tool_rounds = 1;
+
+        let error = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink { sender: None }),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+            )
+            .await
+            .expect_err("second tool round must exceed the configured limit");
+
+        assert!(matches!(error, RuntimeError::MaxToolRounds(1)));
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

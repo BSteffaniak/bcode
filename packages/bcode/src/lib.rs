@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 
 pub use bcode_agent_permissions::{AgentPermissionPolicy, allow_all_agent_policy};
@@ -42,7 +42,8 @@ pub use bcode_agent_runtime::{
     AgentRuntimeStreamItem as AgentStreamItem, AllowAllPolicy, CancellationToken,
     ModelProviderInvoker, PermissionDecision, PermissionPolicy, RegisteredTool, RuntimeError,
     RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
-    ToolExecutionOutput, ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
+    ToolExecutionOutput, ToolExecutor, ToolRoundObserver, ToolRoundState, ToolSource,
+    UnifiedToolCatalog,
 };
 pub use bcode_agent_runtime::{
     InvocationArtifactSink, InvocationCapabilities, InvocationCapabilityFuture,
@@ -1300,27 +1301,61 @@ impl TurnEventSink for ScopedAgentEventSink {
     }
 }
 
-fn append_provider_tool_calls(
-    messages: &mut Vec<ModelMessage>,
-    response: &AgentTurnResponse,
-    calls: &[ToolCall],
-) {
-    let mut content = Vec::with_capacity(calls.len() + 1);
-    if !response.text.is_empty() {
-        content.push(ModelContentBlock::Text {
-            text: response.text.clone(),
-        });
+struct SdkToolRoundObserver<'a> {
+    agent: &'a Agent,
+    error: Mutex<Option<BcodeError>>,
+}
+
+impl SdkToolRoundObserver<'_> {
+    fn record_error(&self, error: BcodeError) -> RuntimeError {
+        let message = error.to_string();
+        *self
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        RuntimeError::HostExtension(message)
     }
-    content.extend(
-        calls
-            .iter()
-            .cloned()
-            .map(|call| ModelContentBlock::ToolCall { call }),
-    );
-    messages.push(ModelMessage {
-        role: MessageRole::Assistant,
-        content,
-    });
+
+    fn take_error(&self) -> Option<BcodeError> {
+        self.error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl ToolRoundObserver for SdkToolRoundObserver<'_> {
+    fn before_tool_batch(&self, calls: &[ToolCall]) -> bcode_agent_runtime::Result<()> {
+        for call in calls {
+            self.agent
+                .hooks
+                .run_before_tool(&ToolCallContext {
+                    agent_name: self.agent.name.clone(),
+                    call: call.clone(),
+                })
+                .map_err(|error| self.record_error(error))?;
+        }
+        Ok(())
+    }
+
+    fn after_tool_call(
+        &self,
+        call: &ToolCall,
+        output: &ToolExecutionOutput,
+    ) -> bcode_agent_runtime::Result<()> {
+        self.agent
+            .hooks
+            .run_after_tool(
+                &ToolCallContext {
+                    agent_name: self.agent.name.clone(),
+                    call: call.clone(),
+                },
+                &ToolCallOutcome {
+                    output: output.clone(),
+                },
+            )
+            .map_err(|error| self.record_error(error))
+    }
 }
 
 fn structured_prompt(prompt: &str, options: &StructuredOutputOptions) -> String {
@@ -3130,173 +3165,50 @@ impl Agent {
     async fn run_provider_tool_loop<P>(
         &self,
         provider: &mut P,
-        mut request: AgentTurnRequest,
+        request: AgentTurnRequest,
         events: Arc<dyn TurnEventSink>,
     ) -> Result<AgentTurnResponse>
     where
         P: ModelProviderInvoker + ?Sized,
     {
-        let scope = self.runtime.begin_turn_scope(
-            format!("sdk-agent:{}", self.session_id),
-            events,
-            self.invocation_capabilities.clone(),
-        );
+        let default_invoker = SdkToolInvoker {
+            handlers: self.inline_tool_handlers.clone(),
+            #[cfg(feature = "embedded-plugins")]
+            session_id: self.session_id,
+            #[cfg(feature = "embedded-plugins")]
+            plugins: self.plugins.clone(),
+        };
+        let invoker = self.tool_invoker.as_deref().unwrap_or(&default_invoker);
+        let policy_authorization =
+            PermissionPolicyAuthorization::new(self.permission_policy.as_ref());
+        let authorization = self
+            .authorization_coordinator
+            .as_deref()
+            .unwrap_or(&policy_authorization);
+        let observer = SdkToolRoundObserver {
+            agent: self,
+            error: Mutex::new(None),
+        };
         let result = self
-            .run_provider_tool_loop_in_scope(provider, &mut request, &scope)
+            .runtime
+            .run_provider_tool_loop(
+                provider,
+                request,
+                &self.tool_catalog,
+                authorization,
+                invoker,
+                &self.permission_context(),
+                &[],
+                self.execution_options,
+                events,
+                self.invocation_capabilities.clone(),
+                &observer,
+            )
             .await;
-        match result {
-            Ok(response) if self.runtime.complete_turn_scope(&scope) => Ok(response),
-            Ok(_) => Err(RuntimeError::Cancelled.into()),
-            Err(error) => {
-                let _ = self.runtime.cancel_turn_scope(&scope);
-                Err(error)
-            }
+        if let Some(error) = observer.take_error() {
+            return Err(error);
         }
-    }
-
-    async fn run_provider_tool_loop_in_scope<P>(
-        &self,
-        provider: &mut P,
-        request: &mut AgentTurnRequest,
-        scope: &TurnScope,
-    ) -> Result<AgentTurnResponse>
-    where
-        P: ModelProviderInvoker + ?Sized,
-    {
-        let mut rounds = ToolRoundState::new(request.max_tool_rounds);
-        let started = Instant::now();
-        let timeout = request.timeout;
-        let mut all_events = Vec::new();
-        let mut messages = request.messages.clone();
-        if request.append_prompt {
-            messages.push(ModelMessage {
-                role: MessageRole::User,
-                content: vec![ModelContentBlock::Text {
-                    text: request.prompt.clone(),
-                }],
-            });
-        }
-
-        loop {
-            request.timeout = timeout
-                .checked_sub(started.elapsed())
-                .ok_or(RuntimeError::Timeout { timeout })?;
-            let response = self
-                .runtime
-                .run_text_turn_in_scope(provider, request, scope)
-                .await?;
-            all_events.extend(response.events.iter().cloned());
-            let calls = response
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    AgentEvent::ToolCallFinished(call) => Some(call.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-
-            if response.stop_reason != Some(StopReason::ToolCall) {
-                return Ok(AgentTurnResponse {
-                    text: response.text,
-                    stop_reason: response.stop_reason,
-                    usage: response.usage,
-                    latency_ms: started.elapsed().as_millis(),
-                    events: all_events,
-                });
-            }
-            if calls.is_empty() {
-                return Err(BcodeError::ToolExecution(
-                    "provider finished with tool_call but emitted no completed tool calls"
-                        .to_string(),
-                ));
-            }
-
-            append_provider_tool_calls(&mut messages, &response, &calls);
-            self.run_before_tool_hooks(&calls)?;
-            let cancellation = request.cancellation.clone();
-            let remaining = timeout
-                .checked_sub(started.elapsed())
-                .ok_or(RuntimeError::Timeout { timeout })?;
-            let batch = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    let _ = self.runtime.cancel_turn_scope(scope);
-                    return Err(RuntimeError::Cancelled.into());
-                }
-                () = tokio::time::sleep(remaining) => {
-                    let _ = self.runtime.cancel_turn_scope(scope);
-                    return Err(RuntimeError::Timeout { timeout }.into());
-                }
-                batch = self.execute_tool_batch_in_scope(&calls, &mut rounds, scope) => batch?,
-            };
-
-            self.append_tool_results(&mut messages, &mut all_events, &calls, batch, scope)?;
-            request.messages.clone_from(&messages);
-            request.prompt.clear();
-            request.append_prompt = false;
-        }
-    }
-
-    fn run_before_tool_hooks(&self, calls: &[ToolCall]) -> Result<()> {
-        for call in calls {
-            self.hooks.run_before_tool(&ToolCallContext {
-                agent_name: self.name.clone(),
-                call: call.clone(),
-            })?;
-        }
-        Ok(())
-    }
-
-    fn append_tool_results(
-        &self,
-        messages: &mut Vec<ModelMessage>,
-        all_events: &mut Vec<AgentEvent>,
-        calls: &[ToolCall],
-        batch: ToolBatchExecutionOutput,
-        scope: &TurnScope,
-    ) -> Result<()> {
-        for (call, result) in calls.iter().zip(batch.results) {
-            let model_result = match result {
-                Ok(output) => {
-                    self.hooks.run_after_tool(
-                        &ToolCallContext {
-                            agent_name: self.name.clone(),
-                            call: call.clone(),
-                        },
-                        &ToolCallOutcome {
-                            output: output.clone(),
-                        },
-                    )?;
-                    if let Some(event) = output.events.into_iter().find_map(|event| {
-                        matches!(event, AgentEvent::ToolResult(_)).then_some(event)
-                    }) {
-                        all_events.push(event);
-                    }
-                    output.model_result
-                }
-                Err(error) => {
-                    let result = bcode_model::ToolResult {
-                        call_id: call.id.clone(),
-                        output: error.to_string(),
-                        is_error: true,
-                        content: Vec::new(),
-                    };
-                    let event = AgentEvent::ToolResult(result.clone());
-                    if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
-                        return Err(RuntimeError::Cancelled.into());
-                    }
-                    all_events.push(event);
-                    result
-                }
-            };
-            messages.push(ModelMessage {
-                role: MessageRole::Tool,
-                content: vec![ModelContentBlock::ToolResult {
-                    result: model_result,
-                }],
-            });
-        }
-        Ok(())
+        result.map_err(Into::into)
     }
 
     fn permission_context(&self) -> RuntimePermissionContext {
