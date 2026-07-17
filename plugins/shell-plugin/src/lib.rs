@@ -2705,10 +2705,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn thousands_of_small_pty_chunks_emit_only_linear_artifact_notifications() {
-        const CHUNKS: usize = 4_096;
-        const CHUNK_BYTES: usize = 17;
+    #[derive(Debug)]
+    struct ChunkWorkloadMetrics {
+        raw_bytes: usize,
+        recording_bytes: u64,
+        notification_count: usize,
+        ipc_bytes: usize,
+    }
+
+    fn run_small_chunk_workload(chunks: usize, chunk_bytes: usize) -> ChunkWorkloadMetrics {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("many-chunks.bcsr");
         let events = Mutex::new(Vec::<Vec<u8>>::new());
@@ -2718,8 +2723,8 @@ mod tests {
         );
         let mut output = read_limited_streaming(
             FixedChunkReader {
-                remaining_chunks: CHUNKS,
-                chunk: vec![b'x'; CHUNK_BYTES],
+                remaining_chunks: chunks,
+                chunk: vec![b'x'; chunk_bytes],
             },
             emitter,
             "many-chunks",
@@ -2764,12 +2769,11 @@ mod tests {
             committed = committed_bytes;
             revisions = revisions.max(usize::try_from(revision).unwrap_or(usize::MAX));
         }
+        let notification_count = events.len();
         drop(events);
         let recording_bytes = std::fs::metadata(&path).expect("recording metadata").len();
-        let raw_bytes = CHUNKS.saturating_mul(CHUNK_BYTES);
-        assert!(revisions <= CHUNKS.saturating_mul(2).saturating_add(2));
-        assert!(recording_bytes <= u64::try_from(raw_bytes.saturating_mul(6)).unwrap_or(u64::MAX));
-        assert!(ipc_bytes <= raw_bytes.saturating_mul(64));
+        let raw_bytes = chunks.saturating_mul(chunk_bytes);
+        assert!(revisions <= chunks.saturating_mul(2).saturating_add(2));
         let (_, frames) = recording::read_recording(&path).expect("recording");
         let exact_output_bytes = frames
             .iter()
@@ -2779,6 +2783,46 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(exact_output_bytes, raw_bytes);
+        ChunkWorkloadMetrics {
+            raw_bytes,
+            recording_bytes,
+            notification_count,
+            ipc_bytes,
+        }
+    }
+
+    #[test]
+    fn thousands_of_small_pty_chunks_emit_only_linear_artifact_notifications() {
+        let metrics = run_small_chunk_workload(4_096, 17);
+        assert!(
+            metrics.recording_bytes
+                <= u64::try_from(metrics.raw_bytes.saturating_mul(6)).unwrap_or(u64::MAX)
+        );
+        assert!(metrics.ipc_bytes <= metrics.raw_bytes.saturating_mul(64));
+    }
+
+    #[test]
+    fn live_notification_transport_scales_linearly_with_recording_input() {
+        let small = run_small_chunk_workload(512, 17);
+        let large = run_small_chunk_workload(4_096, 17);
+        let input_scale = large.raw_bytes / small.raw_bytes;
+
+        assert_eq!(input_scale, 8);
+        assert!(large.notification_count <= small.notification_count.saturating_mul(input_scale));
+        assert!(
+            large.ipc_bytes
+                <= small
+                    .ipc_bytes
+                    .saturating_mul(input_scale)
+                    .saturating_mul(2)
+        );
+        assert!(
+            large.recording_bytes
+                <= small
+                    .recording_bytes
+                    .saturating_mul(u64::try_from(input_scale).expect("scale"))
+                    .saturating_mul(2)
+        );
     }
 
     #[test]
