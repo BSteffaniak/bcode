@@ -32,7 +32,7 @@ use bcode_tool::{
     ToolResultContent as InvocationToolResultContent,
 };
 use futures::{StreamExt, stream};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -107,6 +107,9 @@ pub enum RuntimeError {
         /// Actual response count.
         actual: usize,
     },
+    /// A host supplied invalid or oversized opaque tool context.
+    #[error("invalid tool host context: {0}")]
+    InvalidToolHostContext(String),
     /// Tool preparation failed.
     #[error("tool preparation failed for {tool_name}: {message}")]
     ToolPreparation {
@@ -1035,9 +1038,10 @@ impl AgentRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error when the tool-round budget is exhausted, an authorization adapter returns
-    /// an invalid response, or authorization cannot complete. Per-call resolution, preparation,
-    /// denial, cancellation, and invocation failures are returned in the ordered batch output.
+    /// Returns an error when the tool-round budget is exhausted, host context is invalid or
+    /// oversized, an authorization adapter returns an invalid response, or authorization cannot
+    /// complete. Per-call resolution, preparation, denial, cancellation, and invocation failures
+    /// are returned in the ordered batch output.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_prepared_tool_batch_with_host_context<C, A, I>(
         &self,
@@ -1056,6 +1060,7 @@ impl AgentRuntime {
         A: ToolAuthorizationCoordinator + ?Sized,
         I: ToolInvoker + Sync + ?Sized,
     {
+        validate_tool_host_context(host_context)?;
         if calls.is_empty() {
             return Ok(empty_batch_output());
         }
@@ -1707,6 +1712,66 @@ where
         }
     }
     prepared
+}
+
+const TOOL_HOST_CONTEXT_MAX_ENTRIES: usize = 32;
+const TOOL_HOST_CONTEXT_SCHEMA_MAX_BYTES: usize = 128;
+const TOOL_HOST_CONTEXT_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
+const TOOL_HOST_CONTEXT_TOTAL_MAX_BYTES: usize = 256 * 1024;
+
+fn validate_tool_host_context(host_context: &[bcode_tool::ToolHostContextEntry]) -> Result<()> {
+    if host_context.len() > TOOL_HOST_CONTEXT_MAX_ENTRIES {
+        return Err(RuntimeError::InvalidToolHostContext(format!(
+            "received {} entries; maximum is {TOOL_HOST_CONTEXT_MAX_ENTRIES}",
+            host_context.len()
+        )));
+    }
+
+    let mut identities = BTreeSet::new();
+    for entry in host_context {
+        if entry.schema.is_empty() {
+            return Err(RuntimeError::InvalidToolHostContext(
+                "schema identifier must not be empty".to_string(),
+            ));
+        }
+        if entry.schema.len() > TOOL_HOST_CONTEXT_SCHEMA_MAX_BYTES {
+            return Err(RuntimeError::InvalidToolHostContext(format!(
+                "schema identifier is {} bytes; maximum is {TOOL_HOST_CONTEXT_SCHEMA_MAX_BYTES}",
+                entry.schema.len()
+            )));
+        }
+        if entry.schema_version == 0 {
+            return Err(RuntimeError::InvalidToolHostContext(format!(
+                "schema {} has version zero",
+                entry.schema
+            )));
+        }
+        if !identities.insert((entry.schema.as_str(), entry.schema_version)) {
+            return Err(RuntimeError::InvalidToolHostContext(format!(
+                "duplicate schema {} version {}",
+                entry.schema, entry.schema_version
+            )));
+        }
+        let payload_bytes = serde_json::to_vec(&entry.payload)
+            .expect("serializing a serde_json::Value cannot fail")
+            .len();
+        if payload_bytes > TOOL_HOST_CONTEXT_PAYLOAD_MAX_BYTES {
+            return Err(RuntimeError::InvalidToolHostContext(format!(
+                "schema {} payload is {payload_bytes} bytes; maximum is {TOOL_HOST_CONTEXT_PAYLOAD_MAX_BYTES}",
+                entry.schema
+            )));
+        }
+    }
+
+    let total_bytes = serde_json::to_vec(host_context)
+        .expect("serializing tool host context cannot fail")
+        .len();
+    if total_bytes > TOOL_HOST_CONTEXT_TOTAL_MAX_BYTES {
+        return Err(RuntimeError::InvalidToolHostContext(format!(
+            "serialized context is {total_bytes} bytes; maximum is {TOOL_HOST_CONTEXT_TOTAL_MAX_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 fn tool_invocation_descriptor(call: &ToolCall) -> ToolInvocationDescriptor {
@@ -2958,6 +3023,113 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             host_context
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_host_context_is_rejected_before_preparation() {
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("first"));
+        let calls = [ToolCall {
+            id: "call-1".to_string(),
+            name: "first".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        let host_context = [
+            bcode_tool::ToolHostContextEntry {
+                schema: "example.duplicate".to_string(),
+                schema_version: 1,
+                payload: serde_json::Value::Null,
+            },
+            bcode_tool::ToolHostContextEntry {
+                schema: "example.duplicate".to_string(),
+                schema_version: 1,
+                payload: serde_json::Value::Null,
+            },
+        ];
+        let invoker = HostContextInvoker::default();
+        let mut rounds = ToolRoundState::new(1);
+
+        let error = AgentRuntime::new()
+            .execute_prepared_tool_batch_with_host_context(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                &host_context,
+                ToolExecutionOptions::default(),
+                &TurnScope::without_events("turn", TurnGeneration::new(1)),
+            )
+            .await
+            .expect_err("duplicate host context should fail");
+
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidToolHostContext(message)
+                if message.contains("duplicate schema example.duplicate version 1")
+        ));
+        assert_eq!(rounds.completed_rounds(), 0);
+        assert!(
+            invoker
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_context_validation_enforces_transport_bounds() {
+        let entry = |schema: String, schema_version, payload| bcode_tool::ToolHostContextEntry {
+            schema,
+            schema_version,
+            payload,
+        };
+        let maximum_count = (0..TOOL_HOST_CONTEXT_MAX_ENTRIES)
+            .map(|index| entry(format!("example.{index}"), 1, serde_json::Value::Null))
+            .collect::<Vec<_>>();
+        assert!(validate_tool_host_context(&maximum_count).is_ok());
+
+        let too_many = (0..=TOOL_HOST_CONTEXT_MAX_ENTRIES)
+            .map(|index| entry(format!("example.{index}"), 1, serde_json::Value::Null))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_tool_host_context(&too_many),
+            Err(RuntimeError::InvalidToolHostContext(message))
+                if message.contains("maximum is 32")
+        ));
+        assert!(matches!(
+            validate_tool_host_context(&[entry(
+                "x".repeat(TOOL_HOST_CONTEXT_SCHEMA_MAX_BYTES + 1),
+                1,
+                serde_json::Value::Null,
+            )]),
+            Err(RuntimeError::InvalidToolHostContext(message))
+                if message.contains("schema identifier")
+        ));
+        assert!(matches!(
+            validate_tool_host_context(&[entry(
+                "example.payload".to_string(),
+                1,
+                serde_json::Value::String("x".repeat(TOOL_HOST_CONTEXT_PAYLOAD_MAX_BYTES)),
+            )]),
+            Err(RuntimeError::InvalidToolHostContext(message))
+                if message.contains("payload")
+        ));
+        let excessive_total = (0..5)
+            .map(|index| {
+                entry(
+                    format!("example.total.{index}"),
+                    1,
+                    serde_json::Value::String("x".repeat(60_000)),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_tool_host_context(&excessive_total),
+            Err(RuntimeError::InvalidToolHostContext(message))
+                if message.contains("serialized context")
+        ));
     }
 
     #[tokio::test]
