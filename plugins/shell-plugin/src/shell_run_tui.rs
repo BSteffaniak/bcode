@@ -1818,6 +1818,29 @@ mod tests {
         writer
             .finish(6, Some(0), None, false, false)
             .expect("finish recording");
+        let (_, frames) = crate::recording::read_recording(&path).expect("recording frames");
+        let exact_bytes = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                crate::recording::ShellRecordingFrame::Output { bytes, .. } => {
+                    Some(bytes.as_slice())
+                }
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exact_bytes,
+            [
+                b"valid ".as_slice(),
+                &[0xe7],
+                &[0x95, 0x8c],
+                &[b' ', 0xff, b' ', b'e', 0xcc],
+                &[0x81, b'\n'],
+            ]
+            .concat()
+        );
         let payload = authoritative_recording_payload(&path);
         let rendered = render_rows(&payload)
             .iter()
