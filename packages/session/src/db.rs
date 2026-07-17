@@ -1127,13 +1127,15 @@ impl SessionDb {
     ///
     /// Returns an error if event serialization, event insertion, projection updates, or commit
     /// fail.
-    pub async fn append_event_with_activity_timestamp(
+    async fn append_event_for_writer_epoch(
         &self,
         event: &SessionEvent,
         activity_timestamp_ms: Option<u64>,
+        writer_epoch: u32,
     ) -> SessionDbResult<()> {
         let tx = self.db.begin_transaction().await?;
-        validate_append_preconditions(&*tx, event).await?;
+        validate_storage_writer_contract_for_epoch(&*tx, writer_epoch).await?;
+        validate_append_preconditions_without_writer(&*tx, event).await?;
         insert_event(&*tx, event, activity_timestamp_ms).await?;
         project_materialized_event(&*tx, event).await?;
         project_model_context_event(&*tx, event).await?;
@@ -1142,6 +1144,25 @@ impl SessionDb {
         validate_append_postconditions(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Append an event with the manager-assigned activity timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writer compatibility, event insertion, projection updates, or commit
+    /// fail.
+    pub async fn append_event_with_activity_timestamp(
+        &self,
+        event: &SessionEvent,
+        activity_timestamp_ms: Option<u64>,
+    ) -> SessionDbResult<()> {
+        self.append_event_for_writer_epoch(
+            event,
+            activity_timestamp_ms,
+            CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+        )
+        .await
     }
     /// Return the last event sequence processed by a materialized projection, if known.
     ///
@@ -2270,7 +2291,10 @@ fn add_sql_migration(
     ));
 }
 
-async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<()> {
+async fn validate_storage_writer_contract_for_epoch(
+    db: &dyn Database,
+    expected_writer_epoch: u32,
+) -> SessionDbResult<()> {
     let row = db
         .select("session_storage_contract")
         .columns(&["schema_version", "writer_epoch"])
@@ -2280,7 +2304,7 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
     let Some(row) = row.as_ref() else {
         return Err(SessionDbError::WriterIncompatible {
             actual: Some(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
-            expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            expected: u64::from(expected_writer_epoch),
         });
     };
     let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
@@ -2292,7 +2316,7 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
         });
     }
     let actual = required_i64(row, "writer_epoch").map(i64_to_u64)?;
-    let expected = u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH);
+    let expected = u64::from(expected_writer_epoch);
     if actual != expected {
         return Err(SessionDbError::WriterIncompatible {
             actual: Some(actual),
@@ -2300,6 +2324,10 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
         });
     }
     Ok(())
+}
+
+async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<()> {
+    validate_storage_writer_contract_for_epoch(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await
 }
 
 async fn last_event_sequence_from_database(db: &dyn Database) -> SessionDbResult<Option<u64>> {
@@ -2433,11 +2461,10 @@ async fn validate_context_occupancy_precondition(
     Ok(())
 }
 
-async fn validate_append_preconditions(
+async fn validate_append_preconditions_without_writer(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    validate_storage_writer_contract(db).await?;
     let canonical_tail = last_event_sequence_from_database(db).await?;
     let expected_sequence = canonical_tail.map_or(0, |tail| tail.saturating_add(1));
     if event.sequence != expected_sequence {
@@ -4717,6 +4744,157 @@ mod tests {
             .await
             .expect("compatibility context");
         assert_eq!(context, compatibility);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mixed_version_incident_is_blocked_before_canonical_divergence() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("initialize session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "legacy history through N".to_string(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ))
+        .await
+        .expect("append history through N");
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
+            )
+            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+            .execute(db.database())
+            .await
+            .expect("set legacy writer epoch");
+        db.database()
+            .update("model_context_projection_state")
+            .value("schema_version", DatabaseValue::Int64(1))
+            .execute(db.database())
+            .await
+            .expect("set legacy model-context schema");
+        drop(db);
+
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
+            .expect("write guard");
+        let migrated =
+            SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                .await
+                .expect("exclusive storage migration");
+        assert_eq!(
+            migrated.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        assert_eq!(
+            migrated
+                .model_context_projection_status()
+                .await
+                .expect("model-context status"),
+            ModelContextProjectionStatus::Fresh { checkpoint: 0 }
+        );
+        drop(write);
+        drop(maintenance);
+
+        let rejected = event(
+            session_id,
+            1,
+            SessionEventKind::AssistantMessage {
+                text: "incompatible writer must not commit".to_string(),
+            },
+        );
+        let error = migrated
+            .append_event_for_writer_epoch(&rejected, None, LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+            .await
+            .expect_err("legacy writer must be fenced before canonical insert");
+        assert!(matches!(
+            error,
+            SessionDbError::WriterIncompatible {
+                actual: Some(actual),
+                expected
+            } if actual == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+                && expected == u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+        ));
+        assert_eq!(
+            migrated
+                .last_event_sequence()
+                .await
+                .expect("canonical tail"),
+            Some(0)
+        );
+        for projection in MaterializedProjection::all() {
+            assert_eq!(
+                migrated
+                    .materialized_projection_checkpoint(*projection)
+                    .await
+                    .expect("projection checkpoint"),
+                Some(0),
+                "projection {} must remain fresh at N",
+                projection.as_str()
+            );
+        }
+        assert_eq!(
+            migrated
+                .model_context_events()
+                .await
+                .expect("model context")
+                .len(),
+            1
+        );
+
+        migrated
+            .append_event(&event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "compatible append".to_string(),
+                },
+            ))
+            .await
+            .expect("compatible writer should append N+1");
+        assert_eq!(
+            migrated
+                .last_event_sequence()
+                .await
+                .expect("canonical tail"),
+            Some(1)
+        );
+        for projection in MaterializedProjection::all() {
+            assert_eq!(
+                migrated
+                    .materialized_projection_checkpoint(*projection)
+                    .await
+                    .expect("projection checkpoint"),
+                Some(1),
+                "projection {} must advance atomically to N+1",
+                projection.as_str()
+            );
+        }
+        assert_eq!(
+            migrated
+                .model_context_projection_status()
+                .await
+                .expect("model-context status"),
+            ModelContextProjectionStatus::Fresh { checkpoint: 1 }
+        );
+        assert_eq!(
+            migrated
+                .model_context_events()
+                .await
+                .expect("model context")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

@@ -85,7 +85,7 @@ if ! grep -q 'ModelContextProjectionVersion' <<<"$model_context_projector" \
   violations=1
 fi
 
-if ! rg -q 'validate_storage_writer_contract\(db\).*await' packages/session/src/db.rs \
+if ! rg -q 'validate_storage_writer_contract_for_epoch\(&\*tx, writer_epoch\)\.await' packages/session/src/db.rs \
   || ! rg -q 'session_storage_contract' packages/session/src/db.rs; then
   echo "Session writer contract violation: durable appends require explicit writer-epoch validation." >&2
   violations=1
