@@ -187,6 +187,14 @@ impl ChatLoopState {
         }
     }
 
+    fn retain_artifact_fetches_for_session(
+        &mut self,
+        session_id: Option<bcode_session_models::SessionId>,
+    ) {
+        self.artifact_fetches
+            .retain(|key, _| Some(key.0) == session_id);
+    }
+
     fn observe_finalized_artifact(
         &mut self,
         session_id: bcode_session_models::SessionId,
@@ -842,6 +850,7 @@ async fn run_chat_loop<W: Write>(
             .sync_automation_hold(client, chat.session_id)
             .await?;
         if before_session_id != chat.session_id {
+            loop_state.retain_artifact_fetches_for_session(chat.session_id);
             draft_autosave.last_saved_text = None;
             draft_autosave.dirty = true;
             draft_autosave.save_at = Some(Instant::now());
@@ -936,6 +945,9 @@ fn apply_effect_result(
             has_older_history,
             result,
         } => {
+            if result.is_ok() {
+                loop_state.retain_artifact_fetches_for_session(Some(session_id));
+            }
             if let Ok((attached, _)) = &result {
                 for event in &attached.history {
                     loop_state.observe_finalized_artifact(
