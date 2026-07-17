@@ -75,6 +75,36 @@ struct ActiveArtifactFetchCompletion {
     result: Result<bcode_client::SessionArtifactRange, ClientError>,
 }
 
+fn active_artifact_completion_is_current(
+    completion_session_id: bcode_session_models::SessionId,
+    current_session_id: Option<bcode_session_models::SessionId>,
+    requested_offset: u64,
+    next_offset: u64,
+) -> bool {
+    Some(completion_session_id) == current_session_id && requested_offset == next_offset
+}
+
+fn validate_active_artifact_range(
+    range: &bcode_client::SessionArtifactRange,
+    next_offset: u64,
+    target: &ActiveArtifactTarget,
+    requested_revision: u64,
+) -> Result<u64, &'static str> {
+    let expected_end = range.next_offset();
+    if range.offset != next_offset
+        || range.total_bytes < expected_end
+        || range.total_bytes > target.committed_bytes
+        || requested_revision > target.revision
+        || range.reference_revision < requested_revision
+    {
+        return Err("artifact range response did not match the requested committed prefix");
+    }
+    if range.bytes.is_empty() && next_offset < target.committed_bytes {
+        return Err("artifact range response ended before the committed boundary");
+    }
+    Ok(expected_end)
+}
+
 #[derive(Debug, Clone)]
 struct DraftAutosave {
     launch_working_directory: std::path::PathBuf,
@@ -372,12 +402,15 @@ impl ChatLoopState {
                 let Some(state) = self.artifact_fetches.get_mut(&key) else {
                     continue;
                 };
-                state.fetching = false;
-                if Some(completion.session_id) != current_session_id
-                    || completion.requested_offset != state.next_offset
-                {
+                if !active_artifact_completion_is_current(
+                    completion.session_id,
+                    current_session_id,
+                    completion.requested_offset,
+                    state.next_offset,
+                ) {
                     continue;
                 }
+                state.fetching = false;
                 let range = match completion.result {
                     Ok(range) => range,
                     Err(error) => {
@@ -388,28 +421,18 @@ impl ChatLoopState {
                 let Some(target) = state.target.clone() else {
                     continue;
                 };
-                let bytes_len = u64::try_from(range.bytes.len()).unwrap_or(u64::MAX);
-                let expected_end = range.offset.saturating_add(bytes_len);
-                let invalid_range = range.offset != state.next_offset
-                    || range.total_bytes < expected_end
-                    || range.total_bytes > target.committed_bytes
-                    || completion.target_revision > target.revision
-                    || range.reference_revision < completion.target_revision;
-                if invalid_range {
-                    Self::defer_active_artifact_fetch(
-                        state,
-                        "artifact range response did not match the requested committed prefix"
-                            .to_owned(),
-                    );
-                    continue;
-                }
-                if range.bytes.is_empty() && state.next_offset < target.committed_bytes {
-                    Self::defer_active_artifact_fetch(
-                        state,
-                        "artifact range response ended before the committed boundary".to_owned(),
-                    );
-                    continue;
-                }
+                let expected_end = match validate_active_artifact_range(
+                    &range,
+                    state.next_offset,
+                    &target,
+                    completion.target_revision,
+                ) {
+                    Ok(expected_end) => expected_end,
+                    Err(error) => {
+                        Self::defer_active_artifact_fetch(state, error.to_owned());
+                        continue;
+                    }
+                };
                 if range.bytes.is_empty() {
                     state.consecutive_failures = 0;
                     state.retry_at = None;
@@ -2471,5 +2494,94 @@ fn paste_clipboard_image(chat: &mut ActiveChat) {
         Err(error) => {
             chat.app.set_status(format!("image paste failed: {error}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod artifact_fetch_tests {
+    use super::*;
+
+    fn target(committed_bytes: u64, revision: u64, finalized: bool) -> ActiveArtifactTarget {
+        ActiveArtifactTarget {
+            producer_plugin_id: "plugin".to_owned(),
+            schema: "plugin.artifact".to_owned(),
+            schema_version: 1,
+            content_type: Some("application/octet-stream".to_owned()),
+            committed_bytes,
+            revision,
+            finalized,
+        }
+    }
+
+    fn range(
+        offset: u64,
+        total_bytes: u64,
+        revision: u64,
+        bytes: &[u8],
+    ) -> bcode_client::SessionArtifactRange {
+        bcode_client::SessionArtifactRange {
+            artifact_id: "artifact".to_owned(),
+            reference_key: "recording".to_owned(),
+            content_type: Some("application/octet-stream".to_owned()),
+            offset,
+            total_bytes,
+            reference_bytes: Some(total_bytes),
+            reference_revision: revision,
+            finalized: false,
+            finalized_event_seq: None,
+            availability: Some("active".to_owned()),
+            complete: Some(false),
+            checksum_sha256: None,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn range_validation_accepts_short_nonempty_pages_and_finalized_growth() {
+        let active = target(10, 2, false);
+        assert_eq!(
+            validate_active_artifact_range(&range(0, 10, 2, b"abc"), 0, &active, 2),
+            Ok(3)
+        );
+
+        let finalized = target(12, 3, true);
+        assert_eq!(
+            validate_active_artifact_range(&range(3, 12, 3, b"def"), 3, &finalized, 2),
+            Ok(6)
+        );
+    }
+
+    #[test]
+    fn range_validation_retries_empty_short_and_inconsistent_responses() {
+        let target = target(10, 2, false);
+        assert!(validate_active_artifact_range(&range(0, 10, 2, b""), 0, &target, 2).is_err());
+        assert!(validate_active_artifact_range(&range(1, 10, 2, b"abc"), 0, &target, 2).is_err());
+        assert!(validate_active_artifact_range(&range(0, 11, 2, b"abc"), 0, &target, 2).is_err());
+        assert!(validate_active_artifact_range(&range(0, 10, 1, b"abc"), 0, &target, 2).is_err());
+    }
+
+    #[test]
+    fn lagged_duplicate_and_cross_session_completions_are_ignored() {
+        let session = bcode_session_models::SessionId::new();
+        let other = bcode_session_models::SessionId::new();
+        assert!(active_artifact_completion_is_current(
+            session,
+            Some(session),
+            3,
+            3
+        ));
+        assert!(!active_artifact_completion_is_current(
+            session,
+            Some(session),
+            0,
+            3
+        ));
+        assert!(!active_artifact_completion_is_current(
+            session,
+            Some(other),
+            3,
+            3
+        ));
+        assert!(!active_artifact_completion_is_current(session, None, 3, 3));
     }
 }
