@@ -1787,6 +1787,11 @@ pub async fn run_with_static_bundled(
         plugin_configs,
     )?;
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");
+    let recovered_sessions =
+        bcode_session::recover_accidental_epoch_session_root(&bcode_config::default_state_dir())?;
+    if recovered_sessions > 0 {
+        tracing::info!(target: "bcode_server::startup", recovered_sessions, "restored sessions to canonical storage root");
+    }
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;
     let daemon_record = register_daemon(&endpoint)?;
@@ -3003,6 +3008,20 @@ async fn handle_list_sessions(
         .session_catalog
         .snapshot(state, working_directory)
         .await;
+    let snapshot = if matches!(snapshot.status, SessionCatalogStatus::Loading) {
+        state
+            .sessions
+            .wait_catalog_loaded()
+            .await
+            .map_err(ServerError::SessionStore)?;
+        state.session_catalog.refresh_native_now(state).await;
+        state
+            .session_catalog
+            .snapshot(state, working_directory)
+            .await
+    } else {
+        snapshot
+    };
     send_response(
         writer,
         request_id,
@@ -19464,7 +19483,7 @@ async fn active_skill_contexts(
 }
 
 fn default_session_store_dir() -> PathBuf {
-    bcode_session::current_session_storage_root(&bcode_config::default_state_dir())
+    bcode_config::default_state_dir().join("sessions")
 }
 
 fn default_provider_state_path() -> PathBuf {
@@ -20610,10 +20629,10 @@ library = "test"
     }
 
     #[test]
-    fn default_session_store_uses_current_writer_epoch_domain() {
+    fn default_session_store_uses_canonical_sessions_directory() {
         assert_eq!(
             default_session_store_dir(),
-            bcode_session::current_session_storage_root(&bcode_config::default_state_dir())
+            bcode_config::default_state_dir().join("sessions")
         );
     }
 

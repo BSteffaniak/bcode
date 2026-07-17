@@ -10,10 +10,11 @@ if rg -n 'incompatible_storage_writer_records|ensure_daemon_storage_compatibilit
   violations=1
 fi
 
-if rg -n 'default_state_dir\(\)\.join\("sessions"\)' packages/server/src packages/cli/src --glob '*.rs' \
-  >/tmp/bcode-legacy-session-root-mutation-violations.txt; then
-  echo "Session storage-domain violation: current server/CLI paths must use the writer-epoch storage root." >&2
-  cat /tmp/bcode-legacy-session-root-mutation-violations.txt >&2
+if ! rg -q 'default_state_dir\(\)\.join\("sessions"\)' packages/server/src/lib.rs \
+  || rg -n 'session-storage|writer-epoch-' packages/server/src packages/cli/src --glob '*.rs' \
+    >/tmp/bcode-split-session-root-violations.txt; then
+  echo "Session storage-root violation: all sessions must use the canonical sessions directory; writer epochs are per-session metadata." >&2
+  cat /tmp/bcode-split-session-root-violations.txt >&2 2>/dev/null || true
   violations=1
 fi
 

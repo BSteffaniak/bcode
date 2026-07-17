@@ -68,23 +68,16 @@ incompatible daemon from claiming the session between model/tool operations. Cat
 listing remain lease-free.
 
 Daemon build fingerprints isolate IPC endpoints and client routing; they are not a global storage
-lock. Different fingerprints and writer epochs may run concurrently. Session storage is instead
-partitioned by durable writer epoch under `session-storage/writer-epoch-<epoch>/`, so all builds
-implementing the same contract share one domain while incompatible and pre-contract binaries cannot
-mutate the same physical databases. The pre-contract `sessions/` root is legacy storage and current
-runtime/maintenance paths must not write it implicitly.
+lock. Different fingerprints and writer epochs may run concurrently. Every session remains under
+the single canonical `sessions/<session-id>/` root. Compatibility is enforced per session through
+its lease metadata and durable database writer contract; writer epochs never select a filesystem
+root or hide sessions from the catalog.
 
 Each daemon registry record advertises its writer epoch for diagnostics and optional administration.
-`bcode server retire-incompatible` is optional and is never part of normal daemon startup. It may be
-used before an explicit identity-preserving legacy migration, where the non-cooperating legacy
-writer must be quiescent; unrelated old daemons do not block startup or current-domain work.
-
-Legacy sessions remain in the pre-contract `sessions/` root and are never opened by current runtime
-paths. `bcode session legacy list` performs strict, non-mutating discovery there. `bcode session
-legacy snapshot <id>` strictly reads one canonical snapshot and copies it into the current epoch
-domain under a new session id with clone lineage; it leaves the source untouched and does not
-require legacy daemon retirement. This is a point-in-time fork, not synchronization. Preserving the
-same identity still requires a separate target-quiesced migration.
+`bcode server retire-incompatible` is optional and is never part of normal daemon startup. An
+incompatible daemon may run concurrently, but its attempt to claim or mutate a session owned by a
+different epoch fails specifically for that session. Explicit migration requires exclusive target
+session maintenance ownership; unrelated old daemons do not block startup or other sessions.
 
 ## Projection append invariants
 

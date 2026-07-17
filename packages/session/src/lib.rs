@@ -14,29 +14,55 @@
 //! Normal model-context reads return that marker plus later semantic events without replaying or
 //! repairing the complete event log.
 
-use std::path::{Path, PathBuf};
-
-/// Return the pre-contract session-storage root used by legacy daemon generations.
-#[must_use]
-pub fn legacy_session_storage_root(state_dir: &Path) -> PathBuf {
-    state_dir.join("sessions")
-}
-
-/// Return the session-storage root for a specific durable writer epoch.
+/// Relocate sessions accidentally written to the temporary epoch-partitioned root back into the
+/// canonical session directory.
 ///
-/// Storage is shared by all builds implementing the same writer contract and isolated from
-/// incompatible or legacy writers.
-#[must_use]
-pub fn session_storage_root(state_dir: &Path, writer_epoch: u32) -> PathBuf {
-    state_dir
-        .join("session-storage")
-        .join(format!("writer-epoch-{writer_epoch}"))
-}
-
-/// Return the session-storage root owned by this build's writer contract.
-#[must_use]
-pub fn current_session_storage_root(state_dir: &Path) -> PathBuf {
-    session_storage_root(state_dir, lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+/// This is narrowly scoped remediation for the removed epoch-root implementation. Sessions with a
+/// live owner or an existing canonical destination are left untouched and retried on a later
+/// startup. No database is opened or rewritten.
+///
+/// # Errors
+///
+/// Returns an error when directory inspection, coordination, or atomic relocation fails.
+pub fn recover_accidental_epoch_session_root(state_dir: &Path) -> Result<usize, SessionStoreError> {
+    let accidental_root = state_dir.join("session-storage").join("writer-epoch-2");
+    let Ok(entries) = fs::read_dir(&accidental_root) else {
+        return Ok(0);
+    };
+    let canonical_root = state_dir.join("sessions");
+    let mut session_ids = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry.file_type().ok().filter(std::fs::FileType::is_dir)?;
+            entry.file_name().to_str()?.parse::<SessionId>().ok()
+        })
+        .collect::<Vec<_>>();
+    session_ids.sort_unstable();
+    let mut relocated = 0;
+    for session_id in session_ids {
+        let source = accidental_root.join(session_id.to_string());
+        let destination = canonical_root.join(session_id.to_string());
+        if destination.exists() {
+            continue;
+        }
+        let source_maintenance =
+            match lease::acquire_session_maintenance_guard(&accidental_root, session_id) {
+                Ok(guard) => guard,
+                Err(lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => continue,
+                Err(error) => return Err(SessionStoreError::Lease(error)),
+            };
+        let destination_maintenance =
+            lease::acquire_session_maintenance_guard(&canonical_root, session_id)?;
+        if destination.exists() {
+            continue;
+        }
+        fs::create_dir_all(&canonical_root)?;
+        fs::rename(&source, &destination)?;
+        relocated += 1;
+        drop(destination_maintenance);
+        drop(source_maintenance);
+    }
+    Ok(relocated)
 }
 
 mod actor;
@@ -65,6 +91,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -260,6 +287,8 @@ pub enum SessionStoreError {
     BlockingTask(#[from] tokio::task::JoinError),
     #[error("session catalog load failed: {0}")]
     CatalogLoad(String),
+    #[error(transparent)]
+    Lease(#[from] lease::SessionLeaseError),
 }
 
 /// Filesystem-rooted session store for DB-backed session histories.
@@ -300,19 +329,28 @@ impl SessionStore {
     }
 
     fn load_catalog(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
-        let mut sessions = BTreeMap::new();
-        if !self.catalog_db_path().exists() {
-            return Ok(sessions);
-        }
+        let mut summaries = if self.catalog_db_path().exists() {
+            self.load_global_catalog_summaries()?
+        } else {
+            Vec::new()
+        };
+        summaries.extend(self.load_session_manifests()?);
+        summaries.extend(self.load_legacy_catalog_summaries()?);
+        summaries.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+        });
+        summaries.dedup_by_key(|summary| summary.id);
 
-        for summary in self.load_global_catalog_summaries()? {
+        let mut sessions = BTreeMap::new();
+        for summary in summaries {
             let summary = match self.load_session_manifest(summary.id) {
                 Ok(Some(manifest_summary)) => manifest_summary,
                 Ok(None) | Err(_) => summary,
             };
             sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
         }
-
         Ok(sessions)
     }
 
@@ -1948,44 +1986,6 @@ impl SessionManager {
             session,
             draft: None,
         })
-    }
-
-    /// Snapshot canonical events from an external storage domain into a new current-domain session.
-    ///
-    /// The source is never mutated. The returned session has a new identity and records clone
-    /// lineage through its `SessionForked` marker.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when creating the destination or copying a canonical event fails.
-    pub async fn snapshot_external_session(
-        &self,
-        source_session_id: SessionId,
-        source_title: Option<String>,
-        working_directory: PathBuf,
-        events: Vec<SessionEvent>,
-        name: Option<String>,
-    ) -> Result<SessionSummary, SessionError> {
-        let source_cutoff_sequence = events.last().map(|event| event.sequence);
-        let display_title = source_title
-            .clone()
-            .unwrap_or_else(|| source_session_id.to_string());
-        let clone_name = normalize_session_name(name)
-            .or_else(|| Some(format!("[legacy snapshot] {display_title}")));
-        self.copy_session_events(
-            clone_name,
-            working_directory,
-            events,
-            SessionEventKind::SessionForked {
-                source_session_id,
-                source_title,
-                source_cutoff_sequence,
-                source_prompt_sequence: None,
-                forked_at_ms: self.next_activity_timestamp_ms(),
-                kind: SessionForkKind::Clone,
-            },
-        )
-        .await
     }
 
     async fn copy_session_events(
@@ -5496,30 +5496,6 @@ mod tests {
         )));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[test]
-    fn writer_epochs_have_stable_isolated_storage_roots() {
-        let state_dir = std::path::Path::new("state");
-        assert_eq!(
-            crate::session_storage_root(state_dir, 1),
-            state_dir.join("session-storage/writer-epoch-1")
-        );
-        assert_eq!(
-            crate::session_storage_root(state_dir, 2),
-            state_dir.join("session-storage/writer-epoch-2")
-        );
-        assert_ne!(
-            crate::session_storage_root(state_dir, 1),
-            crate::session_storage_root(state_dir, 2)
-        );
-        assert_eq!(
-            crate::current_session_storage_root(state_dir),
-            crate::session_storage_root(
-                state_dir,
-                crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH
-            )
-        );
     }
 
     #[tokio::test]
