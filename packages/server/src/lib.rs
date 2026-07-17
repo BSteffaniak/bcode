@@ -91,6 +91,7 @@ use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillList,
     SkillModelRequest, SkillSource, SkillToolDecision, SkillToolDecisionEntry,
     SkillToolDecisionKey, SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest,
+    SkillToolPolicyTarget,
 };
 use bcode_tool::{
     InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
@@ -101,7 +102,6 @@ use bcode_tool::{
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
     ToolList, ToolOutputStream, ToolPreparationRequest, ToolPreparationResponse, ToolResultContent,
-    ToolSideEffect,
 };
 use futures::{StreamExt, stream};
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
@@ -14939,20 +14939,21 @@ fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
     }
 }
 
-fn automation_policy_allows_tool(
+fn automation_policy_allows_operation(
     policy: Option<bcode_ipc::PluginAutomationExecutionPolicy>,
-    side_effect: ToolSideEffect,
+    is_read_only: bool,
 ) -> bool {
-    policy != Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection)
-        || side_effect == ToolSideEffect::ReadOnly
+    policy != Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection) || is_read_only
 }
 
 fn read_only_policy_denies_tool(
     policy: Option<bcode_ipc::PluginAutomationExecutionPolicy>,
-    side_effect: Option<ToolSideEffect>,
+    metadata: Option<&ToolPolicyAuthorizationMetadata>,
 ) -> bool {
     policy == Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection)
-        && side_effect.is_none_or(|side_effect| !automation_policy_allows_tool(policy, side_effect))
+        && metadata.is_none_or(|metadata| {
+            !automation_policy_allows_operation(policy, metadata.is_read_only())
+        })
 }
 
 async fn collect_model_tools(
@@ -14967,21 +14968,39 @@ async fn collect_model_tools(
         .await
         .get(&session_id)
         .copied();
-    collect_tool_definitions(state)
-        .await
-        .into_iter()
-        .filter(|tool| automation_policy_allows_tool(policy, tool.side_effect))
-        .filter(|tool| {
-            enabled_tools
-                .as_ref()
-                .is_none_or(|enabled| enabled.contains(&tool.name))
-        })
-        .map(|tool| bcode_model::ToolDefinition {
+    let mut tools = Vec::new();
+    for tool in collect_tool_definitions(state).await {
+        if enabled_tools
+            .as_ref()
+            .is_some_and(|enabled| !enabled.contains(&tool.name))
+        {
+            continue;
+        }
+        if policy == Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection) {
+            let call = bcode_model::ToolCall {
+                id: format!("catalog-{}", tool.name),
+                name: tool.name.clone(),
+                arguments: serde_json::Value::Null,
+            };
+            let Ok((_, preparation)) = prepare_server_tool(state, session_id, &call).await else {
+                continue;
+            };
+            let Ok(metadata) =
+                tool_policy_authorization_metadata(&preparation.authorization, &tool.name)
+            else {
+                continue;
+            };
+            if !metadata.is_read_only() {
+                continue;
+            }
+        }
+        tools.push(bcode_model::ToolDefinition {
             name: tool.name,
             description: tool.description,
             input_schema: tool.input_schema,
-        })
-        .collect()
+        });
+    }
+    tools
 }
 
 async fn collect_tool_definitions(state: &ServerState) -> Vec<ServiceToolDefinition> {
@@ -15105,8 +15124,8 @@ async fn prepare_server_tool(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
-) -> Result<(String, ServiceToolDefinition, ToolPreparationResponse), String> {
-    let (plugin_id, definition) = find_tool_provider(state, &call.name)
+) -> Result<(String, ToolPreparationResponse), String> {
+    let (plugin_id, _) = find_tool_provider(state, &call.name)
         .await?
         .ok_or_else(|| format!("tool not found: {}", call.name))?;
     let request = ToolPreparationRequest {
@@ -15128,7 +15147,7 @@ async fn prepare_server_tool(
         )
         .await
         .map_err(|error| error.to_string())?;
-    Ok((plugin_id, definition, preparation))
+    Ok((plugin_id, preparation))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15153,7 +15172,7 @@ async fn execute_model_tool_batch(
                 prepare_server_tool(state, session_id, &call),
             ) => preparation,
         };
-        let (plugin_id, definition, preparation) = match preparation {
+        let (plugin_id, preparation) = match preparation {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(message)) => {
                 results.push((
@@ -15208,7 +15227,7 @@ async fn execute_model_tool_batch(
             .await
             .get(&session_id)
             .copied();
-        if read_only_policy_denies_tool(policy, Some(policy_metadata.legacy_side_effect())) {
+        if read_only_policy_denies_tool(policy, Some(&policy_metadata)) {
             results.push((
                 index,
                 Some(ToolFinishedEventInput {
@@ -15236,14 +15255,7 @@ async fn execute_model_tool_batch(
             &working_directory,
         )
         .await;
-        ready.push((
-            index,
-            call,
-            working_directory,
-            plugin_id,
-            definition,
-            policy_metadata,
-        ));
+        ready.push((index, call, working_directory, plugin_id, policy_metadata));
     }
 
     if !ready.is_empty() {
@@ -15258,7 +15270,7 @@ async fn execute_model_tool_batch(
         };
         let execution_count = ready.len();
         let executions = stream::iter(ready.into_iter().map(
-            |(index, call, working_directory, plugin_id, definition, policy_metadata)| {
+            |(index, call, working_directory, plugin_id, policy_metadata)| {
                 let cancel_state = Arc::clone(&cancel_state);
                 let authorization = authorization_gate.participant();
                 let invocation_permits = invocation_permits.clone();
@@ -15271,7 +15283,6 @@ async fn execute_model_tool_batch(
                             call,
                             working_directory,
                             plugin_id,
-                            definition,
                             policy_metadata,
                             cancel_state,
                             Some(authorization),
@@ -15314,7 +15325,6 @@ async fn execute_model_tool(
     call: bcode_model::ToolCall,
     working_directory: std::path::PathBuf,
     plugin_id: String,
-    definition: ServiceToolDefinition,
     policy_metadata: ToolPolicyAuthorizationMetadata,
     cancel_state: Arc<TurnCancelState>,
     authorization: Option<BatchAuthorizationParticipant>,
@@ -15348,7 +15358,6 @@ async fn execute_model_tool(
         &call,
         &working_directory,
         &plugin_id,
-        &definition,
         &policy_metadata,
         cancel_state.as_ref(),
         authorization,
@@ -15982,7 +15991,6 @@ async fn invoke_model_tool(
     call: &bcode_model::ToolCall,
     working_directory: &std::path::Path,
     plugin_id: &str,
-    definition: &ServiceToolDefinition,
     policy_metadata: &ToolPolicyAuthorizationMetadata,
     cancel_state: &TurnCancelState,
     authorization: Option<BatchAuthorizationParticipant>,
@@ -16016,7 +16024,7 @@ async fn invoke_model_tool(
     let skill_decision = evaluate_active_skill_tool_policy_with_metadata(
         state,
         session_id,
-        &definition.name,
+        &call.name,
         policy_metadata,
     )
     .await;
@@ -16062,7 +16070,7 @@ async fn invoke_model_tool(
                 state,
                 session_id,
                 call,
-                definition,
+                &call.name,
                 plugin_id,
                 cancel_state,
                 PermissionPolicyContext {
@@ -16086,7 +16094,7 @@ async fn invoke_model_tool(
         AgentDecision::Allow => {
             if skill_requests_permission {
                 let skill_decision_key =
-                    skill_tool_decision_key(state, session_id, &definition.name).await;
+                    skill_tool_decision_key(state, session_id, &call.name).await;
                 match skill_decision_key
                     .as_ref()
                     .and_then(remembered_skill_tool_decision)
@@ -16139,7 +16147,7 @@ async fn invoke_model_tool(
                             state,
                             session_id,
                             call,
-                            definition,
+                            &call.name,
                             plugin_id,
                             cancel_state,
                             PermissionPolicyContext {
@@ -16208,8 +16216,8 @@ async fn invoke_model_tool(
         SessionTracePayload::ToolInvocationStarted {
             tool_call_id: call.id.clone(),
             plugin_id: plugin_id.to_string(),
-            tool_name: definition.name.clone(),
-            side_effect: side_effect_name(policy_metadata.legacy_side_effect()).to_string(),
+            tool_name: call.name.clone(),
+            side_effect: policy_metadata.operation_name().to_string(),
             requires_permission: policy_metadata.requires_permission,
             arguments: argument_blob,
         },
@@ -17008,12 +17016,16 @@ async fn evaluate_agent_tool_policy_with_metadata(
         .await
         .ok()
         .map(|path| path.display().to_string());
+    let aliases = std::iter::once(call.name.clone())
+        .chain(metadata.permission_category.iter().cloned())
+        .chain(metadata.aliases.iter().cloned())
+        .collect();
     let request = EvaluateToolCallRequest {
         session_id,
         agent_id,
         tool_name: call.name.clone(),
         operation: metadata.operation.clone(),
-        aliases: metadata.aliases.clone(),
+        aliases,
         requires_permission: metadata.requires_permission,
         cwd,
     };
@@ -17173,17 +17185,15 @@ async fn evaluate_active_skill_tool_policy_with_metadata(
             resolve_skill_permission_policy(&manifest.permission_policy, &available_tools)
         })
         .collect();
-    let definition = ServiceToolDefinition {
+    let target = SkillToolPolicyTarget {
         name: tool_name.to_string(),
-        description: String::new(),
-        input_schema: serde_json::Value::Null,
-        side_effect: metadata.legacy_side_effect(),
-        requires_permission: metadata.requires_permission,
-        policy: metadata.legacy_policy_metadata(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        aliases: metadata.aliases.clone(),
+        compatibility_aliases: metadata.compatibility_aliases.clone(),
+        capabilities: metadata.capabilities.clone(),
+        permission_category: metadata.permission_category.clone(),
     };
     evaluate_skill_tool_call(&SkillToolPolicyRequest {
-        tool: definition,
+        tool: target,
         active_policies,
     })
 }
@@ -17258,7 +17268,7 @@ async fn request_tool_permission(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
-    definition: &ServiceToolDefinition,
+    tool_name: &str,
     producer_plugin_id: &str,
     cancel_state: &TurnCancelState,
     policy_context: PermissionPolicyContext,
@@ -17267,7 +17277,7 @@ async fn request_tool_permission(
     state.metrics.add_counter_with_labels(
         "tool.permission.request_total",
         1,
-        tool_permission_metric_labels(&definition.name, "requested"),
+        tool_permission_metric_labels(tool_name, "requested"),
     );
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
     let agent_id = session_agent_selection(state, session_id).await;
@@ -17276,7 +17286,7 @@ async fn request_tool_permission(
             permission_id: permission_id.clone(),
             session_id,
             tool_call_id: call.id.clone(),
-            tool_name: definition.name.clone(),
+            tool_name: tool_name.to_string(),
             arguments_json: arguments_json.clone(),
             agent_id,
             policy_source: policy_context.source.clone(),
@@ -17299,7 +17309,7 @@ async fn request_tool_permission(
             permission_id: permission_id.clone(),
             tool_call_id: call.id.clone(),
             producer_plugin_id: Some(producer_plugin_id.to_owned()),
-            tool_name: definition.name.clone(),
+            tool_name: tool_name.to_string(),
             arguments_json,
             legacy_request_presentation: None,
             policy_source: policy_context.source,
@@ -17813,14 +17823,6 @@ fn unix_timestamp() -> u64 {
 
 fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-const fn side_effect_name(side_effect: bcode_tool::ToolSideEffect) -> &'static str {
-    match side_effect {
-        bcode_tool::ToolSideEffect::ReadOnly => "read_only",
-        bcode_tool::ToolSideEffect::WriteFiles => "write_files",
-        bcode_tool::ToolSideEffect::ExecuteProcess => "execute_process",
-    }
 }
 
 const fn agent_decision_name(decision: AgentDecision) -> &'static str {
@@ -24738,10 +24740,9 @@ library = "test"
                 "timeout_ms": 5000
             }),
         };
-        let (plugin_id, definition, preparation) =
-            prepare_server_tool(state.as_ref(), session_id, &call)
-                .await
-                .expect("tool preparation");
+        let (plugin_id, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
+            .await
+            .expect("tool preparation");
         let policy_metadata =
             tool_policy_authorization_metadata(&preparation.authorization, &call.name)
                 .expect("tool policy fact");
@@ -24757,7 +24758,6 @@ library = "test"
                 &task_call,
                 &working_directory,
                 &plugin_id,
-                &definition,
                 &policy_metadata,
                 task_cancel.as_ref(),
                 None,
@@ -24882,10 +24882,9 @@ library = "test"
                 }]
             }),
         };
-        let (plugin_id, definition, preparation) =
-            prepare_server_tool(state.as_ref(), session_id, &call)
-                .await
-                .expect("tool preparation");
+        let (plugin_id, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
+            .await
+            .expect("tool preparation");
         let policy_metadata =
             tool_policy_authorization_metadata(&preparation.authorization, &call.name)
                 .expect("tool policy fact");
@@ -24901,7 +24900,6 @@ library = "test"
                 &task_call,
                 &working_directory,
                 &plugin_id,
-                &definition,
                 &policy_metadata,
                 task_cancel.as_ref(),
                 None,
@@ -26618,7 +26616,7 @@ library = "test"
             &state,
             session_id,
             &call,
-            &definition,
+            &definition.name,
             "test.plugin",
             &cancel_state,
             PermissionPolicyContext::default(),
@@ -28091,51 +28089,47 @@ library = "test"
         assert!(plugin_automation_preflight_disposition(false, 0, false, Some(7), 7).is_none());
     }
 
+    fn policy_metadata(
+        operation: bcode_agent_profile::ToolPolicyOperation,
+    ) -> ToolPolicyAuthorizationMetadata {
+        ToolPolicyAuthorizationMetadata {
+            requires_permission: false,
+            aliases: Vec::new(),
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
+            permission_category: None,
+            operation,
+        }
+    }
+
     #[test]
     fn read_only_execution_denies_mutating_and_unknown_tool_calls() {
         let read_only = Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection);
-        assert!(!read_only_policy_denies_tool(
-            read_only,
-            Some(ToolSideEffect::ReadOnly)
-        ));
-        assert!(read_only_policy_denies_tool(
-            read_only,
-            Some(ToolSideEffect::WriteFiles)
-        ));
-        assert!(read_only_policy_denies_tool(
-            read_only,
-            Some(ToolSideEffect::ExecuteProcess)
-        ));
+        let read = policy_metadata(bcode_agent_profile::ToolPolicyOperation::ReadOnly);
+        let write = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Mutating);
+        let command = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
+            command: Some("synthetic".to_string()),
+        });
+        assert!(!read_only_policy_denies_tool(read_only, Some(&read)));
+        assert!(read_only_policy_denies_tool(read_only, Some(&write)));
+        assert!(read_only_policy_denies_tool(read_only, Some(&command)));
         assert!(read_only_policy_denies_tool(read_only, None));
         assert!(!read_only_policy_denies_tool(
             Some(bcode_ipc::PluginAutomationExecutionPolicy::Normal),
-            Some(ToolSideEffect::WriteFiles)
+            Some(&write)
         ));
     }
 
     #[test]
-    fn read_only_automation_policy_allows_only_declared_read_only_tools() {
+    fn read_only_automation_policy_allows_only_owner_declared_read_operations() {
         let read_only = Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection);
-        assert!(automation_policy_allows_tool(
-            read_only,
-            ToolSideEffect::ReadOnly
-        ));
-        assert!(!automation_policy_allows_tool(
-            read_only,
-            ToolSideEffect::WriteFiles
-        ));
-        assert!(!automation_policy_allows_tool(
-            read_only,
-            ToolSideEffect::ExecuteProcess
-        ));
-        assert!(automation_policy_allows_tool(
+        assert!(automation_policy_allows_operation(read_only, true));
+        assert!(!automation_policy_allows_operation(read_only, false));
+        assert!(automation_policy_allows_operation(
             Some(bcode_ipc::PluginAutomationExecutionPolicy::Normal),
-            ToolSideEffect::WriteFiles
+            false
         ));
-        assert!(automation_policy_allows_tool(
-            None,
-            ToolSideEffect::ExecuteProcess
-        ));
+        assert!(automation_policy_allows_operation(None, false));
     }
 
     #[test]

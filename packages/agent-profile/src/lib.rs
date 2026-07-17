@@ -118,41 +118,40 @@ pub enum ToolPolicyOperation {
 pub struct ToolPolicyAuthorizationMetadata {
     /// Whether the owner requires explicit permission absent a stronger policy decision.
     pub requires_permission: bool,
-    /// Tool aliases used for profile enablement lookup.
+    /// Tool aliases used for policy selector matching.
     pub aliases: Vec<String>,
+    /// Source-ecosystem aliases used for policy selector matching.
+    pub compatibility_aliases: Vec<bcode_tool::ToolCompatibilityAlias>,
+    /// Owner-declared capabilities used for policy selector matching.
+    pub capabilities: Vec<String>,
+    /// Owner-declared permission category.
+    pub permission_category: Option<String>,
     /// Owner-extracted policy operation and resources.
     pub operation: ToolPolicyOperation,
 }
 
 impl ToolPolicyAuthorizationMetadata {
-    /// Project the owner operation to the legacy side-effect field still consumed by session and
-    /// skill compatibility paths.
+    /// Return whether this operation is read-only.
     #[must_use]
-    pub const fn legacy_side_effect(&self) -> ToolSideEffect {
-        match self.operation {
-            ToolPolicyOperation::Command { .. } => ToolSideEffect::ExecuteProcess,
-            ToolPolicyOperation::Write { .. } | ToolPolicyOperation::Mutating => {
-                ToolSideEffect::WriteFiles
-            }
+    pub const fn is_read_only(&self) -> bool {
+        matches!(
+            self.operation,
             ToolPolicyOperation::Web { .. }
-            | ToolPolicyOperation::Read { .. }
-            | ToolPolicyOperation::ReadOnly => ToolSideEffect::ReadOnly,
-        }
+                | ToolPolicyOperation::Read { .. }
+                | ToolPolicyOperation::ReadOnly
+        )
     }
 
-    /// Project aliases and category to legacy skill-policy metadata.
+    /// Return a stable operation class for diagnostics and tracing.
     #[must_use]
-    pub fn legacy_policy_metadata(&self) -> bcode_tool::ToolPolicyMetadata {
-        bcode_tool::ToolPolicyMetadata {
-            aliases: self.aliases.clone(),
-            permission_category: match &self.operation {
-                ToolPolicyOperation::Command { .. } => Some("command".to_string()),
-                ToolPolicyOperation::Web { .. } => Some("web".to_string()),
-                ToolPolicyOperation::Read { .. } => Some("read".to_string()),
-                ToolPolicyOperation::Write { category, .. } => Some(category.clone()),
-                ToolPolicyOperation::ReadOnly | ToolPolicyOperation::Mutating => None,
-            },
-            ..bcode_tool::ToolPolicyMetadata::default()
+    pub const fn operation_name(&self) -> &'static str {
+        match self.operation {
+            ToolPolicyOperation::Command { .. } => "command",
+            ToolPolicyOperation::Web { .. } => "web",
+            ToolPolicyOperation::Read { .. } => "read",
+            ToolPolicyOperation::Write { .. } => "write",
+            ToolPolicyOperation::ReadOnly => "read_only",
+            ToolPolicyOperation::Mutating => "mutating",
         }
     }
 }
@@ -274,14 +273,14 @@ pub fn prepare_tool_policy(
             request.invocation.tool_name
         ));
     }
-    let aliases = std::iter::once(definition.name.clone())
-        .chain(definition.policy.permission_category.iter().cloned())
-        .chain(definition.policy.aliases.iter().cloned())
-        .collect();
+    let aliases = definition.policy.aliases.clone();
     let operation = prepared_policy_operation(request, definition);
     let metadata = ToolPolicyAuthorizationMetadata {
         requires_permission: definition.requires_permission,
         aliases,
+        compatibility_aliases: definition.policy.compatibility_aliases.clone(),
+        capabilities: definition.policy.capabilities.clone(),
+        permission_category: definition.policy.permission_category.clone(),
         operation,
     };
     Ok(ToolPreparationResponse {

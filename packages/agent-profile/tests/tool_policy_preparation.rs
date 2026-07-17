@@ -61,8 +61,10 @@ fn preparation_extracts_command_before_authorization() {
             command: Some("cargo check".to_string()),
         }
     );
-    assert!(metadata.aliases.contains(&"owner.exec".to_string()));
     assert!(metadata.aliases.contains(&"owner-alias".to_string()));
+    assert_eq!(metadata.permission_category.as_deref(), Some("edit"));
+    assert!(metadata.compatibility_aliases.is_empty());
+    assert!(metadata.capabilities.is_empty());
 }
 
 #[test]

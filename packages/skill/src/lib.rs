@@ -9,7 +9,7 @@ use bcode_skill_models::{
     SkillDiagnosticSeverity, SkillError, SkillId, SkillList, SkillManifest, SkillModelPolicy,
     SkillModelRequest, SkillPermissionHints, SkillPermissionMode, SkillPermissionPolicy,
     SkillSource, SkillSourceKind, SkillSummary, SkillThinkingEffort, SkillToolPolicyOutcome,
-    SkillToolPolicyRequest,
+    SkillToolPolicyRequest, SkillToolPolicyTarget,
 };
 use bcode_tool::{ResolvedToolSelector, ToolDefinition, ToolReferenceResolution};
 use std::collections::{BTreeMap, BTreeSet};
@@ -836,7 +836,7 @@ pub fn evaluate_skill_tool_call(request: &SkillToolPolicyRequest) -> SkillToolPo
 
 fn evaluate_single_skill_tool_policy(
     policy: &ResolvedSkillPermissionPolicy,
-    tool: &ToolDefinition,
+    tool: &SkillToolPolicyTarget,
 ) -> SkillToolPolicyOutcome {
     if policy.mode == SkillPermissionMode::Disabled {
         return SkillToolPolicyOutcome::NoOpinion;
@@ -879,27 +879,21 @@ fn evaluate_single_skill_tool_policy(
     }
 }
 
-fn selector_matches_tool(selector: &ResolvedToolSelector, tool: &ToolDefinition) -> bool {
+fn selector_matches_tool(selector: &ResolvedToolSelector, tool: &SkillToolPolicyTarget) -> bool {
     match selector {
         ResolvedToolSelector::ToolName { name } => tool.name == *name,
-        ResolvedToolSelector::Alias { alias } => {
-            tool.policy.aliases.iter().any(|value| value == alias)
-        }
+        ResolvedToolSelector::Alias { alias } => tool.aliases.iter().any(|value| value == alias),
         ResolvedToolSelector::CompatibilityAlias { ecosystem, name } => tool
-            .policy
             .compatibility_aliases
             .iter()
             .any(|alias| alias.ecosystem.eq_ignore_ascii_case(ecosystem) && alias.name == *name),
         ResolvedToolSelector::PermissionCategory { category } => tool
-            .policy
             .permission_category
             .as_ref()
             .is_some_and(|tool_category| tool_category == category),
-        ResolvedToolSelector::Capability { capability } => tool
-            .policy
-            .capabilities
-            .iter()
-            .any(|value| value == capability),
+        ResolvedToolSelector::Capability { capability } => {
+            tool.capabilities.iter().any(|value| value == capability)
+        }
     }
 }
 
@@ -1229,7 +1223,7 @@ mod tests {
         active_policies: Vec<ResolvedSkillPermissionPolicy>,
     ) -> SkillToolPolicyOutcome {
         evaluate_skill_tool_call(&SkillToolPolicyRequest {
-            tool,
+            tool: tool.into(),
             active_policies,
         })
     }

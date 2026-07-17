@@ -147,12 +147,16 @@ pub fn runtime_permission_request_to_profile_request(
 ) -> bcode_agent_runtime::Result<EvaluateToolCallRequest> {
     let metadata = tool_policy_authorization_metadata(&request.facts, &request.call.name)
         .map_err(bcode_agent_runtime::RuntimeError::HostExtension)?;
+    let aliases = std::iter::once(request.call.name.clone())
+        .chain(metadata.permission_category.iter().cloned())
+        .chain(metadata.aliases)
+        .collect();
     Ok(EvaluateToolCallRequest {
         session_id: request.context.session_id,
         agent_id: request.context.agent_id.clone(),
         tool_name: request.call.name.clone(),
         operation: metadata.operation,
-        aliases: metadata.aliases,
+        aliases,
         requires_permission: metadata.requires_permission,
         cwd: Some(cwd.to_string_lossy().into_owned()),
     })

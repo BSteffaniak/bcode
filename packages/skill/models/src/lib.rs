@@ -154,10 +154,43 @@ pub struct ResolvedSkillPermissionPolicy {
     pub ambiguous_references: Vec<bcode_tool::ToolReferenceResolution>,
 }
 
+/// Owner-prepared tool identity used for skill policy selector matching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillToolPolicyTarget {
+    /// Canonical model-callable tool name.
+    pub name: String,
+    /// Owner-declared aliases.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Owner-declared source-ecosystem aliases.
+    #[serde(default)]
+    pub compatibility_aliases: Vec<bcode_tool::ToolCompatibilityAlias>,
+    /// Owner-declared capabilities.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Owner-declared permission category.
+    #[serde(default)]
+    pub permission_category: Option<String>,
+}
+
+impl From<bcode_tool::ToolDefinition> for SkillToolPolicyTarget {
+    fn from(tool: bcode_tool::ToolDefinition) -> Self {
+        Self {
+            name: tool.name,
+            aliases: tool.policy.aliases,
+            compatibility_aliases: tool.policy.compatibility_aliases,
+            capabilities: tool.policy.capabilities,
+            permission_category: tool.policy.permission_category,
+        }
+    }
+}
+
 /// Request to evaluate one tool call against active skill policies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillToolPolicyRequest {
-    pub tool: bcode_tool::ToolDefinition,
+    /// Owner-prepared identity evaluated against active skill selectors.
+    pub tool: SkillToolPolicyTarget,
+    /// Active resolved skill policies.
     #[serde(default)]
     pub active_policies: Vec<ResolvedSkillPermissionPolicy>,
 }

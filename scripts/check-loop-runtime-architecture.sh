@@ -205,6 +205,27 @@ if rg -n '\b(ToolExecutor|LegacyToolInvoker)\b|self\.executor\.execute_tool\(' p
   violations=1
 fi
 
+if rg -n 'legacy_side_effect|legacy_policy_metadata|automation_policy_allows_tool' \
+  packages/server/src/lib.rs packages/agent-profile/src/lib.rs >/tmp/bcode-legacy-policy-projection.txt; then
+  echo "Runtime architecture violation: server policy reintroduced legacy side-effect projection." >&2
+  cat /tmp/bcode-legacy-policy-projection.txt >&2
+  violations=1
+fi
+
+if rg -n 'request\.(arguments|policy|side_effect)|\bToolArgumentKind\b|\bToolSideEffect\b' \
+  packages/agent-policy/src/lib.rs >/tmp/bcode-agent-policy-argument-inference.txt; then
+  echo "Runtime architecture violation: agent policy reintroduced raw argument or side-effect inference." >&2
+  cat /tmp/bcode-agent-policy-argument-inference.txt >&2
+  violations=1
+fi
+
+if rg -U 'SkillToolPolicyRequest \{[\s\S]{0,120}tool: (definition|tool\.clone\(\))' \
+  packages/server/src/lib.rs packages/skill/src/lib.rs >/tmp/bcode-skill-definition-policy.txt; then
+  echo "Runtime architecture violation: skill policy reintroduced full ToolDefinition evaluation." >&2
+  cat /tmp/bcode-skill-definition-policy.txt >&2
+  violations=1
+fi
+
 if rg -n '\b(PathBuf|cwd|artifact_dir|cancellation_path|invocation_action_path)\b' packages/tool/src/contracts.rs >/tmp/bcode-preparation-transport-leakage.txt; then
   echo "Runtime architecture violation: transport/path fields appeared in canonical tool contracts." >&2
   cat /tmp/bcode-preparation-transport-leakage.txt >&2
