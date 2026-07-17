@@ -143,6 +143,11 @@ if ! rg -q 'pub async fn reindex_model_context\(' packages/session/src/db.rs \
   violations=1
 fi
 
+if ! rg -q 'ensure_session_maintenance_daemon_compatibility\(\)\.await' packages/cli/src/lib.rs; then
+  echo "Session maintenance fencing violation: CLI mutations must reject incompatible live daemons." >&2
+  violations=1
+fi
+
 if ! rg -q 'storage_writer_epoch: Some\(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/server/src/lib.rs \
   || ! rg -q 'ensure_daemon_storage_compatibility\(\)\.await' packages/server/src/lib.rs; then
   echo "Daemon storage fencing violation: startup records and startup checks must carry writer epoch." >&2

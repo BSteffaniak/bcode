@@ -671,6 +671,9 @@ pub struct DaemonStatus {
     /// Build fingerprint included in the namespace.
     #[serde(default)]
     pub build_fingerprint: String,
+    /// Durable session-storage writer epoch supported by this daemon.
+    #[serde(default)]
+    pub storage_writer_epoch: Option<u32>,
     /// Process identifier, when available.
     #[serde(default)]
     pub pid: Option<u32>,
@@ -2529,6 +2532,7 @@ mod tests {
                         namespace: daemon_namespace(),
                         protocol_version: u32::from(ProtocolVersion::current().0),
                         build_fingerprint: "test-build".to_string(),
+                        storage_writer_epoch: Some(2),
                         pid: Some(123),
                         instance_id: "instance".to_string(),
                         started_at_unix_ms: 456,

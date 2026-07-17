@@ -90,6 +90,8 @@ pub enum CliError {
     BundledPluginInstallFailed(String),
     #[error("plugin service error {code}: {message}")]
     PluginService { code: String, message: String },
+    #[error("session maintenance blocked by incompatible live daemon: {0}")]
+    IncompatibleDaemonStorage(String),
     #[error("session repair usage error: {0}")]
     SessionRepairUsage(String),
     #[error("legacy stream cleanup usage error: {0}")]
@@ -6498,7 +6500,29 @@ const fn repair_cli_output(json: bool) -> SessionRepairCliOutput {
     }
 }
 
+async fn ensure_session_maintenance_daemon_compatibility() -> Result<(), CliError> {
+    if let Some((_, record)) = bcode_daemon_lifecycle::incompatible_storage_writer_records(
+        &bcode_config::default_state_dir(),
+        bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+    )
+    .await
+    .into_iter()
+    .next()
+    {
+        return Err(CliError::IncompatibleDaemonStorage(format!(
+            "namespace={}, pid={:?}, build={}, writer_epoch={:?}, endpoint={:?}; stop this daemon before retrying maintenance",
+            record.namespace,
+            record.pid,
+            record.build_fingerprint,
+            record.storage_writer_epoch,
+            record.endpoint
+        )));
+    }
+    Ok(())
+}
+
 async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliError> {
+    ensure_session_maintenance_daemon_compatibility().await?;
     let root = bcode_config::default_state_dir().join("sessions");
     let _maintenance = bcode_session::lease::acquire_session_maintenance_guard(&root, session_id)?;
     let _write = bcode_session::lease::acquire_session_write_lock(&root, session_id)?;
@@ -6562,6 +6586,7 @@ async fn repair_session_report(
     if dry_run {
         Ok(bcode_session::repair::doctor_session(root, session_id).await?)
     } else {
+        ensure_session_maintenance_daemon_compatibility().await?;
         Ok(bcode_session::repair::repair_session(
             root,
             session_id,

@@ -1617,6 +1617,7 @@ fn daemon_status_from_record(record: &bcode_daemon_lifecycle::DaemonRecord) -> D
         namespace: record.namespace.clone(),
         protocol_version: record.protocol_version,
         build_fingerprint: record.build_fingerprint.clone(),
+        storage_writer_epoch: record.storage_writer_epoch,
         pid: record.pid,
         instance_id: record.instance_id.clone(),
         started_at_unix_ms: record.started_at_unix_ms,

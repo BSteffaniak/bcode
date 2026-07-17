@@ -262,16 +262,48 @@ pub fn remove_record_if_instance(
     Ok(())
 }
 
-/// Return daemon registry records whose IPC endpoints currently respond.
+async fn probe_daemon_status(endpoint: &IpcEndpoint) -> Option<bcode_ipc::DaemonStatus> {
+    let mut stream = bcode_ipc::LocalIpcStream::connect(endpoint).await.ok()?;
+    let envelope = bcode_ipc::request_envelope(2, &bcode_ipc::Request::ServerStatus).ok()?;
+    bcode_ipc::send_envelope(&mut stream, &envelope)
+        .await
+        .ok()?;
+    loop {
+        let envelope = bcode_ipc::recv_envelope(&mut stream).await.ok()?;
+        if envelope.kind != bcode_ipc::EnvelopeKind::Response || envelope.request_id != 2 {
+            continue;
+        }
+        return match bcode_ipc::decode_response(&envelope.payload).ok()? {
+            bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::ServerStatus { status }) => {
+                Some(status.daemon)
+            }
+            _ => None,
+        };
+    }
+}
+
+async fn live_record_matches_instance(record: &DaemonRecord) -> bool {
+    let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
+        return false;
+    };
+    let Some(status) = probe_daemon_status(&endpoint).await else {
+        return false;
+    };
+    status.instance_id == record.instance_id
+        && status.namespace == record.namespace
+        && status.build_fingerprint == record.build_fingerprint
+        && status.storage_writer_epoch == record.storage_writer_epoch
+}
+
+/// Return daemon registry records whose IPC endpoints currently respond and whose server identity
+/// matches the persisted instance record.
 ///
-/// Stale or malformed records are excluded. This function does not mutate registry files.
+/// Stale, malformed, or endpoint-reused records are excluded. This function does not mutate
+/// registry files.
 pub async fn live_records(state_dir: &Path) -> Vec<(PathBuf, DaemonRecord)> {
     let mut live = Vec::new();
     for (path, record) in read_records(state_dir) {
-        let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
-            continue;
-        };
-        if probe_daemon_ready(&endpoint).await {
+        if live_record_matches_instance(&record).await {
             live.push((path, record));
         }
     }
