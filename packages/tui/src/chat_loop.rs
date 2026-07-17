@@ -936,6 +936,15 @@ fn apply_effect_result(
             has_older_history,
             result,
         } => {
+            if let Ok((attached, _)) = &result {
+                for event in &attached.history {
+                    loop_state.observe_finalized_artifact(
+                        event.session_id,
+                        event.sequence,
+                        &event.kind,
+                    );
+                }
+            }
             session_flow::complete_switch_session(chat, session_id, has_older_history, result);
         }
         TuiEffectResult::ConfigLoaded { config } => {
