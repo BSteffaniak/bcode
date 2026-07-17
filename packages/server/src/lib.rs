@@ -35,6 +35,7 @@ use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
     AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
     OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
+    ToolPolicyAuthorizationMetadata, tool_policy_authorization_metadata,
 };
 use bcode_agent_runtime::{
     CancellationToken, InvocationArtifactSink, InvocationCapabilityFuture,
@@ -99,8 +100,8 @@ use bcode_tool::{
     ToolInvocationInputResolution, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
-    ToolList, ToolOutputStream, ToolPolicyAuthorizationMetadata, ToolPreparationRequest,
-    ToolPreparationResponse, ToolResultContent, ToolSideEffect, tool_policy_authorization_metadata,
+    ToolList, ToolOutputStream, ToolPreparationRequest, ToolPreparationResponse, ToolResultContent,
+    ToolSideEffect,
 };
 use futures::{StreamExt, stream};
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
@@ -15127,7 +15128,7 @@ async fn execute_model_tool_batch(
             .await
             .get(&session_id)
             .copied();
-        if read_only_policy_denies_tool(policy, Some(policy_metadata.side_effect)) {
+        if read_only_policy_denies_tool(policy, Some(policy_metadata.legacy_side_effect())) {
             results.push((
                 index,
                 Some(ToolFinishedEventInput {
@@ -16128,7 +16129,7 @@ async fn invoke_model_tool(
             tool_call_id: call.id.clone(),
             plugin_id: plugin_id.to_string(),
             tool_name: definition.name.clone(),
-            side_effect: side_effect_name(policy_metadata.side_effect).to_string(),
+            side_effect: side_effect_name(policy_metadata.legacy_side_effect()).to_string(),
             requires_permission: policy_metadata.requires_permission,
             arguments: argument_blob,
         },
@@ -16931,9 +16932,9 @@ async fn evaluate_agent_tool_policy_with_metadata(
         session_id,
         agent_id,
         tool_name: call.name.clone(),
-        side_effect: metadata.side_effect,
-        policy: metadata.policy.clone(),
-        arguments: metadata.arguments.clone(),
+        operation: metadata.operation.clone(),
+        aliases: metadata.aliases.clone(),
+        requires_permission: metadata.requires_permission,
         cwd,
     };
     state
@@ -17096,9 +17097,9 @@ async fn evaluate_active_skill_tool_policy_with_metadata(
         name: tool_name.to_string(),
         description: String::new(),
         input_schema: serde_json::Value::Null,
-        side_effect: metadata.side_effect,
+        side_effect: metadata.legacy_side_effect(),
         requires_permission: metadata.requires_permission,
-        policy: metadata.policy.clone(),
+        policy: metadata.legacy_policy_metadata(),
         ui: bcode_tool::ToolUiMetadata::default(),
     };
     evaluate_skill_tool_call(&SkillToolPolicyRequest {

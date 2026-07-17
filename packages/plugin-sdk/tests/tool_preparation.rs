@@ -1,9 +1,11 @@
+use bcode_agent_profile::{
+    TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE, TOOL_POLICY_AUTHORIZATION_NAMESPACE,
+    TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION, ToolPolicyAuthorizationMetadata,
+};
 use bcode_plugin_sdk::{ServiceRequest, prepare_tool_from_definitions};
 use bcode_tool::{
-    OP_PREPARE_TOOL, TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE, TOOL_POLICY_AUTHORIZATION_NAMESPACE,
-    TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationDescriptor, ToolPolicyAuthorizationMetadata, ToolPolicyMetadata,
-    ToolPreparationRequest, ToolSideEffect, ToolUiMetadata,
+    OP_PREPARE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationDescriptor,
+    ToolPolicyMetadata, ToolPreparationRequest, ToolSideEffect, ToolUiMetadata,
 };
 
 fn definition() -> ToolDefinition {
@@ -48,9 +50,11 @@ fn preparation_dispatches_to_owner_definition_without_transport_fields() {
     assert_eq!(fact.resource.as_deref(), Some("owner.tool"));
     let metadata: ToolPolicyAuthorizationMetadata =
         serde_json::from_value(fact.metadata.clone()).expect("fact should decode");
-    assert_eq!(metadata.side_effect, ToolSideEffect::WriteFiles);
+    assert_eq!(
+        metadata.operation,
+        bcode_agent_profile::ToolPolicyOperation::Mutating
+    );
     assert!(metadata.requires_permission);
-    assert_eq!(metadata.arguments, serde_json::json!({"path": "file"}));
 }
 
 #[test]

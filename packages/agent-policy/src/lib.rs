@@ -8,8 +8,9 @@ pub use bcode_agent_policy_models::{
     Action, AgentConfig, AgentPermissionConfig, PermissionConfig, default_external_directory_action,
 };
 
-use bcode_agent_profile::{AgentDecision, EvaluateToolCallRequest, EvaluateToolCallResponse};
-use bcode_tool::{ToolArgumentKind, ToolSideEffect};
+use bcode_agent_profile::{
+    AgentDecision, EvaluateToolCallRequest, EvaluateToolCallResponse, ToolPolicyOperation,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -156,27 +157,25 @@ fn evaluate_after_path(
     config: &AgentConfig,
     request: &EvaluateToolCallRequest,
 ) -> PolicyEvaluation {
-    if has_argument_kind(request, ToolArgumentKind::Command) {
-        return evaluate_shell(config, request);
+    match &request.operation {
+        ToolPolicyOperation::Command { .. } => evaluate_shell(config, request),
+        ToolPolicyOperation::Web { .. } => evaluate_web_url(config, request),
+        ToolPolicyOperation::Write { category, .. } => {
+            evaluate_filesystem_path(config, request, write_path_rules(config, category))
+        }
+        ToolPolicyOperation::Read { .. } => {
+            evaluate_filesystem_path(config, request, &config.permission.read)
+        }
+        ToolPolicyOperation::ReadOnly => {
+            evaluation(AgentDecision::Allow, String::new(), None, None)
+        }
+        ToolPolicyOperation::Mutating => evaluate_mutating_fallback(config, request),
     }
-    if has_argument_kind(request, ToolArgumentKind::Url) {
-        return evaluate_web_url(config, request);
-    }
-    if has_argument_kind(request, ToolArgumentKind::WritePath) {
-        return evaluate_filesystem_path(config, request, write_path_rules(config, request));
-    }
-    if has_argument_kind(request, ToolArgumentKind::ReadPath) {
-        return evaluate_filesystem_path(config, request, &config.permission.read);
-    }
-    evaluate_side_effect_fallback(config, request)
 }
 
-fn write_path_rules<'a>(
-    config: &'a AgentConfig,
-    request: &EvaluateToolCallRequest,
-) -> &'a BTreeMap<String, Action> {
-    match request.policy.permission_category.as_deref() {
-        Some("edit") => &config.permission.edit,
+fn write_path_rules<'a>(config: &'a AgentConfig, category: &str) -> &'a BTreeMap<String, Action> {
+    match category {
+        "edit" => &config.permission.edit,
         _ => &config.permission.write,
     }
 }
@@ -229,35 +228,30 @@ fn evaluate_web_url(config: &AgentConfig, request: &EvaluateToolCallRequest) -> 
     }
 }
 
-fn evaluate_side_effect_fallback(
+fn evaluate_mutating_fallback(
     config: &AgentConfig,
     request: &EvaluateToolCallRequest,
 ) -> PolicyEvaluation {
-    match request.side_effect {
-        ToolSideEffect::ReadOnly => evaluation(AgentDecision::Allow, String::new(), None, None),
-        ToolSideEffect::WriteFiles | ToolSideEffect::ExecuteProcess => {
-            if tool_enabled(config, request) == Some(true) {
-                evaluation(
-                    AgentDecision::Ask,
-                    format!(
-                        "{} agent asks before {}",
-                        request.agent_id, request.tool_name
-                    ),
-                    None,
-                    None,
-                )
-            } else {
-                evaluation(
-                    AgentDecision::Deny,
-                    format!(
-                        "{} agent denied mutating tool {}; switch agents if implementation is needed",
-                        request.agent_id, request.tool_name
-                    ),
-                    None,
-                    None,
-                )
-            }
-        }
+    if tool_enabled(config, request) == Some(true) {
+        evaluation(
+            AgentDecision::Ask,
+            format!(
+                "{} agent asks before {}",
+                request.agent_id, request.tool_name
+            ),
+            None,
+            None,
+        )
+    } else {
+        evaluation(
+            AgentDecision::Deny,
+            format!(
+                "{} agent denied mutating tool {}; switch agents if implementation is needed",
+                request.agent_id, request.tool_name
+            ),
+            None,
+            None,
+        )
     }
 }
 
@@ -300,17 +294,20 @@ fn evaluate_filesystem_path(
         };
     }
 
-    evaluate_side_effect_fallback(config, request)
+    match request.operation {
+        ToolPolicyOperation::Read { .. } => {
+            evaluation(AgentDecision::Allow, String::new(), None, None)
+        }
+        ToolPolicyOperation::Write { .. } => evaluate_mutating_fallback(config, request),
+        _ => evaluation(AgentDecision::Allow, String::new(), None, None),
+    }
 }
 
 fn url_argument(request: &EvaluateToolCallRequest) -> Option<&str> {
-    request
-        .policy
-        .argument_extractors
-        .iter()
-        .filter(|extractor| extractor.kind == ToolArgumentKind::Url)
-        .find_map(|extractor| string_argument(&request.arguments, &extractor.argument))
-        .or_else(|| string_argument(&request.arguments, "url"))
+    match &request.operation {
+        ToolPolicyOperation::Web { url } => url.as_deref(),
+        _ => None,
+    }
 }
 
 fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
@@ -372,13 +369,10 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
 }
 
 fn command_argument(request: &EvaluateToolCallRequest) -> Option<&str> {
-    request
-        .policy
-        .argument_extractors
-        .iter()
-        .filter(|extractor| extractor.kind == ToolArgumentKind::Command)
-        .find_map(|extractor| string_argument(&request.arguments, &extractor.argument))
-        .or_else(|| string_argument(&request.arguments, "command"))
+    match &request.operation {
+        ToolPolicyOperation::Command { command } => command.as_deref(),
+        _ => None,
+    }
 }
 
 fn evaluation(
@@ -410,38 +404,15 @@ fn external_path(
         .find(|path| is_external_path(path, cwd))
 }
 
-fn has_argument_kind(request: &EvaluateToolCallRequest, kind: ToolArgumentKind) -> bool {
-    request
-        .policy
-        .argument_extractors
-        .iter()
-        .any(|extractor| extractor.kind == kind)
-}
-
-/// Return candidate path arguments for tool policy checks.
+/// Return candidate path resources produced by the tool owner.
 #[must_use]
 pub fn candidate_paths(request: &EvaluateToolCallRequest) -> Vec<String> {
-    let metadata_paths = request
-        .policy
-        .argument_extractors
-        .iter()
-        .filter(|extractor| {
-            matches!(
-                extractor.kind,
-                ToolArgumentKind::ReadPath | ToolArgumentKind::WritePath
-            )
-        })
-        .filter_map(|extractor| {
-            string_argument(&request.arguments, &extractor.argument).map(ToString::to_string)
-        });
-    let legacy_paths = ["path", "filePath"]
-        .iter()
-        .filter_map(|key| string_argument(&request.arguments, key).map(ToString::to_string));
-    metadata_paths
-        .chain(legacy_paths)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    match &request.operation {
+        ToolPolicyOperation::Read { paths } | ToolPolicyOperation::Write { paths, .. } => {
+            paths.clone()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Return true when a path resolves outside `cwd`.
@@ -562,12 +533,11 @@ fn first_command_word(part: &str) -> Option<&str> {
 }
 
 fn tool_aliases(request: &EvaluateToolCallRequest) -> Vec<String> {
-    let mut aliases = vec![request.tool_name.clone()];
-    if let Some(category) = &request.policy.permission_category {
-        aliases.push(category.clone());
-    }
-    aliases.extend(request.policy.aliases.iter().cloned());
-    aliases
+    std::iter::once(request.tool_name.clone())
+        .chain(request.aliases.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Compile command glob rules.
@@ -766,50 +736,21 @@ pub fn path_rule_specificity(pattern: &str) -> usize {
     }
 }
 
-fn string_argument<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    arguments.get(key).and_then(serde_json::Value::as_str)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_agent_profile::EvaluateToolCallRequest;
-    use serde_json::json;
-
-    fn command_policy() -> bcode_tool::ToolPolicyMetadata {
-        bcode_tool::ToolPolicyMetadata {
-            aliases: Vec::new(),
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some("command".to_string()),
-            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                kind: ToolArgumentKind::Command,
-                argument: "command".to_string(),
-            }],
-        }
-    }
-
-    fn path_policy(category: &str, kind: ToolArgumentKind) -> bcode_tool::ToolPolicyMetadata {
-        bcode_tool::ToolPolicyMetadata {
-            aliases: vec![category.to_string()],
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some(category.to_string()),
-            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                kind,
-                argument: "path".to_string(),
-            }],
-        }
-    }
+    use bcode_agent_profile::{EvaluateToolCallRequest, ToolPolicyOperation};
 
     fn request(agent_id: &str, command: &str) -> EvaluateToolCallRequest {
         EvaluateToolCallRequest {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: agent_id.to_string(),
             tool_name: "shell.run".to_string(),
-            side_effect: ToolSideEffect::ExecuteProcess,
-            policy: command_policy(),
-            arguments: json!({ "command": command }),
+            operation: ToolPolicyOperation::Command {
+                command: Some(command.to_string()),
+            },
+            aliases: vec!["command".to_string()],
+            requires_permission: true,
             cwd: Some("/tmp/project".to_string()),
         }
     }
@@ -1036,9 +977,12 @@ mod tests {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "filesystem.write".to_string(),
-            side_effect: ToolSideEffect::WriteFiles,
-            policy: path_policy("write", ToolArgumentKind::WritePath),
-            arguments: json!({ "path": "../outside.txt" }),
+            operation: ToolPolicyOperation::Write {
+                paths: vec!["../outside.txt".to_string()],
+                category: "write".to_string(),
+            },
+            aliases: vec!["write".to_string()],
+            requires_permission: true,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1052,16 +996,27 @@ mod tests {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: tool_name.to_string(),
-            side_effect: match tool_name {
-                "filesystem.write" | "filesystem.edit" => ToolSideEffect::WriteFiles,
-                _ => ToolSideEffect::ReadOnly,
+            operation: match tool_name {
+                "filesystem.write" => ToolPolicyOperation::Write {
+                    paths: vec![path.to_string()],
+                    category: "write".to_string(),
+                },
+                "filesystem.edit" => ToolPolicyOperation::Write {
+                    paths: vec![path.to_string()],
+                    category: "edit".to_string(),
+                },
+                _ => ToolPolicyOperation::Read {
+                    paths: vec![path.to_string()],
+                },
             },
-            policy: match tool_name {
-                "filesystem.write" => path_policy("write", ToolArgumentKind::WritePath),
-                "filesystem.edit" => path_policy("edit", ToolArgumentKind::WritePath),
-                _ => path_policy("read", ToolArgumentKind::ReadPath),
-            },
-            arguments: json!({ "path": path }),
+            aliases: vec![
+                tool_name
+                    .split('.')
+                    .next_back()
+                    .unwrap_or(tool_name)
+                    .to_string(),
+            ],
+            requires_permission: tool_name != "filesystem.read",
             cwd: Some("/tmp/project".to_string()),
         }
     }
@@ -1206,18 +1161,11 @@ mod tests {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.exec".to_string(),
-            side_effect: ToolSideEffect::ExecuteProcess,
-            policy: bcode_tool::ToolPolicyMetadata {
-                aliases: Vec::new(),
-                compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some("command".to_string()),
-                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                    kind: ToolArgumentKind::Command,
-                    argument: "cmd".to_string(),
-                }],
+            operation: ToolPolicyOperation::Command {
+                command: Some("cargo check".to_string()),
             },
-            arguments: json!({ "cmd": "cargo check" }),
+            aliases: vec!["command".to_string()],
+            requires_permission: true,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1241,18 +1189,11 @@ mod tests {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: PLAN_AGENT.to_string(),
             tool_name: "custom.fetch".to_string(),
-            side_effect: ToolSideEffect::ReadOnly,
-            policy: bcode_tool::ToolPolicyMetadata {
-                aliases: vec!["web".to_string()],
-                compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some("web".to_string()),
-                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                    kind: ToolArgumentKind::Url,
-                    argument: "target".to_string(),
-                }],
+            operation: ToolPolicyOperation::Web {
+                url: Some("https://example.com/docs".to_string()),
             },
-            arguments: json!({ "target": "https://example.com/docs" }),
+            aliases: vec!["web".to_string()],
+            requires_permission: false,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1279,18 +1220,12 @@ mod tests {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.write".to_string(),
-            side_effect: ToolSideEffect::WriteFiles,
-            policy: bcode_tool::ToolPolicyMetadata {
-                aliases: vec!["write".to_string()],
-                compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some("write".to_string()),
-                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                    kind: ToolArgumentKind::WritePath,
-                    argument: "target_path".to_string(),
-                }],
+            operation: ToolPolicyOperation::Write {
+                paths: vec!["generated/out.rs".to_string()],
+                category: "write".to_string(),
             },
-            arguments: json!({ "target_path": "generated/out.rs" }),
+            aliases: vec!["write".to_string()],
+            requires_permission: true,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1314,18 +1249,12 @@ mod tests {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.patch".to_string(),
-            side_effect: ToolSideEffect::WriteFiles,
-            policy: bcode_tool::ToolPolicyMetadata {
-                aliases: vec!["edit".to_string()],
-                compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some("edit".to_string()),
-                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                    kind: ToolArgumentKind::WritePath,
-                    argument: "file".to_string(),
-                }],
+            operation: ToolPolicyOperation::Write {
+                paths: vec!["src/lib.rs".to_string()],
+                category: "edit".to_string(),
             },
-            arguments: json!({ "file": "src/lib.rs" }),
+            aliases: vec!["edit".to_string()],
+            requires_permission: true,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1349,18 +1278,12 @@ mod tests {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.write".to_string(),
-            side_effect: ToolSideEffect::WriteFiles,
-            policy: bcode_tool::ToolPolicyMetadata {
-                aliases: vec!["write".to_string()],
-                compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some("write".to_string()),
-                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                    kind: ToolArgumentKind::WritePath,
-                    argument: "output".to_string(),
-                }],
+            operation: ToolPolicyOperation::Write {
+                paths: vec!["../outside.txt".to_string()],
+                category: "write".to_string(),
             },
-            arguments: json!({ "output": "../outside.txt" }),
+            aliases: vec!["write".to_string()],
+            requires_permission: true,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1380,15 +1303,9 @@ mod tests {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.side-effect".to_string(),
-            side_effect: ToolSideEffect::WriteFiles,
-            policy: bcode_tool::ToolPolicyMetadata {
-                aliases: Vec::new(),
-                compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some("custom-category".to_string()),
-                argument_extractors: Vec::new(),
-            },
-            arguments: json!({}),
+            operation: ToolPolicyOperation::Mutating,
+            aliases: vec!["custom-category".to_string()],
+            requires_permission: true,
             cwd: Some("/tmp/project".to_string()),
         };
 

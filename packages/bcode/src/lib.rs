@@ -43,7 +43,7 @@ pub use bcode_agent_runtime::{
     ModelProviderInvoker, PermissionDecision, PermissionPolicy, ProviderRoundPlan,
     ProviderRoundPlanContext, ProviderRoundPlanner, RegisteredTool, RuntimeError, RuntimeFuture,
     RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog, ToolExecutionOutput,
-    ToolExecutor, ToolRoundObserver, ToolRoundState, ToolSource, UnifiedToolCatalog,
+    ToolRoundObserver, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_agent_runtime::{
     InvocationArtifactSink, InvocationCapabilities, InvocationCapabilityFuture,
@@ -1493,7 +1493,7 @@ impl ToolInvoker for SdkToolInvoker {
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
         match &tool.source {
             ToolSource::Inline => {
-                let result = bcode_tool::prepare_tool_invocation(request, &tool.definition)
+                let result = bcode_agent_profile::prepare_tool_policy(request, &tool.definition)
                     .map_err(|message| RuntimeError::ToolPreparation {
                         tool_name: request.invocation.tool_name.clone(),
                         message,

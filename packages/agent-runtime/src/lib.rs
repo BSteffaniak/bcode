@@ -27,9 +27,8 @@ use bcode_model::{
 use bcode_session_models::SessionId;
 use bcode_tool::{
     PreparedToolInvocation, ToolAuthorizationFact, ToolDefinition, ToolExecutionOptions,
-    ToolInvocationDescriptor, ToolInvocationRequest, ToolInvocationResponse,
-    ToolPreparationRequest, ToolPreparationResponse,
-    ToolResultContent as InvocationToolResultContent,
+    ToolInvocationDescriptor, ToolInvocationResponse, ToolPreparationRequest,
+    ToolPreparationResponse, ToolResultContent as InvocationToolResultContent,
 };
 use futures::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
@@ -682,16 +681,6 @@ impl ToolRoundState {
     }
 }
 
-/// Abstract execution boundary for model-callable tools.
-pub trait ToolExecutor: Send + Sync {
-    /// Execute one requested tool invocation.
-    fn execute_tool<'a>(
-        &'a self,
-        tool: &'a RegisteredTool,
-        request: &'a ToolInvocationRequest,
-    ) -> RuntimeFuture<'a, ToolInvocationResponse>;
-}
-
 /// Neutral adapter that prepares and invokes tools regardless of their transport.
 pub trait ToolInvoker: Send + Sync {
     /// Prepare one invocation without performing its side effects.
@@ -724,43 +713,6 @@ pub trait ToolInvoker: Send + Sync {
         invocation: &'a PreparedToolInvocation,
         scope: &'a InvocationScope,
     ) -> RuntimeFuture<'a, ToolInvocationResponse>;
-}
-
-/// Compatibility adapter for existing executors that do not yet provide preparation contracts.
-pub struct LegacyToolInvoker<'a, E> {
-    executor: &'a E,
-}
-
-impl<'a, E> LegacyToolInvoker<'a, E> {
-    /// Wrap an existing executor with empty preparation metadata.
-    #[must_use]
-    pub const fn new(executor: &'a E) -> Self {
-        Self { executor }
-    }
-}
-
-impl<E> ToolInvoker for LegacyToolInvoker<'_, E>
-where
-    E: ToolExecutor,
-{
-    fn prepare_tool<'a>(
-        &'a self,
-        _tool: &'a RegisteredTool,
-        _request: &'a ToolPreparationRequest,
-        _scope: &'a PreparationScope,
-    ) -> RuntimeFuture<'a, ToolPreparationResponse> {
-        Box::pin(async { Ok(ToolPreparationResponse::default()) })
-    }
-
-    fn invoke_tool<'a>(
-        &'a self,
-        tool: &'a RegisteredTool,
-        invocation: &'a PreparedToolInvocation,
-        _scope: &'a InvocationScope,
-    ) -> RuntimeFuture<'a, ToolInvocationResponse> {
-        let request = legacy_tool_invocation_request(&invocation.invocation);
-        Box::pin(async move { self.executor.execute_tool(tool, &request).await })
-    }
 }
 
 /// One prepared call supplied to a batch authorization coordinator.
@@ -1130,60 +1082,6 @@ impl AgentRuntime {
     #[must_use]
     pub fn complete_turn_scope(&self, scope: &TurnScope) -> bool {
         self.turns.complete_turn(scope)
-    }
-
-    /// Execute a tool call through a catalog, policy, and executor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the tool is unknown, permission policy denies execution, or the
-    /// executor fails.
-    pub async fn execute_tool_call<C, P, E>(
-        &self,
-        catalog: &C,
-        policy: &P,
-        executor: &E,
-        call: &ToolCall,
-    ) -> Result<ToolExecutionOutput>
-    where
-        C: ToolCatalog + Sync,
-        P: PermissionPolicy + ?Sized,
-        E: ToolExecutor + Sync,
-    {
-        let context = RuntimePermissionContext::default();
-        self.execute_tool_call_with_context(catalog, policy, executor, call, &context)
-            .await
-    }
-
-    /// Execute a tool call with explicit permission context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the tool is unknown, permission policy denies execution, or the
-    /// executor fails.
-    pub async fn execute_tool_call_with_context<C, P, E>(
-        &self,
-        catalog: &C,
-        policy: &P,
-        executor: &E,
-        call: &ToolCall,
-        context: &RuntimePermissionContext,
-    ) -> Result<ToolExecutionOutput>
-    where
-        C: ToolCatalog + Sync,
-        P: PermissionPolicy + ?Sized,
-        E: ToolExecutor + Sync,
-    {
-        let mut rounds = ToolRoundState::new(u32::MAX);
-        self.execute_tool_call_with_round_state_and_context(
-            catalog,
-            policy,
-            executor,
-            call,
-            &mut rounds,
-            context,
-        )
-        .await
     }
 
     /// Stream a complete provider/tool conversation through one canonical scoped event surface.
@@ -1564,121 +1462,6 @@ impl AgentRuntime {
         }
 
         Ok(ordered_batch_output(calls.len(), terminal))
-    }
-
-    /// Execute an ordered batch through compatibility adapters.
-    ///
-    /// Legacy executors do not expose preparation metadata. The provider batch still declares
-    /// parallel intent, and the complete permission batch is evaluated before any invocation begins.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the batch cannot be authorized or the round budget is exhausted.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn execute_tool_batch_with_round_state_and_context<C, P, E>(
-        &self,
-        catalog: &C,
-        policy: &P,
-        executor: &E,
-        calls: &[ToolCall],
-        rounds: &mut ToolRoundState,
-        context: &RuntimePermissionContext,
-        max_concurrency: usize,
-    ) -> Result<ToolBatchExecutionOutput>
-    where
-        C: ToolCatalog + Sync,
-        P: PermissionPolicy + ?Sized,
-        E: ToolExecutor + Sync,
-    {
-        let authorization = PermissionPolicyAuthorization::new(policy);
-        let invoker = LegacyToolInvoker::new(executor);
-        let max_concurrency =
-            std::num::NonZeroUsize::new(max_concurrency).unwrap_or(std::num::NonZeroUsize::MIN);
-        let options = ToolExecutionOptions {
-            parallel: max_concurrency.get() > 1,
-            max_concurrency: Some(max_concurrency),
-            ..ToolExecutionOptions::default()
-        };
-        let scope = TurnScope::without_events("legacy-tool-batch", TurnGeneration::new(0));
-        self.execute_prepared_tool_batch(
-            catalog,
-            &authorization,
-            &invoker,
-            calls,
-            rounds,
-            context,
-            options,
-            &scope,
-        )
-        .await
-    }
-
-    /// Execute a tool call and enforce a mutable tool-round budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the maximum number of tool rounds is exhausted, the tool is unknown,
-    /// permission policy denies execution, or the executor fails.
-    pub async fn execute_tool_call_with_round_state<C, P, E>(
-        &self,
-        catalog: &C,
-        policy: &P,
-        executor: &E,
-        call: &ToolCall,
-        rounds: &mut ToolRoundState,
-    ) -> Result<ToolExecutionOutput>
-    where
-        C: ToolCatalog + Sync,
-        P: PermissionPolicy + ?Sized,
-        E: ToolExecutor + Sync,
-    {
-        let context = RuntimePermissionContext::default();
-        self.execute_tool_call_with_round_state_and_context(
-            catalog, policy, executor, call, rounds, &context,
-        )
-        .await
-    }
-
-    /// Execute a tool call with explicit round and permission context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the maximum number of tool rounds is exhausted, the tool is unknown,
-    /// permission policy denies execution, or the executor fails.
-    pub async fn execute_tool_call_with_round_state_and_context<C, P, E>(
-        &self,
-        catalog: &C,
-        policy: &P,
-        executor: &E,
-        call: &ToolCall,
-        rounds: &mut ToolRoundState,
-        context: &RuntimePermissionContext,
-    ) -> Result<ToolExecutionOutput>
-    where
-        C: ToolCatalog + Sync,
-        P: PermissionPolicy + ?Sized,
-        E: ToolExecutor + Sync,
-    {
-        let output = self
-            .execute_tool_batch_with_round_state_and_context(
-                catalog,
-                policy,
-                executor,
-                std::slice::from_ref(call),
-                rounds,
-                context,
-                1,
-            )
-            .await?;
-        output
-            .results
-            .into_iter()
-            .next()
-            .ok_or(RuntimeError::InvalidBatchResponse {
-                component: "single-call compatibility adapter",
-                expected: 1,
-                actual: 0,
-            })?
     }
 
     /// Run a stateless text-generation turn through a provider invoker.
@@ -2511,16 +2294,6 @@ fn tool_invocation_descriptor(call: &ToolCall) -> ToolInvocationDescriptor {
     }
 }
 
-fn legacy_tool_invocation_request(invocation: &ToolInvocationDescriptor) -> ToolInvocationRequest {
-    ToolInvocationRequest {
-        tool_call_id: invocation.invocation_id.clone(),
-        name: invocation.tool_name.clone(),
-        arguments: invocation.arguments.clone(),
-        cwd: None,
-        artifact_dir: None,
-    }
-}
-
 fn batch_concurrency(options: ToolExecutionOptions, batch_len: usize) -> usize {
     options
         .max_concurrency
@@ -2854,17 +2627,32 @@ mod tests {
         }
     }
 
-    struct FakeToolExecutor;
+    struct FakeToolInvoker;
 
-    impl ToolExecutor for FakeToolExecutor {
-        fn execute_tool<'a>(
+    impl ToolInvoker for FakeToolInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            tool: &'a RegisteredTool,
+            request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            let result = bcode_agent_profile::prepare_tool_policy(request, &tool.definition)
+                .map_err(|message| RuntimeError::ToolPreparation {
+                    tool_name: request.invocation.tool_name.clone(),
+                    message,
+                });
+            Box::pin(async move { result })
+        }
+
+        fn invoke_tool<'a>(
             &'a self,
             _tool: &'a RegisteredTool,
-            request: &'a ToolInvocationRequest,
+            invocation: &'a PreparedToolInvocation,
+            _scope: &'a InvocationScope,
         ) -> RuntimeFuture<'a, ToolInvocationResponse> {
             Box::pin(async move {
                 Ok(ToolInvocationResponse {
-                    output: format!("called {}", request.name),
+                    output: format!("called {}", invocation.invocation.tool_name),
                     is_error: false,
                     content: vec![InvocationToolResultContent::Text {
                         text: "structured".to_string(),
@@ -2875,6 +2663,30 @@ mod tests {
                 })
             })
         }
+    }
+
+    async fn execute_fake_batch<P: PermissionPolicy + ?Sized>(
+        runtime: &AgentRuntime,
+        catalog: &UnifiedToolCatalog,
+        policy: &P,
+        calls: &[ToolCall],
+        rounds: &mut ToolRoundState,
+        options: ToolExecutionOptions,
+    ) -> Result<ToolBatchExecutionOutput> {
+        let authorization = PermissionPolicyAuthorization::new(policy);
+        let scope = TurnScope::without_events("test-tool-batch", TurnGeneration::new(0));
+        runtime
+            .execute_prepared_tool_batch(
+                catalog,
+                &authorization,
+                &FakeToolInvoker,
+                calls,
+                rounds,
+                &RuntimePermissionContext::default(),
+                options,
+                &scope,
+            )
+            .await
     }
 
     fn tool_definition(name: &str) -> ToolDefinition {
@@ -4937,18 +4749,20 @@ mod tests {
             },
         ];
         let mut rounds = ToolRoundState::new(1);
-        let output = AgentRuntime::new()
-            .execute_tool_batch_with_round_state_and_context(
-                &catalog,
-                &AllowAllPolicy,
-                &FakeToolExecutor,
-                &calls,
-                &mut rounds,
-                &RuntimePermissionContext::default(),
-                2,
-            )
-            .await
-            .expect("batch should execute");
+        let output = execute_fake_batch(
+            &AgentRuntime::new(),
+            &catalog,
+            &AllowAllPolicy,
+            &calls,
+            &mut rounds,
+            ToolExecutionOptions {
+                parallel: true,
+                max_concurrency: Some(NonZeroUsize::new(2).expect("two is non-zero")),
+                ..ToolExecutionOptions::default()
+            },
+        )
+        .await
+        .expect("batch should execute");
 
         assert_eq!(rounds.completed_rounds(), 1);
         assert_eq!(output.results.len(), 2);
@@ -4978,10 +4792,26 @@ mod tests {
             name: "echo".to_string(),
             arguments: serde_json::json!({ "text": "hi" }),
         };
-        let output = AgentRuntime::new()
-            .execute_tool_call(&catalog, &AllowAllPolicy, &FakeToolExecutor, &call)
-            .await
-            .expect("tool should execute");
+        let runtime = AgentRuntime::new();
+        let mut rounds = ToolRoundState::new(u32::MAX);
+        let output = execute_fake_batch(
+            &runtime,
+            &catalog,
+            &AllowAllPolicy,
+            std::slice::from_ref(&call),
+            &mut rounds,
+            ToolExecutionOptions {
+                parallel: false,
+                ..ToolExecutionOptions::default()
+            },
+        )
+        .await
+        .expect("tool should execute")
+        .results
+        .into_iter()
+        .next()
+        .expect("single call result")
+        .expect("single call should succeed");
 
         assert_eq!(output.model_result.call_id, "call-1");
         assert_eq!(output.model_result.output, "called echo");
@@ -5006,26 +4836,32 @@ mod tests {
         let runtime = AgentRuntime::new();
         let mut rounds = ToolRoundState::new(1);
 
-        runtime
-            .execute_tool_call_with_round_state(
-                &catalog,
-                &AllowAllPolicy,
-                &FakeToolExecutor,
-                &call,
-                &mut rounds,
-            )
-            .await
-            .expect("first tool round should execute");
-        let error = runtime
-            .execute_tool_call_with_round_state(
-                &catalog,
-                &AllowAllPolicy,
-                &FakeToolExecutor,
-                &call,
-                &mut rounds,
-            )
-            .await
-            .expect_err("second tool round should exceed max");
+        execute_fake_batch(
+            &runtime,
+            &catalog,
+            &AllowAllPolicy,
+            std::slice::from_ref(&call),
+            &mut rounds,
+            ToolExecutionOptions {
+                parallel: false,
+                ..ToolExecutionOptions::default()
+            },
+        )
+        .await
+        .expect("first tool round should execute");
+        let error = execute_fake_batch(
+            &runtime,
+            &catalog,
+            &AllowAllPolicy,
+            std::slice::from_ref(&call),
+            &mut rounds,
+            ToolExecutionOptions {
+                parallel: false,
+                ..ToolExecutionOptions::default()
+            },
+        )
+        .await
+        .expect_err("second tool round should exceed max");
 
         assert!(matches!(error, RuntimeError::MaxToolRounds(1)));
     }
@@ -5062,10 +4898,26 @@ mod tests {
             name: "echo".to_string(),
             arguments: serde_json::json!({}),
         };
-        let error = AgentRuntime::new()
-            .execute_tool_call(&catalog, &DenyPolicy, &FakeToolExecutor, &call)
-            .await
-            .expect_err("policy should deny tool");
+        let runtime = AgentRuntime::new();
+        let mut rounds = ToolRoundState::new(u32::MAX);
+        let error = execute_fake_batch(
+            &runtime,
+            &catalog,
+            &DenyPolicy,
+            std::slice::from_ref(&call),
+            &mut rounds,
+            ToolExecutionOptions {
+                parallel: false,
+                ..ToolExecutionOptions::default()
+            },
+        )
+        .await
+        .expect("batch authorization should complete")
+        .results
+        .into_iter()
+        .next()
+        .expect("single call result")
+        .expect_err("policy should deny tool");
 
         assert!(matches!(error, RuntimeError::PermissionDenied(reason) if reason == "blocked"));
     }

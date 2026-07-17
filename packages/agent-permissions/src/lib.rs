@@ -10,9 +10,9 @@
 use bcode_agent_policy::{
     Action, AgentConfig, AgentPermissionConfig, PermissionConfig, evaluate_tool_call,
 };
+use bcode_agent_profile::tool_policy_authorization_metadata;
 use bcode_agent_profile::{AgentDecision, EvaluateToolCallRequest, EvaluateToolCallResponse};
 use bcode_agent_runtime::{PermissionDecision, PermissionPolicy, RuntimePermissionRequest};
-use bcode_tool::tool_policy_authorization_metadata;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -151,9 +151,9 @@ pub fn runtime_permission_request_to_profile_request(
         session_id: request.context.session_id,
         agent_id: request.context.agent_id.clone(),
         tool_name: request.call.name.clone(),
-        side_effect: metadata.side_effect,
-        policy: metadata.policy,
-        arguments: metadata.arguments,
+        operation: metadata.operation,
+        aliases: metadata.aliases,
+        requires_permission: metadata.requires_permission,
         cwd: Some(cwd.to_string_lossy().into_owned()),
     })
 }

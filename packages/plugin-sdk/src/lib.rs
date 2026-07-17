@@ -780,7 +780,7 @@ pub fn prepare_tool_from_definitions(
                 preparation.invocation.tool_name
             )
         })?;
-    bcode_tool::prepare_tool_invocation(&preparation, &definition)
+    bcode_agent_profile::prepare_tool_policy(&preparation, &definition)
 }
 
 /// Encode plugin tool preparation as a standard service response.

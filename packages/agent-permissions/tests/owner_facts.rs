@@ -1,9 +1,9 @@
 use bcode_agent_permissions::runtime_permission_request_to_profile_request;
+use bcode_agent_profile::prepare_tool_policy;
 use bcode_agent_runtime::{RegisteredTool, RuntimePermissionContext, RuntimePermissionRequest};
 use bcode_model::ToolCall;
 use bcode_tool::{
     ToolDefinition, ToolInvocationDescriptor, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
-    prepare_tool_invocation,
 };
 
 fn definition(name: &str) -> ToolDefinition {
@@ -21,7 +21,7 @@ fn definition(name: &str) -> ToolDefinition {
 fn permission_request() -> RuntimePermissionRequest {
     let definition = definition("owner.tool");
     let arguments = serde_json::json!({"path": "owned"});
-    let preparation = prepare_tool_invocation(
+    let preparation = prepare_tool_policy(
         &bcode_tool::ToolPreparationRequest {
             invocation: ToolInvocationDescriptor {
                 invocation_id: "call-1".to_string(),
@@ -56,8 +56,11 @@ fn policy_adapter_consumes_owner_produced_fact_metadata() {
             .expect("owner fact should be accepted");
 
     assert_eq!(profile.tool_name, "owner.tool");
-    assert_eq!(profile.side_effect, ToolSideEffect::WriteFiles);
-    assert_eq!(profile.arguments, serde_json::json!({"path": "owned"}));
+    assert_eq!(
+        profile.operation,
+        bcode_agent_profile::ToolPolicyOperation::Mutating
+    );
+    assert!(profile.requires_permission);
 }
 
 #[test]

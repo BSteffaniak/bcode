@@ -442,18 +442,11 @@ mod tests {
             session_id: SessionId::new(),
             agent_id: PLAN_AGENT.to_string(),
             tool_name: "shell.run".to_string(),
-            side_effect: ToolSideEffect::ExecuteProcess,
-            policy: bcode_tool::ToolPolicyMetadata {
-                aliases: Vec::new(),
-                compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some("command".to_string()),
-                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                    kind: bcode_tool::ToolArgumentKind::Command,
-                    argument: "command".to_string(),
-                }],
+            operation: bcode_agent_profile::ToolPolicyOperation::Command {
+                command: Some("git diff && git commit -m nope".to_string()),
             },
-            arguments: json!({ "command": "git diff && git commit -m nope" }),
+            aliases: vec!["command".to_string()],
+            requires_permission: true,
             cwd: Some("/tmp/project".to_string()),
         };
 

@@ -193,9 +193,9 @@ if rg -n 'default_tool_execution_max_concurrency|max_concurrency: NonZeroUsize::
   violations=1
 fi
 
-legacy_executor_invocations="$(rg -n 'self\.executor\.execute_tool\(' packages/agent-runtime/src/lib.rs | wc -l | tr -d ' ')"
-if [[ "$legacy_executor_invocations" != "1" ]]; then
-  echo "Runtime architecture violation: expected one executor invocation confined to LegacyToolInvoker, found $legacy_executor_invocations." >&2
+if rg -n '\b(ToolExecutor|LegacyToolInvoker)\b|self\.executor\.execute_tool\(' packages/agent-runtime/src/lib.rs >/tmp/bcode-legacy-tool-executor.txt; then
+  echo "Runtime architecture violation: legacy executor compatibility reappeared in AgentRuntime." >&2
+  cat /tmp/bcode-legacy-tool-executor.txt >&2
   violations=1
 fi
 

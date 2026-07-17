@@ -1347,10 +1347,7 @@ dependencies = [
  "bcode_agent_policy_models",
  "bcode_agent_profile",
  "bcode_session_models",
- "bcode_tool",
  "globset",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1377,6 +1374,7 @@ dependencies = [
 name = "bcode_agent_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_profile",
  "bcode_model",
  "bcode_session_models",
  "bcode_tool",
@@ -2065,6 +2063,7 @@ dependencies = [
 name = "bcode_plugin_sdk"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_profile",
  "bcode_command",
  "bcode_session_models",
  "bcode_tool",
