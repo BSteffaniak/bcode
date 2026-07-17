@@ -636,7 +636,79 @@ pub struct SessionDb {
 }
 
 impl SessionDb {
-    /// Open one session database under `root` using Bcode's default per-session layout.
+    /// Open an existing session database without applying migrations or rebuilding projections.
+    ///
+    /// This is the normal runtime/read path. It fails when the database file does not exist and
+    /// never creates parent directories, runs DDL, or replays canonical events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database does not exist or cannot be opened.
+    pub async fn open_existing_turso_in_root(
+        session_id: SessionId,
+        root: &Path,
+    ) -> SessionDbResult<Self> {
+        Self::open_existing_turso_in_root_observed(session_id, root, MetricsRegistry::disabled())
+            .await
+    }
+
+    /// Open an existing session database without mutation, with observability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database does not exist or cannot be opened.
+    pub async fn open_existing_turso_in_root_observed(
+        session_id: SessionId,
+        root: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
+        let path = session_db_path(root, session_id);
+        Self::open_existing_turso_observed(session_id, &path, metrics).await
+    }
+
+    /// Initialize a new session database with the complete current schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database already exists, cannot be created, or migrations fail.
+    pub async fn initialize_turso_in_root(
+        session_id: SessionId,
+        root: &Path,
+    ) -> SessionDbResult<Self> {
+        let path = session_db_path(root, session_id);
+        if path.exists() {
+            return Err(SessionDbError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("session database already exists at {}", path.display()),
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Self::initialize_turso_observed(session_id, &path, MetricsRegistry::disabled()).await
+    }
+
+    /// Explicitly migrate an existing database while exclusive maintenance and write guards are
+    /// held.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened, migrated, or reprojected.
+    pub async fn migrate_turso_in_root(
+        session_id: SessionId,
+        root: &Path,
+        _maintenance: &crate::lease::SessionMaintenanceGuard,
+        _write: &crate::lease::SessionWriteGuard,
+    ) -> SessionDbResult<Self> {
+        let path = session_db_path(root, session_id);
+        let db = Self::open_existing_turso_observed(session_id, &path, MetricsRegistry::disabled())
+            .await?;
+        run_session_migrations(&**db.db).await?;
+        migrate_model_context_projection(&**db.db).await?;
+        Ok(db)
+    }
+
+    /// Open one session database under `root`, initializing only when it does not yet exist.
     ///
     /// # Errors
     ///
@@ -657,33 +729,54 @@ impl SessionDb {
         metrics: MetricsRegistry,
     ) -> SessionDbResult<Self> {
         let path = session_db_path(root, session_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        if path.exists() {
+            Self::open_existing_turso_observed(session_id, &path, metrics).await
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            Self::initialize_turso_observed(session_id, &path, metrics).await
         }
-        Self::open_turso_observed(session_id, &path, metrics).await
     }
 
-    /// Open one session database at `path` and apply cheap schema migrations.
-    ///
-    /// This must not replay events or rebuild projections. Repair/reprojection belongs behind
-    /// explicit repair commands.
+    /// Open an existing database at `path` without applying migrations, or initialize a new one.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    ///
-    /// * the Turso connection cannot be opened after bounded lock retries
-    /// * schema migrations fail
+    /// Returns an error if the database cannot be opened or initialized.
     pub async fn open_turso(session_id: SessionId, path: &Path) -> SessionDbResult<Self> {
-        Self::open_turso_observed(session_id, path, MetricsRegistry::disabled()).await
+        if path.exists() {
+            Self::open_existing_turso_observed(session_id, path, MetricsRegistry::disabled()).await
+        } else {
+            Self::initialize_turso_observed(session_id, path, MetricsRegistry::disabled()).await
+        }
     }
 
-    /// Open one session database with centralized database observability.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database cannot be opened or migrated.
-    pub async fn open_turso_observed(
+    async fn open_existing_turso_observed(
+        session_id: SessionId,
+        path: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
+        if !path.exists() {
+            return Err(SessionDbError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("session database does not exist at {}", path.display()),
+            )));
+        }
+        Self::connect_turso_observed(session_id, path, metrics).await
+    }
+
+    async fn initialize_turso_observed(
+        session_id: SessionId,
+        path: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
+        let db = Self::connect_turso_observed(session_id, path, metrics).await?;
+        run_session_migrations(&**db.db).await?;
+        Ok(db)
+    }
+
+    async fn connect_turso_observed(
         session_id: SessionId,
         path: &Path,
         metrics: MetricsRegistry,
@@ -700,8 +793,6 @@ impl SessionDb {
         let db = db?;
         let db: Box<dyn Database> =
             Box::new(ObservedDatabase::new(db, metrics, "session", "turso"));
-        run_session_migrations(&*db).await?;
-        migrate_model_context_projection(&*db).await?;
         Ok(Self {
             session_id,
             db: Arc::new(db),
@@ -1369,7 +1460,11 @@ impl SessionDb {
     /// # Errors
     ///
     /// Returns an error if canonical history is invalid or projection replacement fails.
-    pub async fn reindex_model_context(&self) -> SessionDbResult<usize> {
+    pub async fn reindex_model_context(
+        &self,
+        _maintenance: &crate::lease::SessionMaintenanceGuard,
+        _write: &crate::lease::SessionWriteGuard,
+    ) -> SessionDbResult<usize> {
         let tx = self.db.begin_transaction().await?;
         let event_count = rebuild_model_context_projection(&*tx).await?;
         tx.commit().await?;
@@ -3423,6 +3518,20 @@ mod tests {
         RequestContextTokenCount,
     };
 
+    async fn reindex_model_context_for_test(
+        db: &SessionDb,
+        root: &Path,
+        session_id: SessionId,
+    ) -> usize {
+        let maintenance = crate::lease::acquire_session_maintenance_guard(root, session_id)
+            .expect("maintenance guard");
+        let write =
+            crate::lease::acquire_session_write_lock(root, session_id).expect("write guard");
+        db.reindex_model_context(&maintenance, &write)
+            .await
+            .expect("explicit reindex")
+    }
+
     fn request_context_event(session_id: SessionId, sequence: u64) -> SessionEvent {
         event(
             session_id,
@@ -4160,7 +4269,11 @@ mod tests {
                 .expect("projection status"),
             ModelContextProjectionStatus::Missing
         ) {
-            db.reindex_model_context().await.expect("explicit reindex");
+            let root = path
+                .parent()
+                .and_then(Path::parent)
+                .expect("benchmark DB must use sessions/<id>/session.db layout");
+            reindex_model_context_for_test(&db, root, session_id).await;
         }
         let _ = db
             .model_context_events()
@@ -4302,9 +4415,7 @@ mod tests {
                 .model_context_events()
                 .await
                 .unwrap_or_else(|error| panic!("load {name} compatibility context: {error}"));
-            db.reindex_model_context()
-                .await
-                .unwrap_or_else(|error| panic!("reindex {name}: {error}"));
+            reindex_model_context_for_test(&db, temp_dir.path(), session_id).await;
             let projected = db
                 .model_context_events()
                 .await
@@ -4346,9 +4457,16 @@ mod tests {
         .expect("insert gapped canonical event");
 
         assert!(matches!(
-            db.reindex_model_context()
-                .await
-                .expect_err("gap must reject reindex"),
+            {
+                let maintenance =
+                    crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                        .expect("maintenance guard");
+                let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
+                    .expect("write guard");
+                db.reindex_model_context(&maintenance, &write)
+                    .await
+                    .expect_err("gap must reject reindex")
+            },
             SessionDbError::InvalidCanonicalSequence {
                 expected: 1,
                 actual: 2
@@ -4410,7 +4528,10 @@ mod tests {
             .await
             .expect("compatibility context");
 
-        assert_eq!(db.reindex_model_context().await.expect("reindex"), 3);
+        assert_eq!(
+            reindex_model_context_for_test(&db, temp_dir.path(), session_id).await,
+            3
+        );
         assert_eq!(
             db.model_context_projection_status()
                 .await
@@ -4839,7 +4960,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_legacy_model_context_projection_migrates_it_atomically() {
+    async fn normal_existing_open_does_not_run_pending_projection_migrations() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("initialize session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "projected".to_string(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ))
+        .await
+        .expect("append projected event");
+        db.database()
+            .update("model_context_projection_state")
+            .value("schema_version", DatabaseValue::Int64(1))
+            .execute(db.database())
+            .await
+            .expect("set legacy projection version");
+        drop(db);
+
+        let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open existing session without migration");
+        assert_eq!(
+            reopened
+                .model_context_projection_status()
+                .await
+                .expect("projection status"),
+            ModelContextProjectionStatus::Incompatible {
+                actual: 1,
+                expected: 2,
+            }
+        );
+        let state = reopened
+            .database()
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+            .execute_first(reopened.database())
+            .await
+            .expect("projection query")
+            .expect("projection row");
+        assert_eq!(required_i64(&state, "schema_version").expect("schema"), 1);
+        assert_eq!(required_i64(&state, "last_event_seq").expect("tail"), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_legacy_model_context_migration_is_atomic() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
@@ -4877,9 +5050,15 @@ mod tests {
         .expect("append canonical tail without projection");
         drop(db);
 
-        let migrated = SessionDb::open_turso_in_root(session_id, temp_dir.path())
-            .await
-            .expect("open and migrate session db");
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
+            .expect("write guard");
+        let migrated =
+            SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                .await
+                .expect("explicitly migrate session db");
         assert_eq!(
             migrated
                 .model_context_projection_status()
@@ -5120,7 +5299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_schema_v3_context_occupancy_resets_incompatible_derived_state() {
+    async fn explicit_schema_v3_context_occupancy_migration_resets_incompatible_derived_state() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
@@ -5155,9 +5334,15 @@ mod tests {
             .expect("mark compatibility migration pending");
         drop(db);
 
-        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
-            .await
-            .expect("reopen legacy session db");
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_session_write_lock(temp_dir.path(), session_id)
+            .expect("write guard");
+        let db =
+            SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                .await
+                .expect("explicitly migrate legacy session db");
         assert_eq!(db.current_context_epoch().await.expect("context epoch"), 0);
         assert_eq!(
             db.current_context_occupancy().await.expect("occupancy"),

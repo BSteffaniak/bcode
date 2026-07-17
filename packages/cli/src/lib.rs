@@ -6502,8 +6502,14 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
     let root = bcode_config::default_state_dir().join("sessions");
     let _maintenance = bcode_session::lease::acquire_session_maintenance_guard(&root, session_id)?;
     let _write = bcode_session::lease::acquire_session_write_lock(&root, session_id)?;
-    let db = bcode_session::db::SessionDb::open_turso_in_root(session_id, &root).await?;
-    let event_count = db.reindex_model_context().await?;
+    let db = bcode_session::db::SessionDb::migrate_turso_in_root(
+        session_id,
+        &root,
+        &_maintenance,
+        &_write,
+    )
+    .await?;
+    let event_count = db.reindex_model_context(&_maintenance, &_write).await?;
     println!(
         "Reindexed model context for session {session_id} from {event_count} canonical events"
     );

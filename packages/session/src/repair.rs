@@ -337,7 +337,7 @@ async fn model_context_projection_note(
     root: &Path,
     session_id: SessionId,
 ) -> Result<String, db::SessionDbError> {
-    let session_db = db::SessionDb::open_turso_in_root(session_id, root).await?;
+    let session_db = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
     Ok(match session_db.model_context_projection_status().await? {
         db::ModelContextProjectionStatus::Missing =>
             "model-context projection is missing; exact compatibility reads are active until explicit reindex".to_string(),
@@ -353,7 +353,7 @@ async fn model_context_projection_note(
 }
 
 async fn validate_session_db(root: &Path, session_id: SessionId) -> Result<(), db::SessionDbError> {
-    let session_db = db::SessionDb::open_turso_in_root(session_id, root).await?;
+    let session_db = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
     let _ = session_db.last_event_sequence().await?;
     let _ = session_db.all_events_strict().await?;
     let _ = session_db.model_context_events().await?;

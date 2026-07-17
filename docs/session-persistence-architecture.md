@@ -14,6 +14,27 @@ history, replaces the projection atomically, and leaves canonical events unchang
 versions and same-version stale or corrupt projections remain repair-required rather than being
 silently rebuilt.
 
+## Session database open modes
+
+Per-session database access is split by capability:
+
+* `open_existing_turso_in_root` is the non-migrating existing runtime/read path. It requires the
+  database file to exist and does not create directories, run DDL, or rebuild projections.
+* `initialize_turso_in_root` creates a brand-new database with the complete current schema and
+  refuses to overwrite an existing database.
+* `migrate_turso_in_root` is the explicit migration path. Its signature requires both a held
+  `SessionMaintenanceGuard` and `SessionWriteGuard`; it runs schema migrations and controlled known
+  projection migration only while those guards remain borrowed.
+* compatibility `open_turso*` entry points initialize only missing databases and otherwise use the
+  non-migrating existing path. They must never be used as a migration trigger.
+
+Health, doctor, validation, and semantic audit paths use the existing non-migrating open. Explicit
+reindex also requires borrowed maintenance and write guards in its API, preventing an uncoordinated
+caller from invoking it accidentally.
+
+Lock acquisition order for mutating maintenance is always session maintenance coordinator, session
+write lock, database connection/transaction. Never acquire these in reverse order.
+
 ## Durable storage writer contract
 
 Every session database contains a singleton `session_storage_contract` row with a versioned writer

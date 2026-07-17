@@ -1145,7 +1145,7 @@ impl SessionManager {
         if !db_path.exists() {
             return SessionHealth::NotFound;
         }
-        let db = match db::SessionDb::open_turso_in_root(session_id, &root).await {
+        let db = match db::SessionDb::open_existing_turso_in_root(session_id, &root).await {
             Ok(db) => db,
             Err(error) => {
                 return SessionHealth::RepairRequired {

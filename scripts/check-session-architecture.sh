@@ -106,6 +106,30 @@ if ! rg -q 'acquire_session_maintenance_guard\(root, session_id\)' packages/sess
   violations=1
 fi
 
+if ! rg -q 'pub async fn open_existing_turso_in_root' packages/session/src/db.rs \
+  || ! rg -q 'pub async fn migrate_turso_in_root' packages/session/src/db.rs; then
+  echo "Session open-mode violation: runtime/read and maintenance migration opens must remain explicit." >&2
+  violations=1
+fi
+
+runtime_open_body="$(sed -n '/pub struct SessionDb {/,$p' packages/session/src/db.rs | sed -n '/pub async fn open_turso_in_root_observed(/,/^    \/\/\/ Open an existing database at/p')"
+if grep -Eq 'run_session_migrations|migrate_model_context_projection|rebuild_model_context_projection' <<<"$runtime_open_body"; then
+  echo "Session open-mode violation: ordinary runtime open must not migrate or rebuild projections." >&2
+  violations=1
+fi
+
+migration_call_count="$(rg -n 'migrate_model_context_projection\(' packages/session/src/db.rs | wc -l | tr -d ' ')"
+if [[ "$migration_call_count" != "2" ]]; then
+  echo "Session migration violation: model-context migration must only be defined and called by explicit migration open." >&2
+  violations=1
+fi
+
+if rg -n 'open_turso_in_root\(session_id, root\)' packages/session/src/repair.rs >/tmp/bcode-repair-mutating-open-violations.txt; then
+  echo "Session repair violation: doctor/validation paths must use existing non-migrating opens." >&2
+  cat /tmp/bcode-repair-mutating-open-violations.txt >&2
+  violations=1
+fi
+
 if ! rg -q 'CompactionPlanningPolicy::OverflowRecovery' packages/server/src/context_compaction.rs; then
   echo "Session compaction violation: overflow recovery must use its explicit planning policy." >&2
   violations=1

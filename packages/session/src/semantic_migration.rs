@@ -185,7 +185,7 @@ pub async fn audit_semantic_result_migration(
         if !session_db_path.exists() {
             continue;
         }
-        let session_db = db::SessionDb::open_turso(session_id, &session_db_path).await?;
+        let session_db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
         let events = match session_db.all_events_strict().await {
             Ok(events) => events,
             Err(error) => {
