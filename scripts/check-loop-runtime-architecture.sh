@@ -205,6 +205,20 @@ if rg -n '\b(PathBuf|cwd|artifact_dir|cancellation_path|invocation_action_path)\
   violations=1
 fi
 
+runtime_permission_context_fields="$(
+  awk '/^pub struct RuntimePermissionContext \{/{capture=1; next} capture && /^\}/{exit} capture && /^    pub /{print}' packages/agent-runtime/src/lib.rs
+)"
+expected_runtime_permission_context_fields="$(cat <<'EOF'
+    pub session_id: SessionId,
+    pub agent_id: String,
+EOF
+)"
+if [[ "$runtime_permission_context_fields" != "$expected_runtime_permission_context_fields" ]]; then
+  echo "Runtime architecture violation: canonical permission context gained path or domain-policy fields." >&2
+  diff -u <(printf '%s\n' "$expected_runtime_permission_context_fields") <(printf '%s\n' "$runtime_permission_context_fields") >&2 || true
+  violations=1
+fi
+
 provider_tool_definition="$(
   awk '/^pub struct ToolDefinition \{/{capture=1} capture{print} capture && /^\}/{exit}' packages/model/src/lib.rs
 )"
@@ -247,7 +261,7 @@ for primitive in 'invoker.prepare_tool(' 'authorization.authorize_batch(' '.invo
 done
 rm -f "$runtime_production"
 
-for legacy_sdk_loop in 'run_provider_tool_loop_in_scope' 'append_provider_tool_calls' 'append_tool_results' 'ToolRoundState::new(request.max_tool_rounds)'; do
+for legacy_sdk_loop in 'run_provider_tool_loop_in_scope' 'append_provider_tool_calls' 'append_tool_results' 'ToolRoundState::new(request.max_tool_rounds)' 'ScopedAgentEventSink' 'unbounded_channel();'; do
   if grep -F "$legacy_sdk_loop" packages/bcode/src/lib.rs >/dev/null; then
     echo "Runtime architecture violation: SDK reintroduced duplicate provider/tool loop fragment '$legacy_sdk_loop'." >&2
     violations=1
@@ -257,8 +271,12 @@ if ! rg -U 'fn run_provider_tool_loop<P>\([\s\S]*\.run_provider_tool_loop\(' pac
   echo "Runtime architecture violation: SDK provider/tool orchestration no longer delegates to AgentRuntime." >&2
   violations=1
 fi
-if ! rg -U 'pub async fn run_provider_tool_loop_in_scope[\s\S]*run_text_turn_in_scope[\s\S]*execute_prepared_tool_batch_with_host_context' packages/agent-runtime/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: canonical provider/tool continuation loop was removed from AgentRuntime." >&2
+if ! rg -U 'pub async fn run_provider_tool_loop_in_scope[\s\S]*run_planned_provider_round[\s\S]*execute_prepared_tool_batch_with_host_context' packages/agent-runtime/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: canonical provider planning/tool continuation loop was removed from AgentRuntime." >&2
+  violations=1
+fi
+if ! rg -U 'provider_round_planner: Arc<dyn ProviderRoundPlanner>[\s\S]*\.run_provider_tool_loop\([\s\S]*self\.provider_round_planner\.as_ref\(\)' packages/bcode/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: SDK provider recovery no longer routes through the canonical planner seam." >&2
   violations=1
 fi
 

@@ -35,7 +35,6 @@ use futures::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     Arc,
@@ -346,6 +345,56 @@ impl AgentRuntimeStream {
     }
 }
 
+/// Item produced by the canonical provider/tool loop stream.
+#[derive(Debug)]
+pub enum AgentLoopStreamItem {
+    /// Provider, runtime, lifecycle, or contribution event from the active scope.
+    Event(ScopedTurnEvent),
+    /// Completed provider/tool conversation.
+    Finished(AgentTurnResponse),
+    /// Runtime error that terminated the conversation.
+    Error(RuntimeError),
+}
+
+/// Unified stream for one complete canonical provider/tool conversation.
+#[derive(Debug)]
+pub struct AgentLoopStream {
+    receiver: mpsc::UnboundedReceiver<AgentLoopStreamItem>,
+}
+
+impl AgentLoopStream {
+    /// Receive the next scoped stream item.
+    pub async fn next(&mut self) -> Option<AgentLoopStreamItem> {
+        self.receiver.recv().await
+    }
+}
+
+struct LoopStreamEventSink {
+    configured: Arc<dyn TurnEventSink>,
+    sender: mpsc::UnboundedSender<AgentLoopStreamItem>,
+}
+
+impl TurnEventSink for LoopStreamEventSink {
+    fn emit(&self, event: ScopedTurnEvent) -> bool {
+        if !self.configured.emit(event.clone()) {
+            return false;
+        }
+        self.sender.send(AgentLoopStreamItem::Event(event)).is_ok()
+    }
+}
+
+struct SharedToolCatalog(Arc<dyn ToolCatalog>);
+
+impl ToolCatalog for SharedToolCatalog {
+    fn tools(&self) -> Vec<RegisteredTool> {
+        self.0.tools()
+    }
+
+    fn find_tool(&self, name: &str) -> Option<RegisteredTool> {
+        self.0.find_tool(name)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeStreamEventSink {
     sender: Option<mpsc::UnboundedSender<AgentRuntimeStreamItem>>,
@@ -517,6 +566,75 @@ pub trait ToolRoundObserver: Send + Sync {
 pub struct NoopToolRoundObserver;
 
 impl ToolRoundObserver for NoopToolRoundObserver {}
+
+/// Input supplied to a host-owned provider round planner before provider work starts.
+pub struct ProviderRoundPlanContext<'a> {
+    /// Zero-based provider round within the canonical turn.
+    pub round: u32,
+    /// Zero-based attempt within `round`.
+    pub attempt: u32,
+    /// Complete request proposed for this attempt.
+    pub proposed_request: &'a AgentTurnRequest,
+    /// Failure from the prior attempt, when recovery is being planned.
+    pub previous_failure: Option<&'a RuntimeError>,
+    /// Canonical turn scope shared by planning, provider work, and tool continuation.
+    pub scope: &'a TurnScope,
+}
+
+/// Directive returned by a host-owned provider round planner.
+#[derive(Debug)]
+pub enum ProviderRoundPlan {
+    /// Start provider work immediately with a complete request.
+    Proceed {
+        /// Complete request to execute.
+        request: AgentTurnRequest,
+    },
+    /// Wait through the canonical cancellation boundary, then retry with a complete request.
+    RetryAfter {
+        /// Complete replacement request to execute after `delay`.
+        request: AgentTurnRequest,
+        /// Host-policy-resolved retry delay.
+        delay: Duration,
+    },
+    /// Stop planning with an optional host-normalized terminal error.
+    ///
+    /// When `error` is `None` after a provider attempt, the runtime preserves the prior provider
+    /// failure. Before any provider attempt, `error` must be present.
+    Fail {
+        /// Host-selected terminal error, when it should replace the prior provider failure.
+        error: Option<RuntimeError>,
+    },
+}
+
+/// Host extension for retry, recovery, compaction, and complete provider-request rebuilding.
+pub trait ProviderRoundPlanner: Send + Sync {
+    /// Plan one provider attempt without moving product policy into the runtime.
+    fn plan_round<'a>(
+        &'a self,
+        context: ProviderRoundPlanContext<'a>,
+    ) -> RuntimeFuture<'a, ProviderRoundPlan>;
+}
+
+/// Provider planner that runs each round once and preserves the first provider failure.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopProviderRoundPlanner;
+
+impl ProviderRoundPlanner for NoopProviderRoundPlanner {
+    fn plan_round<'a>(
+        &'a self,
+        context: ProviderRoundPlanContext<'a>,
+    ) -> RuntimeFuture<'a, ProviderRoundPlan> {
+        Box::pin(async move {
+            Ok(if context.previous_failure.is_some() {
+                ProviderRoundPlan::Fail { error: None }
+            } else {
+                ProviderRoundPlan::Proceed {
+                    request: context.proposed_request.clone(),
+                }
+            })
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 struct PreparedRuntimeToolCall {
@@ -703,25 +821,68 @@ where
         requests: &'a [ToolAuthorizationRequest],
         _scope: &'a TurnScope,
     ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
-        Box::pin(async move {
-            let mut decisions = Vec::with_capacity(requests.len());
-            for request in requests {
-                let permission_request = RuntimePermissionRequest {
-                    context: request.context.clone(),
-                    call: request.call.clone(),
-                    tool: request.tool.clone(),
-                };
-                decisions.push(
-                    match self.policy.evaluate_tool_call(&permission_request).await? {
-                        PermissionDecision::Allow => ToolAuthorizationDecision::Allow,
-                        PermissionDecision::Ask(reason) => ToolAuthorizationDecision::Ask(reason),
-                        PermissionDecision::Deny(reason) => ToolAuthorizationDecision::Deny(reason),
-                    },
-                );
-            }
-            Ok(decisions)
-        })
+        Box::pin(authorize_with_permission_policy(self.policy, requests))
     }
+}
+
+/// Owned permission-policy adapter for spawned canonical provider/tool loops.
+#[derive(Clone)]
+pub struct SharedPermissionPolicyAuthorization {
+    policy: Arc<dyn PermissionPolicy>,
+}
+
+impl std::fmt::Debug for SharedPermissionPolicyAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedPermissionPolicyAuthorization")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedPermissionPolicyAuthorization {
+    /// Create an owned complete-batch authorization adapter.
+    #[must_use]
+    pub fn new(policy: Arc<dyn PermissionPolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl ToolAuthorizationCoordinator for SharedPermissionPolicyAuthorization {
+    fn authorize_batch<'a>(
+        &'a self,
+        requests: &'a [ToolAuthorizationRequest],
+        _scope: &'a TurnScope,
+    ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
+        Box::pin(authorize_with_permission_policy(
+            self.policy.as_ref(),
+            requests,
+        ))
+    }
+}
+
+async fn authorize_with_permission_policy<P>(
+    policy: &P,
+    requests: &[ToolAuthorizationRequest],
+) -> Result<Vec<ToolAuthorizationDecision>>
+where
+    P: PermissionPolicy + ?Sized,
+{
+    let mut decisions = Vec::with_capacity(requests.len());
+    for request in requests {
+        let permission_request = RuntimePermissionRequest {
+            context: request.context.clone(),
+            call: request.call.clone(),
+            tool: request.tool.clone(),
+        };
+        decisions.push(
+            match policy.evaluate_tool_call(&permission_request).await? {
+                PermissionDecision::Allow => ToolAuthorizationDecision::Allow,
+                PermissionDecision::Ask(reason) => ToolAuthorizationDecision::Ask(reason),
+                PermissionDecision::Deny(reason) => ToolAuthorizationDecision::Deny(reason),
+            },
+        );
+    }
+    Ok(decisions)
 }
 
 /// Tool catalog visible to the runtime.
@@ -773,8 +934,6 @@ pub struct RuntimePermissionContext {
     pub session_id: SessionId,
     /// Active agent/profile ID.
     pub agent_id: String,
-    /// Current working directory used for path-boundary checks.
-    pub cwd: Option<PathBuf>,
 }
 
 impl Default for RuntimePermissionContext {
@@ -782,7 +941,6 @@ impl Default for RuntimePermissionContext {
         Self {
             session_id: SessionId::default(),
             agent_id: "build".to_string(),
-            cwd: None,
         }
     }
 }
@@ -1025,6 +1183,60 @@ impl AgentRuntime {
         .await
     }
 
+    /// Stream a complete provider/tool conversation through one canonical scoped event surface.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_streaming_provider_tool_loop<P>(
+        &self,
+        mut provider: P,
+        request: AgentTurnRequest,
+        catalog: Arc<dyn ToolCatalog>,
+        authorization: Arc<dyn ToolAuthorizationCoordinator>,
+        invoker: Arc<dyn ToolInvoker>,
+        context: RuntimePermissionContext,
+        host_context: Vec<bcode_tool::ToolHostContextEntry>,
+        options: ToolExecutionOptions,
+        events: Arc<dyn TurnEventSink>,
+        capabilities: InvocationCapabilities,
+        observer: Arc<dyn ToolRoundObserver>,
+        planner: Arc<dyn ProviderRoundPlanner>,
+    ) -> AgentLoopStream
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let runtime = self.clone();
+        let stream_events: Arc<dyn TurnEventSink> = Arc::new(LoopStreamEventSink {
+            configured: events,
+            sender: sender.clone(),
+        });
+        tokio::spawn(async move {
+            let catalog = SharedToolCatalog(catalog);
+            let result = runtime
+                .run_provider_tool_loop(
+                    &mut provider,
+                    request,
+                    &catalog,
+                    authorization.as_ref(),
+                    invoker.as_ref(),
+                    &context,
+                    &host_context,
+                    options,
+                    stream_events,
+                    capabilities,
+                    observer.as_ref(),
+                    planner.as_ref(),
+                )
+                .await;
+            let item = match result {
+                Ok(response) => AgentLoopStreamItem::Finished(response),
+                Err(error) => AgentLoopStreamItem::Error(error),
+            };
+            let _ = sender.send(item);
+        });
+        AgentLoopStream { receiver }
+    }
+
     /// Run a complete provider/tool conversation through one canonical turn scope.
     ///
     /// Provider rounds, complete-batch preparation and authorization, ordered tool results, and
@@ -1035,7 +1247,7 @@ impl AgentRuntime {
     /// Returns an error when provider execution, tool orchestration, host observation, scope
     /// completion, cancellation, or the whole-turn timeout fails.
     #[allow(clippy::too_many_arguments)]
-    pub async fn run_provider_tool_loop<P, C, A, I, O>(
+    pub async fn run_provider_tool_loop<P, C, A, I, O, R>(
         &self,
         provider: &mut P,
         request: AgentTurnRequest,
@@ -1048,6 +1260,7 @@ impl AgentRuntime {
         events: Arc<dyn TurnEventSink>,
         capabilities: InvocationCapabilities,
         observer: &O,
+        planner: &R,
     ) -> Result<AgentTurnResponse>
     where
         P: ModelProviderInvoker + ?Sized,
@@ -1055,6 +1268,7 @@ impl AgentRuntime {
         A: ToolAuthorizationCoordinator + ?Sized,
         I: ToolInvoker + Sync + ?Sized,
         O: ToolRoundObserver + ?Sized,
+        R: ProviderRoundPlanner + ?Sized,
     {
         let scope = self.begin_turn_scope(
             format!("agent-turn:{}", context.session_id),
@@ -1073,6 +1287,7 @@ impl AgentRuntime {
                 options,
                 &scope,
                 observer,
+                planner,
             )
             .await;
         match result {
@@ -1094,7 +1309,7 @@ impl AgentRuntime {
     ///
     /// Returns an error under the same conditions as [`Self::run_provider_tool_loop`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn run_provider_tool_loop_in_scope<P, C, A, I, O>(
+    pub async fn run_provider_tool_loop_in_scope<P, C, A, I, O, R>(
         &self,
         provider: &mut P,
         mut request: AgentTurnRequest,
@@ -1106,6 +1321,7 @@ impl AgentRuntime {
         options: ToolExecutionOptions,
         scope: &TurnScope,
         observer: &O,
+        planner: &R,
     ) -> Result<AgentTurnResponse>
     where
         P: ModelProviderInvoker + ?Sized,
@@ -1113,11 +1329,14 @@ impl AgentRuntime {
         A: ToolAuthorizationCoordinator + ?Sized,
         I: ToolInvoker + Sync + ?Sized,
         O: ToolRoundObserver + ?Sized,
+        R: ProviderRoundPlanner + ?Sized,
     {
         validate_tool_host_context(host_context)?;
         let mut rounds = ToolRoundState::new(request.max_tool_rounds);
+        let turn_cancellation = request.cancellation.clone();
         let started = Instant::now();
         let timeout = request.timeout;
+        let mut provider_round = 0_u32;
         let mut all_events = Vec::new();
         let mut messages = request.messages.clone();
         if request.append_prompt {
@@ -1130,12 +1349,20 @@ impl AgentRuntime {
         }
 
         loop {
-            request.timeout = timeout
-                .checked_sub(started.elapsed())
-                .ok_or(RuntimeError::Timeout { timeout })?;
-            let response = self
-                .run_text_turn_in_scope(provider, &request, scope)
-                .await?;
+            let planned_round = run_planned_provider_round(
+                self,
+                provider,
+                request,
+                planner,
+                provider_round,
+                &turn_cancellation,
+                started,
+                timeout,
+                scope,
+            )
+            .await?;
+            let response = planned_round.response;
+            request = planned_round.request;
             all_events.extend(response.events.iter().cloned());
             let calls = response
                 .events
@@ -1199,6 +1426,7 @@ impl AgentRuntime {
             request.messages.clone_from(&messages);
             request.prompt.clear();
             request.append_prompt = false;
+            provider_round = provider_round.saturating_add(1);
         }
     }
 
@@ -2009,6 +2237,134 @@ where
         }
     }
     prepared
+}
+
+struct PlannedProviderRound {
+    request: AgentTurnRequest,
+    response: AgentTurnResponse,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_planned_provider_round<P, R>(
+    runtime: &AgentRuntime,
+    provider: &mut P,
+    mut proposed_request: AgentTurnRequest,
+    planner: &R,
+    round: u32,
+    turn_cancellation: &CancellationToken,
+    started: Instant,
+    timeout: Duration,
+    scope: &TurnScope,
+) -> Result<PlannedProviderRound>
+where
+    P: ModelProviderInvoker + ?Sized,
+    R: ProviderRoundPlanner + ?Sized,
+{
+    let mut attempt = 0_u32;
+    let mut previous_failure = None;
+    loop {
+        proposed_request.timeout = remaining_turn_duration(started, timeout)?;
+        proposed_request.cancellation = turn_cancellation.clone();
+        let plan = plan_provider_round(
+            planner,
+            ProviderRoundPlanContext {
+                round,
+                attempt,
+                proposed_request: &proposed_request,
+                previous_failure: previous_failure.as_ref(),
+                scope,
+            },
+            turn_cancellation,
+            started,
+            timeout,
+            scope,
+        )
+        .await?;
+        let (request, delay) = match plan {
+            ProviderRoundPlan::Proceed { request } => (request, None),
+            ProviderRoundPlan::RetryAfter { request, delay } => (request, Some(delay)),
+            ProviderRoundPlan::Fail { error } => {
+                return Err(error.or(previous_failure).unwrap_or_else(|| {
+                    RuntimeError::HostExtension(
+                        "provider planner returned fail before a provider attempt without an error"
+                            .to_string(),
+                    )
+                }));
+            }
+        };
+        if let Some(delay) = delay {
+            wait_for_provider_retry_delay(delay, turn_cancellation, started, timeout, scope)
+                .await?;
+        }
+        proposed_request = request;
+        proposed_request.timeout = remaining_turn_duration(started, timeout)?;
+        proposed_request.cancellation = turn_cancellation.clone();
+        match runtime
+            .run_text_turn_in_scope(provider, &proposed_request, scope)
+            .await
+        {
+            Ok(response) => {
+                return Ok(PlannedProviderRound {
+                    request: proposed_request,
+                    response,
+                });
+            }
+            Err(RuntimeError::Cancelled) => return Err(RuntimeError::Cancelled),
+            Err(RuntimeError::Timeout { .. }) => {
+                return Err(RuntimeError::Timeout { timeout });
+            }
+            Err(error) => {
+                previous_failure = Some(error);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+async fn plan_provider_round<R>(
+    planner: &R,
+    context: ProviderRoundPlanContext<'_>,
+    turn_cancellation: &CancellationToken,
+    started: Instant,
+    timeout: Duration,
+    scope: &TurnScope,
+) -> Result<ProviderRoundPlan>
+where
+    R: ProviderRoundPlanner + ?Sized,
+{
+    let remaining = remaining_turn_duration(started, timeout)?;
+    let scope_cancellation = scope.control().cancellation();
+    tokio::select! {
+        biased;
+        () = turn_cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        () = tokio::time::sleep(remaining) => Err(RuntimeError::Timeout { timeout }),
+        plan = planner.plan_round(context) => plan,
+    }
+}
+
+async fn wait_for_provider_retry_delay(
+    delay: Duration,
+    turn_cancellation: &CancellationToken,
+    started: Instant,
+    timeout: Duration,
+    scope: &TurnScope,
+) -> Result<()> {
+    let remaining = remaining_turn_duration(started, timeout)?;
+    let scope_cancellation = scope.control().cancellation();
+    tokio::select! {
+        biased;
+        () = turn_cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        () = tokio::time::sleep(remaining) => Err(RuntimeError::Timeout { timeout }),
+        () = tokio::time::sleep(delay) => Ok(()),
+    }
+}
+
+fn remaining_turn_duration(started: Instant, timeout: Duration) -> Result<Duration> {
+    timeout
+        .checked_sub(started.elapsed())
+        .ok_or(RuntimeError::Timeout { timeout })
 }
 
 fn append_provider_tool_calls(
@@ -2977,6 +3333,7 @@ mod tests {
                 Arc::new(RuntimeStreamEventSink { sender: None }),
                 InvocationCapabilities::default(),
                 &observer,
+                &NoopProviderRoundPlanner,
             )
             .await
             .expect("canonical provider/tool loop should complete");
@@ -3003,6 +3360,199 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(result_ids, ["call-1", "call-2"]);
         drop(requests);
+    }
+
+    #[derive(Debug, Default)]
+    struct RetryOncePlanner {
+        plans: AtomicUsize,
+    }
+
+    impl ProviderRoundPlanner for RetryOncePlanner {
+        fn plan_round<'a>(
+            &'a self,
+            context: ProviderRoundPlanContext<'a>,
+        ) -> RuntimeFuture<'a, ProviderRoundPlan> {
+            self.plans.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if context.previous_failure.is_some() {
+                    assert_eq!(context.round, 0);
+                    assert_eq!(context.attempt, 1);
+                    let mut request = context.proposed_request.clone();
+                    request
+                        .metadata
+                        .insert("recovered".to_string(), "true".to_string());
+                    Ok(ProviderRoundPlan::RetryAfter {
+                        request,
+                        delay: Duration::from_millis(1),
+                    })
+                } else {
+                    assert_eq!(context.attempt, 0);
+                    Ok(ProviderRoundPlan::Proceed {
+                        request: context.proposed_request.clone(),
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_planner_recovers_provider_failure_in_same_scope() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![ProviderTurnEvent::Error {
+                    error: ProviderError {
+                        code: "retry-me".to_string(),
+                        category: bcode_model::ProviderErrorCategory::Network,
+                        message: "temporary".to_string(),
+                        retryable: true,
+                        provider_message: None,
+                        retry: None,
+                    },
+                }],
+                vec![
+                    ProviderTurnEvent::TextDelta {
+                        text: "recovered".to_string(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+            ],
+            Arc::clone(&requests),
+        );
+        let planner = RetryOncePlanner::default();
+
+        let response = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                AgentTurnRequest::new("model", "recover"),
+                &UnifiedToolCatalog::new(),
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(0),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink { sender: None }),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &planner,
+            )
+            .await
+            .expect("planner should recover provider failure");
+
+        assert_eq!(response.text, "recovered");
+        assert_eq!(planner.plans.load(Ordering::SeqCst), 2);
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].metadata.get("recovered").map(String::as_str),
+            Some("true")
+        );
+        drop(requests);
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingProviderPlanner;
+
+    impl ProviderRoundPlanner for BlockingProviderPlanner {
+        fn plan_round<'a>(
+            &'a self,
+            _context: ProviderRoundPlanContext<'a>,
+        ) -> RuntimeFuture<'a, ProviderRoundPlan> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_blocked_provider_planning_before_start() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(Vec::<Vec<ProviderTurnEvent>>::new(), requests);
+        let cancellation = CancellationToken::new();
+        let mut request = AgentTurnRequest::new("model", "blocked planning");
+        request.cancellation = cancellation.clone();
+        let runtime = AgentRuntime::new();
+        let catalog = UnifiedToolCatalog::new();
+        let authorization = AllowBatchAuthorization::default();
+        let invoker = ContractTestInvoker::new(0);
+        let context = RuntimePermissionContext::default();
+        let execution = runtime.run_provider_tool_loop(
+            &mut provider,
+            request,
+            &catalog,
+            &authorization,
+            &invoker,
+            &context,
+            &[],
+            ToolExecutionOptions::default(),
+            Arc::new(RuntimeStreamEventSink { sender: None }),
+            InvocationCapabilities::default(),
+            &NoopToolRoundObserver,
+            &BlockingProviderPlanner,
+        );
+        let cancel = async {
+            tokio::task::yield_now().await;
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(execution, cancel);
+
+        assert!(matches!(result, Err(RuntimeError::Cancelled)));
+        assert_eq!(provider.next_turn, 0);
+    }
+
+    #[derive(Debug, Default)]
+    struct DelayedProviderPlanner;
+
+    impl ProviderRoundPlanner for DelayedProviderPlanner {
+        fn plan_round<'a>(
+            &'a self,
+            context: ProviderRoundPlanContext<'a>,
+        ) -> RuntimeFuture<'a, ProviderRoundPlan> {
+            Box::pin(async move {
+                Ok(ProviderRoundPlan::RetryAfter {
+                    request: context.proposed_request.clone(),
+                    delay: Duration::from_mins(1),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_provider_retry_delay_before_start() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(Vec::<Vec<ProviderTurnEvent>>::new(), requests);
+        let cancellation = CancellationToken::new();
+        let mut request = AgentTurnRequest::new("model", "delayed planning");
+        request.cancellation = cancellation.clone();
+        let runtime = AgentRuntime::new();
+        let catalog = UnifiedToolCatalog::new();
+        let authorization = AllowBatchAuthorization::default();
+        let invoker = ContractTestInvoker::new(0);
+        let context = RuntimePermissionContext::default();
+        let execution = runtime.run_provider_tool_loop(
+            &mut provider,
+            request,
+            &catalog,
+            &authorization,
+            &invoker,
+            &context,
+            &[],
+            ToolExecutionOptions::default(),
+            Arc::new(RuntimeStreamEventSink { sender: None }),
+            InvocationCapabilities::default(),
+            &NoopToolRoundObserver,
+            &DelayedProviderPlanner,
+        );
+        let cancel = async {
+            tokio::task::yield_now().await;
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(execution, cancel);
+
+        assert!(matches!(result, Err(RuntimeError::Cancelled)));
+        assert_eq!(provider.next_turn, 0);
     }
 
     #[tokio::test]
@@ -3052,6 +3602,7 @@ mod tests {
                 Arc::new(RuntimeStreamEventSink { sender: None }),
                 InvocationCapabilities::default(),
                 &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
             )
             .await
             .expect_err("second tool round must exceed the configured limit");

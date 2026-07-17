@@ -1,7 +1,8 @@
 use bcode::{
     Agent, AgentEvent, BcodeError, ModelContentBlock, ModelProviderInvoker, PreparationScope,
-    PreparedToolInvocation, RegisteredTool, RuntimeFuture, ScopedAgentStreamItem, ScopedTurnEvent,
-    ToolCall, ToolDefinition, ToolInvoker, ToolPreparationRequest, ToolPreparationResponse,
+    PreparedToolInvocation, ProviderRoundPlan, ProviderRoundPlanContext, ProviderRoundPlanner,
+    RegisteredTool, RuntimeFuture, ScopedAgentStreamItem, ScopedTurnEvent, ToolCall,
+    ToolDefinition, ToolInvoker, ToolPreparationRequest, ToolPreparationResponse,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, MessageRole, ModelTurnRequest,
@@ -220,6 +221,53 @@ fn invoker() -> (Arc<ParallelInvoker>, Arc<AtomicUsize>) {
         }),
         maximum,
     )
+}
+
+#[derive(Debug, Default)]
+struct SdkPlanner(AtomicUsize);
+
+impl ProviderRoundPlanner for SdkPlanner {
+    fn plan_round<'a>(
+        &'a self,
+        context: ProviderRoundPlanContext<'a>,
+    ) -> RuntimeFuture<'a, ProviderRoundPlan> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let mut request = context.proposed_request.clone();
+            request
+                .metadata
+                .insert("sdk_planner".to_string(), context.round.to_string());
+            Ok(ProviderRoundPlan::Proceed { request })
+        })
+    }
+}
+
+#[tokio::test]
+async fn sdk_builder_routes_provider_round_planner_through_canonical_loop() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = BatchProvider::new(Arc::clone(&requests));
+    let (invoker, _) = invoker();
+    let planner = Arc::new(SdkPlanner::default());
+    let agent = agent_builder(invoker)
+        .provider_round_planner(planner.clone())
+        .build();
+
+    let response = agent
+        .run(&mut provider, "run tools")
+        .await
+        .expect("configured planner should run");
+
+    assert_eq!(response.text, "done");
+    assert_eq!(planner.0.load(Ordering::SeqCst), 2);
+    let requests = requests.lock().expect("provider requests lock");
+    assert_eq!(
+        requests[0].metadata.get("sdk_planner").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        requests[1].metadata.get("sdk_planner").map(String::as_str),
+        Some("1")
+    );
 }
 
 #[tokio::test]

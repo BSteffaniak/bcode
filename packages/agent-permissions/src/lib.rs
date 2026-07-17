@@ -28,6 +28,7 @@ pub type PermissionAskCallback = Arc<
 #[derive(Clone)]
 pub struct AgentPermissionPolicy {
     config: AgentConfig,
+    cwd: PathBuf,
     ask_callback: Option<PermissionAskCallback>,
 }
 
@@ -36,6 +37,7 @@ impl fmt::Debug for AgentPermissionPolicy {
         formatter
             .debug_struct("AgentPermissionPolicy")
             .field("config", &self.config)
+            .field("cwd", &self.cwd)
             .field("ask_callback", &self.ask_callback.is_some())
             .finish()
     }
@@ -47,6 +49,7 @@ impl AgentPermissionPolicy {
     pub fn new(config: AgentConfig) -> Self {
         Self {
             config,
+            cwd: PathBuf::from("."),
             ask_callback: None,
         }
     }
@@ -55,6 +58,13 @@ impl AgentPermissionPolicy {
     #[must_use]
     pub fn from_permission_config(config: &AgentPermissionConfig, agent_id: &str) -> Self {
         Self::new(bcode_agent_policy::agent_config(config, agent_id))
+    }
+
+    /// Configure the workspace used by this domain policy adapter.
+    #[must_use]
+    pub fn with_working_directory(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = cwd.into();
+        self
     }
 
     /// Attach a callback used only when core policy returns [`AgentDecision::Ask`].
@@ -90,13 +100,8 @@ impl PermissionPolicy for AgentPermissionPolicy {
         request: &'a RuntimePermissionRequest,
     ) -> bcode_agent_runtime::RuntimeFuture<'a, PermissionDecision> {
         Box::pin(async move {
-            let cwd = request
-                .context
-                .cwd
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("."));
-            let profile_request = runtime_permission_request_to_profile_request(request);
-            let evaluation = evaluate_profile_tool_call(&self.config, &profile_request, &cwd);
+            let profile_request = runtime_permission_request_to_profile_request(request, &self.cwd);
+            let evaluation = evaluate_profile_tool_call(&self.config, &profile_request, &self.cwd);
             Ok(self.runtime_decision(request, evaluation))
         })
     }
@@ -132,6 +137,7 @@ impl AgentPermissionPolicy {
 #[must_use]
 pub fn runtime_permission_request_to_profile_request(
     request: &RuntimePermissionRequest,
+    cwd: &std::path::Path,
 ) -> EvaluateToolCallRequest {
     EvaluateToolCallRequest {
         session_id: request.context.session_id,
@@ -140,11 +146,7 @@ pub fn runtime_permission_request_to_profile_request(
         side_effect: request.tool.definition.side_effect,
         policy: request.tool.definition.policy.clone(),
         arguments: request.call.arguments.clone(),
-        cwd: request
-            .context
-            .cwd
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
     }
 }
 

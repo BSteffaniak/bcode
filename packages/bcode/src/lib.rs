@@ -40,10 +40,10 @@ pub use bcode_agent_profile::{AgentDecision, EvaluateToolCallResponse};
 pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
     AgentRuntimeStreamItem as AgentStreamItem, AllowAllPolicy, CancellationToken,
-    ModelProviderInvoker, PermissionDecision, PermissionPolicy, RegisteredTool, RuntimeError,
-    RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
-    ToolExecutionOutput, ToolExecutor, ToolRoundObserver, ToolRoundState, ToolSource,
-    UnifiedToolCatalog,
+    ModelProviderInvoker, PermissionDecision, PermissionPolicy, ProviderRoundPlan,
+    ProviderRoundPlanContext, ProviderRoundPlanner, RegisteredTool, RuntimeError, RuntimeFuture,
+    RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog, ToolExecutionOutput,
+    ToolExecutor, ToolRoundObserver, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_agent_runtime::{
     InvocationArtifactSink, InvocationCapabilities, InvocationCapabilityFuture,
@@ -1275,38 +1275,53 @@ pub enum ScopedAgentStreamItem {
 /// Generic stream for one complete provider/tool turn across every scoped event family.
 #[derive(Debug)]
 pub struct ScopedAgentStream {
-    receiver: tokio::sync::mpsc::UnboundedReceiver<ScopedAgentStreamItem>,
+    stream: bcode_agent_runtime::AgentLoopStream,
+    observer: Arc<SdkToolRoundObserver>,
 }
 
 impl ScopedAgentStream {
     /// Receive the next scoped stream item.
     pub async fn next(&mut self) -> Option<ScopedAgentStreamItem> {
-        self.receiver.recv().await
+        self.stream.next().await.map(|item| match item {
+            bcode_agent_runtime::AgentLoopStreamItem::Event(event) => {
+                ScopedAgentStreamItem::Event(event)
+            }
+            bcode_agent_runtime::AgentLoopStreamItem::Finished(response) => {
+                ScopedAgentStreamItem::Finished(response.into())
+            }
+            bcode_agent_runtime::AgentLoopStreamItem::Error(error) => ScopedAgentStreamItem::Error(
+                self.observer
+                    .take_error()
+                    .unwrap_or(BcodeError::Runtime(error)),
+            ),
+        })
     }
 }
 
-struct ScopedAgentEventSink {
-    configured: Arc<dyn TurnEventSink>,
-    sender: tokio::sync::mpsc::UnboundedSender<ScopedAgentStreamItem>,
-}
-
-impl TurnEventSink for ScopedAgentEventSink {
-    fn emit(&self, event: ScopedTurnEvent) -> bool {
-        let configured = self.configured.emit(event.clone());
-        let streamed = self
-            .sender
-            .send(ScopedAgentStreamItem::Event(event))
-            .is_ok();
-        configured && streamed
-    }
-}
-
-struct SdkToolRoundObserver<'a> {
-    agent: &'a Agent,
+struct SdkToolRoundObserver {
+    agent_name: Option<String>,
+    hooks: AgentHooks,
     error: Mutex<Option<BcodeError>>,
 }
 
-impl SdkToolRoundObserver<'_> {
+impl fmt::Debug for SdkToolRoundObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SdkToolRoundObserver")
+            .field("agent_name", &self.agent_name)
+            .field("hooks", &self.hooks)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SdkToolRoundObserver {
+    fn new(agent: &Agent) -> Self {
+        Self {
+            agent_name: agent.name.clone(),
+            hooks: agent.hooks.clone(),
+            error: Mutex::new(None),
+        }
+    }
     fn record_error(&self, error: BcodeError) -> RuntimeError {
         let message = error.to_string();
         *self
@@ -1324,13 +1339,12 @@ impl SdkToolRoundObserver<'_> {
     }
 }
 
-impl ToolRoundObserver for SdkToolRoundObserver<'_> {
+impl ToolRoundObserver for SdkToolRoundObserver {
     fn before_tool_batch(&self, calls: &[ToolCall]) -> bcode_agent_runtime::Result<()> {
         for call in calls {
-            self.agent
-                .hooks
+            self.hooks
                 .run_before_tool(&ToolCallContext {
-                    agent_name: self.agent.name.clone(),
+                    agent_name: self.agent_name.clone(),
                     call: call.clone(),
                 })
                 .map_err(|error| self.record_error(error))?;
@@ -1343,11 +1357,10 @@ impl ToolRoundObserver for SdkToolRoundObserver<'_> {
         call: &ToolCall,
         output: &ToolExecutionOutput,
     ) -> bcode_agent_runtime::Result<()> {
-        self.agent
-            .hooks
+        self.hooks
             .run_after_tool(
                 &ToolCallContext {
-                    agent_name: self.agent.name.clone(),
+                    agent_name: self.agent_name.clone(),
                     call: call.clone(),
                 },
                 &ToolCallOutcome {
@@ -2479,6 +2492,7 @@ pub struct Agent {
     authorization_coordinator: Option<Arc<dyn ToolAuthorizationCoordinator>>,
     tool_invoker: Option<Arc<dyn ToolInvoker>>,
     provider_factory: Option<ProviderFactory>,
+    provider_round_planner: Arc<dyn ProviderRoundPlanner>,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
@@ -2516,6 +2530,7 @@ impl fmt::Debug for Agent {
             )
             .field("tool_invoker", &self.tool_invoker.is_some())
             .field("provider_factory", &self.provider_factory.is_some())
+            .field("provider_round_planner", &"<planner>")
             .field("tool_catalog", &self.tool_catalog)
             .field(
                 "inline_tool_handlers",
@@ -3015,31 +3030,46 @@ impl Agent {
     #[must_use]
     pub fn stream_with_cancellation<P>(
         &self,
-        mut provider: P,
+        provider: P,
         prompt: impl Into<String>,
         cancellation: CancellationToken,
     ) -> ScopedAgentStream
     where
         P: ModelProviderInvoker + 'static,
     {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let agent = self.clone();
-        let events: Arc<dyn TurnEventSink> = Arc::new(ScopedAgentEventSink {
-            configured: Arc::clone(&agent.invocation_event_sink),
-            sender: sender.clone(),
+        let invoker: Arc<dyn ToolInvoker> = self.tool_invoker.clone().unwrap_or_else(|| {
+            Arc::new(SdkToolInvoker {
+                handlers: self.inline_tool_handlers.clone(),
+                #[cfg(feature = "embedded-plugins")]
+                session_id: self.session_id,
+                #[cfg(feature = "embedded-plugins")]
+                plugins: self.plugins.clone(),
+            })
         });
-        let request = agent.turn_request_with_cancellation(prompt.into(), cancellation);
-        tokio::spawn(async move {
-            let result = agent
-                .run_provider_tool_loop(&mut provider, request, events)
-                .await;
-            let item = match result {
-                Ok(runtime) => ScopedAgentStreamItem::Finished(runtime.into()),
-                Err(error) => ScopedAgentStreamItem::Error(error),
-            };
-            let _ = sender.send(item);
-        });
-        ScopedAgentStream { receiver }
+        let authorization: Arc<dyn ToolAuthorizationCoordinator> =
+            self.authorization_coordinator.clone().unwrap_or_else(|| {
+                Arc::new(
+                    bcode_agent_runtime::SharedPermissionPolicyAuthorization::new(Arc::clone(
+                        &self.permission_policy,
+                    )),
+                )
+            });
+        let observer = Arc::new(SdkToolRoundObserver::new(self));
+        let stream = self.runtime.run_streaming_provider_tool_loop(
+            provider,
+            self.turn_request_with_cancellation(prompt.into(), cancellation),
+            Arc::new(self.tool_catalog.clone()),
+            authorization,
+            invoker,
+            self.permission_context(),
+            Vec::new(),
+            self.execution_options,
+            Arc::clone(&self.invocation_event_sink),
+            self.invocation_capabilities.clone(),
+            observer.clone(),
+            Arc::clone(&self.provider_round_planner),
+        );
+        ScopedAgentStream { stream, observer }
     }
 
     /// Create mutable tool-round state using this agent's configured maximum.
@@ -3185,10 +3215,7 @@ impl Agent {
             .authorization_coordinator
             .as_deref()
             .unwrap_or(&policy_authorization);
-        let observer = SdkToolRoundObserver {
-            agent: self,
-            error: Mutex::new(None),
-        };
+        let observer = SdkToolRoundObserver::new(self);
         let result = self
             .runtime
             .run_provider_tool_loop(
@@ -3203,6 +3230,7 @@ impl Agent {
                 events,
                 self.invocation_capabilities.clone(),
                 &observer,
+                self.provider_round_planner.as_ref(),
             )
             .await;
         if let Some(error) = observer.take_error() {
@@ -3215,7 +3243,6 @@ impl Agent {
         RuntimePermissionContext {
             session_id: self.session_id,
             agent_id: self.profile_id.clone(),
-            cwd: self.cwd.clone(),
         }
     }
 
@@ -3336,6 +3363,7 @@ pub struct AgentBuilder {
     authorization_coordinator: Option<Arc<dyn ToolAuthorizationCoordinator>>,
     tool_invoker: Option<Arc<dyn ToolInvoker>>,
     provider_factory: Option<ProviderFactory>,
+    provider_round_planner: Arc<dyn ProviderRoundPlanner>,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
@@ -3374,6 +3402,7 @@ impl fmt::Debug for AgentBuilder {
             )
             .field("tool_invoker", &self.tool_invoker.is_some())
             .field("provider_factory", &self.provider_factory.is_some())
+            .field("provider_round_planner", &"<planner>")
             .field("tool_catalog", &self.tool_catalog)
             .field(
                 "inline_tool_handlers",
@@ -3419,6 +3448,7 @@ impl Default for AgentBuilder {
             authorization_coordinator: None,
             tool_invoker: None,
             provider_factory: None,
+            provider_round_planner: Arc::new(bcode_agent_runtime::NoopProviderRoundPlanner),
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
             hooks: AgentHooks::new(),
@@ -3608,6 +3638,13 @@ impl AgentBuilder {
         F: Fn() -> Box<dyn ModelProviderInvoker> + Send + Sync + 'static,
     {
         self.provider_factory = Some(Arc::new(factory));
+        self
+    }
+
+    /// Configure provider retry, recovery, compaction, and request rebuilding policy.
+    #[must_use]
+    pub fn provider_round_planner(mut self, planner: Arc<dyn ProviderRoundPlanner>) -> Self {
+        self.provider_round_planner = planner;
         self
     }
 
@@ -3845,6 +3882,7 @@ impl AgentBuilder {
         self.custom_permission_policy.clone().unwrap_or_else(|| {
             Arc::new(
                 AgentPermissionPolicy::new(self.policy_config.clone())
+                    .with_working_directory(self.cwd.clone().unwrap_or_else(|| PathBuf::from(".")))
                     .with_ask_callback(self.permission_ask_callback.clone()),
             )
         })
@@ -3874,6 +3912,7 @@ impl AgentBuilder {
             authorization_coordinator: self.authorization_coordinator,
             tool_invoker: self.tool_invoker,
             provider_factory: self.provider_factory,
+            provider_round_planner: self.provider_round_planner,
             tool_catalog: self.tool_catalog,
             inline_tool_handlers: self.inline_tool_handlers,
             hooks: self.hooks,
