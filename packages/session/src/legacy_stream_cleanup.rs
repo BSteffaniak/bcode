@@ -89,6 +89,12 @@ pub enum LegacyStreamCleanupError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("backup verification failed between {source_path} and {destination}: {reason}")]
+    BackupVerification {
+        source_path: PathBuf,
+        destination: PathBuf,
+        reason: String,
+    },
     #[error("event #{sequence} failed strict persisted decoding: {source}")]
     StrictDecode {
         sequence: u64,
@@ -550,7 +556,150 @@ fn create_backup(root: &Path, session_id: SessionId) -> Result<PathBuf, LegacySt
         .join("legacy-stream-cleanup-backups")
         .join(format!("{timestamp}-{session_id}"));
     copy_dir_recursive(&root.join(session_id.to_string()), &destination)?;
+    verify_directory_copy(&root.join(session_id.to_string()), &destination)?;
     Ok(destination)
+}
+
+fn verify_directory_copy(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), LegacyStreamCleanupError> {
+    let mut source_entries = fs::read_dir(source)
+        .map_err(|source_error| LegacyStreamCleanupError::Io {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source_error| LegacyStreamCleanupError::Io {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+    source_entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut destination_entries = fs::read_dir(destination)
+        .map_err(|source_error| LegacyStreamCleanupError::Io {
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source_error| LegacyStreamCleanupError::Io {
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?;
+    destination_entries.sort_by_key(std::fs::DirEntry::file_name);
+    if source_entries.len() != destination_entries.len()
+        || source_entries
+            .iter()
+            .zip(&destination_entries)
+            .any(|(source, destination)| source.file_name() != destination.file_name())
+    {
+        return Err(LegacyStreamCleanupError::BackupVerification {
+            source_path: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            reason: "directory entries differ".to_owned(),
+        });
+    }
+    for (source_entry, destination_entry) in source_entries.iter().zip(&destination_entries) {
+        let source_path = source_entry.path();
+        let destination_path = destination_entry.path();
+        let source_type =
+            source_entry
+                .file_type()
+                .map_err(|source_error| LegacyStreamCleanupError::Io {
+                    path: source_path.clone(),
+                    source: source_error,
+                })?;
+        let destination_type =
+            destination_entry
+                .file_type()
+                .map_err(|source_error| LegacyStreamCleanupError::Io {
+                    path: destination_path.clone(),
+                    source: source_error,
+                })?;
+        if source_type.is_dir() != destination_type.is_dir()
+            || source_type.is_file() != destination_type.is_file()
+        {
+            return Err(LegacyStreamCleanupError::BackupVerification {
+                source_path,
+                destination: destination_path,
+                reason: "entry types differ".to_owned(),
+            });
+        }
+        if source_type.is_dir() {
+            verify_directory_copy(&source_path, &destination_path)?;
+        } else if source_type.is_file() {
+            verify_file_copy(&source_path, &destination_path)?;
+        } else {
+            return Err(LegacyStreamCleanupError::BackupVerification {
+                source_path,
+                destination: destination_path,
+                reason: "unsupported non-file entry".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn verify_file_copy(source: &Path, destination: &Path) -> Result<(), LegacyStreamCleanupError> {
+    use std::io::Read as _;
+
+    let source_length = fs::metadata(source)
+        .map_err(|source_error| LegacyStreamCleanupError::Io {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?
+        .len();
+    let destination_length = fs::metadata(destination)
+        .map_err(|source_error| LegacyStreamCleanupError::Io {
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?
+        .len();
+    if source_length != destination_length {
+        return Err(LegacyStreamCleanupError::BackupVerification {
+            source_path: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            reason: "file lengths differ".to_owned(),
+        });
+    }
+    let mut source_file =
+        fs::File::open(source).map_err(|source_error| LegacyStreamCleanupError::Io {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+    let mut destination_file =
+        fs::File::open(destination).map_err(|source_error| LegacyStreamCleanupError::Io {
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?;
+    let mut source_buffer = vec![0_u8; 64 * 1024];
+    let mut destination_buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let source_read = source_file
+            .read(&mut source_buffer)
+            .map_err(|source_error| LegacyStreamCleanupError::Io {
+                path: source.to_path_buf(),
+                source: source_error,
+            })?;
+        let destination_read =
+            destination_file
+                .read(&mut destination_buffer)
+                .map_err(|source_error| LegacyStreamCleanupError::Io {
+                    path: destination.to_path_buf(),
+                    source: source_error,
+                })?;
+        if source_read != destination_read
+            || source_buffer[..source_read] != destination_buffer[..source_read]
+        {
+            return Err(LegacyStreamCleanupError::BackupVerification {
+                source_path: source.to_path_buf(),
+                destination: destination.to_path_buf(),
+                reason: "file contents differ".to_owned(),
+            });
+        }
+        if source_read == 0 {
+            return Ok(());
+        }
+    }
 }
 
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), LegacyStreamCleanupError> {
@@ -668,6 +817,15 @@ mod tests {
         assert_eq!(applied.outcome, CleanupOutcome::Cleaned);
         let backup = applied.backup_path.expect("backup path");
         assert!(backup.join("session.db").exists());
+        verify_directory_copy(&root.join(session_id.to_string()), &backup)
+            .expect_err("installed compact database should differ from source backup");
+        let backup_events = db::SessionDb::open_turso(session_id, &backup.join("session.db"))
+            .await
+            .expect("open verified backup")
+            .all_events_strict()
+            .await
+            .expect("read verified backup");
+        assert_eq!(backup_events, vec![semantic_event.clone(), event]);
 
         let reopened = db::SessionDb::open_turso_in_root(session_id, &root)
             .await
