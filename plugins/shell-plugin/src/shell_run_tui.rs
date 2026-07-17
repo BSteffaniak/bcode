@@ -1575,6 +1575,41 @@ mod tests {
     }
 
     #[test]
+    fn production_adapter_never_uses_model_tail_for_referenced_authoritative_output() {
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "output_tail": "forbidden bounded model fallback",
+            "columns": 80,
+            "rows": 24,
+            "_artifact_refs": [{
+                "key": SHELL_RECORDING_REF_KEY,
+                "content_type": SHELL_RECORDING_CONTENT_TYPE,
+                "storage_uri": "file:///definitely/not/read/by/rows.bcsr",
+                "metadata": {"complete": true}
+            }]
+        });
+        let rendered = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter::default(),
+            "bcode.shell.run",
+            &payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
+        )
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(
+            !rendered.contains("forbidden bounded model fallback"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn explicitly_evicted_recording_is_unavailable_without_fallback() {
         let payload = serde_json::json!({
             "mode": "terminal",
