@@ -619,9 +619,19 @@ mod tests {
         let database = db::SessionDb::open_turso_in_root(session_id, &root)
             .await
             .expect("open session");
-        let event = SessionEvent {
+        let semantic_event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 0,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::AssistantMessage {
+                text: "semantic event must survive cleanup".to_owned(),
+            },
+        };
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
             timestamp_ms: 1,
             session_id,
             provenance: None,
@@ -635,6 +645,10 @@ mod tests {
                 },
             },
         };
+        database
+            .append_event(&semantic_event)
+            .await
+            .expect("append semantic event");
         database
             .append_event(&event)
             .await
@@ -659,9 +673,11 @@ mod tests {
             .await
             .expect("reopen session");
         let events = reopened.all_events_strict().await.expect("strict history");
-        assert_eq!(events[0].sequence, 0);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], semantic_event);
+        assert_eq!(events[1].sequence, 1);
         assert!(matches!(
-            &events[0].kind,
+            &events[1].kind,
             SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::LegacyTransientPruned {
                     tool_call_id,
