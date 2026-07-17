@@ -10,8 +10,8 @@ use bcode_session_models::{
     ModelRequestIdentity, ModelTurnOutcome, ProviderContextSnapshot, RequestContextObservation,
     RequestContextTokenCount, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
-    ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, TurnOrigin,
-    WorkId, current_unix_timestamp_ms,
+    ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
+    TurnAdmissionMetadata, WorkId, current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -173,8 +173,8 @@ enum PersistedSessionEventKind {
     UserMessage {
         client_id: ClientId,
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin: Option<TurnOrigin>,
+        #[serde(default)]
+        admission: TurnAdmissionMetadata,
     },
     AssistantDelta {
         text: String,
@@ -568,11 +568,11 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             SessionEventKind::UserMessage {
                 client_id,
                 text,
-                origin,
+                admission,
             } => Self::UserMessage {
                 client_id: *client_id,
                 text: text.clone(),
-                origin: origin.clone(),
+                admission: admission.clone(),
             },
             SessionEventKind::AssistantDelta { text } => {
                 Self::AssistantDelta { text: text.clone() }
@@ -964,11 +964,11 @@ impl PersistedSessionEventKind {
             Self::UserMessage {
                 client_id,
                 text,
-                origin,
+                admission,
             } => SessionEventKind::UserMessage {
                 client_id,
                 text,
-                origin,
+                admission,
             },
             Self::AssistantDelta { text } => SessionEventKind::AssistantDelta { text },
             Self::AssistantMessage { text } => SessionEventKind::AssistantMessage { text },
@@ -1425,10 +1425,13 @@ mod tests {
         let payload = r#"{"schema_version":29,"sequence":1,"timestamp_ms":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"user_message":{"client_id":"00000000-0000-0000-0000-000000000002","text":"hello"}}}"#;
 
         let event = decode_session_event(payload).expect("legacy user message should decode");
-        assert!(matches!(
-            event.kind,
-            SessionEventKind::UserMessage { origin: None, .. }
-        ));
+        let SessionEventKind::UserMessage { admission, .. } = event.kind else {
+            panic!("expected user message");
+        };
+        assert_eq!(
+            admission,
+            bcode_session_models::TurnAdmissionMetadata::default()
+        );
     }
 
     #[test]
@@ -1442,11 +1445,14 @@ mod tests {
             kind: SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "background prompt".to_string(),
-                origin: Some(TurnOrigin {
-                    producer: "test.producer".to_string(),
-                    correlation_id: Some("operation-1".to_string()),
-                    display_label: Some("Background pass 1".to_string()),
-                }),
+                admission: TurnAdmissionMetadata {
+                    origin: Some(bcode_session_models::TurnOrigin {
+                        producer: "test.producer".to_string(),
+                        correlation_id: Some("operation-1".to_string()),
+                        display_label: Some("Background pass 1".to_string()),
+                    }),
+                    ..TurnAdmissionMetadata::default()
+                },
             },
         };
 
@@ -1549,7 +1555,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "hello".to_string(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
             SessionEventKind::AssistantDelta {
                 text: "delta".to_string(),

@@ -1177,7 +1177,7 @@ fn live_user_message_does_not_overwrite_saved_history_draft() {
         SessionEventKind::UserMessage {
             text: "newly committed prompt".to_owned(),
             client_id: ClientId::new(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     ));
     assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Down)).redraw);
@@ -2019,7 +2019,7 @@ fn history_rebuild_does_not_duplicate_initial_history() {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "first".to_owned(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ),
         event(
@@ -2072,7 +2072,7 @@ fn live_event_overlapping_initial_history_is_ignored() {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "question".to_owned(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ),
         event(
@@ -2105,7 +2105,7 @@ fn newer_live_event_after_initial_history_is_absorbed() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "question".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2134,7 +2134,7 @@ fn prepended_history_coalesces_assistant_deltas() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "newer prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &newer, &[], true);
@@ -2658,7 +2658,7 @@ fn scroll_up_requests_older_history_only_after_top() {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: format!("prompt {sequence}"),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
         })
@@ -2824,7 +2824,7 @@ fn streaming_delta_fills_virtual_space_instead_of_top_anchoring() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2890,7 +2890,7 @@ fn manual_scroll_grace_prevents_stream_top_anchor() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -3058,7 +3058,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "new prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     ));
     app.absorb_session_event(&event(
@@ -3091,7 +3091,7 @@ fn streaming_assistant_response_anchors_at_top_when_following() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -3135,7 +3135,7 @@ fn manual_scroll_from_stream_anchor_preserves_visual_position() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -3221,7 +3221,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -3276,7 +3276,7 @@ fn manual_scroll_cancels_stream_anchor_for_remaining_deltas() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -3325,7 +3325,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -3389,7 +3389,7 @@ fn runtime_work_events_do_not_pull_final_response_to_bottom() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -3488,7 +3488,7 @@ fn committed_user_echo_does_not_restart_submitted_message_anchor() {
         SessionEventKind::UserMessage {
             client_id: ClientId::new(),
             text: "new prompt".to_owned(),
-            origin: None,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
@@ -4279,7 +4279,7 @@ fn transcript_resident_window_trims_live_bottom_following_turns() {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: format!("user {turn}"),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ));
         app.absorb_session_event(&event(
@@ -4324,7 +4324,7 @@ fn transcript_resident_window_does_not_trim_with_active_tool() {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: format!("user {turn}"),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ));
         app.absorb_session_event(&event(
@@ -4375,7 +4375,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: format!("user {turn}"),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ));
         app.absorb_session_event(&event(

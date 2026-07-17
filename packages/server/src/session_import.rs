@@ -121,7 +121,7 @@ pub async fn import_external_session(
                         SessionEventKind::UserMessage {
                             client_id: ClientId::new(),
                             text,
-                            origin: None,
+                            admission: bcode_session_models::TurnAdmissionMetadata::default(),
                         }
                     }
                     ImportableSessionEventKind::AssistantMessage { text } => {

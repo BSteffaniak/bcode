@@ -21960,7 +21960,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "hello".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22021,7 +22021,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old request".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22038,7 +22038,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "new request".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -22069,7 +22069,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id,
                     text: "old request".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22078,7 +22078,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id,
                     text: "current request".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22126,7 +22126,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id,
                     text: "continue".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -22268,7 +22268,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "one".into(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22284,7 +22284,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "two".into(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22300,7 +22300,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "three".into(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -22324,7 +22324,7 @@ library = "test"
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "work".into(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         )];
         for (sequence, call) in [(2, "a"), (4, "b")] {
@@ -22375,7 +22375,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old turn".into(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22404,7 +22404,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "new turn".into(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -22430,7 +22430,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "historical turn".repeat(1_000),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22492,7 +22492,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old".into(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22508,7 +22508,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active".into(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -22549,7 +22549,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("history user {index}"),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -22570,7 +22570,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active delayed turn".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
             .await
@@ -22685,7 +22685,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -22763,7 +22763,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "x".repeat(4_000),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
             .await
@@ -22807,7 +22807,7 @@ library = "test"
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "x".repeat(4_000),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         )];
         let error =
@@ -22829,7 +22829,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older question".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22845,7 +22845,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active question".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22894,7 +22894,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "inspect".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22945,7 +22945,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -22961,7 +22961,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -23002,7 +23002,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "first".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -23033,7 +23033,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "second".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -23049,7 +23049,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -23097,7 +23097,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             session_event(
@@ -23113,7 +23113,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -23148,7 +23148,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "continue".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -23216,7 +23216,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "x".repeat(COMPACTION_DEFAULT_KEEP_RECENT_CHARS / 4),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 }
             } else {
                 SessionEventKind::AssistantMessage {
@@ -25034,7 +25034,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "managed context turn".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
             .await
@@ -25148,7 +25148,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("history {index} {}", "x".repeat(1_000)),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -25169,7 +25169,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "continue with unknown window".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
             .await
@@ -25260,7 +25260,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "historical turn with an abandoned tool call".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
             .await
@@ -25307,7 +25307,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("overflow history user {index} {}", "x".repeat(500)),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -25328,7 +25328,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "retry after overflow".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
             .await
@@ -25455,7 +25455,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("historical user turn {index} {}", "x".repeat(1_000)),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -25476,7 +25476,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "continue after proactive compaction".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
             .await
@@ -25565,7 +25565,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -25665,7 +25665,7 @@ library = "test"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old context".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             )
             .await
@@ -25729,7 +25729,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -25811,7 +25811,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -25879,7 +25879,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -25958,7 +25958,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await
@@ -26110,7 +26110,7 @@ library = "test"
                         SessionEventKind::UserMessage {
                             client_id: ClientId::new(),
                             text: format!("round {round} user {turn}"),
-                            origin: None,
+                            admission: bcode_session_models::TurnAdmissionMetadata::default(),
                         },
                     )
                     .await
@@ -26197,7 +26197,7 @@ library = "test"
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: text.to_string(),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
                 .await

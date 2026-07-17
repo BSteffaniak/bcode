@@ -1119,8 +1119,11 @@ fn non_streaming_transcript_item_from_event(
     streamed_tool_results: &BTreeMap<String, StreamedToolReplayContext>,
 ) -> Option<TranscriptItem> {
     match &event.kind {
-        SessionEventKind::UserMessage { text, origin, .. } => Some(
-            origin
+        SessionEventKind::UserMessage {
+            text, admission, ..
+        } => Some(
+            admission
+                .origin
                 .as_ref()
                 .and_then(|origin| origin.display_label.clone())
                 .map_or_else(
@@ -1510,11 +1513,14 @@ mod tests {
                 kind: SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
                     text: "automated prompt".to_owned(),
-                    origin: Some(bcode_session_models::TurnOrigin {
-                        producer: "test.producer".to_owned(),
-                        correlation_id: Some("operation-1".to_owned()),
-                        display_label: Some("Background pass 4".to_owned()),
-                    }),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        origin: Some(bcode_session_models::TurnOrigin {
+                            producer: "test.producer".to_owned(),
+                            correlation_id: Some("operation-1".to_owned()),
+                            display_label: Some("Background pass 4".to_owned()),
+                        }),
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
                 },
             },
             SessionEvent {
@@ -1542,7 +1548,7 @@ mod tests {
                 kind: SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
                     text: "manual steering".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             },
         ];

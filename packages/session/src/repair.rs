@@ -666,7 +666,7 @@ mod tests {
                 bcode_session_models::SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
                     text: "projected".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ))
             .await
@@ -713,7 +713,7 @@ mod tests {
                 bcode_session_models::SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
                     text: "hello".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ))
             .await

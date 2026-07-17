@@ -1114,7 +1114,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "question".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             event(
@@ -1153,7 +1153,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             event(
@@ -1169,7 +1169,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "newer".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
         ];
@@ -1238,7 +1238,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "a".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             event(
@@ -1254,7 +1254,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "c".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             event(
@@ -1301,7 +1301,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             event(
@@ -1348,7 +1348,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "older".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             event(

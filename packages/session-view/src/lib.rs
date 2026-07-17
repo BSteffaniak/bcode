@@ -702,7 +702,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
                     text: "Explain renderer neutrality".to_owned(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             event(

@@ -597,6 +597,76 @@ pub struct TurnAdmissionMetadata {
     pub execution: TurnExecutionOptions,
 }
 
+const MAX_TURN_PRODUCER_BYTES: usize = 256;
+const MAX_TURN_IDEMPOTENCY_KEY_BYTES: usize = 512;
+
+/// Generic turn-admission metadata validation error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnAdmissionMetadataError {
+    MissingIdempotencyProducer,
+    ProducerTooLong,
+    IdempotencyKeyTooLong,
+    EmptyIdempotencyKey,
+}
+
+impl Display for TurnAdmissionMetadataError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingIdempotencyProducer => {
+                "idempotency key requires a non-empty origin producer"
+            }
+            Self::ProducerTooLong => "turn origin producer is too long",
+            Self::IdempotencyKeyTooLong => "turn idempotency key is too long",
+            Self::EmptyIdempotencyKey => "turn idempotency key must not be empty",
+        })
+    }
+}
+
+impl std::error::Error for TurnAdmissionMetadataError {}
+
+impl TurnAdmissionMetadata {
+    /// Validate bounded generic admission metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when producer/idempotency fields are empty where identity requires them
+    /// or exceed their durable bounds.
+    pub fn validate(&self) -> Result<(), TurnAdmissionMetadataError> {
+        if self
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.producer.len() > MAX_TURN_PRODUCER_BYTES)
+        {
+            return Err(TurnAdmissionMetadataError::ProducerTooLong);
+        }
+        if let Some(key) = &self.idempotency_key {
+            if key.is_empty() {
+                return Err(TurnAdmissionMetadataError::EmptyIdempotencyKey);
+            }
+            if key.len() > MAX_TURN_IDEMPOTENCY_KEY_BYTES {
+                return Err(TurnAdmissionMetadataError::IdempotencyKeyTooLong);
+            }
+            if self
+                .origin
+                .as_ref()
+                .is_none_or(|origin| origin.producer.is_empty())
+            {
+                return Err(TurnAdmissionMetadataError::MissingIdempotencyProducer);
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the producer/key pair used for idempotency lookup.
+    #[must_use]
+    pub fn idempotency_identity(&self) -> Option<(&str, &str)> {
+        Some((
+            self.origin.as_ref()?.producer.as_str(),
+            self.idempotency_key.as_deref()?,
+        ))
+    }
+}
+
 /// Generic reason that turn admission was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1717,8 +1787,8 @@ pub enum SessionEventKind {
     UserMessage {
         client_id: ClientId,
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin: Option<TurnOrigin>,
+        #[serde(default)]
+        admission: TurnAdmissionMetadata,
     },
     AssistantDelta {
         text: String,
@@ -2039,6 +2109,34 @@ mod tests {
         assert_eq!(metadata.priority, TurnPriority::Interactive);
         assert_eq!(metadata.idempotency_key, None);
         assert_eq!(metadata.execution.tools, TurnToolPolicy::Enabled);
+        assert_eq!(metadata.validate(), Ok(()));
+    }
+
+    #[test]
+    fn idempotency_requires_bounded_nonempty_producer_and_key() {
+        let metadata = TurnAdmissionMetadata {
+            origin: Some(TurnOrigin {
+                producer: "test.producer".to_string(),
+                correlation_id: None,
+                display_label: None,
+            }),
+            idempotency_key: Some("operation-1".to_string()),
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            metadata.idempotency_identity(),
+            Some(("test.producer", "operation-1"))
+        );
+        assert_eq!(metadata.validate(), Ok(()));
+
+        let missing_producer = TurnAdmissionMetadata {
+            idempotency_key: Some("operation-1".to_string()),
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            missing_producer.validate(),
+            Err(TurnAdmissionMetadataError::MissingIdempotencyProducer)
+        );
     }
 
     #[test]

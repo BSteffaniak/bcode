@@ -90,13 +90,13 @@ impl SessionHandle {
         &self,
         client_id: ClientId,
         text: String,
-        origin: Option<bcode_session_models::TurnOrigin>,
+        admission: bcode_session_models::TurnAdmissionMetadata,
         activity_timestamp_ms: u64,
-    ) -> Result<Vec<SessionEvent>, SessionError> {
+    ) -> Result<TurnAdmissionResult, SessionError> {
         self.send(|reply| SessionCommand::AppendUserMessage {
             client_id,
             text,
-            origin,
+            admission,
             activity_timestamp_ms,
             reply,
         })
@@ -279,6 +279,12 @@ type SessionEventReceivers = (
     broadcast::Receiver<SessionLiveEvent>,
 );
 
+#[derive(Debug)]
+pub struct TurnAdmissionResult {
+    pub admission: bcode_session_models::TurnAdmission,
+    pub events: Vec<SessionEvent>,
+}
+
 enum SessionCommand {
     AppendEvent {
         kind: SessionEventKind,
@@ -289,9 +295,9 @@ enum SessionCommand {
     AppendUserMessage {
         client_id: ClientId,
         text: String,
-        origin: Option<bcode_session_models::TurnOrigin>,
+        admission: bcode_session_models::TurnAdmissionMetadata,
         activity_timestamp_ms: u64,
-        reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
+        reply: oneshot::Sender<Result<TurnAdmissionResult, SessionError>>,
     },
     Attach {
         client_id: ClientId,
@@ -388,12 +394,12 @@ impl SessionActor {
             SessionCommand::AppendUserMessage {
                 client_id,
                 text,
-                origin,
+                admission,
                 activity_timestamp_ms,
                 reply,
             } => {
                 let _ = reply.send(
-                    self.append_user_message(client_id, text, origin, activity_timestamp_ms)
+                    self.append_user_message(client_id, text, admission, activity_timestamp_ms)
                         .await,
                 );
             }
@@ -727,9 +733,28 @@ impl SessionActor {
         &mut self,
         client_id: ClientId,
         text: String,
-        origin: Option<bcode_session_models::TurnOrigin>,
+        admission: bcode_session_models::TurnAdmissionMetadata,
         activity_timestamp_ms: u64,
-    ) -> Result<Vec<SessionEvent>, SessionError> {
+    ) -> Result<TurnAdmissionResult, SessionError> {
+        admission.validate()?;
+        if let Some((producer, idempotency_key)) = admission.idempotency_identity() {
+            let identity = (producer.to_owned(), idempotency_key.to_owned());
+            if let Some(receipt) = self.state.turn_receipts.get(&identity) {
+                return Ok(TurnAdmissionResult {
+                    admission: bcode_session_models::TurnAdmission::Existing(receipt.clone()),
+                    events: Vec::new(),
+                });
+            }
+            if let Some(db) = self.existing_session_db().await?
+                && let Some(receipt) = db.turn_receipt(producer, idempotency_key).await?
+            {
+                self.state.turn_receipts.insert(identity, receipt.clone());
+                return Ok(TurnAdmissionResult {
+                    admission: bcode_session_models::TurnAdmission::Existing(receipt),
+                    events: Vec::new(),
+                });
+            }
+        }
         let mut events = Vec::new();
         if self.state.summary.name.is_none() && !self.state.has_user_message {
             let title = title_from_first_prompt(&text);
@@ -742,19 +767,32 @@ impl SessionActor {
                 .await?,
             );
         }
-        events.push(
-            self.append_event(
+        let event = self
+            .append_event(
                 SessionEventKind::UserMessage {
                     client_id,
                     text,
-                    origin,
+                    admission: admission.clone(),
                 },
                 None,
                 activity_timestamp_ms,
             )
-            .await?,
+            .await?;
+        let receipt = bcode_session_models::TurnReceipt::from_accepted_event(
+            event.session_id,
+            event.sequence,
         );
-        Ok(events)
+        if let Some((producer, idempotency_key)) = admission.idempotency_identity() {
+            self.state.turn_receipts.insert(
+                (producer.to_owned(), idempotency_key.to_owned()),
+                receipt.clone(),
+            );
+        }
+        events.push(event);
+        Ok(TurnAdmissionResult {
+            admission: bcode_session_models::TurnAdmission::Accepted(receipt),
+            events,
+        })
     }
 
     const fn attach_mode_label(mode: &AttachMode) -> &'static str {

@@ -199,6 +199,9 @@ pub enum SessionError {
         checkpoint: Option<u64>,
         expected: u64,
     },
+    /// Turn admission metadata is invalid.
+    #[error(transparent)]
+    TurnAdmission(#[from] bcode_session_models::TurnAdmissionMetadataError),
     /// Session database error: {0}
     #[error("session database error: {0}")]
     Db(#[from] db::SessionDbError),
@@ -590,6 +593,7 @@ pub(crate) struct SessionState {
     latest_compaction_sequence: Option<u64>,
     context_epoch: u64,
     context_occupancy: Option<bcode_session_models::RequestContextOccupancy>,
+    turn_receipts: BTreeMap<(String, String), bcode_session_models::TurnReceipt>,
     total_metered_tokens: u64,
     load_status: SessionLoadStatusKind,
     sender: broadcast::Sender<SessionEvent>,
@@ -1246,6 +1250,7 @@ impl SessionManager {
             latest_compaction_sequence: None,
             context_epoch: 0,
             context_occupancy: None,
+            turn_receipts: BTreeMap::new(),
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
             sender,
@@ -2331,19 +2336,56 @@ impl SessionManager {
         text: String,
         origin: Option<bcode_session_models::TurnOrigin>,
     ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.admit_turn_result(
+            session_id,
+            client_id,
+            text,
+            bcode_session_models::TurnAdmissionMetadata {
+                origin,
+                ..bcode_session_models::TurnAdmissionMetadata::default()
+            },
+        )
+        .await
+        .map(|result| result.events)
+    }
+
+    /// Atomically admit an ordinary turn and return its durable receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist, metadata is invalid, or persistence fails.
+    pub async fn admit_turn(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    ) -> Result<bcode_session_models::TurnAdmission, SessionError> {
+        self.admit_turn_result(session_id, client_id, text, admission)
+            .await
+            .map(|result| result.admission)
+    }
+
+    async fn admit_turn_result(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    ) -> Result<actor::TurnAdmissionResult, SessionError> {
         self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        let events = handle
-            .append_user_message(client_id, text, origin, activity_timestamp_ms)
+        let result = handle
+            .append_user_message(client_id, text, admission, activity_timestamp_ms)
             .await?;
         let summary = handle.summary().await?;
         self.release_persistent_idle_session_resources(session_id)
             .await;
-        for event in &events {
+        for event in &result.events {
             self.publish_committed_mutation(event.clone(), summary.clone());
         }
-        Ok(events)
+        Ok(result)
     }
 
     /// Append an assistant streaming delta to a session.
@@ -2991,6 +3033,7 @@ impl SessionState {
             latest_compaction_sequence: None,
             context_epoch: 0,
             context_occupancy: None,
+            turn_receipts: BTreeMap::new(),
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::SummaryOnly,
             sender,
@@ -3040,6 +3083,7 @@ impl SessionState {
             latest_compaction_sequence: state.latest_compaction_sequence,
             context_epoch: state.latest_compaction_sequence.unwrap_or_default(),
             context_occupancy: None,
+            turn_receipts: BTreeMap::new(),
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
             sender,
@@ -5596,6 +5640,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_duplicate_turn_admission_is_atomic() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("idempotency".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let metadata = bcode_session_models::TurnAdmissionMetadata {
+            origin: Some(bcode_session_models::TurnOrigin {
+                producer: "test.producer".to_string(),
+                correlation_id: None,
+                display_label: None,
+            }),
+            idempotency_key: Some("operation-1".to_string()),
+            ..bcode_session_models::TurnAdmissionMetadata::default()
+        };
+
+        let first = manager.admit_turn(
+            session.id,
+            ClientId::new(),
+            "first".to_string(),
+            metadata.clone(),
+        );
+        let second =
+            manager.admit_turn(session.id, ClientId::new(), "second".to_string(), metadata);
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first concurrent admission");
+        let second = second.expect("second concurrent admission");
+
+        let accepted = [&first, &second]
+            .into_iter()
+            .filter(|admission| {
+                matches!(admission, bcode_session_models::TurnAdmission::Accepted(_))
+            })
+            .count();
+        let existing = [&first, &second]
+            .into_iter()
+            .filter(|admission| {
+                matches!(admission, bcode_session_models::TurnAdmission::Existing(_))
+            })
+            .count();
+        assert_eq!((accepted, existing), (1, 1));
+        let first_receipt = match first {
+            bcode_session_models::TurnAdmission::Accepted(receipt)
+            | bcode_session_models::TurnAdmission::Existing(receipt) => receipt,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let second_receipt = match second {
+            bcode_session_models::TurnAdmission::Accepted(receipt)
+            | bcode_session_models::TurnAdmission::Existing(receipt) => receipt,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        assert_eq!(first_receipt, second_receipt);
+    }
+
+    #[tokio::test]
+    async fn idempotent_turn_admission_returns_existing_receipt_without_duplicate_event() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("idempotency".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let metadata = bcode_session_models::TurnAdmissionMetadata {
+            origin: Some(bcode_session_models::TurnOrigin {
+                producer: "test.producer".to_string(),
+                correlation_id: Some("run-1".to_string()),
+                display_label: Some("Background pass 1".to_string()),
+            }),
+            priority: bcode_session_models::TurnPriority::Background,
+            idempotency_key: Some("operation-1".to_string()),
+            execution: bcode_session_models::TurnExecutionOptions {
+                tools: bcode_session_models::TurnToolPolicy::Disabled,
+            },
+        };
+
+        let first = manager
+            .admit_turn(
+                session.id,
+                ClientId::new(),
+                "prompt".to_string(),
+                metadata.clone(),
+            )
+            .await
+            .expect("first admission should succeed");
+        let duplicate = manager
+            .admit_turn(
+                session.id,
+                ClientId::new(),
+                "different text must not append".to_string(),
+                metadata,
+            )
+            .await
+            .expect("duplicate admission should succeed");
+
+        let bcode_session_models::TurnAdmission::Accepted(receipt) = first else {
+            panic!("first admission should be accepted");
+        };
+        assert_eq!(
+            duplicate,
+            bcode_session_models::TurnAdmission::Existing(receipt)
+        );
+        let history = manager.session_history(session.id).await.expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_idempotent_turn_receipt_survives_manager_restart() {
+        let root = unique_temp_dir();
+        let session_id;
+        let expected;
+        let metadata = bcode_session_models::TurnAdmissionMetadata {
+            origin: Some(bcode_session_models::TurnOrigin {
+                producer: "test.producer".to_string(),
+                correlation_id: None,
+                display_label: None,
+            }),
+            idempotency_key: Some("operation-1".to_string()),
+            ..bcode_session_models::TurnAdmissionMetadata::default()
+        };
+        {
+            let manager = SessionManager::persistent(&root).expect("manager");
+            let session = manager
+                .create_session(Some("idempotency".to_string()), test_working_directory())
+                .await
+                .expect("session");
+            session_id = session.id;
+            expected = manager
+                .admit_turn(
+                    session_id,
+                    ClientId::new(),
+                    "prompt".to_string(),
+                    metadata.clone(),
+                )
+                .await
+                .expect("admission");
+        }
+
+        let restored = SessionManager::persistent(&root).expect("restored manager");
+        let duplicate = restored
+            .admit_turn(
+                session_id,
+                ClientId::new(),
+                "different".to_string(),
+                metadata,
+            )
+            .await
+            .expect("duplicate");
+        let bcode_session_models::TurnAdmission::Accepted(receipt) = expected else {
+            panic!("first admission should be accepted");
+        };
+        assert_eq!(
+            duplicate,
+            bcode_session_models::TurnAdmission::Existing(receipt)
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
     async fn generic_turn_origin_is_persisted_on_the_ordinary_user_message_path() {
         let manager = SessionManager::default();
         let session = manager
@@ -5622,7 +5829,11 @@ mod tests {
             events.last().map(|event| &event.kind),
             Some(SessionEventKind::UserMessage {
                 text,
-                origin: Some(actual),
+                admission:
+                    bcode_session_models::TurnAdmissionMetadata {
+                        origin: Some(actual),
+                        ..
+                    },
                 ..
             }) if text == "ordinary prompt" && actual == &origin
         ));
@@ -5951,7 +6162,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id,
                     text: "user".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             (

@@ -941,6 +941,35 @@ impl SessionDb {
         &**self.db
     }
 
+    /// Return a turn receipt by producer-scoped idempotency identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bounded indexed query fails or contains malformed identity data.
+    pub async fn turn_receipt(
+        &self,
+        producer: &str,
+        idempotency_key: &str,
+    ) -> SessionDbResult<Option<bcode_session_models::TurnReceipt>> {
+        let row = self
+            .db
+            .select("turn_receipts")
+            .columns(&["accepted_event_seq", "turn_id", "work_id"])
+            .where_eq("producer", producer.to_owned())
+            .where_eq("idempotency_key", idempotency_key.to_owned())
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(|row| {
+                Ok(bcode_session_models::TurnReceipt {
+                    accepted_event_sequence: i64_to_u64(required_i64(row, "accepted_event_seq")?),
+                    turn_id: bcode_session_models::TurnId(required_string(row, "turn_id")?),
+                    work_id: WorkId::new(required_string(row, "work_id")?),
+                })
+            })
+            .transpose()
+    }
+
     /// Append an event and update first-class projections in one transaction.
     ///
     /// # Errors
@@ -967,6 +996,7 @@ impl SessionDb {
         project_event(&*tx, event).await?;
         project_model_context_event(&*tx, event).await?;
         project_context_occupancy_event(&*tx, event).await?;
+        project_turn_receipt(&*tx, event).await?;
         update_projection_checkpoints(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
@@ -2010,6 +2040,12 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "UPDATE context_occupancy_projection SET schema_version = 4, occupancy_json = NULL WHERE schema_version < 4",
         "UPDATE context_occupancy_projection SET schema_version = 3, occupancy_json = NULL WHERE schema_version = 4",
     );
+    add_sql_migration(
+        source,
+        "025_turn_receipts_table",
+        "CREATE TABLE IF NOT EXISTS turn_receipts (\n    producer TEXT NOT NULL,\n    idempotency_key TEXT NOT NULL,\n    accepted_event_seq INTEGER NOT NULL,\n    turn_id TEXT NOT NULL,\n    work_id TEXT NOT NULL,\n    PRIMARY KEY(producer, idempotency_key),\n    FOREIGN KEY(accepted_event_seq) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS turn_receipts",
+    );
 }
 
 fn add_sql_migration(
@@ -2185,6 +2221,29 @@ async fn project_context_occupancy_event(
             "occupancy_json",
             occupancy.as_ref().map(serde_json::to_string).transpose()?,
         )
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn project_turn_receipt(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+    let SessionEventKind::UserMessage { admission, .. } = &event.kind else {
+        return Ok(());
+    };
+    let Some((producer, idempotency_key)) = admission.idempotency_identity() else {
+        return Ok(());
+    };
+    let receipt =
+        bcode_session_models::TurnReceipt::from_accepted_event(event.session_id, event.sequence);
+    db.insert("turn_receipts")
+        .value("producer", producer.to_owned())
+        .value("idempotency_key", idempotency_key.to_owned())
+        .value(
+            "accepted_event_seq",
+            seq_to_value(receipt.accepted_event_sequence),
+        )
+        .value("turn_id", receipt.turn_id.to_string())
+        .value("work_id", receipt.work_id.to_string())
         .execute(db)
         .await?;
     Ok(())
@@ -3412,7 +3471,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "hello".to_string(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ))
         .await
@@ -3792,7 +3851,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: "legacy".to_string(),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 ),
                 None,
@@ -3917,7 +3976,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "projected".to_string(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ))
         .await
@@ -3969,7 +4028,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             (
@@ -4035,7 +4094,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "old".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             (
@@ -4056,7 +4115,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "new".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             (
@@ -4178,7 +4237,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "projected".to_string(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ))
         .await
@@ -4247,7 +4306,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "projected".to_string(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ))
         .await
@@ -4318,7 +4377,7 @@ mod tests {
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "unprojected tail".to_string(),
-                    origin: None,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
             None,
@@ -4357,7 +4416,7 @@ mod tests {
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
                         text: format!("semantic-{sequence}"),
-                        origin: None,
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 ),
                 None,
@@ -4548,7 +4607,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "old".to_string(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ))
         .await
@@ -4569,7 +4628,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "new".to_string(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         ))
         .await

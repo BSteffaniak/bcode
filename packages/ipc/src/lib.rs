@@ -2635,7 +2635,7 @@ mod tests {
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "hello".to_string(),
-                origin: None,
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
             SessionEventKind::AssistantDelta {
                 text: "delta".to_string(),
