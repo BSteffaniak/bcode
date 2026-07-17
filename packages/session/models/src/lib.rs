@@ -519,6 +519,103 @@ pub struct TurnOrigin {
     pub display_label: Option<String>,
 }
 
+/// Stable identifier for one admitted model turn.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(pub String);
+
+impl TurnId {
+    /// Derive the canonical turn identity from its accepted user-message event.
+    #[must_use]
+    pub fn from_accepted_event(session_id: SessionId, accepted_event_sequence: u64) -> Self {
+        Self(format!("{session_id}-{accepted_event_sequence}"))
+    }
+}
+
+impl Display for TurnId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Durable receipt returned after a turn is admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnReceipt {
+    pub work_id: WorkId,
+    pub turn_id: TurnId,
+    pub accepted_event_sequence: u64,
+}
+
+impl TurnReceipt {
+    /// Derive the canonical receipt from an accepted user-message event.
+    #[must_use]
+    pub fn from_accepted_event(session_id: SessionId, accepted_event_sequence: u64) -> Self {
+        let turn_id = TurnId::from_accepted_event(session_id, accepted_event_sequence);
+        Self {
+            work_id: WorkId::new(format!("model_{turn_id}")),
+            turn_id,
+            accepted_event_sequence,
+        }
+    }
+}
+
+/// Generic scheduling priority for an admitted turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPriority {
+    #[default]
+    Interactive,
+    Background,
+}
+
+/// Generic tool availability for one turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnToolPolicy {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
+/// Generic execution options applied to one admitted turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnExecutionOptions {
+    #[serde(default)]
+    pub tools: TurnToolPolicy,
+}
+
+/// Generic metadata carried by an ordinary admitted turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnAdmissionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TurnOrigin>,
+    #[serde(default)]
+    pub priority: TurnPriority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub execution: TurnExecutionOptions,
+}
+
+/// Generic reason that turn admission was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRejectionReason {
+    SessionUnavailable,
+    ExecutionPolicy,
+}
+
+/// Result of admitting an ordinary turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnAdmission {
+    Accepted(TurnReceipt),
+    Existing(TurnReceipt),
+    Deferred(TurnReceipt),
+    Rejected(TurnRejectionReason),
+    CancelledBeforeStart(TurnReceipt),
+}
+
 /// Durable work identifier used across session history, IPC, and UI surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1918,6 +2015,31 @@ pub enum SessionEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_receipt_derives_the_existing_model_work_identity() {
+        let session_id = SessionId::from_str("00000000-0000-0000-0000-000000000001")
+            .expect("session id should parse");
+        let receipt = TurnReceipt::from_accepted_event(session_id, 42);
+
+        assert_eq!(receipt.turn_id, TurnId::from_accepted_event(session_id, 42));
+        assert_eq!(receipt.turn_id.to_string(), format!("{session_id}-42"));
+        assert_eq!(
+            receipt.work_id,
+            WorkId::new(format!("model_{session_id}-42"))
+        );
+        assert_eq!(receipt.accepted_event_sequence, 42);
+    }
+
+    #[test]
+    fn turn_admission_metadata_defaults_to_interactive_tools_enabled() {
+        let metadata = TurnAdmissionMetadata::default();
+
+        assert_eq!(metadata.origin, None);
+        assert_eq!(metadata.priority, TurnPriority::Interactive);
+        assert_eq!(metadata.idempotency_key, None);
+        assert_eq!(metadata.execution.tools, TurnToolPolicy::Enabled);
+    }
 
     #[test]
     fn work_id_remains_a_transparent_serialized_identifier() {
