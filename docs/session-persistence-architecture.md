@@ -14,6 +14,40 @@ history, replaces the projection atomically, and leaves canonical events unchang
 versions and same-version stale or corrupt projections remain repair-required rather than being
 silently rebuilt.
 
+## Durable storage writer contract
+
+Every session database contains a singleton `session_storage_contract` row with a versioned writer
+epoch. A mutation-capable process must advertise an explicit storage writer epoch in its session
+lease and must validate the durable row inside each event-append transaction before inserting the
+canonical event. Missing and unknown/future epochs fail closed with a migration-required error;
+IPC protocol and build fingerprint are diagnostic metadata, not storage compatibility proofs.
+Non-event session mutations such as composer drafts perform the same durable check.
+
+The writer epoch must be bumped whenever a released writer would be unable to preserve canonical
+append atomicity under the new code: adding or changing a required projector, changing required
+projection semantics/schema, adding writer-required tables or constraints (including turn-receipt
+persistence), or changing canonical event write rules. Read-only schema additions that old writers
+cannot damage do not by themselves require an epoch bump.
+
+Session access compatibility is defined by equal storage writer epochs. Different builds may share
+a session only when they implement the same storage writer contract. A loaded session actor retains
+its compatibility lease while idle even if it drops cached database and event state, preventing an
+incompatible daemon from claiming the session between model/tool operations. Catalog discovery and
+listing remain lease-free.
+
+The initial rollout of this contract must explicitly retire pre-contract daemon processes before
+upgrading session writer epochs, because already-running legacy binaries cannot retroactively honor
+the durable check.
+
+## Projection append invariants
+
+A canonical append and all required projections are one transaction. Before insertion, the append
+path validates the next canonical sequence, writer epoch, and each required projection's schema and
+checkpoint against the previous canonical tail. A projector owns its checkpoint and advances it only
+after its projection update succeeds. Incompatible, missing, or discontinuous required projections
+reject and roll back the append; they are never silently skipped and never receive blanket checkpoint
+advancement.
+
 ## Current implementation direction
 
 Startup loads session catalog state from fresh sidecar indexes when possible. A valid metadata index contains enough data for session listing and safe appends without decoding the full event payload stream:

@@ -145,15 +145,11 @@ pub async fn repair_session(
         return Ok(report);
     }
 
-    let _lease = if options.dry_run {
+    let _maintenance = if options.dry_run {
         None
     } else {
-        match lease::acquire_session_lease(
-            root,
-            session_id,
-            &lease::SessionLeaseOwnerContext::default(),
-        ) {
-            Ok(lease) => Some(lease),
+        match lease::acquire_session_maintenance_guard(root, session_id) {
+            Ok(guard) => Some(guard),
             Err(lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
                 report.status = RepairStatus::RefusedOwnedElsewhere;
                 report.final_error = Some("session is owned by another daemon".to_string());
@@ -161,6 +157,11 @@ pub async fn repair_session(
             }
             Err(error) => return Err(error.into()),
         }
+    };
+    let _write = if options.dry_run {
+        None
+    } else {
+        Some(lease::acquire_session_write_lock(root, session_id)?)
     };
 
     let initial_error = match validate_session_db(root, session_id).await {

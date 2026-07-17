@@ -6500,11 +6500,8 @@ const fn repair_cli_output(json: bool) -> SessionRepairCliOutput {
 
 async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliError> {
     let root = bcode_config::default_state_dir().join("sessions");
-    let _lease = bcode_session::lease::acquire_session_lease(
-        &root,
-        session_id,
-        &bcode_session::lease::SessionLeaseOwnerContext::default(),
-    )?;
+    let _maintenance = bcode_session::lease::acquire_session_maintenance_guard(&root, session_id)?;
+    let _write = bcode_session::lease::acquire_session_write_lock(&root, session_id)?;
     let db = bcode_session::db::SessionDb::open_turso_in_root(session_id, &root).await?;
     let event_count = db.reindex_model_context().await?;
     println!(

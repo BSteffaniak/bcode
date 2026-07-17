@@ -69,6 +69,43 @@ if grep -Eq 'context_usage_observed|request_context_observed' <<<"$model_context
   violations=1
 fi
 
+if rg -q 'async fn update_projection_checkpoints' packages/session/src/db.rs; then
+  echo "Session projection checkpoint violation: blanket checkpoint advancement is forbidden." >&2
+  violations=1
+fi
+
+model_context_projector="$(sed -n '/async fn project_model_context_event(/,/^async fn project_context_occupancy_event(/p' packages/session/src/db.rs)"
+if grep -q 'None => return Ok(())' <<<"$model_context_projector"; then
+  echo "Session model-context projection violation: missing projection state must not silently accept append." >&2
+  violations=1
+fi
+if ! grep -q 'ModelContextProjectionVersion' <<<"$model_context_projector" \
+  || ! grep -q 'ModelContextProjectionStale' <<<"$model_context_projector"; then
+  echo "Session model-context projection violation: append must reject incompatible or stale state." >&2
+  violations=1
+fi
+
+if ! rg -q 'validate_storage_writer_contract\(db\).*await' packages/session/src/db.rs \
+  || ! rg -q 'session_storage_contract' packages/session/src/db.rs; then
+  echo "Session writer contract violation: durable appends require explicit writer-epoch validation." >&2
+  violations=1
+fi
+
+if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/server/src/lib.rs; then
+  echo "Session lease identity violation: production daemon leases must advertise storage writer epoch." >&2
+  violations=1
+fi
+
+if ! rg -q 'acquire_session_maintenance_guard\(&root, session_id\)' packages/cli/src/lib.rs; then
+  echo "Session reindex violation: CLI reindex requires exclusive maintenance coordination." >&2
+  violations=1
+fi
+
+if ! rg -q 'acquire_session_maintenance_guard\(root, session_id\)' packages/session/src/repair.rs; then
+  echo "Session repair violation: mutating repair requires exclusive maintenance coordination." >&2
+  violations=1
+fi
+
 if ! rg -q 'CompactionPlanningPolicy::OverflowRecovery' packages/server/src/context_compaction.rs; then
   echo "Session compaction violation: overflow recovery must use its explicit planning policy." >&2
   violations=1

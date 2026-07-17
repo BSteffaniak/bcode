@@ -1815,6 +1815,7 @@ pub async fn run_with_static_bundled(
         default_session_store_dir(),
         metrics.clone(),
         SessionLeaseOwnerContext {
+            storage_writer_epoch: Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
             daemon_namespace: Some(daemon_status.namespace.clone()),
             build_fingerprint: Some(daemon_status.build_fingerprint.clone()),
             protocol_version: Some(daemon_status.protocol_version),

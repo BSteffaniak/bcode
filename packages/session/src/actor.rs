@@ -8,11 +8,52 @@ use super::{
     elapsed_ms, input_history_from_events, model_context_events_from_history,
     title_from_first_prompt, usize_to_u64,
 };
-use crate::db::{MaterializedProjection, SessionDb};
+use crate::db::{MaterializedProjection, SessionDb, SessionDbError};
 use bcode_metrics::MetricsContext;
 use bcode_session_models::ProjectionWindowAnchor;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
+
+const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
+    match error {
+        SessionDbError::WriterIncompatible { .. } => {
+            "session.actor.append_event.rejected.writer_incompatible_total"
+        }
+        SessionDbError::ModelContextProjectionStale { .. }
+        | SessionDbError::ProjectionStale { .. } => {
+            "session.actor.append_event.rejected.projection_stale_total"
+        }
+        SessionDbError::ModelContextProjectionVersion { .. }
+        | SessionDbError::ProjectionIncompatible { .. } => {
+            "session.actor.append_event.rejected.projection_incompatible_total"
+        }
+        SessionDbError::InvalidCanonicalAppendSequence { .. }
+        | SessionDbError::InvalidCanonicalSequence { .. } => {
+            "session.actor.append_event.rejected.canonical_sequence_total"
+        }
+        SessionDbError::Connection(_)
+        | SessionDbError::Database(_)
+        | SessionDbError::Migration(_)
+        | SessionDbError::Io(_)
+        | SessionDbError::Lease(_)
+        | SessionDbError::Serialize(_)
+        | SessionDbError::PersistedEvent(_)
+        | SessionDbError::InvalidCompactionMarker { .. }
+        | SessionDbError::InvalidRow { .. } => {
+            "session.actor.append_event.rejected.storage_error_total"
+        }
+    }
+}
+
+fn record_append_rejection_metrics(
+    metrics: &bcode_metrics::MetricsRegistry,
+    result: &Result<(), SessionDbError>,
+) {
+    if let Err(error) = result {
+        metrics.increment_counter("session.actor.append_event.rejected_total");
+        metrics.increment_counter(append_rejection_metric(error));
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
@@ -649,8 +690,13 @@ impl SessionActor {
             let mut event = self.state.build_next_event(kind, event_timestamp_ms);
             event.provenance = provenance;
             let db_append_started_at = Instant::now();
-            db.append_event_with_activity_timestamp(&event, Some(event_timestamp_ms))
-                .await?;
+            let append_result = db
+                .append_event_with_activity_timestamp(&event, Some(event_timestamp_ms))
+                .await;
+            if let Some(metrics) = &metrics {
+                record_append_rejection_metrics(metrics, &append_result);
+            }
+            append_result?;
             if let Some(metrics) = &metrics {
                 metrics.record_histogram(
                     "session.actor.append_event.db_append_duration_ms",
@@ -666,58 +712,7 @@ impl SessionActor {
         };
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
-        if let Some(store) = &self.store {
-            if let Err(error) = store.write_session_manifest(self.state.summary()).await {
-                store
-                    .metrics()
-                    .increment_counter("session.manifest.write_error_total");
-                eprintln!("failed to write session manifest: {error}");
-            }
-            let catalog = match store
-                .lease_owner()
-                .build_fingerprint
-                .as_deref()
-                .map(crate::safe_catalog_namespace)
-            {
-                Some(namespace) => {
-                    crate::db::GlobalSessionDb::open_turso_in_root_namespace_observed(
-                        &store.root_path(),
-                        &namespace,
-                        store.metrics(),
-                    )
-                    .await
-                }
-                None => {
-                    crate::db::GlobalSessionDb::open_turso_in_root_observed(
-                        &store.root_path(),
-                        store.metrics(),
-                    )
-                    .await
-                }
-            };
-            match catalog {
-                Ok(catalog) => {
-                    if let Err(error) = catalog
-                        .upsert_session(
-                            &self.state.summary(),
-                            &crate::db::session_db_path(&store.root_path(), self.state.summary.id),
-                        )
-                        .await
-                    {
-                        store
-                            .metrics()
-                            .increment_counter("session.catalog.upsert_error_total");
-                        eprintln!("failed to update session catalog: {error}");
-                    }
-                }
-                Err(error) => {
-                    store
-                        .metrics()
-                        .increment_counter("session.catalog.open_error_total");
-                    eprintln!("failed to open session catalog for update: {error}");
-                }
-            }
-        }
+        self.update_manifest_and_catalog_after_append().await;
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         if let Some(metrics) = &metrics {
@@ -727,6 +722,62 @@ impl SessionActor {
             );
         }
         Ok(event)
+    }
+
+    async fn update_manifest_and_catalog_after_append(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(error) = store.write_session_manifest(self.state.summary()).await {
+            store
+                .metrics()
+                .increment_counter("session.manifest.write_error_total");
+            eprintln!("failed to write session manifest: {error}");
+        }
+        let catalog = match store
+            .lease_owner()
+            .build_fingerprint
+            .as_deref()
+            .map(crate::safe_catalog_namespace)
+        {
+            Some(namespace) => {
+                crate::db::GlobalSessionDb::open_turso_in_root_namespace_observed(
+                    &store.root_path(),
+                    &namespace,
+                    store.metrics(),
+                )
+                .await
+            }
+            None => {
+                crate::db::GlobalSessionDb::open_turso_in_root_observed(
+                    &store.root_path(),
+                    store.metrics(),
+                )
+                .await
+            }
+        };
+        match catalog {
+            Ok(catalog) => {
+                if let Err(error) = catalog
+                    .upsert_session(
+                        &self.state.summary(),
+                        &crate::db::session_db_path(&store.root_path(), self.state.summary.id),
+                    )
+                    .await
+                {
+                    store
+                        .metrics()
+                        .increment_counter("session.catalog.upsert_error_total");
+                    eprintln!("failed to update session catalog: {error}");
+                }
+            }
+            Err(error) => {
+                store
+                    .metrics()
+                    .increment_counter("session.catalog.open_error_total");
+                eprintln!("failed to open session catalog for update: {error}");
+            }
+        }
     }
 
     async fn append_user_message(

@@ -40,6 +40,11 @@ const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Durable storage writer epoch understood by this session database implementation.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
+    crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
+const SESSION_STORAGE_CONTRACT_ID: i32 = 1;
+const SESSION_STORAGE_CONTRACT_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 2;
 const LEGACY_MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u64 = 1;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
@@ -78,6 +83,11 @@ pub enum SessionDbError {
     /// The durable model-context projection schema is unsupported.
     #[error("unsupported model-context projection schema version {actual}; expected {expected}")]
     ModelContextProjectionVersion { actual: u64, expected: u64 },
+    /// The durable session storage writer contract is absent or unsupported.
+    #[error(
+        "unsupported session storage writer epoch: actual={actual:?} expected={expected}; explicit migration is required"
+    )]
+    WriterIncompatible { actual: Option<u64>, expected: u64 },
     /// Canonical append attempted a sequence other than the next contiguous event.
     #[error("invalid canonical append sequence: expected #{expected}, found #{actual}")]
     InvalidCanonicalAppendSequence { expected: u64, actual: u64 },
@@ -726,6 +736,7 @@ impl SessionDb {
         text: &str,
         updated_at_ms: u64,
     ) -> SessionDbResult<()> {
+        validate_storage_writer_contract(&**self.db).await?;
         if text.is_empty() {
             self.db
                 .delete("session_drafts")
@@ -956,6 +967,26 @@ impl SessionDb {
     #[must_use]
     pub fn database(&self) -> &dyn Database {
         &**self.db
+    }
+
+    /// Return the durable storage writer epoch recorded by this session database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract row is missing or malformed.
+    pub async fn storage_writer_epoch(&self) -> SessionDbResult<u64> {
+        let row = self
+            .db
+            .select("session_storage_contract")
+            .columns(&["writer_epoch"])
+            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+            .execute_first(&**self.db)
+            .await?
+            .ok_or(SessionDbError::WriterIncompatible {
+                actual: None,
+                expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            })?;
+        required_i64(&row, "writer_epoch").map(i64_to_u64)
     }
 
     /// Return a turn receipt by producer-scoped idempotency identity.
@@ -2064,6 +2095,18 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "CREATE TABLE IF NOT EXISTS turn_receipts (\n    producer TEXT NOT NULL,\n    idempotency_key TEXT NOT NULL,\n    accepted_event_seq INTEGER NOT NULL,\n    turn_id TEXT NOT NULL,\n    work_id TEXT NOT NULL,\n    PRIMARY KEY(producer, idempotency_key),\n    FOREIGN KEY(accepted_event_seq) REFERENCES events(event_seq)\n)",
         "DROP TABLE IF EXISTS turn_receipts",
     );
+    add_sql_migration(
+        source,
+        "026_session_storage_contract_table",
+        "CREATE TABLE IF NOT EXISTS session_storage_contract (\n    contract_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    writer_epoch INTEGER NOT NULL,\n    updated_by_build TEXT\n)",
+        "DROP TABLE IF EXISTS session_storage_contract",
+    );
+    add_sql_migration(
+        source,
+        "027_initialize_session_storage_contract",
+        "INSERT OR IGNORE INTO session_storage_contract (contract_id, schema_version, writer_epoch, updated_by_build) VALUES (1, 1, 1, NULL)",
+        "DELETE FROM session_storage_contract WHERE contract_id = 1",
+    );
 }
 
 fn add_sql_migration(
@@ -2077,6 +2120,38 @@ fn add_sql_migration(
         Box::new(up_sql.to_string()),
         Some(Box::new(down_sql.to_string())),
     ));
+}
+
+async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<()> {
+    let row = db
+        .select("session_storage_contract")
+        .columns(&["schema_version", "writer_epoch"])
+        .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+        .execute_first(db)
+        .await?;
+    let Some(row) = row.as_ref() else {
+        return Err(SessionDbError::WriterIncompatible {
+            actual: None,
+            expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+        });
+    };
+    let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
+    if schema_version != u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION) {
+        return Err(SessionDbError::ProjectionIncompatible {
+            projection: "session_storage_contract",
+            actual: schema_version,
+            expected: u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION),
+        });
+    }
+    let actual = required_i64(row, "writer_epoch").map(i64_to_u64)?;
+    let expected = u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH);
+    if actual != expected {
+        return Err(SessionDbError::WriterIncompatible {
+            actual: Some(actual),
+            expected,
+        });
+    }
+    Ok(())
 }
 
 async fn last_event_sequence_from_database(db: &dyn Database) -> SessionDbResult<Option<u64>> {
@@ -2214,6 +2289,7 @@ async fn validate_append_preconditions(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
+    validate_storage_writer_contract(db).await?;
     let canonical_tail = last_event_sequence_from_database(db).await?;
     let expected_sequence = canonical_tail.map_or(0, |tail| tail.saturating_add(1));
     if event.sequence != expected_sequence {
@@ -4452,6 +4528,112 @@ mod tests {
             .await
             .expect("compatibility context");
         assert_eq!(context, compatibility);
+    }
+
+    #[tokio::test]
+    async fn incompatible_storage_writer_contract_rejects_mutations_after_reopen() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("writer contract".to_string()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append initial event");
+        let future_epoch = u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH).saturating_add(1);
+        db.database()
+            .update("session_storage_contract")
+            .value("writer_epoch", seq_to_value(future_epoch))
+            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+            .execute(db.database())
+            .await
+            .expect("set future writer epoch");
+        drop(db);
+
+        let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("runtime open may inspect incompatible contract");
+        assert_eq!(
+            reopened.storage_writer_epoch().await.expect("writer epoch"),
+            future_epoch
+        );
+        let error = reopened
+            .append_event(&event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "must not commit".to_string(),
+                },
+            ))
+            .await
+            .expect_err("future writer contract must reject append");
+        assert!(matches!(
+            error,
+            SessionDbError::WriterIncompatible {
+                actual: Some(actual),
+                expected
+            } if actual == future_epoch
+                && expected == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        ));
+        assert!(matches!(
+            reopened.set_session_composer_draft("blocked", 1).await,
+            Err(SessionDbError::WriterIncompatible { .. })
+        ));
+        assert_eq!(
+            reopened
+                .last_event_sequence()
+                .await
+                .expect("canonical tail"),
+            Some(0)
+        );
+        assert_eq!(
+            reopened.session_composer_draft().await.expect("draft read"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_storage_writer_contract_fails_closed_for_mutation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.database()
+            .delete("session_storage_contract")
+            .execute(db.database())
+            .await
+            .expect("remove writer contract");
+
+        let error = db
+            .append_event(&event(
+                session_id,
+                0,
+                SessionEventKind::SessionCreated {
+                    name: Some("missing contract".to_string()),
+                    working_directory: temp_dir.path().to_path_buf(),
+                },
+            ))
+            .await
+            .expect_err("missing contract must reject append");
+        assert!(matches!(
+            error,
+            SessionDbError::WriterIncompatible {
+                actual: None,
+                expected
+            } if expected == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        ));
+        assert_eq!(
+            db.last_event_sequence().await.expect("canonical tail"),
+            None
+        );
     }
 
     #[tokio::test]

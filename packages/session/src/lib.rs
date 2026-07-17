@@ -564,6 +564,8 @@ pub enum CatalogLoadStatus {
 pub enum SessionHealth {
     /// DB-backed session is ready for normal runtime access.
     Ready,
+    /// Session storage requires a different writer epoch.
+    WriterIncompatible { actual: Option<u64>, expected: u64 },
     /// A DB read model is missing or stale.
     ProjectionStale {
         projection: &'static str,
@@ -1151,6 +1153,24 @@ impl SessionManager {
                 };
             }
         };
+        let expected_writer_epoch = u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
+        match db.storage_writer_epoch().await {
+            Ok(actual) if actual == expected_writer_epoch => {}
+            Ok(actual) => {
+                return SessionHealth::WriterIncompatible {
+                    actual: Some(actual),
+                    expected: expected_writer_epoch,
+                };
+            }
+            Err(db::SessionDbError::WriterIncompatible { actual, expected }) => {
+                return SessionHealth::WriterIncompatible { actual, expected };
+            }
+            Err(error) => {
+                return SessionHealth::RepairRequired {
+                    reason: error.to_string(),
+                };
+            }
+        }
         let expected = match db.last_event_sequence().await {
             Ok(Some(sequence)) => sequence,
             Ok(None) => 0,
@@ -3501,6 +3521,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_health_reports_incompatible_storage_writer_epoch() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("writer health".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let db = db::SessionDb::open_turso_in_root(session.id, &root)
+            .await
+            .expect("open session db");
+        let future_epoch = u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH).saturating_add(1);
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                switchy::database::DatabaseValue::Int64(
+                    i64::try_from(future_epoch).expect("epoch fits"),
+                ),
+            )
+            .execute(db.database())
+            .await
+            .expect("set future writer epoch");
+
+        assert_eq!(
+            manager.session_health(session.id).await,
+            SessionHealth::WriterIncompatible {
+                actual: Some(future_epoch),
+                expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            }
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn session_health_reports_missing_artifact_projection_as_stale() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should create");
@@ -5314,6 +5368,9 @@ mod tests {
             &root,
             MetricsRegistry::default(),
             SessionLeaseOwnerContext {
+                storage_writer_epoch: Some(
+                    crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH.saturating_add(1),
+                ),
                 build_fingerprint: Some("incompatible-test-build".to_string()),
                 ..SessionLeaseOwnerContext::default()
             },

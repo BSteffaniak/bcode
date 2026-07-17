@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Durable session-storage writer contract supported by this Bcode build.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 1;
+
 /// Serializable metadata describing one process currently accessing a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLeaseOwner {
@@ -24,6 +27,9 @@ pub struct SessionLeaseOwner {
     pub lease_token: String,
     /// Accessing process id.
     pub pid: u32,
+    /// Durable session-storage writer epoch supported by this process.
+    #[serde(default)]
+    pub storage_writer_epoch: Option<u32>,
     /// Bcode daemon namespace, when known.
     pub daemon_namespace: Option<String>,
     /// Bcode build fingerprint, when known.
@@ -46,10 +52,11 @@ impl SessionLeaseOwner {
     fn new(session_id: SessionId, context: &SessionLeaseOwnerContext) -> Self {
         let now = unix_time_millis();
         Self {
-            schema_version: 1,
+            schema_version: 2,
             session_id,
             lease_token: format!("{}-{now}-{session_id}", std::process::id()),
             pid: std::process::id(),
+            storage_writer_epoch: context.storage_writer_epoch,
             daemon_namespace: context.daemon_namespace.clone(),
             build_fingerprint: context.build_fingerprint.clone(),
             protocol_version: context.protocol_version,
@@ -66,8 +73,10 @@ impl SessionLeaseOwner {
 }
 
 /// Optional daemon identity to write into session access metadata.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLeaseOwnerContext {
+    /// Durable session-storage writer epoch.
+    pub storage_writer_epoch: Option<u32>,
     /// Bcode daemon namespace.
     pub daemon_namespace: Option<String>,
     /// Bcode build fingerprint.
@@ -80,6 +89,20 @@ pub struct SessionLeaseOwnerContext {
     pub executable_path: Option<PathBuf>,
     /// Daemon instance id.
     pub daemon_instance_id: Option<String>,
+}
+
+impl Default for SessionLeaseOwnerContext {
+    fn default() -> Self {
+        Self {
+            storage_writer_epoch: Some(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            daemon_namespace: None,
+            build_fingerprint: None,
+            protocol_version: None,
+            endpoint: None,
+            executable_path: None,
+            daemon_instance_id: None,
+        }
+    }
 }
 
 /// Errors returned while registering or releasing cross-process session access.
@@ -96,8 +119,14 @@ pub enum SessionLeaseError {
     /// Owner metadata could not be serialized.
     #[error("session access metadata serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
-    /// Another daemon with an incompatible build currently has the session open.
-    #[error("session {session_id} is open in another Bcode build{owner_summary}")]
+    /// A mutation-capable session lease omitted its required storage writer identity.
+    #[error("session {session_id} access requires an explicit storage writer epoch")]
+    MissingStorageWriterEpoch {
+        /// Session whose lease identity was incomplete.
+        session_id: SessionId,
+    },
+    /// Another daemon with an incompatible storage writer currently has the session open.
+    #[error("session {session_id} is open in another incompatible Bcode writer{owner_summary}")]
     OwnedByOtherDaemon {
         /// Session whose access could not be registered.
         session_id: SessionId,
@@ -183,6 +212,9 @@ pub fn acquire_session_lease(
     session_id: SessionId,
     context: &SessionLeaseOwnerContext,
 ) -> Result<SessionLeaseGuard, SessionLeaseError> {
+    if context.storage_writer_epoch.is_none() {
+        return Err(SessionLeaseError::MissingStorageWriterEpoch { session_id });
+    }
     let lock_path = session_lock_path(root, session_id);
     let file = open_lock_file(&lock_path)?;
     lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
@@ -416,15 +448,14 @@ fn find_incompatible_owner(
     Ok(None)
 }
 
-fn owner_is_compatible(owner: &SessionLeaseOwner, context: &SessionLeaseOwnerContext) -> bool {
-    match (&owner.build_fingerprint, &context.build_fingerprint) {
-        (Some(left), Some(right)) => left == right,
-        _ => {
-            owner.protocol_version.is_none()
-                || context.protocol_version.is_none()
-                || owner.protocol_version == context.protocol_version
-        }
-    }
+const fn owner_is_compatible(
+    owner: &SessionLeaseOwner,
+    context: &SessionLeaseOwnerContext,
+) -> bool {
+    matches!(
+        (owner.storage_writer_epoch, context.storage_writer_epoch),
+        (Some(owner_epoch), Some(context_epoch)) if owner_epoch == context_epoch
+    )
 }
 
 fn remove_file_best_effort(path: &Path) -> Result<(), SessionLeaseError> {
@@ -440,6 +471,9 @@ fn remove_file_best_effort(path: &Path) -> Result<(), SessionLeaseError> {
 
 fn format_owner(owner: &SessionLeaseOwner) -> String {
     let mut parts = vec![format!("pid {}", owner.pid)];
+    if let Some(epoch) = owner.storage_writer_epoch {
+        parts.push(format!("storage writer epoch {epoch}"));
+    }
     if let Some(namespace) = &owner.daemon_namespace {
         parts.push(format!("namespace {namespace}"));
     }
@@ -534,8 +568,9 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
-    fn context(build: &str) -> SessionLeaseOwnerContext {
+    fn context(build: &str, storage_writer_epoch: u32) -> SessionLeaseOwnerContext {
         SessionLeaseOwnerContext {
+            storage_writer_epoch: Some(storage_writer_epoch),
             build_fingerprint: Some(build.to_string()),
             protocol_version: Some(2),
             ..SessionLeaseOwnerContext::default()
@@ -543,26 +578,30 @@ mod tests {
     }
 
     #[test]
-    fn allows_multiple_same_build_session_access_guards() {
+    fn allows_multiple_builds_with_same_storage_writer_epoch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
-        let first = acquire_session_lease(temp_dir.path(), session_id, &context("same"))
+        let first = acquire_session_lease(temp_dir.path(), session_id, &context("first", 7))
             .expect("first guard");
-        let second = acquire_session_lease(temp_dir.path(), session_id, &context("same"))
-            .expect("same build guard");
+        let second = acquire_session_lease(temp_dir.path(), session_id, &context("second", 7))
+            .expect("compatible writer guard");
 
-        assert_eq!(first.owner().build_fingerprint.as_deref(), Some("same"));
-        assert_eq!(second.owner().build_fingerprint.as_deref(), Some("same"));
+        assert_eq!(first.owner().storage_writer_epoch, Some(7));
+        assert_eq!(second.owner().storage_writer_epoch, Some(7));
+        assert_ne!(
+            first.owner().build_fingerprint,
+            second.owner().build_fingerprint
+        );
     }
 
     #[test]
-    fn rejects_live_different_build_session_access_guard() {
+    fn rejects_live_different_storage_writer_epoch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
-        let _first = acquire_session_lease(temp_dir.path(), session_id, &context("old"))
+        let _first = acquire_session_lease(temp_dir.path(), session_id, &context("old", 1))
             .expect("first guard");
-        let error = acquire_session_lease(temp_dir.path(), session_id, &context("new"))
-            .expect_err("different build should be rejected");
+        let error = acquire_session_lease(temp_dir.path(), session_id, &context("new", 2))
+            .expect_err("different storage writer epoch should be rejected");
 
         assert!(matches!(
             error,
@@ -571,15 +610,34 @@ mod tests {
     }
 
     #[test]
-    fn allows_different_build_after_guard_drop() {
+    fn rejects_missing_storage_writer_identity() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let error = acquire_session_lease(
+            temp_dir.path(),
+            session_id,
+            &SessionLeaseOwnerContext {
+                storage_writer_epoch: None,
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect_err("anonymous storage writer must be rejected");
+        assert!(matches!(
+            error,
+            SessionLeaseError::MissingStorageWriterEpoch { .. }
+        ));
+    }
+
+    #[test]
+    fn allows_different_storage_writer_epoch_after_guard_drop() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
         {
-            let _first = acquire_session_lease(temp_dir.path(), session_id, &context("old"))
+            let _first = acquire_session_lease(temp_dir.path(), session_id, &context("old", 1))
                 .expect("first guard");
         }
 
-        acquire_session_lease(temp_dir.path(), session_id, &context("new"))
-            .expect("different build after drop");
+        acquire_session_lease(temp_dir.path(), session_id, &context("new", 2))
+            .expect("different writer after drop");
     }
 }
