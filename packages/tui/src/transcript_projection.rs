@@ -10,7 +10,6 @@ use super::transcript_layout::{
     TranscriptLayoutFingerprint, TranscriptLayoutSignature, TranscriptLayoutSpec,
 };
 use bcode_config::TuiDiffViewerConfig;
-use bcode_plugin::PluginHost;
 
 /// Prepare transcript layout and viewport projections for a frame body.
 pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
@@ -100,7 +99,7 @@ struct TranscriptLayoutInput<'a> {
     width: u16,
     transcript: &'a [TranscriptItem],
     live_tool_previews: &'a std::collections::BTreeMap<String, LiveToolPreviewState>,
-    plugin_host: Option<&'a PluginHost>,
+    plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
     diff_viewer_config: TuiDiffViewerConfig,
     pending: &'a [PendingSubmission],
     transcript_projection_revision: u64,
@@ -115,7 +114,7 @@ impl<'a> TranscriptLayoutInput<'a> {
             width,
             transcript: app.transcript(),
             live_tool_previews: app.live_tool_previews(),
-            plugin_host: app.plugin_host(),
+            plugin_host: app.plugin_presentation(),
             diff_viewer_config: app.effective_diff_viewer_config(),
             pending: app.pending_submissions(),
             transcript_projection_revision: app.transcript_projection_revision(),

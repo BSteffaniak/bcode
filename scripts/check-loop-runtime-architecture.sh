@@ -6,6 +6,12 @@ cd "$root"
 
 violations=0
 
+if rg -n -i 'bcode\.shell|shell[_ .-]?recording|terminal[_ .-]?pty|pty[_ .-]?stream' packages/tui/src/artifact_stream.rs >/tmp/bcode-artifact-stream-domain-leak.txt; then
+  echo "Runtime architecture violation: generic TUI artifact transport contains shell-domain knowledge." >&2
+  cat /tmp/bcode-artifact-stream-domain-leak.txt >&2
+  violations=1
+fi
+
 if rg -n 'SESSION_STATUS_POLL_INTERVAL|PERMISSION_POLL_INTERVAL|maybe_start_(session_status|permission)_poll|PermissionPollSchedule' packages/tui/src --glob '*.rs' >/tmp/bcode-tui-sync-polling.txt; then
   echo "Runtime architecture violation: TUI state synchronization must be snapshot/event-driven, not polling-driven." >&2
   cat /tmp/bcode-tui-sync-polling.txt >&2

@@ -330,7 +330,7 @@ pub struct BmuxApp {
     cursor: CursorBlink,
     live_preview_frame: LivePreviewFrameState,
     pending_key_activation: Option<PendingKeyActivation>,
-    plugin_host: Option<Arc<bcode_plugin::PluginHost>>,
+    plugin_presentation: Option<Arc<crate::plugin_tui::PluginTuiPresentation>>,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -547,7 +547,7 @@ impl BmuxApp {
             cursor: CursorBlink::new(),
             live_preview_frame: LivePreviewFrameState::new(),
             pending_key_activation: None,
-            plugin_host: None,
+            plugin_presentation: None,
         };
         app.absorb_history(history);
         app
@@ -558,19 +558,40 @@ impl BmuxApp {
         self.apply_tui_config(source.tui_config().clone());
         self.set_daemon_connection(source.daemon_connection());
         self.set_agent_metadata_hydrated(source.is_agent_metadata_hydrated());
-        self.plugin_host.clone_from(&source.plugin_host);
+        self.plugin_presentation
+            .clone_from(&source.plugin_presentation);
         self.take_theme_transition_state_from(source);
     }
 
     /// Set the local plugin runtime used for client-side presentation projection.
+    #[cfg(test)]
     pub fn set_plugin_host(&mut self, host: Arc<bcode_plugin::PluginHost>) {
-        self.plugin_host = Some(host);
+        self.plugin_presentation = Some(Arc::new(
+            crate::plugin_tui::PluginTuiPresentation::from_shared(host),
+        ));
+    }
+
+    /// Set persistent local plugin presentation state.
+    pub fn set_plugin_presentation(
+        &mut self,
+        presentation: Arc<crate::plugin_tui::PluginTuiPresentation>,
+    ) {
+        self.plugin_presentation = Some(presentation);
     }
 
     /// Return the local plugin runtime used for client-side presentation projection.
+    #[cfg(test)]
     #[must_use]
     pub fn plugin_host(&self) -> Option<&bcode_plugin::PluginHost> {
-        self.plugin_host.as_deref()
+        self.plugin_presentation
+            .as_deref()
+            .map(crate::plugin_tui::PluginTuiPresentation::host)
+    }
+
+    /// Return persistent local plugin presentation state.
+    #[must_use]
+    pub fn plugin_presentation(&self) -> Option<&crate::plugin_tui::PluginTuiPresentation> {
+        self.plugin_presentation.as_deref()
     }
 
     #[cfg(test)]

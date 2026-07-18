@@ -535,7 +535,7 @@ pub fn transcript_item_rows(
     live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
     diff_viewer_config: TuiDiffViewerConfig,
 ) -> Vec<Line> {
     DIFF_VIEWER_CONFIG.with(|config| config.set(diff_viewer_config));
@@ -631,7 +631,7 @@ fn push_transcript_item_rows(
     live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) {
     let item = &transcript[index];
     match item.kind() {
@@ -859,7 +859,7 @@ struct ToolRequestRenderContext<'a> {
     working_directory: Option<&'a std::path::Path>,
     request_visual: Option<&'a bcode_session_models::PluginVisualDescriptor>,
     _live_preview: bool,
-    plugin_host: Option<&'a bcode_plugin::PluginHost>,
+    plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
 }
 
 fn push_tool_request_rows(
@@ -935,7 +935,7 @@ fn push_live_tool_preview_anchor_rows(
     fallback_tool_name: &str,
     state: Option<&LiveToolPreviewState>,
     width: u16,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) {
     let Some(state) = state else {
         push_wrapped_styled_text(
@@ -970,10 +970,10 @@ fn push_live_tool_preview_anchor_rows(
 
 fn canonical_plugin_visual_render_mode(
     visual: &CanonicalPluginVisual,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) -> Option<PluginTuiVisualRenderMode> {
-    let host = plugin_host?;
-    let route = host.visual_adapter(
+    let presentation = plugin_host?;
+    let route = presentation.host().visual_adapter(
         &visual.schema,
         visual.schema_version,
         "tui",
@@ -992,19 +992,21 @@ fn canonical_plugin_visual_render_mode(
 
 fn canonical_plugin_visual_available(
     visual: &CanonicalToolVisual,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) -> bool {
     let CanonicalToolVisual::Plugin(plugin_visual) = visual;
-    let Some(host) = plugin_host else {
+    let Some(presentation) = plugin_host else {
         return false;
     };
-    host.visual_adapter(
-        &plugin_visual.schema,
-        plugin_visual.schema_version,
-        "tui",
-        plugin_visual.producer_plugin_id.as_deref(),
-    )
-    .is_some()
+    presentation
+        .host()
+        .visual_adapter(
+            &plugin_visual.schema,
+            plugin_visual.schema_version,
+            "tui",
+            plugin_visual.producer_plugin_id.as_deref(),
+        )
+        .is_some()
 }
 
 fn push_canonical_tool_visual_rows(
@@ -1012,7 +1014,7 @@ fn push_canonical_tool_visual_rows(
     visual: &CanonicalToolVisual,
     working_directory: Option<&std::path::Path>,
     width: u16,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) {
     let CanonicalToolVisual::Plugin(plugin_visual) = visual;
     push_canonical_plugin_visual_rows(rows, plugin_visual, working_directory, width, plugin_host);
@@ -1023,19 +1025,22 @@ fn push_canonical_plugin_visual_rows(
     visual: &CanonicalPluginVisual,
     working_directory: Option<&std::path::Path>,
     width: u16,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) {
-    let Some(host) = plugin_host else {
+    let Some(presentation) = plugin_host else {
         push_plugin_visual_degraded_rows(rows, visual, "plugin host unavailable", width);
         return;
     };
     let producer = visual.producer_plugin_id.as_deref();
-    let Some(route) = host.visual_adapter(&visual.schema, visual.schema_version, "tui", producer)
+    let Some(route) =
+        presentation
+            .host()
+            .visual_adapter(&visual.schema, visual.schema_version, "tui", producer)
     else {
         push_plugin_visual_degraded_rows(rows, visual, "no TUI visual adapter registered", width);
         return;
     };
-    let Some(registry) = crate::plugin_tui::tui_registry(&route.plugin_id) else {
+    let Some(registry) = presentation.registry(&route.plugin_id) else {
         push_plugin_visual_degraded_rows(
             rows,
             visual,
@@ -1065,7 +1070,7 @@ struct PluginTranscriptBlockContext<'a> {
     title: &'a str,
     visual: &'a CanonicalPluginVisual,
     working_directory: Option<&'a std::path::Path>,
-    plugin_host: Option<&'a bcode_plugin::PluginHost>,
+    plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
     streaming: bool,
     is_error: bool,
     timing: Option<ToolTiming>,
@@ -1214,7 +1219,7 @@ fn push_tool_result_rows(
     item: &TranscriptItem,
     context: &ToolResultRenderContext<'_>,
     width: u16,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) {
     if let Some(artifact) = context.artifact {
         let visual = CanonicalToolVisual::from_artifact(artifact);

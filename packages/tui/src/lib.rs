@@ -6,6 +6,7 @@
 
 pub(crate) mod activity;
 pub(crate) mod app;
+pub(crate) mod artifact_stream;
 pub(crate) mod chat_loop;
 pub(crate) mod clipboard_image;
 pub mod code_review_launcher;
