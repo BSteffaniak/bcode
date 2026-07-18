@@ -240,6 +240,27 @@ fn renderer_neutral_and_web_crates_do_not_depend_on_terminal_plugin_apis() {
     );
 }
 
+#[test]
+fn tui_runtime_never_writes_diagnostics_directly_to_the_terminal() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut offenders = Vec::new();
+    for root in ["packages/server/src", "packages/tui/src"] {
+        collect_literal_offenders(&workspace_root.join(root), &["eprint"], &mut offenders);
+    }
+    assert!(
+        offenders.is_empty(),
+        "TUI runtime diagnostics must use tracing instead of stderr:\n{}",
+        offenders.join("\n")
+    );
+
+    let cli = std::fs::read_to_string(workspace_root.join("packages/cli/src/lib.rs"))
+        .expect("CLI source should be readable");
+    assert!(
+        !cli.contains("with_writer(std::io::stderr)"),
+        "the shared TUI tracing subscriber must not write to stderr"
+    );
+}
+
 fn collect_literal_offenders(path: &Path, needles: &[&str], offenders: &mut Vec<String>) {
     let Ok(metadata) = std::fs::metadata(path) else {
         return;

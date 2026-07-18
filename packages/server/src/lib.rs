@@ -575,6 +575,15 @@ struct RuntimeCurrentTurn {
 }
 
 impl RuntimeCurrentTurn {
+    fn model_attempt_for_provider_turn(
+        &self,
+        provider_turn_id: &str,
+    ) -> Option<&ModelRequestAttempt> {
+        self.model
+            .as_ref()
+            .filter(|attempt| attempt.provider_turn_id == provider_turn_id)
+    }
+
     fn plugin_scope_for_provider(&self, session_id: SessionId) -> PluginInvocationScope {
         let work_id = match self.kind {
             RuntimeOperationKind::ModelTurn => format!("model_{}", self.turn_id),
@@ -699,15 +708,15 @@ impl ProviderStateStore {
         if let Some(parent) = self.path.parent()
             && let Err(error) = fs::create_dir_all(parent)
         {
-            eprintln!("failed to create provider state directory: {error}");
+            tracing::warn!("failed to create provider state directory: {error}");
             return;
         }
         let Ok(contents) = serde_json::to_string_pretty(&self.records) else {
-            eprintln!("failed to encode provider state");
+            tracing::warn!("failed to encode provider state");
             return;
         };
         if let Err(error) = fs::write(&self.path, contents) {
-            eprintln!("failed to persist provider state: {error}");
+            tracing::warn!("failed to persist provider state: {error}");
         }
     }
 }
@@ -1214,7 +1223,7 @@ impl ServerState {
             .release_idle_session_resources(session_id)
             .await
         {
-            eprintln!("failed to release idle session resources for {session_id}: {error}");
+            tracing::warn!("failed to release idle session resources for {session_id}: {error}");
         }
     }
 
@@ -1904,7 +1913,7 @@ pub async fn run_with_static_bundled(
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(error) = handle_client(stream, state).await {
-                        eprintln!("client connection failed: {error}");
+                        tracing::warn!("client connection failed: {error}");
                     }
                 });
             }
@@ -1949,7 +1958,7 @@ fn interrupt_stale_ralph_runs_best_effort(state: &ServerState) {
             state
                 .metrics
                 .increment_counter("server.ralph_runs.interrupt_startup_error_total");
-            eprintln!("failed to interrupt stale Ralph runs on startup: {error}");
+            tracing::warn!("failed to interrupt stale Ralph runs on startup: {error}");
         }
     }
 }
@@ -1962,7 +1971,9 @@ async fn recover_abandoned_session_runtime_work_best_effort(
         state
             .metrics
             .increment_counter("server.runtime_work.recovery_error_total");
-        eprintln!("failed to recover abandoned runtime work for session {session_id}: {error}");
+        tracing::warn!(
+            "failed to recover abandoned runtime work for session {session_id}: {error}"
+        );
     }
 }
 
@@ -3509,7 +3520,7 @@ async fn append_ralph_session_lifecycle(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append Ralph session lifecycle: {error}"),
+        Err(error) => tracing::warn!("failed to append Ralph session lifecycle: {error}"),
     }
 }
 
@@ -8935,9 +8946,10 @@ async fn apply_skill_model_request(
         .insert(session_id, origin);
     publish_session_event(state, &event).await;
     if required {
-        eprintln!(
+        tracing::warn!(
             "skill required model applied for session {session_id}: {} via {}",
-            request.model, provider
+            request.model,
+            provider
         );
     }
     Ok(())
@@ -8966,7 +8978,7 @@ fn handle_unresolved_skill_model(
             } else {
                 "keeping current session model"
             };
-            eprintln!(
+            tracing::warn!(
                 "{} model '{}' for skill {skill_id} could not be resolved; {message}",
                 if required { "required" } else { "preferred" },
                 request.model
@@ -12617,16 +12629,19 @@ async fn handle_provider_turn_event(
             append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
         }
         ProviderTurnEvent::ExactRequestInputTokens { tokens } => {
-            let active_turn = state
-                .session_current_turn(session_id)
+            let active_turn = command_context
+                .current_turn
+                .lock()
                 .await
-                .and_then(|turn| turn.model)
-                .filter(|turn| turn.provider_turn_id == turn_id);
+                .as_ref()
+                .and_then(|turn| turn.model_attempt_for_provider_turn(provider_turn_id))
+                .cloned();
             append_exact_request_context_observation(
                 state,
                 session_id,
                 tokens,
                 active_turn.as_ref(),
+                provider_turn_id,
             )
             .await;
         }
@@ -14967,7 +14982,7 @@ async fn collect_tool_definitions(state: &ServerState) -> Vec<ServiceToolDefinit
             .await;
         match response {
             Ok(list) => tools.extend(list.tools),
-            Err(error) => eprintln!("failed to list tools from {plugin_id}: {error}"),
+            Err(error) => tracing::warn!("failed to list tools from {plugin_id}: {error}"),
         }
     }
     tools
@@ -16633,7 +16648,7 @@ async fn append_tool_stream_event(
     let progress = runtime_work_progress_from_tool_stream_event(&event);
     if let ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. } = &event {
         if let Err(error) = update_active_plugin_visual(state, session_id, tool_call_id, &event) {
-            eprintln!("failed to update active plugin visual registry: {error}");
+            tracing::warn!("failed to update active plugin visual registry: {error}");
             return;
         }
         let _ = state
@@ -16647,7 +16662,7 @@ async fn append_tool_stream_event(
     }
     if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
         if let Err(error) = update_active_artifact(state, session_id, &event) {
-            eprintln!("failed to update active artifact: {error}");
+            tracing::warn!("failed to update active artifact: {error}");
             return;
         }
         let _ = state
@@ -16673,7 +16688,7 @@ async fn append_tool_stream_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append tool stream event: {error}"),
+        Err(error) => tracing::warn!("failed to append tool stream event: {error}"),
     }
     if let Some((work_id, message)) = progress {
         append_runtime_work_progress_event(state, session_id, work_id, message, None, None).await;
@@ -17109,7 +17124,7 @@ async fn list_service_tools(state: &ServerState) -> Vec<ServiceToolDefinition> {
             .await
         {
             Ok(list) => tools.extend(list.tools),
-            Err(error) => eprintln!("failed to list tools from {plugin_id}: {error}"),
+            Err(error) => tracing::warn!("failed to list tools from {plugin_id}: {error}"),
         }
     }
     tools
@@ -17395,7 +17410,7 @@ async fn append_permission_requested_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append permission request: {error}"),
+        Err(error) => tracing::warn!("failed to append permission request: {error}"),
     }
 }
 
@@ -17411,7 +17426,7 @@ async fn append_permission_resolved_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append permission result: {error}"),
+        Err(error) => tracing::warn!("failed to append permission result: {error}"),
     }
 }
 
@@ -17763,7 +17778,7 @@ async fn append_trace_event(
     };
     match state.sessions.append_trace_event(session_id, trace).await {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append trace event: {error}"),
+        Err(error) => tracing::warn!("failed to append trace event: {error}"),
     }
 }
 
@@ -17840,7 +17855,7 @@ async fn append_assistant_message_event(state: &ServerState, session_id: Session
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append assistant message: {error}"),
+        Err(error) => tracing::warn!("failed to append assistant message: {error}"),
     }
 }
 
@@ -17874,7 +17889,7 @@ async fn append_interactive_tool_request_resolved_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append interactive tool resolution: {error}"),
+        Err(error) => tracing::warn!("failed to append interactive tool resolution: {error}"),
     }
 }
 
@@ -17925,7 +17940,7 @@ async fn append_tool_request_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append tool request: {error}"),
+        Err(error) => tracing::warn!("failed to append tool request: {error}"),
     }
     register_runtime_work(
         state,
@@ -17968,7 +17983,7 @@ async fn append_runtime_work_cancel_requested_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append runtime work cancel request: {error}"),
+        Err(error) => tracing::warn!("failed to append runtime work cancel request: {error}"),
     }
 }
 
@@ -18001,7 +18016,7 @@ async fn append_interactive_tool_request_created_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append interactive tool request: {error}"),
+        Err(error) => tracing::warn!("failed to append interactive tool request: {error}"),
     }
 }
 
@@ -18235,7 +18250,7 @@ async fn append_tool_finished_event(
     input: ToolFinishedEventInput,
 ) {
     if let Err(error) = append_tool_finished_event_inner(state, session_id, input).await {
-        eprintln!("failed to append tool result: {error}");
+        tracing::warn!("failed to append tool result: {error}");
     }
 }
 
@@ -18346,7 +18361,7 @@ fn runtime_work_status_from_tool_result(result: &str, is_error: bool) -> Runtime
 async fn append_system_event(state: &ServerState, session_id: SessionId, text: String) {
     match state.sessions.append_system_message(session_id, text).await {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append system message: {error}"),
+        Err(error) => tracing::warn!("failed to append system message: {error}"),
     }
 }
 
@@ -18385,7 +18400,7 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append runtime work start: {error}"),
+        Err(error) => tracing::warn!("failed to append runtime work start: {error}"),
     }
 }
 
@@ -18452,7 +18467,7 @@ async fn append_model_turn_started_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append model turn start: {error}"),
+        Err(error) => tracing::warn!("failed to append model turn start: {error}"),
     }
 }
 
@@ -18479,7 +18494,7 @@ async fn append_runtime_work_progress_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append runtime work progress: {error}"),
+        Err(error) => tracing::warn!("failed to append runtime work progress: {error}"),
     }
 }
 
@@ -18507,7 +18522,7 @@ async fn append_runtime_work_finished_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append runtime work finish: {error}"),
+        Err(error) => tracing::warn!("failed to append runtime work finish: {error}"),
     }
 }
 
@@ -18584,7 +18599,7 @@ async fn append_model_turn_cancel_requested_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append model turn cancel request: {error}"),
+        Err(error) => tracing::warn!("failed to append model turn cancel request: {error}"),
     }
 }
 
@@ -18601,7 +18616,7 @@ async fn append_model_turn_finished_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append model turn finish: {error}"),
+        Err(error) => tracing::warn!("failed to append model turn finish: {error}"),
     }
 }
 
@@ -18610,9 +18625,15 @@ async fn append_exact_request_context_observation(
     session_id: SessionId,
     tokens: bcode_model::ExactRequestInputTokens,
     attempt: Option<&ModelRequestAttempt>,
+    provider_turn_id: &str,
 ) {
     let Some(attempt) = attempt else {
-        eprintln!("provider usage was not associated with the active request");
+        tracing::warn!(
+            %session_id,
+            provider_turn_id,
+            exact_request_input_tokens = tokens.get(),
+            "provider usage was not associated with the active request"
+        );
         return;
     };
     let snapshot = bcode_session_models::RequestContextObservation {
@@ -18645,7 +18666,7 @@ async fn append_exact_request_context_observation(
             publish_session_event(state, &event).await;
             publish_context_occupancy(state, session_id).await;
         }
-        Err(error) => eprintln!("failed to append provider context usage: {error}"),
+        Err(error) => tracing::warn!("failed to append provider context usage: {error}"),
     }
 }
 
@@ -18661,7 +18682,7 @@ async fn append_model_usage_event(
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append model usage: {error}"),
+        Err(error) => tracing::warn!("failed to append model usage: {error}"),
     }
 }
 
@@ -18865,7 +18886,7 @@ async fn publish_session_event(state: &ServerState, event: &bcode_session_models
     let payload = match serde_json::to_vec(event) {
         Ok(payload) => payload,
         Err(error) => {
-            eprintln!("failed to encode plugin session event: {error}");
+            tracing::warn!("failed to encode plugin session event: {error}");
             return;
         }
     };
@@ -18875,7 +18896,7 @@ async fn publish_session_event(state: &ServerState, event: &bcode_session_models
         .await;
     match response {
         Ok(_) => {}
-        Err(error) => eprintln!("failed to publish plugin session event: {error}"),
+        Err(error) => tracing::warn!("failed to publish plugin session event: {error}"),
     }
 }
 
@@ -18988,7 +19009,7 @@ async fn collect_catalog_send_result(
     if let Err(error) = send_result {
         disconnected_clients.push(client_id);
         if !is_expected_disconnect(&error) {
-            eprintln!("failed to send catalog update event to {client_id}: {error}");
+            tracing::warn!("failed to send catalog update event to {client_id}: {error}");
         }
     } else {
         state.mark_catalog_event_sent(client_id, revision).await;
@@ -19046,7 +19067,7 @@ fn forward_session_events(
             };
             if let Err(error) = sink.send(event).await {
                 if !is_expected_disconnect(&error) {
-                    eprintln!(
+                    tracing::warn!(
                         "failed to send session event to {}: {error}",
                         sink.client_id()
                     );
@@ -19066,7 +19087,7 @@ fn forward_runtime_work_events(
         for event in initial_events {
             if let Err(error) = sink.send(Event::RuntimeWork(event)).await {
                 if !is_expected_disconnect(&error) {
-                    eprintln!(
+                    tracing::warn!(
                         "failed to send runtime work event to {}: {error}",
                         sink.client_id()
                     );
@@ -19086,7 +19107,7 @@ fn forward_runtime_work_events(
             }
             if let Err(error) = sink.send(Event::RuntimeWork(event)).await {
                 if !is_expected_disconnect(&error) {
-                    eprintln!(
+                    tracing::warn!(
                         "failed to send runtime work event to {}: {error}",
                         sink.client_id()
                     );
@@ -27552,6 +27573,22 @@ library = "test"
             managed_compaction_persisted: false,
         };
         begin_provider_round(&context, model_turn.clone()).await;
+        let matched_request_id = current_turn
+            .lock()
+            .await
+            .as_ref()
+            .expect("current turn")
+            .model_attempt_for_provider_turn("provider-turn-test")
+            .map(|attempt| attempt.identity.request_id.clone());
+        assert_eq!(matched_request_id.as_deref(), Some("request-test"));
+        let request_id_matched = current_turn
+            .lock()
+            .await
+            .as_ref()
+            .expect("current turn")
+            .model_attempt_for_provider_turn("request-test")
+            .is_some();
+        assert!(!request_id_matched);
         assert_eq!(
             current_turn
                 .lock()

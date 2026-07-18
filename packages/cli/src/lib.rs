@@ -132,13 +132,13 @@ pub async fn run() -> Result<(), CliError> {
 pub async fn run_with_static_bundled(
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
+    init_tracing();
     let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
     if let Err(error) = bcode_daemon_lifecycle::ensure_current_executable_cached() {
         tracing::warn!(%error, "failed to cache current executable for detached daemon startup");
     }
     let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
     let _ = STATIC_BUNDLED_PLUGIN_IDS.set(static_plugin_ids);
-    init_tracing();
     let registrations = plugin_cli::registrations(
         STATIC_BUNDLED_PLUGINS.get().map_or(&[][..], Vec::as_slice),
         STATIC_BUNDLED_PLUGIN_IDS
@@ -331,7 +331,7 @@ async fn handle_web_command(
         .with_actix_bind_address(bind.to_string())
         .with_actix_port(port)
         .with_actix_on_bound(move |address| {
-            eprintln!("Bcode web renderer: http://{address}/?{launch_query}");
+            println!("Bcode web renderer: http://{address}/?{launch_query}");
         })
         .with_viewport(bcode_web_render::VIEWPORT.clone());
     let mut app = bcode_web_render::build_app(builder)
@@ -634,16 +634,34 @@ fn init_tracing() {
                 "off".to_string()
             }
         });
-    let env_filter = tracing_subscriber::EnvFilter::try_new(filter).unwrap_or_else(|error| {
-        eprintln!("bcode warning: invalid log filter; logging disabled: {error}");
-        tracing_subscriber::EnvFilter::new("off")
-    });
+    let (env_filter, invalid_filter) = match tracing_subscriber::EnvFilter::try_new(filter) {
+        Ok(filter) => (filter, None),
+        Err(error) => (tracing_subscriber::EnvFilter::new("off"), Some(error)),
+    };
+    let log_path = bcode_daemon_lifecycle::default_daemon_log_path();
+    let log_parent_ready = log_path
+        .parent()
+        .is_none_or(|parent| fs::create_dir_all(parent).is_ok());
+    let writer_path = log_path;
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
-        .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_writer(move || -> Box<dyn std::io::Write> {
+            if log_parent_ready
+                && let Ok(file) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&writer_path)
+            {
+                return Box::new(file);
+            }
+            Box::new(std::io::sink())
+        })
         .finish();
     let _ = subscriber.try_init();
+    if let Some(error) = invalid_filter {
+        tracing::warn!(%error, "invalid log filter; logging disabled");
+    }
 }
 
 /// Return the root `bcode` CLI command definition.
@@ -4424,8 +4442,8 @@ fn report_login_completion(
                 println!("Config updated: {}", display_from_current_dir(&config_path));
             }
             Err(error) => {
-                eprintln!("Config update failed: {error}");
-                eprintln!(
+                println!("Config update failed: {error}");
+                println!(
                     "Credentials were saved. To use them, run a provider wrapper with a declarative {provider} auth profile or update a writable config."
                 );
             }
@@ -4678,7 +4696,7 @@ fn manual_oauth_callback_code(
     match parse_oauth_callback(input.trim()) {
         OAuthCallbackParse::Code { code, state } if state == expected_state => Ok(Some(code)),
         OAuthCallbackParse::Code { .. } => {
-            eprintln!(
+            println!(
                 "Pasted OpenAI OAuth callback state did not match; paste the newest redirected URL from this login attempt."
             );
             Ok(None)
@@ -4687,7 +4705,7 @@ fn manual_oauth_callback_code(
             "OpenAI OAuth failed: {error}"
         ))),
         OAuthCallbackParse::Ignored => {
-            eprintln!(
+            println!(
                 "Pasted text was not an OpenAI OAuth callback URL; paste the full localhost callback URL."
             );
             Ok(None)
@@ -7047,9 +7065,9 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
                 .await?;
             println!("{}", session.id);
             if !warnings.is_empty() {
-                eprintln!("imported [{source}] with {} warnings", warnings.len());
+                println!("imported [{source}] with {} warnings", warnings.len());
                 for warning in warnings {
-                    eprintln!("{}: {}", warning.code, warning.message);
+                    println!("{}: {}", warning.code, warning.message);
                 }
             }
         }

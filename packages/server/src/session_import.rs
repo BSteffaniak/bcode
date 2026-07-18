@@ -293,18 +293,18 @@ pub async fn resolve_attach_session_id(
                 state.session_catalog.upsert_native_session(session).await;
             }
             if !warnings.is_empty() {
-                eprintln!(
+                tracing::warn!(
                     "imported [{source_id}] session with {} warnings",
                     warnings.len()
                 );
                 for warning in warnings {
-                    eprintln!("import warning: {}: {}", warning.code, warning.message);
+                    tracing::warn!("import warning: {}: {}", warning.code, warning.message);
                 }
             }
             imported_session_id
         }
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "failed to import external session {source_id}/{external_session_id}: {error}"
             );
             session_id
