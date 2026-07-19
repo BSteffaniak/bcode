@@ -38,8 +38,6 @@ use super::{
 };
 
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const BCODE_EVENT_DRAIN_BUDGET: usize = 32;
-const ARTIFACT_COMPLETION_DRAIN_BUDGET: usize = 8;
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 #[derive(Debug, Clone)]
 struct DraftAutosave {
@@ -385,13 +383,7 @@ async fn run_chat_loop<W: Write>(
 
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, &settings.keymap);
-        if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
-            needs_redraw = true;
-        }
-        if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET).await {
-            needs_redraw = true;
-        }
-        if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
+        if drain_bcode_events(chat, loop_state).await {
             needs_redraw = true;
         }
 
@@ -486,21 +478,23 @@ async fn run_chat_loop<W: Write>(
             }
             ChatLoopEvent::Bcode(event) => {
                 if absorb_bcode_event(chat, loop_state, *event).await
-                    || drain_bcode_events(
-                        chat,
-                        loop_state,
-                        BCODE_EVENT_DRAIN_BUDGET.saturating_sub(1),
-                    )
-                    .await
+                    || drain_bcode_events(chat, loop_state).await
                 {
-                    needs_redraw = true;
-                }
-                if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
                     needs_redraw = true;
                 }
             }
             ChatLoopEvent::ArtifactFetchCompleted(completion) => {
-                needs_redraw |= handle_artifact_completion(chat, loop_state, *completion);
+                let presentation = chat.app.plugin_presentation();
+                needs_redraw |= loop_state.artifact_stream.handle_completion(
+                    chat.session_id,
+                    *completion,
+                    |chunk| {
+                        presentation.map_or_else(
+                            || Err("plugin presentation unavailable".to_owned()),
+                            |presentation| presentation.deliver_artifact_chunk(chunk),
+                        )
+                    },
+                );
             }
             ChatLoopEvent::TimedInvalidations(keys) => {
                 if chat
@@ -617,27 +611,11 @@ fn apply_effect_result(
                 loop_state.artifact_stream.retain_session(Some(session_id));
             }
             if let Ok((attached, _)) = &result {
-                let presentation = chat.app.plugin_presentation();
                 for event in &attached.history {
                     loop_state.artifact_stream.observe_finalized_artifact(
                         event.session_id,
                         event.sequence,
                         &event.kind,
-                        |producer_plugin_id,
-                         schema,
-                         schema_version,
-                         reference_key,
-                         content_type| {
-                            presentation.is_some_and(|presentation| {
-                                presentation.accepts_artifact_reference(
-                                    producer_plugin_id,
-                                    schema,
-                                    schema_version,
-                                    reference_key,
-                                    content_type,
-                                )
-                            })
-                        },
                     );
                 }
             }
@@ -1567,54 +1545,10 @@ fn interactive_surface_area(
     None
 }
 
-fn take_bcode_events(
-    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<BcodeEvent>,
-    budget: usize,
-) -> Vec<BcodeEvent> {
-    (0..budget)
-        .map_while(|_| receiver.try_recv().ok())
-        .collect()
-}
-
-async fn drain_bcode_events(
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    budget: usize,
-) -> bool {
+async fn drain_bcode_events(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
     let mut needs_redraw = false;
-    for event in take_bcode_events(&mut chat.event_receiver, budget) {
+    while let Ok(event) = chat.event_receiver.try_recv() {
         needs_redraw |= absorb_bcode_event(chat, loop_state, event).await;
-    }
-    needs_redraw
-}
-
-fn handle_artifact_completion(
-    chat: &ActiveChat,
-    loop_state: &mut ChatLoopState,
-    completion: ActiveArtifactFetchCompletion,
-) -> bool {
-    let presentation = chat.app.plugin_presentation();
-    loop_state
-        .artifact_stream
-        .handle_completion(chat.session_id, completion, |chunk| {
-            presentation.map_or_else(
-                || Err("plugin presentation unavailable".to_owned()),
-                |presentation| presentation.deliver_artifact_chunk(chunk),
-            )
-        })
-}
-
-fn drain_artifact_completions(
-    chat: &ActiveChat,
-    loop_state: &mut ChatLoopState,
-    budget: usize,
-) -> bool {
-    let mut needs_redraw = false;
-    for _ in 0..budget {
-        let Some(completion) = loop_state.artifact_stream.try_next_completion() else {
-            break;
-        };
-        needs_redraw |= handle_artifact_completion(chat, loop_state, completion);
     }
     needs_redraw
 }
@@ -1626,22 +1560,10 @@ async fn absorb_bcode_event(
 ) -> bool {
     match event {
         BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
-            let presentation = chat.app.plugin_presentation();
             loop_state.artifact_stream.observe_finalized_artifact(
                 event.session_id,
                 event.sequence,
                 &event.kind,
-                |producer_plugin_id, schema, schema_version, reference_key, content_type| {
-                    presentation.is_some_and(|presentation| {
-                        presentation.accepts_artifact_reference(
-                            producer_plugin_id,
-                            schema,
-                            schema_version,
-                            reference_key,
-                            content_type,
-                        )
-                    })
-                },
             );
             if let SessionEventKind::AgentChanged { agent_id } = &event.kind {
                 chat.agents
@@ -1747,14 +1669,6 @@ async fn next_artifact_fetch_event(
     )
 }
 
-fn try_next_ready_artifact_event(
-    artifact_stream: &mut ArtifactStreamCoordinator,
-) -> Option<ChatLoopEvent> {
-    artifact_stream
-        .try_next_completion()
-        .map(|completion| ChatLoopEvent::ArtifactFetchCompleted(Box::new(completion)))
-}
-
 async fn next_chat_loop_event(
     terminal_events: &mut TuiInput,
     invalidation_queue: &mut InvalidationQueue,
@@ -1763,9 +1677,6 @@ async fn next_chat_loop_event(
     redraw_at: Option<Instant>,
     draft_save_at: Option<Instant>,
 ) -> Result<ChatLoopEvent, TuiError> {
-    if let Some(event) = try_next_ready_artifact_event(artifact_stream) {
-        return Ok(event);
-    }
     let now = Instant::now();
     let due = invalidation_queue.take_due(now);
     if !due.is_empty() {
@@ -1783,11 +1694,12 @@ async fn next_chat_loop_event(
     if let Some(next_at) = next_timer_at {
         let delay = next_at.saturating_duration_since(now);
         return tokio::select! {
-            artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
+            biased;
             bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
                 |event| ChatLoopEvent::Bcode(Box::new(event)),
             )),
+            artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
             event = terminal_events.recv() => event.map(|event| {
                 event.map_or_else(
                     || ChatLoopEvent::TimedInvalidations(Vec::new()),
@@ -1806,11 +1718,12 @@ async fn next_chat_loop_event(
         };
     }
     tokio::select! {
-        artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
+        biased;
         bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
             || ChatLoopEvent::TimedInvalidations(Vec::new()),
             |event| ChatLoopEvent::Bcode(Box::new(event)),
         )),
+        artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
         event = terminal_events.recv() => event.map(|event| {
             event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
@@ -2246,446 +2159,5 @@ fn paste_clipboard_image(chat: &mut ActiveChat) {
         Err(error) => {
             chat.app.set_status(format!("image paste failed: {error}"));
         }
-    }
-}
-
-#[cfg(test)]
-mod scheduler_tests {
-    use super::*;
-    use bmux_tui::buffer::Buffer;
-    use bmux_tui::frame::Frame;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn shell_plugin_host() -> bcode_plugin::PluginHost {
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
-        )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
-            &bundled,
-            &bcode_plugin::PluginSelection::all_enabled(),
-        )
-        .expect("select shell plugin");
-        bcode_plugin::PluginHost::load_static_plugins(&selected).expect("load shell plugin")
-    }
-
-    fn session_event(
-        session_id: bcode_session_models::SessionId,
-        sequence: u64,
-        kind: bcode_session_models::SessionEventKind,
-    ) -> bcode_session_models::SessionEvent {
-        bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        }
-    }
-
-    fn session_summary(
-        session_id: bcode_session_models::SessionId,
-    ) -> bcode_session_models::SessionSummary {
-        bcode_session_models::SessionSummary {
-            id: session_id,
-            name: Some("live shell projection".to_owned()),
-            explicit_name: Some("live shell projection".to_owned()),
-            derived_title: None,
-            title_source: bcode_session_models::SessionTitleSource::Explicit,
-            client_count: 1,
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            working_directory: "/tmp".into(),
-            import: None,
-            fork: None,
-        }
-    }
-
-    fn render_text(app: &mut super::super::app::BmuxApp) -> String {
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buffer = Buffer::empty(area);
-        let mut frame = Frame::new(&mut buffer);
-        super::super::render::render(app, &mut frame);
-        (0..area.height)
-            .filter_map(|row| buffer.row_symbols(row))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    async fn send_ipc_response(
-        stream: &mut bcode_ipc::LocalIpcStream,
-        request_id: u64,
-        response: bcode_ipc::Response,
-    ) {
-        let envelope =
-            bcode_ipc::response_envelope(request_id, &response).expect("response envelope");
-        bcode_ipc::send_envelope(stream, &envelope)
-            .await
-            .expect("send response");
-    }
-
-    fn test_chat() -> ActiveChat {
-        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
-        ActiveChat {
-            app: super::super::app::BmuxApp::new_with_history(None, &[], &[], false),
-            agents: super::super::session_flow::AgentCatalog::default(),
-            session_id: None,
-            event_sender,
-            event_receiver,
-            event_task: None,
-            opening_session_id: None,
-            pending_effects: super::super::effects::TuiEffectQueue::default(),
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn projection_window_stream_renders_live_shell_artifact_before_finish() {
-        let session_id = bcode_session_models::SessionId::new();
-        let tool_call_id = "projection-live-shell";
-        let recording_dir = tempfile::tempdir().expect("recording directory");
-        let recording_path = recording_dir.path().join("live.bcsr");
-        let mut writer =
-            bcode_shell_plugin::recording::ShellRecordingWriter::create(&recording_path, 80, 24)
-                .expect("recording writer");
-        writer
-            .write_replay_output(1, b"LIVE_SENTINEL\r\n")
-            .expect("live replay frame");
-        writer
-            .finish(2, Some(0), None, false, false)
-            .expect("finish recording fixture");
-        let recording_bytes = Arc::new(std::fs::read(&recording_path).expect("recording bytes"));
-        let committed_bytes = u64::try_from(recording_bytes.len()).expect("recording length");
-        let artifact_requests = Arc::new(AtomicUsize::new(0));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("tui.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
-        let summary = session_summary(session_id);
-        let stale_history = (0_u64..8)
-            .map(|index| {
-                let tool_call_id = format!("history-tool-{index}");
-                session_event(
-                    session_id,
-                    index + 1,
-                    bcode_session_models::SessionEventKind::ToolCallFinished {
-                        tool_call_id: tool_call_id.clone(),
-                        result: String::new(),
-                        is_error: false,
-                        output: None,
-                        semantic_result: Some(
-                            bcode_session_models::ToolInvocationResult::Artifact {
-                                artifact: Box::new(bcode_session_models::ToolArtifact {
-                                    artifact_id: format!("history-artifact-{index}"),
-                                    producer_plugin_id: "bcode.shell".to_owned(),
-                                    schema: "bcode.shell.run".to_owned(),
-                                    schema_version: 1,
-                                    tool_call_id: Some(tool_call_id),
-                                    title: None,
-                                    metadata: serde_json::Value::Null,
-                                    refs: vec![bcode_session_models::ToolArtifactRef {
-                                        key: "shell_recording".to_owned(),
-                                        content_type: Some(
-                                            "application/x-bcode-shell-recording; version=3"
-                                                .to_owned(),
-                                        ),
-                                        storage_uri: Some(format!("file:///missing/{index}.bcsr")),
-                                        byte_len: Some(3),
-                                        metadata: Some(serde_json::json!({
-                                            "availability": "complete",
-                                            "complete": true,
-                                        })),
-                                    }],
-                                }),
-                            },
-                        ),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let request = session_event(
-            session_id,
-            9,
-            bcode_session_models::SessionEventKind::ToolCallRequested {
-                tool_call_id: tool_call_id.to_owned(),
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                tool_name: "shell.run".to_owned(),
-                arguments_json: r#"{"command":"blocked command"}"#.to_owned(),
-                working_directory: None,
-                request_visual: Some(bcode_session_models::PluginVisualDescriptor {
-                    visual_id: None,
-                    producer_plugin_id: Some("bcode.shell".to_owned()),
-                    schema: "bcode.tool.request.shell.run".to_owned(),
-                    schema_version: 1,
-                    title: Some("Shell command".to_owned()),
-                    subtitle: None,
-                    payload: serde_json::json!({"command": "blocked command"}),
-                }),
-                legacy_request_presentation: None,
-            },
-        );
-        let started = session_event(
-            session_id,
-            10,
-            bcode_session_models::SessionEventKind::ToolInvocationStream {
-                event: bcode_session_models::ToolInvocationStreamEvent::Started {
-                    tool_call_id: tool_call_id.to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 1,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(24),
-                    started_at_ms: Some(1),
-                },
-            },
-        );
-        let server_bytes = Arc::clone(&recording_bytes);
-        let server_requests = Arc::clone(&artifact_requests);
-        let server_history = stale_history;
-        let server = tokio::spawn(async move {
-            loop {
-                let mut stream = listener.accept().await.expect("client connection");
-                let bytes = Arc::clone(&server_bytes);
-                let requests = Arc::clone(&server_requests);
-                let summary = summary.clone();
-                let mut history = server_history.clone();
-                history.extend([request.clone(), started.clone()]);
-                tokio::spawn(async move {
-                    loop {
-                        let Ok(envelope) = bcode_ipc::recv_envelope(&mut stream).await else {
-                            break;
-                        };
-                        let ipc_request =
-                            bcode_ipc::decode_request(&envelope.payload).expect("decode request");
-                        match ipc_request {
-                            bcode_ipc::Request::Hello { .. } => {
-                                send_ipc_response(
-                                    &mut stream,
-                                    envelope.request_id,
-                                    bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
-                                        protocol_version: bcode_ipc::ProtocolVersion::current(),
-                                        client_id: bcode_session_models::ClientId::new(),
-                                    }),
-                                )
-                                .await;
-                            }
-                            bcode_ipc::Request::AttachSessionProjectionWindow { .. } => {
-                                send_ipc_response(
-                                    &mut stream,
-                                    envelope.request_id,
-                                    bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Attached {
-                                        session_id,
-                                        session: summary.clone(),
-                                        history: history.clone(),
-                                        input_history: Vec::new(),
-                                        import_warnings: Vec::new(),
-                                        draft: None,
-                                        runtime_selection:
-                                            bcode_ipc::SessionRuntimeSelection::default(),
-                                    }),
-                                )
-                                .await;
-                                tokio::time::sleep(Duration::from_millis(25)).await;
-                                let event = bcode_ipc::Event::SessionLive(
-                                    bcode_session_models::SessionLiveEvent {
-                                        session_id,
-                                        kind: bcode_session_models::SessionLiveEventKind::ToolOutputDelta {
-                                            event: bcode_session_models::ToolInvocationStreamEvent::ArtifactUpdate {
-                                                tool_call_id: tool_call_id.to_owned(),
-                                                sequence: 2,
-                                                artifact_id: format!("{tool_call_id}-shell-run"),
-                                                reference_key: "shell_recording".to_owned(),
-                                                producer_plugin_id: "bcode.shell".to_owned(),
-                                                schema: "bcode.shell.run".to_owned(),
-                                                schema_version: 1,
-                                                content_type: Some("application/x-bcode-shell-recording; version=3".to_owned()),
-                                                storage_uri: String::new(),
-                                                committed_bytes,
-                                                revision: 1,
-                                                availability: None,
-                                                finalized: false,
-                                            },
-                                        },
-                                    },
-                                );
-                                let event =
-                                    bcode_ipc::event_envelope(&event).expect("event envelope");
-                                bcode_ipc::send_envelope(&mut stream, &event)
-                                    .await
-                                    .expect("send live event");
-                            }
-                            bcode_ipc::Request::ReadSessionArtifact {
-                                artifact_id,
-                                reference_key,
-                                offset,
-                                length,
-                                ..
-                            } => {
-                                requests.fetch_add(1, Ordering::Relaxed);
-                                if artifact_id.starts_with("history-artifact-") {
-                                    send_ipc_response(
-                                        &mut stream,
-                                        envelope.request_id,
-                                        bcode_ipc::Response::Err(
-                                            bcode_ipc::ErrorResponse::new(
-                                                "artifact_not_found",
-                                                "artifact reference was not found in the finalized projection",
-                                            ),
-                                        ),
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                let start = usize::try_from(offset).expect("range offset");
-                                let end = start
-                                    .saturating_add(usize::try_from(length).expect("range length"))
-                                    .min(bytes.len());
-                                send_ipc_response(
-                                    &mut stream,
-                                    envelope.request_id,
-                                    bcode_ipc::Response::Ok(
-                                        bcode_ipc::ResponsePayload::SessionArtifactRange {
-                                            artifact_id,
-                                            reference_key,
-                                            content_type: Some(
-                                                "application/x-bcode-shell-recording; version=3"
-                                                    .to_owned(),
-                                            ),
-                                            offset,
-                                            total_bytes: committed_bytes,
-                                            reference_bytes: Some(committed_bytes),
-                                            reference_revision: 1,
-                                            finalized: false,
-                                            finalized_event_seq: None,
-                                            availability: Some("active".to_owned()),
-                                            complete: Some(false),
-                                            checksum_sha256: None,
-                                            bytes: bytes[start..end].to_vec(),
-                                        },
-                                    ),
-                                )
-                                .await;
-                            }
-                            request => panic!("unexpected IPC request: {request:?}"),
-                        }
-                    }
-                });
-            }
-        });
-
-        let client = bcode_client::BcodeClient::new(endpoint);
-        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (attached, event_task) =
-            super::super::history_flow::attach_session_event_stream_with_window_request(
-                &client,
-                session_id,
-                event_sender.clone(),
-                super::super::history_flow::initial_transcript_window_request(Rect::new(
-                    0, 0, 100, 40,
-                )),
-            )
-            .await
-            .expect("projection-window attach");
-        let mut app = super::super::app::BmuxApp::new_with_history(
-            Some(session_id),
-            &attached.history,
-            &attached.input_history,
-            false,
-        );
-        app.set_plugin_host(Arc::new(shell_plugin_host()));
-        let before = render_text(&mut app);
-        assert!(!before.contains("LIVE_SENTINEL"), "{before}");
-        let mut chat = ActiveChat {
-            app,
-            agents: super::super::session_flow::AgentCatalog::default(),
-            session_id: Some(session_id),
-            event_sender,
-            event_receiver,
-            event_task: Some(event_task),
-            opening_session_id: None,
-            pending_effects: super::super::effects::TuiEffectQueue::default(),
-        };
-        let mut loop_state = ChatLoopState::new(
-            &client,
-            &client,
-            super::super::daemon_host::TuiDaemonHost::new(&[]),
-        );
-        let presentation = chat.app.plugin_presentation();
-        for event in &attached.history {
-            loop_state.artifact_stream.observe_finalized_artifact(
-                event.session_id,
-                event.sequence,
-                &event.kind,
-                |producer_plugin_id, schema, schema_version, reference_key, content_type| {
-                    presentation.is_some_and(|presentation| {
-                        presentation.accepts_artifact_reference(
-                            producer_plugin_id,
-                            schema,
-                            schema_version,
-                            reference_key,
-                            content_type,
-                        )
-                    })
-                },
-            );
-        }
-        let live_event = tokio::time::timeout(Duration::from_secs(1), chat.event_receiver.recv())
-            .await
-            .expect("live event timeout")
-            .expect("live event channel");
-        assert!(absorb_bcode_event(&mut chat, &mut loop_state, live_event).await);
-        let mut live_rendered = false;
-        for _ in 0..9 {
-            let completion = tokio::time::timeout(
-                Duration::from_secs(1),
-                loop_state.artifact_stream.next_completion(),
-            )
-            .await
-            .expect("artifact fetch timeout")
-            .expect("artifact completion");
-            live_rendered |= handle_artifact_completion(&chat, &mut loop_state, completion);
-        }
-        assert!(live_rendered);
-        assert_eq!(artifact_requests.load(Ordering::Relaxed), 9);
-        assert!(loop_state.artifact_stream.next_retry_at().is_none());
-        let rendered = render_text(&mut chat.app);
-        assert!(rendered.contains("LIVE_SENTINEL"), "{rendered}");
-        chat.event_task.take().expect("event task").abort();
-        server.abort();
-    }
-
-    #[test]
-    fn daemon_queue_draining_obeys_its_per_tick_budget() {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        for revision in 0..100 {
-            sender
-                .send(BcodeEvent::SessionCatalogUpdated { revision })
-                .expect("daemon event");
-        }
-
-        assert_eq!(take_bcode_events(&mut receiver, 32).len(), 32);
-        assert!(receiver.try_recv().is_ok());
-    }
-
-    #[test]
-    fn ready_artifact_completion_precedes_a_saturated_daemon_queue() {
-        let mut chat = test_chat();
-        for revision in 0..1_000 {
-            chat.event_sender
-                .send(BcodeEvent::SessionCatalogUpdated { revision })
-                .expect("daemon event");
-        }
-        let session_id = bcode_session_models::SessionId::new();
-        let mut artifacts = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
-        artifacts.enqueue_test_completion(session_id);
-
-        assert!(matches!(
-            try_next_ready_artifact_event(&mut artifacts),
-            Some(ChatLoopEvent::ArtifactFetchCompleted(_))
-        ));
-        assert!(chat.event_receiver.try_recv().is_ok());
-        assert!(chat.event_receiver.try_recv().is_ok());
     }
 }

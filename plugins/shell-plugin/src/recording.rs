@@ -638,7 +638,6 @@ pub struct ShellRecordingSummary {
 pub struct ShellRecordingWriter {
     final_path: PathBuf,
     partial_path: PathBuf,
-    active_path: PathBuf,
     writer: BufWriter<File>,
     columns: u16,
     rows: u16,
@@ -653,25 +652,17 @@ impl ShellRecordingWriter {
     ///
     /// # Errors
     ///
-    /// Returns an error if the parent directory, partial recording, or stable active alias cannot
-    /// be created or written.
+    /// Returns an error if the parent directory or partial recording cannot be created or written.
     pub fn create(path: &Path, columns: u16, rows: u16) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let partial_path = path.with_extension("shell-recording.partial");
-        let active_path = path.with_extension("shell-recording.active");
-        match fs::remove_file(&active_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&partial_path)?;
-        fs::hard_link(&partial_path, &active_path)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(MAGIC)?;
         writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
@@ -680,7 +671,6 @@ impl ShellRecordingWriter {
         let mut recording = Self {
             final_path: path.to_path_buf(),
             partial_path,
-            active_path,
             writer,
             columns,
             rows,
@@ -788,7 +778,7 @@ impl ShellRecordingWriter {
         let path = if finalized {
             self.final_path.clone()
         } else {
-            self.active_path.clone()
+            self.partial_path.clone()
         };
         let committed_bytes = fs::metadata(&path)?.len();
         observer(ShellRecordingCommit {
@@ -1179,12 +1169,11 @@ mod tests {
         );
         assert!(commits.last().expect("final commit").finalized);
         assert_eq!(commits.last().expect("final commit").path, path);
-        let active_path = path.with_extension("shell-recording.active");
-        assert!(active_path.exists());
         assert!(
             commits[..commits.len() - 1]
                 .iter()
-                .all(|commit| !commit.finalized && commit.path == active_path)
+                .all(|commit| !commit.finalized
+                    && commit.path.extension().is_some_and(|ext| ext == "partial"))
         );
         drop(commits);
     }

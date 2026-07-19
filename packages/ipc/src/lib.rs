@@ -2109,15 +2109,7 @@ fn default_socket_path(endpoint_override_allowed: bool) -> PathBuf {
         return PathBuf::from(path);
     }
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
-    stable_unix_socket_path(&user, &daemon_namespace())
-}
-
-#[cfg(unix)]
-fn stable_unix_socket_path(user: &str, namespace: &str) -> PathBuf {
-    // The daemon namespace already isolates builds. Do not derive identity from `TMPDIR`: Nix and
-    // other launch environments commonly replace it, which previously let one build start several
-    // daemons with the same namespace but different sockets and registry ownership.
-    PathBuf::from("/tmp").join(format!("bcode-{user}-{namespace}.sock"))
+    env::temp_dir().join(format!("bcode-{user}-{}.sock", daemon_namespace()))
 }
 
 #[cfg(test)]
@@ -2131,15 +2123,6 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
-
-    #[cfg(unix)]
-    #[test]
-    fn default_socket_identity_is_independent_of_process_temp_directory() {
-        assert_eq!(
-            stable_unix_socket_path("user", "ipc-v9-build"),
-            PathBuf::from("/tmp/bcode-user-ipc-v9-build.sock")
-        );
-    }
 
     #[test]
     fn endpoint_override_rejects_stale_daemon_context() {

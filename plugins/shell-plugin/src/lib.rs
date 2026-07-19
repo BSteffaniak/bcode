@@ -8,8 +8,8 @@
 //! interpretation, terminal emulation, and shell-result rendering. Host, session, server, and
 //! generic TUI-extension code must treat shell recordings as opaque tool artifacts and must not
 //! branch on shell schema IDs, recording reference keys, MIME types, ANSI, PTY, resize, grid, or
-//! scrollback semantics. Live presentation continues through generic artifact-update events and
-//! range transport; durable replay is provided by shell-owned artifact references.
+//! scrollback semantics. Live presentation continues through generic transient tool-stream events;
+//! durable replay is provided by shell-owned artifact references.
 
 pub mod recording;
 #[cfg(feature = "static-bundled")]
@@ -2187,7 +2187,6 @@ mod tests {
             }
         )));
         assert!(!path.with_extension("shell-recording.partial").exists());
-        assert!(path.with_extension("shell-recording.active").exists());
         let artifact_updates = events
             .lock()
             .expect("events")
@@ -2764,14 +2763,14 @@ mod tests {
         for payload in events.iter() {
             ipc_bytes = ipc_bytes.saturating_add(payload.len());
             let event: ToolInvocationStreamEvent =
-                serde_json::from_slice(payload).expect("stream notification");
+                serde_json::from_slice(payload).expect("artifact notification");
             let ToolInvocationStreamEvent::ArtifactUpdate {
                 committed_bytes,
                 revision,
                 ..
             } = event
             else {
-                continue;
+                panic!("shell live path emitted a non-artifact event");
             };
             assert!(committed_bytes >= committed);
             committed = committed_bytes;

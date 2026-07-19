@@ -32,18 +32,6 @@ pub enum DaemonLifecycleError {
     /// Registry serialization failed.
     #[error("daemon registry serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
-    /// A different live daemon already owns this build namespace.
-    #[error(
-        "daemon namespace {namespace} is already owned by live instance {instance_id} at {endpoint:?}"
-    )]
-    LiveNamespaceConflict {
-        /// Conflicting namespace.
-        namespace: String,
-        /// Existing live instance identity.
-        instance_id: String,
-        /// Existing live endpoint.
-        endpoint: DaemonEndpointRecord,
-    },
     /// System time was before the Unix epoch.
     #[error("system clock is before Unix epoch")]
     Clock,
@@ -178,34 +166,6 @@ pub fn registry_dir(state_dir: &Path) -> PathBuf {
 #[must_use]
 pub fn record_path(state_dir: &Path, namespace: &str) -> PathBuf {
     registry_dir(state_dir).join(format!("{namespace}.json"))
-}
-
-/// Write a daemon record unless another responding instance already owns its namespace.
-///
-/// Stale or malformed records may be replaced. A live record is verified against the daemon's
-/// reported instance, namespace, build fingerprint, and storage-writer epoch before it blocks the
-/// write.
-///
-/// # Errors
-///
-/// Returns an error for a live namespace conflict or registry read/write failure.
-pub async fn write_record_guarded(
-    state_dir: &Path,
-    record: &DaemonRecord,
-) -> Result<PathBuf, DaemonLifecycleError> {
-    let path = record_path(state_dir, &record.namespace);
-    if let Ok(contents) = fs::read(&path)
-        && let Ok(existing) = serde_json::from_slice::<DaemonRecord>(&contents)
-        && existing.instance_id != record.instance_id
-        && live_record_matches_instance(&existing).await
-    {
-        return Err(DaemonLifecycleError::LiveNamespaceConflict {
-            namespace: existing.namespace,
-            instance_id: existing.instance_id,
-            endpoint: existing.endpoint,
-        });
-    }
-    write_record(state_dir, record)
 }
 
 /// Write a daemon registry record atomically.
@@ -539,83 +499,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn guarded_record_write_refuses_a_different_live_instance() {
-        let unique = format!(
-            "bcode-daemon-guard-{}-{}",
-            std::process::id(),
-            unix_time_millis().expect("clock")
-        );
-        let state_dir = std::env::temp_dir().join(&unique);
-        let socket = state_dir.join("daemon.sock");
-        let endpoint = IpcEndpoint::unix_socket(socket.clone());
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
-        let mut existing = DaemonRecord::current(
-            &endpoint,
-            state_dir.join("daemon.log"),
-            None,
-            "live-instance".to_owned(),
-        )
-        .expect("record");
-        existing.storage_writer_epoch = Some(2);
-        write_record(&state_dir, &existing).expect("existing record");
-        let existing_status = existing.clone();
-        let responder = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("connection");
-            let request = bcode_ipc::recv_envelope(&mut stream)
-                .await
-                .expect("status request");
-            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::ServerStatus {
-                status: bcode_ipc::ServerStatus {
-                    connected_client_count: 0,
-                    sessions: Vec::new(),
-                    session_catalog_loaded: true,
-                    session_catalog_status: bcode_ipc::SessionCatalogStatus::Loaded,
-                    session_catalog_sources: Vec::new(),
-                    session_catalog_revision: 0,
-                    selected_provider_plugin_id: None,
-                    selected_model_id: None,
-                    plugin_runtime: Vec::new(),
-                    daemon: bcode_ipc::DaemonStatus {
-                        namespace: existing_status.namespace,
-                        protocol_version: existing_status.protocol_version,
-                        build_fingerprint: existing_status.build_fingerprint,
-                        storage_writer_epoch: existing_status.storage_writer_epoch,
-                        pid: existing_status.pid,
-                        instance_id: existing_status.instance_id,
-                        started_at_unix_ms: existing_status.started_at_unix_ms,
-                    },
-                    metrics: bcode_metrics::MetricsSnapshot::default(),
-                    metrics_report: Box::default(),
-                },
-            });
-            let response = bcode_ipc::response_envelope(request.request_id, &response)
-                .expect("response envelope");
-            bcode_ipc::send_envelope(&mut stream, &response)
-                .await
-                .expect("status response");
-        });
-        let mut replacement = DaemonRecord::current(
-            &endpoint,
-            state_dir.join("replacement.log"),
-            None,
-            "replacement-instance".to_owned(),
-        )
-        .expect("replacement record");
-        replacement.storage_writer_epoch = Some(2);
-
-        assert!(matches!(
-            write_record_guarded(&state_dir, &replacement).await,
-            Err(DaemonLifecycleError::LiveNamespaceConflict { .. })
-        ));
-        responder.await.expect("responder");
-        let persisted = read_records(&state_dir);
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].1.instance_id, "live-instance");
-        let _ = fs::remove_dir_all(&state_dir);
-    }
-
     #[test]
     fn storage_writer_compatibility_fails_closed_for_legacy_records() {
         assert!(storage_writer_is_incompatible(
@@ -885,10 +768,6 @@ pub fn default_daemon_log_path() -> PathBuf {
     )
 }
 
-const STARTUP_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
-const STARTUP_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
-const STARTUP_LOCK_ATTEMPTS: usize = 600;
-
 #[derive(Debug)]
 struct StartupLock {
     path: PathBuf,
@@ -902,7 +781,7 @@ impl StartupLock {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        for _ in 0..STARTUP_LOCK_ATTEMPTS {
+        for _ in 0..20 {
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -913,31 +792,23 @@ impl StartupLock {
                     return Ok(Self { path });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age >= STARTUP_LOCK_STALE_AFTER);
-                    if stale {
-                        match fs::remove_file(&path) {
-                            Ok(()) => continue,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    std::thread::sleep(STARTUP_LOCK_RETRY_DELAY);
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!(
-                "timed out waiting for daemon startup lock {}",
-                display_from_current_dir(&path)
-            ),
-        )
-        .into())
+        let _ = fs::remove_file(&path);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id())?;
+                Ok(Self { path })
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 

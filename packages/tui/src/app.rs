@@ -2802,21 +2802,29 @@ impl BmuxApp {
         working_directory: Option<std::path::PathBuf>,
         request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
     ) {
-        let effective_request_visual = request_visual.cloned().or_else(|| {
-            self.live_tool_previews
-                .get(tool_call_id)
-                .map(|state| state.preview.visual.clone())
-        });
         self.tool_call_contexts.insert(
             tool_call_id.to_owned(),
             ToolCallContext {
                 tool_name: tool_name.to_owned(),
                 arguments_json: arguments_json.to_owned(),
                 working_directory: working_directory.clone(),
-                request_visual: effective_request_visual.clone(),
+                request_visual: request_visual.cloned(),
             },
         );
-        let mut item = self
+        let has_live_preview_anchor = self
+            .transcript
+            .iter()
+            .any(|item| item.is_live_preview_anchor_for(tool_call_id));
+        if has_live_preview_anchor {
+            self.finish_tool_request_preview(tool_call_id);
+            self.set_activity(ActivityState::RunningTool {
+                name: tool_name.to_owned(),
+            });
+            self.status =
+                tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
+            return;
+        }
+        let item = self
             .tool_invocation_projections
             .get(tool_call_id)
             .map_or_else(
@@ -2826,54 +2834,12 @@ impl BmuxApp {
                         tool_name: Some(tool_name.to_owned()),
                         arguments_json: Some(arguments_json.to_owned()),
                         working_directory,
-                        request_visual: effective_request_visual.clone(),
+                        request_visual: request_visual.cloned(),
                         ..ToolInvocationProjection::default()
                     })
                 },
                 tool_request_item_from_projection,
             );
-        if let Some(visual) = effective_request_visual.clone() {
-            item.set_tool_request_visual(visual, false);
-        }
-        if let Some(context) = self.streamed_tool_results.get(tool_call_id)
-            && let Some(mut visual) = effective_request_visual
-        {
-            enrich_tool_request_visual_runtime(
-                &mut visual,
-                tool_call_id,
-                context.columns,
-                context.rows,
-            );
-            item.set_tool_request_visual(visual, true);
-            item.set_tool_started_at_ms(context.started_at_ms);
-        }
-        let has_live_preview_anchor = self
-            .transcript
-            .iter()
-            .any(|item| item.is_live_preview_anchor_for(tool_call_id));
-        if has_live_preview_anchor && request_visual.is_none() {
-            self.finish_tool_request_preview(tool_call_id);
-            self.set_activity(ActivityState::RunningTool {
-                name: tool_name.to_owned(),
-            });
-            self.status =
-                tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
-            return;
-        }
-        if has_live_preview_anchor {
-            self.transcript.mutate_rev_find(
-                |existing| existing.is_live_preview_anchor_for(tool_call_id),
-                |existing| *existing = item,
-            );
-            self.live_tool_previews.remove(tool_call_id);
-            self.mark_live_preview_dirty();
-            self.set_activity(ActivityState::RunningTool {
-                name: tool_name.to_owned(),
-            });
-            self.status =
-                tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
-            return;
-        }
         let replaced = self.transcript.mutate_rev_find(
             |existing| {
                 matches!(
@@ -3356,27 +3322,34 @@ impl BmuxApp {
             .get(tool_call_id)
             .and_then(|context| context.request_visual.clone())
         {
-            enrich_tool_request_visual_runtime(
-                &mut visual,
-                tool_call_id,
-                columns.unwrap_or(0),
-                rows.unwrap_or(0),
-            );
+            let runtime = visual
+                .payload
+                .as_object_mut()
+                .map(|payload| {
+                    payload
+                        .entry("_bcode_runtime")
+                        .or_insert_with(|| serde_json::json!({}))
+                })
+                .and_then(serde_json::Value::as_object_mut);
+            if let Some(runtime) = runtime {
+                runtime.insert(
+                    "live_state_key".to_owned(),
+                    serde_json::Value::String(tool_call_id.to_owned()),
+                );
+                runtime.insert(
+                    "columns".to_owned(),
+                    serde_json::json!(columns.unwrap_or(0)),
+                );
+                runtime.insert("rows".to_owned(), serde_json::json!(rows.unwrap_or(0)));
+                runtime.insert(
+                    "output".to_owned(),
+                    serde_json::Value::String(String::new()),
+                );
+                runtime.insert("streaming".to_owned(), serde_json::Value::Bool(true));
+            }
             if let Some(context) = self.tool_call_contexts.get_mut(tool_call_id) {
                 context.request_visual = Some(visual.clone());
             }
-            self.transcript.mutate_rev_find(
-                |item| {
-                    matches!(
-                        item.kind(),
-                        TranscriptItemKind::ToolRequest {
-                            tool_call_id: item_tool_call_id,
-                            ..
-                        } if item_tool_call_id == tool_call_id
-                    )
-                },
-                |item| item.set_tool_request_visual(visual.clone(), true),
-            );
             self.active_plugin_visuals
                 .entry(tool_call_id.to_owned())
                 .or_insert(visual);
@@ -4414,36 +4387,6 @@ fn submitted_interactive_payload_json(resolution_json: &str) -> Option<String> {
     serde_json::to_string_pretty(&payload).ok()
 }
 
-fn enrich_tool_request_visual_runtime(
-    visual: &mut bcode_session_models::PluginVisualDescriptor,
-    tool_call_id: &str,
-    columns: u16,
-    rows: u16,
-) {
-    let runtime = visual
-        .payload
-        .as_object_mut()
-        .map(|payload| {
-            payload
-                .entry("_bcode_runtime")
-                .or_insert_with(|| serde_json::json!({}))
-        })
-        .and_then(serde_json::Value::as_object_mut);
-    if let Some(runtime) = runtime {
-        runtime.insert(
-            "live_state_key".to_owned(),
-            serde_json::Value::String(tool_call_id.to_owned()),
-        );
-        runtime.insert("columns".to_owned(), serde_json::json!(columns));
-        runtime.insert("rows".to_owned(), serde_json::json!(rows));
-        runtime.insert(
-            "output".to_owned(),
-            serde_json::Value::String(String::new()),
-        );
-        runtime.insert("streaming".to_owned(), serde_json::Value::Bool(true));
-    }
-}
-
 const fn live_tool_preview_truncated(_preview: &LiveToolArgumentPreview) -> bool {
     false
 }
@@ -4785,24 +4728,6 @@ mod tests {
             runtime.get("output").and_then(serde_json::Value::as_str),
             Some("")
         );
-        let request_runtime = app
-            .transcript()
-            .iter()
-            .find_map(|item| match item.kind() {
-                TranscriptItemKind::ToolRequest {
-                    request_visual: Some(visual),
-                    ..
-                } => visual.payload.get("_bcode_runtime"),
-                _ => None,
-            })
-            .expect("transcript request runtime metadata");
-        assert_eq!(
-            request_runtime
-                .get("live_state_key")
-                .and_then(serde_json::Value::as_str),
-            Some("call")
-        );
-        assert!(app.transcript()[0].streaming());
     }
 
     #[test]

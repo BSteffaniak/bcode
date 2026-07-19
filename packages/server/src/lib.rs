@@ -1568,7 +1568,7 @@ fn catalog_status_to_ipc(status: CatalogLoadStatus) -> SessionCatalogStatus {
     }
 }
 
-async fn register_daemon(
+fn register_daemon(
     endpoint: &IpcEndpoint,
 ) -> Result<bcode_daemon_lifecycle::DaemonRecord, ServerError> {
     let instance_id = daemon_instance_id()?;
@@ -1579,8 +1579,7 @@ async fn register_daemon(
         instance_id,
     )?;
     record.storage_writer_epoch = Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
-    bcode_daemon_lifecycle::write_record_guarded(&bcode_config::default_state_dir(), &record)
-        .await?;
+    bcode_daemon_lifecycle::write_record(&bcode_config::default_state_dir(), &record)?;
     Ok(record)
 }
 
@@ -1804,7 +1803,7 @@ pub async fn run_with_static_bundled(
     }
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;
-    let daemon_record = register_daemon(&endpoint).await?;
+    let daemon_record = register_daemon(&endpoint)?;
     let daemon_status = daemon_status_from_record(&daemon_record);
     tracing::debug!(target: "bcode_server::startup", "IPC endpoint bound");
     tracing::debug!(target: "bcode_server::startup", "initializing lazy session services");
@@ -2833,20 +2832,6 @@ async fn handle_hello(
     runtime_context: Option<ClientRuntimeContext>,
     daemon_namespace: String,
 ) -> Result<(), ServerError> {
-    if daemon_namespace != state.daemon_status.namespace {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "daemon_namespace_mismatch",
-                format!(
-                    "client daemon namespace {daemon_namespace} does not match server namespace {}",
-                    state.daemon_status.namespace
-                ),
-            )),
-        )
-        .await;
-    }
     if client_name_supports_message_accepted(client_name) {
         state.register_message_accepted_client(client_id).await;
     }
@@ -5154,14 +5139,13 @@ struct ActiveArtifactKey {
     reference_key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveArtifactReference {
     producer_plugin_id: String,
     schema: String,
     schema_version: u32,
     content_type: Option<String>,
     path: PathBuf,
-    file: Arc<std::fs::File>,
     committed_bytes: u64,
     revision: u64,
     finalized: bool,
@@ -5366,61 +5350,14 @@ async fn handle_read_session_artifact(
     match result {
         Ok(payload) => send_response(writer, request_id, Response::Ok(payload)).await,
         Err(error) => {
-            let code = artifact_read_error_code(&error);
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new(code, error)),
+                Response::Err(ErrorResponse::new("artifact_read_failed", error)),
             )
             .await
         }
     }
-}
-
-fn artifact_read_error_code(error: &str) -> &'static str {
-    if error.contains("was not found in the finalized projection") {
-        "artifact_not_found"
-    } else if error.contains("artifact reference has no storage URI")
-        || error.contains("artifact reference is unavailable")
-        || error.contains("artifact reference is incomplete")
-        || error.contains("artifact file is unavailable")
-        || error.contains("No such file or directory")
-    {
-        "artifact_unavailable"
-    } else {
-        "artifact_read_failed"
-    }
-}
-
-fn read_open_artifact_file_range_at_length(
-    file: &std::fs::File,
-    registered_path: &Path,
-    artifact_root: &Path,
-    offset: u64,
-    length: u32,
-    visible_bytes: u64,
-) -> Result<(u64, Vec<u8>), String> {
-    let canonical_root = artifact_root
-        .canonicalize()
-        .map_err(|error| format!("artifact root is unavailable: {error}"))?;
-    if !registered_path.starts_with(&canonical_root) {
-        return Err("artifact path is outside the session artifact root".to_owned());
-    }
-    let mut file = file.try_clone().map_err(|error| error.to_string())?;
-    let file_bytes = file.metadata().map_err(|error| error.to_string())?.len();
-    let total_bytes = visible_bytes.min(file_bytes);
-    if offset > total_bytes {
-        return Err(format!(
-            "artifact range offset {offset} exceeds artifact length {total_bytes}"
-        ));
-    }
-    let read_len = u64::from(length).min(total_bytes.saturating_sub(offset));
-    let mut bytes = vec![0; usize::try_from(read_len).unwrap_or(usize::MAX)];
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|error| error.to_string())?;
-    file.read_exact(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    Ok((total_bytes, bytes))
 }
 
 fn read_artifact_file_range_at_length(
@@ -5555,16 +5492,14 @@ async fn read_active_artifact_range(
     }
     let artifact_root = default_session_artifact_dir(session_id);
     let path = active.path.clone();
-    let file = Arc::clone(&active.file);
     let committed_bytes = active.committed_bytes;
     let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
-        read_open_artifact_file_range_at_length(
-            file.as_ref(),
+        read_artifact_file_range_at_length(
             &path,
             &artifact_root,
             offset,
             length,
-            committed_bytes,
+            Some(committed_bytes),
         )
     })
     .await
@@ -16577,9 +16512,9 @@ fn update_active_artifact(
     if !canonical_path.starts_with(&canonical_root) {
         return Err("active artifact path is outside the session artifact root".to_owned());
     }
-    let file = std::fs::File::open(&canonical_path)
-        .map_err(|error| format!("active artifact is unavailable: {error}"))?;
-    let file_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    let file_bytes = std::fs::metadata(&canonical_path)
+        .map_err(|error| error.to_string())?
+        .len();
     if *committed_bytes > file_bytes {
         return Err(format!(
             "active artifact committed length {committed_bytes} exceeds file length {file_bytes}"
@@ -16625,7 +16560,6 @@ fn update_active_artifact(
             schema_version: *schema_version,
             content_type: content_type.clone(),
             path: canonical_path,
-            file: Arc::new(file),
             committed_bytes: *committed_bytes,
             revision: *revision,
             finalized: *finalized,
@@ -20620,74 +20554,6 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn accepted_active_artifact_remains_readable_after_atomic_rename() {
-        let sessions = SessionManager::default();
-        let session_id = sessions
-            .create_session(
-                Some("renamed-artifact".to_owned()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session")
-            .id;
-        let state = test_server_state(sessions);
-        let artifact_dir = default_session_artifact_dir(session_id);
-        std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
-        let partial_path = artifact_dir.join("recording.partial");
-        let final_path = artifact_dir.join("recording.bcsr");
-        std::fs::write(&partial_path, b"live-prefix").expect("partial artifact");
-        let registration = ActivePluginInvocationRegistration::register(
-            Arc::clone(&state.active_plugin_invocations),
-            Arc::clone(&state.active_artifacts),
-            Arc::clone(&state.active_plugin_visuals),
-            session_id,
-            "call-rename",
-            ActivePluginInvocation {
-                producer_plugin_id: "fixture.plugin".to_owned(),
-                inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
-                next_input_id: Arc::new(AtomicU64::new(1)),
-            },
-        )
-        .expect("registration");
-        update_active_artifact(
-            &state,
-            session_id,
-            &ToolInvocationStreamEvent::ArtifactUpdate {
-                tool_call_id: "call-rename".to_owned(),
-                sequence: 1,
-                artifact_id: "artifact-rename".to_owned(),
-                reference_key: "recording".to_owned(),
-                producer_plugin_id: "fixture.plugin".to_owned(),
-                schema: "fixture.recording".to_owned(),
-                schema_version: 1,
-                content_type: Some("application/octet-stream".to_owned()),
-                storage_uri: url::Url::from_file_path(&partial_path)
-                    .expect("file URL")
-                    .to_string(),
-                committed_bytes: 11,
-                revision: 1,
-                availability: None,
-                finalized: false,
-            },
-        )
-        .expect("register active artifact");
-        std::fs::rename(&partial_path, &final_path).expect("atomic publication");
-
-        let ResponsePayload::SessionArtifactRange {
-            bytes, finalized, ..
-        } = read_session_artifact_range(&state, session_id, "artifact-rename", "recording", 0, 11)
-            .await
-            .expect("renamed active artifact remains readable")
-        else {
-            panic!("expected artifact range");
-        };
-        assert_eq!(bytes, b"live-prefix");
-        assert!(!finalized);
-        drop(registration);
-        remove_session_artifact_dir(&artifact_dir).expect("cleanup");
-    }
-
-    #[tokio::test]
     async fn unfinished_active_artifact_becomes_explicitly_incomplete_after_producer_drop() {
         let sessions = SessionManager::default();
         let session_id = sessions
@@ -24352,32 +24218,6 @@ library = "test"
         assert!(truncated.contains('z'));
     }
 
-    #[test]
-    fn artifact_read_errors_distinguish_terminal_unavailability() {
-        assert_eq!(
-            artifact_read_error_code(
-                "artifact reference was not found in the finalized projection"
-            ),
-            "artifact_not_found"
-        );
-        assert_eq!(
-            artifact_read_error_code("artifact reference has no storage URI"),
-            "artifact_unavailable"
-        );
-        assert_eq!(
-            artifact_read_error_code("artifact reference is unavailable: missing"),
-            "artifact_unavailable"
-        );
-        assert_eq!(
-            artifact_read_error_code("artifact reference is incomplete"),
-            "artifact_unavailable"
-        );
-        assert_eq!(
-            artifact_read_error_code("artifact references projection is stale"),
-            "artifact_read_failed"
-        );
-    }
-
     fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
@@ -24652,321 +24492,6 @@ library = "test"
                 .collect::<Vec<_>>(),
         )
         .await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn shell_publishes_readable_artifact_output_before_command_finishes() {
-        let workspace = tempfile::tempdir().expect("shell live workspace");
-        let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(
-                Some("shell live output".to_string()),
-                workspace.path().to_path_buf(),
-            )
-            .await
-            .expect("shell live session");
-        let session_id = summary.id;
-        let mut subscription = sessions
-            .subscribe_session_events(session_id)
-            .await
-            .expect("subscribe to live shell events");
-        let mut state = test_server_state_with_shell_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
-        let state = Arc::new(state);
-        let call = bcode_model::ToolCall {
-            id: "shell-live-output-call".to_string(),
-            name: "shell.run".to_string(),
-            arguments: serde_json::json!({
-                "command": "printf 'first\\n'; sleep 1; printf 'second\\n'",
-                "columns": 80,
-                "rows": 24,
-                "timeout_ms": 5000
-            }),
-        };
-        let (plugin_id, definition, preparation) =
-            prepare_server_tool(state.as_ref(), session_id, &call)
-                .await
-                .expect("tool preparation");
-        let policy_metadata =
-            tool_policy_authorization_metadata(&preparation.authorization, &call.name)
-                .expect("tool policy fact");
-        let task_state = Arc::clone(&state);
-        let task_call = call.clone();
-        let working_directory = workspace.path().to_path_buf();
-        let task = tokio::spawn(async move {
-            invoke_model_tool(
-                task_state.as_ref(),
-                session_id,
-                &task_call,
-                &working_directory,
-                &plugin_id,
-                &definition,
-                &policy_metadata,
-                &TurnCancelState::default(),
-                None,
-                None,
-            )
-            .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let permission = state
-                    .pending_permissions
-                    .lock()
-                    .await
-                    .values()
-                    .next()
-                    .cloned();
-                if let Some(permission) = permission {
-                    state
-                        .pending_permissions
-                        .lock()
-                        .await
-                        .remove(&permission.summary.permission_id);
-                    *permission.decision.lock().await = Some(true);
-                    permission.notify.notify_waiters();
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("shell permission should become pending");
-
-        tokio::time::timeout(Duration::from_millis(750), async {
-            loop {
-                let event = subscription
-                    .live_events
-                    .recv()
-                    .await
-                    .expect("live shell event");
-                let SessionLiveEventKind::ToolOutputDelta {
-                    event:
-                        ToolInvocationStreamEvent::ArtifactUpdate {
-                            artifact_id,
-                            reference_key,
-                            finalized: false,
-                            ..
-                        },
-                } = event.kind
-                else {
-                    continue;
-                };
-                let ResponsePayload::SessionArtifactRange { bytes, .. } =
-                    read_session_artifact_range(
-                        state.as_ref(),
-                        session_id,
-                        &artifact_id,
-                        &reference_key,
-                        0,
-                        MAX_ARTIFACT_RANGE_BYTES,
-                    )
-                    .await
-                    .expect("active shell recording range")
-                else {
-                    panic!("expected active artifact range");
-                };
-                if bytes
-                    .windows(b"first".len())
-                    .any(|window| window == b"first")
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("first shell output must be readable while command is running");
-        assert!(
-            !task.is_finished(),
-            "shell command finished before live assertion"
-        );
-
-        let response = task
-            .await
-            .expect("shell task joins")
-            .expect("shell invocation succeeds");
-        assert!(!response.is_error, "{}", response.output);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn shell_live_artifact_crosses_real_ipc_before_command_finishes() {
-        let workspace = tempfile::tempdir().expect("shell IPC workspace");
-        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
-            .expect("persistent session manager");
-        let session_id = sessions
-            .create_session(
-                Some("shell live IPC".to_owned()),
-                workspace.path().to_path_buf(),
-            )
-            .await
-            .expect("session")
-            .id;
-        let artifact_dir = default_session_artifact_dir(session_id);
-        let mut state = test_server_state_with_shell_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
-        state.daemon_status.namespace = bcode_ipc::daemon_namespace();
-        state.daemon_status.protocol_version = u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION);
-        state.daemon_status.build_fingerprint = bcode_ipc::BUILD_FINGERPRINT.to_owned();
-        let state = Arc::new(state);
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
-        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
-        let server_state = Arc::clone(&state);
-        let server = tokio::spawn(async move {
-            loop {
-                let stream = listener.accept().await.expect("client connection");
-                let state = Arc::clone(&server_state);
-                tokio::spawn(async move {
-                    handle_client(stream, state).await.expect("handle client");
-                });
-            }
-        });
-        let client = bcode_client::BcodeClient::new(endpoint);
-        let mut watcher = client
-            .connect("bcode-tui-bmux")
-            .await
-            .expect("TUI connection");
-        watcher
-            .attach_session_projection_window_with_input_history(
-                session_id,
-                bcode_session_models::ProjectionWindowRequest {
-                    projection: bcode_session_models::SessionProjectionKind::Transcript,
-                    anchor: bcode_session_models::ProjectionWindowAnchor::Latest,
-                    direction: bcode_session_models::ProjectionWindowDirection::Backward,
-                    target: bcode_session_models::ProjectionWindowTarget {
-                        min_items: Some(12),
-                        min_estimated_rows: Some(48),
-                        min_bytes: None,
-                        width_columns: Some(80),
-                    },
-                    limits: bcode_session_models::ProjectionWindowLimits {
-                        max_items: 64,
-                        max_events_scanned: 2_048,
-                        max_bytes: 512 * 1_024,
-                    },
-                },
-            )
-            .await
-            .expect("projection-window attachment");
-        let release_path = workspace.path().join("release-shell");
-        let command = format!(
-            "printf 'first\\n'; while [ ! -f '{}' ]; do sleep 0.01; done; printf 'second\\n'",
-            release_path.display()
-        );
-        let call = bcode_model::ToolCall {
-            id: "shell-live-ipc-call".to_owned(),
-            name: "shell.run".to_owned(),
-            arguments: serde_json::json!({
-                "command": command,
-                "columns": 80,
-                "rows": 24,
-                "timeout_ms": 5000
-            }),
-        };
-        let (plugin_id, definition, preparation) =
-            prepare_server_tool(state.as_ref(), session_id, &call)
-                .await
-                .expect("tool preparation");
-        let policy_metadata =
-            tool_policy_authorization_metadata(&preparation.authorization, &call.name)
-                .expect("tool policy");
-        let task_state = Arc::clone(&state);
-        let task_call = call.clone();
-        let working_directory = workspace.path().to_path_buf();
-        let task = tokio::spawn(async move {
-            invoke_model_tool(
-                task_state.as_ref(),
-                session_id,
-                &task_call,
-                &working_directory,
-                &plugin_id,
-                &definition,
-                &policy_metadata,
-                &TurnCancelState::default(),
-                None,
-                None,
-            )
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let permission = state
-                    .pending_permissions
-                    .lock()
-                    .await
-                    .values()
-                    .next()
-                    .cloned();
-                if let Some(permission) = permission {
-                    state
-                        .pending_permissions
-                        .lock()
-                        .await
-                        .remove(&permission.summary.permission_id);
-                    *permission.decision.lock().await = Some(true);
-                    permission.notify.notify_waiters();
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("permission request");
-
-        tokio::time::timeout(Duration::from_millis(750), async {
-            loop {
-                let bcode_ipc::Event::SessionLive(event) =
-                    watcher.recv_event().await.expect("session event")
-                else {
-                    continue;
-                };
-                let bcode_session_models::SessionLiveEventKind::ToolOutputDelta {
-                    event:
-                        ToolInvocationStreamEvent::ArtifactUpdate {
-                            artifact_id,
-                            reference_key,
-                            finalized: false,
-                            ..
-                        },
-                } = event.kind
-                else {
-                    continue;
-                };
-                let range = client
-                    .session_artifact_range(
-                        session_id,
-                        artifact_id,
-                        reference_key,
-                        0,
-                        MAX_ARTIFACT_RANGE_BYTES,
-                    )
-                    .await
-                    .expect("live artifact range over IPC");
-                if range
-                    .bytes
-                    .windows(b"first".len())
-                    .any(|window| window == b"first")
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("live artifact must cross IPC before finish");
-        assert!(
-            !task.is_finished(),
-            "shell finished before live IPC assertion"
-        );
-        std::fs::write(&release_path, b"release").expect("release shell command");
-        let response = task.await.expect("shell task").expect("shell response");
-        assert!(!response.is_error, "{}", response.output);
-        server.abort();
-        remove_session_artifact_dir(&artifact_dir).expect("remove test artifacts");
     }
 
     #[cfg(unix)]
