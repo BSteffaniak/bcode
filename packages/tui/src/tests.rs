@@ -4516,6 +4516,84 @@ fn shell_request_visual(command: &str, cwd: Option<&str>) -> PluginVisualDescrip
     shell_request_preview(command, cwd).visual
 }
 
+#[test]
+fn completed_argument_preview_becomes_runtime_keyed_tool_request() {
+    let session_id = SessionId::new();
+    let tool_call_id = "call-preview-to-running";
+    let command = "printf live; sleep 20";
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: "shell.run".to_owned(),
+            argument_bytes: command.len(),
+            preview: shell_request_preview(command, None),
+        },
+    });
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: tool_call_id.to_owned(),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: serde_json::json!({"command": command}).to_string(),
+            working_directory: None,
+            request_visual: Some(shell_request_visual(command, None)),
+            legacy_request_presentation: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "shell.run".to_owned(),
+                sequence: 1,
+                terminal: true,
+                columns: Some(120),
+                rows: Some(30),
+                started_at_ms: Some(2),
+            },
+        },
+    ));
+
+    assert!(
+        !app.transcript()
+            .iter()
+            .any(|item| item.is_live_preview_anchor_for(tool_call_id))
+    );
+    let visual = app
+        .transcript()
+        .iter()
+        .find_map(|item| match item.kind() {
+            TranscriptItemKind::ToolRequest {
+                tool_call_id: item_tool_call_id,
+                request_visual,
+                ..
+            } if item_tool_call_id == tool_call_id => request_visual.as_ref(),
+            _ => None,
+        })
+        .expect("canonical tool request visual");
+    assert_eq!(
+        visual
+            .payload
+            .pointer("/_bcode_runtime/live_state_key")
+            .and_then(serde_json::Value::as_str),
+        Some(tool_call_id)
+    );
+    assert_eq!(
+        visual
+            .payload
+            .pointer("/_bcode_runtime/streaming")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+}
+
 fn file_change_visual(
     title: &str,
     path: Option<&str>,
@@ -4779,6 +4857,185 @@ fn rendered_tool_body(rendered: &str) -> Vec<String> {
         .filter(|line| !line.trim().is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn live_shell_recording_chunk_renders_through_active_request_visual() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-live-shell".to_owned(),
+            tool_call_id: "call-live-shell".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            argument_bytes: 10,
+            preview: shell_request_preview("printf red", None),
+        },
+    });
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-live-shell".to_owned(),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"printf red"}"#.to_owned(),
+            working_directory: None,
+            request_visual: Some(bcode_session_models::PluginVisualDescriptor {
+                visual_id: None,
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                schema: "bcode.tool.request.shell.run".to_owned(),
+                schema_version: 1,
+                title: Some("Shell command".to_owned()),
+                subtitle: None,
+                payload: serde_json::json!({"command": "printf red"}),
+            }),
+            legacy_request_presentation: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call-live-shell".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                sequence: 1,
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+                started_at_ms: Some(1),
+            },
+        },
+    ));
+    let before_delivery = render_app_text(&mut app);
+    assert!(!before_delivery.contains("live red"), "{before_delivery}");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("live.bcsr");
+    let (commit_sender, commit_receiver) = std::sync::mpsc::channel();
+    let observer: bcode_shell_plugin::recording::ShellRecordingCommitObserver =
+        Arc::new(move |commit| {
+            let _ = commit_sender.send(commit);
+        });
+    let mut writer =
+        bcode_shell_plugin::recording::AsyncShellRecordingWriter::create_with_observer(
+            &path,
+            80,
+            24,
+            Some(observer),
+        )
+        .expect("recording writer");
+    let initial = commit_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("initial live commit");
+    writer
+        .write_output_with(
+            1,
+            b"raw live red\r\n",
+            Some(b"\x1b[31mlive red\x1b[0m\r\n"),
+            || {},
+        )
+        .expect("live replay output");
+    let commit = commit_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("output live commit");
+    assert!(!initial.finalized && !commit.finalized);
+    assert!(commit.committed_bytes > initial.committed_bytes);
+    assert!(
+        !path.exists(),
+        "final recording must not exist before finish"
+    );
+    let mut bytes = std::fs::read(&commit.path).expect("live recording prefix");
+    bytes.truncate(usize::try_from(commit.committed_bytes).expect("committed length"));
+    let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("artifact.sock"));
+    let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
+    let response_bytes = bytes.clone();
+    let responder = tokio::spawn(async move {
+        let mut stream = listener.accept().await.expect("artifact client");
+        loop {
+            let envelope = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("client request");
+            let request = bcode_ipc::decode_request(&envelope.payload).expect("decode request");
+            let response = match request {
+                bcode_ipc::Request::Hello { .. } => {
+                    bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                        protocol_version: bcode_ipc::ProtocolVersion::current(),
+                        client_id: ClientId::new(),
+                    })
+                }
+                bcode_ipc::Request::ReadSessionArtifact { offset, .. } => {
+                    bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionArtifactRange {
+                        artifact_id: "call-live-shell-shell-run".to_owned(),
+                        reference_key: "shell_recording".to_owned(),
+                        content_type: Some(
+                            "application/x-bcode-shell-recording; version=3".to_owned(),
+                        ),
+                        offset,
+                        total_bytes: u64::try_from(response_bytes.len()).expect("recording length"),
+                        reference_bytes: Some(
+                            u64::try_from(response_bytes.len()).expect("recording length"),
+                        ),
+                        reference_revision: 2,
+                        finalized: false,
+                        finalized_event_seq: None,
+                        availability: Some("active".to_owned()),
+                        complete: Some(false),
+                        checksum_sha256: None,
+                        bytes: response_bytes.clone(),
+                    })
+                }
+                request => panic!("unexpected request: {request:?}"),
+            };
+            let response = bcode_ipc::response_envelope(envelope.request_id, &response)
+                .expect("response envelope");
+            bcode_ipc::send_envelope(&mut stream, &response)
+                .await
+                .expect("send response");
+            if matches!(request, bcode_ipc::Request::ReadSessionArtifact { .. }) {
+                break;
+            }
+        }
+    });
+    let mut coordinator = super::artifact_stream::ArtifactStreamCoordinator::new(
+        bcode_client::BcodeClient::new(endpoint),
+    );
+    coordinator.observe_live_event(
+        session_id,
+        &ToolInvocationStreamEvent::ArtifactUpdate {
+            tool_call_id: "call-live-shell".to_owned(),
+            sequence: 2,
+            artifact_id: "call-live-shell-shell-run".to_owned(),
+            reference_key: "shell_recording".to_owned(),
+            producer_plugin_id: "bcode.shell".to_owned(),
+            schema: "bcode.shell.run".to_owned(),
+            schema_version: 1,
+            content_type: Some("application/x-bcode-shell-recording; version=3".to_owned()),
+            storage_uri: String::new(),
+            committed_bytes: u64::try_from(bytes.len()).expect("recording length"),
+            revision: 2,
+            availability: None,
+            finalized: false,
+        },
+    );
+    let completion = tokio::time::timeout(Duration::from_secs(1), coordinator.next_completion())
+        .await
+        .expect("artifact fetch timeout")
+        .expect("artifact completion");
+    let presentation = app.plugin_presentation().expect("plugin presentation");
+    assert!(
+        coordinator.handle_completion(Some(session_id), completion, |chunk| {
+            presentation.deliver_artifact_chunk(chunk)
+        })
+    );
+    responder.await.expect("artifact responder");
+
+    let rendered = render_app_text(&mut app);
+    assert!(rendered.contains("live red"), "{rendered}");
 }
 
 #[test]

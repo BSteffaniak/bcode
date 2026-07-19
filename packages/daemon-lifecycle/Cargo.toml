@@ -19,6 +19,9 @@ serde_json       = { workspace = true }
 thiserror        = { workspace = true }
 tokio            = { workspace = true, features = ["process", "time"] }
 
+[dev-dependencies]
+bcode_metrics = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

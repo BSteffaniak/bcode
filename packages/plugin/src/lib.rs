@@ -1703,6 +1703,7 @@ impl StreamingServiceInvocation {
     /// Returns an error when the response channel closes before a plugin response is produced.
     pub async fn next_event(&mut self) -> Result<StreamingServiceInvocationEvent, PluginLoadError> {
         tokio::select! {
+            biased;
             event = self.events.recv() => {
                 match event {
                     Some(payload) => Ok(StreamingServiceInvocationEvent::Event(payload)),
@@ -4776,6 +4777,45 @@ library = "libexample_plugin.dylib"
 
         assert_eq!(response.payload, b"ok");
         assert_eq!(events, vec![b"event".to_vec(), b"thread-event".to_vec()]);
+    }
+
+    #[test]
+    fn streaming_events_cannot_be_overtaken_by_the_final_response() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        runtime.block_on(async {
+            let (response_tx, response) = oneshot::channel();
+            let (events_tx, events) = mpsc::unbounded_channel();
+            events_tx.send(b"committed-prefix".to_vec()).expect("event");
+            response_tx
+                .send(Ok(ServiceResponse::text("complete")))
+                .expect("response");
+            drop(events_tx);
+            let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+            let mut invocation = StreamingServiceInvocation {
+                response,
+                events,
+                cancel: PluginInvocationCancelHandle {
+                    id: PluginInvocationId(1),
+                    cancellation,
+                },
+                resource_permit: None,
+            };
+
+            assert!(matches!(
+                invocation.next_event().await.expect("first item"),
+                StreamingServiceInvocationEvent::Event(payload)
+                    if payload == b"committed-prefix"
+            ));
+            assert!(matches!(
+                invocation.next_event().await.expect("second item"),
+                StreamingServiceInvocationEvent::Response(Ok(response))
+                    if response.payload_text().ok() == Some("complete")
+            ));
+            drop(invocation);
+        });
     }
 
     #[test]

@@ -2150,6 +2150,7 @@ fn session_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
     add_session_base_migrations(&mut source);
     add_session_runtime_migrations(&mut source);
+    add_session_projection_compatibility_migrations(&mut source);
     source
 }
 
@@ -2318,6 +2319,15 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "027_initialize_session_storage_contract",
         "INSERT OR IGNORE INTO session_storage_contract (contract_id, schema_version, writer_epoch, updated_by_build) VALUES (1, 1, 1, NULL)",
         "DELETE FROM session_storage_contract WHERE contract_id = 1",
+    );
+}
+
+fn add_session_projection_compatibility_migrations(source: &mut CodeMigrationSource<'static>) {
+    add_sql_migration(
+        source,
+        "028_repair_context_occupancy_checkpoint_version",
+        "UPDATE projection_checkpoints SET projection_version = 4 WHERE projection_name = 'context_occupancy' AND projection_version < 4 AND EXISTS (SELECT 1 FROM context_occupancy_projection WHERE projection_id = 1 AND schema_version = 4)",
+        "UPDATE projection_checkpoints SET projection_version = 1 WHERE projection_name = 'context_occupancy' AND projection_version = 4",
     );
 }
 
@@ -5908,6 +5918,65 @@ mod tests {
                 .await
                 .expect("current occupancy")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_migration_repairs_legacy_context_occupancy_checkpoint_version() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_owned(),
+                model: "model".to_owned(),
+            },
+        ))
+        .await
+        .expect("append model boundary");
+        db.database()
+            .update("projection_checkpoints")
+            .value("projection_version", DatabaseValue::Int32(1))
+            .where_eq("projection_name", "context_occupancy")
+            .execute(db.database())
+            .await
+            .expect("install legacy checkpoint version");
+        db.database()
+            .delete(SESSION_MIGRATIONS_TABLE)
+            .where_eq("id", "028_repair_context_occupancy_checkpoint_version")
+            .execute(db.database())
+            .await
+            .expect("mark checkpoint repair migration pending");
+        drop(db);
+
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
+        let db =
+            SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                .await
+                .expect("explicitly repair legacy checkpoint");
+        db.validate_write_readiness()
+            .await
+            .expect("repaired projection must be writable");
+        assert_eq!(
+            projection_version_from_database(
+                db.database(),
+                MaterializedProjection::RequestContextOccupancy,
+            )
+            .await
+            .expect("projection version"),
+            Some(u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION))
         );
     }
 

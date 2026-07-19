@@ -265,6 +265,19 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         None
     }
 
+    /// Return whether this adapter consumes streamed bytes for one artifact reference.
+    ///
+    /// Hosts use this before scheduling range reads so unrelated references on the same artifact
+    /// are not fetched or retried through an adapter that cannot interpret them.
+    fn accepts_artifact_reference(
+        &self,
+        _kind: &str,
+        _reference_key: &str,
+        _content_type: Option<&str>,
+    ) -> bool {
+        false
+    }
+
     /// Consume one ordered opaque artifact range fetched by the host outside rendering.
     ///
     /// The host may redeliver metadata revisions but does not redeliver byte ranges. Adapters must
@@ -567,6 +580,22 @@ impl PluginTuiRegistry {
             .iter()
             .find(|adapter| adapter.supports(kind))
             .and_then(|adapter| adapter.invocation_event_action(kind, payload, event))
+    }
+
+    /// Return whether the owning visual adapter consumes one artifact reference.
+    #[must_use]
+    pub fn visual_accepts_artifact_reference(
+        &self,
+        kind: &str,
+        reference_key: &str,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.visual_adapters
+            .iter()
+            .find(|adapter| adapter.supports(kind))
+            .is_some_and(|adapter| {
+                adapter.accepts_artifact_reference(kind, reference_key, content_type)
+            })
     }
 
     /// Deliver opaque artifact bytes through the adapter that owns the artifact schema.

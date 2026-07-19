@@ -5,6 +5,7 @@ use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiArtifactChunk, PluginTuiRegistry, PluginTuiSurfaceOpenRequest,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Process-local presentation state for one TUI instance.
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 pub struct PluginTuiPresentation {
     host: Arc<PluginHost>,
     registries: Mutex<BTreeMap<String, Arc<PluginTuiRegistry>>>,
+    revision: AtomicU64,
 }
 
 impl PluginTuiPresentation {
@@ -30,6 +32,7 @@ impl PluginTuiPresentation {
         Self {
             host,
             registries: Mutex::new(BTreeMap::new()),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -37,6 +40,12 @@ impl PluginTuiPresentation {
     #[must_use]
     pub fn host(&self) -> &PluginHost {
         &self.host
+    }
+
+    /// Return the presentation revision incremented when adapter-owned visual state changes.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 
     /// Return one retained native TUI registry.
@@ -50,6 +59,28 @@ impl PluginTuiPresentation {
         registries.insert(plugin_id.to_owned(), Arc::clone(&registry));
         drop(registries);
         Some(registry)
+    }
+
+    /// Return whether the routed adapter consumes bytes from one artifact reference.
+    #[must_use]
+    pub fn accepts_artifact_reference(
+        &self,
+        producer_plugin_id: &str,
+        schema: &str,
+        schema_version: u32,
+        reference_key: &str,
+        content_type: Option<&str>,
+    ) -> bool {
+        let producer = Some(producer_plugin_id);
+        let Some(route) = self
+            .host
+            .visual_adapter(schema, schema_version, "tui", producer)
+        else {
+            return false;
+        };
+        self.registry(&route.plugin_id).is_some_and(|registry| {
+            registry.visual_accepts_artifact_reference(&route.schema, reference_key, content_type)
+        })
     }
 
     /// Deliver opaque artifact bytes to the retained adapter selected by generic routing metadata.
@@ -68,7 +99,11 @@ impl PluginTuiPresentation {
         let Some(registry) = self.registry(&route.plugin_id) else {
             return Ok(false);
         };
-        registry.visual_artifact_chunk(chunk)
+        let delivered = registry.visual_artifact_chunk(chunk)?;
+        if delivered {
+            self.revision.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(delivered)
     }
 }
 
@@ -195,7 +230,7 @@ mod tests {
 
     impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for StatefulTestAdapter {
         fn supports(&self, kind: &str) -> bool {
-            kind == "test.artifact"
+            kind == "bcode.shell.run"
         }
 
         fn artifact_chunk(&self, chunk: &PluginTuiArtifactChunk) -> Result<(), String> {
@@ -238,37 +273,55 @@ mod tests {
     #[test]
     fn presentation_retains_one_registry_for_delivery_and_rendering() {
         let presentation = test_presentation();
+        assert!(presentation.accepts_artifact_reference(
+            "bcode.shell",
+            "bcode.shell.run",
+            1,
+            "shell_recording",
+            Some("application/x-bcode-shell-recording; version=3"),
+        ));
+        assert!(!presentation.accepts_artifact_reference(
+            "bcode.shell",
+            "bcode.shell.run",
+            1,
+            "clean_output",
+            Some("text/plain; charset=utf-8"),
+        ));
         let mut registry = PluginTuiRegistry::default();
         registry.register_visual_adapter(Box::new(StatefulTestAdapter::default()));
         presentation
             .registries
             .lock()
             .expect("presentation registries")
-            .insert("test.plugin".to_owned(), Arc::new(registry));
+            .insert("bcode.shell".to_owned(), Arc::new(registry));
 
-        let first = presentation.registry("test.plugin").expect("registry");
-        first
-            .visual_artifact_chunk(&PluginTuiArtifactChunk {
-                tool_call_id: "call".to_owned(),
-                artifact_id: "artifact".to_owned(),
-                reference_key: "reference".to_owned(),
-                producer_plugin_id: "test.plugin".to_owned(),
-                schema: "test.artifact".to_owned(),
-                schema_version: 1,
-                content_type: None,
-                offset: 0,
-                total_bytes: 3,
-                revision: 1,
-                finalized: false,
-                bytes: b"abc".to_vec(),
-            })
-            .expect("deliver artifact chunk");
+        let first = presentation.registry("bcode.shell").expect("registry");
+        assert_eq!(presentation.revision(), 0);
+        assert!(
+            presentation
+                .deliver_artifact_chunk(&PluginTuiArtifactChunk {
+                    tool_call_id: "call".to_owned(),
+                    artifact_id: "artifact".to_owned(),
+                    reference_key: "reference".to_owned(),
+                    producer_plugin_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.run".to_owned(),
+                    schema_version: 1,
+                    content_type: None,
+                    offset: 0,
+                    total_bytes: 3,
+                    revision: 1,
+                    finalized: false,
+                    bytes: b"abc".to_vec(),
+                })
+                .expect("deliver artifact chunk")
+        );
+        assert_eq!(presentation.revision(), 1);
 
-        let second = presentation.registry("test.plugin").expect("registry");
+        let second = presentation.registry("bcode.shell").expect("registry");
         assert!(Arc::ptr_eq(&first, &second));
         let rows = second
             .visual_rows(
-                "test.artifact",
+                "bcode.shell.run",
                 &serde_json::Value::Null,
                 &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
                     80,
