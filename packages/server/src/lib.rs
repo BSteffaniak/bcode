@@ -14687,7 +14687,7 @@ async fn collect_model_tools(
         {
             continue;
         }
-        if policy != Some(bcode_session_models::TurnToolPolicy::Enabled) {
+        if !tool_policy_allows_operation(policy, false) {
             let call = bcode_model::ToolCall {
                 id: format!("catalog-{}", tool.name),
                 name: tool.name.clone(),
