@@ -12,10 +12,11 @@
 pub mod turn;
 
 pub use turn::{
-    InvocationArtifactSink, InvocationCancellation, InvocationCapabilities,
+    HostTurnEventSink, InvocationArtifactSink, InvocationCancellation, InvocationCapabilities,
     InvocationCapabilityFuture, InvocationExchangeBroker, InvocationInputRouter, InvocationScope,
-    InvocationServiceRouter, PreparationScope, ScopedTurnEvent, TurnControl, TurnEventSink,
-    TurnGeneration, TurnLifecycle, TurnScope, TurnScopeOwner,
+    InvocationServiceRouter, PreparationScope, ScopedTurnEvent, TurnControl,
+    TurnEventObservability, TurnEventPersistence, TurnEventSink, TurnGeneration, TurnLifecycle,
+    TurnScope, TurnScopeOwner,
 };
 
 use bcode_model::{

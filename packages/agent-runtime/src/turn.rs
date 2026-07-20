@@ -265,6 +265,78 @@ pub trait TurnEventSink: Send + Sync {
     fn emit(&self, event: ScopedTurnEvent) -> bool;
 }
 
+/// Neutral host persistence seam for accepted scoped runtime events.
+///
+/// Implementations must synchronously accept or reject the event. Durable storage may complete
+/// asynchronously after acceptance, but the implementation is responsible for owning any data it
+/// needs before this method returns.
+pub trait TurnEventPersistence: Send + Sync {
+    /// Accept one event for persistence.
+    ///
+    /// Returns `false` when persistence admission has closed. Rejection prevents downstream
+    /// observability and publication through [`HostTurnEventSink`].
+    fn persist(&self, event: &ScopedTurnEvent) -> bool;
+}
+
+/// Neutral host observability seam for accepted scoped runtime events.
+pub trait TurnEventObservability: Send + Sync {
+    /// Observe an event after persistence admission and before final publication.
+    fn observe(&self, event: &ScopedTurnEvent);
+}
+
+/// Composed neutral host event sink for persistence, observability, and publication.
+///
+/// Events are admitted in that order. A persistence rejection stops the event before observation
+/// or publication. Publication rejection is returned to the originating turn scope; an event that
+/// was already admitted for persistence remains durable host work and is not rolled back.
+pub struct HostTurnEventSink {
+    publication: Arc<dyn TurnEventSink>,
+    persistence: Option<Arc<dyn TurnEventPersistence>>,
+    observability: Option<Arc<dyn TurnEventObservability>>,
+}
+
+impl HostTurnEventSink {
+    /// Create a host event sink with publication only.
+    #[must_use]
+    pub fn new(publication: Arc<dyn TurnEventSink>) -> Self {
+        Self {
+            publication,
+            persistence: None,
+            observability: None,
+        }
+    }
+
+    /// Attach host persistence admission.
+    #[must_use]
+    pub fn with_persistence(mut self, persistence: Arc<dyn TurnEventPersistence>) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// Attach host observability.
+    #[must_use]
+    pub fn with_observability(mut self, observability: Arc<dyn TurnEventObservability>) -> Self {
+        self.observability = Some(observability);
+        self
+    }
+}
+
+impl TurnEventSink for HostTurnEventSink {
+    fn emit(&self, event: ScopedTurnEvent) -> bool {
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| !persistence.persist(&event))
+        {
+            return false;
+        }
+        if let Some(observability) = &self.observability {
+            observability.observe(&event);
+        }
+        self.publication.emit(event)
+    }
+}
+
 #[derive(Debug, Default)]
 struct DiscardingTurnEventSink;
 
@@ -1048,7 +1120,10 @@ impl InvocationScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[derive(Debug, Default)]
     struct CountingSink(AtomicUsize);
@@ -1064,6 +1139,95 @@ mod tests {
         fn request_cancel(&self) {
             self.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    struct OrderedPublication {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        accepts: bool,
+    }
+
+    impl TurnEventSink for OrderedPublication {
+        fn emit(&self, _event: ScopedTurnEvent) -> bool {
+            self.calls.lock().expect("calls lock").push("publish");
+            self.accepts
+        }
+    }
+
+    struct OrderedPersistence {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        accepts: bool,
+    }
+
+    impl TurnEventPersistence for OrderedPersistence {
+        fn persist(&self, _event: &ScopedTurnEvent) -> bool {
+            self.calls.lock().expect("calls lock").push("persist");
+            self.accepts
+        }
+    }
+
+    struct OrderedObservability(Arc<Mutex<Vec<&'static str>>>);
+
+    impl TurnEventObservability for OrderedObservability {
+        fn observe(&self, _event: &ScopedTurnEvent) {
+            self.0.lock().expect("calls lock").push("observe");
+        }
+    }
+
+    #[test]
+    fn host_event_sink_persists_observes_and_publishes_in_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = HostTurnEventSink::new(Arc::new(OrderedPublication {
+            calls: Arc::clone(&calls),
+            accepts: true,
+        }))
+        .with_persistence(Arc::new(OrderedPersistence {
+            calls: Arc::clone(&calls),
+            accepts: true,
+        }))
+        .with_observability(Arc::new(OrderedObservability(Arc::clone(&calls))));
+
+        assert!(sink.emit(ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted)));
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec!["persist", "observe", "publish"]
+        );
+    }
+
+    #[test]
+    fn persistence_rejection_stops_observation_and_publication() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = HostTurnEventSink::new(Arc::new(OrderedPublication {
+            calls: Arc::clone(&calls),
+            accepts: true,
+        }))
+        .with_persistence(Arc::new(OrderedPersistence {
+            calls: Arc::clone(&calls),
+            accepts: false,
+        }))
+        .with_observability(Arc::new(OrderedObservability(Arc::clone(&calls))));
+
+        assert!(!sink.emit(ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted)));
+        assert_eq!(*calls.lock().expect("calls lock"), vec!["persist"]);
+    }
+
+    #[test]
+    fn publication_rejection_is_reported_after_persistence_and_observation() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = HostTurnEventSink::new(Arc::new(OrderedPublication {
+            calls: Arc::clone(&calls),
+            accepts: false,
+        }))
+        .with_persistence(Arc::new(OrderedPersistence {
+            calls: Arc::clone(&calls),
+            accepts: true,
+        }))
+        .with_observability(Arc::new(OrderedObservability(Arc::clone(&calls))));
+
+        assert!(!sink.emit(ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted)));
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec!["persist", "observe", "publish"]
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use bcode::{
     Agent, InvocationScope, PreparationScope, PreparedToolInvocation, RegisteredTool,
     ToolAuthorizationCoordinator, ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCall,
     ToolDefinition, ToolInvocationResponse, ToolInvoker, ToolPreparationRequest,
-    ToolPreparationResponse,
+    ToolPreparationResponse, TurnEventObservability, TurnEventPersistence,
 };
 use bcode_agent_runtime::{ModelProviderInvoker, RuntimeFuture, TurnScope};
 use bcode_model::{
@@ -163,13 +163,32 @@ fn call() -> ToolCall {
     }
 }
 
+struct CountingHostExtension(Arc<AtomicUsize>);
+
+impl TurnEventPersistence for CountingHostExtension {
+    fn persist(&self, _event: &bcode::ScopedTurnEvent) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
+
+impl TurnEventObservability for CountingHostExtension {
+    fn observe(&self, _event: &bcode::ScopedTurnEvent) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[tokio::test]
 async fn builder_routes_provider_tool_invoker_and_authorization_adapters() {
     let invocations = Arc::new(AtomicUsize::new(0));
+    let persisted = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(AtomicUsize::new(0));
     let agent = Agent::builder()
         .provider_factory(|| Box::new(FakeProvider::new()))
         .inline_tool(definition(), |_| Ok(response("legacy")))
         .tool_invoker(Arc::new(CountingInvoker(Arc::clone(&invocations))))
+        .event_persistence(Arc::new(CountingHostExtension(Arc::clone(&persisted))))
+        .event_observability(Arc::new(CountingHostExtension(Arc::clone(&observed))))
         .build();
 
     assert_eq!(
@@ -190,6 +209,11 @@ async fn builder_routes_provider_tool_invoker_and_authorization_adapters() {
         "adapter-call:adapter-call"
     );
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert!(persisted.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        persisted.load(Ordering::SeqCst),
+        observed.load(Ordering::SeqCst)
+    );
 
     let authorizations = Arc::new(AtomicUsize::new(0));
     let denied = Agent::builder()

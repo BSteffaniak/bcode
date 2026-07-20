@@ -46,10 +46,11 @@ pub use bcode_agent_runtime::{
     ToolRoundObserver, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_agent_runtime::{
-    InvocationArtifactSink, InvocationCapabilities, InvocationCapabilityFuture,
+    HostTurnEventSink, InvocationArtifactSink, InvocationCapabilities, InvocationCapabilityFuture,
     InvocationExchangeBroker, InvocationInputRouter, InvocationScope, InvocationServiceRouter,
     PreparationScope, ScopedTurnEvent, ToolAuthorizationCoordinator, ToolAuthorizationDecision,
-    ToolAuthorizationRequest, ToolInvoker, TurnEventSink,
+    ToolAuthorizationRequest, ToolInvoker, TurnEventObservability, TurnEventPersistence,
+    TurnEventSink,
 };
 #[cfg(feature = "daemon-client")]
 pub use bcode_client::{
@@ -3418,6 +3419,8 @@ pub struct AgentBuilder {
     execution_options: ToolExecutionOptions,
     invocation_capabilities: InvocationCapabilities,
     invocation_event_sink: Arc<dyn TurnEventSink>,
+    event_persistence: Option<Arc<dyn TurnEventPersistence>>,
+    event_observability: Option<Arc<dyn TurnEventObservability>>,
     authorization_coordinator: Option<Arc<dyn ToolAuthorizationCoordinator>>,
     tool_invoker: Option<Arc<dyn ToolInvoker>>,
     provider_factory: Option<ProviderFactory>,
@@ -3454,6 +3457,8 @@ impl fmt::Debug for AgentBuilder {
             .field("execution_options", &self.execution_options)
             .field("invocation_capabilities", &self.invocation_capabilities)
             .field("invocation_event_sink", &"<sink>")
+            .field("event_persistence", &self.event_persistence.is_some())
+            .field("event_observability", &self.event_observability.is_some())
             .field(
                 "authorization_coordinator",
                 &self.authorization_coordinator.is_some(),
@@ -3503,6 +3508,8 @@ impl Default for AgentBuilder {
             execution_options: ToolExecutionOptions::default(),
             invocation_capabilities: InvocationCapabilities::default(),
             invocation_event_sink: Arc::new(DiscardingSdkTurnEventSink),
+            event_persistence: None,
+            event_observability: None,
             authorization_coordinator: None,
             tool_invoker: None,
             provider_factory: None,
@@ -3669,6 +3676,20 @@ impl AgentBuilder {
     #[must_use]
     pub fn invocation_event_sink(mut self, sink: Arc<dyn TurnEventSink>) -> Self {
         self.invocation_event_sink = sink;
+        self
+    }
+
+    /// Configure neutral runtime-event persistence admission.
+    #[must_use]
+    pub fn event_persistence(mut self, persistence: Arc<dyn TurnEventPersistence>) -> Self {
+        self.event_persistence = Some(persistence);
+        self
+    }
+
+    /// Configure neutral runtime-event observability.
+    #[must_use]
+    pub fn event_observability(mut self, observability: Arc<dyn TurnEventObservability>) -> Self {
+        self.event_observability = Some(observability);
         self
     }
 
@@ -3950,6 +3971,19 @@ impl AgentBuilder {
     #[must_use]
     pub fn build(self) -> Agent {
         let permission_policy = self.permission_policy();
+        let invocation_event_sink: Arc<dyn TurnEventSink> =
+            if self.event_persistence.is_some() || self.event_observability.is_some() {
+                let mut sink = HostTurnEventSink::new(Arc::clone(&self.invocation_event_sink));
+                if let Some(persistence) = self.event_persistence.clone() {
+                    sink = sink.with_persistence(persistence);
+                }
+                if let Some(observability) = self.event_observability.clone() {
+                    sink = sink.with_observability(observability);
+                }
+                Arc::new(sink)
+            } else {
+                Arc::clone(&self.invocation_event_sink)
+            };
         Agent {
             runtime: self.runtime,
             name: self.name,
@@ -3966,7 +4000,7 @@ impl AgentBuilder {
             max_tool_rounds: self.max_tool_rounds,
             execution_options: self.execution_options,
             invocation_capabilities: self.invocation_capabilities,
-            invocation_event_sink: self.invocation_event_sink,
+            invocation_event_sink,
             authorization_coordinator: self.authorization_coordinator,
             tool_invoker: self.tool_invoker,
             provider_factory: self.provider_factory,
