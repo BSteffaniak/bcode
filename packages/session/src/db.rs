@@ -2037,17 +2037,18 @@ async fn initialize_current_storage_contract(db: &dyn Database) -> SessionDbResu
 async fn projection_checkpoint_snapshot(
     db: &dyn Database,
 ) -> SessionDbResult<BTreeMap<String, ProjectionCheckpointState>> {
-    let projection_names = MaterializedProjection::all()
-        .iter()
-        .map(|projection| DatabaseValue::String(projection.as_str().to_owned()))
-        .collect::<Vec<_>>();
-    let placeholders = std::iter::repeat_n("?", projection_names.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query = format!(
-        "SELECT projection_name, projection_version, last_event_seq FROM projection_checkpoints WHERE projection_name IN ({placeholders})"
-    );
-    let rows = db.query_raw_params(&query, &projection_names).await?;
+    let rows = db
+        .select("projection_checkpoints")
+        .columns(&["projection_name", "projection_version", "last_event_seq"])
+        .where_in(
+            "projection_name",
+            MaterializedProjection::all()
+                .iter()
+                .map(|projection| DatabaseValue::String(projection.as_str().to_owned()))
+                .collect::<Vec<_>>(),
+        )
+        .execute(db)
+        .await?;
     rows.into_iter()
         .map(|row| {
             let name = required_string(&row, "projection_name")?;
@@ -3258,16 +3259,17 @@ async fn update_projection_checkpoint(
     projection: MaterializedProjection,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    db.exec_raw_params(
-        "INSERT INTO projection_checkpoints (projection_name, last_event_seq, projection_version, updated_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT(projection_name) DO UPDATE SET last_event_seq = excluded.last_event_seq, projection_version = excluded.projection_version, updated_at_ms = excluded.updated_at_ms",
-        &[
-            DatabaseValue::String(projection.as_str().to_owned()),
-            seq_to_value(event.sequence),
+    db.upsert("projection_checkpoints")
+        .unique(&["projection_name"])
+        .value("projection_name", projection.as_str())
+        .value("last_event_seq", seq_to_value(event.sequence))
+        .value(
+            "projection_version",
             DatabaseValue::Int64(i64::from(projection.schema_version())),
-            seq_to_value(event_created_at_ms(event)),
-        ],
-    )
-    .await?;
+        )
+        .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
+        .execute(db)
+        .await?;
     Ok(())
 }
 
