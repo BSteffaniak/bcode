@@ -24,6 +24,8 @@ pub struct RepairOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepairTarget {
+    /// The removed historical writer-epoch storage root.
+    LegacyStorage,
     /// A per-session database.
     Session { session_id: SessionId },
     /// The global session catalog database.
@@ -94,6 +96,9 @@ impl RepairReport {
 /// Errors returned by explicit repair operations.
 #[derive(Debug, Error)]
 pub enum SessionRepairError {
+    /// Session store inspection failed.
+    #[error(transparent)]
+    Store(#[from] crate::SessionStoreError),
     /// Filesystem operation failed.
     #[error("repair I/O error at {}: {source}", path.display())]
     Io {
@@ -111,6 +116,42 @@ pub enum SessionRepairError {
     /// Report serialization failed.
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
+}
+
+/// Diagnose the removed historical writer-epoch root without mutating files.
+///
+/// # Errors
+///
+/// Returns an error if historical directory or owner inspection fails.
+pub fn doctor_legacy_storage(state_dir: &Path) -> Result<RepairReport, SessionRepairError> {
+    let inspection = crate::inspect_accidental_epoch_session_root(state_dir)?;
+    let historical_root = crate::legacy_storage::accidental_epoch_session_root(state_dir);
+    let mut report = RepairReport::new(RepairTarget::LegacyStorage, historical_root);
+    report.status = if !inspection.destination_conflicts.is_empty() {
+        RepairStatus::ManualRequired
+    } else if !inspection.blocked_by_owner.is_empty() {
+        RepairStatus::RefusedOwnedElsewhere
+    } else if !inspection.pending_relocation.is_empty() {
+        RepairStatus::WouldRepair
+    } else {
+        RepairStatus::Ok
+    };
+    for session_id in inspection.pending_relocation {
+        report.notes.push(format!(
+            "historical session {session_id} can be relocated to canonical storage"
+        ));
+    }
+    for session_id in inspection.blocked_by_owner {
+        report.notes.push(format!(
+            "historical session {session_id} is still owned by a live process"
+        ));
+    }
+    for session_id in inspection.destination_conflicts {
+        report.notes.push(format!(
+            "historical session {session_id} conflicts with an existing canonical session; no merge or overwrite is safe"
+        ));
+    }
+    Ok(report)
 }
 
 /// Diagnose a per-session database without mutating files.

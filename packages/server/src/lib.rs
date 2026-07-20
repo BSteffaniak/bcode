@@ -1840,10 +1840,29 @@ pub async fn run_with_static_bundled(
         plugin_configs,
     )?;
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");
-    let recovered_sessions =
+    let legacy_recovery =
         bcode_session::recover_accidental_epoch_session_root(&bcode_config::default_state_dir())?;
-    if recovered_sessions > 0 {
-        tracing::info!(target: "bcode_server::startup", recovered_sessions, "restored sessions to canonical storage root");
+    if !legacy_recovery.relocated.is_empty() {
+        tracing::info!(
+            target: "bcode_server::startup",
+            recovered_sessions = legacy_recovery.relocated.len(),
+            session_ids = ?legacy_recovery.relocated,
+            "restored sessions to canonical storage root"
+        );
+    }
+    if !legacy_recovery.blocked_by_owner.is_empty() {
+        tracing::warn!(
+            target: "bcode_server::startup",
+            session_ids = ?legacy_recovery.blocked_by_owner,
+            "historical session relocation blocked by live owners"
+        );
+    }
+    if !legacy_recovery.destination_conflicts.is_empty() {
+        tracing::warn!(
+            target: "bcode_server::startup",
+            session_ids = ?legacy_recovery.destination_conflicts,
+            "historical and canonical session directories conflict; no data was moved"
+        );
     }
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;
@@ -1872,7 +1891,7 @@ pub async fn run_with_static_bundled(
     };
     let plugins = plugins.with_metrics(metrics.clone());
     let sessions = SessionManager::persistent_lazy_with_metrics_and_lease_owner(
-        default_session_store_dir(),
+        bcode_config::default_session_store_dir(),
         metrics.clone(),
         SessionLeaseOwnerContext {
             storage_writer_epoch: Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
@@ -19596,10 +19615,6 @@ async fn active_skill_contexts(
     contexts
 }
 
-fn default_session_store_dir() -> PathBuf {
-    bcode_config::default_state_dir().join("sessions")
-}
-
 fn default_provider_state_path() -> PathBuf {
     bcode_config::default_state_dir()
         .join("provider-state")
@@ -19655,6 +19670,7 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolCardPresentation,
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
+    use switchy::database::{DatabaseValue, query::FilterableQuery};
 
     #[derive(Default)]
     struct NonReturningCancelProvider;
@@ -20743,10 +20759,12 @@ library = "test"
     }
 
     #[test]
-    fn default_session_store_uses_canonical_sessions_directory() {
+    fn canonical_session_store_path_comes_from_config() {
         assert_eq!(
-            default_session_store_dir(),
-            bcode_config::default_state_dir().join("sessions")
+            bcode_config::default_session_store_dir()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("sessions")
         );
     }
 
@@ -24607,11 +24625,20 @@ library = "test"
             .await
             .expect("session database");
             db.database()
-                .exec_raw("DELETE FROM __bcode_session_migrations WHERE id = '026_session_storage_contract_table' OR id = '027_initialize_session_storage_contract'")
+                .delete("__bcode_session_migrations")
+                .where_in(
+                    "id",
+                    vec![
+                        DatabaseValue::String("026_session_storage_contract_table".to_owned()),
+                        DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
+                    ],
+                )
+                .execute(db.database())
                 .await
                 .expect("remove contract migrations");
             db.database()
-                .exec_raw("DROP TABLE session_storage_contract")
+                .drop_table("session_storage_contract")
+                .execute(db.database())
                 .await
                 .expect("drop contract table");
             session.id
@@ -24758,10 +24785,9 @@ library = "test"
                 "timeout_ms": 5000
             }),
         };
-        let (plugin_id, definition, preparation) =
-            prepare_server_tool(state.as_ref(), session_id, &call)
-                .await
-                .expect("tool preparation");
+        let (plugin_id, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
+            .await
+            .expect("tool preparation");
         let policy_metadata =
             tool_policy_authorization_metadata(&preparation.authorization, &call.name)
                 .expect("tool policy");
@@ -24775,7 +24801,6 @@ library = "test"
                 &task_call,
                 &working_directory,
                 &plugin_id,
-                &definition,
                 &policy_metadata,
                 &TurnCancelState::default(),
                 None,

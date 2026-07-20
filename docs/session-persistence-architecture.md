@@ -1,223 +1,220 @@
 # Session Persistence Architecture
 
-Bcode keeps session `*.events` files as the canonical append-only history, but normal daemon startup, catalog listing, session opening, and paged history reads must not replay every persisted transcript. The scalable architecture uses canonical logs plus rebuildable sidecars:
+## Canonical storage and authority
 
-* `sessions/<session-id>.events` is the durable source of truth.
-* `sessions/index/<session-id>.index.json` is the primary metadata sidecar for catalog/startup metadata.
-* `sessions/index/<session-id>.entries.jsonl` is the primary entry sidecar for sequence-to-offset lookup.
-* Derived sidecars under `sessions/index/<session-id>/` store projection-specific data such as transcript spans and input history.
+A Bcode session id maps to exactly one canonical database:
 
-The event log is authoritative, but normal runtime paths must not automatically rebuild indexes from it. Full event-log replay belongs to explicit maintenance operations such as doctor-with-fix, reindex,
-repair, or a versioned data migration. Known projection schema upgrades may rebuild derived state
-automatically when a session database is opened, provided the migration strictly validates canonical
-history, replaces the projection atomically, and leaves canonical events unchanged. Unknown schema
-versions and same-version stale or corrupt projections remain repair-required rather than being
-silently rebuilt.
+```text
+<state-dir>/sessions/<session-id>/session.db
+```
+
+The `events` table in that database is the authoritative ordered session history. Canonical event
+rows are append-only and sequence-contiguous. Writer epochs, daemon namespaces, protocol versions,
+and build fingerprints never select a different session root, directory, database, or history.
+They are compatibility and routing metadata only.
+
+Other authoritative session-owned state, such as composer drafts, lives in explicitly designated
+tables in the same per-session database. It is authoritative for that state but is not transcript
+history.
+
+The default production session root is resolved only by
+`bcode_config::default_session_store_dir()`. Low-level session APIs accept an explicit root for
+tests, imports, and isolated stores, but all production default paths use the same canonical root.
+`bcode_session::db::session_dir_path` and `session_db_path` own per-session path construction.
+
+## On-disk layout
+
+```text
+<state-dir>/sessions/
+  <session-id>/
+    session.db             # authoritative database
+    session.db-wal         # database implementation sidecar
+    session.db-shm         # database implementation sidecar
+    manifest.json          # derived discovery/display cache
+  catalog.db               # legacy derived catalog cache
+  catalogs/
+    <build-namespace>/
+      catalog.db           # derived catalog cache
+  locks/                   # cross-process coordination
+  leases/                  # live compatibility-owner metadata
+```
+
+Classification:
+
+* `session.db` is authoritative for canonical events and session-owned database state.
+* WAL/SHM files are database implementation sidecars and must be handled through Bcode's Turso
+  repair path.
+* Materialized projection tables are derived from canonical events and may be rebuilt only by a
+  controlled migration, reindex, or repair operation.
+* `manifest.json` and every catalog database are disposable discovery caches. Missing, stale, or
+  build-scoped catalog state must never hide a canonical session directory or replace canonical
+  event history.
+* Lock and lease files are coordination metadata, not session history.
+
+## Catalog discovery
+
+Catalog discovery is best-effort, bounded, and non-mutating:
+
+* Enumerate UUID-shaped directories directly under the canonical session root.
+* Merge namespaced catalog rows, legacy catalog rows, and manifests as display caches.
+* Ensure every directory containing `session.db` remains represented even when all caches are
+  missing or stale.
+* Do not run schema migration, projection rebuild, repair, or full canonical replay while listing.
+* A damaged session should remain visible with degraded or repair-required state rather than
+  disappearing from the catalog.
+
+Build-namespaced catalogs may coexist because they are rebuildable caches. They do not create
+build-specific session storage and cannot choose which session history is opened.
 
 ## Session database open modes
 
-Per-session database access is split by capability:
+Per-session access is split by capability:
 
-* `open_existing_turso_in_root` is the non-migrating existing runtime/read path. It requires the
-  database file to exist and does not create directories, run DDL, or rebuild projections.
-* The manager serializes first load per session, classifies the migration ledger plus writer
-  contract, and acquires a runtime lease only after rechecking compatibility while ownership is
-  held. Known legacy storage is migrated automatically only under exclusive maintenance and the
-  capability-bound write lock. Schema migrations, full derived-projection replay, validation, and
-  writer-contract advancement commit in one transaction; canonical events and drafts are preserved.
-  Unknown migration IDs, dirty migration records, future writers, inconsistent contract state,
-  malformed canonical history, and same-version projection damage fail closed without migration.
-  Competing current daemons may converge after one wins migration, while any genuinely active
-  legacy owner continues to block migration.
-* `initialize_turso_in_root` creates a brand-new database with the complete current schema and
-  refuses to overwrite an existing database.
-* `migrate_turso_in_root` is the explicit migration path. Its signature requires both a held
-  `SessionMaintenanceGuard` and `SessionWriteGuard`; it runs schema migrations and controlled known
-  projection migration only while those guards remain borrowed.
-* compatibility `open_turso*` entry points initialize only missing databases and otherwise use the
-  non-migrating existing path. They must never be used as a migration trigger.
+* `open_existing_turso_in_root` opens an existing database without creating directories, running
+  DDL, or rebuilding projections.
+* `initialize_turso_in_root` creates a new database with the complete current schema and refuses to
+  overwrite an existing database.
+* `migrate_turso_in_root` requires borrowed `SessionMaintenanceGuard` and `SessionWriteGuard`
+  capabilities. Schema migration, full derived-projection replay, validation, and writer-contract
+  advancement commit in one transaction.
+* Compatibility `open_turso*` entry points initialize only missing databases. Existing databases
+  use the non-migrating open.
 
-Health, doctor, validation, and semantic audit paths use the existing non-migrating open. Explicit
-reindex also requires borrowed maintenance and write guards in its API, preventing an uncoordinated
-caller from invoking it accidentally. The session manager may invoke `migrate_turso_in_root` while
-loading a known legacy writer epoch, but only after acquiring exclusive maintenance and the
-capability-bound write lock. It then validates write readiness and atomically transitions
-maintenance ownership to the runtime lease. Any live session owner blocks this automatic migration;
-unknown/future writer epochs and same-version stale or corrupt projections remain repair-required.
+Health, doctor, diagnosis, catalog, and audit paths remain non-migrating. The session manager is the
+single controlled automatic-migration entry point during first real load.
 
-Lock acquisition order for ordinary mutation is the shared session maintenance coordinator, session
-write lock, then database connection/transaction. Mutating maintenance first holds the coordinator
-exclusively, then obtains its capability-bound write lock, then opens the database/transaction.
-Never acquire these in reverse order. The shared coordinator lock is retained with every ordinary
-write guard, so exclusive maintenance waits for in-flight writes and blocks new write critical
-sections as well as new session leases.
+## Automatic legacy migration
 
-## Durable storage writer contract
+First load is serialized per session. The manager inspects the migration ledger and durable storage
+contract without mutation, then follows one of these paths:
 
-Every session database contains a singleton `session_storage_contract` row with a versioned writer
-epoch. A mutation-capable process must advertise an explicit storage writer epoch in its session
-lease and must validate the durable row inside each event-append transaction before inserting the
-canonical event. Missing and unknown/future epochs fail closed with a migration-required error;
-IPC protocol and build fingerprint are diagnostic metadata, not storage compatibility proofs.
-Non-event session mutations such as composer drafts perform the same durable check.
+* Current storage: acquire a compatible runtime lease and recheck compatibility while ownership is
+  held.
+* Known legacy storage: acquire exclusive maintenance ownership, then the maintenance write lock,
+  reopen and reclassify, migrate atomically, validate write readiness, and transition maintenance
+  ownership directly into the runtime lease.
+* Unknown migration ids, dirty or failed migration records, future writer epochs, unsupported
+  contract schemas, malformed canonical history, or ledger/contract inconsistencies: fail closed
+  without mutation.
 
-The current contract-aware baseline uses writer epoch `2`. Databases with a known pre-contract
-migration prefix and no contract row are reported as known legacy epoch `1`; a missing row after the
-ledger records contract initialization is inconsistent and repair-required. Mutation fails closed until explicit guarded
-migration installs epoch `2`. Explicit migration rebuilds and validates model context, verifies all
-required projection checkpoints at the canonical tail, and updates the writer contract in the same
-database transaction. Any validation/rebuild failure rolls the entire transaction back, preserving
-the previous projection and writer epoch.
+Any live session owner blocks legacy migration. If two current daemons race, one may complete the
+migration while the other retries against the now-current database. No current runtime lease is
+installed after migration failure.
 
-The writer epoch must be bumped whenever a released writer would be unable to preserve canonical
-append atomicity under the new code: adding or changing a required projector, changing required
-projection semantics/schema, adding writer-required tables or constraints (including turn-receipt
-persistence), or changing canonical event write rules. Read-only schema additions that old writers
-cannot damage do not by themselves require an epoch bump.
+Migration strictly validates contiguous canonical sequences and session identity, preserves
+canonical events and drafts, rebuilds all required derived projections through the same projector
+functions used by normal append, verifies checkpoints at the canonical tail, and updates the writer
+contract only when validation succeeds.
 
-Session access compatibility is defined by equal storage writer epochs. Different builds may share
-a session only when they implement the same storage writer contract. A loaded session actor retains
-its compatibility lease while idle even if it drops cached database and event state, preventing an
-incompatible daemon from claiming the session between model/tool operations. Catalog discovery and
-listing remain lease-free.
+## Durable writer contract
 
-Daemon build fingerprints isolate IPC endpoints and client routing; they are not a global storage
-lock. Different fingerprints and writer epochs may run concurrently. Every session remains under
-the single canonical `sessions/<session-id>/` root. Compatibility is enforced per session through
-its lease metadata and durable database writer contract; writer epochs never select a filesystem
-root or hide sessions from the catalog.
+`session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
+advertise their epoch in session leases and validate the durable row before mutation. The current
+contract-aware baseline is epoch `2`.
 
-Each daemon registry record advertises its writer epoch for diagnostics and optional administration.
-`bcode server retire-incompatible` is optional and is never part of normal daemon startup. An
-incompatible daemon may run concurrently, but its attempt to claim or mutate a session owned by a
-different epoch fails specifically for that session. Explicit migration requires exclusive target
-session maintenance ownership; unrelated old daemons do not block startup or other sessions.
+A known pre-contract migration prefix with no contract table/row is legacy epoch `1`. A missing
+contract after the migration ledger says contract initialization completed is inconsistent and
+repair-required. Future epochs are never downgraded or automatically migrated.
 
-## Projection append invariants
+The writer epoch must change whenever an older writer could no longer preserve canonical append
+atomicity or required projections. Epoch values govern compatibility, never filesystem location.
 
-A canonical append and all required projections are one transaction. Before insertion, the append
-path validates the next canonical sequence, writer epoch, and each required projection's schema and
-checkpoint against the previous canonical tail. A projector owns its checkpoint and advances it only
-after its projection update succeeds. Incompatible, missing, or discontinuous required projections
-reject and roll back the append; they are never silently skipped and never receive blanket checkpoint
-advancement.
+## Lock order and ownership
 
-## Current implementation direction
+The required lock order is:
 
-Startup loads session catalog state from fresh sidecar indexes when possible. A valid metadata index contains enough data for session listing and safe appends without decoding the full event payload stream:
+1. session maintenance coordinator;
+2. session write lock;
+3. database connection/transaction.
 
-* session id and index version
-* event file fingerprint: length and mtime
-* session summary/title
-* next sequence number
-* decoded event count
-* whether a user message exists, for auto-title behavior
-* latest model/provider selection
-* latest agent selection
-* latest compaction sequence
-* metered token total
-* corruption/degradation records from index rebuild
+Ordinary compatible writers share maintenance coordination and serialize write critical sections.
+Mutating maintenance holds the coordinator exclusively, refuses every live owner, and then acquires
+the write lock. Never acquire these capabilities in reverse order.
 
-Paged history reads use the per-event JSONL entry index (`sequence`, byte offset, frame length, event kind, schema version) and seek directly to requested frames. Newly created sessions keep an in-memory history cache until restart; catalog-only restored sessions do not hydrate full histories for listing, status, paged history, or recent attach.
+A loaded actor retains its compatibility lease while dropping idle database/event caches. This
+prevents an incompatible writer from claiming the session between operations.
 
-When the metadata index is stale but the entry index is trustworthy, normal paths may catch metadata up incrementally from the indexed tail. When sidecars are missing, corrupt, internally inconsistent, or otherwise untrustworthy, normal open/attach/history paths should return an explicit repair-required error instead of replaying the whole log.
+## Historical epoch-root recovery
 
-## Catalog discovery rules
+An earlier, reverted implementation briefly wrote sessions beneath:
 
-The catalog is best-effort and non-mutating for damaged sessions:
+```text
+<state-dir>/session-storage/writer-epoch-2/
+```
 
-* A bad session file or bad sidecar must not fail the whole native session catalog.
-* Catalog discovery may do bounded first-event discovery from the canonical event log to recover display metadata.
-* If an event log has an unindexed tail after that first frame, catalog discovery must not write partial metadata or entry indexes.
-* Synthesized catalog entries with unknown/unindexed tails must be treated as degraded or read-only until explicit repair/reindex validates the log.
-* Bad entry indexes, such as a first entry that does not point at offset `0` or does not identify `session_created`, must not be trusted for catalog synthesis.
-* Catalog status should surface degraded/native repair-needed state without triggering repair.
+Only `bcode_session::legacy_storage` may recognize this exact historical path. It is migration input,
+never an active session store.
 
-This preserves the important distinction between discovery and repair: catalog listing can show what is safely discoverable, but only explicit maintenance commands may scan and rebuild from canonical logs.
+Recovery rules:
 
-## Correctness rules
+* Never open the historical root through normal `SessionManager` access.
+* Relocate a complete session directory atomically only when no live owner exists and the canonical
+  destination is absent.
+* Never merge, overwrite, or silently choose between duplicate historical and canonical sessions.
+* Report live-owner blocks and destination conflicts for diagnosis.
+* Remove empty historical coordination/root directories after successful relocation.
+* Repeated recovery is idempotent.
 
-* The event log is canonical. Deleting an index must never lose session data.
-* Index writes are atomic temp-file + rename writes.
-* Normal catalog/open/attach/history/model-context paths must not call full event-log replay or repair rebuild functions.
-* Missing/corrupt sidecars on normal paths should become degraded or repair-required state, not implicit rebuilds.
-* Derived indexes are projection caches. Missing/invalid derived state should degrade that projection or require repair; stale-but-valid derived state may catch up incrementally from its checkpoint.
-* Repair should quarantine or truncate only clearly invalid tails after creating a backup. Middle-frame decode failures should mark the session degraded because the frame boundary may still be structurally valid even if the payload schema is incompatible.
+## Canonical append and projections
 
-## API direction
+A canonical append and all required projection updates are one transaction. Before insertion, the
+append path validates:
 
-The legacy full-history APIs remain for compatibility, but new code should prefer bounded and projected access:
+* the durable writer epoch;
+* the next contiguous event sequence;
+* every required projection schema;
+* every required projection checkpoint against the prior canonical tail.
 
-* `SessionManager::session_history_page`
-* IPC `SessionHistoryPage`
-* client `session_history_page`
-* lightweight selection projections such as current agent and current model
+Each projector advances only its own checkpoint after its projection update succeeds. Missing,
+stale, incompatible, or discontinuous required projections reject and roll back the append.
 
-The TUI uses a recent-page attach path for initial load and requests/prepends older pages when the user scrolls near the top of the loaded transcript. Model request construction uses a session projection that starts at the latest compaction boundary when available instead of hydrating the entire raw log.
+Required projections include current session state, input history, transcript spans, tool runs,
+artifact references, runtime work, request-context occupancy, model context, and turn receipts.
+Normal reads never silently rebuild them.
 
-## Maintenance commands
+## Normal bounded reads
 
-CLI maintenance commands provide explicit repair ergonomics. These commands may scan canonical event logs and rebuild sidecars:
+Normal attach and history paths use database projections and bounded range queries. They do not full
+replay canonical events or invoke repair. Full history remains available for explicit export,
+diagnosis, and maintenance.
 
-* `bcode session doctor [session-id]` diagnoses a session database with Bcode's native Turso stack without mutating files.
-* `bcode session doctor --catalog` diagnoses the global catalog database.
-* `bcode session doctor --scan` diagnoses the catalog and all discovered session databases.
-* `bcode session repair <session-id>` acquires the session lease, backs up the session directory, removes stale WAL index sidecars, and truncates only clearly incomplete final WAL frames.
-* `bcode session repair --catalog` backs up and repairs the global catalog database with the same stale-sidecar/truncated-tail limits.
-* `bcode session repair --scan --dry-run` reports planned repair actions across the catalog and all discovered sessions.
-* Future `bcode session reindex [session-id]` support may rebuild sidecar indexes from canonical event logs.
+Model context begins at the latest valid local or provider compaction boundary and reads the current
+projection. Same-version stale or corrupt projections remain repair-required; only a controlled
+versioned migration may rebuild known legacy projection state automatically.
 
-Repair must use Bcode's native Turso open path for validation. Do not invoke stock SQLite checkpoint/repair as the primary repair path. Do not invoke these repair paths implicitly from catalog listing, session picker display, normal attach, or paged history reads.
+## Repair and maintenance
+
+Maintenance commands are explicit:
+
+* `bcode session diagnose <session-id>` reports writer, projection, canonical-tail, and ownership
+  state without mutation.
+* `bcode session doctor` diagnoses database and WAL state without mutation.
+* `bcode session repair` acquires exclusive maintenance ownership, creates backups, and performs
+  only supported database-sidecar/tail repair.
+* `bcode session reindex` acquires maintenance and write capabilities before rebuilding projections.
+
+Repair uses Bcode's native Turso stack. Stock SQLite checkpoint/repair is not the primary recovery
+path. Catalog listing, picker display, normal attach, and paged history must never invoke repair.
 
 ## Finalized artifact references
 
-Finalized plugin artifacts are resolved through the per-session `artifact_references` materialized projection. The projection is keyed by artifact id and reference key and stores only generic lookup data:
+Finalized plugin artifacts are resolved through the `artifact_references` projection, keyed by
+artifact id and reference key. It stores generic producer/schema identity, storage URI, content
+type, projected length, availability/completeness, checksum, and finalizing event sequence.
 
-* producer and schema identity;
-* storage URI and content type;
-* projected byte length;
-* generic availability and completeness;
-* generic SHA-256 integrity metadata;
-* the canonical event sequence that finalized the reference.
+Artifact range reads use this projection and bounded file ranges. The projection checkpoint must
+equal the canonical event tail. Missing/stale projection state surfaces `ProjectionStale`; malformed
+state surfaces repair-required. Relative and supported legacy absolute/file references are accepted
+only after canonical path confinement beneath the session artifact root.
 
-Normal artifact range reads must use this projection and bounded file ranges. They must not scan `ToolCallFinished` events or load complete session history. The projection checkpoint must equal the canonical event tail. Missing or stale checkpoints surface `ProjectionStale`; malformed projection state surfaces `RepairRequired`. Normal reads never backfill or rebuild this projection.
+## Non-negotiable invariants
 
-Range responses include current file length, projected reference length, finalizing sequence, availability/completeness, checksum, and returned bytes. Current relative references are resolved beneath the session artifact root. Supported legacy absolute/file references remain readable only after canonical path confinement verifies that the target remains beneath that root. Blocking metadata, seek, and read operations run outside async runtime workers.
-
-### Finalized artifact reference projection
-
-Finalized plugin artifact references are materialized transactionally from semantic
-`ToolCallFinished` events into the per-session `artifact_references` table. The projection is keyed
-by `(artifact_id, reference_key)` and contains only generic producer/schema identity, confined
-storage URI, content type, byte length, availability/completeness, checksum, and the canonical
-finalizing sequence. Its materialized-projection checkpoint must equal the canonical event tail;
-missing or stale checkpoints fail with `ProjectionStale` rather than triggering replay or repair.
-
-Normal artifact range reads resolve this projection with one keyed lookup and perform a bounded
-file seek/read behind a blocking boundary. They must never call `session_history()`, scan
-`ToolCallFinished` events, rebuild indexes, or infer shell-specific meaning. Active artifacts use
-the separate in-memory live registry until the durable projection becomes visible; finalized live
-registrations remain available during that handoff so readers do not observe a missing-reference
-window.
-
-The architecture guard verifies that the checkpointed projection exists, normal server artifact
-reads call `finalized_artifact_reference()`, and those reads do not call `session_history()`.
-
-## Architecture guardrails
-
-Run the session architecture guard before finishing session persistence changes:
-
-```sh
-scripts/check-session-architecture.sh
-```
-
-This includes the normal-path full-scan guard and checks for session actor/store layering violations.
-
-## Migration stages
-
-1. Add sidecar indexes and lazy catalog startup.
-2. Add bounded history APIs over IPC/client/session.
-3. Move server hot paths that only need current model/agent to index-backed projections.
-4. Migrate initial TUI attach to recent-page loading.
-5. Introduce a versioned/checksummed v2 event frame while keeping the legacy reader.
-6. Keep normal paths bounded and move full replay/rebuild behavior behind explicit repair/reindex commands.
+* A session id has one canonical database path.
+* Writer epoch and build identity never choose storage location.
+* The `events` table is canonical history.
+* Catalogs, manifests, projections, and in-memory state are derived.
+* Catalog damage cannot hide canonical session directories.
+* Normal reads do not migrate, repair, or full replay.
+* Automatic migration applies only to known legacy state under exclusive ownership.
+* Unknown, future, dirty, ambiguous, or corrupt storage fails closed.
+* Historical duplicate roots are never merged automatically.

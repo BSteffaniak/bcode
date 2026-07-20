@@ -60,6 +60,7 @@ bcode_client               = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_question_plugin      = { workspace = true, features = ["static-bundled"] }
 bcode_shell_plugin         = { workspace = true, features = ["static-bundled"] }
+switchy                    = { workspace = true, features = ["database", "database-schema"] }
 tempfile                   = { workspace = true }
 
 [features]

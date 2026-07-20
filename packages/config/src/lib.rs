@@ -3783,6 +3783,12 @@ pub fn default_state_dir() -> PathBuf {
     default_state_dir_with_environment(&ProcessConfigEnvironment)
 }
 
+/// Return the canonical default Bcode session store directory.
+#[must_use]
+pub fn default_session_store_dir() -> PathBuf {
+    default_state_dir().join("sessions")
+}
+
 /// Return the default Bcode state directory for an explicit environment.
 #[must_use]
 pub fn default_state_dir_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {

@@ -237,10 +237,16 @@ pub fn namespaced_catalog_db_path(root: &Path, namespace: &str) -> std::path::Pa
     root.join("catalogs").join(namespace).join("catalog.db")
 }
 
+/// Return Bcode's canonical per-session directory under `root`.
+#[must_use]
+pub fn session_dir_path(root: &Path, session_id: SessionId) -> std::path::PathBuf {
+    root.join(session_id.to_string())
+}
+
 /// Return Bcode's default per-session database path for `session_id`.
 #[must_use]
 pub fn session_db_path(root: &Path, session_id: SessionId) -> std::path::PathBuf {
-    root.join(session_id.to_string()).join("session.db")
+    session_dir_path(root, session_id).join("session.db")
 }
 
 /// Typed tool-run projection row stored in a per-session database.

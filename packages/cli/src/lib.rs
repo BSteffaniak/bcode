@@ -6455,7 +6455,7 @@ struct SessionDiagnosisTrace {
 }
 
 async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliError> {
-    let root = bcode_config::default_state_dir().join("sessions");
+    let root = bcode_config::default_session_store_dir();
     let database_path = bcode_session::db::session_db_path(&root, session_id);
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
     let writer_epoch = db.storage_writer_epoch().await.ok();
@@ -6508,7 +6508,7 @@ async fn audit_semantic_result_migration(
     root: Option<PathBuf>,
     json: bool,
 ) -> Result<(), CliError> {
-    let root = root.unwrap_or_else(|| bcode_config::default_state_dir().join("sessions"));
+    let root = root.unwrap_or_else(bcode_config::default_session_store_dir);
     let report = bcode_session::semantic_migration::audit_semantic_result_migration(&root).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -6640,7 +6640,7 @@ const fn repair_cli_output(json: bool) -> SessionRepairCliOutput {
 }
 
 async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliError> {
-    let root = bcode_config::default_state_dir().join("sessions");
+    let root = bcode_config::default_session_store_dir();
     let maintenance = bcode_session::lease::acquire_session_maintenance_guard(&root, session_id)?;
     let write = bcode_session::lease::acquire_maintenance_session_write_lock(
         &maintenance,
@@ -6677,11 +6677,14 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
 }
 
 async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<(), CliError> {
-    let root = bcode_config::default_state_dir().join("sessions");
+    let root = bcode_config::default_session_store_dir();
     let dry_run = matches!(options.mode, SessionRepairCliMode::DryRun);
     let mut reports = Vec::new();
     match options.target {
         SessionRepairCliTarget::Scan => {
+            reports.push(bcode_session::repair::doctor_legacy_storage(
+                root.parent().unwrap_or(&root),
+            )?);
             reports.push(repair_catalog_report(&root, dry_run).await?);
             for session_id in discover_session_ids(&root)? {
                 reports.push(repair_session_report(&root, session_id, dry_run).await?);
@@ -6792,6 +6795,7 @@ fn print_repair_report(report: &bcode_session::repair::RepairReport) {
 
 fn repair_target_label(target: &bcode_session::repair::RepairTarget) -> String {
     match target {
+        bcode_session::repair::RepairTarget::LegacyStorage => "legacy storage".to_owned(),
         bcode_session::repair::RepairTarget::Session { session_id } => {
             format!("session {session_id}")
         }

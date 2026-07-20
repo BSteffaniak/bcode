@@ -14,56 +14,11 @@
 //! Normal model-context reads return that marker plus later semantic events without replaying or
 //! repairing the complete event log.
 
-/// Relocate sessions accidentally written to the temporary epoch-partitioned root back into the
-/// canonical session directory.
-///
-/// This is narrowly scoped remediation for the removed epoch-root implementation. Sessions with a
-/// live owner or an existing canonical destination are left untouched and retried on a later
-/// startup. No database is opened or rewritten.
-///
-/// # Errors
-///
-/// Returns an error when directory inspection, coordination, or atomic relocation fails.
-pub fn recover_accidental_epoch_session_root(state_dir: &Path) -> Result<usize, SessionStoreError> {
-    let accidental_root = state_dir.join("session-storage").join("writer-epoch-2");
-    let Ok(entries) = fs::read_dir(&accidental_root) else {
-        return Ok(0);
-    };
-    let canonical_root = state_dir.join("sessions");
-    let mut session_ids = entries
-        .flatten()
-        .filter_map(|entry| {
-            entry.file_type().ok().filter(std::fs::FileType::is_dir)?;
-            entry.file_name().to_str()?.parse::<SessionId>().ok()
-        })
-        .collect::<Vec<_>>();
-    session_ids.sort_unstable();
-    let mut relocated = 0;
-    for session_id in session_ids {
-        let source = accidental_root.join(session_id.to_string());
-        let destination = canonical_root.join(session_id.to_string());
-        if destination.exists() {
-            continue;
-        }
-        let source_maintenance =
-            match lease::acquire_session_maintenance_guard(&accidental_root, session_id) {
-                Ok(guard) => guard,
-                Err(lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => continue,
-                Err(error) => return Err(SessionStoreError::Lease(error)),
-            };
-        let destination_maintenance =
-            lease::acquire_session_maintenance_guard(&canonical_root, session_id)?;
-        if destination.exists() {
-            continue;
-        }
-        fs::create_dir_all(&canonical_root)?;
-        fs::rename(&source, &destination)?;
-        relocated += 1;
-        drop(destination_maintenance);
-        drop(source_maintenance);
-    }
-    Ok(relocated)
-}
+pub mod legacy_storage;
+pub use legacy_storage::{
+    LegacyStorageInspectionReport, LegacyStorageRecoveryReport,
+    inspect_accidental_epoch_session_root, recover_accidental_epoch_session_root,
+};
 
 mod actor;
 pub mod db;
@@ -330,12 +285,22 @@ impl SessionStore {
 
     fn load_catalog(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
         let mut summaries = if self.catalog_db_path().exists() {
-            self.load_global_catalog_summaries()?
+            match self.load_global_catalog_summaries() {
+                Ok(summaries) => summaries,
+                Err(error) => {
+                    eprintln!("ignoring unreadable derived session catalog: {error}");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
         summaries.extend(self.load_session_manifests()?);
-        summaries.extend(self.load_legacy_catalog_summaries()?);
+        summaries.extend(self.discover_canonical_session_summaries()?);
+        match self.load_legacy_catalog_summaries() {
+            Ok(legacy) => summaries.extend(legacy),
+            Err(error) => eprintln!("ignoring unreadable legacy session catalog: {error}"),
+        }
         summaries.sort_by(|left, right| {
             left.id
                 .cmp(&right.id)
@@ -356,7 +321,11 @@ impl SessionStore {
 
     fn backfill_catalog(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
         let mut summaries = self.load_session_manifests()?;
-        summaries.extend(self.load_legacy_catalog_summaries()?);
+        summaries.extend(self.discover_canonical_session_summaries()?);
+        match self.load_legacy_catalog_summaries() {
+            Ok(legacy) => summaries.extend(legacy),
+            Err(error) => eprintln!("ignoring unreadable legacy session catalog: {error}"),
+        }
         summaries.sort_by(|left, right| {
             left.id
                 .cmp(&right.id)
@@ -372,6 +341,38 @@ impl SessionStore {
         Ok(summaries)
     }
 
+    fn discover_canonical_session_summaries(
+        &self,
+    ) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let mut summaries = Vec::new();
+        if !self.root.exists() {
+            return Ok(summaries);
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            let Some(session_id) = canonical_session_id_from_dir(&path) else {
+                continue;
+            };
+            if !db::session_db_path(&self.root, session_id).exists() {
+                continue;
+            }
+            summaries.push(SessionSummary {
+                id: session_id,
+                name: None,
+                explicit_name: None,
+                derived_title: None,
+                title_source: SessionTitleSource::EmptyDraft,
+                client_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                working_directory: self.root.clone(),
+                import: None,
+                fork: None,
+            });
+        }
+        Ok(summaries)
+    }
+
     fn load_session_manifests(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
         let mut summaries = Vec::new();
         if !self.root.exists() {
@@ -379,14 +380,7 @@ impl SessionStore {
         }
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
-            if !path.is_dir() || path.file_name().is_some_and(|name| name == "catalogs") {
-                continue;
-            }
-            let Some(session_id) = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.parse::<SessionId>().ok())
-            else {
+            let Some(session_id) = canonical_session_id_from_dir(&path) else {
                 continue;
             };
             match self.load_session_manifest(session_id) {
@@ -510,7 +504,7 @@ impl SessionStore {
     }
 
     fn session_manifest_path(&self, session_id: SessionId) -> PathBuf {
-        self.root.join(session_id.to_string()).join("manifest.json")
+        db::session_dir_path(&self.root, session_id).join("manifest.json")
     }
 
     fn catalog_namespace(&self) -> Option<String> {
@@ -1816,9 +1810,9 @@ impl SessionManager {
             {
                 eprintln!("failed to remove session from scoped catalog: {error}");
             }
-            let session_db_path = db::session_db_path(&store.root_path(), session_id);
-            if let Some(session_dir) = session_db_path.parent() {
-                match std::fs::remove_dir_all(session_dir) {
+            let session_dir = db::session_dir_path(&store.root_path(), session_id);
+            if session_dir.exists() {
+                match std::fs::remove_dir_all(&session_dir) {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => return Err(SessionStoreError::Io(error).into()),
@@ -3668,6 +3662,12 @@ fn current_unix_millis() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+fn canonical_session_id_from_dir(path: &Path) -> Option<SessionId> {
+    path.is_dir()
+        .then(|| path.file_name()?.to_str()?.parse::<SessionId>().ok())
+        .flatten()
 }
 
 fn safe_catalog_namespace(value: &str) -> String {
@@ -6579,6 +6579,92 @@ mod tests {
         let sessions = restored.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].name.as_deref(), Some("New title"));
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn canonical_database_remains_visible_without_manifest_or_catalog() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent_with_metrics_and_lease_owner(
+                &root,
+                MetricsRegistry::default(),
+                SessionLeaseOwnerContext {
+                    build_fingerprint: Some("discovery-build".to_owned()),
+                    ..SessionLeaseOwnerContext::default()
+                },
+            )
+            .expect("manager should initialize");
+            manager
+                .create_session(Some("canonical".to_owned()), test_working_directory())
+                .await
+                .expect("session")
+                .id
+        };
+        std::fs::remove_file(db::session_dir_path(&root, session_id).join("manifest.json"))
+            .expect("remove manifest");
+        std::fs::remove_dir_all(root.join("catalogs")).expect("remove catalogs");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        assert!(
+            restored
+                .all_session_summaries()
+                .await
+                .iter()
+                .any(|session| session.id == session_id),
+            "canonical session directory must not be hidden by missing caches"
+        );
+        restored
+            .require_write_readiness(session_id)
+            .await
+            .expect("canonical database should load");
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn unreadable_catalog_cache_does_not_hide_canonical_database() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent_with_metrics_and_lease_owner(
+                &root,
+                MetricsRegistry::default(),
+                SessionLeaseOwnerContext {
+                    build_fingerprint: Some("corrupt-cache".to_owned()),
+                    ..SessionLeaseOwnerContext::default()
+                },
+            )
+            .expect("manager should initialize");
+            manager
+                .create_session(Some("canonical".to_owned()), test_working_directory())
+                .await
+                .expect("session")
+                .id
+        };
+        std::fs::remove_file(db::session_dir_path(&root, session_id).join("manifest.json"))
+            .expect("remove manifest");
+        let catalogs = root.join("catalogs");
+        std::fs::remove_dir_all(&catalogs).expect("remove catalogs");
+        let catalog = db::namespaced_catalog_db_path(&root, "corrupt-cache");
+        std::fs::create_dir_all(catalog.parent().expect("catalog parent"))
+            .expect("create catalog parent");
+        std::fs::write(&catalog, b"not a database").expect("corrupt catalog");
+
+        let restored = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                build_fingerprint: Some("corrupt-cache".to_owned()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("derived catalog damage must not fail discovery");
+        assert!(
+            restored
+                .all_session_summaries()
+                .await
+                .iter()
+                .any(|session| session.id == session_id)
+        );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

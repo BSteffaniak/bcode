@@ -10,11 +10,39 @@ if rg -n 'incompatible_storage_writer_records|ensure_daemon_storage_compatibilit
   violations=1
 fi
 
-if ! rg -q 'default_state_dir\(\)\.join\("sessions"\)' packages/server/src/lib.rs \
+if ! rg -q 'pub fn default_session_store_dir\(\)' packages/config/src/lib.rs \
+  || rg -n 'default_state_dir\(\)\.join\("sessions"\)' packages/server/src packages/cli/src --glob '*.rs' \
+    >/tmp/bcode-default-session-root-violations.txt \
   || rg -n 'session-storage|writer-epoch-' packages/server/src packages/cli/src --glob '*.rs' \
     >/tmp/bcode-split-session-root-violations.txt; then
-  echo "Session storage-root violation: all sessions must use the canonical sessions directory; writer epochs are per-session metadata." >&2
+  echo "Session storage-root violation: production defaults must use bcode_config::default_session_store_dir; writer epochs are per-session metadata." >&2
+  cat /tmp/bcode-default-session-root-violations.txt >&2 2>/dev/null || true
   cat /tmp/bcode-split-session-root-violations.txt >&2 2>/dev/null || true
+  violations=1
+fi
+
+if rg -n 'join\("session-storage"\)|writer-epoch-' packages/session/src --glob '*.rs' \
+  | rg -v 'packages/session/src/legacy_storage\.rs' \
+  >/tmp/bcode-historical-session-root-violations.txt; then
+  echo "Session historical-root violation: only legacy_storage.rs may recognize the removed epoch root." >&2
+  cat /tmp/bcode-historical-session-root-violations.txt >&2
+  violations=1
+fi
+
+if ! rg -q 'session_dir_path\(root, session_id\)\.join\("session\.db"\)' packages/session/src/db.rs; then
+  echo "Session path violation: session_db_path must remain root/<session-id>/session.db." >&2
+  violations=1
+fi
+
+if rg -n '\*\.events|sessions/index/' docs/session-persistence-architecture.md >/tmp/bcode-stale-session-docs.txt; then
+  echo "Session documentation violation: obsolete file-log/index architecture is documented as current." >&2
+  cat /tmp/bcode-stale-session-docs.txt >&2
+  violations=1
+fi
+
+if sed -n '/async fn legacy_session_migrates_across_real_attach_and_send_ipc/,/^    }/p' packages/server/src/lib.rs \
+  | rg -q 'exec_raw'; then
+  echo "Session migration fixture violation: use typed Switchy delete/drop-table operations." >&2
   violations=1
 fi
 
@@ -33,7 +61,7 @@ if rg -n "handle\.state" packages/session/src/lib.rs >/tmp/bcode-session-actor-v
 fi
 
 if rg -n "std::fs|OpenOptions|fs::File|File::open|File::create" packages/session/src --glob '*.rs' \
-  | rg -v 'packages/session/src/(lib|index|reader|migration|semantic_migration|event_migration|legacy_stream_cleanup|derived|db|lease|repair)\.rs' \
+  | rg -v 'packages/session/src/(lib|index|reader|migration|semantic_migration|event_migration|legacy_storage|legacy_stream_cleanup|derived|db|lease|repair)\.rs' \
   >/tmp/bcode-session-fs-violations.txt; then
   echo "Session persistence architecture violation: direct filesystem access outside approved store modules." >&2
   cat /tmp/bcode-session-fs-violations.txt >&2
