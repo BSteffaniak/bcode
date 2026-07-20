@@ -39,7 +39,9 @@ use bcode_agent_profile::{
 };
 use bcode_agent_runtime::{
     CancellationToken, InvocationArtifactSink, InvocationCapabilityFuture,
-    InvocationExchangeBroker, InvocationInputRouter, InvocationServiceRouter,
+    InvocationExchangeBroker, InvocationInputRouter, InvocationServiceRouter, RegisteredTool,
+    RuntimeFuture, ToolAuthorizationCoordinator, ToolAuthorizationDecision,
+    ToolAuthorizationRequest, ToolSource, TurnGeneration, TurnScope,
 };
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
@@ -15244,72 +15246,12 @@ fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
     }
 }
 
-#[derive(Debug)]
-struct BatchAuthorizationGate {
-    remaining: AtomicUsize,
-    ready: Notify,
-}
-
-impl BatchAuthorizationGate {
-    fn new(participants: usize) -> Arc<Self> {
-        assert!(participants > 0, "authorization gate requires participants");
-        Arc::new(Self {
-            remaining: AtomicUsize::new(participants),
-            ready: Notify::new(),
-        })
-    }
-
-    fn participant(self: &Arc<Self>) -> BatchAuthorizationParticipant {
-        BatchAuthorizationParticipant {
-            gate: Arc::clone(self),
-            arrived: false,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct BatchAuthorizationParticipant {
-    gate: Arc<BatchAuthorizationGate>,
-    arrived: bool,
-}
-
-impl BatchAuthorizationParticipant {
-    async fn arrive_and_wait(mut self) {
-        self.arrive();
-        loop {
-            let ready = self.gate.ready.notified();
-            tokio::pin!(ready);
-            ready.as_mut().enable();
-            if self.gate.remaining.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            ready.await;
-        }
-    }
-
-    fn arrive(&mut self) {
-        if self.arrived {
-            return;
-        }
-        self.arrived = true;
-        if self.gate.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.gate.ready.notify_waiters();
-        }
-    }
-}
-
-impl Drop for BatchAuthorizationParticipant {
-    fn drop(&mut self) {
-        self.arrive();
-    }
-}
-
 async fn prepare_server_tool(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
-) -> Result<(String, ToolPreparationResponse), String> {
-    let (plugin_id, _) = find_tool_provider(state, &call.name)
+) -> Result<(RegisteredTool, ToolPreparationResponse), String> {
+    let (plugin_id, definition) = find_tool_provider(state, &call.name)
         .await?
         .ok_or_else(|| format!("tool not found: {}", call.name))?;
     let request = ToolPreparationRequest {
@@ -15331,7 +15273,206 @@ async fn prepare_server_tool(
         )
         .await
         .map_err(|error| error.to_string())?;
-    Ok((plugin_id, preparation))
+    Ok((RegisteredTool::plugin(definition, plugin_id), preparation))
+}
+
+#[derive(Clone, Copy)]
+struct ServerAuthorizationCoordinator<'a> {
+    state: &'a ServerState,
+    session_id: SessionId,
+    cancel_state: &'a TurnCancelState,
+}
+
+impl<'a> ServerAuthorizationCoordinator<'a> {
+    const fn new(
+        state: &'a ServerState,
+        session_id: SessionId,
+        cancel_state: &'a TurnCancelState,
+    ) -> Self {
+        Self {
+            state,
+            session_id,
+            cancel_state,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn authorize_one(self, request: &ToolAuthorizationRequest) -> ToolAuthorizationDecision {
+        let policy_metadata =
+            match tool_policy_authorization_metadata(&request.facts, &request.call.name) {
+                Ok(metadata) => metadata,
+                Err(message) => {
+                    return ToolAuthorizationDecision::Deny(format!(
+                        "tool authorization facts invalid: {message}"
+                    ));
+                }
+            };
+        let policy = self
+            .state
+            .plugin_automation_policies
+            .lock()
+            .await
+            .get(&self.session_id)
+            .copied();
+        if read_only_policy_denies_tool(policy, Some(&policy_metadata)) {
+            return ToolAuthorizationDecision::Deny(
+                "tool denied by read-only inspection policy".to_string(),
+            );
+        }
+        let ToolSource::Plugin { plugin_id } = &request.tool.source else {
+            return ToolAuthorizationDecision::Deny(
+                "server cannot authorize a non-plugin tool".to_string(),
+            );
+        };
+        let agent_decision = evaluate_agent_tool_policy_with_metadata(
+            self.state,
+            self.session_id,
+            &request.call,
+            &policy_metadata,
+        )
+        .await;
+        append_trace_event(
+            self.state,
+            self.session_id,
+            None,
+            SessionTracePhase::ToolPolicyEvaluated,
+            SessionTracePayload::ToolPolicyEvaluated {
+                tool_call_id: request.call.id.clone(),
+                agent_id: session_agent_selection(self.state, self.session_id).await,
+                decision: agent_decision_name(agent_decision.decision).to_string(),
+                reason: agent_decision.reason.clone(),
+            },
+        )
+        .await;
+        let skill_decision = evaluate_active_skill_tool_policy_with_metadata(
+            self.state,
+            self.session_id,
+            &request.call.name,
+            &policy_metadata,
+        )
+        .await;
+        append_trace_event(
+            self.state,
+            self.session_id,
+            None,
+            SessionTracePhase::ToolPolicyEvaluated,
+            SessionTracePayload::ToolPolicyEvaluated {
+                tool_call_id: request.call.id.clone(),
+                agent_id: session_agent_selection(self.state, self.session_id).await,
+                decision: skill_tool_policy_decision_name(&skill_decision).to_string(),
+                reason: skill_tool_policy_reason(&skill_decision),
+            },
+        )
+        .await;
+        if let SkillToolPolicyOutcome::Deny { reason } = skill_decision {
+            return ToolAuthorizationDecision::Deny(reason);
+        }
+        if agent_decision.decision == AgentDecision::Deny {
+            return ToolAuthorizationDecision::Deny(
+                agent_decision
+                    .reason
+                    .unwrap_or_else(|| "tool denied by active agent policy".to_string()),
+            );
+        }
+
+        let skill_requests_permission =
+            matches!(skill_decision, SkillToolPolicyOutcome::Ask { .. });
+        let mut policy_context = PermissionPolicyContext {
+            source: None,
+            reason: agent_decision.reason,
+            skill_decision_key: None,
+        };
+        let should_ask = if agent_decision.decision == AgentDecision::Ask {
+            true
+        } else if skill_requests_permission {
+            let key =
+                skill_tool_decision_key(self.state, self.session_id, &request.call.name).await;
+            match key.as_ref().and_then(remembered_skill_tool_decision) {
+                Some(SkillToolDecision::Allow) => {
+                    append_trace_event(
+                        self.state,
+                        self.session_id,
+                        None,
+                        SessionTracePhase::ToolPolicyEvaluated,
+                        SessionTracePayload::ToolPolicyEvaluated {
+                            tool_call_id: request.call.id.clone(),
+                            agent_id: session_agent_selection(self.state, self.session_id).await,
+                            decision: "remembered_skill_allow".to_string(),
+                            reason: Some(
+                                "remembered skill tool decision allowed prompt skip".to_string(),
+                            ),
+                        },
+                    )
+                    .await;
+                    return ToolAuthorizationDecision::Allow;
+                }
+                Some(SkillToolDecision::Deny) => {
+                    append_trace_event(
+                        self.state,
+                        self.session_id,
+                        None,
+                        SessionTracePhase::ToolPolicyEvaluated,
+                        SessionTracePayload::ToolPolicyEvaluated {
+                            tool_call_id: request.call.id.clone(),
+                            agent_id: session_agent_selection(self.state, self.session_id).await,
+                            decision: "remembered_skill_deny".to_string(),
+                            reason: Some(
+                                "remembered skill tool decision denied tool call".to_string(),
+                            ),
+                        },
+                    )
+                    .await;
+                    return ToolAuthorizationDecision::Deny(
+                        "tool denied by remembered skill policy decision".to_string(),
+                    );
+                }
+                None => {
+                    policy_context = PermissionPolicyContext {
+                        source: Some("skill".to_string()),
+                        reason: skill_tool_policy_reason(&skill_decision),
+                        skill_decision_key: key,
+                    };
+                    true
+                }
+            }
+        } else {
+            false
+        };
+
+        if !should_ask {
+            return ToolAuthorizationDecision::Allow;
+        }
+        if request_tool_permission(
+            self.state,
+            self.session_id,
+            &request.call,
+            &request.call.name,
+            plugin_id,
+            self.cancel_state,
+            policy_context,
+        )
+        .await
+        {
+            ToolAuthorizationDecision::Allow
+        } else {
+            ToolAuthorizationDecision::Deny("permission denied".to_string())
+        }
+    }
+}
+
+impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
+    fn authorize_batch<'a>(
+        &'a self,
+        requests: &'a [ToolAuthorizationRequest],
+        _scope: &'a TurnScope,
+    ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
+        Box::pin(async move {
+            Ok(futures::future::join_all(
+                requests.iter().map(|request| self.authorize_one(request)),
+            )
+            .await)
+        })
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15356,7 +15497,7 @@ async fn execute_model_tool_batch(
                 prepare_server_tool(state, session_id, &call),
             ) => preparation,
         };
-        let (plugin_id, preparation) = match preparation {
+        let (tool, preparation) = match preparation {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(message)) => {
                 results.push((
@@ -15405,26 +15546,6 @@ async fn execute_model_tool_batch(
                     continue;
                 }
             };
-        let policy = state
-            .plugin_automation_policies
-            .lock()
-            .await
-            .get(&session_id)
-            .copied();
-        if read_only_policy_denies_tool(policy, Some(&policy_metadata)) {
-            results.push((
-                index,
-                Some(ToolFinishedEventInput {
-                    tool_call_id: call.id,
-                    result: "tool denied by read-only inspection policy".to_owned(),
-                    is_error: true,
-                    content: Vec::new(),
-                    output: None,
-                    semantic_result: None,
-                }),
-            ));
-            continue;
-        }
         let Ok(working_directory) = state.sessions.session_working_directory(session_id).await
         else {
             return false;
@@ -15435,15 +15556,93 @@ async fn execute_model_tool_batch(
             call.id.clone(),
             call.name.clone(),
             serde_json::to_string(&call.arguments).unwrap_or_default(),
-            Some(plugin_id.clone()),
+            match &tool.source {
+                ToolSource::Plugin { plugin_id } => Some(plugin_id.clone()),
+                ToolSource::Inline => None,
+            },
             &working_directory,
         )
         .await;
-        ready.push((index, call, working_directory, plugin_id, policy_metadata));
+        ready.push((
+            index,
+            call,
+            working_directory,
+            tool,
+            policy_metadata,
+            preparation.authorization,
+        ));
     }
 
     if !ready.is_empty() {
-        let authorization_gate = BatchAuthorizationGate::new(ready.len());
+        let permission_context = bcode_agent_runtime::RuntimePermissionContext {
+            session_id,
+            agent_id: session_agent_selection(state, session_id).await,
+        };
+        let authorization_requests = ready
+            .iter()
+            .map(
+                |(index, call, _, tool, _, facts)| ToolAuthorizationRequest {
+                    index: *index,
+                    call: call.clone(),
+                    tool: tool.clone(),
+                    facts: facts.clone(),
+                    context: permission_context.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let authorization_scope = TurnScope::without_events(
+            format!("server-tool-batch:{session_id}"),
+            TurnGeneration::new(0),
+        );
+        let coordinator =
+            ServerAuthorizationCoordinator::new(state, session_id, cancel_state.as_ref());
+        let authorization =
+            coordinator.authorize_batch(&authorization_requests, &authorization_scope);
+        let ProviderCallWait::Completed(Ok(decisions)) = wait_for_provider_call(
+            state,
+            session_id,
+            command_context,
+            cancel_state.as_ref(),
+            Box::pin(authorization),
+        )
+        .await
+        else {
+            return false;
+        };
+        if decisions.len() != ready.len() {
+            return false;
+        }
+        let mut approved = Vec::new();
+        for ((index, call, working_directory, tool, policy_metadata, _), decision) in
+            ready.into_iter().zip(decisions)
+        {
+            match decision {
+                ToolAuthorizationDecision::Allow => {
+                    approved.push((index, call, working_directory, tool, policy_metadata));
+                }
+                ToolAuthorizationDecision::Ask(reason)
+                | ToolAuthorizationDecision::Deny(reason) => results.push((
+                    index,
+                    Some(ToolFinishedEventInput {
+                        tool_call_id: call.id,
+                        result: reason,
+                        is_error: true,
+                        content: Vec::new(),
+                        output: None,
+                        semantic_result: None,
+                    }),
+                )),
+            }
+        }
+        if approved.is_empty() {
+            results.sort_by_key(|(index, _)| *index);
+            for (_, result) in results {
+                if let Some(result) = result {
+                    append_tool_finished_event(state, session_id, result).await;
+                }
+            }
+            return !cancel_state.is_cancelled();
+        }
         let invocation_permits = if state.tool_execution.parallel {
             state
                 .tool_execution
@@ -15452,13 +15651,25 @@ async fn execute_model_tool_batch(
         } else {
             Some(Arc::new(Semaphore::new(1)))
         };
-        let execution_count = ready.len();
-        let executions = stream::iter(ready.into_iter().map(
-            |(index, call, working_directory, plugin_id, policy_metadata)| {
+        let execution_count = approved.len();
+        let executions = stream::iter(approved.into_iter().map(
+            |(index, call, working_directory, tool, policy_metadata)| {
                 let cancel_state = Arc::clone(&cancel_state);
-                let authorization = authorization_gate.participant();
                 let invocation_permits = invocation_permits.clone();
                 async move {
+                    let ToolSource::Plugin { plugin_id } = tool.source else {
+                        return (
+                            index,
+                            Some(ToolFinishedEventInput {
+                                tool_call_id: call.id,
+                                result: "server cannot invoke a non-plugin tool".to_string(),
+                                is_error: true,
+                                content: Vec::new(),
+                                output: None,
+                                semantic_result: None,
+                            }),
+                        );
+                    };
                     (
                         index,
                         execute_model_tool(
@@ -15469,7 +15680,6 @@ async fn execute_model_tool_batch(
                             plugin_id,
                             policy_metadata,
                             cancel_state,
-                            Some(authorization),
                             invocation_permits,
                         )
                         .await,
@@ -15511,7 +15721,6 @@ async fn execute_model_tool(
     plugin_id: String,
     policy_metadata: ToolPolicyAuthorizationMetadata,
     cancel_state: Arc<TurnCancelState>,
-    authorization: Option<BatchAuthorizationParticipant>,
     invocation_permits: Option<Arc<Semaphore>>,
 ) -> Option<ToolFinishedEventInput> {
     let producer_plugin_id = Some(plugin_id.clone());
@@ -15544,7 +15753,6 @@ async fn execute_model_tool(
         &plugin_id,
         &policy_metadata,
         cancel_state.as_ref(),
-        authorization,
         invocation_permits,
     )
     .await
@@ -16177,7 +16385,6 @@ async fn invoke_model_tool(
     plugin_id: &str,
     policy_metadata: &ToolPolicyAuthorizationMetadata,
     cancel_state: &TurnCancelState,
-    authorization: Option<BatchAuthorizationParticipant>,
     invocation_permits: Option<Arc<Semaphore>>,
 ) -> Result<ToolInvocationResponse, String> {
     if cancel_state.is_cancelled() {
@@ -16189,181 +16396,6 @@ async fn invoke_model_tool(
             host_action: None,
             result: None,
         });
-    }
-    let agent_decision =
-        evaluate_agent_tool_policy_with_metadata(state, session_id, call, policy_metadata).await;
-    append_trace_event(
-        state,
-        session_id,
-        None,
-        SessionTracePhase::ToolPolicyEvaluated,
-        SessionTracePayload::ToolPolicyEvaluated {
-            tool_call_id: call.id.clone(),
-            agent_id: session_agent_selection(state, session_id).await,
-            decision: agent_decision_name(agent_decision.decision).to_string(),
-            reason: agent_decision.reason.clone(),
-        },
-    )
-    .await;
-    let skill_decision = evaluate_active_skill_tool_policy_with_metadata(
-        state,
-        session_id,
-        &call.name,
-        policy_metadata,
-    )
-    .await;
-    append_trace_event(
-        state,
-        session_id,
-        None,
-        SessionTracePhase::ToolPolicyEvaluated,
-        SessionTracePayload::ToolPolicyEvaluated {
-            tool_call_id: call.id.clone(),
-            agent_id: session_agent_selection(state, session_id).await,
-            decision: skill_tool_policy_decision_name(&skill_decision).to_string(),
-            reason: skill_tool_policy_reason(&skill_decision),
-        },
-    )
-    .await;
-    if let SkillToolPolicyOutcome::Deny { reason } = skill_decision {
-        return Ok(ToolInvocationResponse {
-            output: reason,
-            is_error: true,
-            content: Vec::new(),
-            full_output: None,
-            host_action: None,
-            result: None,
-        });
-    }
-    let skill_requests_permission = matches!(skill_decision, SkillToolPolicyOutcome::Ask { .. });
-    match agent_decision.decision {
-        AgentDecision::Deny => {
-            return Ok(ToolInvocationResponse {
-                output: agent_decision
-                    .reason
-                    .unwrap_or_else(|| "tool denied by active agent policy".to_string()),
-                is_error: true,
-                content: Vec::new(),
-                full_output: None,
-                host_action: None,
-                result: None,
-            });
-        }
-        AgentDecision::Ask => {
-            if !request_tool_permission(
-                state,
-                session_id,
-                call,
-                &call.name,
-                plugin_id,
-                cancel_state,
-                PermissionPolicyContext {
-                    source: None,
-                    reason: agent_decision.reason.clone(),
-                    skill_decision_key: None,
-                },
-            )
-            .await
-            {
-                return Ok(ToolInvocationResponse {
-                    output: "permission denied".to_string(),
-                    is_error: true,
-                    content: Vec::new(),
-                    full_output: None,
-                    host_action: None,
-                    result: None,
-                });
-            }
-        }
-        AgentDecision::Allow => {
-            if skill_requests_permission {
-                let skill_decision_key =
-                    skill_tool_decision_key(state, session_id, &call.name).await;
-                match skill_decision_key
-                    .as_ref()
-                    .and_then(remembered_skill_tool_decision)
-                {
-                    Some(SkillToolDecision::Allow) => {
-                        append_trace_event(
-                            state,
-                            session_id,
-                            None,
-                            SessionTracePhase::ToolPolicyEvaluated,
-                            SessionTracePayload::ToolPolicyEvaluated {
-                                tool_call_id: call.id.clone(),
-                                agent_id: session_agent_selection(state, session_id).await,
-                                decision: "remembered_skill_allow".to_string(),
-                                reason: Some(
-                                    "remembered skill tool decision allowed prompt skip"
-                                        .to_string(),
-                                ),
-                            },
-                        )
-                        .await;
-                    }
-                    Some(SkillToolDecision::Deny) => {
-                        append_trace_event(
-                            state,
-                            session_id,
-                            None,
-                            SessionTracePhase::ToolPolicyEvaluated,
-                            SessionTracePayload::ToolPolicyEvaluated {
-                                tool_call_id: call.id.clone(),
-                                agent_id: session_agent_selection(state, session_id).await,
-                                decision: "remembered_skill_deny".to_string(),
-                                reason: Some(
-                                    "remembered skill tool decision denied tool call".to_string(),
-                                ),
-                            },
-                        )
-                        .await;
-                        return Ok(ToolInvocationResponse {
-                            output: "tool denied by remembered skill policy decision".to_string(),
-                            is_error: true,
-                            content: Vec::new(),
-                            full_output: None,
-                            host_action: None,
-                            result: None,
-                        });
-                    }
-                    None => {
-                        if !request_tool_permission(
-                            state,
-                            session_id,
-                            call,
-                            &call.name,
-                            plugin_id,
-                            cancel_state,
-                            PermissionPolicyContext {
-                                source: Some("skill".to_string()),
-                                reason: skill_tool_policy_reason(&skill_decision),
-                                skill_decision_key,
-                            },
-                        )
-                        .await
-                        {
-                            return Ok(ToolInvocationResponse {
-                                output: "permission denied".to_string(),
-                                is_error: true,
-                                content: Vec::new(),
-                                full_output: None,
-                                host_action: None,
-                                result: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if let Some(authorization) = authorization {
-        tokio::select! {
-            biased;
-            () = cancel_state.cancelled() => {
-                return Ok(tool_error("tool cancelled while awaiting batch authorization"));
-            }
-            () = authorization.arrive_and_wait() => {}
-        }
     }
     let _invocation_permit = if let Some(permits) = invocation_permits {
         Some(tokio::select! {
@@ -24522,37 +24554,49 @@ library = "test"
         state
     }
 
-    #[tokio::test]
-    async fn batch_authorization_gate_releases_when_participant_exits_without_waiting() {
-        let gate = BatchAuthorizationGate::new(2);
-        let waiting = gate.participant();
-        let denied = gate.participant();
-        let waiter = tokio::spawn(waiting.arrive_and_wait());
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-
-        drop(denied);
-        tokio::time::timeout(Duration::from_millis(100), waiter)
-            .await
-            .expect("denied participant should release the complete-batch gate")
-            .expect("authorization waiter should not panic");
-    }
-
-    #[tokio::test]
-    async fn batch_authorization_gate_does_not_miss_last_arrival_notification() {
-        for _ in 0..1_000 {
-            let gate = BatchAuthorizationGate::new(2);
-            let first = gate.participant();
-            let second = gate.participant();
-            let first = tokio::spawn(first.arrive_and_wait());
-            let second = tokio::spawn(second.arrive_and_wait());
-            tokio::time::timeout(Duration::from_millis(100), async {
-                first.await.expect("first authorization participant");
-                second.await.expect("second authorization participant");
-            })
-            .await
-            .expect("authorization gate must not miss the final arrival");
+    #[allow(clippy::too_many_arguments)]
+    async fn invoke_prepared_tool_for_test(
+        state: &ServerState,
+        session_id: SessionId,
+        call: &bcode_model::ToolCall,
+        working_directory: &Path,
+        tool: RegisteredTool,
+        preparation: ToolPreparationResponse,
+        policy_metadata: &ToolPolicyAuthorizationMetadata,
+        cancel_state: &TurnCancelState,
+    ) -> Result<ToolInvocationResponse, String> {
+        let request = ToolAuthorizationRequest {
+            index: 0,
+            call: call.clone(),
+            tool: tool.clone(),
+            facts: preparation.authorization,
+            context: bcode_agent_runtime::RuntimePermissionContext {
+                session_id,
+                agent_id: session_agent_selection(state, session_id).await,
+            },
+        };
+        let decision = ServerAuthorizationCoordinator::new(state, session_id, cancel_state)
+            .authorize_one(&request)
+            .await;
+        if let ToolAuthorizationDecision::Deny(reason) | ToolAuthorizationDecision::Ask(reason) =
+            decision
+        {
+            return Ok(tool_error(reason));
         }
+        let ToolSource::Plugin { plugin_id } = tool.source else {
+            return Err("server test tool must be plugin-backed".to_string());
+        };
+        invoke_model_tool(
+            state,
+            session_id,
+            call,
+            working_directory,
+            &plugin_id,
+            policy_metadata,
+            cancel_state,
+            None,
+        )
+        .await
     }
 
     async fn approve_pending_permission_for_test(
@@ -24902,7 +24946,7 @@ library = "test"
                 "timeout_ms": 5000
             }),
         };
-        let (plugin_id, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
+        let (tool, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
             .await
             .expect("tool preparation");
         let policy_metadata =
@@ -24912,16 +24956,15 @@ library = "test"
         let task_call = call.clone();
         let working_directory = workspace.path().to_path_buf();
         let task = tokio::spawn(async move {
-            invoke_model_tool(
+            invoke_prepared_tool_for_test(
                 task_state.as_ref(),
                 session_id,
                 &task_call,
                 &working_directory,
-                &plugin_id,
+                tool,
+                preparation,
                 &policy_metadata,
                 &TurnCancelState::default(),
-                None,
-                None,
             )
             .await
         });
@@ -25025,7 +25068,7 @@ library = "test"
                 "timeout_ms": 5000
             }),
         };
-        let (plugin_id, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
+        let (tool, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
             .await
             .expect("tool preparation");
         let policy_metadata =
@@ -25037,16 +25080,15 @@ library = "test"
         let task_call = call.clone();
         let task_cancel = Arc::clone(&cancel_state);
         let task = tokio::spawn(async move {
-            invoke_model_tool(
+            invoke_prepared_tool_for_test(
                 task_state.as_ref(),
                 session_id,
                 &task_call,
                 &working_directory,
-                &plugin_id,
+                tool,
+                preparation,
                 &policy_metadata,
                 task_cancel.as_ref(),
-                None,
-                None,
             )
             .await
         });
@@ -25167,7 +25209,7 @@ library = "test"
                 }]
             }),
         };
-        let (plugin_id, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
+        let (tool, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
             .await
             .expect("tool preparation");
         let policy_metadata =
@@ -25179,16 +25221,15 @@ library = "test"
         let task_call = call.clone();
         let task_cancel = Arc::clone(&cancel_state);
         let task = tokio::spawn(async move {
-            invoke_model_tool(
+            invoke_prepared_tool_for_test(
                 task_state.as_ref(),
                 session_id,
                 &task_call,
                 &working_directory,
-                &plugin_id,
+                tool,
+                preparation,
                 &policy_metadata,
                 task_cancel.as_ref(),
-                None,
-                None,
             )
             .await
         });
