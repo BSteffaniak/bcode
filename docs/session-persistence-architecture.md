@@ -20,6 +20,15 @@ Per-session database access is split by capability:
 
 * `open_existing_turso_in_root` is the non-migrating existing runtime/read path. It requires the
   database file to exist and does not create directories, run DDL, or rebuild projections.
+* The manager serializes first load per session, classifies the migration ledger plus writer
+  contract, and acquires a runtime lease only after rechecking compatibility while ownership is
+  held. Known legacy storage is migrated automatically only under exclusive maintenance and the
+  capability-bound write lock. Schema migrations, full derived-projection replay, validation, and
+  writer-contract advancement commit in one transaction; canonical events and drafts are preserved.
+  Unknown migration IDs, dirty migration records, future writers, inconsistent contract state,
+  malformed canonical history, and same-version projection damage fail closed without migration.
+  Competing current daemons may converge after one wins migration, while any genuinely active
+  legacy owner continues to block migration.
 * `initialize_turso_in_root` creates a brand-new database with the complete current schema and
   refuses to overwrite an existing database.
 * `migrate_turso_in_root` is the explicit migration path. Its signature requires both a held
@@ -52,8 +61,9 @@ canonical event. Missing and unknown/future epochs fail closed with a migration-
 IPC protocol and build fingerprint are diagnostic metadata, not storage compatibility proofs.
 Non-event session mutations such as composer drafts perform the same durable check.
 
-The current contract-aware baseline uses writer epoch `2`. Databases with no contract row are
-reported diagnostically as known legacy epoch `1`, but mutation fails closed until explicit guarded
+The current contract-aware baseline uses writer epoch `2`. Databases with a known pre-contract
+migration prefix and no contract row are reported as known legacy epoch `1`; a missing row after the
+ledger records contract initialization is inconsistent and repair-required. Mutation fails closed until explicit guarded
 migration installs epoch `2`. Explicit migration rebuilds and validates model context, verifies all
 required projection checkpoints at the canonical tail, and updates the writer contract in the same
 database transaction. Any validation/rebuild failure rolls the entire transaction back, preserving

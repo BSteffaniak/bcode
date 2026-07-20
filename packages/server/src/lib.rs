@@ -221,7 +221,7 @@ pub struct ServerState {
     clients: Mutex<BTreeSet<ClientId>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
     client_session_namespaces: Mutex<BTreeMap<ClientId, String>>,
-    active_session_namespaces: Mutex<BTreeMap<SessionId, String>>,
+    active_session_namespaces: Mutex<BTreeMap<SessionId, ActiveSessionNamespace>>,
     message_accepted_clients: Mutex<BTreeSet<ClientId>>,
     attached_client_sessions: Mutex<BTreeMap<ClientId, SessionId>>,
     client_forwarders: Mutex<BTreeMap<ClientId, Vec<JoinHandle<()>>>>,
@@ -232,6 +232,12 @@ pub struct ServerState {
     daemon_record_path: Option<PathBuf>,
     metrics: MetricsRegistry,
     shutdown: broadcast::Sender<()>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSessionNamespace {
+    namespace: String,
+    pending_attaches: usize,
 }
 
 #[derive(Debug)]
@@ -1299,27 +1305,65 @@ impl ServerState {
         namespace: String,
     ) -> Result<(), String> {
         let mut active_namespaces = self.active_session_namespaces.lock().await;
-        match active_namespaces.get(&session_id) {
-            Some(active_namespace) if active_namespace != &namespace => {
-                Err(active_namespace.clone())
-            }
-            Some(_) => Ok(()),
-            None => {
-                active_namespaces.insert(session_id, namespace);
-                drop(active_namespaces);
+        let result = match active_namespaces.get_mut(&session_id) {
+            Some(active) if active.namespace != namespace => Err(active.namespace.clone()),
+            Some(active) => {
+                active.pending_attaches = active.pending_attaches.saturating_add(1);
                 Ok(())
             }
+            None => {
+                active_namespaces.insert(
+                    session_id,
+                    ActiveSessionNamespace {
+                        namespace,
+                        pending_attaches: 1,
+                    },
+                );
+                Ok(())
+            }
+        };
+        drop(active_namespaces);
+        result
+    }
+
+    async fn complete_session_namespace_attach(&self, session_id: SessionId) {
+        if let Some(active) = self
+            .active_session_namespaces
+            .lock()
+            .await
+            .get_mut(&session_id)
+        {
+            active.pending_attaches = active.pending_attaches.saturating_sub(1);
         }
     }
 
-    async fn deactivate_session_namespace_if_inactive(&self, session_id: SessionId) {
-        if let Ok(summary) = self.sessions.session_summary(session_id).await
-            && summary.client_count == 0
+    async fn cancel_session_namespace_attach(&self, session_id: SessionId) {
         {
-            self.active_session_namespaces
-                .lock()
-                .await
-                .remove(&session_id);
+            let mut active = self.active_session_namespaces.lock().await;
+            if let Some(namespace) = active.get_mut(&session_id) {
+                namespace.pending_attaches = namespace.pending_attaches.saturating_sub(1);
+            }
+        }
+        self.deactivate_session_namespace_if_inactive(session_id)
+            .await;
+    }
+
+    async fn deactivate_session_namespace_if_inactive(&self, session_id: SessionId) {
+        let has_attached_client = self
+            .attached_client_sessions
+            .lock()
+            .await
+            .values()
+            .any(|attached| *attached == session_id);
+        if has_attached_client {
+            return;
+        }
+        let mut active = self.active_session_namespaces.lock().await;
+        if active
+            .get(&session_id)
+            .is_some_and(|namespace| namespace.pending_attaches == 0)
+        {
+            active.remove(&session_id);
         }
     }
 
@@ -1333,8 +1377,8 @@ impl ServerState {
             .lock()
             .await
             .get(&session_id)
-            .filter(|active_namespace| *active_namespace != &client_namespace)
-            .cloned()
+            .filter(|active| active.namespace != client_namespace)
+            .map(|active| active.namespace.clone())
     }
 
     async fn client_supports_message_accepted(&self, client_id: ClientId) -> bool {
@@ -5910,12 +5954,19 @@ fn session_error_response(error: &bcode_session::SessionError) -> ErrorResponse 
 
 fn session_db_error_response(error: &bcode_session::db::SessionDbError) -> ErrorResponse {
     match error {
-        bcode_session::db::SessionDbError::WriterIncompatible { .. }
-        | bcode_session::db::SessionDbError::ProjectionIncompatible { .. }
+        bcode_session::db::SessionDbError::WriterIncompatible { .. } => {
+            ErrorResponse::new("session_writer_incompatible", error.to_string())
+        }
+        bcode_session::db::SessionDbError::ProjectionIncompatible { .. }
         | bcode_session::db::SessionDbError::ProjectionStale { .. }
         | bcode_session::db::SessionDbError::ModelContextProjectionVersion { .. }
         | bcode_session::db::SessionDbError::ModelContextProjectionStale { .. } => {
             ErrorResponse::new("projection_stale", error.to_string())
+        }
+        bcode_session::db::SessionDbError::MigrationHistoryIncompatible { .. }
+        | bcode_session::db::SessionDbError::InvalidCanonicalSequence { .. }
+        | bcode_session::db::SessionDbError::InvalidRow { .. } => {
+            ErrorResponse::new("session_repair_required", error.to_string())
         }
         _ if database_error_requires_repair(error) => {
             ErrorResponse::new("session_repair_required", error.to_string())
@@ -5950,6 +6001,7 @@ async fn handle_attach_session(
     }
     match state.sessions.attach_session(session_id, client_id).await {
         Ok(attachment) => {
+            state.complete_session_namespace_attach(session_id).await;
             restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
             state.attach_client_session(client_id, session_id).await;
@@ -5981,9 +6033,7 @@ async fn handle_attach_session(
                 Response::Err(session_error_response(&error)),
             )
             .await?;
-            state
-                .deactivate_session_namespace_if_inactive(session_id)
-                .await;
+            state.cancel_session_namespace_attach(session_id).await;
             Ok(())
         }
     }
@@ -6034,6 +6084,7 @@ async fn handle_attach_session_recent(
         .await
     {
         Ok(attachment) => {
+            state.complete_session_namespace_attach(session_id).await;
             finish_attach_session_recent_success(
                 AttachRecentSuccessContext {
                     request_id,
@@ -6065,9 +6116,7 @@ async fn handle_attach_session_recent(
                 Response::Err(session_error_response(&error)),
             )
             .await?;
-            state
-                .deactivate_session_namespace_if_inactive(session_id)
-                .await;
+            state.cancel_session_namespace_attach(session_id).await;
             state.metrics.record_histogram(
                 "server.attach_recent.total_duration_ms",
                 elapsed_ms(total_started_at),
@@ -6119,6 +6168,7 @@ async fn handle_attach_session_projection_window(
         .await
     {
         Ok(window_attachment) => {
+            state.complete_session_namespace_attach(session_id).await;
             finish_attach_session_projection_window_success(
                 AttachProjectionWindowSuccessContext {
                     request_id,
@@ -6150,9 +6200,7 @@ async fn handle_attach_session_projection_window(
                 Response::Err(session_error_response(&error)),
             )
             .await?;
-            state
-                .deactivate_session_namespace_if_inactive(session_id)
-                .await;
+            state.cancel_session_namespace_attach(session_id).await;
             state.metrics.record_histogram(
                 "server.attach_projection_window.total_duration_ms",
                 elapsed_ms(total_started_at),
@@ -24536,6 +24584,101 @@ library = "test"
                 .collect::<Vec<_>>(),
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_session_migrates_across_real_attach_and_send_ipc() {
+        let workspace = tempfile::tempdir().expect("IPC workspace");
+        let session_root = workspace.path().join("sessions");
+        let session_id = {
+            let sessions = SessionManager::persistent(&session_root).expect("persistent sessions");
+            let session = sessions
+                .create_session(
+                    Some("legacy IPC".to_owned()),
+                    workspace.path().to_path_buf(),
+                )
+                .await
+                .expect("session");
+            let db = bcode_session::db::SessionDb::open_existing_turso_in_root(
+                session.id,
+                &session_root,
+            )
+            .await
+            .expect("session database");
+            db.database()
+                .exec_raw("DELETE FROM __bcode_session_migrations WHERE id = '026_session_storage_contract_table' OR id = '027_initialize_session_storage_contract'")
+                .await
+                .expect("remove contract migrations");
+            db.database()
+                .exec_raw("DROP TABLE session_storage_contract")
+                .await
+                .expect("drop contract table");
+            session.id
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let sessions = SessionManager::persistent(&session_root).expect("restored sessions");
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client
+            .connect("legacy-migration-test")
+            .await
+            .expect("connect");
+        connection
+            .attach_session_recent(session_id, 16)
+            .await
+            .expect("legacy attach should migrate transparently");
+        connection
+            .send_user_message(
+                session_id,
+                "after migration".to_owned(),
+                bcode_ipc::PromptPlacement::Steering,
+            )
+            .await
+            .expect("send should be accepted");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let history = state
+                    .sessions
+                    .session_history(session_id)
+                    .await
+                    .expect("history");
+                if history.iter().any(|event| {
+                    matches!(
+                        &event.kind,
+                        SessionEventKind::UserMessage { text, .. } if text == "after migration"
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("message should persist");
+        let db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &session_root)
+                .await
+                .expect("migrated database");
+        assert_eq!(
+            db.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(bcode_session::db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        server.abort();
     }
 
     #[cfg(unix)]

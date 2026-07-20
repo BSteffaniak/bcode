@@ -6,7 +6,13 @@
 //! intentionally keeps Turso-specific details at connection boundaries and uses
 //! `switchy` database traits for migrations and repository operations.
 
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::persisted::{
     PersistedSessionEventError, decode_session_event, decode_session_event_degraded,
@@ -29,6 +35,7 @@ use switchy::{
     schema::{
         MigrationError,
         discovery::code::{CodeMigration, CodeMigrationSource},
+        migration::MigrationSource,
         runner::MigrationRunner,
     },
 };
@@ -118,6 +125,18 @@ pub enum SessionDbError {
     /// A database row did not contain the expected column/type.
     #[error("invalid session database row: missing or invalid column {column}")]
     InvalidRow { column: String },
+    /// Session migration history is not a known clean prefix of this build's migrations.
+    #[error("unsupported or inconsistent session migration history: {reason}")]
+    MigrationHistoryIncompatible { reason: String },
+}
+
+/// Read-only compatibility classification for a session database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStorageCompatibility {
+    /// The database implements this build's complete storage contract.
+    Current { writer_epoch: u64 },
+    /// The database is a known legacy generation that this build can migrate.
+    KnownLegacy { writer_epoch: u64 },
 }
 
 /// Result type for session DB operations.
@@ -709,8 +728,10 @@ impl SessionDb {
         let path = session_db_path(root, session_id);
         let db = Self::open_existing_turso_observed(session_id, &path, MetricsRegistry::disabled())
             .await?;
-        run_session_migrations(&**db.db).await?;
-        migrate_session_storage(&**db.db).await?;
+        let tx = db.db.begin_transaction().await?;
+        run_session_migrations(&*tx).await?;
+        migrate_session_storage(&*tx, session_id).await?;
+        tx.commit().await?;
         Ok(db)
     }
 
@@ -1067,13 +1088,113 @@ impl SessionDb {
         &**self.db
     }
 
+    /// Inspect this database's durable storage compatibility without mutating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unknown migration history, dirty migrations, malformed contracts,
+    /// unsupported contract schemas, or future writer epochs.
+    pub async fn storage_compatibility(&self) -> SessionDbResult<SessionStorageCompatibility> {
+        let known_migrations = session_migrations()
+            .migrations()
+            .await?
+            .into_iter()
+            .map(|migration| migration.id().to_owned())
+            .collect::<Vec<_>>();
+        let known_set = known_migrations.iter().cloned().collect::<BTreeSet<_>>();
+        let applied = if self.db.table_exists(SESSION_MIGRATIONS_TABLE).await? {
+            self.db
+                .select(SESSION_MIGRATIONS_TABLE)
+                .columns(&["id", "status"])
+                .execute(&**self.db)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    let id = required_string(&row, "id")?;
+                    let status = required_string(&row, "status")?;
+                    if status != "completed" {
+                        return Err(SessionDbError::MigrationHistoryIncompatible {
+                            reason: format!("migration {id} has status {status}"),
+                        });
+                    }
+                    Ok(id)
+                })
+                .collect::<SessionDbResult<BTreeSet<_>>>()?
+        } else {
+            BTreeSet::new()
+        };
+        if let Some(unknown) = applied.iter().find(|id| !known_set.contains(*id)) {
+            return Err(SessionDbError::MigrationHistoryIncompatible {
+                reason: format!("unknown migration {unknown}"),
+            });
+        }
+        let applied_count = known_migrations
+            .iter()
+            .take_while(|id| applied.contains(*id))
+            .count();
+        if applied.len() != applied_count {
+            return Err(SessionDbError::MigrationHistoryIncompatible {
+                reason: "completed migrations are not a contiguous known prefix".to_owned(),
+            });
+        }
+
+        let contract_table_exists = self.db.table_exists("session_storage_contract").await?;
+        if !contract_table_exists {
+            if applied_count == known_migrations.len() {
+                return Err(SessionDbError::MigrationHistoryIncompatible {
+                    reason: "migration history claims the storage contract exists, but its table is missing".to_owned(),
+                });
+            }
+            return Ok(SessionStorageCompatibility::KnownLegacy {
+                writer_epoch: u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH),
+            });
+        }
+        let row = self
+            .db
+            .select("session_storage_contract")
+            .columns(&["schema_version", "writer_epoch"])
+            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+            .execute_first(&**self.db)
+            .await?;
+        let Some(row) = row.as_ref() else {
+            if applied_count == known_migrations.len() {
+                return Err(SessionDbError::MigrationHistoryIncompatible {
+                    reason: "migration history claims the storage contract was initialized, but its row is missing".to_owned(),
+                });
+            }
+            return Ok(SessionStorageCompatibility::KnownLegacy {
+                writer_epoch: u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH),
+            });
+        };
+        let schema_version = required_non_negative_u64(row, "schema_version")?;
+        if schema_version != u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION) {
+            return Err(SessionDbError::ProjectionIncompatible {
+                projection: "session_storage_contract",
+                actual: schema_version,
+                expected: u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION),
+            });
+        }
+        let writer_epoch = required_non_negative_u64(row, "writer_epoch")?;
+        if writer_epoch == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH) {
+            if applied_count != known_migrations.len() {
+                return Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch });
+            }
+            return Ok(SessionStorageCompatibility::Current { writer_epoch });
+        }
+        if writer_epoch == u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH) {
+            return Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch });
+        }
+        Err(SessionDbError::WriterIncompatible {
+            actual: Some(writer_epoch),
+            expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+        })
+    }
+
     /// Return the durable storage writer epoch recorded by this session database.
     ///
     /// # Errors
     ///
-    /// Returns an error if the contract row is malformed. A missing table or row is reported as
-    /// the known legacy writer epoch so diagnostics and load coordination can distinguish
-    /// migration-required legacy state from an unknown future writer.
+    /// Returns an error when compatibility inspection finds unsupported or damaged storage.
     pub async fn storage_writer_epoch(&self) -> SessionDbResult<u64> {
         if !self.db.table_exists("session_storage_contract").await? {
             return Ok(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH));
@@ -1087,7 +1208,7 @@ impl SessionDb {
             .await?;
         row.as_ref().map_or_else(
             || Ok(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
-            |row| required_i64(row, "writer_epoch").map(i64_to_u64),
+            |row| required_non_negative_u64(row, "writer_epoch"),
         )
     }
 
@@ -2106,30 +2227,67 @@ async fn validate_all_projection_checkpoints_at_tail(
     validate_projection_checkpoint_snapshot(&snapshot, expected)
 }
 
-async fn migrate_session_storage(db: &dyn Database) -> SessionDbResult<()> {
-    let tx = db.begin_transaction().await?;
-    let canonical_tail = last_event_sequence_from_database(&*tx).await?;
-    rebuild_model_context_projection(&*tx).await?;
+async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> SessionDbResult<()> {
+    let events = strict_events_from_database(db).await?;
+    for (index, event) in events.iter().enumerate() {
+        let expected = u64::try_from(index).unwrap_or(u64::MAX);
+        if event.sequence != expected {
+            return Err(SessionDbError::InvalidCanonicalSequence {
+                expected,
+                actual: event.sequence,
+            });
+        }
+        if event.session_id != session_id {
+            return Err(SessionDbError::InvalidRow {
+                column: "events.session_id".to_owned(),
+            });
+        }
+    }
+
+    for table in [
+        "turn_receipts",
+        "model_context_entries",
+        "model_context_projection_state",
+        "context_occupancy_projection",
+        "projection_checkpoints",
+        "artifact_references",
+        "runtime_work",
+        "tool_runs",
+        "transcript_items",
+        "input_messages",
+        "session_state",
+    ] {
+        db.delete(table).execute(db).await?;
+    }
+    for event in &events {
+        project_materialized_event(db, event).await?;
+        project_model_context_event(db, event).await?;
+        project_context_occupancy_event(db, event).await?;
+        project_turn_receipt(db, event).await?;
+    }
+
+    let canonical_tail = events.last().map(|event| event.sequence);
+    validate_all_projection_checkpoints_at_tail(db, canonical_tail).await?;
     if let Some(expected) = canonical_tail {
-        let model_state = tx
+        let model_state = db
             .select("model_context_projection_state")
             .columns(&["schema_version", "last_event_seq"])
             .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
-            .execute_first(&*tx)
+            .execute_first(db)
             .await?
             .ok_or(SessionDbError::ProjectionStale {
                 projection: "model_context",
                 checkpoint: None,
                 expected,
             })?;
-        let schema_version = required_i64(&model_state, "schema_version").map(i64_to_u64)?;
+        let schema_version = required_non_negative_u64(&model_state, "schema_version")?;
         if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
             return Err(SessionDbError::ModelContextProjectionVersion {
                 actual: schema_version,
                 expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
             });
         }
-        let checkpoint = required_i64(&model_state, "last_event_seq").map(i64_to_u64)?;
+        let checkpoint = required_non_negative_u64(&model_state, "last_event_seq")?;
         if checkpoint != expected {
             return Err(SessionDbError::ModelContextProjectionStale {
                 checkpoint,
@@ -2137,10 +2295,8 @@ async fn migrate_session_storage(db: &dyn Database) -> SessionDbResult<()> {
             });
         }
     }
-    validate_all_projection_checkpoints_at_tail(&*tx, canonical_tail).await?;
-    set_storage_writer_contract(&*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
-    tx.commit().await?;
-    Ok(())
+    set_storage_writer_contract(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
+    validate_storage_writer_contract(db).await
 }
 
 async fn strict_events_from_database(db: &dyn Database) -> SessionDbResult<Vec<SessionEvent>> {
@@ -3521,6 +3677,16 @@ fn required_i64(row: &switchy::database::Row, column: &str) -> SessionDbResult<i
         })
 }
 
+fn required_non_negative_u64(row: &switchy::database::Row, column: &str) -> SessionDbResult<u64> {
+    let value = required_i64(row, column)?;
+    if value.is_negative() {
+        return Err(SessionDbError::InvalidRow {
+            column: column.to_owned(),
+        });
+    }
+    Ok(value.cast_unsigned())
+}
+
 fn optional_i64(row: &switchy::database::Row, column: &str) -> Option<i64> {
     row.get(column).and_then(|value| value.as_i64())
 }
@@ -3683,6 +3849,85 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn storage_compatibility_rejects_future_writer_epoch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let future = u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH).saturating_add(1);
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::try_from(future).expect("future epoch fits")),
+            )
+            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+            .execute(db.database())
+            .await
+            .expect("set future writer epoch");
+
+        assert!(matches!(
+            db.storage_compatibility().await,
+            Err(SessionDbError::WriterIncompatible {
+                actual: Some(actual),
+                expected
+            }) if actual == future
+                && expected == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        ));
+    }
+
+    #[tokio::test]
+    async fn storage_compatibility_rejects_contract_missing_from_completed_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.database()
+            .exec_raw("DROP TABLE session_storage_contract")
+            .await
+            .expect("drop contract table");
+
+        assert!(matches!(
+            db.storage_compatibility().await,
+            Err(SessionDbError::MigrationHistoryIncompatible { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn storage_compatibility_classifies_clean_legacy_prefix() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.database()
+            .delete(SESSION_MIGRATIONS_TABLE)
+            .where_in(
+                "id",
+                vec![
+                    DatabaseValue::String("026_session_storage_contract_table".to_owned()),
+                    DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
+                ],
+            )
+            .execute(db.database())
+            .await
+            .expect("remove contract migrations");
+        db.database()
+            .exec_raw("DROP TABLE session_storage_contract")
+            .await
+            .expect("drop contract table");
+
+        assert_eq!(
+            db.storage_compatibility().await.expect("compatibility"),
+            SessionStorageCompatibility::KnownLegacy {
+                writer_epoch: u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH),
+            }
+        );
     }
 
     #[test]

@@ -39,7 +39,8 @@ const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
         | SessionDbError::Serialize(_)
         | SessionDbError::PersistedEvent(_)
         | SessionDbError::InvalidCompactionMarker { .. }
-        | SessionDbError::InvalidRow { .. } => {
+        | SessionDbError::InvalidRow { .. }
+        | SessionDbError::MigrationHistoryIncompatible { .. } => {
             "session.actor.append_event.rejected.storage_error_total"
         }
     }

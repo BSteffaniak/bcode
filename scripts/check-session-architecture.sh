@@ -145,9 +145,18 @@ if rg -n 'open_turso_in_root\(session_id, root\)' packages/session/src/repair.rs
   violations=1
 fi
 
-if ! rg -q 'migrate_session_storage\(&\*\*db\.db\)' packages/session/src/db.rs \
-  || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs; then
-  echo "Session migration violation: projection rebuild and writer-epoch update must share explicit migration transaction." >&2
+if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/db.rs \
+  || ! rg -q 'run_session_migrations\(&\*tx\)' packages/session/src/db.rs \
+  || ! rg -q 'migrate_session_storage\(&\*tx, session_id\)' packages/session/src/db.rs \
+  || ! rg -q 'set_storage_writer_contract\(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs; then
+  echo "Session migration violation: schema migration, projection replay, and writer-epoch update must share explicit migration transaction." >&2
+  violations=1
+fi
+
+if ! rg -q 'storage_compatibility\(\)' packages/session/src/lib.rs \
+  || ! rg -q 'acquire_session_maintenance_guard\(root, session_id\)' packages/session/src/lib.rs \
+  || ! rg -q 'load_gates: BTreeMap<SessionId, Arc<Mutex<\(\)>>>' packages/session/src/lib.rs; then
+  echo "Session automatic migration violation: manager first load must classify storage, serialize per session, and require maintenance ownership." >&2
   violations=1
 fi
 

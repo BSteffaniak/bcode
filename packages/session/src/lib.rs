@@ -603,12 +603,18 @@ pub struct SessionManager {
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionHandle>,
     leases: BTreeMap<SessionId, SessionLeaseGuard>,
+    load_gates: BTreeMap<SessionId, Arc<Mutex<()>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionLoadStatusKind {
     Current,
     SummaryOnly,
+}
+
+enum SessionLeaseLoadOutcome {
+    Acquired(Box<SessionLeaseGuard>),
+    Retry,
 }
 
 /// Current asynchronous catalog discovery status.
@@ -861,6 +867,7 @@ impl SessionManager {
                     })
                     .collect(),
                 leases: BTreeMap::new(),
+                load_gates: BTreeMap::new(),
             })),
             store: Some(executor),
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
@@ -943,7 +950,24 @@ impl SessionManager {
             .ok_or(SessionError::NotFound(session_id))
     }
 
+    async fn session_load_gate(&self, session_id: SessionId) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.inner
+                .lock()
+                .await
+                .load_gates
+                .entry(session_id)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
     async fn ensure_session_loaded(&self, session_id: SessionId) -> Result<(), SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        self.ensure_session_loaded_inner(session_id).await
+    }
+
+    async fn ensure_session_loaded_inner(&self, session_id: SessionId) -> Result<(), SessionError> {
         let total_timer = self.metrics.timer();
         let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
         if let Some(handle) = cached_handle {
@@ -1009,39 +1033,150 @@ impl SessionManager {
         session_id: SessionId,
         store: &SessionStoreExecutor,
     ) -> Result<SessionLeaseGuard, SessionError> {
+        use db::SessionStorageCompatibility::{Current, KnownLegacy};
+
         let root = store.root_path();
-        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
-        let writer_epoch = db.storage_writer_epoch().await?;
-        let current_epoch = u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
-        drop(db);
-        if writer_epoch == current_epoch {
-            return Ok(lease::acquire_session_lease(
-                &root,
+        for attempt in 0..3_u8 {
+            let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+            let compatibility = db.storage_compatibility().await?;
+            drop(db);
+            let outcome = match compatibility {
+                Current { .. } => {
+                    self.acquire_current_session_lease(session_id, store, &root)
+                        .await?
+                }
+                KnownLegacy { writer_epoch } => {
+                    self.migrate_legacy_session_for_load(
+                        session_id,
+                        store,
+                        &root,
+                        writer_epoch,
+                        attempt,
+                    )
+                    .await?
+                }
+            };
+            if let SessionLeaseLoadOutcome::Acquired(lease) = outcome {
+                return Ok(*lease);
+            }
+        }
+        Err(db::SessionDbError::MigrationHistoryIncompatible {
+            reason: "session storage changed repeatedly while acquiring ownership".to_owned(),
+        }
+        .into())
+    }
+
+    async fn acquire_current_session_lease(
+        &self,
+        session_id: SessionId,
+        store: &SessionStoreExecutor,
+        root: &Path,
+    ) -> Result<SessionLeaseLoadOutcome, SessionError> {
+        use db::SessionStorageCompatibility::{Current, KnownLegacy};
+
+        let lease = lease::acquire_session_lease(root, session_id, store.lease_owner())?;
+        let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
+            .await?
+            .storage_compatibility()
+            .await?;
+        match rechecked {
+            Current { .. } => Ok(SessionLeaseLoadOutcome::Acquired(Box::new(lease))),
+            KnownLegacy { .. } => {
+                drop(lease);
+                self.metrics
+                    .increment_counter("session.manager.storage_migration.race_retry_total");
+                Ok(SessionLeaseLoadOutcome::Retry)
+            }
+        }
+    }
+
+    async fn migrate_legacy_session_for_load(
+        &self,
+        session_id: SessionId,
+        store: &SessionStoreExecutor,
+        root: &Path,
+        writer_epoch: u64,
+        attempt: u8,
+    ) -> Result<SessionLeaseLoadOutcome, SessionError> {
+        use db::SessionStorageCompatibility::{Current, KnownLegacy};
+
+        let started = self.metrics.timer();
+        self.metrics
+            .increment_counter("session.manager.storage_migration.attempted_total");
+        tracing::info!(
+            target: "bcode_session::migration",
+            %session_id,
+            writer_epoch,
+            target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            "attempting automatic legacy session migration"
+        );
+        let maintenance = match lease::acquire_session_maintenance_guard(root, session_id) {
+            Ok(maintenance) => maintenance,
+            Err(error @ lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
+                self.metrics
+                    .increment_counter("session.manager.storage_migration.blocked_owner_total");
+                let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
+                    .await?
+                    .storage_compatibility()
+                    .await?;
+                if matches!(rechecked, Current { .. }) && attempt < 2 {
+                    self.metrics
+                        .increment_counter("session.manager.storage_migration.race_retry_total");
+                    return Ok(SessionLeaseLoadOutcome::Retry);
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let write = lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)?;
+        let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
+            .await?
+            .storage_compatibility()
+            .await?;
+        if matches!(rechecked, KnownLegacy { .. }) {
+            let migrated =
+                match db::SessionDb::migrate_turso_in_root(session_id, root, &maintenance, &write)
+                    .await
+                {
+                    Ok(migrated) => migrated,
+                    Err(error) => {
+                        self.metrics
+                            .increment_counter("session.manager.storage_migration.failed_total");
+                        tracing::warn!(
+                            target: "bcode_session::migration",
+                            %session_id,
+                            %error,
+                            "automatic legacy session migration failed"
+                        );
+                        return Err(error.into());
+                    }
+                };
+            migrated.validate_write_readiness().await?;
+            drop(migrated);
+            self.metrics
+                .increment_counter("session.manager.storage_migration.completed_total");
+            self.metrics.record_histogram(
+                "session.manager.storage_migration.duration_ms",
+                started.elapsed_ms(),
+            );
+            tracing::info!(
+                target: "bcode_session::migration",
+                %session_id,
+                writer_epoch,
+                target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                duration_ms = started.elapsed_ms(),
+                "automatic legacy session migration completed"
+            );
+        }
+        drop(write);
+        Ok(SessionLeaseLoadOutcome::Acquired(Box::new(
+            lease::transition_session_maintenance_to_lease(
+                maintenance,
+                root,
                 session_id,
                 store.lease_owner(),
-            )?);
-        }
-        if writer_epoch != u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH) {
-            return Err(db::SessionDbError::WriterIncompatible {
-                actual: Some(writer_epoch),
-                expected: current_epoch,
-            }
-            .into());
-        }
-
-        let maintenance = lease::acquire_session_maintenance_guard(&root, session_id)?;
-        let write = lease::acquire_maintenance_session_write_lock(&maintenance, &root, session_id)?;
-        let migrated =
-            db::SessionDb::migrate_turso_in_root(session_id, &root, &maintenance, &write).await?;
-        migrated.validate_write_readiness().await?;
-        drop(migrated);
-        drop(write);
-        Ok(lease::transition_session_maintenance_to_lease(
-            maintenance,
-            &root,
-            session_id,
-            store.lease_owner(),
-        )?)
+            )?,
+        )))
     }
 
     async fn acquire_missing_session_lease(
@@ -1261,11 +1396,11 @@ impl SessionManager {
             }
         };
         let expected_writer_epoch = u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
-        match db.storage_writer_epoch().await {
-            Ok(actual) if actual == expected_writer_epoch => {}
-            Ok(actual) => {
+        match db.storage_compatibility().await {
+            Ok(db::SessionStorageCompatibility::Current { .. }) => {}
+            Ok(db::SessionStorageCompatibility::KnownLegacy { writer_epoch }) => {
                 return SessionHealth::WriterIncompatible {
-                    actual: Some(actual),
+                    actual: Some(writer_epoch),
                     expected: expected_writer_epoch,
                 };
             }
@@ -1656,7 +1791,9 @@ impl SessionManager {
                 .sessions
                 .remove(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
-            inner.leases.remove(&session_id)
+            let lease = inner.leases.remove(&session_id);
+            inner.load_gates.remove(&session_id);
+            lease
         };
         if let Some(store) = &self.store {
             let catalog = match store
@@ -5184,6 +5321,55 @@ mod tests {
         assert_eq!(
             migrated.storage_writer_epoch().await.expect("writer epoch"),
             u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_loads_share_one_automatic_legacy_migration() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should initialize");
+            let session = manager
+                .create_session(
+                    Some("concurrent legacy".to_owned()),
+                    test_working_directory(),
+                )
+                .await
+                .expect("session should create");
+            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+                .await
+                .expect("database should open");
+            db.database()
+                .update("session_storage_contract")
+                .value(
+                    "writer_epoch",
+                    switchy::database::DatabaseValue::Int64(i64::from(
+                        db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
+                    )),
+                )
+                .execute(db.database())
+                .await
+                .expect("writer epoch should become legacy");
+            session.id
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let metrics = MetricsRegistry::default();
+        let restored = SessionManager::persistent_with_metrics(&root, metrics.clone())
+            .expect("manager should restore");
+        let (first, second) = tokio::join!(
+            restored.require_write_readiness(session_id),
+            restored.require_write_readiness(session_id)
+        );
+        first.expect("first load should succeed");
+        second.expect("second load should share the successful load");
+        assert_eq!(
+            metrics
+                .snapshot()
+                .counters
+                .get("session.manager.storage_migration.completed_total"),
+            Some(&1)
         );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

@@ -17,6 +17,10 @@ pub enum TuiDaemonIssue {
     StaleOrIncompatible,
     /// The daemon response could not be decoded or converted.
     InvalidDaemonResponse(String),
+    /// Another daemon owns the session, so migration or access must wait.
+    SessionActiveElsewhere { message: String },
+    /// The session storage writer generation is unsupported by this build.
+    SessionWriterIncompatible { message: String },
     /// The requested session is unavailable.
     SessionUnavailable { message: String },
     /// The requested session needs explicit repair before normal use.
@@ -68,6 +72,18 @@ impl TuiDaemonIssue {
                 status: format!("{label}: daemon response decode failed"),
                 detail: Some(format!(
                     "The daemon response could not be decoded or converted. This does not necessarily mean the daemon is stale.\n\nDecode error: {error}"
+                )),
+            },
+            Self::SessionActiveElsewhere { message } => TuiDaemonIssueMessage {
+                status: format!("{label}: session is active in another daemon"),
+                detail: Some(format!(
+                    "Another daemon currently owns this session. Close clients using that daemon or stop it, then retry. Bcode will migrate known legacy storage automatically once exclusive ownership is available.\n\nDaemon error: {message}"
+                )),
+            },
+            Self::SessionWriterIncompatible { message } => TuiDaemonIssueMessage {
+                status: format!("{label}: incompatible session storage writer"),
+                detail: Some(format!(
+                    "This session was written by an unsupported storage generation. Use a compatible Bcode build or run `bcode session diagnose <session-id>`. Automatic migration was not attempted.\n\nDaemon error: {message}"
                 )),
             },
             Self::SessionUnavailable { message } => TuiDaemonIssueMessage {
@@ -137,6 +153,14 @@ fn classify_server_error(code: &str, message: &str) -> TuiDaemonIssue {
     match code {
         "session_repair_required" => TuiDaemonIssue::SessionRepairRequired,
         "projection_stale" => TuiDaemonIssue::ProjectionStale,
+        "session_active_elsewhere" | "session_incompatible_active_client" => {
+            TuiDaemonIssue::SessionActiveElsewhere {
+                message: message.to_owned(),
+            }
+        }
+        "session_writer_incompatible" => TuiDaemonIssue::SessionWriterIncompatible {
+            message: message.to_owned(),
+        },
         "session_not_found" | "session_unavailable" => TuiDaemonIssue::SessionUnavailable {
             message: message.to_owned(),
         },
@@ -272,6 +296,42 @@ mod tests {
             classify_client_error(&error),
             TuiDaemonIssue::SessionRepairRequired
         );
+    }
+
+    #[test]
+    fn active_session_owner_has_specific_retry_guidance() {
+        let error = bcode_client::ClientError::Server {
+            code: "session_active_elsewhere".to_owned(),
+            message: "owned by daemon 42".to_owned(),
+        };
+        let issue = classify_client_error(&error);
+        assert_eq!(
+            issue,
+            TuiDaemonIssue::SessionActiveElsewhere {
+                message: "owned by daemon 42".to_owned(),
+            }
+        );
+        let detail = issue.message("send failed").detail.expect("detail");
+        assert!(detail.contains("migrate known legacy storage automatically"));
+        assert!(!detail.contains("Refresh the session catalog"));
+    }
+
+    #[test]
+    fn writer_incompatibility_is_not_projection_staleness() {
+        let error = bcode_client::ClientError::Server {
+            code: "session_writer_incompatible".to_owned(),
+            message: "future writer".to_owned(),
+        };
+        let issue = classify_client_error(&error);
+        assert_eq!(
+            issue,
+            TuiDaemonIssue::SessionWriterIncompatible {
+                message: "future writer".to_owned(),
+            }
+        );
+        let detail = issue.message("attach failed").detail.expect("detail");
+        assert!(detail.contains("Automatic migration was not attempted"));
+        assert!(!detail.contains("Refresh the session catalog"));
     }
 
     #[test]
