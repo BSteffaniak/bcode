@@ -204,8 +204,7 @@ pub struct ServerState {
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     plugin_automation_holds: Mutex<BTreeMap<SessionId, BTreeMap<String, ClientId>>>,
-    plugin_automation_policies:
-        Mutex<BTreeMap<SessionId, bcode_ipc::PluginAutomationExecutionPolicy>>,
+    turn_tool_policies: Mutex<BTreeMap<SessionId, bcode_session_models::TurnToolPolicy>>,
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
@@ -464,6 +463,7 @@ enum FollowupCommand {
         client_id: ClientId,
         runtime_context: Option<ClientRuntimeContext>,
         user_event: Box<bcode_session_models::SessionEvent>,
+        tool_policy: bcode_session_models::TurnToolPolicy,
     },
     SkillInvocation {
         client_id: ClientId,
@@ -1088,7 +1088,7 @@ impl ServerState {
             session_runtimes: Mutex::default(),
             turn_admission_locks: Mutex::default(),
             plugin_automation_holds: Mutex::default(),
-            plugin_automation_policies: Mutex::default(),
+            turn_tool_policies: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
@@ -6863,7 +6863,13 @@ async fn run_session_runtime(
                 client_id,
                 runtime_context,
                 user_event,
+                tool_policy,
             } => {
+                state
+                    .turn_tool_policies
+                    .lock()
+                    .await
+                    .insert(session_id, tool_policy);
                 Box::pin(process_existing_user_event_command(
                     &state,
                     &mut permit,
@@ -6879,6 +6885,7 @@ async fn run_session_runtime(
                     None,
                 ))
                 .await;
+                state.turn_tool_policies.lock().await.remove(&session_id);
             }
             FollowupCommand::SkillInvocation {
                 client_id,
@@ -7417,11 +7424,19 @@ async fn process_plugin_automation_command(
     plugin_automation_active: &std::sync::atomic::AtomicBool,
 ) {
     plugin_automation_active.store(true, Ordering::Release);
+    let tool_policy = match request.execution_policy {
+        bcode_ipc::PluginAutomationExecutionPolicy::Normal => {
+            bcode_session_models::TurnToolPolicy::Enabled
+        }
+        bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection => {
+            bcode_session_models::TurnToolPolicy::ReadOnly
+        }
+    };
     state
-        .plugin_automation_policies
+        .turn_tool_policies
         .lock()
         .await
-        .insert(permit.session_id(), request.execution_policy);
+        .insert(permit.session_id(), tool_policy);
     Box::pin(process_plugin_automation_command_inner(
         state,
         permit,
@@ -7440,7 +7455,7 @@ async fn process_plugin_automation_command(
     ))
     .await;
     state
-        .plugin_automation_policies
+        .turn_tool_policies
         .lock()
         .await
         .remove(&permit.session_id());
@@ -8253,9 +8268,7 @@ async fn handle_submit_turn(
         return send_incompatible_active_session_response(writer, request_id, &active_namespace)
             .await;
     }
-    let rejected = admission.priority != bcode_session_models::TurnPriority::Interactive
-        || admission.execution.tools != bcode_session_models::TurnToolPolicy::Enabled;
-    if rejected {
+    if admission.priority != bcode_session_models::TurnPriority::Interactive {
         return send_response(
             writer,
             request_id,
@@ -8267,6 +8280,7 @@ async fn handle_submit_turn(
         )
         .await;
     }
+    let tool_policy = admission.execution.tools;
     let admission_lock = turn_admission_lock(state, session_id).await;
     let _admission_guard = admission_lock.lock().await;
     let result = state
@@ -8304,6 +8318,7 @@ async fn handle_submit_turn(
                 client_id,
                 runtime_context: state.client_runtime_context(client_id).await,
                 user_event: Box::new(user_event),
+                tool_policy,
             },
         )
         .await?;
@@ -15125,21 +15140,22 @@ fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
     }
 }
 
-fn automation_policy_allows_operation(
-    policy: Option<bcode_ipc::PluginAutomationExecutionPolicy>,
+fn tool_policy_allows_operation(
+    policy: Option<bcode_session_models::TurnToolPolicy>,
     is_read_only: bool,
 ) -> bool {
-    policy != Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection) || is_read_only
+    match policy.unwrap_or_default() {
+        bcode_session_models::TurnToolPolicy::Enabled => true,
+        bcode_session_models::TurnToolPolicy::ReadOnly => is_read_only,
+        bcode_session_models::TurnToolPolicy::Disabled => false,
+    }
 }
 
-fn read_only_policy_denies_tool(
-    policy: Option<bcode_ipc::PluginAutomationExecutionPolicy>,
+fn tool_policy_denies_tool(
+    policy: Option<bcode_session_models::TurnToolPolicy>,
     metadata: Option<&ToolPolicyAuthorizationMetadata>,
 ) -> bool {
-    policy == Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection)
-        && metadata.is_none_or(|metadata| {
-            !automation_policy_allows_operation(policy, metadata.is_read_only())
-        })
+    metadata.is_none_or(|metadata| !tool_policy_allows_operation(policy, metadata.is_read_only()))
 }
 
 async fn collect_model_tools(
@@ -15149,11 +15165,14 @@ async fn collect_model_tools(
 ) -> Vec<bcode_model::ToolDefinition> {
     let enabled_tools = enabled_tools.map(|tools| tools.into_iter().collect::<BTreeSet<_>>());
     let policy = state
-        .plugin_automation_policies
+        .turn_tool_policies
         .lock()
         .await
         .get(&session_id)
         .copied();
+    if policy == Some(bcode_session_models::TurnToolPolicy::Disabled) {
+        return Vec::new();
+    }
     let mut tools = Vec::new();
     for tool in collect_tool_definitions(state).await {
         if enabled_tools
@@ -15162,7 +15181,7 @@ async fn collect_model_tools(
         {
             continue;
         }
-        if policy == Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection) {
+        if policy != Some(bcode_session_models::TurnToolPolicy::Enabled) {
             let call = bcode_model::ToolCall {
                 id: format!("catalog-{}", tool.name),
                 name: tool.name.clone(),
@@ -15309,12 +15328,12 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             };
         let policy = self
             .state
-            .plugin_automation_policies
+            .turn_tool_policies
             .lock()
             .await
             .get(&self.session_id)
             .copied();
-        if read_only_policy_denies_tool(policy, Some(&policy_metadata)) {
+        if tool_policy_denies_tool(policy, Some(&policy_metadata)) {
             return ToolAuthorizationDecision::Deny(
                 "tool denied by read-only inspection policy".to_string(),
             );
@@ -28480,32 +28499,32 @@ library = "test"
 
     #[test]
     fn read_only_execution_denies_mutating_and_unknown_tool_calls() {
-        let read_only = Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection);
+        let read_only = Some(bcode_session_models::TurnToolPolicy::ReadOnly);
         let read = policy_metadata(bcode_agent_profile::ToolPolicyOperation::ReadOnly);
         let write = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Mutating);
         let command = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
             command: Some("synthetic".to_string()),
         });
-        assert!(!read_only_policy_denies_tool(read_only, Some(&read)));
-        assert!(read_only_policy_denies_tool(read_only, Some(&write)));
-        assert!(read_only_policy_denies_tool(read_only, Some(&command)));
-        assert!(read_only_policy_denies_tool(read_only, None));
-        assert!(!read_only_policy_denies_tool(
-            Some(bcode_ipc::PluginAutomationExecutionPolicy::Normal),
+        assert!(!tool_policy_denies_tool(read_only, Some(&read)));
+        assert!(tool_policy_denies_tool(read_only, Some(&write)));
+        assert!(tool_policy_denies_tool(read_only, Some(&command)));
+        assert!(tool_policy_denies_tool(read_only, None));
+        assert!(!tool_policy_denies_tool(
+            Some(bcode_session_models::TurnToolPolicy::Enabled),
             Some(&write)
         ));
     }
 
     #[test]
     fn read_only_automation_policy_allows_only_owner_declared_read_operations() {
-        let read_only = Some(bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection);
-        assert!(automation_policy_allows_operation(read_only, true));
-        assert!(!automation_policy_allows_operation(read_only, false));
-        assert!(automation_policy_allows_operation(
-            Some(bcode_ipc::PluginAutomationExecutionPolicy::Normal),
+        let read_only = Some(bcode_session_models::TurnToolPolicy::ReadOnly);
+        assert!(tool_policy_allows_operation(read_only, true));
+        assert!(!tool_policy_allows_operation(read_only, false));
+        assert!(tool_policy_allows_operation(
+            Some(bcode_session_models::TurnToolPolicy::Enabled),
             false
         ));
-        assert!(automation_policy_allows_operation(None, false));
+        assert!(tool_policy_allows_operation(None, false));
     }
 
     #[test]

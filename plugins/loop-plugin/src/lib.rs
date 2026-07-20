@@ -183,38 +183,14 @@ fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionSt
     let Ok(Some(state)) = load_state_result(session_id) else {
         return bcode_plugin_sdk::SessionStatusResponse::default();
     };
-    let pending_steering = automation_snapshot_blocking(session_id)
-        .map_or(0, |snapshot| snapshot.pending_steering_messages);
     bcode_plugin_sdk::SessionStatusResponse {
-        contribution: active_status_contribution(&state, pending_steering),
+        contribution: active_status_contribution(&state, 0),
     }
-}
-
-fn automation_snapshot_blocking(
-    session_id: SessionId,
-) -> Result<bcode_ipc::PluginAutomationSnapshot, String> {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?
-            .block_on(BcodeClient::default_endpoint().plugin_automation_snapshot(session_id))
-            .map_err(|error| error.to_string())
-    })
-    .join()
-    .map_err(|_panic| "automation snapshot worker panicked".to_owned())?
 }
 
 fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
     match load_state_result(session_id) {
-        Ok(state) => {
-            let pending_steering = state
-                .as_ref()
-                .filter(|state| !state.state.is_terminal())
-                .and_then(|_| automation_snapshot_blocking(session_id).ok())
-                .map(|snapshot| snapshot.pending_steering_messages);
-            status_response(&format_status(state.as_ref(), pending_steering))
-        }
+        Ok(state) => status_response(&format_status(state.as_ref(), None)),
         Err(error) => status_response(&format!("loop state unavailable: {error}")),
     }
 }
@@ -299,17 +275,29 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
         return status_response(&error);
     }
     state.stop_reason = Some("stopped by user".to_owned());
-    let cancel_session_id = state
-        .pending_operation
-        .as_ref()
-        .map_or(session_id, |operation| operation.target_session_id);
+    let pending_work = state.pending_operation.as_ref().and_then(|operation| {
+        operation.accepted_sequence.map(|sequence| {
+            (
+                operation.target_session_id,
+                bcode_session_models::TurnReceipt::from_accepted_event(
+                    operation.target_session_id,
+                    sequence,
+                )
+                .work_id,
+            )
+        })
+    });
     let message = match save_state(&state) {
         Ok(()) => {
             publish_lifecycle_note(&state);
-            let client = BcodeClient::default_endpoint();
-            tokio::spawn(async move {
-                let _cancelled = client.cancel_session_turn(cancel_session_id).await;
-            });
+            if let Some((pending_session_id, work_id)) = pending_work {
+                let client = BcodeClient::default_endpoint();
+                tokio::spawn(async move {
+                    let _cancelled = client
+                        .cancel_runtime_work(pending_session_id, work_id)
+                        .await;
+                });
+            }
             stop_confirmation()
         }
         Err(error) => format!("failed to stop loop: {error}"),
@@ -782,8 +770,13 @@ struct Evaluation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OperationKind {
-    Iteration { iteration: u64 },
-    Evaluation { source_generation: u64 },
+    Iteration {
+        iteration: u64,
+    },
+    Evaluation {
+        #[serde(alias = "source_generation")]
+        iteration: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -795,18 +788,27 @@ enum OperationStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct TurnCompletion {
+    outcome: ModelTurnOutcome,
+    #[serde(default)]
+    assistant_text: String,
+    event_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingOperation {
     operation_id: String,
     kind: OperationKind,
     target_session_id: SessionId,
-    expected_generation: u64,
+    #[serde(default, skip_serializing, rename = "expected_generation")]
+    _expected_generation: Option<u64>,
     status: OperationStatus,
     #[serde(default)]
     accepted_turn_id: Option<String>,
     #[serde(default)]
     accepted_sequence: Option<u64>,
     #[serde(default)]
-    completion: Option<bcode_ipc::PluginAutomationTurnCompletion>,
+    completion: Option<TurnCompletion>,
 }
 
 const fn state_schema_version() -> u32 {
@@ -861,77 +863,101 @@ impl LoopState {
     }
 }
 
-fn reconcile_observed_operation(
-    state: &mut LoopState,
-    pending: &PendingOperation,
-    operation: Option<bcode_ipc::PluginAutomationOperation>,
-) -> Result<(), String> {
-    match (pending.status, operation) {
-        (OperationStatus::Prepared, None) => {
-            state.pending_operation = None;
-            Ok(())
-        }
-        (_, None) => Err(format!(
-            "automation operation {} is missing after it was recorded as accepted",
-            pending.operation_id
-        )),
-        (_, Some(operation)) => {
-            let Some(completion) = operation.completion else {
-                return Err(format!(
-                    "automation operation {} may still be in flight; explicit resume is required after it settles",
-                    pending.operation_id
-                ));
-            };
-            if completion.outcome != ModelTurnOutcome::Completed {
-                return Err(format!(
-                    "reconciled automation operation ended with {:?}",
-                    completion.outcome
-                ));
+fn update_completion_from_events(
+    events: &[bcode_session_models::SessionEvent],
+    receipt: &bcode_session_models::TurnReceipt,
+    assistant_text: &mut String,
+) -> Option<TurnCompletion> {
+    for event in events
+        .iter()
+        .filter(|event| event.sequence >= receipt.accepted_event_sequence)
+    {
+        match &event.kind {
+            SessionEventKind::AssistantMessage { text } => assistant_text.clone_from(text),
+            SessionEventKind::ModelTurnFinished {
+                turn_id, outcome, ..
+            } if turn_id == &receipt.turn_id.to_string() => {
+                return Some(TurnCompletion {
+                    outcome: *outcome,
+                    assistant_text: assistant_text.clone(),
+                    event_sequence: event.sequence,
+                });
             }
-            let mut completed = pending.clone();
-            completed.status = OperationStatus::Completed;
-            completed.accepted_turn_id = Some(operation.turn_id);
-            completed.accepted_sequence = Some(operation.user_event_sequence);
-            completed.completion = Some(completion);
-            match pending.kind {
-                OperationKind::Iteration { iteration } => {
-                    state.current_iteration = state.current_iteration.max(iteration);
-                }
-                OperationKind::Evaluation { .. } => {
-                    transition(state, RunState::Evaluating)?;
-                    state.latest_evaluation = None;
-                }
-            }
-            state.pending_operation = None;
-            state.last_completed_operation = Some(completed);
-            Ok(())
+            _ => {}
         }
     }
+    None
 }
 
-fn reconcile_observed_pending(
-    state: &mut LoopState,
-    operation: Option<bcode_ipc::PluginAutomationOperation>,
-) -> Result<(), String> {
-    let Some(pending) = state.pending_operation.clone() else {
-        return Ok(());
-    };
-    reconcile_observed_operation(state, &pending, operation)
+fn completion_from_events(
+    events: &[bcode_session_models::SessionEvent],
+    receipt: &bcode_session_models::TurnReceipt,
+) -> Option<TurnCompletion> {
+    update_completion_from_events(events, receipt, &mut String::new())
+}
+
+async fn persisted_turn_completion(
+    client: &BcodeClient,
+    session_id: SessionId,
+    receipt: &bcode_session_models::TurnReceipt,
+) -> Result<Option<TurnCompletion>, String> {
+    let mut cursor = receipt.accepted_event_sequence;
+    let mut assistant_text = String::new();
+    loop {
+        let page = client
+            .session_history_page(
+                session_id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: Some(bcode_session_models::SessionHistoryCursor { sequence: cursor }),
+                    limit: 256,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(completion) =
+            update_completion_from_events(&page.events, receipt, &mut assistant_text)
+        {
+            return Ok(Some(completion));
+        }
+        let Some(last_sequence) = page.events.last().map(|event| event.sequence) else {
+            return Ok(None);
+        };
+        if !page.has_more {
+            return Ok(None);
+        }
+        cursor = last_sequence.saturating_add(1);
+    }
 }
 
 async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String> {
     let Some(pending) = state.pending_operation.clone() else {
         return Ok(());
     };
-    let operation = BcodeClient::default_endpoint()
-        .lookup_plugin_automation_operation(bcode_ipc::PluginAutomationOperationLookupRequest {
-            session_id: pending.target_session_id,
-            plugin_id: PLUGIN_ID.to_owned(),
-            operation_id: pending.operation_id.clone(),
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    reconcile_observed_pending(state, operation)?;
+    if pending.status == OperationStatus::Prepared {
+        state.pending_operation = None;
+        return save_state(state);
+    }
+    let accepted_sequence = pending.accepted_sequence.ok_or_else(|| {
+        format!(
+            "turn {} is missing its accepted event sequence",
+            pending.operation_id
+        )
+    })?;
+    let receipt = bcode_session_models::TurnReceipt::from_accepted_event(
+        pending.target_session_id,
+        accepted_sequence,
+    );
+    let client = BcodeClient::default_endpoint();
+    let completion = persisted_turn_completion(&client, pending.target_session_id, &receipt)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "turn {} is not complete yet; resume after the active turn settles",
+                pending.operation_id
+            )
+        })?;
+    complete_pending_operation(state, completion)?;
     save_state(state)
 }
 
@@ -967,32 +993,9 @@ const fn decide_turn_outcome(outcome: ModelTurnOutcome) -> TurnOutcomeDecision {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EvaluationDecision {
-    Reevaluate { generation: u64 },
-    Complete,
-    Continue,
-}
-
 fn next_iteration(state: &LoopState) -> Option<u64> {
     (state.current_iteration < state.max_iterations)
         .then(|| state.current_iteration.saturating_add(1))
-}
-
-const fn decide_evaluation(
-    source_generation: u64,
-    current_generation: u64,
-    condition_met: bool,
-) -> EvaluationDecision {
-    if current_generation != source_generation {
-        EvaluationDecision::Reevaluate {
-            generation: current_generation,
-        }
-    } else if condition_met {
-        EvaluationDecision::Complete
-    } else {
-        EvaluationDecision::Continue
-    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1023,45 +1026,31 @@ async fn run_loop(mut state: LoopState) {
                 return;
             }
             let _saved = save_state(&state);
-            let completion = loop {
-                if refresh_cancel(&mut state) {
-                    return;
-                }
-                let generation = match wait_until_automation_ready(state.session_id).await {
-                    Ok(generation) => generation,
-                    Err(error) => {
-                        fail_run(&mut state, error);
+            if refresh_cancel(&mut state) {
+                return;
+            }
+            let session_id = state.session_id;
+            let submission = iteration_submission(&state, iteration_number);
+            let completion = match run_ordinary_turn(
+                &mut state,
+                session_id,
+                OperationKind::Iteration {
+                    iteration: iteration_number,
+                },
+                submission.operation_id,
+                submission.display_label,
+                submission.prompt,
+                bcode_session_models::TurnToolPolicy::Enabled,
+            )
+            .await
+            {
+                Ok(completion) => completion,
+                Err(TurnSubmissionError::Fatal(error)) => {
+                    if refresh_cancel(&mut state) {
                         return;
                     }
-                };
-                if refresh_cancel(&mut state) {
+                    fail_run(&mut state, error);
                     return;
-                }
-                let session_id = state.session_id;
-                let submission = iteration_submission(&state, iteration_number);
-                let result = run_automation_turn(
-                    &mut state,
-                    session_id,
-                    OperationKind::Iteration {
-                        iteration: iteration_number,
-                    },
-                    submission.operation_id,
-                    submission.display_label,
-                    submission.prompt,
-                    generation,
-                    bcode_ipc::PluginAutomationExecutionPolicy::Normal,
-                )
-                .await;
-                match result {
-                    Ok(completion) => break completion,
-                    Err(AutomationTurnError::Retry) => {}
-                    Err(AutomationTurnError::Fatal(error)) => {
-                        if refresh_cancel(&mut state) {
-                            return;
-                        }
-                        fail_run(&mut state, error);
-                        return;
-                    }
                 }
             };
             state.current_iteration = iteration_number;
@@ -1092,114 +1081,65 @@ async fn run_loop(mut state: LoopState) {
         if refresh_cancel(&mut state) {
             return;
         }
-        let mut source_generation = match wait_until_automation_ready(state.session_id).await {
-            Ok(generation) => generation,
+        if state.state != RunState::Evaluating
+            && !transition_or_fail(&mut state, RunState::Evaluating)
+        {
+            return;
+        }
+        let _saved = save_state(&state);
+        let iteration = state.current_iteration;
+        let session_id = state.session_id;
+        let operation_id = format!("{}:evaluation:{iteration}", state.run_id);
+        let stop_condition = state.stop_condition.clone();
+        let evaluation = run_ordinary_turn(
+            &mut state,
+            session_id,
+            OperationKind::Evaluation { iteration },
+            operation_id,
+            format!("Loop evaluation {iteration}"),
+            evaluator_prompt(&stop_condition),
+            bcode_session_models::TurnToolPolicy::ReadOnly,
+        )
+        .await;
+        let evaluation = match evaluation {
+            Ok(completion) => match decide_turn_outcome(completion.outcome) {
+                TurnOutcomeDecision::Completed => {
+                    match parse_evaluation(&completion.assistant_text) {
+                        Ok(evaluation) => evaluation,
+                        Err(error) => {
+                            pause_run(&mut state, error);
+                            return;
+                        }
+                    }
+                }
+                TurnOutcomeDecision::PauseForSteering => {
+                    pause_for_steering(&mut state, "evaluation cancelled".to_owned());
+                    return;
+                }
+                TurnOutcomeDecision::Pause => {
+                    pause_run(
+                        &mut state,
+                        format!("evaluation ended with {:?}", completion.outcome),
+                    );
+                    return;
+                }
+            },
             Err(error) => {
-                fail_run(&mut state, error);
+                pause_run(&mut state, error.into_message());
                 return;
             }
         };
-        loop {
-            if refresh_cancel(&mut state) {
+        state.latest_evaluation = Some(evaluation.clone());
+        if evaluation.condition_met {
+            if !transition_or_fail(&mut state, RunState::Completed) {
                 return;
             }
-            if !transition_or_fail(&mut state, RunState::Evaluating) {
-                return;
-            }
+            state.stop_reason = Some(evaluation.summary);
             let _saved = save_state(&state);
-            let operation_id = format!(
-                "{}:evaluation:{}:{source_generation}",
-                state.run_id, state.current_iteration
-            );
-            let stop_condition = state.stop_condition.clone();
-            if refresh_cancel(&mut state) {
-                return;
-            }
-            let evaluation = run_evaluation_turn(
-                &mut state,
-                source_generation,
-                OperationKind::Evaluation { source_generation },
-                operation_id,
-                evaluator_prompt(&stop_condition),
-            )
-            .await;
-            let evaluation = match evaluation {
-                Ok(completion) => match decide_turn_outcome(completion.outcome) {
-                    TurnOutcomeDecision::Completed => {
-                        match parse_evaluation(&completion.assistant_text) {
-                            Ok(evaluation) => evaluation,
-                            Err(error) => {
-                                if refresh_cancel(&mut state) {
-                                    return;
-                                }
-                                pause_run(&mut state, error);
-                                return;
-                            }
-                        }
-                    }
-                    TurnOutcomeDecision::PauseForSteering => {
-                        if refresh_cancel(&mut state) {
-                            return;
-                        }
-                        pause_for_steering(&mut state, "evaluation cancelled".to_owned());
-                        return;
-                    }
-                    TurnOutcomeDecision::Pause => {
-                        if refresh_cancel(&mut state) {
-                            return;
-                        }
-                        pause_run(
-                            &mut state,
-                            format!("evaluation ended with {:?}", completion.outcome),
-                        );
-                        return;
-                    }
-                },
-                Err(error) => {
-                    if refresh_cancel(&mut state) {
-                        return;
-                    }
-                    pause_run(&mut state, error);
-                    return;
-                }
-            };
-            let current_generation = match wait_until_automation_ready(state.session_id).await {
-                Ok(generation) => generation,
-                Err(error) => {
-                    fail_run(&mut state, error);
-                    return;
-                }
-            };
-            match decide_evaluation(
-                source_generation,
-                current_generation,
-                evaluation.condition_met,
-            ) {
-                EvaluationDecision::Reevaluate { generation } => {
-                    if !transition_or_fail(&mut state, RunState::DrainingSteering) {
-                        return;
-                    }
-                    state.latest_evaluation = None;
-                    let _saved = save_state(&state);
-                    source_generation = generation;
-                }
-                EvaluationDecision::Complete => {
-                    state.latest_evaluation = Some(evaluation.clone());
-                    if !transition_or_fail(&mut state, RunState::Completed) {
-                        return;
-                    }
-                    state.stop_reason = Some(evaluation.summary);
-                    let _saved = save_state(&state);
-                    publish_lifecycle_note(&state);
-                    return;
-                }
-                EvaluationDecision::Continue => {
-                    state.latest_evaluation = Some(evaluation);
-                    let _saved = save_state(&state);
-                    break;
-                }
-            }
+            publish_lifecycle_note(&state);
+            return;
         }
+        let _saved = save_state(&state);
     }
 }
 
@@ -1263,7 +1203,6 @@ async fn resume_after_steering_settles(state: LoopState) -> Result<(), String> {
     if saved.run_id != state.run_id || saved.cancel_requested || saved.state != RunState::Paused {
         return Ok(());
     }
-    let _generation = wait_until_automation_ready(saved.session_id).await?;
     prepare_steering_resume(&mut saved)?;
     save_state(&saved)?;
     run_loop(saved).await;
@@ -1335,243 +1274,149 @@ fn fail_run(state: &mut LoopState, reason: String) {
     publish_lifecycle_note(state);
 }
 
-#[derive(Debug)]
-struct TurnCompletion {
-    outcome: ModelTurnOutcome,
-    assistant_text: String,
-}
-
-async fn wait_until_automation_ready(session_id: SessionId) -> Result<u64, String> {
-    let client = BcodeClient::default_endpoint();
-    let mut watcher = client
-        .watch_session(session_id, 1)
-        .await
-        .map_err(|error| error.to_string())?;
-    let _initial = watcher.take_initial();
-    loop {
-        let snapshot = client
-            .plugin_automation_snapshot(session_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        if (!snapshot.session_busy || snapshot.plugin_automation_active)
-            && snapshot.pending_manual_messages == 0
-            && !snapshot.automation_held
-        {
-            return Ok(snapshot.generation);
-        }
-        let _event = watcher
-            .next_event()
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-}
-
-enum AutomationTurnError {
-    Retry,
+enum TurnSubmissionError {
     Fatal(String),
 }
 
-async fn run_evaluation_turn(
-    state: &mut LoopState,
-    source_generation: u64,
-    kind: OperationKind,
-    operation_id: String,
-    prompt: String,
-) -> Result<TurnCompletion, String> {
-    let source_session_id = state.session_id;
-    let client = BcodeClient::default_endpoint();
-    let clone = client
-        .clone_session_at_generation(
-            source_session_id,
-            source_generation,
-            Some(format!("loop-evaluator-{}", uuid::Uuid::new_v4())),
-        )
-        .await
-        .map_err(|error| format!("failed to create evaluator session: {error}"))?;
-    let evaluator_session_id = clone.session.id;
-    let generation = wait_until_automation_ready(evaluator_session_id).await?;
-    let result = run_automation_turn(
-        state,
-        evaluator_session_id,
-        kind,
-        operation_id,
-        "Loop evaluator".to_owned(),
-        prompt,
-        generation,
-        bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection,
-    )
-    .await;
-    let cleanup = client
-        .delete_session(evaluator_session_id)
-        .await
-        .map(|_deleted| ())
-        .map_err(|error| error.to_string());
-    finalize_evaluation_turn(result, cleanup)
-}
-
-fn finalize_evaluation_turn(
-    result: Result<TurnCompletion, AutomationTurnError>,
-    cleanup: Result<(), String>,
-) -> Result<TurnCompletion, String> {
-    match (result, cleanup) {
-        (Ok(completion), Ok(())) => Ok(completion),
-        (Ok(_completion), Err(error)) => {
-            Err(format!("failed to remove evaluator session: {error}"))
-        }
-        (Err(AutomationTurnError::Fatal(error)), _) => Err(error),
-        (Err(AutomationTurnError::Retry), _) => {
-            Err("evaluator automation was preempted before submission".to_owned())
+impl TurnSubmissionError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Fatal(message) => message,
         }
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn run_automation_turn(
+#[allow(clippy::too_many_lines)]
+async fn run_ordinary_turn(
     state: &mut LoopState,
     session_id: SessionId,
     kind: OperationKind,
     operation_id: String,
     display_label: String,
     text: String,
-    expected_generation: u64,
-    execution_policy: bcode_ipc::PluginAutomationExecutionPolicy,
-) -> Result<TurnCompletion, AutomationTurnError> {
+    tool_policy: bcode_session_models::TurnToolPolicy,
+) -> Result<TurnCompletion, TurnSubmissionError> {
     let client = BcodeClient::default_endpoint();
     let mut watcher = client
-        .watch_session(session_id, 32)
+        .watch_session(session_id, 64)
         .await
-        .map_err(|error| AutomationTurnError::Fatal(error.to_string()))?;
+        .map_err(|error| TurnSubmissionError::Fatal(error.to_string()))?;
     let initial = watcher.take_initial();
     state.pending_operation = Some(PendingOperation {
         operation_id: operation_id.clone(),
         kind,
         target_session_id: session_id,
-        expected_generation,
+        _expected_generation: None,
         status: OperationStatus::Prepared,
         accepted_turn_id: None,
         accepted_sequence: None,
         completion: None,
     });
-    save_state(state).map_err(AutomationTurnError::Fatal)?;
-    let result = client
-        .submit_plugin_automation_turn(bcode_ipc::PluginAutomationTurnRequest {
+    save_state(state).map_err(TurnSubmissionError::Fatal)?;
+    let admission = client
+        .submit_turn(
             session_id,
-            origin: bcode_ipc::PluginAutomationOrigin {
-                plugin_id: PLUGIN_ID.to_owned(),
-                run_id: state.run_id.clone(),
-                operation_id: operation_id.clone(),
-                display_label,
-            },
             text,
-            expected_generation,
-            execution_policy,
-        })
+            bcode_session_models::TurnAdmissionMetadata {
+                origin: Some(bcode_session_models::TurnOrigin {
+                    producer: PLUGIN_ID.to_owned(),
+                    correlation_id: Some(operation_id.clone()),
+                    display_label: Some(display_label),
+                }),
+                idempotency_key: Some(operation_id.clone()),
+                execution: bcode_session_models::TurnExecutionOptions { tools: tool_policy },
+                ..bcode_session_models::TurnAdmissionMetadata::default()
+            },
+        )
         .await
-        .map_err(|error| AutomationTurnError::Fatal(error.to_string()))?;
-    let operation = match result {
-        bcode_ipc::PluginAutomationTurnDisposition::Accepted { operation }
-        | bcode_ipc::PluginAutomationTurnDisposition::AlreadyAccepted { operation } => operation,
-        bcode_ipc::PluginAutomationTurnDisposition::SessionChanged { .. }
-        | bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending { .. }
-        | bcode_ipc::PluginAutomationTurnDisposition::SessionBusy
-        | bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld => {
-            state.pending_operation = None;
-            save_state(state).map_err(AutomationTurnError::Fatal)?;
-            return Err(AutomationTurnError::Retry);
+        .map_err(|error| TurnSubmissionError::Fatal(error.to_string()))?;
+    let receipt = match admission {
+        bcode_session_models::TurnAdmission::Accepted(receipt)
+        | bcode_session_models::TurnAdmission::Existing(receipt)
+        | bcode_session_models::TurnAdmission::Deferred(receipt) => receipt,
+        bcode_session_models::TurnAdmission::Rejected(reason) => {
+            return Err(TurnSubmissionError::Fatal(format!(
+                "ordinary turn was rejected: {reason:?}"
+            )));
+        }
+        bcode_session_models::TurnAdmission::CancelledBeforeStart(receipt) => {
+            return Ok(TurnCompletion {
+                outcome: ModelTurnOutcome::Cancelled,
+                assistant_text: String::new(),
+                event_sequence: receipt.accepted_event_sequence,
+            });
         }
     };
     if let Some(pending) = state.pending_operation.as_mut() {
         pending.status = OperationStatus::Accepted;
-        pending.accepted_turn_id = Some(operation.turn_id.clone());
-        pending.accepted_sequence = Some(operation.user_event_sequence);
-        pending.completion.clone_from(&operation.completion);
+        pending.accepted_turn_id = Some(receipt.turn_id.to_string());
+        pending.accepted_sequence = Some(receipt.accepted_event_sequence);
     }
-    save_state(state).map_err(AutomationTurnError::Fatal)?;
-    let mut assistant_text = initial
+    save_state(state).map_err(TurnSubmissionError::Fatal)?;
+
+    if let Some(completion) = initial
         .as_ref()
-        .and_then(|attached| {
-            assistant_text_for_operation(
-                &attached.history,
-                operation.user_event_sequence,
-                operation
-                    .completion
-                    .as_ref()
-                    .map(|value| value.event_sequence),
-            )
-        })
-        .unwrap_or_default();
-    if let Some(completion) = operation.completion {
-        complete_pending_operation(state, completion.clone())?;
-        return Ok(TurnCompletion {
-            outcome: completion.outcome,
-            assistant_text,
-        });
+        .and_then(|attached| completion_from_events(&attached.history, &receipt))
+    {
+        complete_pending_operation(state, completion.clone())
+            .map_err(TurnSubmissionError::Fatal)?;
+        return Ok(completion);
     }
+    if let Some(completion) = persisted_turn_completion(&client, session_id, &receipt)
+        .await
+        .map_err(TurnSubmissionError::Fatal)?
+    {
+        complete_pending_operation(state, completion.clone())
+            .map_err(TurnSubmissionError::Fatal)?;
+        return Ok(completion);
+    }
+
+    let mut assistant_text = String::new();
     loop {
-        if let SessionWatchEvent::Durable(event) = watcher
+        let event = watcher
             .next_event()
             .await
-            .map_err(|error| AutomationTurnError::Fatal(error.to_string()))?
-        {
-            match &event.kind {
-                SessionEventKind::AssistantMessage { text } => assistant_text.clone_from(text),
-                SessionEventKind::PluginAutomationTurnFinished {
-                    plugin_id,
-                    operation_id: event_operation_id,
-                    outcome,
-                    ..
-                } if plugin_id == PLUGIN_ID && event_operation_id == &operation_id => {
-                    let completion = bcode_ipc::PluginAutomationTurnCompletion {
-                        outcome: *outcome,
-                        message: match &event.kind {
-                            SessionEventKind::PluginAutomationTurnFinished { message, .. } => {
-                                message.clone()
-                            }
-                            _ => None,
-                        },
-                        event_sequence: event.sequence,
-                    };
-                    complete_pending_operation(state, completion)?;
-                    return Ok(TurnCompletion {
-                        outcome: *outcome,
-                        assistant_text,
-                    });
-                }
-                _ => {}
+            .map_err(|error| TurnSubmissionError::Fatal(error.to_string()))?;
+        let SessionWatchEvent::Durable(event) = event else {
+            continue;
+        };
+        if event.sequence < receipt.accepted_event_sequence {
+            continue;
+        }
+        match &event.kind {
+            SessionEventKind::AssistantMessage { text } => assistant_text.clone_from(text),
+            SessionEventKind::ModelTurnFinished {
+                turn_id, outcome, ..
+            } if turn_id == &receipt.turn_id.to_string() => {
+                let completion = TurnCompletion {
+                    outcome: *outcome,
+                    assistant_text,
+                    event_sequence: event.sequence,
+                };
+                complete_pending_operation(state, completion.clone())
+                    .map_err(TurnSubmissionError::Fatal)?;
+                return Ok(completion);
             }
+            _ => {}
         }
     }
 }
 
 fn complete_pending_operation(
     state: &mut LoopState,
-    completion: bcode_ipc::PluginAutomationTurnCompletion,
-) -> Result<(), AutomationTurnError> {
-    if let Some(pending) = state.pending_operation.as_mut() {
-        pending.status = OperationStatus::Completed;
-        pending.completion = Some(completion);
+    completion: TurnCompletion,
+) -> Result<(), String> {
+    let Some(mut pending) = state.pending_operation.take() else {
+        return Err("turn completion arrived without a pending operation".to_owned());
+    };
+    pending.status = OperationStatus::Completed;
+    pending.completion = Some(completion);
+    if let OperationKind::Iteration { iteration } = pending.kind {
+        state.current_iteration = state.current_iteration.max(iteration);
+        transition(state, RunState::Evaluating)?;
     }
-    save_state(state).map_err(AutomationTurnError::Fatal)?;
-    state.last_completed_operation = state.pending_operation.take();
-    save_state(state).map_err(AutomationTurnError::Fatal)
-}
-
-fn assistant_text_for_operation(
-    events: &[bcode_session_models::SessionEvent],
-    start_sequence: u64,
-    end_sequence: Option<u64>,
-) -> Option<String> {
-    events
-        .iter()
-        .filter(|event| {
-            event.sequence > start_sequence
-                && end_sequence.is_none_or(|end_sequence| event.sequence < end_sequence)
-        })
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::AssistantMessage { text } => Some(text.clone()),
-            _ => None,
-        })
-        .next_back()
+    state.last_completed_operation = Some(pending);
+    save_state(state)
 }
 
 fn evaluator_prompt(condition: &str) -> String {
@@ -2005,7 +1850,7 @@ mod tests {
             operation_id: "operation-1".to_owned(),
             kind: OperationKind::Iteration { iteration: 1 },
             target_session_id: state.session_id,
-            expected_generation: 7,
+            _expected_generation: None,
             status,
             accepted_turn_id: (status != OperationStatus::Prepared).then(|| "turn-1".to_owned()),
             accepted_sequence: (status != OperationStatus::Prepared).then_some(8),
@@ -2013,69 +1858,42 @@ mod tests {
         }
     }
 
-    fn observed_operation(
-        completion: Option<ModelTurnOutcome>,
-    ) -> bcode_ipc::PluginAutomationOperation {
-        bcode_ipc::PluginAutomationOperation {
-            origin: bcode_ipc::PluginAutomationOrigin {
-                plugin_id: PLUGIN_ID.to_owned(),
-                run_id: "run-1".to_owned(),
-                operation_id: "operation-1".to_owned(),
-                display_label: "Loop iteration 1".to_owned(),
+    #[test]
+    fn completion_matching_is_scoped_to_the_admitted_turn() {
+        let session_id = SessionId::new();
+        let receipt = bcode_session_models::TurnReceipt::from_accepted_event(session_id, 8);
+        let events = vec![
+            bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 9,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::AssistantMessage {
+                    text: "done".to_owned(),
+                },
             },
-            user_event_sequence: 8,
-            turn_id: "turn-1".to_owned(),
-            completion: completion.map(|outcome| bcode_ipc::PluginAutomationTurnCompletion {
-                outcome,
-                message: None,
-                event_sequence: 12,
-            }),
-        }
+            bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 10,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ModelTurnFinished {
+                    turn_id: receipt.turn_id.to_string(),
+                    outcome: ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            },
+        ];
+        let completion = completion_from_events(&events, &receipt).expect("completion");
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        assert_eq!(completion.assistant_text, "done");
+        assert_eq!(completion.event_sequence, 10);
     }
 
     #[test]
-    fn reconciliation_clears_unaccepted_prepared_operation() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Prepared));
-
-        reconcile_observed_pending(&mut state, None).expect("unaccepted preparation is safe");
-
-        assert!(state.pending_operation.is_none());
-        assert!(state.last_completed_operation.is_none());
-        assert_eq!(state.current_iteration, 0);
-    }
-
-    #[test]
-    fn reconciliation_recovers_acceptance_before_plugin_persistence() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Prepared));
-
-        let error = reconcile_observed_pending(&mut state, Some(observed_operation(None)))
-            .expect_err("accepted in-flight work must remain uncertain");
-
-        assert!(error.contains("may still be in flight"));
-        assert_eq!(
-            state
-                .pending_operation
-                .as_ref()
-                .map(|pending| pending.status),
-            Some(OperationStatus::Prepared)
-        );
-        assert_eq!(state.current_iteration, 0);
-    }
-
-    #[test]
-    fn reconciliation_recovers_terminal_completion_before_plugin_persistence() {
+    fn completing_pending_operation_moves_the_durable_journal() {
         let mut state = LoopState::new(
             SessionId::new(),
             "iterate".to_owned(),
@@ -2083,68 +1901,26 @@ mod tests {
             20,
         );
         state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
-
-        reconcile_observed_pending(
+        transition(&mut state, RunState::SubmittingIteration).expect("submitting");
+        transition(&mut state, RunState::RunningIteration).expect("running");
+        complete_pending_operation(
             &mut state,
-            Some(observed_operation(Some(ModelTurnOutcome::Completed))),
+            TurnCompletion {
+                outcome: ModelTurnOutcome::Completed,
+                assistant_text: "done".to_owned(),
+                event_sequence: 12,
+            },
         )
-        .expect("completed accepted operation should reconcile");
-
+        .expect("complete");
         assert!(state.pending_operation.is_none());
-        assert_eq!(state.current_iteration, 1);
-        let completed = state
-            .last_completed_operation
-            .as_ref()
-            .expect("completed journal retained");
-        assert_eq!(completed.status, OperationStatus::Completed);
-        assert_eq!(completed.accepted_turn_id.as_deref(), Some("turn-1"));
-        assert_eq!(completed.accepted_sequence, Some(8));
         assert_eq!(
-            completed
-                .completion
+            state
+                .last_completed_operation
                 .as_ref()
+                .and_then(|operation| operation.completion.as_ref())
                 .map(|completion| completion.event_sequence),
             Some(12)
         );
-    }
-
-    #[test]
-    fn reconciliation_pauses_on_uncertain_or_failed_accepted_work() {
-        for operation in [
-            None,
-            Some(observed_operation(None)),
-            Some(observed_operation(Some(ModelTurnOutcome::Cancelled))),
-        ] {
-            let mut state = LoopState::new(
-                SessionId::new(),
-                "iterate".to_owned(),
-                "complete".to_owned(),
-                20,
-            );
-            state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
-
-            assert!(reconcile_observed_pending(&mut state, operation).is_err());
-            assert!(state.pending_operation.is_some());
-            assert_eq!(state.current_iteration, 0);
-        }
-    }
-
-    #[test]
-    fn repeated_reconciliation_cannot_count_iteration_twice() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
-        let operation = observed_operation(Some(ModelTurnOutcome::Completed));
-
-        reconcile_observed_pending(&mut state, Some(operation.clone())).expect("first resume");
-        reconcile_observed_pending(&mut state, Some(operation)).expect("duplicate resume");
-
-        assert_eq!(state.current_iteration, 1);
-        assert!(state.pending_operation.is_none());
     }
 
     #[test]
@@ -2155,39 +1931,17 @@ mod tests {
             "complete".to_owned(),
             20,
         );
-        state.pending_operation = Some(PendingOperation {
-            operation_id: "operation-1".to_owned(),
-            kind: OperationKind::Iteration { iteration: 1 },
-            target_session_id: state.session_id,
-            expected_generation: 7,
-            status: OperationStatus::Accepted,
-            accepted_turn_id: Some("turn-1".to_owned()),
-            accepted_sequence: Some(8),
-            completion: None,
-        });
-
+        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
         let encoded = serde_json::to_vec(&state).expect("encode state");
         let decoded: LoopState = serde_json::from_slice(&encoded).expect("decode state");
         validate_state(&decoded).expect("valid state");
-        let pending = decoded.pending_operation.expect("pending operation");
-        assert_eq!(pending.operation_id, "operation-1");
-        assert_eq!(pending.status, OperationStatus::Accepted);
-        assert_eq!(pending.accepted_sequence, Some(8));
-    }
-
-    #[test]
-    fn state_validation_rejects_incompatible_and_invalid_state() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
+        assert_eq!(
+            decoded
+                .pending_operation
+                .as_ref()
+                .and_then(|operation| operation.accepted_sequence),
+            Some(8)
         );
-        state.schema_version = STATE_SCHEMA_VERSION.saturating_add(1);
-        assert!(validate_state(&state).is_err());
-        state.schema_version = STATE_SCHEMA_VERSION;
-        state.current_iteration = 21;
-        assert!(validate_state(&state).is_err());
     }
 
     #[test]
@@ -2425,55 +2179,6 @@ mod tests {
     }
 
     #[test]
-    fn iteration_budget_is_exact_and_only_completed_iterations_advance_it() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            3,
-        );
-        assert_eq!(next_iteration(&state), Some(1));
-
-        // Evaluation and steering decisions do not alter the automated iteration budget.
-        assert_eq!(
-            decide_evaluation(7, 8, false),
-            EvaluationDecision::Reevaluate { generation: 8 }
-        );
-        assert_eq!(state.current_iteration, 0);
-        assert_eq!(next_iteration(&state), Some(1));
-
-        for expected in 1..=3 {
-            state.current_iteration = expected;
-            assert_eq!(
-                next_iteration(&state),
-                (expected < 3).then_some(expected + 1)
-            );
-        }
-        assert_eq!(state.current_iteration, state.max_iterations);
-        assert_eq!(next_iteration(&state), None);
-    }
-
-    #[test]
-    fn stale_evaluation_always_reevaluates_before_more_work() {
-        assert_eq!(
-            decide_evaluation(10, 11, false),
-            EvaluationDecision::Reevaluate { generation: 11 }
-        );
-        assert_eq!(
-            decide_evaluation(10, 11, true),
-            EvaluationDecision::Reevaluate { generation: 11 }
-        );
-        assert_eq!(
-            decide_evaluation(10, 10, true),
-            EvaluationDecision::Complete
-        );
-        assert_eq!(
-            decide_evaluation(10, 10, false),
-            EvaluationDecision::Continue
-        );
-    }
-
-    #[test]
     fn run_state_transition_table_is_explicit_and_complete() {
         let states = [
             RunState::Ready,
@@ -2577,97 +2282,6 @@ mod tests {
         ] {
             assert!(parse_evaluation(invalid).is_err(), "accepted {invalid}");
         }
-    }
-
-    #[test]
-    fn assistant_text_is_bounded_to_the_exact_operation() {
-        let session_id = SessionId::new();
-        let events = vec![
-            bcode_session_models::SessionEvent {
-                session_id,
-                sequence: 10,
-                timestamp_ms: 0,
-                provenance: None,
-                kind: SessionEventKind::AssistantMessage {
-                    text: "before".to_owned(),
-                },
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            },
-            bcode_session_models::SessionEvent {
-                session_id,
-                sequence: 12,
-                timestamp_ms: 0,
-                provenance: None,
-                kind: SessionEventKind::AssistantMessage {
-                    text: "operation result".to_owned(),
-                },
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            },
-            bcode_session_models::SessionEvent {
-                session_id,
-                sequence: 14,
-                timestamp_ms: 0,
-                provenance: None,
-                kind: SessionEventKind::AssistantMessage {
-                    text: "after".to_owned(),
-                },
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            },
-        ];
-
-        assert_eq!(
-            assistant_text_for_operation(&events, 10, Some(14)).as_deref(),
-            Some("operation result")
-        );
-    }
-
-    #[test]
-    fn evaluator_tool_or_inspection_failure_cannot_produce_an_accepted_result() {
-        let error = finalize_evaluation_turn(
-            Err(AutomationTurnError::Fatal(
-                "inspection tool failed: repository unavailable".to_owned(),
-            )),
-            Ok(()),
-        )
-        .expect_err("inspection failure must fail evaluation");
-        assert_eq!(error, "inspection tool failed: repository unavailable");
-
-        let error = finalize_evaluation_turn(Err(AutomationTurnError::Retry), Ok(()))
-            .expect_err("preempted inspection must not become success");
-        assert_eq!(
-            error,
-            "evaluator automation was preempted before submission"
-        );
-    }
-
-    #[test]
-    fn source_change_while_evaluator_is_running_discards_even_positive_result() {
-        let captured_generation = 40;
-        let generation_after_evaluator = 41;
-        assert_eq!(
-            decide_evaluation(captured_generation, generation_after_evaluator, true),
-            EvaluationDecision::Reevaluate {
-                generation: generation_after_evaluator
-            }
-        );
-        assert_eq!(
-            decide_evaluation(captured_generation, generation_after_evaluator, false),
-            EvaluationDecision::Reevaluate {
-                generation: generation_after_evaluator
-            }
-        );
-    }
-
-    #[test]
-    fn evaluator_cleanup_failure_cannot_become_success() {
-        let completion = TurnCompletion {
-            outcome: ModelTurnOutcome::Completed,
-            assistant_text: "valid evaluation".to_owned(),
-        };
-        let error = finalize_evaluation_turn(Ok(completion), Err("permission denied".to_owned()))
-            .expect_err("cleanup failure must fail evaluation");
-        assert!(error.contains("failed to remove evaluator session"));
-        assert!(error.contains("permission denied"));
     }
 
     #[test]

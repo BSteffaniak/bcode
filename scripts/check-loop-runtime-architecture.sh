@@ -85,7 +85,6 @@ plugin_automation_generation
 plugin_automation_holds
 plugin_automation_operation_events
 plugin_automation_origin_labels_only_the_matching_user_turn
-plugin_automation_policies
 plugin_automation_preflight_disposition
 plugin_automation_snapshot
 plugin_automation_turn_finished
@@ -143,7 +142,6 @@ expected_clone_files="$(cat <<'EOF'
 packages/client/src/lib.rs
 packages/server/src/lib.rs
 packages/session/src/lib.rs
-plugins/loop-plugin/src/lib.rs
 EOF
 )"
 if [[ "$clone_files" != "$expected_clone_files" ]]; then
@@ -153,8 +151,8 @@ if [[ "$clone_files" != "$expected_clone_files" ]]; then
 fi
 
 loop_default_clients="$(rg -n 'BcodeClient::default_endpoint' plugins/loop-plugin/src/lib.rs | wc -l | tr -d ' ')"
-if [[ "$loop_default_clients" != "8" ]]; then
-  echo "Loop architecture violation: expected eight recorded direct loop daemon-client constructions, found $loop_default_clients." >&2
+if [[ "$loop_default_clients" != "5" ]]; then
+  echo "Loop architecture violation: expected five recorded direct loop daemon-client constructions, found $loop_default_clients." >&2
   violations=1
 fi
 

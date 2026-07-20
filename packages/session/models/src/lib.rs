@@ -574,6 +574,8 @@ pub enum TurnPriority {
 pub enum TurnToolPolicy {
     #[default]
     Enabled,
+    /// Expose only tools whose generic authorization metadata declares them read-only.
+    ReadOnly,
     Disabled,
 }
 
@@ -2099,6 +2101,20 @@ mod tests {
             WorkId::new(format!("model_{session_id}-42"))
         );
         assert_eq!(receipt.accepted_event_sequence, 42);
+    }
+
+    #[test]
+    fn turn_tool_policy_serializes_all_generic_modes() {
+        for policy in [
+            TurnToolPolicy::Enabled,
+            TurnToolPolicy::ReadOnly,
+            TurnToolPolicy::Disabled,
+        ] {
+            let encoded = serde_json::to_string(&policy).expect("policy should encode");
+            let decoded: TurnToolPolicy =
+                serde_json::from_str(&encoded).expect("policy should decode");
+            assert_eq!(decoded, policy);
+        }
     }
 
     #[test]
