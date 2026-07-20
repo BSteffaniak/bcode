@@ -38,6 +38,8 @@ use super::{
 };
 
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const BCODE_EVENT_DRAIN_BUDGET: usize = 32;
+const ARTIFACT_COMPLETION_DRAIN_BUDGET: usize = 8;
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 #[derive(Debug, Clone)]
 struct DraftAutosave {
@@ -383,7 +385,13 @@ async fn run_chat_loop<W: Write>(
 
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, &settings.keymap);
-        if drain_bcode_events(chat, loop_state).await {
+        if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
+            needs_redraw = true;
+        }
+        if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET).await {
+            needs_redraw = true;
+        }
+        if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
             needs_redraw = true;
         }
 
@@ -478,23 +486,21 @@ async fn run_chat_loop<W: Write>(
             }
             ChatLoopEvent::Bcode(event) => {
                 if absorb_bcode_event(chat, loop_state, *event).await
-                    || drain_bcode_events(chat, loop_state).await
+                    || drain_bcode_events(
+                        chat,
+                        loop_state,
+                        BCODE_EVENT_DRAIN_BUDGET.saturating_sub(1),
+                    )
+                    .await
                 {
+                    needs_redraw = true;
+                }
+                if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
                     needs_redraw = true;
                 }
             }
             ChatLoopEvent::ArtifactFetchCompleted(completion) => {
-                let presentation = chat.app.plugin_presentation();
-                needs_redraw |= loop_state.artifact_stream.handle_completion(
-                    chat.session_id,
-                    *completion,
-                    |chunk| {
-                        presentation.map_or_else(
-                            || Err("plugin presentation unavailable".to_owned()),
-                            |presentation| presentation.deliver_artifact_chunk(chunk),
-                        )
-                    },
-                );
+                needs_redraw |= handle_artifact_completion(chat, loop_state, *completion);
             }
             ChatLoopEvent::TimedInvalidations(keys) => {
                 if chat
@@ -611,11 +617,27 @@ fn apply_effect_result(
                 loop_state.artifact_stream.retain_session(Some(session_id));
             }
             if let Ok((attached, _)) = &result {
+                let presentation = chat.app.plugin_presentation();
                 for event in &attached.history {
                     loop_state.artifact_stream.observe_finalized_artifact(
                         event.session_id,
                         event.sequence,
                         &event.kind,
+                        |producer_plugin_id,
+                         schema,
+                         schema_version,
+                         reference_key,
+                         content_type| {
+                            presentation.is_some_and(|presentation| {
+                                presentation.accepts_artifact_reference(
+                                    producer_plugin_id,
+                                    schema,
+                                    schema_version,
+                                    reference_key,
+                                    content_type,
+                                )
+                            })
+                        },
                     );
                 }
             }
@@ -1545,10 +1567,54 @@ fn interactive_surface_area(
     None
 }
 
-async fn drain_bcode_events(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
+fn take_bcode_events(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<BcodeEvent>,
+    budget: usize,
+) -> Vec<BcodeEvent> {
+    (0..budget)
+        .map_while(|_| receiver.try_recv().ok())
+        .collect()
+}
+
+async fn drain_bcode_events(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    budget: usize,
+) -> bool {
     let mut needs_redraw = false;
-    while let Ok(event) = chat.event_receiver.try_recv() {
+    for event in take_bcode_events(&mut chat.event_receiver, budget) {
         needs_redraw |= absorb_bcode_event(chat, loop_state, event).await;
+    }
+    needs_redraw
+}
+
+fn handle_artifact_completion(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    completion: ActiveArtifactFetchCompletion,
+) -> bool {
+    let presentation = chat.app.plugin_presentation();
+    loop_state
+        .artifact_stream
+        .handle_completion(chat.session_id, completion, |chunk| {
+            presentation.map_or_else(
+                || Err("plugin presentation unavailable".to_owned()),
+                |presentation| presentation.deliver_artifact_chunk(chunk),
+            )
+        })
+}
+
+fn drain_artifact_completions(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    budget: usize,
+) -> bool {
+    let mut needs_redraw = false;
+    for _ in 0..budget {
+        let Some(completion) = loop_state.artifact_stream.try_next_completion() else {
+            break;
+        };
+        needs_redraw |= handle_artifact_completion(chat, loop_state, completion);
     }
     needs_redraw
 }
@@ -1560,10 +1626,22 @@ async fn absorb_bcode_event(
 ) -> bool {
     match event {
         BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
+            let presentation = chat.app.plugin_presentation();
             loop_state.artifact_stream.observe_finalized_artifact(
                 event.session_id,
                 event.sequence,
                 &event.kind,
+                |producer_plugin_id, schema, schema_version, reference_key, content_type| {
+                    presentation.is_some_and(|presentation| {
+                        presentation.accepts_artifact_reference(
+                            producer_plugin_id,
+                            schema,
+                            schema_version,
+                            reference_key,
+                            content_type,
+                        )
+                    })
+                },
             );
             if let SessionEventKind::AgentChanged { agent_id } = &event.kind {
                 chat.agents
@@ -1669,6 +1747,14 @@ async fn next_artifact_fetch_event(
     )
 }
 
+fn try_next_ready_artifact_event(
+    artifact_stream: &mut ArtifactStreamCoordinator,
+) -> Option<ChatLoopEvent> {
+    artifact_stream
+        .try_next_completion()
+        .map(|completion| ChatLoopEvent::ArtifactFetchCompleted(Box::new(completion)))
+}
+
 async fn next_chat_loop_event(
     terminal_events: &mut TuiInput,
     invalidation_queue: &mut InvalidationQueue,
@@ -1677,6 +1763,9 @@ async fn next_chat_loop_event(
     redraw_at: Option<Instant>,
     draft_save_at: Option<Instant>,
 ) -> Result<ChatLoopEvent, TuiError> {
+    if let Some(event) = try_next_ready_artifact_event(artifact_stream) {
+        return Ok(event);
+    }
     let now = Instant::now();
     let due = invalidation_queue.take_due(now);
     if !due.is_empty() {
@@ -1694,12 +1783,11 @@ async fn next_chat_loop_event(
     if let Some(next_at) = next_timer_at {
         let delay = next_at.saturating_duration_since(now);
         return tokio::select! {
-            biased;
+            artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
             bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
                 |event| ChatLoopEvent::Bcode(Box::new(event)),
             )),
-            artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
             event = terminal_events.recv() => event.map(|event| {
                 event.map_or_else(
                     || ChatLoopEvent::TimedInvalidations(Vec::new()),
@@ -1718,12 +1806,11 @@ async fn next_chat_loop_event(
         };
     }
     tokio::select! {
-        biased;
+        artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
         bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
             || ChatLoopEvent::TimedInvalidations(Vec::new()),
             |event| ChatLoopEvent::Bcode(Box::new(event)),
         )),
-        artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
         event = terminal_events.recv() => event.map(|event| {
             event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
@@ -2159,5 +2246,56 @@ fn paste_clipboard_image(chat: &mut ActiveChat) {
         Err(error) => {
             chat.app.set_status(format!("image paste failed: {error}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    fn test_chat() -> ActiveChat {
+        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        ActiveChat {
+            app: super::super::app::BmuxApp::new_with_history(None, &[], &[], false),
+            agents: super::super::session_flow::AgentCatalog::default(),
+            session_id: None,
+            event_sender,
+            event_receiver,
+            event_task: None,
+            opening_session_id: None,
+            pending_effects: super::super::effects::TuiEffectQueue::default(),
+        }
+    }
+
+    #[test]
+    fn daemon_queue_draining_obeys_its_per_tick_budget() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        for revision in 0..100 {
+            sender
+                .send(BcodeEvent::SessionCatalogUpdated { revision })
+                .expect("daemon event");
+        }
+
+        assert_eq!(take_bcode_events(&mut receiver, 32).len(), 32);
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn ready_artifact_completion_precedes_a_saturated_daemon_queue() {
+        let mut chat = test_chat();
+        for revision in 0..1_000 {
+            chat.event_sender
+                .send(BcodeEvent::SessionCatalogUpdated { revision })
+                .expect("daemon event");
+        }
+        let session_id = bcode_session_models::SessionId::new();
+        let mut artifacts = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        artifacts.enqueue_test_completion(session_id);
+
+        assert!(matches!(
+            try_next_ready_artifact_event(&mut artifacts),
+            Some(ChatLoopEvent::ArtifactFetchCompleted(_))
+        ));
+        assert!(chat.event_receiver.try_recv().is_ok());
+        assert!(chat.event_receiver.try_recv().is_ok());
     }
 }

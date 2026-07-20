@@ -5139,7 +5139,7 @@ struct ActiveArtifactKey {
     reference_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ActiveArtifactReference {
     producer_plugin_id: String,
     schema: String,
@@ -5350,13 +5350,29 @@ async fn handle_read_session_artifact(
     match result {
         Ok(payload) => send_response(writer, request_id, Response::Ok(payload)).await,
         Err(error) => {
+            let code = artifact_read_error_code(&error);
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("artifact_read_failed", error)),
+                Response::Err(ErrorResponse::new(code, error)),
             )
             .await
         }
+    }
+}
+
+fn artifact_read_error_code(error: &str) -> &'static str {
+    if error.contains("was not found in the finalized projection") {
+        "artifact_not_found"
+    } else if error.contains("artifact reference has no storage URI")
+        || error.contains("artifact reference is unavailable")
+        || error.contains("artifact reference is incomplete")
+        || error.contains("artifact file is unavailable")
+        || error.contains("No such file or directory")
+    {
+        "artifact_unavailable"
+    } else {
+        "artifact_read_failed"
     }
 }
 
@@ -24218,6 +24234,32 @@ library = "test"
         assert!(truncated.contains('z'));
     }
 
+    #[test]
+    fn artifact_read_errors_distinguish_terminal_unavailability() {
+        assert_eq!(
+            artifact_read_error_code(
+                "artifact reference was not found in the finalized projection"
+            ),
+            "artifact_not_found"
+        );
+        assert_eq!(
+            artifact_read_error_code("artifact reference has no storage URI"),
+            "artifact_unavailable"
+        );
+        assert_eq!(
+            artifact_read_error_code("artifact reference is unavailable: missing"),
+            "artifact_unavailable"
+        );
+        assert_eq!(
+            artifact_read_error_code("artifact reference is incomplete"),
+            "artifact_unavailable"
+        );
+        assert_eq!(
+            artifact_read_error_code("artifact references projection is stale"),
+            "artifact_read_failed"
+        );
+    }
+
     fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
@@ -24492,6 +24534,184 @@ library = "test"
                 .collect::<Vec<_>>(),
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn shell_live_artifact_crosses_real_ipc_before_command_finishes() {
+        let workspace = tempfile::tempdir().expect("shell IPC workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent session manager");
+        let session_id = sessions
+            .create_session(
+                Some("shell live IPC".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let artifact_dir = default_session_artifact_dir(session_id);
+        let mut state = test_server_state_with_shell_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        state.daemon_status.namespace = bcode_ipc::daemon_namespace();
+        state.daemon_status.protocol_version = u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION);
+        state.daemon_status.build_fingerprint = bcode_ipc::BUILD_FINGERPRINT.to_owned();
+        let state = Arc::new(state);
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut watcher = client
+            .connect("bcode-tui-bmux")
+            .await
+            .expect("TUI connection");
+        watcher
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                bcode_session_models::ProjectionWindowRequest {
+                    projection: bcode_session_models::SessionProjectionKind::Transcript,
+                    anchor: bcode_session_models::ProjectionWindowAnchor::Latest,
+                    direction: bcode_session_models::ProjectionWindowDirection::Backward,
+                    target: bcode_session_models::ProjectionWindowTarget {
+                        min_items: Some(12),
+                        min_estimated_rows: Some(48),
+                        min_bytes: None,
+                        width_columns: Some(80),
+                    },
+                    limits: bcode_session_models::ProjectionWindowLimits {
+                        max_items: 64,
+                        max_events_scanned: 2_048,
+                        max_bytes: 512 * 1_024,
+                    },
+                },
+            )
+            .await
+            .expect("projection-window attachment");
+        let release_path = workspace.path().join("release-shell");
+        let command = format!(
+            "printf 'first\\n'; while [ ! -f '{}' ]; do sleep 0.01; done; printf 'second\\n'",
+            release_path.display()
+        );
+        let call = bcode_model::ToolCall {
+            id: "shell-live-ipc-call".to_owned(),
+            name: "shell.run".to_owned(),
+            arguments: serde_json::json!({
+                "command": command,
+                "columns": 80,
+                "rows": 24,
+                "timeout_ms": 5000
+            }),
+        };
+        let (plugin_id, definition, preparation) =
+            prepare_server_tool(state.as_ref(), session_id, &call)
+                .await
+                .expect("tool preparation");
+        let policy_metadata =
+            tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+                .expect("tool policy");
+        let task_state = Arc::clone(&state);
+        let task_call = call.clone();
+        let working_directory = workspace.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            invoke_model_tool(
+                task_state.as_ref(),
+                session_id,
+                &task_call,
+                &working_directory,
+                &plugin_id,
+                &definition,
+                &policy_metadata,
+                &TurnCancelState::default(),
+                None,
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let permission = state
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .cloned();
+                if let Some(permission) = permission {
+                    state
+                        .pending_permissions
+                        .lock()
+                        .await
+                        .remove(&permission.summary.permission_id);
+                    *permission.decision.lock().await = Some(true);
+                    permission.notify.notify_waiters();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permission request");
+
+        tokio::time::timeout(Duration::from_millis(750), async {
+            loop {
+                let bcode_ipc::Event::SessionLive(event) =
+                    watcher.recv_event().await.expect("session event")
+                else {
+                    continue;
+                };
+                let bcode_session_models::SessionLiveEventKind::ToolOutputDelta {
+                    event:
+                        ToolInvocationStreamEvent::ArtifactUpdate {
+                            artifact_id,
+                            reference_key,
+                            finalized: false,
+                            ..
+                        },
+                } = event.kind
+                else {
+                    continue;
+                };
+                let range = client
+                    .session_artifact_range(
+                        session_id,
+                        artifact_id,
+                        reference_key,
+                        0,
+                        MAX_ARTIFACT_RANGE_BYTES,
+                    )
+                    .await
+                    .expect("live artifact range over IPC");
+                if range
+                    .bytes
+                    .windows(b"first".len())
+                    .any(|window| window == b"first")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("live artifact must cross IPC before finish");
+        assert!(
+            !task.is_finished(),
+            "shell finished before live IPC assertion"
+        );
+        std::fs::write(&release_path, b"release").expect("release shell command");
+        let response = task.await.expect("shell task").expect("shell response");
+        assert!(!response.is_error, "{}", response.output);
+        server.abort();
+        remove_session_artifact_dir(&artifact_dir).expect("remove test artifacts");
     }
 
     #[cfg(unix)]

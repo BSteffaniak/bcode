@@ -124,6 +124,18 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         })
     }
 
+    fn accepts_artifact_reference(
+        &self,
+        kind: &str,
+        reference_key: &str,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.supports(kind)
+            && reference_key == SHELL_RECORDING_REF_KEY
+            && content_type
+                .is_some_and(|content_type| content_type.starts_with(SHELL_RECORDING_CONTENT_TYPE))
+    }
+
     fn artifact_chunk(
         &self,
         chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk,
@@ -2085,13 +2097,13 @@ mod tests {
                 {
                     "key": TERMINAL_PTY_STREAM_REF_KEY,
                     "content_type": TERMINAL_PTY_STREAM_CONTENT_TYPE,
-                    "storage_uri": legacy_path.to_string_lossy(),
+                    "storage_uri": legacy_path.to_str().expect("UTF-8 legacy path"),
                     "metadata": {"stream": "pty"}
                 },
                 {
                     "key": SHELL_RECORDING_REF_KEY,
                     "content_type": "application/x-bcode-shell-recording; version=1",
-                    "storage_uri": recording_path.to_string_lossy(),
+                    "storage_uri": recording_path.to_str().expect("UTF-8 recording path"),
                     "metadata": {"complete": true}
                 }
             ]
@@ -2128,13 +2140,13 @@ mod tests {
                 {
                     "key": TERMINAL_PTY_STREAM_REF_KEY,
                     "content_type": TERMINAL_PTY_STREAM_CONTENT_TYPE,
-                    "storage_uri": legacy_path.to_string_lossy(),
+                    "storage_uri": legacy_path.to_str().expect("UTF-8 legacy path"),
                     "metadata": {"stream": "pty"}
                 },
                 {
                     "key": SHELL_RECORDING_REF_KEY,
                     "content_type": SHELL_RECORDING_CONTENT_TYPE,
-                    "storage_uri": partial_path.to_string_lossy(),
+                    "storage_uri": partial_path.to_str().expect("UTF-8 partial path"),
                     "metadata": {"complete": false}
                 }
             ]
@@ -2162,7 +2174,7 @@ mod tests {
             "_artifact_refs": [{
                 "key": TERMINAL_PTY_STREAM_REF_KEY,
                 "content_type": TERMINAL_PTY_STREAM_CONTENT_TYPE,
-                "storage_uri": path.to_string_lossy(),
+                "storage_uri": path.to_str().expect("UTF-8 legacy path"),
                 "metadata": {"stream": "pty"}
             }]
         });

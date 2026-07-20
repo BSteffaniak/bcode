@@ -328,6 +328,19 @@ impl TranscriptItem {
         self.bump_revision();
     }
 
+    /// Replace the plugin-owned visual on a tool request and set its live state.
+    pub fn set_tool_request_visual(
+        &mut self,
+        visual: bcode_session_models::PluginVisualDescriptor,
+        streaming: bool,
+    ) {
+        if let TranscriptItemKind::ToolRequest { request_visual, .. } = &mut self.kind {
+            *request_visual = Some(visual);
+            self.streaming = streaming;
+            self.bump_revision();
+        }
+    }
+
     /// Mark this transcript item as no longer streaming.
     pub const fn finish_streaming(&mut self) {
         self.streaming = false;

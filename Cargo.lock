@@ -2138,6 +2138,7 @@ dependencies = [
  "bcode_agent_profile",
  "bcode_agent_runtime",
  "bcode_bundled_plugins",
+ "bcode_client",
  "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",
