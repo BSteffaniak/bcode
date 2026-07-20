@@ -344,6 +344,15 @@ if ! rg -U 'parallel_tool_calls:[\s\S]{0,180}request\.tool_call_policy\.parallel
   violations=1
 fi
 
+if ! rg -U 'pub struct PermissionSummary \{[\s\S]{0,400}pub tool_call_id: String,[\s\S]{0,400}pub batch: Option<PermissionBatchCorrelation>' packages/ipc/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: permission summaries lost call/batch correlation." >&2
+  violations=1
+fi
+if ! rg -U 'PermissionBatchCorrelation \{[\s\S]{0,220}batch_id:[\s\S]{0,220}call_index: request\.index,[\s\S]{0,220}call_count: self\.call_count' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: server authorization no longer correlates permission checkpoints with complete batches." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

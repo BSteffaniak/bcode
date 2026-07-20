@@ -316,6 +316,7 @@ mod tests {
             tool_call_id: "call-1".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"cargo check --workspace","cwd":"/repo"}"#.to_owned(),
+            batch: None,
             agent_id: "build".to_owned(),
             policy_source: None,
             policy_reason: None,

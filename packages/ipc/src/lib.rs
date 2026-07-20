@@ -644,6 +644,17 @@ pub struct PluginServiceSummary {
     pub description: Option<String>,
 }
 
+/// Correlation metadata for one permission checkpoint in a complete tool-call batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionBatchCorrelation {
+    /// Host-assigned identifier shared by every permission checkpoint in this authorization batch.
+    pub batch_id: String,
+    /// Zero-based provider-order position of the correlated tool call.
+    pub call_index: usize,
+    /// Total number of tool calls submitted for complete-batch authorization.
+    pub call_count: usize,
+}
+
 /// Pending permission checkpoint summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionSummary {
@@ -652,6 +663,9 @@ pub struct PermissionSummary {
     pub tool_call_id: String,
     pub tool_name: String,
     pub arguments_json: String,
+    /// Complete-batch correlation for grouped permission consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<PermissionBatchCorrelation>,
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_source: Option<String>,
@@ -1974,6 +1988,39 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn permission_batch_correlation_round_trips_and_defaults_when_absent() {
+        let summary = PermissionSummary {
+            permission_id: "perm-1".to_string(),
+            session_id: SessionId::new(),
+            tool_call_id: "call-2".to_string(),
+            tool_name: "example.tool".to_string(),
+            arguments_json: "{}".to_string(),
+            batch: Some(PermissionBatchCorrelation {
+                batch_id: "permission-batch-7".to_string(),
+                call_index: 1,
+                call_count: 3,
+            }),
+            agent_id: "build".to_string(),
+            policy_source: None,
+            policy_reason: None,
+            can_remember_policy: false,
+        };
+        let value = serde_json::to_value(&summary).expect("permission summary should encode");
+        let decoded: PermissionSummary =
+            serde_json::from_value(value).expect("permission summary should decode");
+        assert_eq!(decoded, summary);
+
+        let mut value = serde_json::to_value(summary).expect("permission summary should encode");
+        value
+            .as_object_mut()
+            .expect("permission summary JSON object")
+            .remove("batch");
+        let decoded: PermissionSummary =
+            serde_json::from_value(value).expect("summary without batch should decode");
+        assert_eq!(decoded.batch, None);
+    }
 
     #[test]
     fn endpoint_override_rejects_stale_daemon_context() {

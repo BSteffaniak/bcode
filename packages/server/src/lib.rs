@@ -45,17 +45,17 @@ use bcode_agent_runtime::{
 };
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
-    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginContributions,
-    PluginServiceError, PluginServiceResponse, PluginServiceSummary, RalphApproveRequest,
-    RalphCancelRequest, RalphCancelResponse, RalphIterationSummary, RalphLifecycleRequest,
-    RalphListIterationsRequest, RalphListIterationsResponse, RalphListRunsRequest,
-    RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse, RalphRunRequest,
-    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphRunSummary,
-    RalphStatusRequest, RalphStatusResponse, RalphStatusSummary, RalphValidationSummary, Request,
-    Response, ResponsePayload, ServerStatus, ServerStopMode, SessionCatalogSourceStatus,
-    SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
-    decode_request, encode_envelope_frames, event_envelope, recv_envelope, response_envelope,
-    write_encoded_envelope_frames,
+    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionBatchCorrelation, PermissionSummary,
+    PluginContributions, PluginServiceError, PluginServiceResponse, PluginServiceSummary,
+    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphIterationSummary,
+    RalphLifecycleRequest, RalphListIterationsRequest, RalphListIterationsResponse,
+    RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse,
+    RalphRunRequest, RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse,
+    RalphRunSummary, RalphStatusRequest, RalphStatusResponse, RalphStatusSummary,
+    RalphValidationSummary, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
+    SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
+    WorktreeRemoveRequest, decode_request, encode_envelope_frames, event_envelope, recv_envelope,
+    response_envelope, write_encoded_envelope_frames,
 };
 use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
@@ -218,6 +218,7 @@ pub struct ServerState {
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     active_plugin_visuals: Arc<StdMutex<BTreeMap<(SessionId, String), ToolInvocationStreamEvent>>>,
     next_permission_id: Mutex<u64>,
+    next_permission_batch_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
     client_session_namespaces: Mutex<BTreeMap<ClientId, String>>,
@@ -1091,6 +1092,7 @@ impl ServerState {
             active_artifacts: Arc::default(),
             active_plugin_visuals: Arc::default(),
             next_permission_id: Mutex::new(1),
+            next_permission_batch_id: Mutex::new(1),
             clients: Mutex::default(),
             client_runtime_contexts: Mutex::default(),
             client_session_namespaces: Mutex::default(),
@@ -14654,6 +14656,7 @@ struct ServerAuthorizationCoordinator<'a> {
     state: &'a ServerState,
     session_id: SessionId,
     cancel_state: &'a TurnCancelState,
+    call_count: usize,
 }
 
 impl<'a> ServerAuthorizationCoordinator<'a> {
@@ -14661,16 +14664,22 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
         state: &'a ServerState,
         session_id: SessionId,
         cancel_state: &'a TurnCancelState,
+        call_count: usize,
     ) -> Self {
         Self {
             state,
             session_id,
             cancel_state,
+            call_count,
         }
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn authorize_one(self, request: &ToolAuthorizationRequest) -> ToolAuthorizationDecision {
+    async fn authorize_one(
+        self,
+        request: &ToolAuthorizationRequest,
+        batch: Option<PermissionBatchCorrelation>,
+    ) -> ToolAuthorizationDecision {
         let policy_metadata =
             match tool_policy_authorization_metadata(&request.facts, &request.call.name) {
                 Ok(metadata) => metadata,
@@ -14754,6 +14763,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             source: None,
             reason: agent_decision.reason,
             skill_decision_key: None,
+            batch: None,
         };
         let should_ask = if agent_decision.decision == AgentDecision::Ask {
             true
@@ -14804,6 +14814,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
                         source: Some("skill".to_string()),
                         reason: skill_tool_policy_reason(&skill_decision),
                         skill_decision_key: key,
+                        batch: None,
                     };
                     true
                 }
@@ -14815,6 +14826,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
         if !should_ask {
             return ToolAuthorizationDecision::Allow;
         }
+        policy_context.batch = batch;
         if request_tool_permission(
             self.state,
             self.session_id,
@@ -14840,9 +14852,17 @@ impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
         _scope: &'a TurnScope,
     ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
         Box::pin(async move {
-            Ok(futures::future::join_all(
-                requests.iter().map(|request| self.authorize_one(request)),
-            )
+            let batch_id = next_permission_batch_id(self.state).await;
+            Ok(futures::future::join_all(requests.iter().map(|request| {
+                self.authorize_one(
+                    request,
+                    Some(PermissionBatchCorrelation {
+                        batch_id: batch_id.clone(),
+                        call_index: request.index,
+                        call_count: self.call_count,
+                    }),
+                )
+            }))
             .await)
         })
     }
@@ -14856,6 +14876,7 @@ async fn execute_model_tool_batch(
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> bool {
+    let call_count = calls.len();
     let mut ready = Vec::new();
     let mut results = Vec::new();
     for (index, call) in calls.into_iter().enumerate() {
@@ -14967,8 +14988,12 @@ async fn execute_model_tool_batch(
             format!("server-tool-batch:{session_id}"),
             TurnGeneration::new(0),
         );
-        let coordinator =
-            ServerAuthorizationCoordinator::new(state, session_id, cancel_state.as_ref());
+        let coordinator = ServerAuthorizationCoordinator::new(
+            state,
+            session_id,
+            cancel_state.as_ref(),
+            call_count,
+        );
         let authorization =
             coordinator.authorize_batch(&authorization_requests, &authorization_scope);
         let ProviderCallWait::Completed(Ok(decisions)) = wait_for_provider_call(
@@ -16877,6 +16902,7 @@ struct PermissionPolicyContext {
     source: Option<String>,
     reason: Option<String>,
     skill_decision_key: Option<SkillToolDecisionKey>,
+    batch: Option<PermissionBatchCorrelation>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -16904,6 +16930,7 @@ async fn request_tool_permission(
             tool_call_id: call.id.clone(),
             tool_name: tool_name.to_string(),
             arguments_json: arguments_json.clone(),
+            batch: policy_context.batch.clone(),
             agent_id,
             policy_source: policy_context.source.clone(),
             policy_reason: policy_context.reason.clone(),
@@ -17032,6 +17059,13 @@ fn tool_permission_metric_labels(tool_name: &str, outcome: &str) -> MetricLabels
     labels.insert("tool_name".to_owned(), tool_name.to_owned());
     labels.insert("outcome".to_owned(), outcome.to_owned());
     labels
+}
+
+async fn next_permission_batch_id(state: &ServerState) -> String {
+    let mut next = state.next_permission_batch_id.lock().await;
+    let batch_id = format!("permission-batch-{}", *next);
+    *next += 1;
+    batch_id
 }
 
 async fn next_permission_id(state: &ServerState) -> String {
@@ -23997,8 +24031,8 @@ library = "test"
                 agent_id: session_agent_selection(state, session_id).await,
             },
         };
-        let decision = ServerAuthorizationCoordinator::new(state, session_id, cancel_state)
-            .authorize_one(&request)
+        let decision = ServerAuthorizationCoordinator::new(state, session_id, cancel_state, 1)
+            .authorize_one(&request, None)
             .await;
         if let ToolAuthorizationDecision::Deny(reason) | ToolAuthorizationDecision::Ask(reason) =
             decision
@@ -24086,6 +24120,7 @@ library = "test"
     }
 
     #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn server_same_batch_shell_calls_overlap_after_complete_authorization() {
         let workspace = tempfile::tempdir().expect("parallel shell workspace");
@@ -24143,6 +24178,56 @@ library = "test"
         });
 
         let pending = wait_for_pending_permissions(state.as_ref(), 5).await;
+        let correlations = pending
+            .iter()
+            .map(|permission| {
+                permission
+                    .summary
+                    .batch
+                    .clone()
+                    .expect("batch permission must carry correlation")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            correlations
+                .iter()
+                .all(|correlation| correlation.batch_id == correlations[0].batch_id),
+            "one authorization batch must use one batch ID"
+        );
+        assert!(
+            correlations
+                .iter()
+                .all(|correlation| correlation.call_count == 5),
+            "every summary must carry the complete batch size"
+        );
+        assert_eq!(
+            correlations
+                .iter()
+                .map(|correlation| correlation.call_index)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1, 2, 3, 4]),
+            "permission summaries must preserve unique provider-order indices"
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .map(|permission| {
+                    let correlation = permission
+                        .summary
+                        .batch
+                        .as_ref()
+                        .expect("batch permission correlation");
+                    (
+                        permission.summary.tool_call_id.clone(),
+                        correlation.call_index,
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+            (0..5)
+                .map(|index| (format!("parallel-shell-{index}"), index))
+                .collect::<BTreeMap<_, _>>(),
+            "provider call IDs must remain correlated with their batch indices"
+        );
         assert!(
             state
                 .active_plugin_invocations
