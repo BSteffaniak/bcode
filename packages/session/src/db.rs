@@ -6,7 +6,7 @@
 //! intentionally keeps Turso-specific details at connection boundaries and uses
 //! `switchy` database traits for migrations and repository operations.
 
-use std::{fs, path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, sync::Arc, time::Duration};
 
 use crate::persisted::{
     PersistedSessionEventError, decode_session_event, decode_session_event_degraded,
@@ -198,6 +198,12 @@ impl MaterializedProjection {
             Self::RequestContextOccupancy => "context_occupancy",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectionCheckpointState {
+    version: u64,
+    checkpoint: u64,
 }
 
 /// Return Bcode's legacy global catalog database path under `root`.
@@ -2028,6 +2034,63 @@ async fn initialize_current_storage_contract(db: &dyn Database) -> SessionDbResu
     Ok(())
 }
 
+async fn projection_checkpoint_snapshot(
+    db: &dyn Database,
+) -> SessionDbResult<BTreeMap<String, ProjectionCheckpointState>> {
+    let projection_names = MaterializedProjection::all()
+        .iter()
+        .map(|projection| DatabaseValue::String(projection.as_str().to_owned()))
+        .collect::<Vec<_>>();
+    let placeholders = std::iter::repeat_n("?", projection_names.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT projection_name, projection_version, last_event_seq FROM projection_checkpoints WHERE projection_name IN ({placeholders})"
+    );
+    let rows = db.query_raw_params(&query, &projection_names).await?;
+    rows.into_iter()
+        .map(|row| {
+            let name = required_string(&row, "projection_name")?;
+            let state = ProjectionCheckpointState {
+                version: required_i64(&row, "projection_version").map(i64_to_u64)?,
+                checkpoint: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
+            };
+            Ok((name, state))
+        })
+        .collect()
+}
+
+fn validate_projection_checkpoint_snapshot(
+    snapshot: &BTreeMap<String, ProjectionCheckpointState>,
+    expected: u64,
+) -> SessionDbResult<()> {
+    for projection in MaterializedProjection::all() {
+        let Some(state) = snapshot.get(projection.as_str()) else {
+            return Err(SessionDbError::ProjectionStale {
+                projection: projection.as_str(),
+                checkpoint: None,
+                expected,
+            });
+        };
+        let expected_version = u64::from(projection.schema_version());
+        if state.version != expected_version {
+            return Err(SessionDbError::ProjectionIncompatible {
+                projection: projection.as_str(),
+                actual: state.version,
+                expected: expected_version,
+            });
+        }
+        if state.checkpoint != expected {
+            return Err(SessionDbError::ProjectionStale {
+                projection: projection.as_str(),
+                checkpoint: Some(state.checkpoint),
+                expected,
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn validate_all_projection_checkpoints_at_tail(
     db: &dyn Database,
     expected: Option<u64>,
@@ -2035,18 +2098,8 @@ async fn validate_all_projection_checkpoints_at_tail(
     let Some(expected) = expected else {
         return Ok(());
     };
-    for projection in MaterializedProjection::all() {
-        validate_materialized_projection_version(db, *projection).await?;
-        let checkpoint = projection_checkpoint_from_database(db, *projection).await?;
-        if checkpoint != Some(expected) {
-            return Err(SessionDbError::ProjectionStale {
-                projection: projection.as_str(),
-                checkpoint,
-                expected,
-            });
-        }
-    }
-    Ok(())
+    let snapshot = projection_checkpoint_snapshot(db).await?;
+    validate_projection_checkpoint_snapshot(&snapshot, expected)
 }
 
 async fn migrate_session_storage(db: &dyn Database) -> SessionDbResult<()> {
@@ -2386,54 +2439,6 @@ async fn last_event_sequence_from_database(db: &dyn Database) -> SessionDbResult
         .transpose()
 }
 
-async fn projection_checkpoint_from_database(
-    db: &dyn Database,
-    projection: MaterializedProjection,
-) -> SessionDbResult<Option<u64>> {
-    let row = db
-        .select("projection_checkpoints")
-        .columns(&["last_event_seq"])
-        .where_eq("projection_name", projection.as_str())
-        .execute_first(db)
-        .await?;
-    row.as_ref()
-        .map(|row| required_i64(row, "last_event_seq").map(i64_to_u64))
-        .transpose()
-}
-
-async fn projection_version_from_database(
-    db: &dyn Database,
-    projection: MaterializedProjection,
-) -> SessionDbResult<Option<u64>> {
-    let row = db
-        .select("projection_checkpoints")
-        .columns(&["projection_version"])
-        .where_eq("projection_name", projection.as_str())
-        .execute_first(db)
-        .await?;
-    row.as_ref()
-        .map(|row| required_i64(row, "projection_version").map(i64_to_u64))
-        .transpose()
-}
-
-async fn validate_materialized_projection_version(
-    db: &dyn Database,
-    projection: MaterializedProjection,
-) -> SessionDbResult<()> {
-    let actual = projection_version_from_database(db, projection).await?;
-    let expected = u64::from(projection.schema_version());
-    if let Some(actual) = actual
-        && actual != expected
-    {
-        return Err(SessionDbError::ProjectionIncompatible {
-            projection: projection.as_str(),
-            actual,
-            expected,
-        });
-    }
-    Ok(())
-}
-
 async fn validate_model_context_precondition(
     db: &dyn Database,
     event: &SessionEvent,
@@ -2519,17 +2524,8 @@ async fn validate_append_preconditions_without_writer(
     validate_model_context_precondition(db, event).await?;
     validate_context_occupancy_precondition(db, event).await?;
     if let Some(expected) = canonical_tail {
-        for projection in MaterializedProjection::all() {
-            validate_materialized_projection_version(db, *projection).await?;
-            let checkpoint = projection_checkpoint_from_database(db, *projection).await?;
-            if checkpoint != Some(expected) {
-                return Err(SessionDbError::ProjectionStale {
-                    projection: projection.as_str(),
-                    checkpoint,
-                    expected,
-                });
-            }
-        }
+        let snapshot = projection_checkpoint_snapshot(db).await?;
+        validate_projection_checkpoint_snapshot(&snapshot, expected)?;
     }
     Ok(())
 }
@@ -2545,17 +2541,8 @@ async fn validate_append_postconditions(
             actual: canonical_tail.unwrap_or_default(),
         });
     }
-    for projection in MaterializedProjection::all() {
-        validate_materialized_projection_version(db, *projection).await?;
-        let checkpoint = projection_checkpoint_from_database(db, *projection).await?;
-        if checkpoint != Some(event.sequence) {
-            return Err(SessionDbError::ProjectionStale {
-                projection: projection.as_str(),
-                checkpoint,
-                expected: event.sequence,
-            });
-        }
-    }
+    let snapshot = projection_checkpoint_snapshot(db).await?;
+    validate_projection_checkpoint_snapshot(&snapshot, event.sequence)?;
     let model_context = db
         .select("model_context_projection_state")
         .columns(&["schema_version", "last_event_seq"])
@@ -2578,16 +2565,6 @@ async fn validate_append_postconditions(
     if checkpoint != event.sequence {
         return Err(SessionDbError::ModelContextProjectionStale {
             checkpoint,
-            expected: event.sequence,
-        });
-    }
-    let occupancy_checkpoint =
-        projection_checkpoint_from_database(db, MaterializedProjection::RequestContextOccupancy)
-            .await?;
-    if occupancy_checkpoint != Some(event.sequence) {
-        return Err(SessionDbError::ProjectionStale {
-            projection: MaterializedProjection::RequestContextOccupancy.as_str(),
-            checkpoint: occupancy_checkpoint,
             expected: event.sequence,
         });
     }
@@ -3281,39 +3258,16 @@ async fn update_projection_checkpoint(
     projection: MaterializedProjection,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    let projection_name = projection.as_str();
-    let projection_version = projection.schema_version();
-    let existing = db
-        .select("projection_checkpoints")
-        .columns(&["projection_name"])
-        .where_eq("projection_name", projection_name)
-        .execute_first(db)
-        .await?;
-
-    if existing.is_some() {
-        db.update("projection_checkpoints")
-            .value("last_event_seq", seq_to_value(event.sequence))
-            .value(
-                "projection_version",
-                DatabaseValue::Int64(i64::from(projection_version)),
-            )
-            .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
-            .where_eq("projection_name", projection_name)
-            .execute(db)
-            .await?;
-    } else {
-        db.insert("projection_checkpoints")
-            .value("projection_name", projection_name)
-            .value("last_event_seq", seq_to_value(event.sequence))
-            .value(
-                "projection_version",
-                DatabaseValue::Int64(i64::from(projection_version)),
-            )
-            .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
-            .execute(db)
-            .await?;
-    }
-
+    db.exec_raw_params(
+        "INSERT INTO projection_checkpoints (projection_name, last_event_seq, projection_version, updated_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT(projection_name) DO UPDATE SET last_event_seq = excluded.last_event_seq, projection_version = excluded.projection_version, updated_at_ms = excluded.updated_at_ms",
+        &[
+            DatabaseValue::String(projection.as_str().to_owned()),
+            seq_to_value(event.sequence),
+            DatabaseValue::Int64(i64::from(projection.schema_version())),
+            seq_to_value(event_created_at_ms(event)),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -3640,7 +3594,6 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, RequestContextObservation,
         RequestContextTokenCount,
     };
-    use std::collections::BTreeMap;
 
     fn session_storage_files(root: &Path, session_id: SessionId) -> BTreeMap<String, Vec<u8>> {
         let session_dir = root.join(session_id.to_string());
@@ -3710,6 +3663,76 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    fn complete_checkpoint_snapshot(expected: u64) -> BTreeMap<String, ProjectionCheckpointState> {
+        MaterializedProjection::all()
+            .iter()
+            .map(|projection| {
+                (
+                    projection.as_str().to_owned(),
+                    ProjectionCheckpointState {
+                        version: u64::from(projection.schema_version()),
+                        checkpoint: expected,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn complete_checkpoint_snapshot_at_expected_tail_passes() {
+        validate_projection_checkpoint_snapshot(&complete_checkpoint_snapshot(7), 7)
+            .expect("complete checkpoint snapshot");
+    }
+
+    #[test]
+    fn missing_checkpoint_snapshot_row_is_stale() {
+        let mut snapshot = complete_checkpoint_snapshot(7);
+        snapshot.remove(MaterializedProjection::ToolRuns.as_str());
+        assert!(matches!(
+            validate_projection_checkpoint_snapshot(&snapshot, 7),
+            Err(SessionDbError::ProjectionStale {
+                projection: "tool_runs",
+                checkpoint: None,
+                expected: 7
+            })
+        ));
+    }
+
+    #[test]
+    fn incompatible_checkpoint_snapshot_version_is_rejected() {
+        let mut snapshot = complete_checkpoint_snapshot(7);
+        let state = snapshot
+            .get_mut(MaterializedProjection::ToolRuns.as_str())
+            .expect("tool runs checkpoint");
+        state.version = 2;
+        state.checkpoint = 6;
+        assert!(matches!(
+            validate_projection_checkpoint_snapshot(&snapshot, 7),
+            Err(SessionDbError::ProjectionIncompatible {
+                projection: "tool_runs",
+                actual: 2,
+                expected: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn stale_checkpoint_snapshot_row_is_rejected() {
+        let mut snapshot = complete_checkpoint_snapshot(7);
+        snapshot
+            .get_mut(MaterializedProjection::ToolRuns.as_str())
+            .expect("tool runs checkpoint")
+            .checkpoint = 6;
+        assert!(matches!(
+            validate_projection_checkpoint_snapshot(&snapshot, 7),
+            Err(SessionDbError::ProjectionStale {
+                projection: "tool_runs",
+                checkpoint: Some(6),
+                expected: 7
+            })
+        ));
     }
 
     fn local_marker(session_id: SessionId, sequence: u64, boundary: u64) -> SessionEvent {
@@ -5163,6 +5186,147 @@ mod tests {
         assert_eq!(
             db.last_event_sequence().await.expect("canonical tail"),
             Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_upsert_inserts_missing_row() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let projection = MaterializedProjection::ToolRuns;
+        db.database()
+            .delete("projection_checkpoints")
+            .where_eq("projection_name", projection.as_str())
+            .execute(db.database())
+            .await
+            .expect("remove checkpoint");
+
+        update_projection_checkpoint(
+            db.database(),
+            projection,
+            &event(
+                session_id,
+                7,
+                SessionEventKind::AssistantMessage {
+                    text: "checkpoint".to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("insert checkpoint");
+
+        assert_eq!(
+            projection_checkpoint_snapshot(db.database())
+                .await
+                .expect("checkpoint snapshot")
+                .get(projection.as_str()),
+            Some(&ProjectionCheckpointState {
+                version: u64::from(projection.schema_version()),
+                checkpoint: 7,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_upsert_updates_existing_row() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let projection = MaterializedProjection::ToolRuns;
+        let first = event(
+            session_id,
+            6,
+            SessionEventKind::AssistantMessage {
+                text: "first checkpoint".to_owned(),
+            },
+        );
+        let second = event(
+            session_id,
+            7,
+            SessionEventKind::AssistantMessage {
+                text: "second checkpoint".to_owned(),
+            },
+        );
+        update_projection_checkpoint(db.database(), projection, &first)
+            .await
+            .expect("insert checkpoint");
+        update_projection_checkpoint(db.database(), projection, &second)
+            .await
+            .expect("update checkpoint");
+
+        assert_eq!(
+            projection_checkpoint_snapshot(db.database())
+                .await
+                .expect("checkpoint snapshot")
+                .get(projection.as_str()),
+            Some(&ProjectionCheckpointState {
+                version: u64::from(projection.schema_version()),
+                checkpoint: 7,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn incompatible_checkpoint_is_not_overwritten_and_append_rolls_back() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("projection".to_owned()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append initial event");
+        db.database()
+            .update("projection_checkpoints")
+            .value("projection_version", DatabaseValue::Int64(2))
+            .where_eq("projection_name", MaterializedProjection::ToolRuns.as_str())
+            .execute(db.database())
+            .await
+            .expect("make checkpoint incompatible");
+        let before = projection_checkpoint_snapshot(db.database())
+            .await
+            .expect("checkpoint snapshot before append");
+
+        let error = db
+            .append_event(&event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "must roll back".to_owned(),
+                },
+            ))
+            .await
+            .expect_err("incompatible checkpoint must reject append");
+
+        assert!(matches!(
+            error,
+            SessionDbError::ProjectionIncompatible {
+                projection: "tool_runs",
+                actual: 2,
+                expected: 1
+            }
+        ));
+        assert_eq!(
+            db.last_event_sequence().await.expect("canonical tail"),
+            Some(0)
+        );
+        assert_eq!(
+            projection_checkpoint_snapshot(db.database())
+                .await
+                .expect("checkpoint snapshot after append"),
+            before
         );
     }
 
