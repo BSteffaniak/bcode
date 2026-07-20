@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 9;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 10;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -252,6 +252,12 @@ pub enum Request {
         session_id: SessionId,
         text: String,
         placement: PromptPlacement,
+    },
+    /// Submit an ordinary turn through generic admission metadata.
+    SubmitTurn {
+        session_id: SessionId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
     },
     InvokeSkill {
         session_id: SessionId,
@@ -1282,6 +1288,9 @@ pub enum ResponsePayload {
         queue_position: Option<u32>,
         disposition: MessageAcceptanceDisposition,
     },
+    TurnAdmission {
+        admission: bcode_session_models::TurnAdmission,
+    },
     SessionModelList {
         provider_plugin_id: Option<String>,
         models: bcode_model::ModelList,
@@ -2209,6 +2218,39 @@ mod tests {
         for (path, encoded) in cases {
             assert_eq!(encoded, fixture_bytes(path), "fixture changed: {path}");
         }
+    }
+
+    #[test]
+    fn generic_turn_admission_request_and_response_round_trip() {
+        let session_id: SessionId = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("session id should parse");
+        let admission = bcode_session_models::TurnAdmissionMetadata {
+            origin: Some(bcode_session_models::TurnOrigin {
+                producer: "test.producer".to_string(),
+                correlation_id: Some("operation-1".to_string()),
+                display_label: Some("Background pass 1".to_string()),
+            }),
+            idempotency_key: Some("operation-1".to_string()),
+            ..bcode_session_models::TurnAdmissionMetadata::default()
+        };
+        let request = Request::SubmitTurn {
+            session_id,
+            text: "continue".to_string(),
+            admission,
+        };
+        let encoded = encode(&request).expect("request should encode");
+        let decoded: Request = decode(&encoded).expect("request should decode");
+        assert_eq!(decoded, request);
+
+        let response = Response::Ok(ResponsePayload::TurnAdmission {
+            admission: bcode_session_models::TurnAdmission::Accepted(
+                bcode_session_models::TurnReceipt::from_accepted_event(session_id, 42),
+            ),
+        });
+        let encoded = encode(&response).expect("response should encode");
+        let decoded: Response = decode(&encoded).expect("response should decode");
+        assert_eq!(decoded, response);
     }
 
     #[test]

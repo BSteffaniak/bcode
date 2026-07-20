@@ -173,6 +173,9 @@ enum PersistedSessionEventKind {
     UserMessage {
         client_id: ClientId,
         text: String,
+        /// Schema-30 compatibility field used before complete admission metadata existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<bcode_session_models::TurnOrigin>,
         #[serde(default)]
         admission: TurnAdmissionMetadata,
     },
@@ -572,6 +575,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             } => Self::UserMessage {
                 client_id: *client_id,
                 text: text.clone(),
+                origin: None,
                 admission: admission.clone(),
             },
             SessionEventKind::AssistantDelta { text } => {
@@ -964,12 +968,18 @@ impl PersistedSessionEventKind {
             Self::UserMessage {
                 client_id,
                 text,
-                admission,
-            } => SessionEventKind::UserMessage {
-                client_id,
-                text,
-                admission,
-            },
+                origin,
+                mut admission,
+            } => {
+                if admission.origin.is_none() {
+                    admission.origin = origin;
+                }
+                SessionEventKind::UserMessage {
+                    client_id,
+                    text,
+                    admission,
+                }
+            }
             Self::AssistantDelta { text } => SessionEventKind::AssistantDelta { text },
             Self::AssistantMessage { text } => SessionEventKind::AssistantMessage { text },
             Self::ToolCallRequested {
@@ -1418,6 +1428,24 @@ mod tests {
         );
         assert_eq!(observation.local_estimate.tokens, 100);
         assert_eq!(observation.local_estimate.algorithm_version, 1);
+    }
+
+    #[test]
+    fn schema_30_user_message_origin_migrates_into_admission_metadata() {
+        let payload = r#"{"schema_version":30,"sequence":1,"timestamp_ms":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"user_message":{"client_id":"00000000-0000-0000-0000-000000000002","text":"hello","origin":{"producer":"test.producer","correlation_id":"operation-1","display_label":"Background pass 1"}}}}"#;
+
+        let event = decode_session_event(payload).expect("schema-30 user message should decode");
+        let SessionEventKind::UserMessage { admission, .. } = event.kind else {
+            panic!("expected user message");
+        };
+        assert_eq!(
+            admission.origin,
+            Some(bcode_session_models::TurnOrigin {
+                producer: "test.producer".to_string(),
+                correlation_id: Some("operation-1".to_string()),
+                display_label: Some("Background pass 1".to_string()),
+            })
+        );
     }
 
     #[test]

@@ -83,8 +83,6 @@ expected_snake_symbols="$(cat <<'EOF'
 plugin_automation_active
 plugin_automation_generation
 plugin_automation_holds
-plugin_automation_lock
-plugin_automation_locks
 plugin_automation_operation_events
 plugin_automation_origin_labels_only_the_matching_user_turn
 plugin_automation_policies

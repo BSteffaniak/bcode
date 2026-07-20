@@ -200,7 +200,7 @@ pub struct ServerState {
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
-    plugin_automation_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
+    turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     plugin_automation_holds: Mutex<BTreeMap<SessionId, BTreeMap<String, ClientId>>>,
     plugin_automation_policies:
         Mutex<BTreeMap<SessionId, bcode_ipc::PluginAutomationExecutionPolicy>>,
@@ -457,6 +457,11 @@ enum FollowupCommand {
         user_event: Box<bcode_session_models::SessionEvent>,
         queued_steering: Arc<AtomicUsize>,
         completion: Option<oneshot::Sender<ModelTurnCompletion>>,
+    },
+    AdmittedTurn {
+        client_id: ClientId,
+        runtime_context: Option<ClientRuntimeContext>,
+        user_event: Box<bcode_session_models::SessionEvent>,
     },
     SkillInvocation {
         client_id: ClientId,
@@ -1079,7 +1084,7 @@ impl ServerState {
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
-            plugin_automation_locks: Mutex::default(),
+            turn_admission_locks: Mutex::default(),
             plugin_automation_holds: Mutex::default(),
             plugin_automation_policies: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
@@ -2161,6 +2166,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::AttachSessionRecent { session_id, .. }
         | Request::SendUserMessage { session_id, .. }
         | Request::SendUserMessageWithPlacement { session_id, .. }
+        | Request::SubmitTurn { session_id, .. }
         | Request::InvokeSkill { session_id, .. }
         | Request::CancelSessionTurn { session_id, .. }
         | Request::CancelRuntimeWork { session_id, .. }
@@ -2221,6 +2227,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::AttachSessionRecent { .. } => "attach_session_recent",
         Request::SendUserMessage { .. } => "send_user_message",
         Request::SendUserMessageWithPlacement { .. } => "send_user_message_with_placement",
+        Request::SubmitTurn { .. } => "submit_turn",
         Request::InvokeSkill { .. } => "invoke_skill",
         Request::CancelSessionTurn { .. } => "cancel_session_turn",
         Request::ListPermissions => "list_permissions",
@@ -2605,6 +2612,16 @@ async fn handle_request_inner(
         } => {
             handle_user_message(
                 request_id, client_id, state, writer, session_id, text, placement,
+            )
+            .await
+        }
+        Request::SubmitTurn {
+            session_id,
+            text,
+            admission,
+        } => {
+            handle_submit_turn(
+                request_id, client_id, state, writer, session_id, text, admission,
             )
             .await
         }
@@ -6420,7 +6437,7 @@ async fn enqueue_user_message_command(
     text: String,
     placement: bcode_ipc::PromptPlacement,
 ) -> Result<MessageQueueStatus, ServerError> {
-    let automation_lock = plugin_automation_lock(state, session_id).await;
+    let automation_lock = turn_admission_lock(state, session_id).await;
     let _automation_guard = automation_lock.lock().await;
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
@@ -6837,6 +6854,27 @@ async fn run_session_runtime(
                     runtime_context,
                     *user_event,
                     completion,
+                ))
+                .await;
+            }
+            FollowupCommand::AdmittedTurn {
+                client_id,
+                runtime_context,
+                user_event,
+            } => {
+                Box::pin(process_existing_user_event_command(
+                    &state,
+                    &mut permit,
+                    Arc::clone(&phase),
+                    &mut followup_commands,
+                    &mut steering_commands,
+                    &mut cancel_commands,
+                    queued_followups.as_ref(),
+                    Arc::clone(&current_turn),
+                    client_id,
+                    runtime_context,
+                    *user_event,
+                    None,
                 ))
                 .await;
             }
@@ -7738,8 +7776,8 @@ async fn submit_session_model_turn_and_wait(
     receiver.await.map_err(ServerError::from)
 }
 
-async fn plugin_automation_lock(state: &ServerState, session_id: SessionId) -> Arc<Mutex<()>> {
-    let mut locks = state.plugin_automation_locks.lock().await;
+async fn turn_admission_lock(state: &ServerState, session_id: SessionId) -> Arc<Mutex<()>> {
+    let mut locks = state.turn_admission_locks.lock().await;
     Arc::clone(
         locks
             .entry(session_id)
@@ -7883,7 +7921,7 @@ async fn handle_record_plugin_status_note(
         )
         .await;
     }
-    let lock = plugin_automation_lock(state, request.session_id).await;
+    let lock = turn_admission_lock(state, request.session_id).await;
     let _guard = lock.lock().await;
     let existing = state
         .sessions
@@ -8104,7 +8142,7 @@ async fn handle_submit_plugin_automation_turn(
     writer: &SharedWriter,
     request: bcode_ipc::PluginAutomationTurnRequest,
 ) -> Result<(), ServerError> {
-    let lock = plugin_automation_lock(state, request.session_id).await;
+    let lock = turn_admission_lock(state, request.session_id).await;
     let _guard = lock.lock().await;
     let lookup = bcode_ipc::PluginAutomationOperationLookupRequest {
         session_id: request.session_id,
@@ -8193,6 +8231,85 @@ async fn handle_submit_plugin_automation_turn(
         Response::Ok(ResponsePayload::PluginAutomationTurn {
             result: bcode_ipc::PluginAutomationTurnDisposition::Accepted { operation },
         }),
+    )
+    .await
+}
+
+async fn handle_submit_turn(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    text: String,
+    admission: bcode_session_models::TurnAdmissionMetadata,
+) -> Result<(), ServerError> {
+    if let Some(active_namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
+    let rejected = admission.priority != bcode_session_models::TurnPriority::Interactive
+        || admission.execution.tools != bcode_session_models::TurnToolPolicy::Enabled;
+    if rejected {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::TurnAdmission {
+                admission: bcode_session_models::TurnAdmission::Rejected(
+                    bcode_session_models::TurnRejectionReason::ExecutionPolicy,
+                ),
+            }),
+        )
+        .await;
+    }
+    let admission_lock = turn_admission_lock(state, session_id).await;
+    let _admission_guard = admission_lock.lock().await;
+    let result = state
+        .sessions
+        .admit_turn(session_id, client_id, text, admission)
+        .await;
+    let admission = match result {
+        Ok(admission) => admission,
+        Err(error) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await;
+        }
+    };
+    if let bcode_session_models::TurnAdmission::Accepted(receipt) = &admission {
+        let mut events = state
+            .sessions
+            .session_events_range(
+                session_id,
+                receipt.accepted_event_sequence,
+                receipt.accepted_event_sequence,
+                1,
+            )
+            .await?;
+        let user_event = events
+            .pop()
+            .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+        enqueue_followup_command(
+            state,
+            session_id,
+            FollowupCommand::AdmittedTurn {
+                client_id,
+                runtime_context: state.client_runtime_context(client_id).await,
+                user_event: Box::new(user_event),
+            },
+        )
+        .await?;
+    }
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::TurnAdmission { admission }),
     )
     .await
 }

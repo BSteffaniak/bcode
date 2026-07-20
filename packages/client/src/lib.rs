@@ -1478,6 +1478,30 @@ impl BcodeClient {
         }
     }
 
+    /// Submit an ordinary turn with generic admission metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn submit_turn(
+        &self,
+        session_id: SessionId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    ) -> Result<bcode_session_models::TurnAdmission, ClientError> {
+        match self
+            .send_request(Request::SubmitTurn {
+                session_id,
+                text,
+                admission,
+            })
+            .await?
+        {
+            ResponsePayload::TurnAdmission { admission } => Ok(admission),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return complete replayable session history for explicit export/debug/history commands.
     ///
     /// This request performs a full canonical event read on the daemon. Do not use it for
