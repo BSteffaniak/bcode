@@ -400,6 +400,20 @@ if ! awk '
   violations=1
 fi
 
+if rg -n 'bcode_parallel_tool_calls' packages plugins examples --glob '*.rs' >/tmp/bcode-parallel-tool-metadata.txt; then
+  echo "Runtime architecture violation: provider parallel intent regressed to transitional metadata." >&2
+  cat /tmp/bcode-parallel-tool-metadata.txt >&2
+  violations=1
+fi
+if ! rg -U 'pub struct ModelTurnRequest \{[\s\S]*pub tool_call_policy: ToolCallRequestPolicy' packages/model/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: model turn requests lost typed tool-call policy." >&2
+  violations=1
+fi
+if ! rg -U 'parallel_tool_calls:[\s\S]{0,180}request\.tool_call_policy\.parallel' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: provider request mapping bypasses typed tool-call policy." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

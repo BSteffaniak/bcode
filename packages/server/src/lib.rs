@@ -14067,9 +14067,6 @@ async fn build_model_turn_request(
             selected_model_id.to_string(),
         );
     }
-    if state.tool_execution.parallel {
-        metadata.insert("bcode_parallel_tool_calls".to_string(), "true".to_string());
-    }
     let request = ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
@@ -14078,6 +14075,9 @@ async fn build_model_turn_request(
         system_prompt: Some(system_prompt),
         messages,
         tools,
+        tool_call_policy: bcode_model::ToolCallRequestPolicy {
+            parallel: state.tool_execution.parallel,
+        },
         structured_output: None,
         context_management,
         parameters,
@@ -21100,6 +21100,7 @@ library = "test"
                 }],
             }],
             tools: Vec::new(),
+            tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
             parameters: bcode_model::ModelParameters::default(),
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
@@ -21558,6 +21559,7 @@ library = "test"
             system_prompt: None,
             messages,
             tools: Vec::new(),
+            tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: ModelParameters::default(),

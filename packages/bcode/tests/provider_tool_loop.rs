@@ -236,6 +236,7 @@ impl ProviderRoundPlanner for SdkPlanner {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let mut request = context.proposed_request.clone();
+            request.tool_call_policy.parallel = false;
             request
                 .metadata
                 .insert("sdk_planner".to_string(), context.round.to_string());
@@ -262,6 +263,12 @@ async fn sdk_builder_routes_provider_round_planner_through_canonical_loop() {
     assert_eq!(response.text, "done");
     assert_eq!(planner.0.load(Ordering::SeqCst), 2);
     let requests = requests.lock().expect("provider requests lock");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.tool_call_policy.parallel),
+        "host planner must not override scheduler-owned provider parallel intent"
+    );
     assert_eq!(
         requests[0].metadata.get("sdk_planner").map(String::as_str),
         Some("0")
@@ -296,6 +303,12 @@ async fn high_level_run_executes_provider_batch_once_and_returns_results_in_prov
     assert_eq!(maximum.load(Ordering::SeqCst), 2, "tools must overlap");
     let requests = requests.lock().expect("provider requests lock");
     assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.tool_call_policy.parallel),
+        "canonical scheduler parallel intent must reach every provider continuation"
+    );
     let feedback = &requests[1].messages;
     assert!(matches!(feedback[0].role, MessageRole::User));
     assert!(matches!(feedback[1].role, MessageRole::Assistant));

@@ -2395,6 +2395,7 @@ mod tests {
                 description: "read".to_string(),
                 input_schema: serde_json::json!({"type":"object"}),
             }],
+            tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),

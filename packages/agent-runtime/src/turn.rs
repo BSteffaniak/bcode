@@ -381,9 +381,9 @@ pub trait InvocationServiceRouter: Send + Sync {
 /// Artifact sinks may prepare non-public staging before calling [`Self::commit`], but must remove
 /// that staging if the gate returns `None`. The commit closure must perform the externally visible
 /// publication. The gate holds the owning turn's publication lock across the closure, so
-/// the closure, so cancellation or generation supersession linearizes strictly before or after
-/// the artifact commit. Commit closures must not synchronously request cancellation or begin a new
-/// generation for the same turn owner because those transitions wait for this boundary.
+/// cancellation or generation supersession linearizes strictly before or after the artifact
+/// commit. Commit closures must not synchronously request cancellation or begin a new generation
+/// for the same turn owner because those transitions wait for this boundary.
 pub struct ArtifactCommitGuard {
     turn: TurnScope,
     invocation_id: Arc<str>,

@@ -3350,6 +3350,9 @@ impl Agent {
             prompt,
             append_prompt: true,
             tools: self.enabled_tool_definitions(),
+            tool_call_policy: bcode_model::ToolCallRequestPolicy {
+                parallel: self.execution_options.parallel,
+            },
             structured_output: None,
             parameters: self.parameters.clone(),
             metadata: self.metadata.clone(),

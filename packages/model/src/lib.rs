@@ -1258,6 +1258,14 @@ pub struct StructuredOutputRequest {
     pub strict: bool,
 }
 
+/// Provider-neutral policy for model-generated tool calls in one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRequestPolicy {
+    /// Permit the provider to generate multiple independent tool calls in one response.
+    #[serde(default)]
+    pub parallel: bool,
+}
+
 /// Start a provider model turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
@@ -1272,6 +1280,9 @@ pub struct ModelTurnRequest {
     pub messages: Vec<ModelMessage>,
     #[serde(default)]
     pub tools: Vec<ToolDefinition>,
+    /// Host-resolved policy for provider-generated tool calls.
+    #[serde(default)]
+    pub tool_call_policy: ToolCallRequestPolicy,
     #[serde(default)]
     pub parameters: ModelParameters,
     #[serde(default)]
@@ -1794,9 +1805,33 @@ pub enum ProviderErrorCategory {
 mod tests {
     use super::{
         ModelCatalogPolicy, ModelCatalogSupportHint, ModelInfo, ModelList, ModelListAuthority,
-        ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelVisibility,
-        ModelVisibilitySource, ProviderErrorCategory, TokenUsage,
+        ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelTurnRequest,
+        ModelVisibility, ModelVisibilitySource, ProviderErrorCategory, TokenUsage,
+        ToolCallRequestPolicy,
     };
+
+    #[test]
+    fn model_turn_request_defaults_typed_tool_call_policy_when_omitted() {
+        let request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "turn_id": "turn",
+            "model_id": "model",
+            "messages": []
+        }))
+        .expect("request without typed policy should decode with the safe default");
+
+        assert_eq!(request.tool_call_policy, ToolCallRequestPolicy::default());
+    }
+
+    #[test]
+    fn typed_tool_call_policy_round_trips_parallel_intent() {
+        let policy = ToolCallRequestPolicy { parallel: true };
+        let encoded = serde_json::to_value(policy).expect("policy should encode");
+        let decoded: ToolCallRequestPolicy =
+            serde_json::from_value(encoded).expect("policy should decode");
+
+        assert_eq!(decoded, policy);
+    }
 
     #[test]
     fn token_usage_prefers_provider_reported_total() {

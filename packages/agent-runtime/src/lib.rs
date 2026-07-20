@@ -198,6 +198,8 @@ pub struct AgentTurnRequest {
     pub append_prompt: bool,
     /// Model-callable tool definitions available to the provider.
     pub tools: Vec<ToolDefinition>,
+    /// Host-resolved provider tool-call policy.
+    pub tool_call_policy: bcode_model::ToolCallRequestPolicy,
     /// Provider-native structured output request.
     pub structured_output: Option<bcode_model::StructuredOutputRequest>,
     /// Model parameters.
@@ -225,6 +227,7 @@ impl AgentTurnRequest {
             prompt: prompt.into(),
             append_prompt: true,
             tools: Vec::new(),
+            tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
             structured_output: None,
             parameters: ModelParameters::default(),
             metadata: BTreeMap::new(),
@@ -1234,6 +1237,7 @@ impl AgentRuntime {
         R: ProviderRoundPlanner + ?Sized,
     {
         validate_tool_host_context(host_context)?;
+        request.tool_call_policy.parallel = options.parallel;
         let mut rounds = ToolRoundState::new(request.max_tool_rounds);
         let turn_cancellation = request.cancellation.clone();
         let started = Instant::now();
@@ -1260,6 +1264,7 @@ impl AgentRuntime {
                 &turn_cancellation,
                 started,
                 timeout,
+                options.parallel,
                 scope,
             )
             .await?;
@@ -2041,6 +2046,7 @@ async fn run_planned_provider_round<P, R>(
     turn_cancellation: &CancellationToken,
     started: Instant,
     timeout: Duration,
+    parallel_tool_calls: bool,
     scope: &TurnScope,
 ) -> Result<PlannedProviderRound>
 where
@@ -2084,6 +2090,7 @@ where
                 .await?;
         }
         proposed_request = request;
+        proposed_request.tool_call_policy.parallel = parallel_tool_calls;
         proposed_request.timeout = remaining_turn_duration(started, timeout)?;
         proposed_request.cancellation = turn_cancellation.clone();
         match runtime
@@ -2466,6 +2473,7 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
             .cloned()
             .map(model_tool_definition)
             .collect(),
+        tool_call_policy: request.tool_call_policy,
         parameters: request.parameters.clone(),
         structured_output: request.structured_output.clone(),
         context_management: bcode_model::ContextManagementRequest::default(),
@@ -3089,6 +3097,47 @@ mod tests {
         ) -> RuntimeFuture<'a, AckResponse> {
             Box::pin(async { Ok(AckResponse::default()) })
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_loop_derives_sequential_provider_policy_from_scheduler_options() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [vec![ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            }]],
+            Arc::clone(&requests),
+        );
+        let mut request = AgentTurnRequest::new("model", "no tools");
+        request.tool_call_policy.parallel = true;
+
+        AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &EmptyToolCatalog,
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(0),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions {
+                    parallel: false,
+                    ..ToolExecutionOptions::default()
+                },
+                Arc::new(RuntimeStreamEventSink { sender: None }),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await
+            .expect("sequential canonical loop should complete");
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].tool_call_policy.parallel);
+        drop(requests);
     }
 
     #[tokio::test]

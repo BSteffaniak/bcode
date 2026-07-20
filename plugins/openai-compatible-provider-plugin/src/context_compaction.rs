@@ -133,6 +133,7 @@ pub async fn compact_context_inner(
         system_prompt: request.system_prompt,
         messages: request.messages,
         tools: request.tools,
+        tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
         parameters: bcode_model::ModelParameters::default(),
         structured_output: None,
         context_management: bcode_model::ContextManagementRequest::default(),
