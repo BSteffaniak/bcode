@@ -1,45 +1,82 @@
 # Renderer Architecture
 
-Bcode renderers consume a shared semantic session-view layer rather than session event logs or another renderer's UI state.
+Bcode's target renderer architecture uses a shared semantic session-view layer rather than session event logs or another renderer's UI state.
+
+## Current migration status
+
+The target boundary exists but is not yet the single application boundary:
+
+* `packages/session-view/models` defines renderer-neutral snapshot, transcript, tool, permission, runtime-work, composer, interaction, visual, action, and patch contracts.
+* `packages/session-view` projects a useful subset of bounded history and live events and executes daemon-backed semantic actions.
+* `packages/web-render` consumes this layer for the HyperChad renderer.
+* `packages/tui` still owns its established projection and does not yet consume `bcode_session_view`.
+
+Until TUI migration and projection parity are complete, the shared session view is an extraction target and web-renderer contract, not yet the canonical state path for every renderer. The implementation progress tracker should be kept aligned with the audited gaps described here.
 
 ## Shared renderer contract
 
 New renderers should depend on:
 
 * `bcode_session_view_models` for serializable snapshots, transcript items, patches, permissions, interactions, composer state, and `SessionViewAction`.
-* `bcode_session_view` for bounded daemon-backed snapshot construction and `execute_session_view_action`.
-* `bcode_client` only for daemon connectivity and renderer-host state flow that is not a daemon effect, such as selecting which session to display.
+* `bcode_session_view` for semantic projection and `execute_session_view_action`.
+* `bcode_client` only for daemon connectivity, bounded attach/hydration, and renderer-host state flow that is not a daemon effect, such as selecting which session to display.
 * `bcode_tool::InteractionInput` for renderer-neutral interactive-tool input.
 
-Renderers must not depend on TUI frame, key, mouse, or BMUX drawing types. They also must not replay full session event logs during normal attach or refresh paths.
+Renderers must not depend on TUI frame, key, mouse, or BMUX drawing types. They also must not full-replay session event logs during normal attach, refresh, or history paths.
 
 ## Layer ownership
 
 `packages/session-view/models` owns renderer-neutral data contracts. These types describe presentation semantics without terminal or browser primitives.
 
-`packages/session-view` owns projection from bounded daemon/session history into `SessionViewSnapshot` and generic execution of daemon-backed `SessionViewAction` values.
+`packages/session-view` owns generic projection from bounded daemon/session state into `SessionViewSnapshot` and generic execution of daemon-backed `SessionViewAction` values. It must remain domain-focused rather than becoming a miscellaneous application-state crate.
 
-`packages/tui` owns terminal layout and terminal-event mapping. Terminal-specific plugin surfaces remain TUI-only.
+`packages/tui` owns terminal layout, terminal-event mapping, viewport and anchoring behavior, frame rendering, and terminal-specific polish. Terminal-specific plugin surfaces remain TUI-only. During migration it also temporarily retains legacy projection logic that should move behind the shared semantic boundary after parity is demonstrated.
 
-`packages/web-render` owns the HyperChad host, daemon connection, session selection, browser routes, and mapping HyperChad form events into shared semantic actions.
+`packages/web-render` owns the HyperChad host, daemon connection, bounded snapshot hydration, session selection, browser routes, and mapping HyperChad events into shared semantic actions.
 
-`packages/web-render/ui` owns only HyperChad presentation. Plugin visuals, artifacts, and interaction snapshots have a generic structured-data fallback here. Rich visual adapters are registered by exact plugin-owned `(schema, schema_version)` keys and must retain that fallback.
+`packages/web-render/ui` owns HyperChad presentation. Plugin visuals, artifacts, and interaction snapshots have a generic structured-data fallback. Rich visual adapters are registered by exact plugin-owned `(schema, schema_version)` keys and must retain that fallback.
 
-The local web host binds to loopback unless the CLI receives explicit non-loopback opt-in. Each launch generates a capability token; page and action routes must validate it before reading daemon state or executing effects, and generated links/forms propagate it.
+The local web host binds to loopback unless the CLI receives explicit non-loopback opt-in. Each launch generates a capability token; page and action routes validate it before reading daemon state or executing effects, and generated links/forms propagate it. This is a local companion security model, not by itself a production remote-access design.
 
 Plugins own domain schemas and renderer-neutral interaction controllers. A renderer may add rich schema-specific adapters, but it must preserve the generic fallback and must not move plugin behavior into renderer code.
 
-## State and action flow
+## Target state and action flow
 
 1. A renderer host connects through `BcodeClient`.
-2. It requests bounded history and builds a `SessionViewSnapshot` through `SessionView`.
-3. Renderer UI code displays the snapshot without interpreting persisted event logs directly.
-4. User input is converted to `SessionViewAction` or `InteractionInput`.
-5. Daemon-backed actions run through `execute_session_view_action`.
-6. Renderer-local state-flow actions, such as switching the displayed session or changing a history window, remain in the host and request a new bounded snapshot.
+2. It requests bounded history plus renderer-relevant attached state.
+3. `SessionView` builds a semantic `SessionViewSnapshot` and hydrates ephemeral daemon state, such as a pending interaction snapshot, through explicit bounded client APIs.
+4. The host retains that view and applies live events cumulatively.
+5. Gaps, reconnects, and resync requests replace or reconcile state from a trustworthy bounded snapshot.
+6. Renderer UI code displays semantic state without interpreting persisted event logs directly.
+7. User input is converted to `SessionViewAction` or `InteractionInput`.
+8. Daemon-backed actions run through `execute_session_view_action`.
+9. Renderer-local actions, such as switching the displayed session or changing a history window, remain in the host and request a new bounded snapshot.
 
-Web updates must use HyperChad's update/action mechanisms. Missing browser transport, routing, asset, or server capabilities belong upstream in HyperChad rather than in Bcode-specific JavaScript or WebSocket/SSE plumbing.
+Full snapshots are the correctness baseline. `SessionViewPatch` is an optional later optimization after identity, revision, reconnect, and cumulative-live semantics are stable.
+
+Web updates use HyperChad's update/action mechanisms. Missing browser transport, routing, asset, or server capabilities belong upstream in HyperChad rather than in Bcode-specific JavaScript or WebSocket/SSE plumbing.
+
+## TUI migration rules
+
+The TUI migration should be incremental:
+
+* Compare TUI and shared projection with focused parity fixtures before removing established logic.
+* Move generic transcript, tool, permission, interaction, runtime, and session semantics into the shared view.
+* Keep terminal viewport, scroll anchoring, hit testing, input editing, cursor behavior, animation, layout, and native plugin surfaces in the TUI.
+* Adapt semantic items into terminal presentation rather than exposing terminal types through shared crates.
+* Remove duplicate projection and daemon effects only after relevant parity and UX tests pass.
+
+The goal is not to make every renderer look or behave identically. The goal is for them to consume the same product semantics while retaining native presentation and interaction.
 
 ## Adding another renderer
 
-A new renderer should start with `SessionViewSnapshot`, generic transcript/tool/artifact rendering, and semantic action mapping. It should add renderer-specific layout and input code around that contract, then add rich visual adapters only where actual schemas need them. It should not reuse `packages/tui` app state or fork projection and daemon-effect behavior.
+A new renderer should start with `SessionViewSnapshot`, generic transcript/tool/artifact rendering, and semantic action mapping. It should add renderer-specific layout and input around that contract, then add rich visual adapters only where actual schemas need them.
+
+A new renderer must not:
+
+* Reuse `packages/tui` application state.
+* Fork event projection or daemon-effect behavior.
+* Depend on terminal drawing or event types.
+* Assume plugin TUI surfaces are portable.
+* Full-replay event logs on normal paths.
+* Add custom browser/mobile transport inside Bcode when the renderer framework should own it.
