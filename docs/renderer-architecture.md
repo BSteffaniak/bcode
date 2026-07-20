@@ -60,6 +60,8 @@ Web updates use HyperChad's update/action mechanisms. Missing browser transport,
 
 The TUI migration should be incremental:
 
+* Use [`session-view-event-coverage.md`](session-view-event-coverage.md) as the explicit durable/live event parity inventory.
+
 * Compare TUI and shared projection with focused parity fixtures before removing established logic.
 * Move generic transcript, tool, permission, interaction, runtime, and session semantics into the shared view.
 * Keep terminal viewport, scroll anchoring, hit testing, input editing, cursor behavior, animation, layout, and native plugin surfaces in the TUI.

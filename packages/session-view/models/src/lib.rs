@@ -9,8 +9,9 @@
 //! browser DOM primitives, daemon clients, or application orchestration.
 
 use bcode_session_models::{
-    ClientId, InteractiveToolRenderTarget, InteractiveToolTurnBehavior, PluginVisualDescriptor,
-    RuntimeWorkStatus, SessionId, SessionSummary, ToolArtifact, ToolInvocationResult, WorkId,
+    ClientId, InteractiveToolRenderTarget, InteractiveToolTurnBehavior, ModelTurnOutcome,
+    PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkStatus, SessionId, SessionSummary,
+    SessionTokenUsage, ToolArtifact, ToolInvocationResult, WorkId,
 };
 use bcode_tool::InteractionInput;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,9 @@ pub struct SessionViewSnapshot {
     pub composer: ComposerViewState,
     /// Current reasoning/thinking display state.
     pub thinking: ThinkingViewState,
+    /// Renderer-neutral runtime/model/agent/turn state.
+    #[serde(default)]
+    pub runtime: SessionRuntimeViewState,
     /// Known interactive requests.
     pub interactions: Vec<InteractionViewSummary>,
     /// Session summary metadata, when supplied by the daemon/catalog.
@@ -67,7 +71,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 1;
+    pub const SCHEMA_VERSION: u16 = 2;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -85,6 +89,7 @@ impl SessionViewSnapshot {
             runtime_work: Vec::new(),
             composer: ComposerViewState::default(),
             thinking: ThinkingViewState::default(),
+            runtime: SessionRuntimeViewState::default(),
             interactions: Vec::new(),
             session_summary: None,
         }
@@ -114,13 +119,15 @@ pub struct SessionViewPatch {
     pub composer: Option<ComposerViewState>,
     /// Thinking state replacement, when changed.
     pub thinking: Option<ThinkingViewState>,
+    /// Runtime/model/agent/turn state replacement, when changed.
+    pub runtime: Option<SessionRuntimeViewState>,
     /// Interaction updates.
     pub interactions: Vec<InteractionViewSummary>,
 }
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 1;
+    pub const SCHEMA_VERSION: u16 = 2;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -136,6 +143,7 @@ impl SessionViewPatch {
             runtime_work: Vec::new(),
             composer: None,
             thinking: None,
+            runtime: None,
             interactions: Vec::new(),
         }
     }
@@ -425,6 +433,35 @@ pub struct RuntimeWorkView {
     pub updated_at_ms: Option<u64>,
 }
 
+/// Renderer-neutral model, agent, context, and turn state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeViewState {
+    /// Selected provider plugin, when known.
+    pub provider_plugin_id: Option<String>,
+    /// User-facing requested model selection, when known.
+    pub requested_model_id: Option<String>,
+    /// Concrete effective model, when known.
+    pub effective_model_id: Option<String>,
+    /// Selected agent, when known.
+    pub agent_id: Option<String>,
+    /// Selected reasoning effort, when configured.
+    pub reasoning_effort: Option<String>,
+    /// Selected reasoning summary mode, when configured.
+    pub reasoning_summary: Option<String>,
+    /// Authoritative active request-context occupancy.
+    pub context_occupancy: Option<RequestContextOccupancy>,
+    /// Most recently observed model usage.
+    pub latest_usage: Option<SessionTokenUsage>,
+    /// Active model turn identifier, when a turn is running or cancelling.
+    pub active_turn_id: Option<String>,
+    /// Whether cancellation has been requested for the active turn.
+    pub cancelling: bool,
+    /// Most recent completed turn outcome.
+    pub last_turn_outcome: Option<ModelTurnOutcome>,
+    /// Most recent completed turn message, when supplied.
+    pub last_turn_message: Option<String>,
+}
+
 /// Composer state shared by renderers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComposerViewState {
@@ -458,8 +495,17 @@ pub struct InteractionViewSummary {
     pub tool_call_id: Option<String>,
     /// Optional title for display.
     pub title: Option<String>,
+    /// Whether the interaction requires a response before the turn can continue.
+    #[serde(default)]
+    pub required: bool,
     /// Optional snapshot payload for generic rendering.
     pub snapshot: Option<serde_json::Value>,
+    /// Whether the interaction has been durably resolved.
+    #[serde(default)]
+    pub resolved: bool,
+    /// Durable resolution payload, when resolved.
+    #[serde(default)]
+    pub resolution: Option<serde_json::Value>,
     /// Target renderer placement.
     pub render_target: InteractiveToolRenderTarget,
     /// Model turn behavior for the request.

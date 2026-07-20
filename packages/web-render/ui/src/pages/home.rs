@@ -145,6 +145,8 @@ pub fn home(
                         (runtime_work_section(&snapshot.runtime_work))
                     }
 
+                    (runtime_state_section(snapshot))
+
                     section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
                         h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "transcript" }
                         @if snapshot.transcript.items.is_empty() {
@@ -184,6 +186,53 @@ pub fn home(
                         (composer(snapshot, access_token))
                     }
                 }
+            }
+        }
+    }
+}
+
+fn runtime_state_section(snapshot: &SessionViewSnapshot) -> Containers {
+    let runtime = &snapshot.runtime;
+    let model = runtime
+        .requested_model_id
+        .as_deref()
+        .or(runtime.effective_model_id.as_deref())
+        .unwrap_or("—");
+    let provider = runtime.provider_plugin_id.as_deref().unwrap_or("—");
+    let agent = runtime.agent_id.as_deref().unwrap_or("—");
+    let turn = runtime.active_turn_id.as_deref().map_or_else(
+        || {
+            runtime
+                .last_turn_outcome
+                .map_or_else(|| "idle".to_owned(), |outcome| format!("{outcome:?}"))
+        },
+        |turn_id| {
+            if runtime.cancelling {
+                format!("{turn_id} (cancelling)")
+            } else {
+                turn_id.to_owned()
+            }
+        },
+    );
+    let context = runtime.context_occupancy.as_ref().map_or_else(
+        || "—".to_owned(),
+        |occupancy| {
+            let count = occupancy.observation.context_tokens;
+            if count.is_estimated() {
+                format!("~{} tokens", count.tokens())
+            } else {
+                format!("{} tokens", count.tokens())
+            }
+        },
+    );
+    container! {
+        section background="#161b22" border="1, #30363d" border-radius=10 padding=12 margin-bottom=18 {
+            div direction=row gap=18 font-size=12 {
+                div { span color="#8b949e" { "provider " } span color="#c9d1d9" { (provider) } }
+                div { span color="#8b949e" { "model " } span color="#c9d1d9" { (model) } }
+                div { span color="#8b949e" { "agent " } span color="#c9d1d9" { (agent) } }
+                div { span color="#8b949e" { "turn " } span color="#c9d1d9" { (turn) } }
+                div { span color="#8b949e" { "context " } span color="#c9d1d9" { (context) } }
             }
         }
     }
@@ -257,18 +306,28 @@ fn interaction_request(
             div color="#58a6ff" margin-bottom=6 {
                 (interaction.title.as_deref().unwrap_or("Interactive request"))
             }
-            div color="#8b949e" font-size=12 margin-bottom=8 { (interaction.kind) }
-            @if interaction.kind == "bcode.question" {
-                @if let Some(snapshot) = interaction.snapshot.as_ref().and_then(|value| serde_json::from_value::<QuestionSnapshot>(value.clone()).ok()) {
-                    (question_interaction(&snapshot, interaction, session_id, access_token))
+            div color="#8b949e" font-size=12 margin-bottom=8 {
+                (interaction.kind)
+                @if interaction.required { " · required" }
+            }
+            @if interaction.resolved {
+                div color="#8b949e" font-size=12 margin-top=8 { "resolved" }
+                @if let Some(resolution) = &interaction.resolution {
+                    (json_panel("resolution", resolution))
+                }
+            } @else {
+                @if interaction.kind == "bcode.question" {
+                    @if let Some(snapshot) = interaction.snapshot.as_ref().and_then(|value| serde_json::from_value::<QuestionSnapshot>(value.clone()).ok()) {
+                        (question_interaction(&snapshot, interaction, session_id, access_token))
+                    } @else if let Some(snapshot) = &interaction.snapshot {
+                        (json_panel("controller snapshot", snapshot))
+                    }
                 } @else if let Some(snapshot) = &interaction.snapshot {
                     (json_panel("controller snapshot", snapshot))
                 }
-            } @else if let Some(snapshot) = &interaction.snapshot {
-                (json_panel("controller snapshot", snapshot))
-            }
-            @if let Some(session_id) = session_id {
-                (generic_interaction_controls(interaction, session_id, access_token))
+                @if let Some(session_id) = session_id {
+                    (generic_interaction_controls(interaction, session_id, access_token))
+                }
             }
         }
     }
@@ -750,6 +809,7 @@ mod tests {
             kind: "bcode.question".to_owned(),
             tool_call_id: Some("call-1".to_owned()),
             title: Some("Choose".to_owned()),
+            required: true,
             snapshot: Some(serde_json::json!({
                 "request": {
                     "questions": [{
@@ -767,6 +827,8 @@ mod tests {
                 "focus": {"type": "question", "question_index": 0},
                 "focused_control_id": "question-0"
             })),
+            resolved: false,
+            resolution: None,
             render_target: InteractiveToolRenderTarget::TranscriptToolCall,
             turn_behavior: InteractiveToolTurnBehavior::AwaitBeforeContinuing,
         };

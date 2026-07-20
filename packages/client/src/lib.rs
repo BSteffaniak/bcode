@@ -645,16 +645,23 @@ pub enum SessionWatchEvent {
     Durable(Box<SessionEvent>),
     /// Ephemeral live session event.
     Live(Box<bcode_session_models::SessionLiveEvent>),
+    /// The daemon requires this watcher to replace its view from bounded state.
+    ResyncRequired,
 }
 
 /// Event-driven session watcher initialized with bounded recent history.
 #[derive(Debug)]
 pub struct SessionWatcher {
     connection: ClientConnection,
+    session_id: SessionId,
     initial: Option<AttachedSessionHistory>,
 }
 
 impl SessionWatcher {
+    const fn initial_session_id(&self) -> SessionId {
+        self.session_id
+    }
+
     /// Take the bounded initial session state captured while subscribing.
     #[must_use]
     pub const fn take_initial(&mut self) -> Option<AttachedSessionHistory> {
@@ -673,9 +680,14 @@ impl SessionWatcher {
                 Event::SessionLive(event) => {
                     return Ok(SessionWatchEvent::Live(Box::new(event)));
                 }
+                Event::SessionViewResyncRequired {
+                    session_id: required,
+                } if required == self.initial_session_id() => {
+                    return Ok(SessionWatchEvent::ResyncRequired);
+                }
                 Event::RuntimeWork(_)
-                | Event::SessionViewResyncRequired { .. }
-                | Event::SessionCatalogUpdated { .. } => {}
+                | Event::SessionCatalogUpdated { .. }
+                | Event::SessionViewResyncRequired { .. } => {}
             }
         }
     }
@@ -820,6 +832,7 @@ impl BcodeClient {
             .await?;
         Ok(SessionWatcher {
             connection,
+            session_id,
             initial: Some(initial),
         })
     }

@@ -12,14 +12,15 @@ mod actions;
 pub use actions::execute_session_view_action;
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionId, SessionLiveEvent, SessionLiveEventKind,
-    ToolInvocationProjection, ToolInvocationStreamEvent, apply_tool_invocation_projection_event,
+    InteractiveToolRenderTarget, InteractiveToolTurnBehavior, SessionEvent, SessionEventKind,
+    SessionId, SessionLiveEvent, SessionLiveEventKind, ToolInvocationProjection,
+    ToolInvocationStreamEvent, apply_tool_invocation_projection_event,
 };
 use bcode_session_view_models::{
-    ChatMessageView, ComposerViewState, PluginVisualView, SessionViewSnapshot, TextFormat,
-    ThinkingViewState, ToolInvocationView, ToolInvocationViewStatus, ToolOutputView,
-    ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
-    TranscriptViewItemKind,
+    ChatMessageView, ComposerViewState, InteractionViewSummary, PluginVisualView,
+    SessionViewSnapshot, TextFormat, ThinkingViewState, ToolInvocationView,
+    ToolInvocationViewStatus, ToolOutputView, ToolResultView, ToolTimingView, TranscriptViewItem,
+    TranscriptViewItemId, TranscriptViewItemKind,
 };
 use std::collections::{BTreeMap, btree_map::Entry};
 
@@ -29,6 +30,7 @@ pub struct SessionView {
     snapshot: SessionViewSnapshot,
     next_item_id: u64,
     tool_item_ids: BTreeMap<String, TranscriptViewItemId>,
+    interaction_item_ids: BTreeMap<String, TranscriptViewItemId>,
     tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
 }
 
@@ -46,6 +48,7 @@ impl SessionView {
             snapshot: SessionViewSnapshot::empty(),
             next_item_id: 1,
             tool_item_ids: BTreeMap::new(),
+            interaction_item_ids: BTreeMap::new(),
             tool_invocation_projections: BTreeMap::new(),
         }
     }
@@ -68,6 +71,58 @@ impl SessionView {
             self.snapshot.composer = composer;
             self.bump_revision();
         }
+    }
+
+    /// Replace attached runtime selections supplied by the daemon.
+    pub fn set_runtime_selection(
+        &mut self,
+        provider_plugin_id: Option<String>,
+        requested_model_id: Option<String>,
+        effective_model_id: Option<String>,
+        reasoning_effort: Option<String>,
+        reasoning_summary: Option<String>,
+        context_occupancy: Option<bcode_session_models::RequestContextOccupancy>,
+    ) {
+        let runtime = &mut self.snapshot.runtime;
+        let changed = runtime.provider_plugin_id != provider_plugin_id
+            || runtime.requested_model_id != requested_model_id
+            || runtime.effective_model_id != effective_model_id
+            || runtime.reasoning_effort != reasoning_effort
+            || runtime.reasoning_summary != reasoning_summary
+            || runtime.context_occupancy != context_occupancy;
+        if !changed {
+            return;
+        }
+        runtime.provider_plugin_id = provider_plugin_id;
+        runtime.requested_model_id = requested_model_id;
+        runtime.effective_model_id = effective_model_id;
+        runtime.reasoning_effort = reasoning_effort;
+        runtime.reasoning_summary = reasoning_summary;
+        runtime.context_occupancy = context_occupancy;
+        self.bump_revision();
+    }
+
+    /// Insert or replace an authoritative pending permission hydrated from the daemon.
+    pub fn upsert_permission(&mut self, permission: bcode_session_view_models::PermissionView) {
+        let existing = self
+            .snapshot
+            .permissions
+            .iter_mut()
+            .find(|existing| existing.permission_id == permission.permission_id);
+        if let Some(existing) = existing {
+            if *existing != permission {
+                *existing = permission;
+                self.bump_revision();
+            }
+        } else {
+            self.snapshot.permissions.push(permission);
+            self.bump_revision();
+        }
+    }
+
+    /// Insert or replace renderer-neutral interaction state hydrated from the daemon.
+    pub fn upsert_interaction(&mut self, interaction: InteractionViewSummary) {
+        self.upsert_interaction_item(interaction, 0, None);
     }
 
     /// Apply replayed history events in chronological order.
@@ -169,6 +224,171 @@ impl SessionView {
                     );
                 }
             }
+            SessionEventKind::SystemMessage { text } => {
+                self.push_item(
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::markdown(text.clone()),
+                    },
+                );
+            }
+            SessionEventKind::ModelChanged { provider, model } => {
+                self.snapshot.runtime.provider_plugin_id = Some(provider.clone());
+                self.snapshot.runtime.requested_model_id = Some(model.clone());
+                self.snapshot.runtime.effective_model_id = Some(model.clone());
+                self.bump_revision();
+            }
+            SessionEventKind::AgentChanged { agent_id } => {
+                self.snapshot.runtime.agent_id = Some(agent_id.clone());
+                self.bump_revision();
+            }
+            SessionEventKind::ReasoningChanged { effort, summary } => {
+                self.snapshot.runtime.reasoning_effort.clone_from(effort);
+                self.snapshot.runtime.reasoning_summary.clone_from(summary);
+                self.bump_revision();
+            }
+            SessionEventKind::ModelTurnStarted { turn_id } => {
+                self.snapshot.runtime.active_turn_id = Some(turn_id.clone());
+                self.snapshot.runtime.cancelling = false;
+                self.bump_revision();
+            }
+            SessionEventKind::ModelTurnCancelRequested { turn_id, .. } => {
+                self.snapshot.runtime.active_turn_id = Some(turn_id.clone());
+                self.snapshot.runtime.cancelling = true;
+                self.bump_revision();
+            }
+            SessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            } => {
+                if self.snapshot.runtime.active_turn_id.as_deref() == Some(turn_id) {
+                    self.snapshot.runtime.active_turn_id = None;
+                }
+                self.snapshot.runtime.cancelling = false;
+                self.snapshot.runtime.last_turn_outcome = Some(*outcome);
+                self.snapshot.runtime.last_turn_message.clone_from(message);
+                if *outcome == bcode_session_models::ModelTurnOutcome::Error {
+                    self.push_item(
+                        event.sequence,
+                        Some(event.timestamp_ms),
+                        false,
+                        TranscriptViewItemKind::SystemMessage {
+                            message: ChatMessageView::plain(format!(
+                                "Model turn failed: {}",
+                                message.as_deref().unwrap_or("no details recorded")
+                            )),
+                        },
+                    );
+                } else {
+                    self.bump_revision();
+                }
+            }
+            SessionEventKind::ModelUsage { usage, .. } => {
+                self.snapshot.runtime.latest_usage = Some(usage.clone());
+                self.bump_revision();
+            }
+            SessionEventKind::ContextCompacted { summary, .. } => {
+                self.push_item(
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::markdown(format!(
+                            "Context compacted\n\n{summary}"
+                        )),
+                    },
+                );
+            }
+            SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
+                self.snapshot.runtime.context_occupancy = None;
+                self.push_item(
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain(format!(
+                            "Provider context compacted for {} / {}",
+                            snapshot.provider_plugin_id, snapshot.model_id
+                        )),
+                    },
+                );
+            }
+            SessionEventKind::RequestContextObserved { observation } => {
+                self.snapshot.runtime.context_occupancy =
+                    Some(bcode_session_models::RequestContextOccupancy {
+                        context_epoch: observation.request.context_epoch,
+                        observation_sequence: event.sequence,
+                        observation: observation.clone(),
+                    });
+                self.bump_revision();
+            }
+            SessionEventKind::InteractiveToolRequestCreated {
+                interaction_id,
+                tool_call_id,
+                tool_name,
+                interaction_kind,
+                surface_kind,
+                request_json,
+                required,
+                turn_behavior,
+                render_target,
+                ..
+            } => {
+                self.upsert_interaction_item(
+                    InteractionViewSummary {
+                        interaction_id: interaction_id.clone(),
+                        kind: interaction_kind
+                            .clone()
+                            .unwrap_or_else(|| surface_kind.clone()),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        title: Some(tool_name.clone()),
+                        required: *required,
+                        snapshot: parse_json_value(request_json),
+                        resolved: false,
+                        resolution: None,
+                        render_target: *render_target,
+                        turn_behavior: *turn_behavior,
+                    },
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                );
+            }
+            SessionEventKind::InteractiveToolRequestResolved {
+                interaction_id,
+                tool_call_id,
+                resolution_json,
+            } => {
+                let resolution = parse_json_value(resolution_json)
+                    .unwrap_or_else(|| serde_json::Value::String(resolution_json.clone()));
+                let existing = self
+                    .snapshot
+                    .interactions
+                    .iter()
+                    .find(|interaction| interaction.interaction_id == *interaction_id)
+                    .cloned();
+                let interaction = if let Some(mut interaction) = existing {
+                    interaction.resolved = true;
+                    interaction.resolution = Some(resolution);
+                    interaction
+                } else {
+                    InteractionViewSummary {
+                        interaction_id: interaction_id.clone(),
+                        kind: "unknown".to_owned(),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        title: None,
+                        required: false,
+                        snapshot: None,
+                        resolved: true,
+                        resolution: Some(resolution),
+                        render_target: InteractiveToolRenderTarget::default(),
+                        turn_behavior: InteractiveToolTurnBehavior::default(),
+                    }
+                };
+                self.upsert_interaction_item(interaction, event.sequence, Some(event.timestamp_ms));
+            }
             SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
@@ -210,6 +430,19 @@ impl SessionView {
                 {
                     permission.resolved = true;
                     permission.approved = Some(*approved);
+                    let permission = permission.clone();
+                    if let Some(item) = self.snapshot.transcript.items.iter_mut().find(|item| {
+                        matches!(
+                            &item.kind,
+                            TranscriptViewItemKind::Permission { permission: existing }
+                                if existing.permission_id == *permission_id
+                        )
+                    }) {
+                        item.kind = TranscriptViewItemKind::Permission { permission };
+                        item.revision = item.revision.saturating_add(1);
+                        self.snapshot.transcript.revision =
+                            self.snapshot.transcript.revision.saturating_add(1);
+                    }
                     self.bump_revision();
                 }
             }
@@ -358,8 +591,14 @@ impl SessionView {
                     });
                 self.upsert_tool_item(tool_call_id, 0, None);
             }
-            SessionLiveEventKind::ProviderStreamProgress { .. }
-            | SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
+            SessionLiveEventKind::ProviderStreamProgress { .. } => {}
+            SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
+                self.snapshot
+                    .runtime
+                    .context_occupancy
+                    .clone_from(occupancy.as_ref());
+                self.bump_revision();
+            }
         }
     }
 
@@ -460,6 +699,62 @@ impl SessionView {
         self.bump_revision();
     }
 
+    fn upsert_interaction_item(
+        &mut self,
+        interaction: InteractionViewSummary,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+    ) {
+        if let Some(existing) = self
+            .snapshot
+            .interactions
+            .iter_mut()
+            .find(|existing| existing.interaction_id == interaction.interaction_id)
+        {
+            if *existing == interaction {
+                return;
+            }
+            *existing = interaction.clone();
+            self.update_interaction_transcript_item(&interaction);
+            self.bump_revision();
+            return;
+        }
+        self.snapshot.interactions.push(interaction.clone());
+        let id = self.push_item(
+            sequence,
+            timestamp_ms,
+            false,
+            TranscriptViewItemKind::Interaction {
+                interaction: interaction.clone(),
+            },
+        );
+        self.interaction_item_ids
+            .insert(interaction.interaction_id, id);
+    }
+
+    fn update_interaction_transcript_item(&mut self, interaction: &InteractionViewSummary) {
+        let Some(id) = self
+            .interaction_item_ids
+            .get(&interaction.interaction_id)
+            .copied()
+        else {
+            return;
+        };
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            item.kind = TranscriptViewItemKind::Interaction {
+                interaction: interaction.clone(),
+            };
+            item.revision = item.revision.saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        }
+    }
+
     fn push_or_append_streaming_message(
         &mut self,
         sequence: u64,
@@ -471,8 +766,9 @@ impl SessionView {
             .snapshot
             .transcript
             .items
-            .last_mut()
-            .filter(|item| item.streaming && streaming_item_matches(&item.kind, kind))
+            .iter_mut()
+            .rev()
+            .find(|item| item.streaming && streaming_item_matches(&item.kind, kind))
         {
             append_text_to_item(item, text);
             item.revision = item.revision.saturating_add(1);
@@ -499,8 +795,9 @@ impl SessionView {
             .snapshot
             .transcript
             .items
-            .last_mut()
-            .filter(|item| item.streaming && streaming_item_matches(&item.kind, kind))
+            .iter_mut()
+            .rev()
+            .find(|item| item.streaming && streaming_item_matches(&item.kind, kind))
         {
             replace_text_in_item(item, text);
             item.streaming = false;
@@ -516,6 +813,10 @@ impl SessionView {
             kind.item_kind(text.to_owned()),
         );
     }
+}
+
+fn parse_json_value(value: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(value).ok()
 }
 
 fn tool_invocation_view_from_projection(
@@ -668,8 +969,10 @@ pub fn build_session_view_snapshot_for(
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventKind, SessionId,
-        ToolOutputStream,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, InteractiveToolRenderTarget,
+        InteractiveToolTurnBehavior, LocalContextEstimate, ModelRequestIdentity,
+        RequestContextObservation, RequestContextTokenCount, SessionEvent, SessionEventKind,
+        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTokenUsage, ToolOutputStream,
     };
     use std::path::PathBuf;
 
@@ -741,6 +1044,266 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn projects_interaction_lifecycle_and_keeps_transcript_in_sync() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::InteractiveToolRequestCreated {
+                interaction_id: "interaction-1".to_owned(),
+                tool_call_id: "tool-1".to_owned(),
+                tool_name: "question".to_owned(),
+                interaction_kind: Some("bcode.question".to_owned()),
+                surface_kind: "bcode.question.inline".to_owned(),
+                request_json: r#"{"questions":[]}"#.to_owned(),
+                required: true,
+                turn_behavior: InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+                render_target: InteractiveToolRenderTarget::TranscriptToolCall,
+            },
+        ));
+
+        assert_eq!(view.snapshot().interactions.len(), 1);
+        assert_eq!(view.snapshot().interactions[0].kind, "bcode.question");
+        assert_eq!(
+            view.snapshot().interactions[0].snapshot,
+            Some(serde_json::json!({"questions": []}))
+        );
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::Interaction { interaction } if !interaction.resolved
+        ));
+
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::InteractiveToolRequestResolved {
+                interaction_id: "interaction-1".to_owned(),
+                tool_call_id: "tool-1".to_owned(),
+                resolution_json: r#"{"type":"submitted"}"#.to_owned(),
+            },
+        ));
+
+        assert!(view.snapshot().interactions[0].resolved);
+        assert_eq!(
+            view.snapshot().interactions[0].resolution,
+            Some(serde_json::json!({"type": "submitted"}))
+        );
+        assert_eq!(view.snapshot().transcript.items.len(), 1);
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::Interaction { interaction } if interaction.resolved
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn projects_runtime_selection_turn_usage_context_and_system_state() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.set_runtime_selection(
+            Some("provider".to_owned()),
+            Some("requested-model".to_owned()),
+            Some("effective-model".to_owned()),
+            Some("high".to_owned()),
+            Some("detailed".to_owned()),
+            None,
+        );
+        view.apply_history(&[
+            event(
+                session_id,
+                1,
+                SessionEventKind::AgentChanged {
+                    agent_id: "build".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ModelTurnStarted {
+                    turn_id: "turn-1".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::ModelUsage {
+                    turn_id: "turn-1".to_owned(),
+                    usage: SessionTokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        total_tokens: Some(15),
+                        ..SessionTokenUsage::default()
+                    },
+                },
+            ),
+            event(
+                session_id,
+                4,
+                SessionEventKind::RequestContextObserved {
+                    observation: RequestContextObservation {
+                        request: ModelRequestIdentity {
+                            provider_plugin_id: "provider".to_owned(),
+                            requested_model_id: Some("requested-model".to_owned()),
+                            effective_model_id: "effective-model".to_owned(),
+                            request_id: "request-1".to_owned(),
+                            model_turn_id: "turn-1".to_owned(),
+                            round: 0,
+                            request_fingerprint: "fingerprint".to_owned(),
+                            effective_auth_profile: None,
+                            context_format_version: None,
+                            compatibility_key: None,
+                            context_epoch: 2,
+                        },
+                        context_through_sequence: 3,
+                        context_tokens: RequestContextTokenCount::ProviderExact(10),
+                        local_estimate: LocalContextEstimate {
+                            tokens: 9,
+                            algorithm_version: 1,
+                        },
+                    },
+                },
+            ),
+            event(
+                session_id,
+                5,
+                SessionEventKind::SystemMessage {
+                    text: "status".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                6,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: "turn-1".to_owned(),
+                    outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            ),
+        ]);
+
+        let runtime = &view.snapshot().runtime;
+        assert_eq!(runtime.provider_plugin_id.as_deref(), Some("provider"));
+        assert_eq!(
+            runtime.requested_model_id.as_deref(),
+            Some("requested-model")
+        );
+        assert_eq!(
+            runtime.effective_model_id.as_deref(),
+            Some("effective-model")
+        );
+        assert_eq!(runtime.agent_id.as_deref(), Some("build"));
+        assert_eq!(runtime.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            runtime
+                .latest_usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(15)
+        );
+        assert_eq!(
+            runtime
+                .context_occupancy
+                .as_ref()
+                .map(|occupancy| occupancy.context_epoch),
+            Some(2)
+        );
+        assert_eq!(runtime.active_turn_id, None);
+        assert_eq!(
+            runtime.last_turn_outcome,
+            Some(bcode_session_models::ModelTurnOutcome::Completed)
+        );
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::SystemMessage { message } if message.text == "status"
+        ));
+    }
+
+    #[test]
+    fn permission_resolution_updates_collection_and_transcript() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::PermissionRequested {
+                permission_id: "permission-1".to_owned(),
+                tool_call_id: "tool-1".to_owned(),
+                producer_plugin_id: Some("shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{}".to_owned(),
+                legacy_request_presentation: None,
+                policy_source: None,
+                policy_reason: Some("requires approval".to_owned()),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::PermissionResolved {
+                permission_id: "permission-1".to_owned(),
+                approved: true,
+            },
+        ));
+
+        assert!(view.snapshot().permissions[0].resolved);
+        assert_eq!(view.snapshot().permissions[0].approved, Some(true));
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::Permission { permission }
+                if permission.resolved && permission.approved == Some(true)
+        ));
+    }
+
+    #[test]
+    fn live_events_accumulate_in_one_projection() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for text in ["hello ", "world"] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "turn-1".to_owned(),
+                    text: text.to_owned(),
+                },
+            });
+        }
+        for text in ["reason ", "continued"] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantReasoningDelta {
+                    turn_id: "turn-1".to_owned(),
+                    text: text.to_owned(),
+                },
+            });
+        }
+
+        assert_eq!(view.snapshot().transcript.items.len(), 2);
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::AssistantMessage { message } if message.text == "hello world"
+        ));
+        assert!(matches!(
+            &view.snapshot().transcript.items[1].kind,
+            TranscriptViewItemKind::ReasoningMessage { message }
+                if message.text == "reason continued"
+        ));
+
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                text: " again".to_owned(),
+            },
+        });
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "hello world again"
+        ));
     }
 
     #[test]

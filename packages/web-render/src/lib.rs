@@ -13,7 +13,8 @@ use bcode_client::{AttachedSessionHistory, BcodeClient, ClientError, SessionWatc
 use bcode_session_models::{SessionId, SessionSummary};
 use bcode_session_view::{SessionView, execute_session_view_action};
 use bcode_session_view_models::{
-    ComposerDraftViewScope, PromptPlacementView, SessionViewAction, SessionViewSnapshot,
+    ComposerDraftViewScope, InteractionViewSummary, PromptPlacementView, SessionViewAction,
+    SessionViewSnapshot,
 };
 use hyperchad::app::{App, AppBuilder, renderer::DefaultRenderer};
 use hyperchad::color::Color;
@@ -216,23 +217,132 @@ impl WebRenderState {
         let attached = connection
             .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
             .await?;
-        Ok(snapshot_from_attached_history(attached))
+        session_view_from_attached_history(&self.client, attached).await
     }
+}
+
+async fn session_view_from_attached_history(
+    client: &BcodeClient,
+    attached: AttachedSessionHistory,
+) -> Result<SessionViewSnapshot, ClientError> {
+    let mut view = view_from_attached_history(&attached);
+    hydrate_session_model_status(client, attached.session.id, &mut view).await?;
+    hydrate_pending_permissions(client, attached.session.id, &mut view).await?;
+    hydrate_pending_interactions(client, attached.session.id, &mut view).await?;
+    Ok(snapshot_from_view(&view, &attached))
+}
+
+async fn hydrate_session_model_status(
+    client: &BcodeClient,
+    session_id: SessionId,
+    view: &mut SessionView,
+) -> Result<(), ClientError> {
+    let status = client.session_model_status(session_id).await?;
+    view.set_runtime_selection(
+        status.provider_plugin_id,
+        status.requested_model_id.or(status.model_id),
+        status.effective_model_id,
+        status.reasoning_effort,
+        status.reasoning_summary,
+        status.context_occupancy.map(|occupancy| *occupancy),
+    );
+    Ok(())
+}
+
+fn view_from_attached_history(attached: &AttachedSessionHistory) -> SessionView {
+    let mut view = SessionView::new();
+    view.apply_history(&attached.history);
+    let runtime = &attached.runtime_selection;
+    view.set_runtime_selection(
+        runtime.provider_plugin_id.clone(),
+        runtime
+            .requested_model_id
+            .clone()
+            .or_else(|| runtime.model_id.clone()),
+        runtime.effective_model_id.clone(),
+        runtime.reasoning_effort.clone(),
+        runtime.reasoning_summary.clone(),
+        None,
+    );
+    view
+}
+
+async fn hydrate_pending_permissions(
+    client: &BcodeClient,
+    session_id: SessionId,
+    view: &mut SessionView,
+) -> Result<(), ClientError> {
+    for permission in client
+        .list_permissions()
+        .await?
+        .into_iter()
+        .filter(|permission| permission.session_id == session_id)
+    {
+        view.upsert_permission(bcode_session_view_models::PermissionView {
+            permission_id: permission.permission_id,
+            tool_call_id: permission.tool_call_id,
+            title: Some(format!("Permission requested: {}", permission.tool_name)),
+            detail: permission.policy_reason,
+            resolved: false,
+            approved: None,
+            can_remember: permission.can_remember_policy,
+        });
+    }
+    Ok(())
+}
+
+async fn hydrate_pending_interactions(
+    client: &BcodeClient,
+    session_id: SessionId,
+    view: &mut SessionView,
+) -> Result<(), ClientError> {
+    let requests = client.list_interactive_tool_requests().await?;
+    for request in requests
+        .into_iter()
+        .filter(|request| request.session_id == session_id)
+    {
+        let interaction_id = request.interaction_id.clone();
+        let snapshot = client
+            .interaction_snapshot(interaction_id.clone())
+            .await?
+            .map_or(request.request, |snapshot| snapshot.snapshot);
+        view.upsert_interaction(InteractionViewSummary {
+            interaction_id,
+            kind: request
+                .interaction_kind
+                .unwrap_or_else(|| request.surface_kind.clone()),
+            tool_call_id: Some(request.tool_call_id),
+            title: Some(request.tool_name),
+            required: request.required,
+            snapshot: Some(snapshot),
+            resolved: false,
+            resolution: None,
+            render_target: request.render_target,
+            turn_behavior: request.turn_behavior,
+        });
+    }
+    Ok(())
+}
+
+fn snapshot_from_view(
+    view: &SessionView,
+    attached: &AttachedSessionHistory,
+) -> SessionViewSnapshot {
+    let mut snapshot = view.snapshot().clone();
+    snapshot.session_id = Some(attached.session.id);
+    snapshot.title = attached.session.title().map(ToOwned::to_owned);
+    snapshot.working_directory = Some(attached.session.working_directory.clone());
+    snapshot.composer.draft = attached.draft.clone().unwrap_or_default();
+    snapshot.composer.can_submit = true;
+    snapshot.session_summary = Some(attached.session.clone());
+    snapshot
 }
 
 /// Build a renderer-neutral snapshot from bounded daemon attach history.
 #[must_use]
-pub fn snapshot_from_attached_history(attached: AttachedSessionHistory) -> SessionViewSnapshot {
-    let mut view = SessionView::new();
-    view.apply_history(&attached.history);
-    let mut snapshot = view.into_snapshot();
-    snapshot.session_id = Some(attached.session.id);
-    snapshot.title = attached.session.title().map(ToOwned::to_owned);
-    snapshot.working_directory = Some(attached.session.working_directory.clone());
-    snapshot.composer.draft = attached.draft.unwrap_or_default();
-    snapshot.composer.can_submit = true;
-    snapshot.session_summary = Some(attached.session);
-    snapshot
+pub fn snapshot_from_attached_history(attached: &AttachedSessionHistory) -> SessionViewSnapshot {
+    let view = view_from_attached_history(attached);
+    snapshot_from_view(&view, attached)
 }
 
 /// Build a state-backed application router.
@@ -691,32 +801,46 @@ async fn watch_session_updates(
     let mut watcher = client
         .watch_session(session_id, INITIAL_HISTORY_EVENT_LIMIT)
         .await?;
-    watcher
+    let mut attached = watcher
         .take_initial()
         .ok_or(ClientError::UnexpectedResponse)?;
+    let mut view = view_from_attached_history(&attached);
+    hydrate_pending_interactions(&client, session_id, &mut view).await?;
 
     loop {
-        let event = watcher.next_event().await?;
-        let mut connection = client.connect("bcode-web-render-live").await?;
-        let attached = connection
-            .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
-            .await?;
-        let mut view = SessionView::new();
-        view.apply_history(&attached.history);
-        if let SessionWatchEvent::Live(event) = event {
-            view.apply_live_event(&event);
+        match watcher.next_event().await? {
+            SessionWatchEvent::Durable(event) => {
+                if view
+                    .snapshot()
+                    .latest_sequence
+                    .is_none_or(|sequence| event.sequence > sequence)
+                {
+                    view.apply_event(&event);
+                }
+            }
+            SessionWatchEvent::Live(event) => view.apply_live_event(&event),
+            SessionWatchEvent::ResyncRequired => {
+                let mut connection = client.connect("bcode-web-render-resync").await?;
+                attached = connection
+                    .attach_session_recent_with_input_history(
+                        session_id,
+                        INITIAL_HISTORY_EVENT_LIMIT,
+                    )
+                    .await?;
+                view = view_from_attached_history(&attached);
+            }
         }
-        let mut snapshot = view.into_snapshot();
-        snapshot.session_id = Some(attached.session.id);
-        snapshot.title = attached.session.title().map(ToOwned::to_owned);
-        snapshot.working_directory = Some(attached.session.working_directory.clone());
-        snapshot.composer.draft = attached.draft.unwrap_or_default();
-        snapshot.composer.can_submit = true;
-        snapshot.session_summary = Some(attached.session);
+
+        hydrate_session_model_status(&client, session_id, &mut view).await?;
+        hydrate_pending_permissions(&client, session_id, &mut view).await?;
+        hydrate_pending_interactions(&client, session_id, &mut view).await?;
         let sessions = client.list_sessions().await?;
+        if let Some(summary) = sessions.iter().find(|summary| summary.id == session_id) {
+            attached.session.clone_from(summary);
+        }
         let update = ScopedSnapshotUpdate {
             scope: format!("{access_token}:{session_id}"),
-            snapshot,
+            snapshot: snapshot_from_view(&view, &attached),
             sessions,
         };
         let sender = renderer_tx
