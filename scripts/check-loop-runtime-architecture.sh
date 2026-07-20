@@ -24,80 +24,12 @@ if rg -n 'RecvError::Lagged\(_\) => continue' packages/server/src packages/clien
   violations=1
 fi
 
-expected_feature_files="$(cat <<'EOF'
-packages/cli/src/lib.rs
-packages/client/src/lib.rs
-packages/ipc/src/lib.rs
-packages/server/src/lib.rs
-packages/session/models/src/lib.rs
-packages/session/src/db.rs
-packages/session/src/lib.rs
-packages/session/src/persisted.rs
-packages/tui/src/app.rs
-packages/tui/src/chat_loop.rs
-packages/tui/src/palette_flow.rs
-packages/tui/src/transcript.rs
-plugins/loop-plugin/src/lib.rs
-EOF
-)"
-actual_feature_files="$(
-  rg -l 'PluginAutomation|plugin_automation|PluginStatusNote|clone_session_at_generation|automation_hold' \
-    packages plugins --glob '*.rs' | sort
-)"
-if [[ "$actual_feature_files" != "$expected_feature_files" ]]; then
-  echo "Loop architecture violation: specialized automation machinery spread to unexpected files." >&2
-  diff -u <(printf '%s\n' "$expected_feature_files") <(printf '%s\n' "$actual_feature_files") >&2 || true
-  violations=1
-fi
-
-expected_pascal_symbols="$(cat <<'EOF'
-PluginAutomation
-PluginAutomationExecutionPolicy
-PluginAutomationHold
-PluginAutomationHoldRequest
-PluginAutomationHoldResponse
-PluginAutomationOperation
-PluginAutomationOperationLookupRequest
-PluginAutomationOrigin
-PluginAutomationSnapshot
-PluginAutomationSnapshotRequest
-PluginAutomationTurn
-PluginAutomationTurnCompletion
-PluginAutomationTurnDisposition
-PluginAutomationTurnFinished
-PluginAutomationTurnRequest
-PluginAutomationTurnStarted
-EOF
-)"
-actual_pascal_symbols="$(
-  rg -o '\bPluginAutomation[A-Za-z0-9_]*\b' packages plugins --glob '*.rs' \
-    | sed 's/.*://' | sort -u
-)"
-if [[ "$actual_pascal_symbols" != "$expected_pascal_symbols" ]]; then
-  echo "Loop architecture violation: the temporary PluginAutomation symbol set changed." >&2
-  diff -u <(printf '%s\n' "$expected_pascal_symbols") <(printf '%s\n' "$actual_pascal_symbols") >&2 || true
-  violations=1
-fi
-
-expected_snake_symbols="$(cat <<'EOF'
-plugin_automation_active
-plugin_automation_generation
-plugin_automation_holds
-plugin_automation_operation_events
-plugin_automation_origin_labels_only_the_matching_user_turn
-plugin_automation_preflight_disposition
-plugin_automation_snapshot
-plugin_automation_turn_finished
-plugin_automation_turn_started
-EOF
-)"
-actual_snake_symbols="$(
-  rg -o '\bplugin_automation_[A-Za-z0-9_]*\b' packages plugins --glob '*.rs' \
-    | sed 's/.*://' | sort -u
-)"
-if [[ "$actual_snake_symbols" != "$expected_snake_symbols" ]]; then
-  echo "Loop architecture violation: the temporary plugin_automation symbol set changed." >&2
-  diff -u <(printf '%s\n' "$expected_snake_symbols") <(printf '%s\n' "$actual_snake_symbols") >&2 || true
+if rg -n '\bPluginAutomation[A-Za-z0-9_]*\b|\bplugin_automation_[A-Za-z0-9_]*\b|automation_hold' \
+  packages plugins --glob '*.rs' \
+  | rg -v '"plugin_automation_turn_(started|finished)"' \
+  >/tmp/bcode-removed-plugin-automation.txt; then
+  echo "Loop architecture violation: removed specialized PluginAutomation machinery was reintroduced." >&2
+  cat /tmp/bcode-removed-plugin-automation.txt >&2
   violations=1
 fi
 
@@ -151,8 +83,8 @@ if [[ "$clone_files" != "$expected_clone_files" ]]; then
 fi
 
 loop_default_clients="$(rg -n 'BcodeClient::default_endpoint' plugins/loop-plugin/src/lib.rs | wc -l | tr -d ' ')"
-if [[ "$loop_default_clients" != "5" ]]; then
-  echo "Loop architecture violation: expected five recorded direct loop daemon-client constructions, found $loop_default_clients." >&2
+if [[ "$loop_default_clients" != "4" ]]; then
+  echo "Loop architecture violation: expected four recorded direct loop daemon-client constructions, found $loop_default_clients." >&2
   violations=1
 fi
 

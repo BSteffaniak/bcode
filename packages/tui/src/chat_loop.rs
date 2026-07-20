@@ -121,7 +121,6 @@ struct ChatLoopState {
     interactive_surface: Option<InteractiveSurfaceState>,
     plugin_runtime: Option<PluginRuntimeHost>,
     artifact_stream: ArtifactStreamCoordinator,
-    automation_hold: ModalAutomationHold,
 }
 
 impl ChatLoopState {
@@ -141,7 +140,6 @@ impl ChatLoopState {
             interactive_surface: None,
             plugin_runtime: None,
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
-            automation_hold: ModalAutomationHold::new(),
         }
     }
 
@@ -173,76 +171,6 @@ impl ChatLoopState {
         if let Some(state) = self.daemon_connection.observe(observation) {
             chat.app.set_daemon_connection(state);
         }
-    }
-
-    const fn has_blocking_surface(&self) -> bool {
-        self.palette.is_some()
-            || self.slash_palette.is_some()
-            || self.permission_dialog.is_some()
-            || self.thinking_dialog.is_some()
-            || self.timeline_dialog.is_some()
-            || self.interactive_surface.is_some()
-    }
-
-    async fn sync_automation_hold(
-        &mut self,
-        client: &BcodeClient,
-        session_id: Option<bcode_session_models::SessionId>,
-    ) -> Result<(), ClientError> {
-        self.automation_hold
-            .sync(client, session_id, self.has_blocking_surface())
-            .await
-    }
-}
-
-struct ModalAutomationHold {
-    holder_id: String,
-    held_session_id: Option<bcode_session_models::SessionId>,
-}
-
-impl ModalAutomationHold {
-    fn new() -> Self {
-        Self {
-            holder_id: format!("tui-modal:{}", uuid::Uuid::new_v4()),
-            held_session_id: None,
-        }
-    }
-
-    async fn sync(
-        &mut self,
-        client: &BcodeClient,
-        session_id: Option<bcode_session_models::SessionId>,
-        blocking_surface_open: bool,
-    ) -> Result<(), ClientError> {
-        let desired_session_id = blocking_surface_open.then_some(session_id).flatten();
-        if self.held_session_id == desired_session_id {
-            return Ok(());
-        }
-        if let Some(held_session_id) = self.held_session_id {
-            client
-                .set_plugin_automation_hold(bcode_ipc::PluginAutomationHoldRequest {
-                    session_id: held_session_id,
-                    holder_id: self.holder_id.clone(),
-                    held: false,
-                })
-                .await?;
-            self.held_session_id = None;
-        }
-        if let Some(desired_session_id) = desired_session_id {
-            client
-                .set_plugin_automation_hold(bcode_ipc::PluginAutomationHoldRequest {
-                    session_id: desired_session_id,
-                    holder_id: self.holder_id.clone(),
-                    held: true,
-                })
-                .await?;
-            self.held_session_id = Some(desired_session_id);
-        }
-        Ok(())
-    }
-
-    async fn release(&mut self, client: &BcodeClient) -> Result<(), ClientError> {
-        self.sync(client, None, false).await
     }
 }
 
@@ -347,9 +275,7 @@ pub async fn run_with_client<W: Write>(
         &mut loop_state,
     )
     .await;
-    let release_result = loop_state.automation_hold.release(client).await;
     loop_state.abort_all_effects();
-    release_result?;
     result
 }
 
@@ -398,9 +324,6 @@ async fn run_chat_loop<W: Write>(
         if handle_loop_housekeeping(settings, chat, &mut draft_autosave, loop_state).await {
             needs_redraw = true;
         }
-        loop_state
-            .sync_automation_hold(client, chat.session_id)
-            .await?;
 
         if helpers::resize_from_terminal(terminal)? {
             needs_redraw = true;
@@ -513,9 +436,6 @@ async fn run_chat_loop<W: Write>(
             }
             ChatLoopEvent::Timer => {}
         }
-        loop_state
-            .sync_automation_hold(client, chat.session_id)
-            .await?;
         if before_session_id != chat.session_id {
             loop_state.artifact_stream.retain_session(chat.session_id);
             draft_autosave.last_saved_text = None;
@@ -1662,8 +1582,7 @@ async fn absorb_bcode_event(
                     event.kind,
                     SessionEventKind::RalphLifecycle { .. }
                         | SessionEventKind::PluginStatusNote { .. }
-                        | SessionEventKind::PluginAutomationTurnStarted { .. }
-                        | SessionEventKind::PluginAutomationTurnFinished { .. }
+                        | SessionEventKind::LegacyEvent { .. }
                 ) {
                     loop_state.replace_effect(TuiEffect::LoadPluginStatus {
                         session_id: event.session_id,

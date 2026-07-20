@@ -203,7 +203,6 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
-    plugin_automation_holds: Mutex<BTreeMap<SessionId, BTreeMap<String, ClientId>>>,
     turn_tool_policies: Mutex<BTreeMap<SessionId, bcode_session_models::TurnToolPolicy>>,
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
@@ -353,7 +352,6 @@ struct SessionRuntimeHandle {
     queued_steering: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
-    plugin_automation_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -477,14 +475,6 @@ enum FollowupCommand {
         client_id: ClientId,
         selection: SessionModelSelection,
         response: oneshot::Sender<Result<String, CompactionError>>,
-    },
-    PluginAutomation {
-        client_id: ClientId,
-        runtime_context: Option<ClientRuntimeContext>,
-        request: bcode_ipc::PluginAutomationTurnRequest,
-        user_event: Box<bcode_session_models::SessionEvent>,
-        turn_id: String,
-        completion: oneshot::Sender<ModelTurnCompletion>,
     },
 }
 
@@ -1087,7 +1077,6 @@ impl ServerState {
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
             turn_admission_locks: Mutex::default(),
-            plugin_automation_holds: Mutex::default(),
             turn_tool_policies: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
             ralph_store: init.ralph_store,
@@ -1134,9 +1123,6 @@ impl ServerState {
             .lock()
             .await
             .remove(&client_id);
-        let mut holds = self.plugin_automation_holds.lock().await;
-        remove_client_automation_holds(&mut holds, client_id);
-        drop(holds);
         self.unregister_catalog_event_client(client_id).await;
     }
 
@@ -2181,20 +2167,6 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::ActiveSkills { session_id }
         | Request::SetSessionAgent { session_id, .. }
         | Request::ChangeSessionWorkingDirectory { session_id, .. }
-        | Request::PluginAutomationSnapshot(bcode_ipc::PluginAutomationSnapshotRequest {
-            session_id,
-        })
-        | Request::SubmitPluginAutomationTurn(bcode_ipc::PluginAutomationTurnRequest {
-            session_id,
-            ..
-        })
-        | Request::LookupPluginAutomationOperation(
-            bcode_ipc::PluginAutomationOperationLookupRequest { session_id, .. },
-        )
-        | Request::SetPluginAutomationHold(bcode_ipc::PluginAutomationHoldRequest {
-            session_id,
-            ..
-        })
         | Request::ListRuntimeWork { session_id }
         | Request::RuntimeWorkHistory { session_id, .. }
         | Request::SubscribeRuntimeWork { session_id }
@@ -2240,11 +2212,6 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::InvokePluginService { .. } => "invoke_plugin_service",
         Request::CallPluginService { .. } => "call_plugin_service",
         Request::PublishPluginEvent { .. } => "publish_plugin_event",
-        Request::PluginAutomationSnapshot(_) => "plugin_automation_snapshot",
-        Request::SubmitPluginAutomationTurn(_) => "submit_plugin_automation_turn",
-        Request::LookupPluginAutomationOperation(_) => "lookup_plugin_automation_operation",
-        Request::RecordPluginStatusNote(_) => "record_plugin_status_note",
-        Request::SetPluginAutomationHold(_) => "set_plugin_automation_hold",
         Request::UpdateClientRuntimeContext { .. } => "update_client_runtime_context",
         Request::ChangeSessionWorkingDirectory { .. } => "change_session_working_directory",
         Request::ListWorktrees(_) => "list_worktrees",
@@ -2432,22 +2399,6 @@ async fn handle_request_inner(
         }
         Request::RecordRalphLifecycle(request) => {
             handle_record_ralph_lifecycle(request_id, state, writer, request).await
-        }
-        Request::PluginAutomationSnapshot(request) => {
-            handle_plugin_automation_snapshot(request_id, state, writer, request).await
-        }
-        Request::SubmitPluginAutomationTurn(request) => {
-            handle_submit_plugin_automation_turn(request_id, client_id, state, writer, request)
-                .await
-        }
-        Request::LookupPluginAutomationOperation(request) => {
-            handle_lookup_plugin_automation_operation(request_id, state, writer, request).await
-        }
-        Request::RecordPluginStatusNote(request) => {
-            handle_record_plugin_status_note(request_id, state, writer, request).await
-        }
-        Request::SetPluginAutomationHold(request) => {
-            handle_set_plugin_automation_hold(request_id, client_id, state, writer, request).await
         }
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
@@ -2812,12 +2763,7 @@ async fn handle_agent_permission_plugin_request(
         | Request::ListRalphIterations(_)
         | Request::ResumeRalphRun(_)
         | Request::RalphRunStatus(_)
-        | Request::RecordRalphLifecycle(_)
-        | Request::PluginAutomationSnapshot(_)
-        | Request::SubmitPluginAutomationTurn(_)
-        | Request::LookupPluginAutomationOperation(_)
-        | Request::RecordPluginStatusNote(_)
-        | Request::SetPluginAutomationHold(_) => {
+        | Request::RecordRalphLifecycle(_) => {
             unreachable!("primary request routed to primary handler")
         }
         _ => unreachable!("primary request routed to agent/permission/plugin handler"),
@@ -6710,7 +6656,6 @@ async fn session_runtime_handle(
     let cancel_receiver = Arc::new(Mutex::new(Some(cancel_receiver)));
     let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
     let current_turn = Arc::new(Mutex::new(None));
-    let plugin_automation_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = SessionRuntimeHandle {
         followup_commands,
         steering_commands,
@@ -6719,7 +6664,6 @@ async fn session_runtime_handle(
         queued_steering: Arc::clone(&queued_steering),
         phase: Arc::clone(&phase),
         current_turn: Arc::clone(&current_turn),
-        plugin_automation_active: Arc::clone(&plugin_automation_active),
     };
     runtimes.insert(session_id, handle.clone());
     drop(runtimes);
@@ -6734,7 +6678,6 @@ async fn session_runtime_handle(
             queued_followups,
             phase,
             current_turn,
-            plugin_automation_active,
         ))
         .await;
     });
@@ -6751,7 +6694,6 @@ async fn run_session_runtime(
     queued_followups: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
-    plugin_automation_active: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut permit = SessionTurnPermit::new(session_id);
     let mut followup_commands = followup_commands
@@ -6910,33 +6852,6 @@ async fn run_session_runtime(
                     arguments,
                     source,
                     display_text,
-                ))
-                .await;
-            }
-            FollowupCommand::PluginAutomation {
-                client_id,
-                runtime_context,
-                request,
-                user_event,
-                turn_id,
-                completion,
-            } => {
-                Box::pin(process_plugin_automation_command(
-                    &state,
-                    &mut permit,
-                    Arc::clone(&phase),
-                    &mut followup_commands,
-                    &mut steering_commands,
-                    &mut cancel_commands,
-                    queued_followups.as_ref(),
-                    Arc::clone(&current_turn),
-                    client_id,
-                    runtime_context,
-                    request,
-                    *user_event,
-                    turn_id,
-                    completion,
-                    plugin_automation_active.as_ref(),
                 ))
                 .await;
             }
@@ -7406,117 +7321,6 @@ async fn process_existing_user_event_command(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_plugin_automation_command(
-    state: &ServerState,
-    permit: &mut SessionTurnPermit,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
-    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
-    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
-    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &AtomicUsize,
-    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
-    client_id: ClientId,
-    runtime_context: Option<ClientRuntimeContext>,
-    request: bcode_ipc::PluginAutomationTurnRequest,
-    user_event: bcode_session_models::SessionEvent,
-    turn_id: String,
-    completion_sender: oneshot::Sender<ModelTurnCompletion>,
-    plugin_automation_active: &std::sync::atomic::AtomicBool,
-) {
-    plugin_automation_active.store(true, Ordering::Release);
-    let tool_policy = match request.execution_policy {
-        bcode_ipc::PluginAutomationExecutionPolicy::Normal => {
-            bcode_session_models::TurnToolPolicy::Enabled
-        }
-        bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection => {
-            bcode_session_models::TurnToolPolicy::ReadOnly
-        }
-    };
-    state
-        .turn_tool_policies
-        .lock()
-        .await
-        .insert(permit.session_id(), tool_policy);
-    Box::pin(process_plugin_automation_command_inner(
-        state,
-        permit,
-        phase,
-        followup_commands,
-        steering_commands,
-        cancel_commands,
-        queued_followups,
-        current_turn,
-        client_id,
-        runtime_context,
-        request,
-        user_event,
-        turn_id,
-        completion_sender,
-    ))
-    .await;
-    state
-        .turn_tool_policies
-        .lock()
-        .await
-        .remove(&permit.session_id());
-    plugin_automation_active.store(false, Ordering::Release);
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn process_plugin_automation_command_inner(
-    state: &ServerState,
-    permit: &mut SessionTurnPermit,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
-    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
-    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
-    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &AtomicUsize,
-    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
-    client_id: ClientId,
-    runtime_context: Option<ClientRuntimeContext>,
-    request: bcode_ipc::PluginAutomationTurnRequest,
-    user_event: bcode_session_models::SessionEvent,
-    turn_id: String,
-    completion_sender: oneshot::Sender<ModelTurnCompletion>,
-) {
-    set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
-    suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
-    let mut command_context = RuntimeCommandContext::new(
-        followup_commands,
-        steering_commands,
-        cancel_commands,
-        queued_followups,
-        Arc::clone(&current_turn),
-    );
-    let completion = Box::pin(run_model_turn(
-        state,
-        permit,
-        &user_event,
-        client_id,
-        runtime_context,
-        &mut command_context,
-        &phase,
-    ))
-    .await;
-    set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
-    if let Ok(event) = state
-        .sessions
-        .append_plugin_automation_turn_finished(
-            permit.session_id(),
-            request.origin.plugin_id,
-            request.origin.operation_id,
-            turn_id,
-            completion.outcome,
-            completion.message.clone(),
-        )
-        .await
-    {
-        publish_session_event(state, &event).await;
-    }
-    let _sent = completion_sender.send(completion);
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn process_skill_invocation_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
@@ -7800,456 +7604,6 @@ async fn turn_admission_lock(state: &ServerState, session_id: SessionId) -> Arc<
             .entry(session_id)
             .or_insert_with(|| Arc::new(Mutex::new(()))),
     )
-}
-
-async fn plugin_automation_generation(
-    state: &ServerState,
-    session_id: SessionId,
-) -> Result<u64, ServerError> {
-    let page = state
-        .sessions
-        .session_history_page(
-            session_id,
-            bcode_session_models::SessionHistoryQuery {
-                cursor: None,
-                limit: 1,
-                direction: bcode_session_models::SessionHistoryDirection::Backward,
-            },
-        )
-        .await?;
-    Ok(page.events.first().map_or(0, |event| event.sequence))
-}
-
-fn automation_operation_from_events(
-    events: &[bcode_session_models::SessionEvent],
-    plugin_id: &str,
-    operation_id: &str,
-) -> Option<bcode_ipc::PluginAutomationOperation> {
-    let started = events.iter().find_map(|event| match &event.kind {
-        SessionEventKind::PluginAutomationTurnStarted {
-            plugin_id: event_plugin_id,
-            run_id,
-            operation_id: event_operation_id,
-            display_label,
-            turn_id,
-            user_event_sequence,
-            ..
-        } if event_plugin_id == plugin_id && event_operation_id == operation_id => Some((
-            bcode_ipc::PluginAutomationOrigin {
-                plugin_id: event_plugin_id.clone(),
-                run_id: run_id.clone(),
-                operation_id: event_operation_id.clone(),
-                display_label: display_label.clone(),
-            },
-            turn_id.clone(),
-            *user_event_sequence,
-        )),
-        _ => None,
-    })?;
-    let completion = events.iter().find_map(|event| match &event.kind {
-        SessionEventKind::PluginAutomationTurnFinished {
-            plugin_id: event_plugin_id,
-            operation_id: event_operation_id,
-            outcome,
-            message,
-            ..
-        } if event_plugin_id == plugin_id && event_operation_id == operation_id => {
-            Some(bcode_ipc::PluginAutomationTurnCompletion {
-                outcome: *outcome,
-                message: message.clone(),
-                event_sequence: event.sequence,
-            })
-        }
-        _ => None,
-    });
-    Some(bcode_ipc::PluginAutomationOperation {
-        origin: started.0,
-        user_event_sequence: started.2,
-        turn_id: started.1,
-        completion,
-    })
-}
-
-async fn lookup_plugin_automation_operation(
-    state: &ServerState,
-    request: &bcode_ipc::PluginAutomationOperationLookupRequest,
-) -> Result<Option<bcode_ipc::PluginAutomationOperation>, ServerError> {
-    let events = state
-        .sessions
-        .plugin_automation_operation_events(
-            request.session_id,
-            &request.plugin_id,
-            &request.operation_id,
-        )
-        .await?;
-    Ok(automation_operation_from_events(
-        &events,
-        &request.plugin_id,
-        &request.operation_id,
-    ))
-}
-
-fn remove_client_automation_holds(
-    holds: &mut BTreeMap<SessionId, BTreeMap<String, ClientId>>,
-    client_id: ClientId,
-) {
-    holds.retain(|_, session_holds| {
-        session_holds.retain(|_, owner| *owner != client_id);
-        !session_holds.is_empty()
-    });
-}
-
-fn update_plugin_automation_hold(
-    holds: &mut BTreeMap<SessionId, BTreeMap<String, ClientId>>,
-    client_id: ClientId,
-    request: &bcode_ipc::PluginAutomationHoldRequest,
-) -> bcode_ipc::PluginAutomationHoldResponse {
-    let session_holds = holds.entry(request.session_id).or_default();
-    if request.held {
-        session_holds.insert(request.holder_id.clone(), client_id);
-    } else {
-        session_holds.remove(&request.holder_id);
-    }
-    let active_holds = usize_to_u32_saturating(session_holds.len());
-    let held = active_holds > 0;
-    if !held {
-        holds.remove(&request.session_id);
-    }
-    bcode_ipc::PluginAutomationHoldResponse { held, active_holds }
-}
-
-async fn handle_record_plugin_status_note(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::PluginStatusNoteRequest,
-) -> Result<(), ServerError> {
-    if request.plugin_id.trim().is_empty()
-        || request.note_id.trim().is_empty()
-        || request.text.trim().is_empty()
-    {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "invalid_plugin_status_note",
-                "plugin status note requires non-empty plugin_id, note_id, and text",
-            )),
-        )
-        .await;
-    }
-    let lock = turn_admission_lock(state, request.session_id).await;
-    let _guard = lock.lock().await;
-    let existing = state
-        .sessions
-        .plugin_status_note_events(request.session_id, &request.plugin_id, &request.note_id)
-        .await?;
-    let (event, created) = if let Some(event) = existing.last() {
-        (event.clone(), false)
-    } else {
-        let event = state
-            .sessions
-            .append_event(
-                request.session_id,
-                SessionEventKind::PluginStatusNote {
-                    plugin_id: request.plugin_id,
-                    note_id: request.note_id,
-                    text: request.text,
-                    metadata: request.metadata,
-                },
-            )
-            .await?;
-        publish_session_event(state, &event).await;
-        (event, true)
-    };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PluginStatusNoteRecorded { event, created }),
-    )
-    .await
-}
-
-async fn handle_set_plugin_automation_hold(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    request: bcode_ipc::PluginAutomationHoldRequest,
-) -> Result<(), ServerError> {
-    state.sessions.session_summary(request.session_id).await?;
-    if request.holder_id.trim().is_empty() {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "invalid_automation_hold",
-                "automation hold holder_id must not be empty",
-            )),
-        )
-        .await;
-    }
-    let response = {
-        let mut holds = state.plugin_automation_holds.lock().await;
-        update_plugin_automation_hold(&mut holds, client_id, &request)
-    };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PluginAutomationHold { response }),
-    )
-    .await
-}
-
-async fn handle_plugin_automation_snapshot(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::PluginAutomationSnapshotRequest,
-) -> Result<(), ServerError> {
-    state.sessions.session_summary(request.session_id).await?;
-    let handle = session_runtime_handle(state, request.session_id).await;
-    let snapshot = bcode_ipc::PluginAutomationSnapshot {
-        session_id: request.session_id,
-        generation: plugin_automation_generation(state, request.session_id).await?,
-        pending_manual_messages: usize_to_u32_saturating(
-            handle.queued_followups.load(Ordering::Acquire),
-        ),
-        pending_steering_messages: usize_to_u32_saturating(
-            handle.queued_steering.load(Ordering::Acquire),
-        ),
-        session_busy: handle.phase.lock().await.has_active_work(),
-        plugin_automation_active: handle.plugin_automation_active.load(Ordering::Acquire),
-        automation_held: state
-            .plugin_automation_holds
-            .lock()
-            .await
-            .get(&request.session_id)
-            .is_some_and(|holds| !holds.is_empty()),
-    };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PluginAutomationSnapshot { snapshot }),
-    )
-    .await
-}
-
-async fn handle_lookup_plugin_automation_operation(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::PluginAutomationOperationLookupRequest,
-) -> Result<(), ServerError> {
-    let operation = lookup_plugin_automation_operation(state, &request).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PluginAutomationOperation { operation }),
-    )
-    .await
-}
-
-fn plugin_automation_preflight_disposition(
-    automation_held: bool,
-    pending_manual_messages: usize,
-    session_busy: bool,
-    current_generation: Option<u64>,
-    expected_generation: u64,
-) -> Option<bcode_ipc::PluginAutomationTurnDisposition> {
-    if automation_held {
-        return Some(bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld);
-    }
-    if pending_manual_messages > 0 {
-        return Some(
-            bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending {
-                pending_messages: usize_to_u32_saturating(pending_manual_messages),
-            },
-        );
-    }
-    if session_busy {
-        return Some(bcode_ipc::PluginAutomationTurnDisposition::SessionBusy);
-    }
-    if let Some(current_generation) = current_generation
-        && current_generation != expected_generation
-    {
-        return Some(bcode_ipc::PluginAutomationTurnDisposition::SessionChanged {
-            current_generation,
-        });
-    }
-    None
-}
-
-#[derive(Debug)]
-struct PersistedAutomationAcceptance {
-    operation: bcode_ipc::PluginAutomationOperation,
-    user_event: bcode_session_models::SessionEvent,
-}
-
-async fn persist_plugin_automation_acceptance(
-    state: &ServerState,
-    client_id: ClientId,
-    request: &bcode_ipc::PluginAutomationTurnRequest,
-) -> Result<Result<PersistedAutomationAcceptance, bcode_ipc::PluginAutomationOperation>, ServerError>
-{
-    let lookup = bcode_ipc::PluginAutomationOperationLookupRequest {
-        session_id: request.session_id,
-        plugin_id: request.origin.plugin_id.clone(),
-        operation_id: request.origin.operation_id.clone(),
-    };
-    if let Some(operation) = lookup_plugin_automation_operation(state, &lookup).await? {
-        return Ok(Err(operation));
-    }
-    state
-        .sessions
-        .require_write_readiness(request.session_id)
-        .await?;
-    let events = state
-        .sessions
-        .append_user_message_with_origin(
-            request.session_id,
-            client_id,
-            request.text.clone(),
-            Some(bcode_session_models::TurnOrigin {
-                producer: request.origin.plugin_id.clone(),
-                correlation_id: Some(request.origin.operation_id.clone()),
-                display_label: Some(request.origin.display_label.clone()),
-            }),
-        )
-        .await?;
-    for event in &events {
-        publish_session_event(state, event).await;
-    }
-    let user_event = events
-        .last()
-        .cloned()
-        .ok_or_else(|| bcode_session::SessionError::NotFound(request.session_id))?;
-    let turn_id = format!("{}-{}", request.session_id, user_event.sequence);
-    let started = state
-        .sessions
-        .append_plugin_automation_turn_started(
-            request.session_id,
-            request.origin.plugin_id.clone(),
-            request.origin.run_id.clone(),
-            request.origin.operation_id.clone(),
-            request.origin.display_label.clone(),
-            turn_id.clone(),
-            user_event.sequence,
-            request.execution_policy
-                == bcode_ipc::PluginAutomationExecutionPolicy::ReadOnlyInspection,
-        )
-        .await?;
-    publish_session_event(state, &started).await;
-    Ok(Ok(PersistedAutomationAcceptance {
-        operation: bcode_ipc::PluginAutomationOperation {
-            origin: request.origin.clone(),
-            user_event_sequence: user_event.sequence,
-            turn_id,
-            completion: None,
-        },
-        user_event,
-    }))
-}
-
-#[allow(clippy::too_many_lines)]
-async fn handle_submit_plugin_automation_turn(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::PluginAutomationTurnRequest,
-) -> Result<(), ServerError> {
-    let lock = turn_admission_lock(state, request.session_id).await;
-    let _guard = lock.lock().await;
-    let lookup = bcode_ipc::PluginAutomationOperationLookupRequest {
-        session_id: request.session_id,
-        plugin_id: request.origin.plugin_id.clone(),
-        operation_id: request.origin.operation_id.clone(),
-    };
-    if let Some(operation) = lookup_plugin_automation_operation(state, &lookup).await? {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::PluginAutomationTurn {
-                result: bcode_ipc::PluginAutomationTurnDisposition::AlreadyAccepted { operation },
-            }),
-        )
-        .await;
-    }
-    let automation_held = state
-        .plugin_automation_holds
-        .lock()
-        .await
-        .get(&request.session_id)
-        .is_some_and(|holds| !holds.is_empty());
-    let handle = session_runtime_handle(state, request.session_id).await;
-    let pending = handle.queued_followups.load(Ordering::Acquire);
-    let session_busy = handle.phase.lock().await.has_active_work();
-    let generation = if automation_held || pending > 0 || session_busy {
-        None
-    } else {
-        Some(plugin_automation_generation(state, request.session_id).await?)
-    };
-    if let Some(result) = plugin_automation_preflight_disposition(
-        automation_held,
-        pending,
-        session_busy,
-        generation,
-        request.expected_generation,
-    ) {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::PluginAutomationTurn { result }),
-        )
-        .await;
-    }
-    let acceptance = match persist_plugin_automation_acceptance(state, client_id, &request).await? {
-        Ok(acceptance) => acceptance,
-        Err(operation) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::PluginAutomationTurn {
-                    result: bcode_ipc::PluginAutomationTurnDisposition::AlreadyAccepted {
-                        operation,
-                    },
-                }),
-            )
-            .await;
-        }
-    };
-    let operation = acceptance.operation;
-    let user_event = acceptance.user_event;
-    let turn_id = operation.turn_id.clone();
-    let (completion, _receiver) = oneshot::channel();
-    let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
-    debug_assert_eq!(pending_before, 0);
-    let session_id = request.session_id;
-    if handle
-        .followup_commands
-        .send(FollowupCommand::PluginAutomation {
-            client_id,
-            runtime_context: state.client_runtime_context(client_id).await,
-            request,
-            user_event: Box::new(user_event),
-            turn_id,
-            completion,
-        })
-        .await
-        .is_err()
-    {
-        handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
-        return Err(bcode_session::SessionError::NotFound(session_id).into());
-    }
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PluginAutomationTurn {
-            result: bcode_ipc::PluginAutomationTurnDisposition::Accepted { operation },
-        }),
-    )
-    .await
 }
 
 async fn handle_submit_turn(
@@ -19240,8 +18594,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
-        SessionEventKind::PluginAutomationTurnStarted { .. } => "plugin_automation_turn_started",
-        SessionEventKind::PluginAutomationTurnFinished { .. } => "plugin_automation_turn_finished",
+        SessionEventKind::LegacyEvent { .. } => "legacy_event",
     }
 }
 
@@ -28243,133 +27596,6 @@ library = "test"
         assert!(current_turn.lock().await.is_none());
     }
 
-    fn automation_request(
-        session_id: SessionId,
-        operation_id: &str,
-        expected_generation: u64,
-    ) -> bcode_ipc::PluginAutomationTurnRequest {
-        bcode_ipc::PluginAutomationTurnRequest {
-            session_id,
-            origin: bcode_ipc::PluginAutomationOrigin {
-                plugin_id: "bcode.test".to_owned(),
-                run_id: "run-1".to_owned(),
-                operation_id: operation_id.to_owned(),
-                display_label: "Test operation".to_owned(),
-            },
-            text: "automated prompt".to_owned(),
-            expected_generation,
-            execution_policy: bcode_ipc::PluginAutomationExecutionPolicy::Normal,
-        }
-    }
-
-    #[tokio::test]
-    async fn duplicate_automation_acceptance_persists_exactly_one_user_turn() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions = SessionManager::persistent(temp.path()).expect("persistent sessions");
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session");
-        let state = test_server_state(sessions);
-        let generation = plugin_automation_generation(&state, summary.id)
-            .await
-            .expect("generation");
-        let request = automation_request(summary.id, "operation-1", generation);
-
-        let first = persist_plugin_automation_acceptance(&state, ClientId::new(), &request)
-            .await
-            .expect("first submission")
-            .expect("first submission accepted");
-        let duplicate = persist_plugin_automation_acceptance(&state, ClientId::new(), &request)
-            .await
-            .expect("duplicate submission")
-            .expect_err("duplicate must report existing operation");
-
-        assert_eq!(duplicate, first.operation);
-        let history = state
-            .sessions
-            .session_history(summary.id)
-            .await
-            .expect("history");
-        assert_eq!(
-            history
-                .iter()
-                .filter(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            history
-                .iter()
-                .filter(|event| matches!(
-                    &event.kind,
-                    SessionEventKind::PluginAutomationTurnStarted { operation_id, .. }
-                        if operation_id == "operation-1"
-                ))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn automation_hold_lifecycle_is_idempotent_and_does_not_touch_in_flight_state() {
-        let session_id = SessionId::new();
-        let mut holds = BTreeMap::new();
-        let active = std::sync::atomic::AtomicBool::new(true);
-        let request = bcode_ipc::PluginAutomationHoldRequest {
-            session_id,
-            holder_id: "modal-1".to_owned(),
-            held: true,
-        };
-
-        let client_id = ClientId::new();
-        let acquired = update_plugin_automation_hold(&mut holds, client_id, &request);
-        let reacquired = update_plugin_automation_hold(&mut holds, client_id, &request);
-        assert_eq!(acquired.active_holds, 1);
-        assert_eq!(reacquired.active_holds, 1);
-        assert!(active.load(Ordering::Acquire));
-        assert!(matches!(
-            plugin_automation_preflight_disposition(true, 0, true, None, 7),
-            Some(bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld)
-        ));
-
-        let released = update_plugin_automation_hold(
-            &mut holds,
-            client_id,
-            &bcode_ipc::PluginAutomationHoldRequest {
-                held: false,
-                ..request
-            },
-        );
-        assert!(!released.held);
-        assert_eq!(released.active_holds, 0);
-        assert!(!holds.contains_key(&session_id));
-        assert!(active.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn disconnect_removes_only_the_disconnected_clients_automation_holds() {
-        let session_id = SessionId::new();
-        let disconnected = ClientId::new();
-        let connected = ClientId::new();
-        let mut holds = BTreeMap::from([(
-            session_id,
-            BTreeMap::from([
-                ("disconnected-modal".to_owned(), disconnected),
-                ("connected-modal".to_owned(), connected),
-            ]),
-        )]);
-
-        remove_client_automation_holds(&mut holds, disconnected);
-
-        assert_eq!(
-            holds.get(&session_id),
-            Some(&BTreeMap::from([("connected-modal".to_owned(), connected)]))
-        );
-        remove_client_automation_holds(&mut holds, connected);
-        assert!(!holds.contains_key(&session_id));
-    }
-
     #[tokio::test]
     async fn multiple_steering_messages_during_active_work_preserve_acceptance_order() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -28384,7 +27610,6 @@ library = "test"
         let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         let queued = Arc::new(AtomicUsize::new(0));
         let queued_steering = Arc::new(AtomicUsize::new(0));
-        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let handle = SessionRuntimeHandle {
             followup_commands: followup_tx,
             steering_commands: steering_tx,
@@ -28393,7 +27618,6 @@ library = "test"
             queued_steering: Arc::clone(&queued_steering),
             phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
             current_turn: Arc::new(Mutex::new(None)),
-            plugin_automation_active: Arc::clone(&active),
         };
         let client_id = ClientId::new();
 
@@ -28454,34 +27678,6 @@ library = "test"
             })
             .collect::<Vec<_>>();
         assert_eq!(messages, ["first", "second"]);
-        assert!(active.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn automation_preflight_enforces_manual_hold_busy_and_generation_priority() {
-        assert!(matches!(
-            plugin_automation_preflight_disposition(true, 3, true, None, 7),
-            Some(bcode_ipc::PluginAutomationTurnDisposition::AutomationHeld)
-        ));
-        assert!(matches!(
-            plugin_automation_preflight_disposition(false, 3, true, None, 7),
-            Some(
-                bcode_ipc::PluginAutomationTurnDisposition::ManualInputPending {
-                    pending_messages: 3
-                }
-            )
-        ));
-        assert!(matches!(
-            plugin_automation_preflight_disposition(false, 0, true, None, 7),
-            Some(bcode_ipc::PluginAutomationTurnDisposition::SessionBusy)
-        ));
-        assert!(matches!(
-            plugin_automation_preflight_disposition(false, 0, false, Some(8), 7),
-            Some(bcode_ipc::PluginAutomationTurnDisposition::SessionChanged {
-                current_generation: 8
-            })
-        ));
-        assert!(plugin_automation_preflight_disposition(false, 0, false, Some(7), 7).is_none());
     }
 
     fn policy_metadata(
@@ -28498,7 +27694,7 @@ library = "test"
     }
 
     #[test]
-    fn read_only_execution_denies_mutating_and_unknown_tool_calls() {
+    fn read_only_turn_policy_denies_mutating_and_unknown_tool_calls() {
         let read_only = Some(bcode_session_models::TurnToolPolicy::ReadOnly);
         let read = policy_metadata(bcode_agent_profile::ToolPolicyOperation::ReadOnly);
         let write = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Mutating);
@@ -28516,7 +27712,7 @@ library = "test"
     }
 
     #[test]
-    fn read_only_automation_policy_allows_only_owner_declared_read_operations() {
+    fn read_only_turn_policy_allows_only_owner_declared_read_operations() {
         let read_only = Some(bcode_session_models::TurnToolPolicy::ReadOnly);
         assert!(tool_policy_allows_operation(read_only, true));
         assert!(!tool_policy_allows_operation(read_only, false));
@@ -28525,52 +27721,5 @@ library = "test"
             false
         ));
         assert!(tool_policy_allows_operation(None, false));
-    }
-
-    #[test]
-    fn automation_operation_projection_reconciles_started_and_finished_events() {
-        let session_id = SessionId::new();
-        let events = vec![
-            session_event(
-                session_id,
-                5,
-                SessionEventKind::PluginAutomationTurnStarted {
-                    plugin_id: "bcode.test".to_owned(),
-                    run_id: "run-1".to_owned(),
-                    operation_id: "operation-1".to_owned(),
-                    display_label: "Test operation".to_owned(),
-                    turn_id: "turn-1".to_owned(),
-                    user_event_sequence: 4,
-                    read_only: false,
-                },
-            ),
-            session_event(
-                session_id,
-                8,
-                SessionEventKind::PluginAutomationTurnFinished {
-                    plugin_id: "bcode.test".to_owned(),
-                    operation_id: "operation-1".to_owned(),
-                    turn_id: "turn-1".to_owned(),
-                    outcome: ModelTurnOutcome::Completed,
-                    message: None,
-                },
-            ),
-        ];
-
-        let operation = automation_operation_from_events(&events, "bcode.test", "operation-1")
-            .expect("operation should reconcile");
-        assert_eq!(operation.origin.plugin_id, "bcode.test");
-        assert_eq!(operation.origin.run_id, "run-1");
-        assert_eq!(operation.origin.operation_id, "operation-1");
-        assert_eq!(operation.origin.display_label, "Test operation");
-        assert_eq!(operation.user_event_sequence, 4);
-        assert_eq!(operation.turn_id, "turn-1");
-        assert_eq!(
-            operation
-                .completion
-                .map(|completion| completion.event_sequence),
-            Some(8)
-        );
-        assert!(automation_operation_from_events(&events, "other", "operation-1").is_none());
     }
 }

@@ -1342,24 +1342,6 @@ impl BcodeClient {
         }
     }
 
-    /// Persist one idempotent plugin-owned status note in session history.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn record_plugin_status_note(
-        &self,
-        request: bcode_ipc::PluginStatusNoteRequest,
-    ) -> Result<(SessionEvent, bool), ClientError> {
-        match self
-            .send_request(Request::RecordPluginStatusNote(request))
-            .await?
-        {
-            ResponsePayload::PluginStatusNoteRecorded { event, created } => Ok((event, created)),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
     /// Rename a session.
     ///
     /// # Errors
@@ -1539,80 +1521,6 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionHistoryPage { page } => Ok(page),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Return the current generic plugin automation scheduling snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn plugin_automation_snapshot(
-        &self,
-        session_id: SessionId,
-    ) -> Result<bcode_ipc::PluginAutomationSnapshot, ClientError> {
-        match self
-            .send_request(Request::PluginAutomationSnapshot(
-                bcode_ipc::PluginAutomationSnapshotRequest { session_id },
-            ))
-            .await?
-        {
-            ResponsePayload::PluginAutomationSnapshot { snapshot } => Ok(snapshot),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Atomically compare and submit one generic plugin automation turn.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn submit_plugin_automation_turn(
-        &self,
-        request: bcode_ipc::PluginAutomationTurnRequest,
-    ) -> Result<bcode_ipc::PluginAutomationTurnDisposition, ClientError> {
-        match self
-            .send_request(Request::SubmitPluginAutomationTurn(request))
-            .await?
-        {
-            ResponsePayload::PluginAutomationTurn { result } => Ok(result),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Look up a generic plugin automation operation by stable identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn lookup_plugin_automation_operation(
-        &self,
-        request: bcode_ipc::PluginAutomationOperationLookupRequest,
-    ) -> Result<Option<bcode_ipc::PluginAutomationOperation>, ClientError> {
-        match self
-            .send_request(Request::LookupPluginAutomationOperation(request))
-            .await?
-        {
-            ResponsePayload::PluginAutomationOperation { operation } => Ok(operation),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Update one generic plugin automation hold.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn set_plugin_automation_hold(
-        &self,
-        request: bcode_ipc::PluginAutomationHoldRequest,
-    ) -> Result<bcode_ipc::PluginAutomationHoldResponse, ClientError> {
-        match self
-            .send_request(Request::SetPluginAutomationHold(request))
-            .await?
-        {
-            ResponsePayload::PluginAutomationHold { response } => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

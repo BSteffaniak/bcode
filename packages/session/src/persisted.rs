@@ -461,7 +461,12 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         metadata: BTreeMap<String, serde_json::Value>,
     },
-    PluginAutomationTurnStarted {
+    LegacyEvent {
+        event_type: String,
+        payload: serde_json::Value,
+    },
+    #[serde(rename = "plugin_automation_turn_started")]
+    LegacyTurnStarted {
         plugin_id: String,
         run_id: String,
         operation_id: String,
@@ -470,7 +475,8 @@ enum PersistedSessionEventKind {
         user_event_sequence: u64,
         read_only: bool,
     },
-    PluginAutomationTurnFinished {
+    #[serde(rename = "plugin_automation_turn_finished")]
+    LegacyTurnFinished {
         plugin_id: String,
         operation_id: String,
         turn_id: String,
@@ -918,35 +924,12 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 text: text.clone(),
                 metadata: metadata.clone(),
             },
-            SessionEventKind::PluginAutomationTurnStarted {
-                plugin_id,
-                run_id,
-                operation_id,
-                display_label,
-                turn_id,
-                user_event_sequence,
-                read_only,
-            } => Self::PluginAutomationTurnStarted {
-                plugin_id: plugin_id.clone(),
-                run_id: run_id.clone(),
-                operation_id: operation_id.clone(),
-                display_label: display_label.clone(),
-                turn_id: turn_id.clone(),
-                user_event_sequence: *user_event_sequence,
-                read_only: *read_only,
-            },
-            SessionEventKind::PluginAutomationTurnFinished {
-                plugin_id,
-                operation_id,
-                turn_id,
-                outcome,
-                message,
-            } => Self::PluginAutomationTurnFinished {
-                plugin_id: plugin_id.clone(),
-                operation_id: operation_id.clone(),
-                turn_id: turn_id.clone(),
-                outcome: *outcome,
-                message: message.clone(),
+            SessionEventKind::LegacyEvent {
+                event_type,
+                payload,
+            } => Self::LegacyEvent {
+                event_type: event_type.clone(),
+                payload: payload.clone(),
             },
         }
     }
@@ -1316,35 +1299,48 @@ impl PersistedSessionEventKind {
                 text,
                 metadata,
             },
-            Self::PluginAutomationTurnStarted {
-                plugin_id,
-                run_id,
-                operation_id,
-                display_label,
-                turn_id,
-                user_event_sequence,
-                read_only,
-            } => SessionEventKind::PluginAutomationTurnStarted {
-                plugin_id,
-                run_id,
-                operation_id,
-                display_label,
-                turn_id,
-                user_event_sequence,
-                read_only,
+            Self::LegacyEvent {
+                event_type,
+                payload,
+            } => SessionEventKind::LegacyEvent {
+                event_type,
+                payload,
             },
-            Self::PluginAutomationTurnFinished {
+            Self::LegacyTurnStarted {
+                plugin_id,
+                run_id,
+                operation_id,
+                display_label,
+                turn_id,
+                user_event_sequence,
+                read_only,
+            } => SessionEventKind::LegacyEvent {
+                event_type: "plugin_automation_turn_started".to_owned(),
+                payload: serde_json::json!({
+                    "plugin_id": plugin_id,
+                    "run_id": run_id,
+                    "operation_id": operation_id,
+                    "display_label": display_label,
+                    "turn_id": turn_id,
+                    "user_event_sequence": user_event_sequence,
+                    "read_only": read_only,
+                }),
+            },
+            Self::LegacyTurnFinished {
                 plugin_id,
                 operation_id,
                 turn_id,
                 outcome,
                 message,
-            } => SessionEventKind::PluginAutomationTurnFinished {
-                plugin_id,
-                operation_id,
-                turn_id,
-                outcome,
-                message,
+            } => SessionEventKind::LegacyEvent {
+                event_type: "plugin_automation_turn_finished".to_owned(),
+                payload: serde_json::json!({
+                    "plugin_id": plugin_id,
+                    "operation_id": operation_id,
+                    "turn_id": turn_id,
+                    "outcome": outcome,
+                    "message": message,
+                }),
             },
         }
     }
@@ -1509,13 +1505,8 @@ mod tests {
         for (payload, expected_kind) in cases {
             let event = decode_session_event(payload).expect("schema-29 fixture should decode");
             let actual_kind = match event.kind {
-                SessionEventKind::PluginAutomationTurnStarted { .. } => {
-                    "plugin_automation_turn_started"
-                }
-                SessionEventKind::PluginAutomationTurnFinished { .. } => {
-                    "plugin_automation_turn_finished"
-                }
-                SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
+                SessionEventKind::LegacyEvent { event_type, .. } => event_type,
+                SessionEventKind::PluginStatusNote { .. } => "plugin_status_note".to_owned(),
                 other => panic!("unexpected compatibility event: {other:?}"),
             };
             assert_eq!(actual_kind, expected_kind);

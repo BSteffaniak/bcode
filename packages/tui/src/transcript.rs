@@ -1000,22 +1000,6 @@ fn push_transcript_item_from_event(
         SessionEventKind::ToolInvocationStream { event } => {
             apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
         }
-        SessionEventKind::PluginAutomationTurnStarted {
-            display_label,
-            user_event_sequence,
-            ..
-        } => {
-            if let Some(index) = items
-                .iter()
-                .position(|item| item.event_sequence() == Some(*user_event_sequence))
-                && items[index].display_label.is_none()
-            {
-                let replacement = items[index]
-                    .clone()
-                    .with_display_label(display_label.clone());
-                items[index] = replacement;
-            }
-        }
         _ => {
             if let Some(item) =
                 non_streaming_transcript_item_from_event(event, tool_calls, streamed_tool_results)
@@ -1514,7 +1498,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plugin_automation_origin_labels_only_the_matching_user_turn() {
+    fn generic_turn_origin_labels_only_the_matching_user_turn() {
         let session_id = bcode_session_models::SessionId::new();
         let events = vec![
             SessionEvent {
@@ -1534,22 +1518,6 @@ mod tests {
                         }),
                         ..bcode_session_models::TurnAdmissionMetadata::default()
                     },
-                },
-            },
-            SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 6,
-                timestamp_ms: 2,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::PluginAutomationTurnStarted {
-                    plugin_id: "bcode.loop".to_owned(),
-                    run_id: "run-1".to_owned(),
-                    operation_id: "operation-1".to_owned(),
-                    display_label: "Loop iteration 4".to_owned(),
-                    turn_id: "turn-1".to_owned(),
-                    user_event_sequence: 5,
-                    read_only: false,
                 },
             },
             SessionEvent {

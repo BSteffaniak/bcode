@@ -2063,24 +2063,10 @@ pub enum SessionEventKind {
         #[serde(default)]
         metadata: BTreeMap<String, serde_json::Value>,
     },
-    /// Durable generic origin marker for plugin-submitted automation.
-    PluginAutomationTurnStarted {
-        plugin_id: String,
-        run_id: String,
-        operation_id: String,
-        display_label: String,
-        turn_id: String,
-        user_event_sequence: u64,
-        read_only: bool,
-    },
-    /// Durable generic completion marker for plugin-submitted automation.
-    PluginAutomationTurnFinished {
-        plugin_id: String,
-        operation_id: String,
-        turn_id: String,
-        outcome: ModelTurnOutcome,
-        #[serde(default)]
-        message: Option<String>,
+    /// Opaque historical event retained for replay/export compatibility only.
+    LegacyEvent {
+        event_type: String,
+        payload: serde_json::Value,
     },
 }
 

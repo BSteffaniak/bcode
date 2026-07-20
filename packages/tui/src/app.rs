@@ -4513,8 +4513,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. }
         | SessionEventKind::ModelTurnFinished { .. }
-        | SessionEventKind::PluginAutomationTurnStarted { .. }
-        | SessionEventKind::PluginAutomationTurnFinished { .. } => true,
+        | SessionEventKind::LegacyEvent { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
         SessionEventKind::SessionCreated { .. }
         | SessionEventKind::ClientAttached { .. }
