@@ -672,12 +672,22 @@ impl SessionActor {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        let db = SessionDb::open_turso_in_root_observed(
-            self.state.summary.id,
-            &store.root_path(),
-            store.metrics(),
-        )
-        .await?;
+        let db_path = crate::db::session_db_path(&store.root_path(), self.state.summary.id);
+        let db = if db_path.exists() {
+            SessionDb::open_runtime_turso_in_root_observed(
+                self.state.summary.id,
+                &store.root_path(),
+                store.metrics(),
+            )
+            .await?
+        } else {
+            SessionDb::initialize_turso_in_root_observed(
+                self.state.summary.id,
+                &store.root_path(),
+                store.metrics(),
+            )
+            .await?
+        };
         self.db = Some(db.clone());
         Ok(db)
     }
@@ -692,7 +702,7 @@ impl SessionActor {
         if !crate::db::session_db_path(&store.root_path(), self.state.summary.id).exists() {
             return Ok(None);
         }
-        let db = SessionDb::open_turso_in_root_observed(
+        let db = SessionDb::open_existing_turso_in_root_observed(
             self.state.summary.id,
             &store.root_path(),
             store.metrics(),

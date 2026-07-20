@@ -1200,7 +1200,7 @@ impl SessionManager {
         handle: &SessionHandle,
     ) -> Result<(), SessionError> {
         let db_open_timer = self.metrics.timer();
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.summary_refresh_db_open_duration_ms",
             db_open_timer.elapsed_ms(),
@@ -1236,7 +1236,7 @@ impl SessionManager {
             lease_timer.elapsed_ms(),
         );
         let db_open_timer = self.metrics.timer();
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.db_open_duration_ms",
             db_open_timer.elapsed_ms(),
@@ -1883,7 +1883,8 @@ impl SessionManager {
         if let Some(store) = &self.store {
             let db_path = db::session_db_path(&store.root_path(), session_id);
             if db_path.exists() {
-                let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+                let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path())
+                    .await?;
                 return Ok(db.history_page(query).await?);
             }
         }
@@ -1909,7 +1910,7 @@ impl SessionManager {
         if !db_path.exists() {
             return Err(SessionError::NotFound(session_id));
         }
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         Ok(db
             .plugin_automation_operation_events(plugin_id, operation_id)
             .await?)
@@ -1934,7 +1935,7 @@ impl SessionManager {
         if !db_path.exists() {
             return Err(SessionError::NotFound(session_id));
         }
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         Ok(db.plugin_status_note_events(plugin_id, note_id).await?)
     }
 
@@ -2246,7 +2247,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::DbUnavailable(session_id))?;
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         let expected_last_sequence = db.last_event_sequence().await?.unwrap_or(0);
         let checkpoint = db
             .materialized_projection_checkpoint(db::MaterializedProjection::RuntimeWork)
@@ -3206,7 +3207,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::DbUnavailable(session_id))?;
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         let reference = db
             .finalized_artifact_reference(artifact_id, reference_key)
             .await?;
@@ -3742,7 +3743,7 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         AppendToolCallRequestedInput, MAX_DURABLE_TOOL_STREAM_EVENT_BYTES, SessionError,
-        SessionHealth, SessionLeaseOwnerContext, SessionManager, db,
+        SessionHealth, SessionLeaseOwnerContext, SessionManager, db, lease,
     };
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
@@ -6579,6 +6580,62 @@ mod tests {
         let sessions = restored.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].name.as_deref(), Some("New title"));
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn catalog_listing_remains_lease_free_with_an_incompatible_live_owner() {
+        let root = unique_temp_dir();
+        let writer = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                storage_writer_epoch: Some(lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+                build_fingerprint: Some("current-writer".to_owned()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("writer manager should initialize");
+        let session = writer
+            .create_session(Some("catalog-only".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        assert_eq!(
+            lease::active_session_owners(&root, session.id)
+                .expect("owners should be readable")
+                .len(),
+            1,
+            "the loaded writer should hold exactly one session lease"
+        );
+
+        let passive_reader = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                storage_writer_epoch: Some(lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH - 1),
+                build_fingerprint: Some("incompatible-passive-reader".to_owned()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("catalog loading must not acquire a session lease");
+        assert!(
+            passive_reader
+                .all_session_summaries()
+                .await
+                .iter()
+                .any(|summary| summary.id == session.id),
+            "passive catalog listing should discover the owned session"
+        );
+        assert_eq!(
+            lease::active_session_owners(&root, session.id)
+                .expect("owners should remain readable")
+                .len(),
+            1,
+            "passive discovery must not create an owner record"
+        );
+
+        drop(passive_reader);
+        drop(writer);
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

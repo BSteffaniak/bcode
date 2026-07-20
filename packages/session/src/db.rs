@@ -719,6 +719,34 @@ impl SessionDb {
         Self::initialize_turso_observed(session_id, &path, MetricsRegistry::disabled()).await
     }
 
+    pub(crate) async fn open_runtime_turso_in_root_observed(
+        session_id: SessionId,
+        root: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
+        let db = Self::open_existing_turso_in_root_observed(session_id, root, metrics).await?;
+        db.validate_write_readiness().await?;
+        Ok(db)
+    }
+
+    pub(crate) async fn initialize_turso_in_root_observed(
+        session_id: SessionId,
+        root: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
+        let path = session_db_path(root, session_id);
+        if path.exists() {
+            return Err(SessionDbError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("session database already exists at {}", path.display()),
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Self::initialize_turso_observed(session_id, &path, metrics).await
+    }
+
     /// Explicitly migrate an existing database while exclusive maintenance and write guards are
     /// held.
     ///

@@ -84,6 +84,17 @@ if rg -n "SessionDb::open_turso_in_root" packages/server/src --glob '*.rs' >/tmp
   violations=1
 fi
 
+normal_session_open_violations="$(
+  rg -n '\bSessionDb::open_turso_in_root(_observed)?' packages/session/src/{actor,lib}.rs \
+    | awk -F: '$1 !~ /lib.rs/ || $2 < 3700' \
+    || true
+)"
+if [[ -n "$normal_session_open_violations" ]]; then
+  echo "Session open-mode violation: production session paths must use explicit existing/runtime/initialize/maintenance opens." >&2
+  printf '%s\n' "$normal_session_open_violations" >&2
+  violations=1
+fi
+
 if ! rg -q 'CREATE TABLE IF NOT EXISTS artifact_references' packages/session/src/db.rs \
   || ! rg -q 'MaterializedProjection::ArtifactReferences' packages/session/src/db.rs; then
   echo "Session artifact projection violation: finalized references require a checkpointed bounded projection." >&2
