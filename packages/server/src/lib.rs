@@ -38,9 +38,9 @@ use bcode_agent_profile::{
     ToolPolicyAuthorizationMetadata, tool_policy_authorization_metadata,
 };
 use bcode_agent_runtime::{
-    CancellationToken, InvocationArtifactSink, InvocationCapabilityFuture,
-    InvocationExchangeBroker, InvocationInputRouter, InvocationServiceRouter, RegisteredTool,
-    RuntimeFuture, ToolAuthorizationCoordinator, ToolAuthorizationDecision,
+    ArtifactCommitGuard, CancellationToken, InvocationArtifactSink, InvocationCapabilityFuture,
+    InvocationExchangeBroker, InvocationInputRouter, InvocationScope, InvocationServiceRouter,
+    RegisteredTool, RuntimeFuture, ToolAuthorizationCoordinator, ToolAuthorizationDecision,
     ToolAuthorizationRequest, ToolSource, TurnGeneration, TurnScope,
 };
 use bcode_ipc::{
@@ -15947,6 +15947,7 @@ impl InvocationArtifactSink for SessionArtifactSink<'_> {
     fn write(
         &self,
         request: ToolArtifactWriteRequest,
+        commit: ArtifactCommitGuard,
     ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
         Box::pin(async move {
             if request.invocation_id != self.invocation_id {
@@ -15979,6 +15980,7 @@ impl InvocationArtifactSink for SessionArtifactSink<'_> {
                 self.invocation_id,
                 &request,
                 self.cancel_state,
+                commit,
             ) {
                 Ok(reference) => ToolArtifactWriteResolution::Written {
                     artifact_id: request.artifact_id,
@@ -15997,12 +15999,14 @@ fn write_session_invocation_artifact(
     invocation_id: &str,
     request: &ToolArtifactWriteRequest,
     cancel_state: &TurnCancelState,
+    commit: ArtifactCommitGuard,
 ) -> Result<serde_json::Value, (String, String)> {
     write_session_invocation_artifact_with_publish_hook(
         root,
         invocation_id,
         request,
         cancel_state,
+        commit,
         || {},
     )
 }
@@ -16012,6 +16016,7 @@ fn write_session_invocation_artifact_with_publish_hook<F>(
     invocation_id: &str,
     request: &ToolArtifactWriteRequest,
     cancel_state: &TurnCancelState,
+    commit: ArtifactCommitGuard,
     after_publish: F,
 ) -> Result<serde_json::Value, (String, String)>
 where
@@ -16065,7 +16070,21 @@ where
             "artifact write cancelled".to_string(),
         ));
     }
-    if let Err(error) = std::fs::hard_link(&temporary, &destination) {
+    let publication = commit.commit(|| {
+        let result = std::fs::hard_link(&temporary, &destination);
+        if result.is_ok() {
+            after_publish();
+        }
+        result
+    });
+    let Some(publication) = publication else {
+        let _ = std::fs::remove_file(&temporary);
+        return Err((
+            "cancelled".to_string(),
+            "artifact publication rejected by closed turn scope".to_string(),
+        ));
+    };
+    if let Err(error) = publication {
         let _ = std::fs::remove_file(&temporary);
         return if error.kind() == std::io::ErrorKind::AlreadyExists {
             Err((
@@ -16076,7 +16095,6 @@ where
             Err(("artifact_publish_failed".to_string(), error.to_string()))
         };
     }
-    after_publish();
     if cancel_state.is_cancelled() {
         let _ = std::fs::remove_file(&temporary);
         let _ = std::fs::remove_file(&destination);
@@ -16305,7 +16323,16 @@ async fn resolve_server_plugin_bridge_request(
                 &call.id,
                 cancel_state,
             );
-            ServiceBridgeResponse::Artifact(sink.write(request).await)
+            let scope = InvocationScope::new(
+                TurnScope::without_events(
+                    format!("server-artifact:{session_id}"),
+                    TurnGeneration::new(0),
+                ),
+                call.id.clone(),
+            );
+            ServiceBridgeResponse::Artifact(
+                sink.write(request, scope.artifact_commit_guard()).await,
+            )
         }
     })
 }
@@ -20131,6 +20158,13 @@ library = "test"
             Err(mpsc::error::TrySendError::Closed(_))
         ));
     }
+    fn test_artifact_scope(invocation_id: &str) -> InvocationScope {
+        InvocationScope::new(
+            TurnScope::without_events("test-artifact", TurnGeneration::new(1)),
+            invocation_id.to_string(),
+        )
+    }
+
     #[tokio::test]
     async fn session_artifact_sink_writes_bounded_owned_artifacts_transactionally() {
         let root = tempfile::tempdir().expect("artifact sink root");
@@ -20144,7 +20178,12 @@ library = "test"
             bytes: b"artifact bytes".to_vec(),
             metadata: serde_json::json!({"kind": "test"}),
         };
-        let resolution = sink.write(request.clone()).await;
+        let resolution = sink
+            .write(
+                request.clone(),
+                test_artifact_scope("artifact-call").artifact_commit_guard(),
+            )
+            .await;
         let ToolArtifactWriteResolution::Written {
             artifact_id,
             byte_len,
@@ -20189,7 +20228,7 @@ library = "test"
         );
 
         assert!(matches!(
-            sink.write(request).await,
+            sink.write(request, test_artifact_scope("artifact-call").artifact_commit_guard()).await,
             ToolArtifactWriteResolution::Failed { code, .. } if code == "duplicate_artifact"
         ));
     }
@@ -20206,11 +20245,13 @@ library = "test"
             metadata: serde_json::Value::Null,
         };
 
+        let scope = test_artifact_scope("artifact-call");
         let result = write_session_invocation_artifact_with_publish_hook(
             root.path(),
             "artifact-call",
             &request,
             &cancel_state,
+            scope.artifact_commit_guard(),
             || cancel_state.close(),
         );
 
@@ -20242,22 +20283,26 @@ library = "test"
                 content_type: "application/octet-stream".to_string(),
                 bytes: Vec::new(),
                 metadata: serde_json::Value::Null,
-            })
+            }, test_artifact_scope("active").artifact_commit_guard())
             .await,
             ToolArtifactWriteResolution::Failed { code, .. }
                 if code == "invocation_id_mismatch"
         ));
         assert_eq!(
-            sink.write(ToolArtifactWriteRequest {
-                invocation_id: "active".to_string(),
-                artifact_id: "large".to_string(),
-                content_type: "application/octet-stream".to_string(),
-                bytes: vec![
-                    0;
-                    usize::try_from(SESSION_ARTIFACT_WRITE_MAX_BYTES).expect("bound") + 1
-                ],
-                metadata: serde_json::Value::Null,
-            })
+            sink.write(
+                ToolArtifactWriteRequest {
+                    invocation_id: "active".to_string(),
+                    artifact_id: "large".to_string(),
+                    content_type: "application/octet-stream".to_string(),
+                    bytes: vec![
+                        0;
+                        usize::try_from(SESSION_ARTIFACT_WRITE_MAX_BYTES).expect("bound")
+                            + 1
+                    ],
+                    metadata: serde_json::Value::Null,
+                },
+                test_artifact_scope("active").artifact_commit_guard()
+            )
             .await,
             ToolArtifactWriteResolution::TooLarge {
                 max_bytes: SESSION_ARTIFACT_WRITE_MAX_BYTES
@@ -20270,13 +20315,16 @@ library = "test"
             SessionArtifactSink::new(root.path().to_path_buf(), "cancelled", &cancelled);
         assert_eq!(
             cancelled_sink
-                .write(ToolArtifactWriteRequest {
-                    invocation_id: "cancelled".to_string(),
-                    artifact_id: "cancelled".to_string(),
-                    content_type: "application/octet-stream".to_string(),
-                    bytes: Vec::new(),
-                    metadata: serde_json::Value::Null,
-                })
+                .write(
+                    ToolArtifactWriteRequest {
+                        invocation_id: "cancelled".to_string(),
+                        artifact_id: "cancelled".to_string(),
+                        content_type: "application/octet-stream".to_string(),
+                        bytes: Vec::new(),
+                        metadata: serde_json::Value::Null,
+                    },
+                    test_artifact_scope("cancelled").artifact_commit_guard()
+                )
                 .await,
             ToolArtifactWriteResolution::Cancelled
         );

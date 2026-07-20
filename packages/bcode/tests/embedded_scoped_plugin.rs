@@ -1,12 +1,12 @@
 #![cfg(feature = "embedded-plugins")]
 
 use bcode::{
-    Agent, InvocationArtifactSink, InvocationCapabilityFuture, InvocationExchangeBroker,
-    InvocationInputRouter, InvocationServiceRouter, ToolArtifactWriteRequest,
-    ToolArtifactWriteResolution, ToolAuthorizationCoordinator, ToolAuthorizationDecision,
-    ToolAuthorizationRequest, ToolCall, ToolDefinition, ToolExchangeRequest,
-    ToolExchangeResolution, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationServiceRequest, ToolInvocationServiceResolution,
+    Agent, ArtifactCommitGuard, InvocationArtifactSink, InvocationCapabilityFuture,
+    InvocationExchangeBroker, InvocationInputRouter, InvocationServiceRouter,
+    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolAuthorizationCoordinator,
+    ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCall, ToolDefinition,
+    ToolExchangeRequest, ToolExchangeResolution, ToolInvocationInput,
+    ToolInvocationInputResolution, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
 };
 use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
 use std::sync::{Arc, Mutex};
@@ -77,14 +77,17 @@ impl InvocationArtifactSink for Capabilities {
     fn write(
         &self,
         request: ToolArtifactWriteRequest,
+        commit: ArtifactCommitGuard,
     ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
         self.record(request.invocation_id);
-        Box::pin(async {
-            ToolArtifactWriteResolution::Written {
-                artifact_id: "hello-artifact".to_string(),
-                byte_len: 5,
-                reference: serde_json::Value::Null,
-            }
+        Box::pin(async move {
+            commit
+                .commit(|| ToolArtifactWriteResolution::Written {
+                    artifact_id: "hello-artifact".to_string(),
+                    byte_len: 5,
+                    reference: serde_json::Value::Null,
+                })
+                .unwrap_or(ToolArtifactWriteResolution::Cancelled)
         })
     }
 }

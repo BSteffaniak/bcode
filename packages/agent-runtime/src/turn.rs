@@ -376,12 +376,69 @@ pub trait InvocationServiceRouter: Send + Sync {
     ) -> InvocationCapabilityFuture<'_, ToolInvocationServiceResolution>;
 }
 
+/// Runtime-owned final-commit gate for one invocation artifact operation.
+///
+/// Artifact sinks may prepare non-public staging before calling [`Self::commit`], but must remove
+/// that staging if the gate returns `None`. The commit closure must perform the externally visible
+/// publication. The gate holds the owning turn's publication lock across the closure, so
+/// the closure, so cancellation or generation supersession linearizes strictly before or after
+/// the artifact commit. Commit closures must not synchronously request cancellation or begin a new
+/// generation for the same turn owner because those transitions wait for this boundary.
+pub struct ArtifactCommitGuard {
+    turn: TurnScope,
+    invocation_id: Arc<str>,
+}
+
+impl fmt::Debug for ArtifactCommitGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactCommitGuard")
+            .field("turn", &self.turn)
+            .field("invocation_id", &self.invocation_id)
+            .finish()
+    }
+}
+
+impl ArtifactCommitGuard {
+    const fn new(turn: TurnScope, invocation_id: Arc<str>) -> Self {
+        Self {
+            turn,
+            invocation_id,
+        }
+    }
+
+    /// Return the invocation that owns this final-commit gate.
+    #[must_use]
+    pub fn invocation_id(&self) -> &str {
+        &self.invocation_id
+    }
+
+    /// Publish one staged artifact at the owning turn's atomic final-commit boundary.
+    ///
+    /// Returns `None` without calling `commit` when the turn is already closed or superseded.
+    /// Cancellation and generation supersession cannot complete while the closure is running.
+    pub fn commit<T>(self, commit: impl FnOnce() -> T) -> Option<T> {
+        let _gate = self
+            .turn
+            .control
+            .publication_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.turn.accepts_work() {
+            Some(commit())
+        } else {
+            None
+        }
+    }
+}
+
 /// Host-owned bounded artifact sink for active invocations.
 pub trait InvocationArtifactSink: Send + Sync {
-    /// Persist one complete bounded artifact.
+    /// Persist one complete bounded artifact through the runtime-owned final-commit gate.
     fn write(
         &self,
         request: ToolArtifactWriteRequest,
+        commit: ArtifactCommitGuard,
     ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution>;
 }
 
@@ -419,6 +476,7 @@ impl InvocationArtifactSink for UnsupportedInvocationCapabilities {
     fn write(
         &self,
         _request: ToolArtifactWriteRequest,
+        _commit: ArtifactCommitGuard,
     ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
         Box::pin(async {
             ToolArtifactWriteResolution::Failed {
@@ -1089,6 +1147,12 @@ impl InvocationScope {
         }
     }
 
+    /// Create the runtime-owned final-commit gate for this invocation's artifact sink adapter.
+    #[must_use]
+    pub fn artifact_commit_guard(&self) -> ArtifactCommitGuard {
+        ArtifactCommitGuard::new(self.turn.clone(), Arc::clone(&self.invocation_id))
+    }
+
     /// Write one bounded host artifact, bounded by turn cancellation.
     pub async fn write_artifact(
         &self,
@@ -1104,10 +1168,11 @@ impl InvocationScope {
             return ToolArtifactWriteResolution::Cancelled;
         }
         let cancellation = self.cancellation();
+        let commit = self.artifact_commit_guard();
         let resolution = tokio::select! {
             biased;
             () = cancellation.cancelled() => ToolArtifactWriteResolution::Cancelled,
-            resolution = self.turn.capabilities.artifacts.write(request) => resolution,
+            resolution = self.turn.capabilities.artifacts.write(request, commit) => resolution,
         };
         if self.accepts_work() {
             resolution
@@ -1673,9 +1738,101 @@ mod tests {
         fn write(
             &self,
             _request: ToolArtifactWriteRequest,
+            _commit: ArtifactCommitGuard,
         ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
             Box::pin(std::future::pending())
         }
+    }
+
+    #[test]
+    fn artifact_commit_guard_rejects_commit_after_turn_closes() {
+        let turn = TurnScope::without_events("turn", TurnGeneration::new(20));
+        let invocation = InvocationScope::new(turn.clone(), "invoke");
+        let guard = invocation.artifact_commit_guard();
+        assert!(turn.control().begin_cancellation());
+        let commits = AtomicUsize::new(0);
+
+        let result = guard.commit(|| commits.fetch_add(1, Ordering::SeqCst));
+
+        assert_eq!(result, None);
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn artifact_commit_guard_serializes_cancellation_after_publication() {
+        let turn = TurnScope::without_events("turn", TurnGeneration::new(21));
+        let invocation = InvocationScope::new(turn.clone(), "invoke");
+        let guard = invocation.artifact_commit_guard();
+        let control = turn.control();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let commit = std::thread::spawn(move || {
+            guard.commit(|| {
+                started.send(()).expect("signal commit start");
+                release_rx.recv().expect("release commit");
+                "published"
+            })
+        });
+        started_rx.recv().expect("commit should start");
+        let (attempting, attempting_rx) = std::sync::mpsc::channel();
+        let cancellation = std::thread::spawn(move || {
+            attempting.send(()).expect("signal cancellation attempt");
+            control.begin_cancellation()
+        });
+        attempting_rx
+            .recv()
+            .expect("cancellation should reach publication gate");
+        std::thread::yield_now();
+        assert!(!cancellation.is_finished());
+
+        release.send(()).expect("release commit");
+        assert_eq!(commit.join().expect("commit thread"), Some("published"));
+        assert!(cancellation.join().expect("cancellation thread"));
+    }
+
+    #[test]
+    fn artifact_commit_guard_serializes_generation_supersession_after_publication() {
+        let owner = TurnScopeOwner::new();
+        let turn = owner.begin_turn(
+            "old",
+            Arc::new(DiscardingTurnEventSink),
+            InvocationCapabilities::default(),
+        );
+        let invocation = InvocationScope::new(turn, "invoke");
+        let guard = invocation.artifact_commit_guard();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let commit = std::thread::spawn(move || {
+            guard.commit(|| {
+                started.send(()).expect("signal commit start");
+                release_rx.recv().expect("release commit");
+                "published"
+            })
+        });
+        started_rx.recv().expect("commit should start");
+        let superseding_owner = owner.clone();
+        let (attempting, attempting_rx) = std::sync::mpsc::channel();
+        let supersede = std::thread::spawn(move || {
+            attempting.send(()).expect("signal supersession attempt");
+            superseding_owner.begin_turn(
+                "new",
+                Arc::new(DiscardingTurnEventSink),
+                InvocationCapabilities::default(),
+            )
+        });
+        attempting_rx
+            .recv()
+            .expect("supersession should reach publication gate");
+        std::thread::yield_now();
+        assert!(!supersede.is_finished());
+
+        release.send(()).expect("release commit");
+        assert_eq!(commit.join().expect("commit thread"), Some("published"));
+        let new_scope = supersede.join().expect("supersession thread");
+        assert_eq!(
+            new_scope.generation(),
+            owner.active_generation().expect("active generation")
+        );
     }
 
     #[tokio::test]

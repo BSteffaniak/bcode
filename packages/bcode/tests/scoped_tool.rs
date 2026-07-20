@@ -1,8 +1,8 @@
 use bcode::{
-    Agent, InvocationArtifactSink, InvocationCapabilityFuture, InvocationExchangeBroker,
-    InvocationInputRouter, InvocationScope, InvocationServiceRouter, ToolArtifactWriteRequest,
-    ToolArtifactWriteResolution, ToolCall, ToolDefinition, ToolExchangeRequest,
-    ToolExchangeResolution, ToolExchangeResponsePolicy, ToolInvocationInput,
+    Agent, ArtifactCommitGuard, InvocationArtifactSink, InvocationCapabilityFuture,
+    InvocationExchangeBroker, InvocationInputRouter, InvocationScope, InvocationServiceRouter,
+    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolCall, ToolDefinition,
+    ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResponsePolicy, ToolInvocationInput,
     ToolInvocationInputResolution, ToolInvocationResponse, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution,
 };
@@ -89,17 +89,20 @@ impl InvocationArtifactSink for Capabilities {
     fn write(
         &self,
         request: ToolArtifactWriteRequest,
+        commit: ArtifactCommitGuard,
     ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
         self.invocation_ids
             .lock()
             .expect("capability IDs lock")
             .push(request.invocation_id);
-        Box::pin(async {
-            ToolArtifactWriteResolution::Written {
-                artifact_id: "artifact".to_string(),
-                byte_len: 5,
-                reference: serde_json::Value::Null,
-            }
+        Box::pin(async move {
+            commit
+                .commit(|| ToolArtifactWriteResolution::Written {
+                    artifact_id: "artifact".to_string(),
+                    byte_len: 5,
+                    reference: serde_json::Value::Null,
+                })
+                .unwrap_or(ToolArtifactWriteResolution::Cancelled)
         })
     }
 }

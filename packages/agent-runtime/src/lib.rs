@@ -12,11 +12,11 @@
 pub mod turn;
 
 pub use turn::{
-    HostTurnEventSink, InvocationArtifactSink, InvocationCancellation, InvocationCapabilities,
-    InvocationCapabilityFuture, InvocationExchangeBroker, InvocationInputRouter, InvocationScope,
-    InvocationServiceRouter, PreparationScope, ScopedTurnEvent, TurnControl,
-    TurnEventObservability, TurnEventPersistence, TurnEventSink, TurnGeneration, TurnLifecycle,
-    TurnScope, TurnScopeOwner,
+    ArtifactCommitGuard, HostTurnEventSink, InvocationArtifactSink, InvocationCancellation,
+    InvocationCapabilities, InvocationCapabilityFuture, InvocationExchangeBroker,
+    InvocationInputRouter, InvocationScope, InvocationServiceRouter, PreparationScope,
+    ScopedTurnEvent, TurnControl, TurnEventObservability, TurnEventPersistence, TurnEventSink,
+    TurnGeneration, TurnLifecycle, TurnScope, TurnScopeOwner,
 };
 
 use bcode_model::{
@@ -3542,14 +3542,17 @@ mod tests {
         fn write(
             &self,
             request: ToolArtifactWriteRequest,
+            commit: ArtifactCommitGuard,
         ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
             self.artifacts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                ToolArtifactWriteResolution::Written {
-                    artifact_id: request.artifact_id,
-                    byte_len: u64::try_from(request.bytes.len()).unwrap_or(u64::MAX),
-                    reference: serde_json::json!({"stored": true}),
-                }
+                commit
+                    .commit(|| ToolArtifactWriteResolution::Written {
+                        artifact_id: request.artifact_id,
+                        byte_len: u64::try_from(request.bytes.len()).unwrap_or(u64::MAX),
+                        reference: serde_json::json!({"stored": true}),
+                    })
+                    .unwrap_or(ToolArtifactWriteResolution::Cancelled)
             })
         }
     }

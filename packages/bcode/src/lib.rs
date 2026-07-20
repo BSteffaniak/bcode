@@ -46,11 +46,11 @@ pub use bcode_agent_runtime::{
     ToolRoundObserver, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_agent_runtime::{
-    HostTurnEventSink, InvocationArtifactSink, InvocationCapabilities, InvocationCapabilityFuture,
-    InvocationExchangeBroker, InvocationInputRouter, InvocationScope, InvocationServiceRouter,
-    PreparationScope, ScopedTurnEvent, ToolAuthorizationCoordinator, ToolAuthorizationDecision,
-    ToolAuthorizationRequest, ToolInvoker, TurnEventObservability, TurnEventPersistence,
-    TurnEventSink,
+    ArtifactCommitGuard, HostTurnEventSink, InvocationArtifactSink, InvocationCapabilities,
+    InvocationCapabilityFuture, InvocationExchangeBroker, InvocationInputRouter, InvocationScope,
+    InvocationServiceRouter, PreparationScope, ScopedTurnEvent, ToolAuthorizationCoordinator,
+    ToolAuthorizationDecision, ToolAuthorizationRequest, ToolInvoker, TurnEventObservability,
+    TurnEventPersistence, TurnEventSink,
 };
 #[cfg(feature = "daemon-client")]
 pub use bcode_client::{
