@@ -30,7 +30,11 @@ Per-session database access is split by capability:
 
 Health, doctor, validation, and semantic audit paths use the existing non-migrating open. Explicit
 reindex also requires borrowed maintenance and write guards in its API, preventing an uncoordinated
-caller from invoking it accidentally.
+caller from invoking it accidentally. The session manager may invoke `migrate_turso_in_root` while
+loading a known legacy writer epoch, but only after acquiring exclusive maintenance and the
+capability-bound write lock. It then validates write readiness and atomically transitions
+maintenance ownership to the runtime lease. Any live session owner blocks this automatic migration;
+unknown/future writer epochs and same-version stale or corrupt projections remain repair-required.
 
 Lock acquisition order for ordinary mutation is the shared session maintenance coordinator, session
 write lock, then database connection/transaction. Mutating maintenance first holds the coordinator

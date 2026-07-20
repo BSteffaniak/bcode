@@ -1004,15 +1004,59 @@ impl SessionManager {
         Ok(())
     }
 
+    async fn acquire_session_lease_for_load(
+        &self,
+        session_id: SessionId,
+        store: &SessionStoreExecutor,
+    ) -> Result<SessionLeaseGuard, SessionError> {
+        let root = store.root_path();
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+        let writer_epoch = db.storage_writer_epoch().await?;
+        let current_epoch = u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
+        drop(db);
+        if writer_epoch == current_epoch {
+            return Ok(lease::acquire_session_lease(
+                &root,
+                session_id,
+                store.lease_owner(),
+            )?);
+        }
+        if writer_epoch != u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH) {
+            return Err(db::SessionDbError::WriterIncompatible {
+                actual: Some(writer_epoch),
+                expected: current_epoch,
+            }
+            .into());
+        }
+
+        let maintenance = lease::acquire_session_maintenance_guard(&root, session_id)?;
+        let write = lease::acquire_maintenance_session_write_lock(&maintenance, &root, session_id)?;
+        let migrated =
+            db::SessionDb::migrate_turso_in_root(session_id, &root, &maintenance, &write).await?;
+        migrated.validate_write_readiness().await?;
+        drop(migrated);
+        drop(write);
+        Ok(lease::transition_session_maintenance_to_lease(
+            maintenance,
+            &root,
+            session_id,
+            store.lease_owner(),
+        )?)
+    }
+
     async fn acquire_missing_session_lease(
         &self,
         session_id: SessionId,
         store: &SessionStoreExecutor,
     ) -> Result<bool, SessionError> {
+        if self.inner.lock().await.leases.contains_key(&session_id) {
+            return Ok(false);
+        }
+        let lease = self
+            .acquire_session_lease_for_load(session_id, store)
+            .await?;
         let mut inner = self.inner.lock().await;
         if let std::collections::btree_map::Entry::Vacant(entry) = inner.leases.entry(session_id) {
-            let lease =
-                lease::acquire_session_lease(&store.root_path(), session_id, store.lease_owner())?;
             entry.insert(lease);
             Ok(true)
         } else {
@@ -1055,8 +1099,9 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         let load_timer = self.metrics.timer();
         let lease_timer = self.metrics.timer();
-        let lease =
-            lease::acquire_session_lease(&store.root_path(), session_id, store.lease_owner())?;
+        let lease = self
+            .acquire_session_lease_for_load(session_id, store)
+            .await?;
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.lease_acquire_duration_ms",
             lease_timer.elapsed_ms(),
@@ -1288,14 +1333,8 @@ impl SessionManager {
     /// Returns a session-specific lease, writer-contract, projection, or database error before
     /// user input is persisted.
     pub async fn require_write_readiness(&self, session_id: SessionId) -> Result<(), SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::DbUnavailable(session_id))?;
-        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
-        db.validate_write_readiness().await?;
-        Ok(())
+        let handle = self.session_handle(session_id).await?;
+        handle.validate_write_readiness().await
     }
 
     /// Create a new session.
@@ -1396,14 +1435,10 @@ impl SessionManager {
         session_id: SessionId,
         text: String,
     ) -> Result<(), SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let Some(store) = &self.store else {
-            return Ok(());
-        };
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-        db.set_session_composer_draft(&text, self.next_activity_timestamp_ms())
-            .await?;
-        Ok(())
+        let handle = self.session_handle(session_id).await?;
+        handle
+            .set_composer_draft(text, self.next_activity_timestamp_ms())
+            .await
     }
 
     /// Return a persisted composer draft for a session.
@@ -1415,12 +1450,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Option<String>, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let Some(store) = &self.store else {
-            return Ok(None);
-        };
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-        Ok(db.session_composer_draft().await?)
+        let handle = self.session_handle(session_id).await?;
+        handle.composer_draft().await
     }
 
     /// Set or clear a launch-cwd-scoped draft-session composer draft.
@@ -5035,6 +5066,216 @@ mod tests {
             SessionEventKind::SystemMessage { text } if text == "system"
         )));
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn exclusive_load_automatically_migrates_legacy_session_storage() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should initialize");
+            let session = manager
+                .create_session(Some("legacy".to_string()), test_working_directory())
+                .await
+                .expect("session should create");
+            manager
+                .append_user_message(session.id, ClientId::new(), "legacy prompt".to_string())
+                .await
+                .expect("message should append");
+            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+                .await
+                .expect("legacy fixture database should open");
+            db.database()
+                .update("session_storage_contract")
+                .value(
+                    "writer_epoch",
+                    switchy::database::DatabaseValue::Int64(i64::from(
+                        db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
+                    )),
+                )
+                .execute(db.database())
+                .await
+                .expect("writer epoch should become legacy");
+            db.database()
+                .update("model_context_projection_state")
+                .value("schema_version", switchy::database::DatabaseValue::Int64(1))
+                .execute(db.database())
+                .await
+                .expect("projection should become legacy");
+            session.id
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        restored
+            .require_write_readiness(session_id)
+            .await
+            .expect("exclusive legacy session should migrate automatically");
+        let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("migrated database should open");
+        assert_eq!(
+            migrated.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        assert!(matches!(
+            migrated
+                .model_context_projection_status()
+                .await
+                .expect("projection status"),
+            db::ModelContextProjectionStatus::Fresh { .. }
+        ));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn exclusive_load_automatically_migrates_missing_legacy_contract_table() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should initialize");
+            let session = manager
+                .create_session(
+                    Some("tableless legacy".to_string()),
+                    test_working_directory(),
+                )
+                .await
+                .expect("session should create");
+            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+                .await
+                .expect("legacy fixture database should open");
+            db.database()
+                .delete("__bcode_session_migrations")
+                .where_in(
+                    "id",
+                    vec![
+                        switchy::database::DatabaseValue::String(
+                            "026_session_storage_contract_table".to_string(),
+                        ),
+                        switchy::database::DatabaseValue::String(
+                            "027_initialize_session_storage_contract".to_string(),
+                        ),
+                    ],
+                )
+                .execute(db.database())
+                .await
+                .expect("contract migrations should become pending");
+            db.database()
+                .exec_raw("DROP TABLE session_storage_contract")
+                .await
+                .expect("legacy contract table should be absent");
+            assert_eq!(
+                db.storage_writer_epoch()
+                    .await
+                    .expect("legacy writer epoch"),
+                u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+            );
+            session.id
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        restored
+            .require_write_readiness(session_id)
+            .await
+            .expect("missing legacy table should migrate automatically");
+        let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("migrated database should open");
+        assert_eq!(
+            migrated.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn active_owner_blocks_automatic_legacy_session_migration() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("owned legacy".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("legacy fixture database should open");
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                switchy::database::DatabaseValue::Int64(i64::from(
+                    db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
+                )),
+            )
+            .execute(db.database())
+            .await
+            .expect("writer epoch should become legacy");
+        drop(db);
+
+        let contender = SessionManager::persistent(&root).expect("contender should initialize");
+        assert!(matches!(
+            contender.require_write_readiness(session.id).await,
+            Err(SessionError::Lease(
+                crate::lease::SessionLeaseError::OwnedByOtherDaemon { .. }
+            ))
+        ));
+        let unchanged = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("legacy database should remain readable");
+        assert_eq!(
+            unchanged
+                .storage_writer_epoch()
+                .await
+                .expect("writer epoch"),
+            u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        drop(unchanged);
+        drop(contender);
+        drop(manager);
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn write_readiness_uses_actor_connection_before_followup_append() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("followup".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "first".to_string())
+            .await
+            .expect("first message should append");
+
+        manager
+            .set_session_composer_draft(session.id, "draft".to_string())
+            .await
+            .expect("draft should persist on actor connection");
+        assert_eq!(
+            manager
+                .session_composer_draft(session.id)
+                .await
+                .expect("draft should load"),
+            Some("draft".to_string())
+        );
+        manager
+            .require_write_readiness(session.id)
+            .await
+            .expect("followup should be ready");
+        manager
+            .append_user_message(session.id, ClientId::new(), "second".to_string())
+            .await
+            .expect("followup should append");
+
+        let history = manager
+            .session_history(session.id)
+            .await
+            .expect("history should load");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "second"
+        )));
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

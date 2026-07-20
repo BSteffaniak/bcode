@@ -43,7 +43,7 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Durable storage writer epoch understood by this session database implementation.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
     crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
-const LEGACY_SESSION_STORAGE_WRITER_EPOCH: u32 = 1;
+pub(crate) const LEGACY_SESSION_STORAGE_WRITER_EPOCH: u32 = 1;
 const SESSION_STORAGE_CONTRACT_ID: i32 = 1;
 const SESSION_STORAGE_CONTRACT_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 2;
@@ -1071,10 +1071,13 @@ impl SessionDb {
     ///
     /// # Errors
     ///
-    /// Returns an error if the contract row is malformed. A missing row is reported as the known
-    /// legacy writer epoch so diagnostics can distinguish migration-required legacy state from an
-    /// unknown future writer.
+    /// Returns an error if the contract row is malformed. A missing table or row is reported as
+    /// the known legacy writer epoch so diagnostics and load coordination can distinguish
+    /// migration-required legacy state from an unknown future writer.
     pub async fn storage_writer_epoch(&self) -> SessionDbResult<u64> {
+        if !self.db.table_exists("session_storage_contract").await? {
+            return Ok(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH));
+        }
         let row = self
             .db
             .select("session_storage_contract")
@@ -5188,6 +5191,48 @@ mod tests {
         assert_eq!(
             db.last_event_sequence().await.expect("canonical tail"),
             Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_on_second_connection_does_not_stale_writer_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let writer = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("writer connection should open");
+        writer
+            .append_event(&event(
+                session_id,
+                0,
+                SessionEventKind::SessionCreated {
+                    name: Some("snapshot".to_string()),
+                    working_directory: temp_dir.path().to_path_buf(),
+                },
+            ))
+            .await
+            .expect("initial event should append");
+        let validator = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("validation connection should open");
+        validator
+            .validate_write_readiness()
+            .await
+            .expect("second connection should validate readiness");
+
+        writer
+            .append_event(&event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "followup".to_string(),
+                },
+            ))
+            .await
+            .expect("writer snapshot should refresh after second-connection read");
+        assert_eq!(
+            writer.last_event_sequence().await.expect("canonical tail"),
+            Some(1)
         );
     }
 

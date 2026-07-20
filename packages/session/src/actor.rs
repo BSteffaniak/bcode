@@ -98,6 +98,33 @@ impl SessionHandle {
             .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))
     }
 
+    pub async fn set_composer_draft(
+        &self,
+        text: String,
+        updated_at_ms: u64,
+    ) -> Result<(), SessionError> {
+        self.send(|reply| SessionCommand::SetComposerDraft {
+            text,
+            updated_at_ms,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn composer_draft(&self) -> Result<Option<String>, SessionError> {
+        self.send(SessionCommand::ComposerDraft).await?
+    }
+
+    /// Validate that the next append can begin on the actor-owned database connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session database error when the writer contract or required projections are not
+    /// ready for the next append.
+    pub async fn validate_write_readiness(&self) -> Result<(), SessionError> {
+        self.send(SessionCommand::ValidateWriteReadiness).await?
+    }
+
     pub async fn append_event(
         &self,
         kind: SessionEventKind,
@@ -353,6 +380,13 @@ enum SessionCommand {
     },
     Summary(oneshot::Sender<SessionSummary>),
     WorkingDirectory(oneshot::Sender<PathBuf>),
+    SetComposerDraft {
+        text: String,
+        updated_at_ms: u64,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    ComposerDraft(oneshot::Sender<Result<Option<String>, SessionError>>),
+    ValidateWriteReadiness(oneshot::Sender<Result<(), SessionError>>),
     History(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ProjectionWindowFromIndex {
         request: ProjectionWindowRequest,
@@ -452,6 +486,13 @@ impl SessionActor {
             } => {
                 let _ = reply.send(self.attach(client_id, mode, queued_at).await);
             }
+            SessionCommand::SetComposerDraft {
+                text,
+                updated_at_ms,
+                reply,
+            } => {
+                let _ = reply.send(self.set_composer_draft(&text, updated_at_ms).await);
+            }
             command => return self.handle_read_command(command).await,
         }
         false
@@ -462,7 +503,8 @@ impl SessionActor {
         match command {
             SessionCommand::AppendEvent { .. }
             | SessionCommand::AppendUserMessage { .. }
-            | SessionCommand::Attach { .. } => {
+            | SessionCommand::Attach { .. }
+            | SessionCommand::SetComposerDraft { .. } => {
                 unreachable!("write commands are handled before read commands")
             }
             SessionCommand::SubscribeEvents(reply) => {
@@ -476,6 +518,12 @@ impl SessionActor {
             }
             SessionCommand::WorkingDirectory(reply) => {
                 let _ = reply.send(self.state.working_directory.clone());
+            }
+            SessionCommand::ComposerDraft(reply) => {
+                let _ = reply.send(self.composer_draft().await);
+            }
+            SessionCommand::ValidateWriteReadiness(reply) => {
+                let _ = reply.send(self.validate_write_readiness().await);
             }
             SessionCommand::History(reply) => {
                 let _ = reply.send(self.history().await);
@@ -582,6 +630,37 @@ impl SessionActor {
         self.state.load_status = SessionLoadStatusKind::SummaryOnly;
         self.refresh_snapshot();
         true
+    }
+
+    async fn set_composer_draft(
+        &mut self,
+        text: &str,
+        updated_at_ms: u64,
+    ) -> Result<(), SessionError> {
+        let Some(db) = self.existing_session_db().await? else {
+            return Ok(());
+        };
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(self.state.summary.id))?;
+        let _write_guard =
+            crate::lease::acquire_session_write_lock(&store.root_path(), self.state.summary.id)?;
+        db.set_session_composer_draft(text, updated_at_ms).await?;
+        Ok(())
+    }
+
+    async fn composer_draft(&mut self) -> Result<Option<String>, SessionError> {
+        let Some(db) = self.existing_session_db().await? else {
+            return Ok(None);
+        };
+        Ok(db.session_composer_draft().await?)
+    }
+
+    async fn validate_write_readiness(&mut self) -> Result<(), SessionError> {
+        let db = self.session_db_for_write().await?;
+        db.validate_write_readiness().await?;
+        Ok(())
     }
 
     async fn session_db_for_write(&mut self) -> Result<SessionDb, SessionError> {
