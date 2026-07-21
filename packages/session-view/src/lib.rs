@@ -248,6 +248,34 @@ impl SessionView {
         self.upsert_interaction_item(interaction, 0, None);
     }
 
+    /// Rebuild the bounded durable-history projection while retaining authoritative hydrated state.
+    ///
+    /// This is used when a renderer changes its resident history window. Transcript and tool
+    /// projection are rebuilt from the supplied window, while daemon-hydrated selections,
+    /// pending checkpoints, runtime work, plugin status, skills, and composer state remain
+    /// available until newer authoritative data replaces them.
+    pub fn rebuild_history_window(&mut self, events: &[SessionEvent]) {
+        let previous = self.snapshot.clone();
+        let terminal_runtime_work = self.terminal_runtime_work.clone();
+        let mut replacement = Self::new();
+        replacement.snapshot.session_id = previous.session_id;
+        replacement.snapshot.title = previous.title;
+        replacement.snapshot.working_directory = previous.working_directory;
+        replacement.snapshot.permissions = previous.permissions;
+        replacement.snapshot.runtime_work = previous.runtime_work;
+        replacement.snapshot.active_skills = previous.active_skills;
+        replacement.snapshot.plugin_status = previous.plugin_status;
+        replacement.snapshot.composer = previous.composer;
+        replacement.snapshot.thinking = previous.thinking;
+        replacement.snapshot.runtime = previous.runtime;
+        replacement.snapshot.interactions = previous.interactions;
+        replacement.snapshot.session_summary = previous.session_summary;
+        replacement.terminal_runtime_work = terminal_runtime_work;
+        replacement.apply_history(events);
+        replacement.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        *self = replacement;
+    }
+
     /// Apply replayed history events in chronological order.
     pub fn apply_history(&mut self, events: &[SessionEvent]) {
         for event in events {
@@ -1816,6 +1844,42 @@ mod tests {
         assert!(matches!(
             &view.snapshot().transcript.items[0].kind,
             TranscriptViewItemKind::Interaction { interaction } if interaction.resolved
+        ));
+    }
+
+    #[test]
+    fn history_window_rebuild_retains_authoritative_runtime_state() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.set_model_selection(
+            Some("provider".to_owned()),
+            Some("requested".to_owned()),
+            Some("effective".to_owned()),
+        );
+        view.set_agent_id(Some("build".to_owned()));
+        view.set_active_skill_ids(BTreeSet::from(["review".to_owned()]));
+        view.rebuild_history_window(&[event(
+            session_id,
+            10,
+            SessionEventKind::AssistantMessage {
+                text: "bounded".to_owned(),
+            },
+        )]);
+
+        let snapshot = view.snapshot();
+        assert_eq!(
+            snapshot.runtime.provider_plugin_id.as_deref(),
+            Some("provider")
+        );
+        assert_eq!(
+            snapshot.runtime.requested_model_id.as_deref(),
+            Some("requested")
+        );
+        assert_eq!(snapshot.runtime.agent_id.as_deref(), Some("build"));
+        assert!(snapshot.active_skills.contains("review"));
+        assert!(matches!(
+            &snapshot.transcript.items[0].kind,
+            TranscriptViewItemKind::AssistantMessage { message } if message.text == "bounded"
         ));
     }
 

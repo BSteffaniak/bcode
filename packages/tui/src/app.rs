@@ -2042,8 +2042,7 @@ impl BmuxApp {
 
     fn rebuild_transcript_from_history(&mut self) {
         let events = self.transcript_window.events().to_vec();
-        self.session_view = bcode_session_view::SessionView::new();
-        self.session_view.apply_history(&events);
+        self.session_view.rebuild_history_window(&events);
         self.transcript.replace(Vec::new());
         self.tool_call_contexts.clear();
         self.tool_invocation_projections.clear();
