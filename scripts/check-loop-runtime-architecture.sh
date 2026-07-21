@@ -424,6 +424,19 @@ if ! grep -F 'runtime_work_status_label_preserves_semantic_activity' packages/se
   violations=1
 fi
 
+if ! grep -F 'transient_contribution_bypasses_persistence_but_remains_observable_and_published' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'durable_contribution_requires_persistence_admission' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'sdk_builder_persists_only_durable_contributions' packages/bcode/tests/builder_adapters.rs >/dev/null; then
+  echo "Runtime architecture violation: contribution persistence boundary coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'presentation_and_exchange_payloads_are_excluded_from_model_context' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'legacy_stream_presentation_payload_is_excluded_from_model_context' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: presentation/exchange model-context exclusion coverage was removed." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

@@ -291,6 +291,9 @@ pub trait TurnEventSink: Send + Sync {
 
 /// Neutral host persistence seam for accepted scoped runtime events.
 ///
+/// The host sink calls this seam for runtime events, lifecycle events, and durable contributions.
+/// Transient contributions bypass persistence and are never passed to implementations.
+///
 /// Implementations must synchronously accept or reject the event. Durable storage may complete
 /// asynchronously after acceptance, but the implementation is responsible for owning any data it
 /// needs before this method returns.
@@ -310,9 +313,11 @@ pub trait TurnEventObservability: Send + Sync {
 
 /// Composed neutral host event sink for persistence, observability, and publication.
 ///
-/// Events are admitted in that order. A persistence rejection stops the event before observation
-/// or publication. Publication rejection is returned to the originating turn scope; an event that
-/// was already admitted for persistence remains durable host work and is not rolled back.
+/// Events are admitted in persistence, observability, and publication order. Transient
+/// contributions bypass persistence by construction but still reach observability and publication.
+/// A persistence rejection stops any other event before observation or publication. Publication
+/// rejection is returned to the originating turn scope; an event that was already admitted for
+/// persistence remains durable host work and is not rolled back.
 pub struct HostTurnEventSink {
     publication: Arc<dyn TurnEventSink>,
     persistence: Option<Arc<dyn TurnEventPersistence>>,
@@ -347,10 +352,16 @@ impl HostTurnEventSink {
 
 impl TurnEventSink for HostTurnEventSink {
     fn emit(&self, event: ScopedTurnEvent) -> bool {
-        if self
-            .persistence
-            .as_ref()
-            .is_some_and(|persistence| !persistence.persist(&event))
+        let is_transient_contribution = matches!(
+            &event,
+            ScopedTurnEvent::Contribution(event)
+                if event.persistence == bcode_tool::ToolContributionPersistence::Transient
+        );
+        if !is_transient_contribution
+            && self
+                .persistence
+                .as_ref()
+                .is_some_and(|persistence| !persistence.persist(&event))
         {
             return false;
         }
@@ -1280,6 +1291,61 @@ mod tests {
             *calls.lock().expect("calls lock"),
             vec!["persist", "observe", "publish"]
         );
+    }
+
+    fn contribution(persistence: bcode_tool::ToolContributionPersistence) -> ScopedTurnEvent {
+        ScopedTurnEvent::Contribution(ToolContributionEvent {
+            invocation_id: "invoke".to_string(),
+            contribution_id: "surface".to_string(),
+            sequence: 1,
+            producer_id: "producer".to_string(),
+            schema: "example.opaque".to_string(),
+            schema_version: 9,
+            operation: bcode_tool::ToolContributionOperation::Upsert,
+            persistence,
+            payload: serde_json::json!({"unknown": [1, 2, 3]}),
+        })
+    }
+
+    #[test]
+    fn transient_contribution_bypasses_persistence_but_remains_observable_and_published() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = HostTurnEventSink::new(Arc::new(OrderedPublication {
+            calls: Arc::clone(&calls),
+            accepts: true,
+        }))
+        .with_persistence(Arc::new(OrderedPersistence {
+            calls: Arc::clone(&calls),
+            accepts: false,
+        }))
+        .with_observability(Arc::new(OrderedObservability(Arc::clone(&calls))));
+
+        assert!(sink.emit(contribution(
+            bcode_tool::ToolContributionPersistence::Transient,
+        )));
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec!["observe", "publish"]
+        );
+    }
+
+    #[test]
+    fn durable_contribution_requires_persistence_admission() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = HostTurnEventSink::new(Arc::new(OrderedPublication {
+            calls: Arc::clone(&calls),
+            accepts: true,
+        }))
+        .with_persistence(Arc::new(OrderedPersistence {
+            calls: Arc::clone(&calls),
+            accepts: false,
+        }))
+        .with_observability(Arc::new(OrderedObservability(Arc::clone(&calls))));
+
+        assert!(!sink.emit(contribution(
+            bcode_tool::ToolContributionPersistence::Durable,
+        )));
+        assert_eq!(*calls.lock().expect("calls lock"), vec!["persist"]);
     }
 
     #[test]

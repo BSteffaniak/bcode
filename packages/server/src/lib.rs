@@ -24560,6 +24560,167 @@ library = "test"
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn presentation_and_exchange_payloads_are_excluded_from_model_context() {
+        let session_id = SessionId::new();
+        let session_event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let visual = |marker: &str| bcode_session_models::PluginVisualDescriptor {
+            visual_id: Some(format!("visual-{marker}")),
+            producer_plugin_id: Some("test.plugin".to_owned()),
+            schema: "test.private-visual".to_owned(),
+            schema_version: 77,
+            title: Some(marker.to_owned()),
+            subtitle: None,
+            payload: serde_json::json!({"private": marker}),
+        };
+        let events = vec![
+            session_event(
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: r#"{"model_visible":"safe-argument"}"#.to_owned(),
+                    working_directory: None,
+                    request_visual: Some(visual("REQUEST_VISUAL_PRIVATE")),
+                    legacy_request_presentation: Some(
+                        bcode_session_models::LegacyToolRequestPresentationMetadata {
+                            title: "LEGACY_REQUEST_PRESENTATION_PRIVATE".to_owned(),
+                            fields: Vec::new(),
+                            preview: None,
+                        },
+                    ),
+                },
+            ),
+            session_event(
+                2,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::VisualUpdate {
+                        tool_call_id: "call-1".to_owned(),
+                        sequence: 1,
+                        visual: visual("LIVE_VISUAL_PRIVATE"),
+                        streaming: true,
+                    },
+                },
+            ),
+            session_event(
+                3,
+                SessionEventKind::InteractiveToolRequestCreated {
+                    interaction_id: "interaction-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "test.tool".to_owned(),
+                    interaction_kind: Some("test.exchange".to_owned()),
+                    surface_kind: "test.surface".to_owned(),
+                    request_json: r#"{"private":"EXCHANGE_REQUEST_PRIVATE"}"#.to_owned(),
+                    required: true,
+                    turn_behavior:
+                        bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+                    render_target:
+                        bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall,
+                },
+            ),
+            session_event(
+                4,
+                SessionEventKind::InteractiveToolRequestResolved {
+                    interaction_id: "interaction-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    resolution_json: r#"{"private":"EXCHANGE_RESPONSE_PRIVATE"}"#.to_owned(),
+                },
+            ),
+            session_event(
+                5,
+                SessionEventKind::PermissionRequested {
+                    permission_id: "permission-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: "PERMISSION_PRESENTATION_PRIVATE".to_owned(),
+                    legacy_request_presentation: None,
+                    policy_source: Some("PRIVATE_POLICY_SOURCE".to_owned()),
+                    policy_reason: Some("PRIVATE_POLICY_REASON".to_owned()),
+                },
+            ),
+            session_event(
+                6,
+                SessionEventKind::PluginStatusNote {
+                    plugin_id: "test.plugin".to_owned(),
+                    note_id: "private-note".to_owned(),
+                    text: "PLUGIN_STATUS_PRIVATE".to_owned(),
+                    metadata: BTreeMap::from([(
+                        "private".to_owned(),
+                        serde_json::json!("PLUGIN_METADATA_PRIVATE"),
+                    )]),
+                },
+            ),
+            session_event(
+                7,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_owned(),
+                    result: "safe-result".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages(&events);
+        let encoded = serde_json::to_string(&messages).expect("model messages serialize");
+        assert!(encoded.contains("safe-argument"));
+        assert!(encoded.contains("safe-result"));
+        for marker in [
+            "REQUEST_VISUAL_PRIVATE",
+            "LEGACY_REQUEST_PRESENTATION_PRIVATE",
+            "LIVE_VISUAL_PRIVATE",
+            "EXCHANGE_REQUEST_PRIVATE",
+            "EXCHANGE_RESPONSE_PRIVATE",
+            "PERMISSION_PRESENTATION_PRIVATE",
+            "PRIVATE_POLICY_SOURCE",
+            "PRIVATE_POLICY_REASON",
+            "PLUGIN_STATUS_PRIVATE",
+            "PLUGIN_METADATA_PRIVATE",
+        ] {
+            assert!(!encoded.contains(marker), "model context leaked {marker}");
+        }
+    }
+
+    #[test]
+    fn legacy_stream_presentation_payload_is_excluded_from_model_context() {
+        let marker = "LEGACY_STREAM_PRESENTATION_PRIVATE";
+        let event = bcode_session_models::SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
+                    tool_call_id: "call-1".to_owned(),
+                    sequence: 1,
+                    presentation: bcode_session_models::LegacyToolPresentationEvent::Status(
+                        bcode_session_models::LegacyToolStatusPresentation {
+                            target: bcode_session_models::LegacyToolPresentationTarget::Activity,
+                            text: marker.to_owned(),
+                            level: bcode_session_models::LegacyToolPresentationLevel::Info,
+                        },
+                    ),
+                },
+            },
+        };
+
+        let encoded = serde_json::to_string(&session_events_to_model_messages(&[event]))
+            .expect("model messages serialize");
+        assert!(!encoded.contains(marker));
+    }
+
+    #[test]
     fn runtime_work_activity_is_excluded_from_model_context() {
         let session_id = SessionId::new();
         let work_id = WorkId::new("tool-call-1");

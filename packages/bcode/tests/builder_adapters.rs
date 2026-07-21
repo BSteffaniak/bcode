@@ -9,7 +9,10 @@ use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse, StopReason,
 };
-use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
+use bcode_tool::{
+    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
+    ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
+};
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -71,6 +74,49 @@ impl ToolInvoker for CountingInvoker {
             scope.invocation_id()
         );
         Box::pin(async move { Ok(response(&output)) })
+    }
+}
+
+#[derive(Debug)]
+struct ContributionInvoker(ToolContributionPersistence);
+
+impl ToolInvoker for ContributionInvoker {
+    fn prepare_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        request: &'a ToolPreparationRequest,
+        _scope: &'a PreparationScope,
+    ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+        let result = bcode_agent_profile::prepare_tool_policy(request, &tool.definition).map_err(
+            |message| bcode::RuntimeError::ToolPreparation {
+                tool_name: request.invocation.tool_name.clone(),
+                message,
+            },
+        );
+        Box::pin(async move { result })
+    }
+
+    fn invoke_tool<'a>(
+        &'a self,
+        _tool: &'a RegisteredTool,
+        _invocation: &'a PreparedToolInvocation,
+        scope: &'a InvocationScope,
+    ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+        let accepted = scope.emit_contribution(ToolContributionEvent {
+            invocation_id: scope.invocation_id().to_string(),
+            contribution_id: "opaque-surface".to_string(),
+            sequence: 1,
+            producer_id: "sdk-test".to_string(),
+            schema: "example.unknown/v9".to_string(),
+            schema_version: 9,
+            operation: ToolContributionOperation::Upsert,
+            persistence: self.0,
+            payload: serde_json::json!({"opaque": [1, 2, 3]}),
+        });
+        Box::pin(async move {
+            assert!(accepted, "contribution should reach SDK publication");
+            Ok(response("contribution emitted"))
+        })
     }
 }
 
@@ -175,6 +221,54 @@ impl TurnEventPersistence for CountingHostExtension {
 impl TurnEventObservability for CountingHostExtension {
     fn observe(&self, _event: &bcode::ScopedTurnEvent) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct ContributionCountingHostExtension(Arc<AtomicUsize>);
+
+impl TurnEventPersistence for ContributionCountingHostExtension {
+    fn persist(&self, event: &bcode::ScopedTurnEvent) -> bool {
+        if matches!(event, bcode::ScopedTurnEvent::Contribution(_)) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        true
+    }
+}
+
+impl TurnEventObservability for ContributionCountingHostExtension {
+    fn observe(&self, event: &bcode::ScopedTurnEvent) {
+        if matches!(event, bcode::ScopedTurnEvent::Contribution(_)) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[tokio::test]
+async fn sdk_builder_persists_only_durable_contributions() {
+    for (persistence, expected_persisted) in [
+        (ToolContributionPersistence::Transient, 0),
+        (ToolContributionPersistence::Durable, 1),
+    ] {
+        let persisted = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::builder()
+            .inline_tool(definition(), |_| Ok(response("unused")))
+            .tool_invoker(Arc::new(ContributionInvoker(persistence)))
+            .event_persistence(Arc::new(ContributionCountingHostExtension(Arc::clone(
+                &persisted,
+            ))))
+            .event_observability(Arc::new(ContributionCountingHostExtension(Arc::clone(
+                &observed,
+            ))))
+            .build();
+
+        agent
+            .execute_tool_call(&call())
+            .await
+            .expect("contribution tool should execute");
+
+        assert_eq!(persisted.load(Ordering::SeqCst), expected_persisted);
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
     }
 }
 
