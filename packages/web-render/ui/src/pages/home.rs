@@ -203,7 +203,9 @@ fn transcript_section(snapshot: &SessionViewSnapshot, access_token: &str) -> Con
                 div color="#8b949e" font-size=13 { "Attach or create a session to begin." }
             } @else {
                 @for item in &snapshot.transcript.items {
-                    (transcript_item(item))
+                    @if should_render_transcript_item(item, snapshot.thinking.visible) {
+                        (transcript_item(item))
+                    }
                 }
             }
             @if snapshot.transcript.has_newer_history {
@@ -624,6 +626,13 @@ fn permission_request(
     }
 }
 
+const fn should_render_transcript_item(
+    item: &bcode_session_view_models::TranscriptViewItem,
+    reasoning_visible: bool,
+) -> bool {
+    reasoning_visible || !matches!(&item.kind, TranscriptViewItemKind::ReasoningMessage { .. })
+}
+
 fn transcript_item(item: &bcode_session_view_models::TranscriptViewItem) -> Containers {
     container! {
         div background="#0d1117" border-left="2, #30363d" border-radius=8 padding=12 margin-bottom=10 {
@@ -824,9 +833,27 @@ mod tests {
         RuntimeWorkStatus, ToolArtifact, WorkId,
     };
     use bcode_session_view_models::{
-        PermissionBatchView, PermissionView, RuntimeWorkView, ToolArtifactView, ToolInvocationView,
-        ToolResultView, ToolTimingView,
+        ChatMessageView, PermissionBatchView, PermissionView, RuntimeWorkView, ToolArtifactView,
+        ToolInvocationView, ToolResultView, ToolTimingView, TranscriptViewItem,
+        TranscriptViewItemId,
     };
+
+    #[test]
+    fn reasoning_items_follow_shared_visibility() {
+        let item = TranscriptViewItem {
+            id: TranscriptViewItemId::new("reasoning:test"),
+            sequence: Some(1),
+            timestamp_ms: None,
+            revision: 1,
+            streaming: false,
+            kind: TranscriptViewItemKind::ReasoningMessage {
+                message: ChatMessageView::markdown("hidden"),
+            },
+        };
+
+        assert!(!should_render_transcript_item(&item, false));
+        assert!(should_render_transcript_item(&item, true));
+    }
 
     #[test]
     fn web_shell_renders_all_primary_regions_including_runtime_state() {

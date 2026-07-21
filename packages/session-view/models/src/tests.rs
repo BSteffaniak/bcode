@@ -1,6 +1,11 @@
 use super::*;
 
 #[test]
+fn empty_snapshot_shows_reasoning_by_default() {
+    assert!(SessionViewSnapshot::empty().thinking.visible);
+}
+
+#[test]
 fn runtime_work_status_label_preserves_semantic_activity() {
     let running = |id: &str, kind, label: &str, message: Option<&str>| RuntimeWorkView {
         work_id: WorkId::new(id),

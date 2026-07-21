@@ -268,7 +268,6 @@ pub struct BmuxApp {
     target_theme: ResolvedTheme,
     presented_theme: PresentedTheme,
     theme_transition: ThemeTransitionState,
-    reasoning_visible: bool,
     thinking_label: String,
     reasoning_support: ReasoningSupport,
     reasoning_default_effort: Option<String>,
@@ -477,7 +476,6 @@ impl BmuxApp {
             target_theme: initial_theme,
             presented_theme: initial_theme.into(),
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
-            reasoning_visible: true,
             thinking_label: "reasoning output shown · unsupported".to_owned(),
             reasoning_support: ReasoningSupport::Unsupported,
             reasoning_default_effort: None,
@@ -1538,12 +1536,12 @@ impl BmuxApp {
     /// Return whether reasoning transcript items are visible.
     #[must_use]
     pub const fn reasoning_visible(&self) -> bool {
-        self.reasoning_visible
+        self.session_view.snapshot().thinking.visible
     }
 
     /// Set whether reasoning transcript items are visible.
     pub fn set_reasoning_visible(&mut self, visible: bool) {
-        self.reasoning_visible = visible;
+        self.session_view.set_reasoning_visible(visible);
         self.refresh_thinking_label();
         self.rebuild_transcript_from_history();
     }
@@ -1585,7 +1583,7 @@ impl BmuxApp {
     }
 
     fn refresh_thinking_label(&mut self) {
-        let display = if self.reasoning_visible {
+        let display = if self.reasoning_visible() {
             "reasoning output shown"
         } else {
             "reasoning output hidden"
@@ -2516,7 +2514,11 @@ impl BmuxApp {
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
                 new_working_directory,
-            } => self.apply_working_directory_changed(old_working_directory, new_working_directory),
+            } => self.apply_working_directory_changed(
+                event.sequence,
+                old_working_directory,
+                new_working_directory,
+            ),
             SessionEventKind::SessionRenamed { name } => self.rename_session(name.as_deref()),
             SessionEventKind::SkillInvoked {
                 skill_id,
@@ -2905,12 +2907,29 @@ impl BmuxApp {
 
     fn apply_working_directory_changed(
         &mut self,
+        event_sequence: u64,
         old_working_directory: &std::path::Path,
         new_working_directory: &std::path::Path,
     ) {
-        let message =
-            working_directory_changed_message(old_working_directory, new_working_directory);
-        self.transcript.push(TranscriptItem::new("System", message));
+        if let Some(message) = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.kind {
+                bcode_session_view_models::TranscriptViewItemKind::SystemMessage { message }
+                    if item.sequence == Some(event_sequence)
+                        && message.text.starts_with("Working directory changed from ") =>
+                {
+                    Some(message.text.clone())
+                }
+                _ => None,
+            })
+        {
+            self.transcript.push(TranscriptItem::new("System", message));
+        }
         self.status = format!(
             "working directory: {}",
             display(new_working_directory, old_working_directory)
@@ -4601,17 +4620,6 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
     let numerator = u64::from(input_tokens).saturating_mul(100);
     let denominator = u64::from(context_window).max(1);
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
-}
-
-fn working_directory_changed_message(
-    old_working_directory: &std::path::Path,
-    new_working_directory: &std::path::Path,
-) -> String {
-    format!(
-        "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
-        display(old_working_directory, old_working_directory),
-        display(new_working_directory, old_working_directory)
-    )
 }
 
 fn item_is_interactive_submission_surface_for_tool_call(

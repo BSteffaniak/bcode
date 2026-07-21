@@ -2235,6 +2235,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
  "bcode_ipc",
+ "bcode_plugin_sdk",
  "bcode_session",
  "bcode_session_models",
  "bcode_session_view_models",

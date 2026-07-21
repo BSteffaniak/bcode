@@ -197,6 +197,14 @@ impl SessionView {
         }
     }
 
+    /// Set whether renderers should expose reasoning transcript content.
+    pub const fn set_reasoning_visible(&mut self, visible: bool) {
+        if self.snapshot.thinking.visible != visible {
+            self.snapshot.thinking.visible = visible;
+            self.bump_revision();
+        }
+    }
+
     /// Replace authoritative request-context occupancy when it is newer than current state.
     pub fn set_context_occupancy(
         &mut self,
@@ -412,7 +420,7 @@ impl SessionView {
             }
             SessionEventKind::AssistantReasoningDelta { text } => {
                 self.snapshot.thinking = ThinkingViewState {
-                    visible: true,
+                    visible: self.snapshot.thinking.visible,
                     active_text: Some(text.clone()),
                     streaming: true,
                 };
@@ -426,7 +434,7 @@ impl SessionView {
             }
             SessionEventKind::AssistantReasoningMessage { text } => {
                 self.snapshot.thinking = ThinkingViewState {
-                    visible: true,
+                    visible: self.snapshot.thinking.visible,
                     active_text: Some(text.clone()),
                     streaming: false,
                 };
@@ -1076,11 +1084,22 @@ impl SessionView {
                 });
             }
             SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory,
                 new_working_directory,
-                ..
             } => {
                 self.snapshot.working_directory = Some(new_working_directory.clone());
-                self.bump_revision();
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::markdown(working_directory_changed_message(
+                            old_working_directory,
+                            new_working_directory,
+                        )),
+                    },
+                );
             }
             SessionEventKind::SessionRenamed { name } => {
                 self.snapshot.title.clone_from(name);
@@ -1105,7 +1124,7 @@ impl SessionView {
             }
             SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
                 self.snapshot.thinking = ThinkingViewState {
-                    visible: true,
+                    visible: self.snapshot.thinking.visible,
                     active_text: Some(text.clone()),
                     streaming: true,
                 };
@@ -1509,6 +1528,19 @@ impl SessionView {
             kind.item_kind(text.to_owned()),
         );
     }
+}
+
+fn working_directory_changed_message(
+    old_working_directory: &std::path::Path,
+    new_working_directory: &std::path::Path,
+) -> String {
+    use bcode_plugin_sdk::path::display;
+
+    format!(
+        "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
+        display(old_working_directory, old_working_directory),
+        display(new_working_directory, old_working_directory)
+    )
 }
 
 fn provider_progress_detail(event: &bcode_session_models::ProviderStreamEvent) -> String {
@@ -2779,6 +2811,57 @@ mod tests {
                 call_index: 1,
                 call_count: 3,
             })
+        );
+    }
+
+    #[test]
+    fn working_directory_change_projects_safety_warning() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory: std::path::PathBuf::from("/tmp/old"),
+                new_working_directory: std::path::PathBuf::from("/tmp/new"),
+            },
+        ));
+
+        assert_eq!(
+            view.snapshot().working_directory.as_deref(),
+            Some(std::path::Path::new("/tmp/new"))
+        );
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::SystemMessage { message }
+                if message.text.contains("Treat prior file/path assumptions as possibly stale")
+        ));
+    }
+
+    #[test]
+    fn reasoning_visibility_survives_durable_and_live_projection() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.set_reasoning_visible(false);
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningDelta {
+                text: "durable".to_owned(),
+            },
+        ));
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantReasoningDelta {
+                turn_id: "turn-1".to_owned(),
+                text: " live".to_owned(),
+            },
+        });
+
+        assert!(!view.snapshot().thinking.visible);
+        assert_eq!(
+            view.snapshot().thinking.active_text.as_deref(),
+            Some(" live")
         );
     }
 

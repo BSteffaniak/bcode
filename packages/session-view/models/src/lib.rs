@@ -695,7 +695,7 @@ pub struct ComposerViewState {
 }
 
 /// Assistant reasoning/thinking display state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingViewState {
     /// Whether reasoning content should be visible by default.
     pub visible: bool,
@@ -703,6 +703,16 @@ pub struct ThinkingViewState {
     pub active_text: Option<String>,
     /// Whether the current reasoning text is streaming.
     pub streaming: bool,
+}
+
+impl Default for ThinkingViewState {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            active_text: None,
+            streaming: false,
+        }
+    }
 }
 
 /// Renderer-neutral interactive request summary.
