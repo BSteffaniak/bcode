@@ -872,6 +872,7 @@ impl SessionView {
                 tool_name,
                 arguments_json,
                 policy_source,
+                batch,
                 policy_reason,
                 ..
             } => {
@@ -881,7 +882,13 @@ impl SessionView {
                     tool_call_id: tool_call_id.clone(),
                     tool_name: tool_name.clone(),
                     arguments_json: arguments_json.clone(),
-                    batch: None,
+                    batch: batch.clone().map(|batch| {
+                        bcode_session_view_models::PermissionBatchView {
+                            batch_id: batch.batch_id,
+                            call_index: batch.call_index,
+                            call_count: batch.call_count,
+                        }
+                    }),
                     agent_id: String::new(),
                     title: Some(format!("Permission requested: {tool_name}")),
                     policy_source: policy_source.clone(),
@@ -2582,6 +2589,7 @@ mod tests {
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 legacy_request_presentation: None,
+                batch: None,
                 policy_source: None,
                 policy_reason: Some("requires approval".to_owned()),
             },
@@ -2601,6 +2609,40 @@ mod tests {
             TranscriptViewItemKind::Permission { permission }
                 if permission.resolved && permission.approved == Some(true)
         ));
+    }
+
+    #[test]
+    fn permission_batch_correlation_survives_session_view_projection() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::PermissionRequested {
+                permission_id: "permission-batched".to_owned(),
+                tool_call_id: "tool-batched".to_owned(),
+                producer_plugin_id: None,
+                tool_name: "example.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                legacy_request_presentation: None,
+                batch: Some(bcode_session_models::PermissionBatchCorrelation {
+                    batch_id: "batch-1".to_owned(),
+                    call_index: 1,
+                    call_count: 3,
+                }),
+                policy_source: None,
+                policy_reason: None,
+            },
+        ));
+
+        assert_eq!(
+            view.snapshot().permissions[0].batch,
+            Some(bcode_session_view_models::PermissionBatchView {
+                batch_id: "batch-1".to_owned(),
+                call_index: 1,
+                call_count: 3,
+            })
+        );
     }
 
     #[test]

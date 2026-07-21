@@ -200,6 +200,11 @@ fn agent_builder(invoker: Arc<ParallelInvoker>) -> bcode::AgentBuilder {
             max_concurrency: Some(NonZeroUsize::new(2).expect("two is non-zero")),
             ..bcode::ToolExecutionOptions::default()
         })
+        .parallel_tool_capabilities(bcode_model::ParallelToolCallCapabilities {
+            provider: true,
+            model: true,
+            canonical_runtime: true,
+        })
         .inline_tool(definition("first"), |_| {
             unreachable!("custom invoker routes tools")
         })
@@ -276,6 +281,52 @@ async fn sdk_builder_routes_provider_round_planner_through_canonical_loop() {
     assert_eq!(
         requests[1].metadata.get("sdk_planner").map(String::as_str),
         Some("1")
+    );
+}
+
+#[tokio::test]
+async fn changing_model_after_capability_resolution_invalidates_parallel_signal() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = BatchProvider::new(Arc::clone(&requests));
+    let (invoker, _) = invoker();
+    let agent = agent_builder(invoker).model("different-model").build();
+
+    agent
+        .run(&mut provider, "run tools")
+        .await
+        .expect("selection change should safely fall back to sequential signaling");
+    assert!(
+        requests
+            .lock()
+            .expect("provider requests lock")
+            .iter()
+            .all(|request| !request.tool_call_policy.parallel)
+    );
+}
+
+#[tokio::test]
+async fn sdk_parallel_signal_falls_back_when_one_capability_is_missing() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = BatchProvider::new(Arc::clone(&requests));
+    let (invoker, _) = invoker();
+    let agent = agent_builder(invoker)
+        .parallel_tool_capabilities(bcode_model::ParallelToolCallCapabilities {
+            provider: true,
+            model: false,
+            canonical_runtime: true,
+        })
+        .build();
+
+    agent
+        .run(&mut provider, "run tools")
+        .await
+        .expect("sequential provider signal should not disable runtime execution");
+    assert!(
+        requests
+            .lock()
+            .expect("provider requests lock")
+            .iter()
+            .all(|request| !request.tool_call_policy.parallel)
     );
 }
 

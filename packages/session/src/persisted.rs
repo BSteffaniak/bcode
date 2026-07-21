@@ -246,6 +246,8 @@ enum PersistedSessionEventKind {
         )]
         legacy_request_presentation: Option<LegacyToolRequestPresentationMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch: Option<bcode_session_models::PermissionBatchCorrelation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_reason: Option<String>,
@@ -671,6 +673,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 tool_name,
                 arguments_json,
                 legacy_request_presentation,
+                batch,
                 policy_source,
                 policy_reason,
             } => Self::PermissionRequested {
@@ -680,6 +683,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
                 legacy_request_presentation: legacy_request_presentation.clone(),
+                batch: batch.clone(),
                 policy_source: policy_source.clone(),
                 policy_reason: policy_reason.clone(),
             },
@@ -1056,6 +1060,7 @@ impl PersistedSessionEventKind {
                 tool_name,
                 arguments_json,
                 legacy_request_presentation,
+                batch,
                 policy_source,
                 policy_reason,
             } => SessionEventKind::PermissionRequested {
@@ -1065,6 +1070,7 @@ impl PersistedSessionEventKind {
                 tool_name,
                 arguments_json,
                 legacy_request_presentation,
+                batch,
                 policy_source,
                 policy_reason,
             },
@@ -1641,6 +1647,11 @@ mod tests {
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
                 legacy_request_presentation: None,
+                batch: Some(bcode_session_models::PermissionBatchCorrelation {
+                    batch_id: "batch".to_owned(),
+                    call_index: 0,
+                    call_count: 2,
+                }),
                 policy_source: None,
                 policy_reason: None,
             },

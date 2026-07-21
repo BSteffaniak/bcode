@@ -7293,6 +7293,7 @@ mod tests {
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
                     legacy_request_presentation: None,
+                    batch: None,
                     policy_source: None,
                     policy_reason: None,
                 },

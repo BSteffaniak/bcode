@@ -944,6 +944,9 @@ fn capabilities_from_catalog(
     if capabilities.tool_use {
         result.insert(ModelCapability::ToolCalls);
     }
+    if capabilities.parallel_tool_calls {
+        result.insert(ModelCapability::ParallelToolCalls);
+    }
     if capabilities.prompt_cache {
         result.insert(ModelCapability::PromptCaching);
     }
@@ -1364,6 +1367,7 @@ pub(crate) const fn merge_capabilities(
         image_input: left.image_input || right.image_input,
         text_output: left.text_output || right.text_output,
         tool_use: left.tool_use || right.tool_use,
+        parallel_tool_calls: left.parallel_tool_calls || right.parallel_tool_calls,
         structured_outputs: left.structured_outputs || right.structured_outputs,
         reasoning: left.reasoning || right.reasoning,
         prompt_cache: left.prompt_cache || right.prompt_cache,
@@ -1561,6 +1565,36 @@ mod tests {
             Some(2_500_000)
         );
         assert!(enriched.capabilities.contains(&ModelCapability::ToolCalls));
+        assert!(
+            enriched
+                .capabilities
+                .contains(&ModelCapability::ParallelToolCalls)
+        );
+    }
+
+    #[test]
+    fn unknown_model_is_not_upgraded_to_parallel_tool_calls() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let model = ModelInfo {
+            model_id: "custom-proxy-model".to_owned(),
+            display_name: "custom-proxy-model".to_owned(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::from([ModelCapability::ToolCalls]),
+            reasoning: None,
+            cache: ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            visibility: ModelVisibility::Visible,
+        };
+
+        let enriched = catalog.enrich_model("openai", model);
+        assert!(
+            !enriched
+                .capabilities
+                .contains(&ModelCapability::ParallelToolCalls)
+        );
     }
 
     #[test]

@@ -2,6 +2,11 @@
 
 use bcode::{Bcode, BcodeError, ModelSelector, ProviderRegistry};
 use bcode_config::{BcodeConfig, ConfigEnvironmentSnapshot};
+use bcode_model::{
+    ModelCapability, ModelCatalogHints, ModelInfo, ModelList, ProviderCapabilities,
+    ProviderCapability,
+};
+use std::collections::BTreeSet;
 
 #[test]
 fn provider_defaults_resolve_from_explicit_config() {
@@ -56,6 +61,65 @@ fn environment_provider_and_model_override_config_defaults() {
             "environment-model"
         ))
     );
+}
+
+#[test]
+fn provider_registry_negotiates_parallel_only_when_provider_and_model_support_it() {
+    let selector = ModelSelector::with_provider("example.provider", "example-model");
+    let capabilities = ProviderCapabilities {
+        provider_id: "example.provider".to_owned(),
+        display_name: "Example".to_owned(),
+        capabilities: BTreeSet::from([
+            ProviderCapability::Tools,
+            ProviderCapability::ParallelToolCalls,
+        ]),
+        auth_schemes: BTreeSet::new(),
+        retry_rules: Vec::new(),
+        metadata: Default::default(),
+    };
+    let model = ModelInfo {
+        model_id: "example-model".to_owned(),
+        display_name: "Example model".to_owned(),
+        is_default: true,
+        context_window: None,
+        max_output_tokens: None,
+        capabilities: BTreeSet::from([
+            ModelCapability::ToolCalls,
+            ModelCapability::ParallelToolCalls,
+        ]),
+        reasoning: None,
+        cache: Default::default(),
+        metadata_source: None,
+        pricing: None,
+        visibility: Default::default(),
+    };
+    let registry = ProviderRegistry::new()
+        .provider_capabilities(capabilities.clone())
+        .provider_models(
+            "example.provider",
+            ModelList {
+                models: vec![model.clone()],
+                catalog: ModelCatalogHints::default(),
+            },
+        );
+    let negotiated = registry.parallel_tool_capabilities(&selector);
+    assert!(negotiated.provider && negotiated.model && negotiated.canonical_runtime);
+
+    let without_provider = ProviderRegistry::new().provider_models(
+        "example.provider",
+        ModelList {
+            models: vec![model],
+            catalog: ModelCatalogHints::default(),
+        },
+    );
+    assert!(
+        !without_provider
+            .parallel_tool_capabilities(&selector)
+            .provider
+    );
+
+    let without_model = ProviderRegistry::new().provider_capabilities(capabilities);
+    assert!(!without_model.parallel_tool_capabilities(&selector).model);
 }
 
 #[test]

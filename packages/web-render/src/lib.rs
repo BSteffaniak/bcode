@@ -97,6 +97,13 @@ struct UpdateDraftForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct PermissionBatchForm {
+    session_id: String,
+    batch_id: String,
+    approved: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct PermissionForm {
     session_id: String,
     permission_id: String,
@@ -464,6 +471,7 @@ pub fn router_from_state(state: WebRenderState) -> Router {
     let cancel_state = state.clone();
     let draft_state = state.clone();
     let permission_state = state.clone();
+    let permission_batch_state = state.clone();
     let history_state = state.clone();
     let interaction_state = state;
     Router::new()
@@ -508,6 +516,10 @@ pub fn router_from_state(state: WebRenderState) -> Router {
         .with_route("/actions/permission", move |request| {
             let state = permission_state.clone();
             async move { state.handle_permission(request).await }
+        })
+        .with_route("/actions/permission-batch", move |request| {
+            let state = permission_batch_state.clone();
+            async move { state.handle_permission_batch(request).await }
         })
         .with_route("/actions/history-window", move |request| {
             let state = history_state.clone();
@@ -674,6 +686,39 @@ impl WebRenderState {
             Ok(_) => {
                 self.render_session_or_initial(Some(session_id), "permission resolved")
                     .await
+            }
+            Err(error) => {
+                self.render_session_or_initial(Some(session_id), &error.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn handle_permission_batch(
+        &self,
+        request: RouteRequest,
+    ) -> hyperchad::template::Containers {
+        if !self.authorizes(&request) {
+            return unauthorized_page();
+        }
+        let form = match request.parse_form::<PermissionBatchForm>() {
+            Ok(form) => form,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let Some(session_id) = parse_session_id(&form.session_id) else {
+            return error_page("invalid session id");
+        };
+        match self
+            .client
+            .resolve_permission_batch(form.batch_id, form.approved)
+            .await
+        {
+            Ok(resolved) => {
+                self.render_session_or_initial(
+                    Some(session_id),
+                    &format!("resolved {resolved} batched permissions"),
+                )
+                .await
             }
             Err(error) => {
                 self.render_session_or_initial(Some(session_id), &error.to_string())
@@ -1207,6 +1252,7 @@ mod tests {
                 tool_name: "example.tool".to_owned(),
                 arguments_json: "{}".to_owned(),
                 legacy_request_presentation: None,
+                batch: None,
                 policy_source: None,
                 policy_reason: None,
             },
@@ -1232,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn web_renders_generic_active_invocation_without_tool_specific_branch() {
+    fn web_preserves_compact_single_tool_activity_until_terminal_event() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         view.apply_event(&bcode_session_models::SessionEvent {
@@ -1256,9 +1302,64 @@ mod tests {
             "{:?}",
             bcode_web_render_ui::pages::home::home(view.snapshot(), &[], "token")
         );
-        assert!(rendered.contains("active invocations"));
+        assert!(rendered.contains("active tool"));
+        assert!(!rendered.contains("active invocations"));
         assert!(rendered.contains("opaque-call"));
         assert!(rendered.contains("waiting generically"));
+
+        view.apply_event(&bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 2,
+            timestamp_ms: 2,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "opaque-call".to_owned(),
+                    sequence: 1,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        });
+        let completed = format!(
+            "{:?}",
+            bcode_web_render_ui::pages::home::home(view.snapshot(), &[], "token")
+        );
+        assert!(!completed.contains("active tool"));
+        assert!(!completed.contains("active invocations"));
+    }
+
+    #[test]
+    fn web_uses_grouped_heading_only_for_multiple_active_invocations() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for (sequence, invocation_id) in [(1, "first"), (2, "second")] {
+            view.apply_event(&bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: sequence,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: invocation_id.to_owned(),
+                        sequence: 0,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                        message: None,
+                        metadata: serde_json::Value::Null,
+                    },
+                },
+            });
+        }
+
+        let rendered = format!(
+            "{:?}",
+            bcode_web_render_ui::pages::home::home(view.snapshot(), &[], "token")
+        );
+        assert!(rendered.contains("active invocations"));
+        assert!(!rendered.contains("active tool"));
     }
 
     #[test]

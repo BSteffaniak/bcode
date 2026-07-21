@@ -270,9 +270,14 @@ fn runtime_state_section(snapshot: &SessionViewSnapshot) -> Containers {
 fn active_invocations_section(
     active: &BTreeMap<String, bcode_session_models::ToolInvocationLifecycleEvent>,
 ) -> Containers {
+    let heading = if active.len() == 1 {
+        "active tool"
+    } else {
+        "active invocations"
+    };
     container! {
         section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
-            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "active invocations" }
+            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { (heading) }
             @for (invocation_id, lifecycle) in active {
                 div background="#0d1117" border="1, #30363d" border-radius=6 padding=10 margin-bottom=8 {
                     div color="#f0f6fc" {
@@ -562,6 +567,11 @@ fn permission_request(
         div border="1, #f2cc60" border-radius=8 padding=10 margin-bottom=10 {
             div color="#f2cc60" margin-bottom=6 { (permission.title.as_deref().unwrap_or("Permission requested")) }
             div color="#c9d1d9" { (permission.detail.as_deref().unwrap_or("No details provided.")) }
+            @if let Some(batch) = &permission.batch {
+                div color="#8b949e" font-size=12 margin-top=6 {
+                    "batch " (batch.call_index.saturating_add(1).to_string()) " of " (batch.call_count.to_string())
+                }
+            }
             @if permission.resolved {
                 div color="#8b949e" font-size=12 margin-top=8 {
                     "resolved: " (if permission.approved.unwrap_or(false) { "approved" } else { "denied" })
@@ -591,6 +601,22 @@ fn permission_request(
                             }
                         }
                         button type=submit background="#da3633" color=white border-radius=6 padding="6, 12" { "deny" }
+                    }
+                }
+                @if let Some(batch) = &permission.batch {
+                    div direction=row gap=8 margin-top=8 {
+                        form hx-post=(format!("/actions/permission-batch?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this {
+                            input type=hidden name="session_id" value=(session_id.to_string());
+                            input type=hidden name="batch_id" value=(batch.batch_id.clone());
+                            input type=hidden name="approved" value="true";
+                            button type=submit background="#238636" color=white border-radius=6 padding="6, 12" { "approve all" }
+                        }
+                        form hx-post=(format!("/actions/permission-batch?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this {
+                            input type=hidden name="session_id" value=(session_id.to_string());
+                            input type=hidden name="batch_id" value=(batch.batch_id.clone());
+                            input type=hidden name="approved" value="false";
+                            button type=submit background="#da3633" color=white border-radius=6 padding="6, 12" { "deny all" }
+                        }
                     }
                 }
             }
@@ -798,7 +824,8 @@ mod tests {
         RuntimeWorkStatus, ToolArtifact, WorkId,
     };
     use bcode_session_view_models::{
-        RuntimeWorkView, ToolArtifactView, ToolInvocationView, ToolResultView, ToolTimingView,
+        PermissionBatchView, PermissionView, RuntimeWorkView, ToolArtifactView, ToolInvocationView,
+        ToolResultView, ToolTimingView,
     };
 
     #[test]
@@ -825,6 +852,41 @@ mod tests {
         assert!(rendered.contains("runtime work"));
         assert!(rendered.contains("index workspace"));
         assert!(rendered.contains("work-1"));
+    }
+
+    #[test]
+    fn grouped_permission_renders_per_call_and_apply_to_all_actions() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(bcode_session_models::SessionId::new());
+        snapshot.permissions.push(PermissionView {
+            permission_id: "permission-1".to_owned(),
+            session_id: snapshot.session_id,
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"pwd"}"#.to_owned(),
+            batch: Some(PermissionBatchView {
+                batch_id: "batch-1".to_owned(),
+                call_index: 0,
+                call_count: 3,
+            }),
+            agent_id: "agent-1".to_owned(),
+            title: Some("Permission requested".to_owned()),
+            policy_source: Some("test".to_owned()),
+            detail: Some("review".to_owned()),
+            resolved: false,
+            approved: None,
+            can_remember: true,
+        });
+
+        let rendered = format!("{:?}", home(&snapshot, &[], "secret-token"));
+        assert!(rendered.contains("batch"));
+        assert!(rendered.contains('1'));
+        assert!(rendered.contains('3'));
+        assert!(rendered.contains("approve all"));
+        assert!(rendered.contains("deny all"));
+        assert!(rendered.contains("/actions/permission-batch"));
+        assert!(rendered.contains("/actions/permission?"));
+        assert!(rendered.contains("batch-1"));
     }
 
     #[test]

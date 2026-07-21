@@ -2515,6 +2515,41 @@ impl ProviderRegistry {
         registry
     }
 
+    /// Return selected provider/model capability support for parallel tool calls.
+    #[must_use]
+    pub fn parallel_tool_capabilities(
+        &self,
+        selector: &ModelSelector,
+    ) -> bcode_model::ParallelToolCallCapabilities {
+        let Some(provider_id) = selector.provider_plugin_id.as_deref() else {
+            return bcode_model::ParallelToolCallCapabilities::default();
+        };
+        let Some(registration) = self.providers.get(provider_id) else {
+            return bcode_model::ParallelToolCallCapabilities::default();
+        };
+        let provider = registration
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .capabilities
+                    .contains(&bcode_model::ProviderCapability::ParallelToolCalls)
+            });
+        let model = registration.models.as_ref().is_some_and(|models| {
+            models.models.iter().any(|model| {
+                model.model_id == selector.model_id
+                    && model
+                        .capabilities
+                        .contains(&bcode_model::ModelCapability::ParallelToolCalls)
+            })
+        });
+        bcode_model::ParallelToolCallCapabilities {
+            provider,
+            model,
+            canonical_runtime: true,
+        }
+    }
+
     /// Register a provider by plugin ID.
     #[must_use]
     pub fn provider(mut self, provider_plugin_id: impl Into<String>) -> Self {
@@ -2665,7 +2700,11 @@ impl Bcode {
             builder
         };
         if let Some(selector) = self.provider_registry.default_model_selector() {
-            builder.model_selector(selector.clone())
+            builder
+                .model_selector(selector.clone())
+                .parallel_tool_capabilities(
+                    self.provider_registry.parallel_tool_capabilities(selector),
+                )
         } else {
             builder
         }
@@ -2807,7 +2846,7 @@ impl Bcode {
                 provider_plugin_id.as_ref(),
                 MODEL_PROVIDER_INTERFACE_ID,
                 OP_MODELS,
-                &serde_json::Value::Null,
+                &bcode_model::ModelListRequest::default(),
                 bcode_plugin::PluginInvocationScope::Global,
             )
             .await
@@ -3431,6 +3470,7 @@ pub struct Agent {
     max_tool_rounds: u32,
     execution_options: ToolExecutionOptions,
     tool_choice: ToolChoice,
+    parallel_tool_capabilities: bcode_model::ParallelToolCallCapabilities,
     tool_failure_policy: ToolFailurePolicy,
     invocation_capabilities: InvocationCapabilities,
     invocation_event_sink: Arc<dyn TurnEventSink>,
@@ -3470,6 +3510,10 @@ impl fmt::Debug for Agent {
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("execution_options", &self.execution_options)
             .field("tool_choice", &self.tool_choice)
+            .field(
+                "parallel_tool_capabilities",
+                &self.parallel_tool_capabilities,
+            )
             .field("tool_failure_policy", &self.tool_failure_policy)
             .field("invocation_capabilities", &self.invocation_capabilities)
             .field("invocation_event_sink", &"<sink>")
@@ -4196,6 +4240,63 @@ impl Agent {
     where
         P: ModelProviderInvoker + ?Sized,
     {
+        let mut request = request;
+        request.tool_call_policy = self.parallel_tool_capabilities.negotiate(
+            request.tool_call_policy.parallel,
+            request.tool_call_policy.choice.clone(),
+        );
+        #[cfg(feature = "embedded-plugins")]
+        if let (Some(plugins), Some(provider_plugin_id)) =
+            (self.plugins.as_ref(), self.provider_plugin_id.as_deref())
+        {
+            let provider = plugins
+                .invoke_service_json_scoped::<(), ProviderCapabilities>(
+                    provider_plugin_id,
+                    MODEL_PROVIDER_INTERFACE_ID,
+                    bcode_model::OP_CAPABILITIES,
+                    &(),
+                    bcode_plugin::PluginInvocationScope::Global,
+                )
+                .await
+                .is_ok_and(|capabilities| {
+                    capabilities
+                        .capabilities
+                        .contains(&bcode_model::ProviderCapability::ParallelToolCalls)
+                });
+            let model = plugins
+                .invoke_service_json_scoped::<bcode_model::ModelListRequest, ModelList>(
+                    provider_plugin_id,
+                    MODEL_PROVIDER_INTERFACE_ID,
+                    OP_MODELS,
+                    &bcode_model::ModelListRequest {
+                        provider_context: self.provider_context.clone(),
+                        selected_model_id: Some(self.model_id.clone()),
+                    },
+                    bcode_plugin::PluginInvocationScope::Global,
+                )
+                .await
+                .ok()
+                .and_then(|models| {
+                    models
+                        .models
+                        .into_iter()
+                        .find(|model| model.model_id == self.model_id)
+                })
+                .is_some_and(|model| {
+                    model
+                        .capabilities
+                        .contains(&bcode_model::ModelCapability::ParallelToolCalls)
+                });
+            request.tool_call_policy = bcode_model::ParallelToolCallCapabilities {
+                provider,
+                model,
+                canonical_runtime: true,
+            }
+            .negotiate(
+                self.execution_options.parallel,
+                request.tool_call_policy.choice.clone(),
+            );
+        }
         let default_invoker = SdkToolInvoker {
             handlers: self.inline_tool_handlers.clone(),
             failure_policy: self.tool_failure_policy,
@@ -4287,10 +4388,9 @@ impl Agent {
             prompt,
             append_prompt: true,
             tools: self.enabled_tool_definitions(),
-            tool_call_policy: bcode_model::ToolCallRequestPolicy {
-                parallel: self.execution_options.parallel,
-                choice: self.tool_choice.clone(),
-            },
+            tool_call_policy: self
+                .parallel_tool_capabilities
+                .negotiate(self.execution_options.parallel, self.tool_choice.clone()),
             structured_output: None,
             parameters: self.parameters.clone(),
             metadata: self.metadata.clone(),
@@ -4377,6 +4477,7 @@ pub struct AgentBuilder {
     max_tool_rounds: u32,
     execution_options: ToolExecutionOptions,
     tool_choice: ToolChoice,
+    parallel_tool_capabilities: bcode_model::ParallelToolCallCapabilities,
     tool_failure_policy: ToolFailurePolicy,
     invocation_capabilities: InvocationCapabilities,
     invocation_event_sink: Arc<dyn TurnEventSink>,
@@ -4419,6 +4520,10 @@ impl fmt::Debug for AgentBuilder {
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("execution_options", &self.execution_options)
             .field("tool_choice", &self.tool_choice)
+            .field(
+                "parallel_tool_capabilities",
+                &self.parallel_tool_capabilities,
+            )
             .field("tool_failure_policy", &self.tool_failure_policy)
             .field("invocation_capabilities", &self.invocation_capabilities)
             .field("invocation_event_sink", &"<sink>")
@@ -4474,6 +4579,10 @@ impl Default for AgentBuilder {
             max_tool_rounds: 8,
             execution_options: ToolExecutionOptions::default(),
             tool_choice: ToolChoice::Auto,
+            parallel_tool_capabilities: bcode_model::ParallelToolCallCapabilities {
+                canonical_runtime: true,
+                ..bcode_model::ParallelToolCallCapabilities::default()
+            },
             tool_failure_policy: ToolFailurePolicy::FailTurn,
             invocation_capabilities: InvocationCapabilities::default(),
             invocation_event_sink: Arc::new(DiscardingSdkTurnEventSink),
@@ -4527,6 +4636,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Configure provider/model capability support used for parallel tool-call negotiation.
+    #[must_use]
+    pub const fn parallel_tool_capabilities(
+        mut self,
+        capabilities: bcode_model::ParallelToolCallCapabilities,
+    ) -> Self {
+        self.parallel_tool_capabilities = capabilities;
+        self
+    }
+
     /// Configure a human-readable agent name.
     #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
@@ -4538,6 +4657,7 @@ impl AgentBuilder {
     #[must_use]
     pub fn model(mut self, model_id: impl Into<String>) -> Self {
         self.model_id = Some(model_id.into());
+        self.parallel_tool_capabilities.model = false;
         self
     }
 
@@ -4547,6 +4667,8 @@ impl AgentBuilder {
         let selector = selector.into();
         self.provider_plugin_id = selector.provider_plugin_id;
         self.model_id = Some(selector.model_id);
+        self.parallel_tool_capabilities.provider = false;
+        self.parallel_tool_capabilities.model = false;
         self
     }
 
@@ -4554,6 +4676,8 @@ impl AgentBuilder {
     #[must_use]
     pub fn provider_plugin(mut self, provider_plugin_id: impl Into<String>) -> Self {
         self.provider_plugin_id = Some(provider_plugin_id.into());
+        self.parallel_tool_capabilities.provider = false;
+        self.parallel_tool_capabilities.model = false;
         self
     }
 
@@ -5053,6 +5177,7 @@ impl AgentBuilder {
             max_tool_rounds: self.max_tool_rounds,
             execution_options: self.execution_options,
             tool_choice: self.tool_choice,
+            parallel_tool_capabilities: self.parallel_tool_capabilities,
             tool_failure_policy: self.tool_failure_policy,
             invocation_capabilities: self.invocation_capabilities,
             invocation_event_sink,

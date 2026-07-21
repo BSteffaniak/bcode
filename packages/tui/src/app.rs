@@ -4845,6 +4845,7 @@ mod tests {
                     tool_name: "shell.run".to_owned(),
                     arguments_json: "{}".to_owned(),
                     legacy_request_presentation: None,
+                    batch: None,
                     policy_source: None,
                     policy_reason: None,
                 },

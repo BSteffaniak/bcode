@@ -1125,6 +1125,7 @@ fn capabilities() -> ProviderCapabilities {
             ProviderCapability::Streaming,
             ProviderCapability::Cancellation,
             ProviderCapability::Tools,
+            ProviderCapability::ParallelToolCalls,
             ProviderCapability::PromptCaching,
         ]
         .into_iter()
@@ -2304,6 +2305,24 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_provider_cancel_turn_signals_active_adapter_state() {
+        let plugin = BedrockProviderPlugin::default();
+        let (provider_turn_id, turn) = plugin
+            .turns
+            .lock()
+            .expect("turn store")
+            .insert_started("cancel-me");
+        let response = plugin.cancel_turn(&ServiceRequest {
+            interface_id: MODEL_PROVIDER_INTERFACE_ID.to_owned(),
+            operation: OP_CANCEL_TURN.to_owned(),
+            payload: serde_json::to_vec(&CancelTurnRequest { provider_turn_id })
+                .expect("cancel request"),
+        });
+        assert!(response.error.is_none());
+        assert!(turn.is_cancelled());
+    }
+
+    #[test]
     fn tool_use_delta_emits_progress_event_when_call_id_is_known() {
         let turn = TurnState::default();
         let mut accumulator = StreamAccumulator::new(BTreeMap::new());
@@ -2369,6 +2388,31 @@ mod tests {
         );
         assert_eq!(completed[0].arguments["position"], 1);
         assert_eq!(completed[1].arguments["position"], 2);
+    }
+
+    #[test]
+    fn malformed_bedrock_tool_call_is_rejected_without_partial_completion() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+        accumulator.tool_calls.insert(
+            0,
+            ToolCallAccumulator {
+                id: Some("bedrock-call-malformed".to_owned()),
+                name: Some("broken_tool".to_owned()),
+                arguments: r#"{"unterminated""#.to_owned(),
+            },
+        );
+
+        let error = accumulator
+            .finish_tool_calls(&turn)
+            .expect_err("malformed Bedrock arguments must fail");
+        assert_eq!(error.code, "tool_arguments_decode_failed");
+        assert!(
+            !turn
+                .drain()
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { .. }))
+        );
     }
 
     #[test]

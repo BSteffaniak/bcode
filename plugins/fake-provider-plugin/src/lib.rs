@@ -25,6 +25,7 @@ use std::time::Duration;
 static FAKE_COMPACTION_STARTED: AtomicBool = AtomicBool::new(false);
 static FAKE_COMPACTION_SUMMARY_STARTED: AtomicBool = AtomicBool::new(false);
 static FAKE_MANAGED_COMPACTION_EMITTED: AtomicBool = AtomicBool::new(false);
+static FAKE_LAST_PARALLEL_TOOL_POLICY: AtomicBool = AtomicBool::new(false);
 
 /// Reset the provider-compaction start signal used by static runtime tests.
 #[cfg(feature = "static-bundled")]
@@ -32,6 +33,14 @@ pub fn reset_fake_compaction_started() {
     FAKE_COMPACTION_STARTED.store(false, Ordering::Release);
     FAKE_COMPACTION_SUMMARY_STARTED.store(false, Ordering::Release);
     FAKE_MANAGED_COMPACTION_EMITTED.store(false, Ordering::Release);
+    FAKE_LAST_PARALLEL_TOOL_POLICY.store(false, Ordering::Release);
+}
+
+/// Return the last provider-visible parallel tool-call policy observed by the fake adapter.
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn fake_last_parallel_tool_policy() -> bool {
+    FAKE_LAST_PARALLEL_TOOL_POLICY.load(Ordering::Acquire)
 }
 
 /// Return whether fake provider-managed compaction was emitted.
@@ -220,6 +229,7 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
+        FAKE_LAST_PARALLEL_TOOL_POLICY.store(request.tool_call_policy.parallel, Ordering::Release);
         let is_compaction_request = request
             .metadata
             .get("bcode_request_kind")
@@ -243,27 +253,14 @@ impl FakeProviderPlugin {
                     .then(|| fake_tool_call(&user_text, state.next_turn))
                     .flatten()
             });
+        let has_tool_result = tool_result.is_some();
         let text = tool_result.map_or_else(
             || format!("fake: {user_text}"),
             |result| format!("fake tool result: {result}"),
         );
         let turn = FakeTurn::default();
         turn.push(ProviderTurnEvent::TurnStarted);
-        if request.context_management.compact_threshold.is_some() {
-            FAKE_MANAGED_COMPACTION_EMITTED.store(true, Ordering::Release);
-            turn.push(ProviderTurnEvent::ContextCompacted {
-                messages: vec![ModelMessage {
-                    role: MessageRole::Assistant,
-                    content: vec![ContentBlock::ProviderExtension {
-                        value: serde_json::json!({
-                            "type": "fake_managed_compaction",
-                            "message_count": request.messages.len(),
-                        }),
-                    }],
-                }],
-                context_format: fake_context_format(),
-            });
-        }
+        emit_fake_managed_compaction(&request, &turn);
         let emit_overflow = request
             .provider_context
             .settings
@@ -273,6 +270,17 @@ impl FakeProviderPlugin {
         if emit_overflow {
             state.overflow_emitted = true;
         }
+        let configured_tool_call_count = request
+            .provider_context
+            .settings
+            .get("fake_parallel_tool_calls")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_default();
+        let emit_malformed_tool_call = request
+            .provider_context
+            .settings
+            .get("fake_malformed_tool_call")
+            .is_some_and(|value| value == "true");
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
         if emit_overflow {
@@ -289,17 +297,16 @@ impl FakeProviderPlugin {
             turn.push(ProviderTurnEvent::TurnFinished {
                 stop_reason: StopReason::Error,
             });
+        } else if finish_configured_fake_tool_conformance(
+            &turn,
+            &request,
+            configured_tool_call_count,
+            emit_malformed_tool_call,
+            has_tool_result,
+        ) {
         } else if let Some(tool_call) = tool_call {
             finish_fake_tool_turn(&turn, tool_call);
-        } else if let Some(delay) = request
-            .provider_context
-            .settings
-            .get("fake_turn_delay_ms")
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|millis| *millis > 0)
-            .map(Duration::from_millis)
-            .or_else(fake_delay)
-        {
+        } else if let Some(delay) = fake_request_delay(&request) {
             std::thread::spawn(move || {
                 FakeTurnWorker {
                     turn,
@@ -414,15 +421,94 @@ fn fake_request_input_tokens(request: &ModelTurnRequest) -> u64 {
     u64::try_from(visible.split_whitespace().count()).unwrap_or(u64::MAX)
 }
 
-fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall) {
+fn emit_fake_managed_compaction(request: &ModelTurnRequest, turn: &FakeTurn) {
+    if request.context_management.compact_threshold.is_none() {
+        return;
+    }
+    FAKE_MANAGED_COMPACTION_EMITTED.store(true, Ordering::Release);
+    turn.push(ProviderTurnEvent::ContextCompacted {
+        messages: vec![ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ProviderExtension {
+                value: serde_json::json!({
+                    "type": "fake_managed_compaction",
+                    "message_count": request.messages.len(),
+                }),
+            }],
+        }],
+        context_format: fake_context_format(),
+    });
+}
+
+fn finish_configured_fake_tool_conformance(
+    turn: &FakeTurn,
+    request: &ModelTurnRequest,
+    tool_call_count: usize,
+    malformed: bool,
+    has_tool_result: bool,
+) -> bool {
+    if malformed {
+        turn.push(ProviderTurnEvent::Error {
+            error: ProviderError {
+                code: "malformed_tool_call".to_owned(),
+                category: ProviderErrorCategory::InvalidRequest,
+                message: "fake provider emitted a malformed tool call".to_owned(),
+                retryable: false,
+                provider_message: None,
+                retry: None,
+            },
+        });
+        turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::Error,
+        });
+        return true;
+    }
+    if tool_call_count == 0 || has_tool_result {
+        return false;
+    }
+    for index in 0..tool_call_count {
+        finish_fake_tool_call(
+            turn,
+            ToolCall {
+                id: format!("fake-call-{index}"),
+                name: request
+                    .tools
+                    .get(index % request.tools.len().max(1))
+                    .map_or_else(|| "fake.tool".to_owned(), |tool| tool.name.clone()),
+                arguments: serde_json::json!({"index": index}),
+            },
+        );
+    }
+    turn.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::ToolCall,
+    });
+    true
+}
+
+fn finish_fake_tool_call(turn: &FakeTurn, call: ToolCall) {
     turn.push(ProviderTurnEvent::ToolCallStarted {
         call_id: call.id.clone(),
         name: call.name.clone(),
     });
     turn.push(ProviderTurnEvent::ToolCallFinished { call });
+}
+
+fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall) {
+    finish_fake_tool_call(turn, call);
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::ToolCall,
     });
+}
+
+fn fake_request_delay(request: &ModelTurnRequest) -> Option<Duration> {
+    request
+        .provider_context
+        .settings
+        .get("fake_turn_delay_ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .or_else(fake_delay)
 }
 
 fn fake_delay() -> Option<Duration> {
@@ -443,6 +529,7 @@ fn capabilities() -> ProviderCapabilities {
         capabilities: [
             ProviderCapability::Streaming,
             ProviderCapability::Tools,
+            ProviderCapability::ParallelToolCalls,
             ProviderCapability::Cancellation,
         ]
         .into_iter()
@@ -461,9 +548,13 @@ fn models(has_context_window: bool) -> ModelList {
             is_default: true,
             context_window: has_context_window.then_some(8_000),
             max_output_tokens: Some(1_000),
-            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
-                .into_iter()
-                .collect(),
+            capabilities: [
+                ModelCapability::StreamingText,
+                ModelCapability::ToolCalls,
+                ModelCapability::ParallelToolCalls,
+            ]
+            .into_iter()
+            .collect(),
             reasoning: None,
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: Some(bcode_model::ModelMetadataSource::BundledCatalog),

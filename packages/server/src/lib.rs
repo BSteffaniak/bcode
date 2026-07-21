@@ -13565,6 +13565,14 @@ async fn build_model_turn_request(
             selected_model_id.to_string(),
         );
     }
+    let parallel_capabilities = resolve_parallel_tool_call_capabilities(
+        state,
+        provider_plugin_id,
+        &model_id,
+        &selection.provider_context,
+        false,
+    )
+    .await;
     let request = ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
@@ -13573,10 +13581,8 @@ async fn build_model_turn_request(
         system_prompt: Some(system_prompt),
         messages,
         tools,
-        tool_call_policy: bcode_model::ToolCallRequestPolicy {
-            parallel: state.tool_execution.parallel,
-            ..bcode_model::ToolCallRequestPolicy::default()
-        },
+        tool_call_policy: parallel_capabilities
+            .negotiate(state.tool_execution.parallel, bcode_model::ToolChoice::Auto),
         structured_output: None,
         context_management,
         parameters,
@@ -13910,6 +13916,54 @@ fn supported_reasoning_value<'a>(
         return None;
     }
     (supported.is_empty() || supported.iter().any(|value| value == requested)).then_some(requested)
+}
+
+async fn resolve_parallel_tool_call_capabilities(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: &str,
+    provider_context: &bcode_model::ProviderRequestContext,
+    canonical_runtime: bool,
+) -> bcode_model::ParallelToolCallCapabilities {
+    let provider = if let Some(provider_plugin_id) = provider_plugin_id {
+        state
+            .plugins
+            .invoke_service_json::<(), bcode_model::ProviderCapabilities>(
+                provider_plugin_id,
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+                bcode_model::OP_CAPABILITIES,
+                &(),
+            )
+            .await
+            .is_ok_and(|capabilities| {
+                capabilities
+                    .capabilities
+                    .contains(&bcode_model::ProviderCapability::ParallelToolCalls)
+            })
+    } else {
+        false
+    };
+    let model = resolved_provider_models(
+        state,
+        provider_plugin_id.map(ToOwned::to_owned),
+        bcode_model::ModelListRequest {
+            provider_context: provider_context.clone(),
+            selected_model_id: Some(selected_model_id.to_owned()),
+        },
+    )
+    .await
+    .ok()
+    .and_then(|models| select_model_info(&models.models, Some(selected_model_id)))
+    .is_some_and(|model| {
+        model
+            .capabilities
+            .contains(&bcode_model::ModelCapability::ParallelToolCalls)
+    });
+    bcode_model::ParallelToolCallCapabilities {
+        provider,
+        model,
+        canonical_runtime,
+    }
 }
 
 async fn resolve_model_reasoning_info(
@@ -17285,6 +17339,7 @@ async fn request_tool_permission(
         tool_name: tool_name.to_string(),
         arguments_json,
         legacy_request_presentation: None,
+        batch: policy_context.batch.clone(),
         policy_source: policy_context.source,
         policy_reason: policy_context.reason,
     };
@@ -20321,6 +20376,27 @@ library = "test"
             ToolExchangeResolution::Failed { code, .. } if code == "invocation_id_mismatch"
         ));
         assert!(state.pending_interactive_tools.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_server_loop_never_advertises_parallel_before_canonical_delegation() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        let capabilities = resolve_parallel_tool_call_capabilities(
+            &state,
+            Some("bcode.fake-provider"),
+            "fake-echo",
+            &bcode_model::ProviderRequestContext::default(),
+            false,
+        )
+        .await;
+        assert!(capabilities.provider);
+        assert!(capabilities.model);
+        assert!(!capabilities.canonical_runtime);
+        assert!(
+            !capabilities
+                .negotiate(true, bcode_model::ToolChoice::Auto)
+                .parallel
+        );
     }
 
     #[tokio::test]
@@ -24838,6 +24914,7 @@ library = "test"
                     tool_name: "test.tool".to_owned(),
                     arguments_json: "PERMISSION_PRESENTATION_PRIVATE".to_owned(),
                     legacy_request_presentation: None,
+                    batch: None,
                     policy_source: Some("PRIVATE_POLICY_SOURCE".to_owned()),
                     policy_reason: Some("PRIVATE_POLICY_REASON".to_owned()),
                 },
@@ -26417,6 +26494,7 @@ library = "test"
                     tool_name: "test.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     legacy_request_presentation: None,
+                    batch: None,
                     policy_source: None,
                     policy_reason: None,
                 },
@@ -26773,6 +26851,7 @@ library = "test"
                     tool_name: "test.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     legacy_request_presentation: None,
+                    batch: None,
                     policy_source: None,
                     policy_reason: None,
                 },

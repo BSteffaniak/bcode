@@ -651,15 +651,7 @@ pub struct PluginServiceSummary {
 }
 
 /// Correlation metadata for one permission checkpoint in a complete tool-call batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionBatchCorrelation {
-    /// Host-assigned identifier shared by every permission checkpoint in this authorization batch.
-    pub batch_id: String,
-    /// Zero-based provider-order position of the correlated tool call.
-    pub call_index: usize,
-    /// Total number of tool calls submitted for complete-batch authorization.
-    pub call_count: usize,
-}
+pub use bcode_session_models::PermissionBatchCorrelation;
 
 /// Pending permission checkpoint summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2703,6 +2695,7 @@ mod tests {
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
                 legacy_request_presentation: None,
+                batch: None,
                 policy_source: None,
                 policy_reason: None,
             },

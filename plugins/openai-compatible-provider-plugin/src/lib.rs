@@ -4700,20 +4700,26 @@ fn openai_tool_name(name: &str) -> String {
         .collect()
 }
 
+fn known_parallel_tool_provider(provider_id: Option<&str>) -> bool {
+    matches!(provider_id, Some("openai" | "xai"))
+}
+
 fn capabilities() -> ProviderCapabilities {
     let settings = settings();
+    let mut capabilities = BTreeSet::from([
+        ProviderCapability::Streaming,
+        ProviderCapability::Cancellation,
+        ProviderCapability::Tools,
+        ProviderCapability::PromptCaching,
+        ProviderCapability::NativeWebSearch,
+    ]);
+    if known_parallel_tool_provider(catalog_provider_id(&settings)) {
+        capabilities.insert(ProviderCapability::ParallelToolCalls);
+    }
     ProviderCapabilities {
         provider_id: PROVIDER_ID.to_string(),
         display_name: "OpenAI-Compatible (xAI, Grok, OpenAI, Groq, ...)".to_string(),
-        capabilities: [
-            ProviderCapability::Streaming,
-            ProviderCapability::Cancellation,
-            ProviderCapability::Tools,
-            ProviderCapability::PromptCaching,
-            ProviderCapability::NativeWebSearch,
-        ]
-        .into_iter()
-        .collect(),
+        capabilities,
         auth_schemes: ["api_key".to_string(), "chatgpt".to_string()]
             .into_iter()
             .collect(),
@@ -6665,6 +6671,36 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 mod tests {
     use super::*;
 
+    #[test]
+    fn openai_provider_cancel_turn_signals_active_adapter_state() {
+        let plugin = OpenAiCompatibleProviderPlugin::default();
+        let turn = TurnState::default();
+        plugin
+            .state
+            .lock()
+            .expect("provider state")
+            .turns
+            .insert("cancel-me".to_owned(), turn.clone());
+        let response = plugin.cancel_turn(&ServiceRequest {
+            interface_id: MODEL_PROVIDER_INTERFACE_ID.to_owned(),
+            operation: OP_CANCEL_TURN.to_owned(),
+            payload: serde_json::to_vec(&CancelTurnRequest {
+                provider_turn_id: "cancel-me".to_owned(),
+            })
+            .expect("cancel request"),
+        });
+        assert!(response.error.is_none());
+        assert!(turn.is_cancelled());
+    }
+
+    #[test]
+    fn parallel_tool_provider_capability_requires_known_backend() {
+        assert!(known_parallel_tool_provider(Some("openai")));
+        assert!(known_parallel_tool_provider(Some("xai")));
+        assert!(!known_parallel_tool_provider(None));
+        assert!(!known_parallel_tool_provider(Some("custom-proxy")));
+    }
+
     fn model_item(id: &str, created: i64) -> ModelResponseItem {
         ModelResponseItem {
             id: id.to_string(),
@@ -7714,6 +7750,35 @@ mod tests {
         );
         assert_eq!(completed[0].arguments["position"], 1);
         assert_eq!(completed[1].arguments["position"], 2);
+    }
+
+    #[test]
+    fn malformed_provider_tool_call_is_rejected_without_partial_completion() {
+        let turn = TurnState::default();
+        let calls = BTreeMap::from([(
+            0,
+            ToolCallAccumulator {
+                id: Some("provider-call-malformed".to_owned()),
+                name: Some("broken_tool".to_owned()),
+                arguments: r#"{"unterminated""#.to_owned(),
+                started: true,
+            },
+        )]);
+
+        let error = finish_tool_calls(
+            &turn,
+            &calls,
+            &BTreeMap::new(),
+            OpenAiCompatibleDialect::ResponsesApi,
+        )
+        .expect_err("malformed provider arguments must fail");
+        assert_eq!(error.code, "tool_arguments_decode_failed");
+        assert!(
+            !turn
+                .drain()
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { .. }))
+        );
     }
 
     #[test]

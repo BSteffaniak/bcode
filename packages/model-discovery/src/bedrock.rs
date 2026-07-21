@@ -82,6 +82,7 @@ fn capabilities_from_summary(summary: &FoundationModelSummary) -> CatalogCapabil
         image_input: has_modality(input_modalities, "Image"),
         text_output: has_modality(output_modalities, "Text"),
         tool_use: false,
+        parallel_tool_calls: false,
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,

@@ -1774,6 +1774,17 @@ pub enum TraceRedaction {
     ManualRequired,
 }
 
+/// Correlation metadata for one permission checkpoint in a simultaneous batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionBatchCorrelation {
+    /// Identifier shared by every checkpoint in the batch.
+    pub batch_id: String,
+    /// Zero-based provider-order position.
+    pub call_index: usize,
+    /// Total checkpoints in the batch.
+    pub call_count: usize,
+}
+
 /// Session event payload.
 ///
 /// IMPORTANT: This enum is persisted with `bmux_codec`, whose binary enum
@@ -1849,6 +1860,8 @@ pub enum SessionEventKind {
             skip_serializing_if = "Option::is_none"
         )]
         legacy_request_presentation: Option<LegacyToolRequestPresentationMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch: Option<PermissionBatchCorrelation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

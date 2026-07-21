@@ -378,6 +378,9 @@ pub struct CatalogCapabilities {
     /// Supports tool/function calling.
     #[serde(default)]
     pub tool_use: bool,
+    /// Supports multiple independent tool calls in one model response.
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
     /// Supports structured output controls.
     #[serde(default)]
     pub structured_outputs: bool,

@@ -232,6 +232,8 @@ impl ProviderRetryRuleMatch {
 pub enum ProviderCapability {
     Streaming,
     Tools,
+    /// Provider transport can request multiple tool calls in one model response.
+    ParallelToolCalls,
     Cancellation,
     JsonMode,
     PromptCaching,
@@ -1287,6 +1289,28 @@ pub struct ToolCallRequestPolicy {
     pub choice: ToolChoice,
 }
 
+/// Capability inputs required before parallel tool calls may be advertised to a provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParallelToolCallCapabilities {
+    /// Provider transport advertises parallel tool-call support.
+    pub provider: bool,
+    /// Selected model advertises parallel tool-call support.
+    pub model: bool,
+    /// Host uses canonical scheduling, authorization, and cancellation for this request.
+    pub canonical_runtime: bool,
+}
+
+impl ParallelToolCallCapabilities {
+    /// Negotiate provider-visible policy from requested intent and all required capabilities.
+    #[must_use]
+    pub const fn negotiate(self, requested: bool, choice: ToolChoice) -> ToolCallRequestPolicy {
+        ToolCallRequestPolicy {
+            parallel: requested && self.provider && self.model && self.canonical_runtime,
+            choice,
+        }
+    }
+}
+
 /// Start a provider model turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
@@ -1827,8 +1851,8 @@ mod tests {
     use super::{
         ModelCatalogPolicy, ModelCatalogSupportHint, ModelInfo, ModelList, ModelListAuthority,
         ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelTurnRequest,
-        ModelVisibility, ModelVisibilitySource, ProviderErrorCategory, TokenUsage,
-        ToolCallRequestPolicy,
+        ModelVisibility, ModelVisibilitySource, ParallelToolCallCapabilities,
+        ProviderErrorCategory, TokenUsage, ToolCallRequestPolicy, ToolChoice,
     };
 
     #[test]
@@ -1855,6 +1879,33 @@ mod tests {
             serde_json::from_value(encoded).expect("policy should decode");
 
         assert_eq!(decoded, policy);
+    }
+
+    #[test]
+    fn parallel_tool_policy_requires_intent_provider_model_and_canonical_runtime() {
+        let ready = ParallelToolCallCapabilities {
+            provider: true,
+            model: true,
+            canonical_runtime: true,
+        };
+        assert!(ready.negotiate(true, ToolChoice::Auto).parallel);
+        assert!(!ready.negotiate(false, ToolChoice::Auto).parallel);
+        for capabilities in [
+            ParallelToolCallCapabilities {
+                provider: false,
+                ..ready
+            },
+            ParallelToolCallCapabilities {
+                model: false,
+                ..ready
+            },
+            ParallelToolCallCapabilities {
+                canonical_runtime: false,
+                ..ready
+            },
+        ] {
+            assert!(!capabilities.negotiate(true, ToolChoice::Auto).parallel);
+        }
     }
 
     #[test]

@@ -489,7 +489,7 @@ if ! grep -F 'orchestration_emits_exactly_one_started_and_terminal_lifecycle_per
    ! grep -F 'server_tool_error_persists_failed_generic_lifecycle' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'projection_history_pages_cross_real_ipc_bidirectionally' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'generic_lifecycle_drives_tui_activity_until_terminal_event' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'web_renders_generic_active_invocation_without_tool_specific_branch' packages/web-render/src/lib.rs >/dev/null ||
+   ! grep -F 'web_preserves_compact_single_tool_activity_until_terminal_event' packages/web-render/src/lib.rs >/dev/null ||
    ! grep -F 'legacy_tool_stream_lifecycle_events_are_not_newly_persisted' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: orchestration-owned lifecycle coverage was removed." >&2
   violations=1
@@ -561,6 +561,68 @@ if ! grep -F 'RuntimePhaseDuration::start("preparation", Some(provider_round))' 
    ! grep -F '"runtime_work.cleanup_duration_ms"' packages/server/src/runtime_work.rs >/dev/null ||
    ! grep -F '"provider.cleanup_duration_ms"' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: neutral runtime phase duration diagnostics were removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'pub struct ParallelToolCallCapabilities' packages/model/src/lib.rs >/dev/null ||
+   ! grep -F 'requested && self.provider && self.model && self.canonical_runtime' packages/model/src/lib.rs >/dev/null ||
+   ! grep -F 'parallel_tool_policy_requires_intent_provider_model_and_canonical_runtime' packages/model/src/lib.rs >/dev/null ||
+   ! grep -F 'provider_registry_negotiates_parallel_only_when_provider_and_model_support_it' packages/bcode/tests/provider_defaults.rs >/dev/null ||
+   ! grep -F 'sdk_parallel_signal_falls_back_when_one_capability_is_missing' packages/bcode/tests/provider_tool_loop.rs >/dev/null ||
+   ! grep -F 'changing_model_after_capability_resolution_invalidates_parallel_signal' packages/bcode/tests/provider_tool_loop.rs >/dev/null ||
+   ! grep -F 'duplicate_server_loop_never_advertises_parallel_before_canonical_delegation' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'unknown_model_is_not_upgraded_to_parallel_tool_calls' packages/model-catalog/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: parallel tool-call capability negotiation was weakened." >&2
+  violations=1
+fi
+
+if rg -n 'tool_call_policy: bcode_model::ToolCallRequestPolicy \{[[:space:]]*$' \
+  packages/bcode/src/lib.rs packages/server/src/lib.rs >/tmp/bcode-direct-parallel-policy.txt; then
+  echo "Runtime architecture violation: production request builders bypass typed parallel capability negotiation." >&2
+  cat /tmp/bcode-direct-parallel-policy.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'parallel_tool_calls: bool' packages/model-catalog/models/src/lib.rs >/dev/null ||
+   ! grep -F 'ModelCapability::ParallelToolCalls' packages/model-catalog/src/lib.rs >/dev/null ||
+   ! grep -F 'ProviderCapability::ParallelToolCalls' plugins/fake-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'known_parallel_tool_provider' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'parallel_tool_provider_capability_requires_known_backend' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ProviderCapability::ParallelToolCalls' plugins/bedrock-provider-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: provider/model parallel capability advertisements were removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'static_provider_adapter_conforms_for_multiple_calls_and_sequential_fallback' packages/bcode/tests/provider_plugin_conformance.rs >/dev/null ||
+   ! grep -F 'static_provider_adapter_conforms_for_malformed_calls_and_cancellation' packages/bcode/tests/provider_plugin_conformance.rs >/dev/null ||
+   ! grep -F 'completed_tool_calls_preserve_provider_order_and_exact_ids' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'malformed_provider_tool_call_is_rejected_without_partial_completion' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'openai_provider_cancel_turn_signals_active_adapter_state' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'completed_tool_calls_preserve_bedrock_order_and_exact_ids' plugins/bedrock-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'malformed_bedrock_tool_call_is_rejected_without_partial_completion' plugins/bedrock-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'bedrock_provider_cancel_turn_signals_active_adapter_state' plugins/bedrock-provider-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: provider parallel-tool conformance coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'generic_lifecycle_drives_tui_activity_until_terminal_event' packages/tui/src/app.rs >/dev/null ||
+   ! grep -F 'web_preserves_compact_single_tool_activity_until_terminal_event' packages/web-render/src/lib.rs >/dev/null ||
+   ! grep -F 'web_uses_grouped_heading_only_for_multiple_active_invocations' packages/web-render/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: single-tool UX regression coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'batched_actions_keep_single_call_and_apply_to_all_distinct' packages/tui/src/permission_dialog.rs >/dev/null ||
+   ! grep -F 'batched_remember_actions_never_apply_to_all' packages/tui/src/permission_dialog.rs >/dev/null ||
+   ! grep -F 'grouped_permission_renders_per_call_and_apply_to_all_actions' packages/web-render/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F 'resolve_permission_batch(form.batch_id, form.approved)' packages/web-render/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: grouped permission adapter behavior was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'permission_batch_correlation_survives_session_view_projection' packages/session-view/src/lib.rs >/dev/null ||
+   ! grep -F 'batch: policy_context.batch.clone()' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: live permission batch correlation was removed." >&2
   violations=1
 fi
 

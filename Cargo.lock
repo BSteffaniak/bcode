@@ -1312,6 +1312,7 @@ dependencies = [
  "bcode_cli",
  "bcode_client",
  "bcode_config",
+ "bcode_fake_provider_plugin",
  "bcode_hello_plugin",
  "bcode_model",
  "bcode_plugin",

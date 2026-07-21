@@ -217,6 +217,7 @@ fn capabilities_from_modalities<'a>(
         image_input: input.iter().any(|m| m.eq_ignore_ascii_case("image")),
         text_output: output.iter().any(|m| m.eq_ignore_ascii_case("text")),
         tool_use: false,
+        parallel_tool_calls: false,
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,
