@@ -12,5 +12,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Install architecture guard dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Check model catalog architecture
         run: scripts/check-model-catalog-architecture.sh

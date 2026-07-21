@@ -1,0 +1,63 @@
+name: TUI PTY Acceptance
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - ".github/workflows/tui-pty-acceptance.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "packages/bcode/**"
+      - "packages/bundled-plugins/**"
+      - "packages/cli/**"
+      - "packages/client/**"
+      - "packages/config/**"
+      - "packages/daemon-lifecycle/**"
+      - "packages/ipc/**"
+      - "packages/plugin/**"
+      - "packages/plugin-sdk/**"
+      - "packages/server/**"
+      - "packages/settings/**"
+      - "packages/tui/**"
+      - "packages/tui-components/**"
+      - "plugins/**"
+      - "scripts/smoke-tui-pty.sh"
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/tui-pty-acceptance.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "packages/bcode/**"
+      - "packages/bundled-plugins/**"
+      - "packages/cli/**"
+      - "packages/client/**"
+      - "packages/config/**"
+      - "packages/daemon-lifecycle/**"
+      - "packages/ipc/**"
+      - "packages/plugin/**"
+      - "packages/plugin-sdk/**"
+      - "packages/server/**"
+      - "packages/settings/**"
+      - "packages/tui/**"
+      - "packages/tui-components/**"
+      - "plugins/**"
+      - "scripts/smoke-tui-pty.sh"
+  workflow_dispatch:
+
+jobs:
+  tui-pty-acceptance:
+    name: TUI PTY acceptance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Exercise the real TUI in a pseudo-terminal
+        run: scripts/smoke-tui-pty.sh
