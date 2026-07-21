@@ -65,8 +65,9 @@ pub use bcode_tool::{
     ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolDefinition, ToolExchangeRequest,
     ToolExchangeResolution, ToolExchangeResponsePolicy, ToolExecutionOptions,
     ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationResponse, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
-    ToolPreparationRequest, ToolPreparationResponse,
+    ToolInvocationResponse, ToolInvocationResult, ToolInvocationServiceRequest,
+    ToolInvocationServiceResolution, ToolPolicyMetadata, ToolPreparationRequest,
+    ToolPreparationResponse, ToolSideEffect, ToolUiMetadata,
 };
 
 /// Result alias for Bcode SDK operations.
@@ -137,6 +138,78 @@ impl From<&str> for ModelSelector {
 impl From<String> for ModelSelector {
     fn from(value: String) -> Self {
         Self::from_text(value)
+    }
+}
+
+/// Model-callable inline tool definition derived from Rust input/output types.
+///
+/// `I` supplies the provider-visible JSON Schema and is deserialized before the handler runs. `O`
+/// is serialized into both the model-visible output and structured tool result. Use
+/// [`AgentBuilder::typed_tool`] to register the completed definition.
+#[derive(Debug, Clone)]
+pub struct TypedTool<I, O> {
+    definition: ToolDefinition,
+    _types: std::marker::PhantomData<fn(I) -> O>,
+}
+
+impl<I, O> TypedTool<I, O>
+where
+    I: schemars::JsonSchema,
+{
+    /// Create a read-only typed tool that does not require permission.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if schemars emits a schema that cannot be represented as JSON.
+    #[must_use]
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            definition: ToolDefinition {
+                name: name.into(),
+                description: description.into(),
+                input_schema: serde_json::to_value(schemars::schema_for!(I))
+                    .expect("schemars tool input schema should serialize to JSON"),
+                side_effect: ToolSideEffect::ReadOnly,
+                requires_permission: false,
+                policy: ToolPolicyMetadata::default(),
+                ui: ToolUiMetadata::default(),
+            },
+            _types: std::marker::PhantomData,
+        }
+    }
+
+    /// Configure the tool's side-effect classification.
+    #[must_use]
+    pub const fn side_effect(mut self, side_effect: ToolSideEffect) -> Self {
+        self.definition.side_effect = side_effect;
+        self
+    }
+
+    /// Configure whether the tool requires permission before execution.
+    #[must_use]
+    pub const fn requires_permission(mut self, requires_permission: bool) -> Self {
+        self.definition.requires_permission = requires_permission;
+        self
+    }
+
+    /// Configure plugin-compatible policy metadata for this inline tool.
+    #[must_use]
+    pub fn policy(mut self, policy: ToolPolicyMetadata) -> Self {
+        self.definition.policy = policy;
+        self
+    }
+
+    /// Configure renderer-neutral UI metadata for this inline tool.
+    #[must_use]
+    pub fn ui(mut self, ui: ToolUiMetadata) -> Self {
+        self.definition.ui = ui;
+        self
+    }
+
+    /// Return the generated tool definition.
+    #[must_use]
+    pub const fn definition(&self) -> &ToolDefinition {
+        &self.definition
     }
 }
 
@@ -237,6 +310,18 @@ impl GenerateTextBuilder {
     #[must_use]
     pub fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
         self.agent = self.agent.max_tool_rounds(max_tool_rounds);
+        self
+    }
+
+    /// Register a typed inline SDK tool for this text-generation request.
+    #[must_use]
+    pub fn typed_tool<I, O, F>(mut self, tool: TypedTool<I, O>, handler: F) -> Self
+    where
+        I: DeserializeOwned + schemars::JsonSchema + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(I) -> std::result::Result<O, String> + Send + Sync + 'static,
+    {
+        self.agent = self.agent.typed_tool(tool, handler);
         self
     }
 
@@ -370,6 +455,18 @@ impl StreamTextBuilder {
     #[must_use]
     pub fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
         self.agent = self.agent.max_tool_rounds(max_tool_rounds);
+        self
+    }
+
+    /// Register a typed inline SDK tool for this streaming request.
+    #[must_use]
+    pub fn typed_tool<I, O, F>(mut self, tool: TypedTool<I, O>, handler: F) -> Self
+    where
+        I: DeserializeOwned + schemars::JsonSchema + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(I) -> std::result::Result<O, String> + Send + Sync + 'static,
+    {
+        self.agent = self.agent.typed_tool(tool, handler);
         self
     }
 
@@ -3894,6 +3991,36 @@ impl AgentBuilder {
     pub fn provider_round_planner(mut self, planner: Arc<dyn ProviderRoundPlanner>) -> Self {
         self.provider_round_planner = planner;
         self
+    }
+
+    /// Register a typed inline SDK tool.
+    ///
+    /// The input schema is derived from `I`. Invocation arguments are decoded before the handler
+    /// runs, and the `O` result is serialized for both model-visible text and structured consumers.
+    #[must_use]
+    pub fn typed_tool<I, O, F>(self, tool: TypedTool<I, O>, handler: F) -> Self
+    where
+        I: DeserializeOwned + schemars::JsonSchema + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(I) -> std::result::Result<O, String> + Send + Sync + 'static,
+    {
+        self.inline_tool(tool.definition, move |request| {
+            let input = serde_json::from_value(request.arguments)
+                .map_err(|error| format!("invalid typed tool arguments: {error}"))?;
+            let output = handler(input)?;
+            let value = serde_json::to_value(output)
+                .map_err(|error| format!("failed to serialize typed tool result: {error}"))?;
+            let encoded = serde_json::to_string(&value)
+                .map_err(|error| format!("failed to encode typed tool result: {error}"))?;
+            Ok(ToolInvocationResponse {
+                output: encoded.clone(),
+                is_error: false,
+                content: Vec::new(),
+                full_output: None,
+                host_action: None,
+                result: Some(ToolInvocationResult::Json { value: encoded }),
+            })
+        })
     }
 
     /// Register an inline SDK tool.
