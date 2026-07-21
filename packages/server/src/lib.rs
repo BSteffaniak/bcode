@@ -25681,11 +25681,20 @@ library = "test"
                 .await
                 .expect("permission history"),
         );
-        assert!(permission_snapshot.permissions.iter().any(|permission| {
-            permission.permission_id == "web-route-permission"
-                && permission.resolved
-                && permission.approved == Some(true)
-        }));
+        assert!(permission_snapshot.permissions.is_empty());
+        assert!(
+            permission_snapshot
+                .transcript
+                .items
+                .iter()
+                .any(|item| matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                        if permission.permission_id == "web-route-permission"
+                            && permission.resolved
+                            && permission.approved == Some(true)
+                ))
+        );
         server.abort();
     }
 
@@ -26018,11 +26027,14 @@ library = "test"
             .await
             .expect("permission history");
         let snapshot = bcode_session_view::build_session_view_snapshot(&history);
-        assert!(snapshot.permissions.iter().any(|permission| {
-            permission.permission_id == "permission-ipc"
-                && permission.resolved
-                && permission.approved == Some(true)
-        }));
+        assert!(snapshot.permissions.is_empty());
+        assert!(snapshot.transcript.items.iter().any(|item| matches!(
+            &item.kind,
+            bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                if permission.permission_id == "permission-ipc"
+                    && permission.resolved
+                    && permission.approved == Some(true)
+        )));
         server.abort();
     }
 

@@ -1252,6 +1252,7 @@ impl AgentRuntime {
     {
         validate_tool_host_context(host_context)?;
         request.tool_call_policy.parallel &= options.parallel;
+        let negotiated_parallel_policy = request.tool_call_policy.parallel;
         let mut rounds = ToolRoundState::new(request.max_tool_rounds);
         let turn_cancellation = request.cancellation.clone();
         let started = Instant::now();
@@ -1278,7 +1279,7 @@ impl AgentRuntime {
                 &turn_cancellation,
                 started,
                 timeout,
-                options.parallel,
+                negotiated_parallel_policy,
                 scope,
             )
             .await?;
@@ -2060,7 +2061,7 @@ async fn run_planned_provider_round<P, R>(
     turn_cancellation: &CancellationToken,
     started: Instant,
     timeout: Duration,
-    parallel_tool_calls: bool,
+    negotiated_parallel_policy: bool,
     scope: &TurnScope,
 ) -> Result<PlannedProviderRound>
 where
@@ -2104,7 +2105,7 @@ where
                 .await?;
         }
         proposed_request = request;
-        proposed_request.tool_call_policy.parallel &= parallel_tool_calls;
+        proposed_request.tool_call_policy.parallel = negotiated_parallel_policy;
         proposed_request.timeout = remaining_turn_duration(started, timeout)?;
         proposed_request.cancellation = turn_cancellation.clone();
         match runtime

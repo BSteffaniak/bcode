@@ -4809,11 +4809,14 @@ mod tests {
             item.kind(),
             super::super::transcript::TranscriptItemKind::PermissionResult { approved: true }
         )));
-        assert!(shared.permissions.iter().any(|permission| {
-            permission.permission_id == "permission-1"
-                && permission.resolved
-                && permission.approved == Some(true)
-        }));
+        assert!(shared.permissions.is_empty());
+        assert!(shared.transcript.items.iter().any(|item| matches!(
+            &item.kind,
+            bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                if permission.permission_id == "permission-1"
+                    && permission.resolved
+                    && permission.approved == Some(true)
+        )));
         assert_eq!(
             app.runtime_work.status_label().as_deref(),
             Some("running tool: shell — halfway")
