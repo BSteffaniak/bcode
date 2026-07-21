@@ -565,12 +565,12 @@ if ! grep -F 'RuntimePhaseDuration::start("preparation", Some(provider_round))' 
 fi
 
 if ! grep -F 'pub struct ParallelToolCallCapabilities' packages/model/src/lib.rs >/dev/null ||
-   ! grep -F 'requested && self.provider && self.model && self.canonical_runtime' packages/model/src/lib.rs >/dev/null ||
-   ! grep -F 'parallel_tool_policy_requires_intent_provider_model_and_canonical_runtime' packages/model/src/lib.rs >/dev/null ||
+   ! grep -F 'requested && self.provider && self.model && self.runtime' packages/model/src/lib.rs >/dev/null ||
+   ! grep -F 'parallel_tool_policy_requires_intent_provider_model_and_runtime' packages/model/src/lib.rs >/dev/null ||
    ! grep -F 'provider_registry_negotiates_parallel_only_when_provider_and_model_support_it' packages/bcode/tests/provider_defaults.rs >/dev/null ||
    ! grep -F 'sdk_parallel_signal_falls_back_when_one_capability_is_missing' packages/bcode/tests/provider_tool_loop.rs >/dev/null ||
    ! grep -F 'changing_model_after_capability_resolution_invalidates_parallel_signal' packages/bcode/tests/provider_tool_loop.rs >/dev/null ||
-   ! grep -F 'duplicate_server_loop_never_advertises_parallel_before_canonical_delegation' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'server_parallel_policy_requires_intent_provider_model_and_runtime_support' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'unknown_model_is_not_upgraded_to_parallel_tool_calls' packages/model-catalog/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: parallel tool-call capability negotiation was weakened." >&2
   violations=1
@@ -586,8 +586,8 @@ fi
 if ! grep -F 'parallel_tool_calls: bool' packages/model-catalog/models/src/lib.rs >/dev/null ||
    ! grep -F 'ModelCapability::ParallelToolCalls' packages/model-catalog/src/lib.rs >/dev/null ||
    ! grep -F 'ProviderCapability::ParallelToolCalls' plugins/fake-provider-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'known_parallel_tool_provider' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'parallel_tool_provider_capability_requires_known_backend' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ProviderCapability::ParallelToolCalls' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'capabilities_advertise_parallel_tool_transport_support' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'ProviderCapability::ParallelToolCalls' plugins/bedrock-provider-plugin/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: provider/model parallel capability advertisements were removed." >&2
   violations=1

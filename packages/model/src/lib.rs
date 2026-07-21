@@ -1296,8 +1296,8 @@ pub struct ParallelToolCallCapabilities {
     pub provider: bool,
     /// Selected model advertises parallel tool-call support.
     pub model: bool,
-    /// Host uses canonical scheduling, authorization, and cancellation for this request.
-    pub canonical_runtime: bool,
+    /// Host runtime can safely authorize, schedule, cancel, and order a parallel tool batch.
+    pub runtime: bool,
 }
 
 impl ParallelToolCallCapabilities {
@@ -1305,7 +1305,7 @@ impl ParallelToolCallCapabilities {
     #[must_use]
     pub const fn negotiate(self, requested: bool, choice: ToolChoice) -> ToolCallRequestPolicy {
         ToolCallRequestPolicy {
-            parallel: requested && self.provider && self.model && self.canonical_runtime,
+            parallel: requested && self.provider && self.model && self.runtime,
             choice,
         }
     }
@@ -1882,11 +1882,11 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_policy_requires_intent_provider_model_and_canonical_runtime() {
+    fn parallel_tool_policy_requires_intent_provider_model_and_runtime() {
         let ready = ParallelToolCallCapabilities {
             provider: true,
             model: true,
-            canonical_runtime: true,
+            runtime: true,
         };
         assert!(ready.negotiate(true, ToolChoice::Auto).parallel);
         assert!(!ready.negotiate(false, ToolChoice::Auto).parallel);
@@ -1900,7 +1900,7 @@ mod tests {
                 ..ready
             },
             ParallelToolCallCapabilities {
-                canonical_runtime: false,
+                runtime: false,
                 ..ready
             },
         ] {

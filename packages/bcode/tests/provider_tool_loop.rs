@@ -208,7 +208,7 @@ fn agent_builder(invoker: Arc<ParallelInvoker>) -> bcode::AgentBuilder {
         .parallel_tool_capabilities(bcode_model::ParallelToolCallCapabilities {
             provider: true,
             model: true,
-            canonical_runtime: true,
+            runtime: true,
         })
         .inline_tool(definition("first"), |_| {
             unreachable!("custom invoker routes tools")
@@ -318,7 +318,7 @@ async fn sdk_parallel_signal_falls_back_when_one_capability_is_missing() {
         .parallel_tool_capabilities(bcode_model::ParallelToolCallCapabilities {
             provider: true,
             model: false,
-            canonical_runtime: true,
+            runtime: true,
         })
         .build();
 
@@ -379,7 +379,7 @@ async fn high_level_run_executes_provider_batch_once_and_returns_results_in_prov
 }
 
 #[tokio::test]
-async fn high_level_run_preserves_tool_hooks_through_canonical_runtime_observer() {
+async fn high_level_run_preserves_tool_hooks_through_runtime_observer() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut provider = BatchProvider::new(requests);
     let (invoker, _) = invoker();

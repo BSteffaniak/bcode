@@ -216,11 +216,36 @@ fn capabilities_from_modalities<'a>(
         text_input: input.iter().any(|m| m.eq_ignore_ascii_case("text")),
         image_input: input.iter().any(|m| m.eq_ignore_ascii_case("image")),
         text_output: output.iter().any(|m| m.eq_ignore_ascii_case("text")),
-        tool_use: false,
-        parallel_tool_calls: false,
+        // xAI documents function calling, including parallel function calling, for its language
+        // model API: https://docs.x.ai/docs/guides/function-calling#parallel-function-calling.
+        // This discovery module only consumes `/v1/language-models`, so every model represented
+        // here belongs to that documented API surface.
+        tool_use: true,
+        parallel_tool_calls: true,
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,
         native_web_search: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovered_xai_language_models_advertise_documented_tool_capabilities() {
+        let capabilities = capabilities_from_modalities(["text"].into_iter(), ["text"].into_iter());
+
+        assert!(capabilities.tool_use);
+        assert!(capabilities.parallel_tool_calls);
+    }
+
+    #[test]
+    fn documented_tool_capabilities_do_not_depend_on_optional_modality_metadata() {
+        let capabilities = capabilities_from_modalities(std::iter::empty(), std::iter::empty());
+
+        assert!(capabilities.tool_use);
+        assert!(capabilities.parallel_tool_calls);
     }
 }

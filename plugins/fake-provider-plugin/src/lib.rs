@@ -229,7 +229,9 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        FAKE_LAST_PARALLEL_TOOL_POLICY.store(request.tool_call_policy.parallel, Ordering::Release);
+        if let Some(error) = validate_fake_parallel_tool_policy(&request) {
+            return error;
+        }
         let is_compaction_request = request
             .metadata
             .get("bcode_request_kind")
@@ -387,6 +389,24 @@ impl FakeTurnWorker {
             finish_fake_turn(&self.turn, self.text, self.request_input_tokens);
         }
     }
+}
+
+fn validate_fake_parallel_tool_policy(request: &ModelTurnRequest) -> Option<ServiceResponse> {
+    FAKE_LAST_PARALLEL_TOOL_POLICY.store(request.tool_call_policy.parallel, Ordering::Release);
+    let expected = request
+        .provider_context
+        .settings
+        .get("fake_expected_parallel_tool_policy")
+        .and_then(|value| value.parse::<bool>().ok())?;
+    (request.tool_call_policy.parallel != expected).then(|| {
+        ServiceResponse::error(
+            "unexpected_parallel_tool_policy",
+            format!(
+                "expected parallel tool policy {expected}, received {}",
+                request.tool_call_policy.parallel
+            ),
+        )
+    })
 }
 
 fn finish_fake_turn(turn: &FakeTurn, text: String, request_input_tokens: u64) {

@@ -13570,7 +13570,7 @@ async fn build_model_turn_request(
         provider_plugin_id,
         &model_id,
         &selection.provider_context,
-        false,
+        true,
     )
     .await;
     let request = ModelTurnRequest {
@@ -13923,7 +13923,7 @@ async fn resolve_parallel_tool_call_capabilities(
     provider_plugin_id: Option<&str>,
     selected_model_id: &str,
     provider_context: &bcode_model::ProviderRequestContext,
-    canonical_runtime: bool,
+    runtime: bool,
 ) -> bcode_model::ParallelToolCallCapabilities {
     let provider = if let Some(provider_plugin_id) = provider_plugin_id {
         state
@@ -13953,7 +13953,12 @@ async fn resolve_parallel_tool_call_capabilities(
     )
     .await
     .ok()
-    .and_then(|models| select_model_info(&models.models, Some(selected_model_id)))
+    .and_then(|models| {
+        models
+            .models
+            .into_iter()
+            .find(|model| model.model_id == selected_model_id)
+    })
     .is_some_and(|model| {
         model
             .capabilities
@@ -13962,7 +13967,7 @@ async fn resolve_parallel_tool_call_capabilities(
     bcode_model::ParallelToolCallCapabilities {
         provider,
         model,
-        canonical_runtime,
+        runtime,
     }
 }
 
@@ -20397,9 +20402,31 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn duplicate_server_loop_never_advertises_parallel_before_canonical_delegation() {
+    async fn server_parallel_policy_requires_intent_provider_model_and_runtime_support() {
         let state = test_server_state_with_fake_provider(SessionManager::default());
-        let capabilities = resolve_parallel_tool_call_capabilities(
+        let supported = resolve_parallel_tool_call_capabilities(
+            &state,
+            Some("bcode.fake-provider"),
+            "fake-echo",
+            &bcode_model::ProviderRequestContext::default(),
+            true,
+        )
+        .await;
+        assert!(supported.provider);
+        assert!(supported.model);
+        assert!(supported.runtime);
+        assert!(
+            supported
+                .negotiate(true, bcode_model::ToolChoice::Auto)
+                .parallel
+        );
+        assert!(
+            !supported
+                .negotiate(false, bcode_model::ToolChoice::Auto)
+                .parallel
+        );
+
+        let without_runtime = resolve_parallel_tool_call_capabilities(
             &state,
             Some("bcode.fake-provider"),
             "fake-echo",
@@ -20407,14 +20434,156 @@ library = "test"
             false,
         )
         .await;
-        assert!(capabilities.provider);
-        assert!(capabilities.model);
-        assert!(!capabilities.canonical_runtime);
+        assert!(without_runtime.provider);
+        assert!(without_runtime.model);
+        assert!(!without_runtime.runtime);
         assert!(
-            !capabilities
+            !without_runtime
                 .negotiate(true, bcode_model::ToolChoice::Auto)
                 .parallel
         );
+
+        let unknown_model = resolve_parallel_tool_call_capabilities(
+            &state,
+            Some("bcode.fake-provider"),
+            "unknown-model",
+            &bcode_model::ProviderRequestContext::default(),
+            true,
+        )
+        .await;
+        assert!(unknown_model.provider);
+        assert!(!unknown_model.model);
+        assert!(unknown_model.runtime);
+        assert!(
+            !unknown_model
+                .negotiate(true, bcode_model::ToolChoice::Auto)
+                .parallel
+        );
+
+        let without_provider = resolve_parallel_tool_call_capabilities(
+            &state,
+            None,
+            "fake-echo",
+            &bcode_model::ProviderRequestContext::default(),
+            true,
+        )
+        .await;
+        assert!(!without_provider.provider);
+        assert!(
+            !without_provider
+                .negotiate(true, bcode_model::ToolChoice::Auto)
+                .parallel
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_model_turn_sends_negotiated_parallel_policy_to_provider() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("parallel policy".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "observe parallel policy".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("trigger");
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([(
+                "fake_expected_parallel_tool_policy".to_owned(),
+                "true".to_owned(),
+            )]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        let state = test_server_state_with_fake_provider(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                provider_context: provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                selected_model_id: Some("fake-echo".to_owned()),
+                provider_context,
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn daemon_model_turn_disables_provider_parallel_policy_when_execution_is_sequential() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("sequential policy".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "observe sequential policy".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("trigger");
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([(
+                "fake_expected_parallel_tool_policy".to_owned(),
+                "false".to_owned(),
+            )]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.tool_execution.parallel = false;
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                provider_context: provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                selected_model_id: Some("fake-echo".to_owned()),
+                provider_context,
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
     }
 
     #[tokio::test]

@@ -103,7 +103,7 @@ fn provider_registry_negotiates_parallel_only_when_provider_and_model_support_it
             },
         );
     let negotiated = registry.parallel_tool_capabilities(&selector);
-    assert!(negotiated.provider && negotiated.model && negotiated.canonical_runtime);
+    assert!(negotiated.provider && negotiated.model && negotiated.runtime);
 
     let without_provider = ProviderRegistry::new().provider_models(
         "example.provider",

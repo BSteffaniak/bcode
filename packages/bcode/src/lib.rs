@@ -2940,7 +2940,7 @@ impl ProviderRegistry {
         bcode_model::ParallelToolCallCapabilities {
             provider,
             model,
-            canonical_runtime: true,
+            runtime: true,
         }
     }
 
@@ -4723,7 +4723,7 @@ impl Agent {
             request.tool_call_policy = bcode_model::ParallelToolCallCapabilities {
                 provider,
                 model,
-                canonical_runtime: true,
+                runtime: true,
             }
             .negotiate(
                 self.execution_options.parallel,
@@ -5013,7 +5013,7 @@ impl Default for AgentBuilder {
             execution_options: ToolExecutionOptions::default(),
             tool_choice: ToolChoice::Auto,
             parallel_tool_capabilities: bcode_model::ParallelToolCallCapabilities {
-                canonical_runtime: true,
+                runtime: true,
                 ..bcode_model::ParallelToolCallCapabilities::default()
             },
             tool_failure_policy: ToolFailurePolicy::FailTurn,

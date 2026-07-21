@@ -488,6 +488,10 @@ impl OpenAiCompatibleDialect {
         self.supports_native_conversation_reuse()
     }
 
+    const fn supports_parallel_tool_policy(self) -> bool {
+        matches!(self, Self::ResponsesApi | Self::ChatGptCodex)
+    }
+
     const fn uses_codex_request_shape(self) -> bool {
         matches!(self, Self::ChatGptCodex)
     }
@@ -2874,18 +2878,12 @@ async fn resolve_model_id_for_turn(
     settings.fallback_model.clone()
 }
 
-async fn send_chat_completion_request(
-    client: &Client,
+fn build_chat_completion_request(
     settings: &Settings,
-    api_key: &str,
     request: &ModelTurnRequest,
     model_id: &str,
-) -> Result<reqwest::Response, ProviderError> {
-    let url = format!(
-        "{}/chat/completions",
-        settings.base_url.trim_end_matches('/')
-    );
-    let request_body = ChatCompletionRequest {
+) -> Result<ChatCompletionRequest, ProviderError> {
+    Ok(ChatCompletionRequest {
         model: model_id.to_string(),
         messages: model_messages_to_chat_messages(request),
         stream: true,
@@ -2901,12 +2899,29 @@ async fn send_chat_completion_request(
         max_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
         stop: request.parameters.stop_sequences.clone(),
-        reasoning_effort: request.parameters.reasoning_effort.map(|e| match e {
-            bcode_model::ReasoningEffort::Low => "low".to_string(),
-            bcode_model::ReasoningEffort::Medium => "medium".to_string(),
-            bcode_model::ReasoningEffort::High => "high".to_string(),
-        }),
-    };
+        reasoning_effort: request
+            .parameters
+            .reasoning_effort
+            .map(|effort| match effort {
+                bcode_model::ReasoningEffort::Low => "low".to_string(),
+                bcode_model::ReasoningEffort::Medium => "medium".to_string(),
+                bcode_model::ReasoningEffort::High => "high".to_string(),
+            }),
+    })
+}
+
+async fn send_chat_completion_request(
+    client: &Client,
+    settings: &Settings,
+    api_key: &str,
+    request: &ModelTurnRequest,
+    model_id: &str,
+) -> Result<reqwest::Response, ProviderError> {
+    let url = format!(
+        "{}/chat/completions",
+        settings.base_url.trim_end_matches('/')
+    );
+    let request_body = build_chat_completion_request(settings, request, model_id)?;
     let response = client
         .post(url)
         .bearer_auth(api_key)
@@ -3767,10 +3782,9 @@ fn build_responses_request(
         .collect(),
         tools: model_tools_to_responses_tools(request, settings.dialect)?,
         tool_choice: openai_tool_choice(request, true),
-        parallel_tool_calls: settings
-            .dialect
-            .uses_codex_request_shape()
-            .then_some(request.tool_call_policy.parallel),
+        parallel_tool_calls: (!request.tools.is_empty()
+            && settings.dialect.supports_parallel_tool_policy())
+        .then_some(request.tool_call_policy.parallel),
         text: responses_text_options(settings, request),
         reasoning: responses_reasoning_options(settings, request),
         include: responses_include(settings.dialect.reasoning_request_shape(), request),
@@ -4700,22 +4714,16 @@ fn openai_tool_name(name: &str) -> String {
         .collect()
 }
 
-fn known_parallel_tool_provider(provider_id: Option<&str>) -> bool {
-    matches!(provider_id, Some("openai" | "xai"))
-}
-
 fn capabilities() -> ProviderCapabilities {
     let settings = settings();
-    let mut capabilities = BTreeSet::from([
+    let capabilities = BTreeSet::from([
         ProviderCapability::Streaming,
         ProviderCapability::Cancellation,
         ProviderCapability::Tools,
+        ProviderCapability::ParallelToolCalls,
         ProviderCapability::PromptCaching,
         ProviderCapability::NativeWebSearch,
     ]);
-    if known_parallel_tool_provider(catalog_provider_id(&settings)) {
-        capabilities.insert(ProviderCapability::ParallelToolCalls);
-    }
     ProviderCapabilities {
         provider_id: PROVIDER_ID.to_string(),
         display_name: "OpenAI-Compatible (xAI, Grok, OpenAI, Groq, ...)".to_string(),
@@ -4823,10 +4831,22 @@ fn model_list_request(request: &ServiceRequest) -> ModelListRequest {
 }
 
 fn apply_provider_static_metadata(settings: &Settings, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
-    if catalog_provider_id(settings) != Some("xai") {
-        return models;
-    }
-    models.into_iter().map(apply_xai_static_metadata).collect()
+    let provider_id = catalog_provider_id(settings);
+    models
+        .into_iter()
+        .map(|mut model| {
+            if matches!(provider_id, Some("openai" | "xai")) {
+                model.capabilities.extend([
+                    ModelCapability::ToolCalls,
+                    ModelCapability::ParallelToolCalls,
+                ]);
+            }
+            if provider_id == Some("xai") {
+                model = apply_xai_static_metadata(model);
+            }
+            model
+        })
+        .collect()
 }
 
 fn apply_xai_static_metadata(mut model: ModelInfo) -> ModelInfo {
@@ -6694,11 +6714,62 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_provider_capability_requires_known_backend() {
-        assert!(known_parallel_tool_provider(Some("openai")));
-        assert!(known_parallel_tool_provider(Some("xai")));
-        assert!(!known_parallel_tool_provider(None));
-        assert!(!known_parallel_tool_provider(Some("custom-proxy")));
+    fn capabilities_advertise_parallel_tool_transport_support() {
+        assert!(
+            capabilities()
+                .capabilities
+                .contains(&ProviderCapability::ParallelToolCalls)
+        );
+    }
+
+    #[test]
+    fn openai_model_candidates_advertise_parallel_tool_support() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let models = apply_provider_static_metadata(
+            &settings,
+            model_infos_from_ids(&["model".to_owned()], Some("model")),
+        );
+
+        assert!(
+            models[0]
+                .capabilities
+                .contains(&ModelCapability::ParallelToolCalls)
+        );
+    }
+
+    #[test]
+    fn xai_model_candidates_advertise_documented_tool_capabilities() {
+        let mut settings =
+            test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        settings.base_url = DEFAULT_XAI_BASE_URL.to_owned();
+        let models = apply_provider_static_metadata(
+            &settings,
+            model_infos_from_ids(&["grok-4.5".to_owned()], Some("grok-4.5")),
+        );
+
+        assert!(models[0].capabilities.contains(&ModelCapability::ToolCalls));
+        assert!(
+            models[0]
+                .capabilities
+                .contains(&ModelCapability::ParallelToolCalls)
+        );
+    }
+
+    #[test]
+    fn custom_backend_model_candidates_do_not_assume_parallel_tool_support() {
+        let mut settings =
+            test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        settings.base_url = "https://custom.example/v1".to_owned();
+        let models = apply_provider_static_metadata(
+            &settings,
+            model_infos_from_ids(&["model".to_owned()], Some("model")),
+        );
+
+        assert!(
+            !models[0]
+                .capabilities
+                .contains(&ModelCapability::ParallelToolCalls)
+        );
     }
 
     fn model_item(id: &str, created: i64) -> ModelResponseItem {
@@ -6906,6 +6977,16 @@ mod tests {
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
             metadata: BTreeMap::new(),
         }
+    }
+
+    fn test_request_with_tool(messages: Vec<ModelMessage>) -> ModelTurnRequest {
+        let mut request = test_request(messages);
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "lookup".to_string(),
+            description: "Lookup data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request
     }
 
     fn auth_candidate(profile: &str) -> ProviderAuthCandidate {
@@ -7649,6 +7730,76 @@ mod tests {
     }
 
     #[test]
+    fn chat_completions_request_maps_typed_parallel_tool_policy() {
+        let mut request = test_request(Vec::new());
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "lookup".to_string(),
+            description: "Lookup data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let settings = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+
+        let body = serde_json::to_value(
+            build_chat_completion_request(&settings, &request, "model")
+                .expect("request should build"),
+        )
+        .expect("request should encode");
+
+        assert_eq!(
+            body.get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_disables_parallel_calls_when_typed_policy_is_false() {
+        let mut request = test_request(Vec::new());
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "lookup".to_string(),
+            description: "Lookup data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.tool_call_policy.parallel = false;
+        let settings = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+
+        let body = serde_json::to_value(
+            build_chat_completion_request(&settings, &request, "model")
+                .expect("request should build"),
+        )
+        .expect("request should encode");
+
+        assert_eq!(
+            body.get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_omits_parallel_policy_without_tools() {
+        let request = test_request(Vec::new());
+        let settings = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+
+        let body = serde_json::to_value(
+            build_chat_completion_request(&settings, &request, "model")
+                .expect("request should build"),
+        )
+        .expect("request should encode");
+
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn chatgpt_codex_request_does_not_send_previous_response_id() {
         let mut request = test_request(vec![
             text_message(MessageRole::User, "old"),
@@ -7693,12 +7844,7 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("auto")
         );
-        assert_eq!(
-            encoded
-                .get("parallel_tool_calls")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
+        assert!(encoded.get("parallel_tool_calls").is_none());
     }
 
     #[test]
@@ -7783,8 +7929,8 @@ mod tests {
 
     #[test]
     fn responses_api_request_maps_typed_parallel_tool_policy() {
-        let request = test_request(vec![text_message(MessageRole::User, "hello")]);
-        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+        let request = test_request_with_tool(vec![text_message(MessageRole::User, "hello")]);
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
 
         let body =
             build_responses_request(&settings, &request, "model").expect("request should build");
@@ -7798,7 +7944,38 @@ mod tests {
 
     #[test]
     fn responses_api_request_disables_parallel_calls_when_typed_policy_is_false() {
-        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        let mut request = test_request_with_tool(vec![text_message(MessageRole::User, "hello")]);
+        request.tool_call_policy.parallel = false;
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+
+        let body =
+            build_responses_request(&settings, &request, "model").expect("request should build");
+
+        assert_eq!(
+            body.get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn chatgpt_codex_request_maps_typed_parallel_tool_policy() {
+        let request = test_request_with_tool(vec![text_message(MessageRole::User, "hello")]);
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let body =
+            build_responses_request(&settings, &request, "model").expect("request should build");
+
+        assert_eq!(
+            body.get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn chatgpt_codex_request_disables_parallel_calls_when_typed_policy_is_false() {
+        let mut request = test_request_with_tool(vec![text_message(MessageRole::User, "hello")]);
         request.tool_call_policy.parallel = false;
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
 
@@ -7810,6 +7987,17 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn responses_api_request_omits_parallel_policy_without_tools() {
+        let request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+
+        let body =
+            build_responses_request(&settings, &request, "model").expect("request should build");
+
+        assert!(body.get("parallel_tool_calls").is_none());
     }
 
     #[test]

@@ -25,6 +25,12 @@ if grep -R --include='*.rs' -nE 'gpt-5\.5|gpt-5\.6-sol' plugins/*-provider-plugi
   exit 1
 fi
 
+if ! grep -F 'discovered_xai_language_models_advertise_documented_tool_capabilities' packages/model-discovery/src/xai.rs >/dev/null ||
+   ! grep -F 'xai_model_candidates_advertise_documented_tool_capabilities' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null; then
+  echo "xAI documented tool and parallel-tool capability coverage was removed" >&2
+  exit 1
+fi
+
 count="$(grep -c 'invoke_model_provider_json_blocking::<_, ModelList>' packages/server/src/lib.rs)"
 if [[ "$count" != "1" ]]; then
   echo "expected exactly one direct server OP_MODELS invocation, found $count" >&2
