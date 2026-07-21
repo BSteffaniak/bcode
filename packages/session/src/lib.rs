@@ -163,6 +163,8 @@ fn record_ensure_loaded_duration(metrics: &MetricsRegistry, result: &str, elapse
 /// Runtime model and reasoning selections restored from a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionRuntimeSelection {
+    /// Session-specific agent id, when explicitly selected.
+    pub agent_id: Option<String>,
     /// Session-specific provider plugin id, when explicitly selected.
     pub provider_plugin_id: Option<String>,
     /// Session-specific model id, when explicitly selected.
@@ -3293,7 +3295,7 @@ impl SessionState {
             current_model: state.current_model,
             reasoning_effort: state.reasoning_effort,
             reasoning_summary: state.reasoning_summary,
-            current_agent: None,
+            current_agent: state.current_agent,
             latest_compaction_sequence: state.latest_compaction_sequence,
             context_epoch: state.latest_compaction_sequence.unwrap_or_default(),
             context_occupancy: None,
@@ -4237,12 +4239,13 @@ mod tests {
     }
 
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderContextSnapshot,
-        ProviderContextSnapshotOrigin, ProviderStreamEvent, RuntimeWorkKind, RuntimeWorkStatus,
-        SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind, SessionId,
-        SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
-        SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
-        TraceBlobRef, WorkId,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowAnchor,
+        ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
+        ProjectionWindowTarget, ProviderContextSnapshot, ProviderContextSnapshotOrigin,
+        ProviderStreamEvent, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+        SessionEventProvenance, SessionForkKind, SessionId, SessionLiveEvent, SessionLiveEventKind,
+        SessionProjectionKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+        ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef, WorkId,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -5147,6 +5150,16 @@ mod tests {
             &event.kind,
             SessionEventKind::SystemMessage { text } if text == "system"
         )));
+        let runtime_selection = restored
+            .current_runtime_selection(session.id)
+            .await
+            .expect("runtime selection should restore");
+        assert_eq!(runtime_selection.agent_id.as_deref(), Some("plan"));
+        assert_eq!(
+            runtime_selection.provider_plugin_id.as_deref(),
+            Some("provider")
+        );
+        assert_eq!(runtime_selection.model_id.as_deref(), Some("model"));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -6007,6 +6020,97 @@ mod tests {
             &events[2].kind,
             SessionEventKind::UserMessage { text, .. } if text == "message 3"
         ));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn restored_projection_windows_page_bidirectionally_without_overlap() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("projection pages".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        for index in 0..6 {
+            manager
+                .append_user_message(session.id, ClientId::new(), format!("message {index}"))
+                .await
+                .expect("message should append");
+        }
+        let request = |anchor, direction| ProjectionWindowRequest {
+            projection: SessionProjectionKind::Transcript,
+            anchor,
+            direction,
+            target: ProjectionWindowTarget {
+                min_items: Some(2),
+                min_estimated_rows: None,
+                min_bytes: None,
+                width_columns: Some(80),
+            },
+            limits: ProjectionWindowLimits {
+                max_items: 2,
+                max_events_scanned: 8,
+                max_bytes: 4096,
+            },
+        };
+
+        let latest = manager
+            .session_projection_window(
+                session.id,
+                request(
+                    ProjectionWindowAnchor::Latest,
+                    ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("latest window");
+        assert_eq!(
+            latest.source_range,
+            Some(bcode_session_models::ProjectionSourceRange {
+                start_sequence: 5,
+                end_sequence: 6,
+            })
+        );
+        assert!(latest.has_older);
+        assert!(!latest.has_newer);
+
+        let older = manager
+            .session_projection_window(
+                session.id,
+                request(
+                    ProjectionWindowAnchor::BeforeSequence(5),
+                    ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("older window");
+        assert_eq!(
+            older.source_range,
+            Some(bcode_session_models::ProjectionSourceRange {
+                start_sequence: 3,
+                end_sequence: 4,
+            })
+        );
+        assert!(older.has_older);
+        assert!(older.has_newer);
+
+        let newer = manager
+            .session_projection_window(
+                session.id,
+                request(
+                    ProjectionWindowAnchor::AfterSequence(4),
+                    ProjectionWindowDirection::Forward,
+                ),
+            )
+            .await
+            .expect("newer window");
+        assert_eq!(newer.source_range, latest.source_range);
+        assert!(newer.has_older);
+        assert!(!newer.has_newer);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

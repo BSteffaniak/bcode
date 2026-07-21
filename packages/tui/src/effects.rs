@@ -8,6 +8,8 @@ use bcode_session_models::{
     ProjectionWindowRequest, SessionForkResult, SessionHistoryCursor, SessionHistoryDirection,
     SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary, WorkId,
 };
+use bcode_session_view::execute_session_view_action;
+use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
 use bcode_skill_models::SkillId;
 use bcode_worktree_models::{WorktreeCreateRequest, WorktreeCreateResponse};
 
@@ -1217,7 +1219,19 @@ impl TuiEffect {
             },
             Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
                 session_id,
-                result: client.cancel_session_turn(session_id).await,
+                result: match execute_session_view_action(
+                    &client,
+                    SessionViewAction::CancelTurn {
+                        session_id,
+                        clear_queue: false,
+                    },
+                )
+                .await
+                {
+                    Ok(SessionViewActionOutcome::Cancelled { cancelled }) => Ok(cancelled),
+                    Ok(_) => Err(ClientError::UnexpectedResponse),
+                    Err(error) => Err(error),
+                },
             },
             Self::CycleThinkingEffort {
                 session_id,

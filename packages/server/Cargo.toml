@@ -56,12 +56,15 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-bcode_client               = { workspace = true }
+bcode_bundled_plugins = { workspace = true, features = [
+    "static-bundled-question-plugin",
+] }
+bcode_client = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_question_plugin      = { workspace = true, features = ["static-bundled"] }
-bcode_shell_plugin         = { workspace = true, features = ["static-bundled"] }
-switchy                    = { workspace = true, features = ["database", "database-schema"] }
-tempfile                   = { workspace = true }
+bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
+switchy = { workspace = true, features = ["database", "database-schema"] }
+tempfile = { workspace = true }
 
 [features]
 default          = []

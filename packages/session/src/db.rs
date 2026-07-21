@@ -304,6 +304,8 @@ pub struct SessionDbState {
     pub title: Option<String>,
     /// Current working directory.
     pub working_directory: std::path::PathBuf,
+    /// Current agent selection, if any.
+    pub current_agent: Option<String>,
     /// Current provider selection, if any.
     pub current_provider: Option<String>,
     /// Current model selection, if any.
@@ -1062,6 +1064,7 @@ impl SessionDb {
         })?;
         let has_user_message = self.input_message_count().await? > 0;
         let latest_compaction_sequence = self.latest_context_compaction_sequence().await?;
+        let current_agent = self.latest_agent_selection().await?;
         Ok(Some(SessionDbState {
             session_id: row_session_id,
             last_event_seq: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
@@ -1070,6 +1073,7 @@ impl SessionDb {
                 &row,
                 "working_directory",
             )?),
+            current_agent,
             current_provider: optional_string(&row, "current_provider"),
             current_model: optional_string(&row, "current_model"),
             reasoning_effort: optional_string(&row, "reasoning_effort"),
@@ -1081,6 +1085,28 @@ impl SessionDb {
             has_user_message,
             latest_compaction_sequence,
         }))
+    }
+
+    async fn latest_agent_selection(&self) -> SessionDbResult<Option<String>> {
+        let row = self
+            .db
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_type", "agent_changed")
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload = required_string(&row, "payload")?;
+        Ok(
+            decode_session_event_degraded(&payload).and_then(|event| match event.kind {
+                SessionEventKind::AgentChanged { agent_id } => Some(agent_id),
+                _ => None,
+            }),
+        )
     }
 
     async fn input_message_count(&self) -> SessionDbResult<usize> {

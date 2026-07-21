@@ -4,7 +4,7 @@
 
 //! `HyperChad` web renderer host for Bcode sessions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::str::FromStr as _;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -65,6 +65,7 @@ pub struct WebRenderState {
     client: BcodeClient,
     access_token: Arc<str>,
     watched_sessions: Arc<Mutex<BTreeSet<SessionId>>>,
+    history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
 }
 
@@ -117,6 +118,20 @@ enum InteractionInputKind {
 }
 
 #[derive(Debug, Deserialize)]
+struct HistoryWindowForm {
+    session_id: String,
+    direction: HistoryWindowDirection,
+    anchor_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HistoryWindowDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Debug, Deserialize)]
 struct InteractionForm {
     session_id: String,
     interaction_id: String,
@@ -136,6 +151,7 @@ impl WebRenderState {
             client,
             access_token: access_token.into(),
             watched_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            history_windows: Arc::new(Mutex::new(BTreeMap::new())),
             renderer_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -153,6 +169,7 @@ impl WebRenderState {
         let client = self.client.clone();
         let access_token = Arc::clone(&self.access_token);
         let renderer_tx = Arc::clone(&self.renderer_tx);
+        let history_windows = Arc::clone(&self.history_windows);
         let watched_sessions = Arc::clone(&self.watched_sessions);
         tokio::spawn(async move {
             if let Err(error) = Box::pin(watch_session_updates(
@@ -160,6 +177,7 @@ impl WebRenderState {
                 access_token,
                 session_id,
                 Arc::clone(&renderer_tx),
+                history_windows,
             ))
             .await
             {
@@ -226,8 +244,16 @@ impl WebRenderState {
         &self,
         session_id: bcode_session_models::SessionId,
     ) -> Result<SessionViewSnapshot, ClientError> {
+        let request = self
+            .history_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_else(web_projection_window_request);
         let mut connection = self.client.connect("bcode-web-render").await?;
-        let attached = attach_web_projection_window(&mut connection, session_id).await?;
+        let attached =
+            attach_web_projection_window_with_request(&mut connection, session_id, request).await?;
         session_view_from_attached_history(&self.client, attached).await
     }
 }
@@ -275,6 +301,9 @@ fn view_from_attached_history(attached: &AttachedSessionHistory) -> SessionView 
         runtime.reasoning_summary.clone(),
         None,
     );
+    if let Some(agent_id) = &runtime.agent_id {
+        view.set_agent_id(Some(agent_id.clone()));
+    }
     view
 }
 
@@ -336,10 +365,20 @@ async fn hydrate_pending_interactions(
 }
 
 const fn web_projection_window_request() -> ProjectionWindowRequest {
+    web_projection_window_request_for_anchor(
+        ProjectionWindowAnchor::Latest,
+        ProjectionWindowDirection::Backward,
+    )
+}
+
+const fn web_projection_window_request_for_anchor(
+    anchor: ProjectionWindowAnchor,
+    direction: ProjectionWindowDirection,
+) -> ProjectionWindowRequest {
     ProjectionWindowRequest {
         projection: SessionProjectionKind::Transcript,
-        anchor: ProjectionWindowAnchor::Latest,
-        direction: ProjectionWindowDirection::Backward,
+        anchor,
+        direction,
         target: ProjectionWindowTarget {
             min_items: Some(64),
             min_estimated_rows: None,
@@ -354,23 +393,25 @@ const fn web_projection_window_request() -> ProjectionWindowRequest {
     }
 }
 
-async fn attach_web_projection_window(
+async fn attach_web_projection_window_with_request(
     connection: &mut bcode_client::ClientConnection,
     session_id: SessionId,
+    request: ProjectionWindowRequest,
 ) -> Result<AttachedSessionHistory, ClientError> {
     connection
-        .attach_session_projection_window_with_input_history(
-            session_id,
-            web_projection_window_request(),
-        )
+        .attach_session_projection_window_with_input_history(session_id, request)
         .await
 }
 
-const fn apply_projection_window_metadata(
+fn apply_projection_window_metadata(
     snapshot: &mut SessionViewSnapshot,
     projection_window: Option<&ProjectionWindow>,
 ) {
     if let Some(window) = projection_window {
+        snapshot.transcript.source_start_sequence =
+            window.source_range.map(|range| range.start_sequence);
+        snapshot.transcript.source_end_sequence =
+            window.source_range.map(|range| range.end_sequence);
         snapshot.transcript.has_older_history = window.has_older;
         snapshot.transcript.has_newer_history = window.has_newer;
     }
@@ -407,6 +448,7 @@ pub fn router_from_state(state: WebRenderState) -> Router {
     let cancel_state = state.clone();
     let draft_state = state.clone();
     let permission_state = state.clone();
+    let history_state = state.clone();
     let interaction_state = state;
     Router::new()
         .with_route("/", move |request| {
@@ -450,6 +492,10 @@ pub fn router_from_state(state: WebRenderState) -> Router {
         .with_route("/actions/permission", move |request| {
             let state = permission_state.clone();
             async move { state.handle_permission(request).await }
+        })
+        .with_route("/actions/history-window", move |request| {
+            let state = history_state.clone();
+            async move { state.handle_history_window(request).await }
         })
         .with_route("/actions/interaction", move |request| {
             let state = interaction_state.clone();
@@ -618,6 +664,71 @@ impl WebRenderState {
                     .await
             }
         }
+    }
+
+    async fn handle_history_window(
+        &self,
+        request: RouteRequest,
+    ) -> hyperchad::template::Containers {
+        if !self.authorizes(&request) {
+            return unauthorized_page();
+        }
+        let form = match request.parse_form::<HistoryWindowForm>() {
+            Ok(form) => form,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let Some(session_id) = parse_session_id(&form.session_id) else {
+            return error_page("invalid session id");
+        };
+        let (anchor, direction) = match form.direction {
+            HistoryWindowDirection::Older => (
+                ProjectionWindowAnchor::BeforeSequence(form.anchor_sequence),
+                ProjectionWindowDirection::Backward,
+            ),
+            HistoryWindowDirection::Newer => (
+                ProjectionWindowAnchor::AfterSequence(form.anchor_sequence),
+                ProjectionWindowDirection::Forward,
+            ),
+        };
+        let request = web_projection_window_request_for_anchor(anchor, direction);
+        let mut connection = match self.client.connect("bcode-web-render-history").await {
+            Ok(connection) => connection,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let attached = match attach_web_projection_window_with_request(
+            &mut connection,
+            session_id,
+            request.clone(),
+        )
+        .await
+        {
+            Ok(attached) => attached,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let at_tail = attached
+            .projection_window
+            .as_ref()
+            .is_none_or(|window| !window.has_newer);
+        if at_tail {
+            self.history_windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&session_id);
+        } else {
+            self.history_windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id, request);
+        }
+        let snapshot = match session_view_from_attached_history(&self.client, attached).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let sessions = match self.client.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        bcode_web_render_ui::pages::home::home(&snapshot, &sessions, self.access_token())
     }
 
     async fn handle_interaction(&self, request: RouteRequest) -> hyperchad::template::Containers {
@@ -889,11 +1000,34 @@ fn browser_update_sender(
         .clone()
 }
 
+async fn watched_session_snapshot(
+    client: &BcodeClient,
+    session_id: SessionId,
+    attached: &AttachedSessionHistory,
+    view: &SessionView,
+    history_windows: &Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
+) -> Result<SessionViewSnapshot, ClientError> {
+    let history_request = history_windows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&session_id)
+        .cloned();
+    if let Some(request) = history_request {
+        let mut connection = client.connect("bcode-web-render-history-refresh").await?;
+        let historical =
+            attach_web_projection_window_with_request(&mut connection, session_id, request).await?;
+        session_view_from_attached_history(client, historical).await
+    } else {
+        Ok(snapshot_from_view(view, attached))
+    }
+}
+
 async fn watch_session_updates(
     client: BcodeClient,
     access_token: Arc<str>,
     session_id: SessionId,
     renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+    history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
 ) -> Result<(), ClientError> {
     let (mut watcher, mut attached, mut view) = loop {
         match attach_watched_session(&client, session_id).await {
@@ -980,9 +1114,12 @@ async fn watch_session_updates(
         if let Some(summary) = sessions.iter().find(|summary| summary.id == session_id) {
             attached.session.clone_from(summary);
         }
+        let snapshot =
+            watched_session_snapshot(&client, session_id, &attached, &view, &history_windows)
+                .await?;
         let update = ScopedSnapshotUpdate {
             scope: format!("{access_token}:{session_id}"),
-            snapshot: snapshot_from_view(&view, &attached),
+            snapshot,
             sessions,
         };
         let Some(sender) = browser_update_sender(&renderer_tx) else {
@@ -1047,8 +1184,58 @@ mod tests {
 
         apply_projection_window_metadata(&mut snapshot, Some(&window));
 
+        assert_eq!(snapshot.transcript.source_start_sequence, None);
+        assert_eq!(snapshot.transcript.source_end_sequence, None);
         assert!(snapshot.transcript.has_older_history);
         assert!(!snapshot.transcript.has_newer_history);
+    }
+
+    #[test]
+    fn history_window_requests_use_strict_source_anchored_directions() {
+        let older = web_projection_window_request_for_anchor(
+            ProjectionWindowAnchor::BeforeSequence(10),
+            ProjectionWindowDirection::Backward,
+        );
+        assert_eq!(older.anchor, ProjectionWindowAnchor::BeforeSequence(10));
+        assert_eq!(older.direction, ProjectionWindowDirection::Backward);
+
+        let newer = web_projection_window_request_for_anchor(
+            ProjectionWindowAnchor::AfterSequence(20),
+            ProjectionWindowDirection::Forward,
+        );
+        assert_eq!(newer.anchor, ProjectionWindowAnchor::AfterSequence(20));
+        assert_eq!(newer.direction, ProjectionWindowDirection::Forward);
+    }
+
+    #[test]
+    fn attached_runtime_selection_populates_authoritative_agent() {
+        let session_id = SessionId::new();
+        let mut attached = AttachedSessionHistory {
+            session: SessionSummary {
+                id: session_id,
+                name: Some("session".to_owned()),
+                explicit_name: Some("session".to_owned()),
+                derived_title: None,
+                title_source: bcode_session_models::SessionTitleSource::Explicit,
+                client_count: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                working_directory: std::path::PathBuf::from("/tmp"),
+                import: None,
+                fork: None,
+            },
+            history: Vec::new(),
+            input_history: Vec::new(),
+            import_warnings: Vec::new(),
+            draft: None,
+            runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
+            projection_window: None,
+        };
+        attached.runtime_selection.agent_id = Some("build".to_owned());
+
+        let snapshot = snapshot_from_attached_history(&attached);
+
+        assert_eq!(snapshot.runtime.agent_id.as_deref(), Some("build"));
     }
 
     #[test]

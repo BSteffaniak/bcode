@@ -100,6 +100,14 @@ impl SessionView {
         self.bump_revision();
     }
 
+    /// Replace attached agent selection supplied by the daemon.
+    pub fn set_agent_id(&mut self, agent_id: Option<String>) {
+        if self.snapshot.runtime.agent_id != agent_id {
+            self.snapshot.runtime.agent_id = agent_id;
+            self.bump_revision();
+        }
+    }
+
     /// Insert or replace an authoritative pending permission hydrated from the daemon.
     pub fn upsert_permission(&mut self, permission: bcode_session_view_models::PermissionView) {
         let existing = self
@@ -1228,7 +1236,8 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, InteractiveToolRenderTarget,
         InteractiveToolTurnBehavior, LocalContextEstimate, ModelRequestIdentity,
         RequestContextObservation, RequestContextTokenCount, SessionEvent, SessionEventKind,
-        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTokenUsage, ToolOutputStream,
+        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTokenUsage, ToolInvocationResult,
+        ToolOutputStream,
     };
     use std::path::PathBuf;
 
@@ -1808,6 +1817,90 @@ mod tests {
             TranscriptViewItemKind::AssistantMessage { message }
                 if message.text == "hello world again"
         ));
+    }
+
+    #[test]
+    fn durable_results_reconcile_cumulative_live_state_without_losing_it_early() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "tool-1".to_owned(),
+                producer_plugin_id: Some("shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+                request_visual: None,
+                legacy_request_presentation: None,
+            },
+        ));
+        for text in ["live ", "answer"] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "turn-1".to_owned(),
+                    text: text.to_owned(),
+                },
+            });
+        }
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolOutputDelta {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "tool-1".to_owned(),
+                    sequence: 1,
+                    stream: ToolOutputStream::Stdout,
+                    text: "live output".to_owned(),
+                    byte_len: 11,
+                },
+            },
+        });
+
+        assert!(matches!(
+            &view.snapshot().transcript.items[1].kind,
+            TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "live answer"
+        ));
+        assert_eq!(
+            view.snapshot()
+                .tools
+                .get("tool-1")
+                .and_then(|tool| tool.output.as_ref())
+                .map(|output| output.text.as_str()),
+            Some("live output")
+        );
+
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "durable answer".to_owned(),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "tool-1".to_owned(),
+                result: "durable output".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::Text {
+                    text: "durable output".to_owned(),
+                }),
+            },
+        ));
+
+        assert!(matches!(
+            &view.snapshot().transcript.items[1].kind,
+            TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "durable answer"
+        ));
+        let tool = view.snapshot().tools.get("tool-1").expect("tool");
+        assert_eq!(tool.status, ToolInvocationViewStatus::Finished);
+        assert_eq!(tool.result_text.as_deref(), Some("durable output"));
     }
 
     #[test]

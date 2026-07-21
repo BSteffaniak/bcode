@@ -221,6 +221,12 @@ pub struct TranscriptViewDocument {
     pub revision: ViewRevision,
     /// Ordered transcript items.
     pub items: Vec<TranscriptViewItem>,
+    /// First source event sequence covered by this bounded window.
+    #[serde(default)]
+    pub source_start_sequence: Option<u64>,
+    /// Last source event sequence covered by this bounded window.
+    #[serde(default)]
+    pub source_end_sequence: Option<u64>,
     /// Whether older history exists before this document window.
     pub has_older_history: bool,
     /// Whether newer history exists after this document window.

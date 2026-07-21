@@ -42,7 +42,8 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+bcode_ipc = { workspace = true }
+tokio     = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 actix            = ["hyperchad/renderer-html-actix"]

@@ -559,6 +559,8 @@ pub struct DaemonStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeSelection {
     #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
     pub provider_plugin_id: Option<String>,
     /// User-facing requested model id.
     #[serde(default)]
@@ -2451,6 +2453,24 @@ mod tests {
                 u8::from_str_radix(&hex[index..index + 2], 16).map_err(|error| error.to_string())
             })
             .collect()
+    }
+
+    #[test]
+    fn session_runtime_selection_round_trips_agent_identity() {
+        let selection = SessionRuntimeSelection {
+            agent_id: Some("build".to_owned()),
+            provider_plugin_id: Some("provider".to_owned()),
+            requested_model_id: Some("requested".to_owned()),
+            effective_model_id: Some("effective".to_owned()),
+            model_id: Some("requested".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            reasoning_summary: Some("detailed".to_owned()),
+        };
+
+        let encoded = encode(&selection).expect("selection should encode");
+        let decoded: SessionRuntimeSelection = decode(&encoded).expect("selection should decode");
+
+        assert_eq!(decoded, selection);
     }
 
     #[test]

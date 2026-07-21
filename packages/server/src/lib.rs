@@ -2726,6 +2726,8 @@ async fn handle_agent_permission_plugin_request(
         | Request::ResolvePermission { .. }
         | Request::ResolvePermissionBatch { .. }
         | Request::ListInteractiveToolRequests
+        | Request::GetInteractionSnapshot { .. }
+        | Request::SubmitInteractionInput { .. }
         | Request::ResolveInteractiveToolRequest { .. } => {
             handle_permission_interaction_request(request, request_id, state, writer).await
         }
@@ -6030,7 +6032,8 @@ async fn handle_attach_session(
             .await?;
             let sink = ClientEventSink::new(client_id, writer.clone(), state.metrics.clone());
             send_active_artifact_snapshots(state, session_id, &sink).await?;
-            let handle = forward_session_events(sink, attachment.events, attachment.live_events);
+            let handle =
+                forward_session_events(sink, session_id, attachment.events, attachment.live_events);
             state.register_client_forwarder(client_id, handle).await;
             Ok(())
         }
@@ -6308,7 +6311,8 @@ async fn finish_attach_session_projection_window_success(
         state.metrics.clone(),
     );
     send_active_artifact_snapshots(state, session_id, &sink).await?;
-    let handle = forward_session_events(sink, attachment.events, attachment.live_events);
+    let handle =
+        forward_session_events(sink, session_id, attachment.events, attachment.live_events);
     state
         .register_client_forwarder(context.client_id, handle)
         .await;
@@ -6397,7 +6401,8 @@ async fn finish_attach_session_recent_success(
         state.metrics.clone(),
     );
     send_active_artifact_snapshots(state, session_id, &sink).await?;
-    let handle = forward_session_events(sink, attachment.events, attachment.live_events);
+    let handle =
+        forward_session_events(sink, session_id, attachment.events, attachment.live_events);
     state
         .register_client_forwarder(context.client_id, handle)
         .await;
@@ -12989,6 +12994,7 @@ async fn session_model_selection(
         return selection.clone();
     }
     let fallback_runtime_selection = || bcode_session::SessionRuntimeSelection {
+        agent_id: None,
         provider_plugin_id: state.selected_provider_plugin_id.clone(),
         model_id: state.selected_model_id.clone(),
         reasoning_effort: state.selected_reasoning.effort.clone(),
@@ -13078,6 +13084,7 @@ async fn session_runtime_selection_payload(
         .current_runtime_selection(session_id)
         .await
         .map(|selection| bcode_ipc::SessionRuntimeSelection {
+            agent_id: selection.agent_id,
             provider_plugin_id: selection
                 .provider_plugin_id
                 .as_deref()
@@ -18824,6 +18831,7 @@ async fn send_active_artifact_snapshots(
 
 fn forward_session_events(
     sink: ClientEventSink,
+    session_id: SessionId,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
     mut live_events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionLiveEvent>,
 ) -> JoinHandle<()> {
@@ -18832,17 +18840,49 @@ fn forward_session_events(
             let event = tokio::select! {
                 durable = events.recv() => match durable {
                     Ok(event) => Event::Session(event),
-                    Err(
-                        tokio::sync::broadcast::error::RecvError::Lagged(_)
-                        | tokio::sync::broadcast::error::RecvError::Closed,
-                    ) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            client_id = %sink.client_id(),
+                            %session_id,
+                            skipped,
+                            "durable session event subscriber lagged; requesting renderer resync"
+                        );
+                        if let Err(error) = sink
+                            .send(Event::SessionViewResyncRequired { session_id })
+                            .await
+                            && !is_expected_disconnect(&error)
+                        {
+                            tracing::warn!(
+                                "failed to request session resync from {}: {error}",
+                                sink.client_id()
+                            );
+                        }
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 live = live_events.recv() => match live {
                     Ok(event) => Event::SessionLive(event),
-                    Err(
-                        tokio::sync::broadcast::error::RecvError::Lagged(_)
-                        | tokio::sync::broadcast::error::RecvError::Closed,
-                    ) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            client_id = %sink.client_id(),
+                            %session_id,
+                            skipped,
+                            "live session event subscriber lagged; requesting renderer resync"
+                        );
+                        if let Err(error) = sink
+                            .send(Event::SessionViewResyncRequired { session_id })
+                            .await
+                            && !is_expected_disconnect(&error)
+                        {
+                            tracing::warn!(
+                                "failed to request session resync from {}: {error}",
+                                sink.client_id()
+                            );
+                        }
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
             };
             if let Err(error) = sink.send(event).await {
@@ -24693,6 +24733,125 @@ library = "test"
         server.abort();
     }
 
+    fn projection_ipc_window_request(
+        anchor: bcode_session_models::ProjectionWindowAnchor,
+        direction: bcode_session_models::ProjectionWindowDirection,
+    ) -> bcode_session_models::ProjectionWindowRequest {
+        bcode_session_models::ProjectionWindowRequest {
+            projection: bcode_session_models::SessionProjectionKind::Transcript,
+            anchor,
+            direction,
+            target: bcode_session_models::ProjectionWindowTarget {
+                min_items: Some(2),
+                min_estimated_rows: None,
+                min_bytes: None,
+                width_columns: Some(80),
+            },
+            limits: bcode_session_models::ProjectionWindowLimits {
+                max_items: 2,
+                max_events_scanned: 8,
+                max_bytes: 4096,
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn projection_history_pages_cross_real_ipc_bidirectionally() {
+        let workspace = tempfile::tempdir().expect("projection IPC workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent session manager");
+        let session = sessions
+            .create_session(
+                Some("projection IPC".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session");
+        for index in 0..6 {
+            sessions
+                .append_user_message(
+                    session.id,
+                    ClientId::new(),
+                    format!("projection message {index}"),
+                )
+                .await
+                .expect("append projection message");
+        }
+
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client
+            .connect("projection-page-test")
+            .await
+            .expect("connect");
+        let latest = connection
+            .attach_session_projection_window_with_input_history(
+                session.id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("latest page");
+        let latest_window = latest.projection_window.expect("latest metadata");
+        let latest_range = latest_window.source_range.expect("latest range");
+        assert!(latest_window.has_older);
+        assert!(!latest_window.has_newer);
+
+        let older = connection
+            .attach_session_projection_window_with_input_history(
+                session.id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::BeforeSequence(
+                        latest_range.start_sequence,
+                    ),
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("older page");
+        let older_window = older.projection_window.expect("older metadata");
+        let older_range = older_window.source_range.expect("older range");
+        assert!(older_range.end_sequence < latest_range.start_sequence);
+        assert!(older_window.has_newer);
+
+        let newer = connection
+            .attach_session_projection_window_with_input_history(
+                session.id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::AfterSequence(
+                        older_range.end_sequence,
+                    ),
+                    bcode_session_models::ProjectionWindowDirection::Forward,
+                ),
+            )
+            .await
+            .expect("newer page");
+        assert_eq!(
+            newer
+                .projection_window
+                .expect("newer metadata")
+                .source_range,
+            Some(latest_range)
+        );
+        server.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -25010,7 +25169,9 @@ library = "test"
         state
     }
 
+    #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn server_question_exchange_completes_original_plugin_invocation() {
         let sessions = SessionManager::default();
         let summary = sessions
@@ -25076,20 +25237,61 @@ library = "test"
         .await
         .expect("question exchange should become pending");
         assert_eq!(pending.summary.interaction_id, "question-call-question");
-        complete_pending_interactive_tool_request(
-            state.as_ref(),
-            &pending,
-            InteractiveToolResolution::Submitted {
-                payload: serde_json::json!({
-                    "status": "answered",
-                    "questions": [{
-                        "question_index": 0,
-                        "selected": ["yes"]
-                    }]
-                }),
-            },
-        )
-        .await;
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let interaction_id = pending.summary.interaction_id.clone();
+        let initial = client
+            .interaction_snapshot(interaction_id.clone())
+            .await
+            .expect("initial question snapshot")
+            .expect("question snapshot exists");
+        assert_eq!(initial.interaction_kind, "bcode.question");
+        assert_eq!(
+            initial.snapshot["answers"][0]["selected"],
+            serde_json::json!([])
+        );
+
+        let redraw = client
+            .submit_interaction_input(
+                interaction_id.clone(),
+                bcode_tool::InteractionInput::Activate {
+                    control_id: bcode_tool::InteractionControlId::new("question-0.option-0"),
+                },
+            )
+            .await
+            .expect("question option input");
+        let bcode_ipc::InteractionInputResponse::Redraw { snapshot } = redraw else {
+            panic!("question option input should redraw");
+        };
+        assert_eq!(snapshot.snapshot["answers"][0]["selected"][0], "yes");
+        let refreshed = client
+            .interaction_snapshot(interaction_id.clone())
+            .await
+            .expect("refreshed question snapshot")
+            .expect("question snapshot remains pending");
+        assert_eq!(refreshed.snapshot, snapshot.snapshot);
+
+        let submitted = client
+            .submit_interaction_input(interaction_id, bcode_tool::InteractionInput::Submit)
+            .await
+            .expect("submit question");
+        assert!(matches!(
+            submitted,
+            bcode_ipc::InteractionInputResponse::Submitted { .. }
+        ));
 
         let response = tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -25100,7 +25302,21 @@ library = "test"
         assert!(response.host_action.is_none());
         assert!(response.output.contains("Answered"));
         assert!(state.pending_interactive_tools.lock().await.is_empty());
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("question history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::InteractiveToolRequestResolved {
+                interaction_id,
+                ..
+            } if interaction_id == "question-call-question"
+        )));
+        server.abort();
     }
+
     fn test_server_state_with_fake_provider(sessions: SessionManager) -> ServerState {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),

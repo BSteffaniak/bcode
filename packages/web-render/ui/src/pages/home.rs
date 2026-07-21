@@ -147,16 +147,7 @@ pub fn home(
 
                     (runtime_state_section(snapshot))
 
-                    section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
-                        h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "transcript" }
-                        @if snapshot.transcript.items.is_empty() {
-                            div color="#8b949e" font-size=13 { "Attach or create a session to begin." }
-                        } @else {
-                            @for item in &snapshot.transcript.items {
-                                (transcript_item(item))
-                            }
-                        }
-                    }
+                    (transcript_section(snapshot, access_token))
 
                     @if !snapshot.interactions.is_empty() {
                         section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
@@ -184,6 +175,41 @@ pub fn home(
                             }
                         }
                         (composer(snapshot, access_token))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn transcript_section(snapshot: &SessionViewSnapshot, access_token: &str) -> Containers {
+    container! {
+        section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
+            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "transcript" }
+            @if snapshot.transcript.has_older_history {
+                @if let (Some(session_id), Some(anchor_sequence)) = (snapshot.session_id, snapshot.transcript.source_start_sequence) {
+                    form hx-post=(format!("/actions/history-window?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this margin-bottom=12 {
+                        input type=hidden name="session_id" value=(session_id.to_string());
+                        input type=hidden name="direction" value="older";
+                        input type=hidden name="anchor_sequence" value=(anchor_sequence.to_string());
+                        button type=submit background="#21262d" color="#58a6ff" border="1, #30363d" border-radius=6 padding="6, 12" { "load older history" }
+                    }
+                }
+            }
+            @if snapshot.transcript.items.is_empty() {
+                div color="#8b949e" font-size=13 { "Attach or create a session to begin." }
+            } @else {
+                @for item in &snapshot.transcript.items {
+                    (transcript_item(item))
+                }
+            }
+            @if snapshot.transcript.has_newer_history {
+                @if let (Some(session_id), Some(anchor_sequence)) = (snapshot.session_id, snapshot.transcript.source_end_sequence) {
+                    form hx-post=(format!("/actions/history-window?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this margin-top=12 {
+                        input type=hidden name="session_id" value=(session_id.to_string());
+                        input type=hidden name="direction" value="newer";
+                        input type=hidden name="anchor_sequence" value=(anchor_sequence.to_string());
+                        button type=submit background="#21262d" color="#58a6ff" border="1, #30363d" border-radius=6 padding="6, 12" { "load newer history" }
                     }
                 }
             }
@@ -756,6 +782,23 @@ mod tests {
         assert!(rendered.contains("daemon connected · session attached"));
         assert!(rendered.contains("runtime work"));
         assert!(rendered.contains("work-1"));
+    }
+
+    #[test]
+    fn transcript_history_controls_render_source_anchored_actions() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(bcode_session_models::SessionId::new());
+        snapshot.transcript.source_start_sequence = Some(10);
+        snapshot.transcript.source_end_sequence = Some(20);
+        snapshot.transcript.has_older_history = true;
+        snapshot.transcript.has_newer_history = true;
+
+        let rendered = format!("{:?}", home(&snapshot, &[], "secret-token"));
+        assert!(rendered.contains("/actions/history-window?token=secret-token"));
+        assert!(rendered.contains("load older history"));
+        assert!(rendered.contains("load newer history"));
+        assert!(rendered.contains("10"));
+        assert!(rendered.contains("20"));
     }
 
     #[test]

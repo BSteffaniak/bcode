@@ -1,6 +1,8 @@
 //! Permission dialog input flow for the TUI.
 
 use bcode_client::BcodeClient;
+use bcode_session_view::execute_session_view_action;
+use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
 use bmux_keyboard::KeyStroke;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 
@@ -138,9 +140,19 @@ async fn resolve_permission_dialog(
         let batch_id = batch_id.expect("batch action requires batch correlation");
         client.resolve_permission_batch(batch_id, approved).await? > 0
     } else {
-        client
-            .resolve_permission_with_remember(permission_id.clone(), approved, remember)
-            .await?
+        match execute_session_view_action(
+            client,
+            SessionViewAction::ResolvePermission {
+                permission_id: permission_id.clone(),
+                approved,
+                remember,
+            },
+        )
+        .await?
+        {
+            SessionViewActionOutcome::PermissionResolved { resolved } => resolved,
+            _ => return Err(bcode_client::ClientError::UnexpectedResponse.into()),
+        }
     };
     chat.app.set_status(if resolved {
         if apply_to_batch {

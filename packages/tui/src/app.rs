@@ -4664,6 +4664,179 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn shared_projection_matches_tui_semantics_for_migration_slices() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let events = vec![
+            event(
+                1,
+                SessionEventKind::AssistantReasoningMessage {
+                    text: "reasoned".to_owned(),
+                },
+            ),
+            event(
+                2,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "tool-1".to_owned(),
+                    producer_plugin_id: Some("shell".to_owned()),
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            event(
+                3,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "tool-1".to_owned(),
+                        sequence: 1,
+                        stream: ToolOutputStream::Stdout,
+                        text: "tool output".to_owned(),
+                        byte_len: 11,
+                    },
+                },
+            ),
+            event(
+                4,
+                SessionEventKind::PermissionRequested {
+                    permission_id: "permission-1".to_owned(),
+                    tool_call_id: "tool-1".to_owned(),
+                    producer_plugin_id: Some("shell".to_owned()),
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    legacy_request_presentation: None,
+                    policy_source: None,
+                    policy_reason: None,
+                },
+            ),
+            event(
+                5,
+                SessionEventKind::PermissionResolved {
+                    permission_id: "permission-1".to_owned(),
+                    approved: true,
+                },
+            ),
+            event(
+                6,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: bcode_session_models::WorkId::new("work-1"),
+                    kind: bcode_session_models::RuntimeWorkKind::Tool,
+                    label: "shell".to_owned(),
+                    tool_call_id: Some("tool-1".to_owned()),
+                    plugin_id: Some("shell".to_owned()),
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(6),
+                    cancellable: true,
+                },
+            ),
+            event(
+                7,
+                SessionEventKind::RuntimeWorkProgress {
+                    work_id: bcode_session_models::WorkId::new("work-1"),
+                    message: "halfway".to_owned(),
+                    completed_units: Some(1),
+                    total_units: Some(2),
+                    progress_at_ms: Some(7),
+                },
+            ),
+            event(
+                8,
+                SessionEventKind::InteractiveToolRequestCreated {
+                    interaction_id: "interaction-1".to_owned(),
+                    tool_call_id: "tool-1".to_owned(),
+                    tool_name: "question".to_owned(),
+                    interaction_kind: Some("bcode.question".to_owned()),
+                    surface_kind: "bcode.question.inline".to_owned(),
+                    request_json: r#"{"questions":[]}"#.to_owned(),
+                    required: true,
+                    turn_behavior:
+                        bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+                    render_target:
+                        bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall,
+                },
+            ),
+            event(
+                9,
+                SessionEventKind::InteractiveToolRequestResolved {
+                    interaction_id: "interaction-1".to_owned(),
+                    tool_call_id: "tool-1".to_owned(),
+                    resolution_json: r#"{"type":"submitted"}"#.to_owned(),
+                },
+            ),
+        ];
+        let mut app = BmuxApp::new_with_history(Some(session_id), &events[..5], &[], false);
+        for event in &events[5..] {
+            app.absorb_session_event(event);
+        }
+        let legacy = app.transcript();
+        let shared = app.session_view_snapshot();
+
+        assert!(legacy.iter().any(|item| matches!(
+            item.kind(),
+            super::super::transcript::TranscriptItemKind::ReasoningMessage
+        )));
+        assert!(shared.transcript.items.iter().any(|item| matches!(
+            &item.kind,
+            bcode_session_view_models::TranscriptViewItemKind::ReasoningMessage { message }
+                if message.text == "reasoned"
+        )));
+        assert!(legacy.iter().any(|item| matches!(
+            item.kind(),
+            super::super::transcript::TranscriptItemKind::ToolRequest { tool_call_id, .. }
+                if tool_call_id == "tool-1"
+        )));
+        assert_eq!(
+            shared
+                .tools
+                .get("tool-1")
+                .and_then(|tool| tool.output.as_ref())
+                .map(|output| output.text.as_str()),
+            Some("tool output")
+        );
+        assert!(legacy.iter().any(|item| matches!(
+            item.kind(),
+            super::super::transcript::TranscriptItemKind::PermissionResult { approved: true }
+        )));
+        assert!(shared.permissions.iter().any(|permission| {
+            permission.permission_id == "permission-1"
+                && permission.resolved
+                && permission.approved == Some(true)
+        }));
+        assert_eq!(
+            app.runtime_work.status_label().as_deref(),
+            Some("running tool: shell — halfway")
+        );
+        assert!(shared.runtime_work.iter().any(|work| {
+            work.work_id == bcode_session_models::WorkId::new("work-1")
+                && work.message.as_deref() == Some("halfway")
+                && work.completed_units == Some(1)
+                && work.total_units == Some(2)
+        }));
+        assert!(legacy.iter().any(|item| matches!(
+            item.kind(),
+            super::super::transcript::TranscriptItemKind::ToolResult {
+                tool_call_id,
+                ..
+            } if tool_call_id == "tool-1" && item.text.contains("interactive submission")
+        )));
+        assert!(shared.interactions.iter().any(|interaction| {
+            interaction.interaction_id == "interaction-1" && interaction.resolved
+        }));
+    }
+
+    #[test]
     fn history_with_reasoning_change_builds_without_recursive_rebuild() {
         let session_id = bcode_session_models::SessionId::new();
         let history = vec![bcode_session_models::SessionEvent {

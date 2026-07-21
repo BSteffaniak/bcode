@@ -568,6 +568,7 @@ impl SessionActor {
             }
             SessionCommand::CurrentRuntimeSelection(reply) => {
                 let _ = reply.send(crate::SessionRuntimeSelection {
+                    agent_id: self.state.current_agent.clone(),
                     provider_plugin_id: self.state.current_provider.clone(),
                     model_id: self.state.current_model.clone(),
                     reasoning_effort: self.state.reasoning_effort.clone(),
@@ -1091,7 +1092,7 @@ impl SessionActor {
                     expected: expected_last_sequence,
                 });
             }
-            if matches!(request.anchor, ProjectionWindowAnchor::AroundSequence(_)) {
+            if !matches!(request.anchor, ProjectionWindowAnchor::Latest) {
                 return self.projection_window_from_bounded_events(&request).await;
             }
             let transcript_items = db
@@ -1120,22 +1121,52 @@ impl SessionActor {
         &mut self,
         request: &ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
-        let ProjectionWindowAnchor::AroundSequence(sequence) = request.anchor else {
-            return Err(SessionError::UnsupportedProjectionWindow);
+        let max_events = request.limits.max_events_scanned.max(1);
+        let max_events_u64 = u64::try_from(max_events).unwrap_or(u64::MAX);
+        let (start_sequence, end_sequence) = match request.anchor {
+            ProjectionWindowAnchor::BeforeSequence(sequence) => (
+                sequence.saturating_sub(max_events_u64),
+                sequence.saturating_sub(1),
+            ),
+            ProjectionWindowAnchor::AfterSequence(sequence) => (
+                sequence.saturating_add(1),
+                sequence.saturating_add(max_events_u64),
+            ),
+            ProjectionWindowAnchor::AroundSequence(sequence) => {
+                let half_scan = max_events_u64 / 2;
+                (
+                    sequence.saturating_sub(half_scan),
+                    sequence.saturating_add(half_scan),
+                )
+            }
+            ProjectionWindowAnchor::Latest => {
+                return Err(SessionError::UnsupportedProjectionWindow);
+            }
         };
-        let half_scan =
-            u64::try_from(request.limits.max_events_scanned.max(1) / 2).unwrap_or(u64::MAX);
-        let start_sequence = sequence.saturating_sub(half_scan).max(1);
-        let end_sequence = sequence.saturating_add(half_scan);
         let events = self
-            .events_range(
-                start_sequence,
-                end_sequence,
-                request.limits.max_events_scanned.max(1),
-            )
+            .events_range(start_sequence, end_sequence, max_events)
             .await?;
-        crate::projection::projection_window_from_events(&events, request)
-            .ok_or(SessionError::UnsupportedProjectionWindow)
+        let (first_event_sequence, last_event_sequence) =
+            if let Some(db) = self.existing_session_db().await? {
+                (
+                    db.first_event_sequence().await?,
+                    db.last_event_sequence().await?,
+                )
+            } else if let Some(all_events) = &self.state.events {
+                (
+                    all_events.first().map(|event| event.sequence),
+                    all_events.last().map(|event| event.sequence),
+                )
+            } else {
+                (None, None)
+            };
+        crate::projection::projection_window_from_events_with_source_bounds(
+            &events,
+            first_event_sequence,
+            last_event_sequence,
+            request,
+        )
+        .ok_or(SessionError::UnsupportedProjectionWindow)
     }
 
     async fn events_range(
