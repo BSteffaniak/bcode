@@ -33,6 +33,13 @@ if rg -n '\bPluginAutomation[A-Za-z0-9_]*\b|\bplugin_automation_[A-Za-z0-9_]*\b|
   violations=1
 fi
 
+if rg -n 'turn_tool_policies|FollowupCommand::(UserMessage|AdmittedTurn|ContinueFromUserEvent)' \
+  packages/server/src/lib.rs >/tmp/bcode-parallel-turn-admission-paths.txt; then
+  echo "Runtime architecture violation: turn execution policy or ordinary messages bypass durable admitted events." >&2
+  cat /tmp/bcode-parallel-turn-admission-paths.txt >&2
+  violations=1
+fi
+
 production_core_sources="$(mktemp)"
 trap 'rm -f "$production_core_sources"' EXIT
 for file in \

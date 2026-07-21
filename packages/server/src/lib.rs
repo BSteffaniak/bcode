@@ -203,7 +203,6 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
-    turn_tool_policies: Mutex<BTreeMap<SessionId, bcode_session_models::TurnToolPolicy>>,
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
@@ -368,10 +367,6 @@ enum SessionRuntimePhase {
 }
 
 impl SessionRuntimePhase {
-    const fn accepts_inline_steering(self) -> bool {
-        matches!(self, Self::AppendingUser | Self::PreparingModelRequest)
-    }
-
     const fn has_active_work(self) -> bool {
         !matches!(self, Self::Idle)
     }
@@ -445,25 +440,12 @@ impl<'a> RuntimeCommandContext<'a> {
 
 #[derive(Debug)]
 enum FollowupCommand {
-    UserMessage {
-        client_id: ClientId,
-        runtime_context: Option<ClientRuntimeContext>,
-        text: String,
-        placement: bcode_ipc::PromptPlacement,
-        completion: Option<oneshot::Sender<ModelTurnCompletion>>,
-    },
-    ContinueFromUserEvent {
+    ExecuteTurn {
         client_id: ClientId,
         runtime_context: Option<ClientRuntimeContext>,
         user_event: Box<bcode_session_models::SessionEvent>,
-        queued_steering: Arc<AtomicUsize>,
+        queued_steering: Option<Arc<AtomicUsize>>,
         completion: Option<oneshot::Sender<ModelTurnCompletion>>,
-    },
-    AdmittedTurn {
-        client_id: ClientId,
-        runtime_context: Option<ClientRuntimeContext>,
-        user_event: Box<bcode_session_models::SessionEvent>,
-        tool_policy: bcode_session_models::TurnToolPolicy,
     },
     SkillInvocation {
         client_id: ClientId,
@@ -1112,7 +1094,6 @@ impl ServerState {
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
             turn_admission_locks: Mutex::default(),
-            turn_tool_policies: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
@@ -6423,6 +6404,38 @@ async fn finish_attach_session_recent_success(
     Ok(())
 }
 
+async fn admit_turn(
+    state: &ServerState,
+    session_id: SessionId,
+    client_id: ClientId,
+    text: String,
+    admission: bcode_session_models::TurnAdmissionMetadata,
+) -> Result<
+    (
+        bcode_session_models::TurnAdmission,
+        Option<bcode_session_models::SessionEvent>,
+    ),
+    bcode_session::SessionError,
+> {
+    let (admission, events) = state
+        .sessions
+        .admit_turn_with_events(session_id, client_id, text, admission)
+        .await?;
+    for event in &events {
+        publish_session_event(state, event).await;
+    }
+    if !events.is_empty()
+        && let Ok(session) = state.sessions.session_summary(session_id).await
+    {
+        state.session_catalog.upsert_native_session(session).await;
+    }
+    let user_event = events
+        .into_iter()
+        .rev()
+        .find(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }));
+    Ok((admission, user_event))
+}
+
 async fn enqueue_user_message_command(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -6454,6 +6467,15 @@ async fn enqueue_user_message_command(
         .await;
     }
 
+    let (_, user_event) = admit_turn(
+        state,
+        session_id,
+        client_id,
+        text,
+        bcode_session_models::TurnAdmissionMetadata::default(),
+    )
+    .await?;
+    let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
     let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
     let queued = pending_before > 0 || phase_snapshot.has_active_work();
     let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
@@ -6466,11 +6488,11 @@ async fn enqueue_user_message_command(
     };
     let send_result = handle
         .followup_commands
-        .send(FollowupCommand::UserMessage {
+        .send(FollowupCommand::ExecuteTurn {
             client_id,
             runtime_context,
-            text,
-            placement,
+            user_event: Box::new(user_event),
+            queued_steering: None,
             completion: None,
         })
         .await
@@ -6500,14 +6522,23 @@ async fn enqueue_steering_message_command(
 ) -> Result<MessageQueueStatus, ServerError> {
     match window {
         SteeringWindow::Idle => {
+            let (_, user_event) = admit_turn(
+                state,
+                session_id,
+                client_id,
+                text,
+                bcode_session_models::TurnAdmissionMetadata::default(),
+            )
+            .await?;
+            let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
             let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
             let send_result = handle
                 .followup_commands
-                .send(FollowupCommand::UserMessage {
+                .send(FollowupCommand::ExecuteTurn {
                     client_id,
                     runtime_context,
-                    text,
-                    placement: bcode_ipc::PromptPlacement::Steering,
+                    user_event: Box::new(user_event),
+                    queued_steering: None,
                     completion: None,
                 })
                 .await
@@ -6549,11 +6580,11 @@ async fn enqueue_steering_message_command(
             let queue_position = Some(usize_to_u32_saturating(pending_before.saturating_add(1)));
             let send_result = handle
                 .followup_commands
-                .send(FollowupCommand::ContinueFromUserEvent {
+                .send(FollowupCommand::ExecuteTurn {
                     client_id,
                     runtime_context,
                     user_event: Box::new(user_event),
-                    queued_steering: Arc::clone(&handle.queued_steering),
+                    queued_steering: Some(Arc::clone(&handle.queued_steering)),
                     completion: None,
                 })
                 .await
@@ -6800,31 +6831,7 @@ async fn run_session_runtime(
             RuntimeQueueCommand::Followup(command) => *command,
         };
         match command {
-            FollowupCommand::UserMessage {
-                client_id,
-                runtime_context,
-                text,
-                placement,
-                completion,
-            } => {
-                Box::pin(process_user_message_command(
-                    &state,
-                    &mut permit,
-                    Arc::clone(&phase),
-                    &mut followup_commands,
-                    &mut steering_commands,
-                    &mut cancel_commands,
-                    queued_followups.as_ref(),
-                    Arc::clone(&current_turn),
-                    client_id,
-                    runtime_context,
-                    text,
-                    placement,
-                    completion,
-                ))
-                .await;
-            }
-            FollowupCommand::ContinueFromUserEvent {
+            FollowupCommand::ExecuteTurn {
                 client_id,
                 runtime_context,
                 user_event,
@@ -6846,34 +6853,6 @@ async fn run_session_runtime(
                     completion,
                 ))
                 .await;
-            }
-            FollowupCommand::AdmittedTurn {
-                client_id,
-                runtime_context,
-                user_event,
-                tool_policy,
-            } => {
-                state
-                    .turn_tool_policies
-                    .lock()
-                    .await
-                    .insert(session_id, tool_policy);
-                Box::pin(process_existing_user_event_command(
-                    &state,
-                    &mut permit,
-                    Arc::clone(&phase),
-                    &mut followup_commands,
-                    &mut steering_commands,
-                    &mut cancel_commands,
-                    queued_followups.as_ref(),
-                    Arc::clone(&current_turn),
-                    client_id,
-                    runtime_context,
-                    *user_event,
-                    None,
-                ))
-                .await;
-                state.turn_tool_policies.lock().await.remove(&session_id);
             }
             FollowupCommand::SkillInvocation {
                 client_id,
@@ -6933,8 +6912,9 @@ enum RuntimeQueueCommand {
 
 fn queued_steering_counter(command: &FollowupCommand) -> Option<&AtomicUsize> {
     match command {
-        FollowupCommand::ContinueFromUserEvent {
-            queued_steering, ..
+        FollowupCommand::ExecuteTurn {
+            queued_steering: Some(queued_steering),
+            ..
         } => Some(queued_steering.as_ref()),
         _ => None,
     }
@@ -7163,10 +7143,6 @@ async fn service_runtime_priority_commands(
     }
 }
 
-async fn runtime_accepts_inline_steering(phase: &Arc<Mutex<SessionRuntimePhase>>) -> bool {
-    phase.lock().await.accepts_inline_steering()
-}
-
 async fn set_runtime_phase(
     phase: &Arc<Mutex<SessionRuntimePhase>>,
     next_phase: SessionRuntimePhase,
@@ -7254,76 +7230,6 @@ async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<Mo
     );
     drop(current_turn_guard);
     active_turn
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn process_user_message_command(
-    state: &ServerState,
-    permit: &mut SessionTurnPermit,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
-    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
-    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
-    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &AtomicUsize,
-    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
-    client_id: ClientId,
-    runtime_context: Option<ClientRuntimeContext>,
-    text: String,
-    placement: bcode_ipc::PromptPlacement,
-    completion_sender: Option<oneshot::Sender<ModelTurnCompletion>>,
-) {
-    if placement == bcode_ipc::PromptPlacement::Steering
-        && runtime_accepts_inline_steering(&phase).await
-    {
-        process_steering_message_command(
-            state,
-            permit.session_id(),
-            client_id,
-            text,
-            completion_sender,
-        )
-        .await;
-        return;
-    }
-
-    set_runtime_phase(&phase, SessionRuntimePhase::AppendingUser).await;
-    let completion = match append_turn_user_message(state, permit, client_id, text).await {
-        Ok(Some(user_event)) => {
-            suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
-            set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
-            let mut command_context = RuntimeCommandContext::new(
-                followup_commands,
-                steering_commands,
-                cancel_commands,
-                queued_followups,
-                Arc::clone(&current_turn),
-            );
-            Box::pin(run_model_turn(
-                state,
-                permit,
-                &user_event,
-                client_id,
-                runtime_context,
-                &mut command_context,
-                &phase,
-            ))
-            .await
-        }
-        Ok(None) => {
-            let message = "no user message event was appended".to_string();
-            append_system_event(state, permit.session_id(), message.clone()).await;
-            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
-        }
-        Err(error) => {
-            let message = format!("failed to append user message: {error}");
-            append_system_event(state, permit.session_id(), message.clone()).await;
-            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
-        }
-    };
-    set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
-    if let Some(sender) = completion_sender {
-        let _sent = sender.send(completion);
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7628,14 +7534,26 @@ async fn submit_session_model_turn_and_wait(
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<ModelTurnCompletion, ServerError> {
     let (sender, receiver) = oneshot::channel();
+    let client_id = ClientId::new();
+    let admission_lock = turn_admission_lock(state, session_id).await;
+    let _admission_guard = admission_lock.lock().await;
+    let (_, user_event) = admit_turn(
+        state,
+        session_id,
+        client_id,
+        text,
+        bcode_session_models::TurnAdmissionMetadata::default(),
+    )
+    .await?;
+    let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
     enqueue_followup_command(
         state,
         session_id,
-        FollowupCommand::UserMessage {
-            client_id: ClientId::new(),
+        FollowupCommand::ExecuteTurn {
+            client_id,
             runtime_context,
-            text,
-            placement: bcode_ipc::PromptPlacement::FollowUp,
+            user_event: Box::new(user_event),
+            queued_steering: None,
             completion: Some(sender),
         },
     )
@@ -7680,15 +7598,11 @@ async fn handle_submit_turn(
         )
         .await;
     }
-    let tool_policy = admission.execution.tools;
     let admission_lock = turn_admission_lock(state, session_id).await;
     let _admission_guard = admission_lock.lock().await;
-    let result = state
-        .sessions
-        .admit_turn(session_id, client_id, text, admission)
-        .await;
-    let admission = match result {
-        Ok(admission) => admission,
+    let result = admit_turn(state, session_id, client_id, text, admission).await;
+    let (admission, user_event) = match result {
+        Ok(result) => result,
         Err(error) => {
             return send_response(
                 writer,
@@ -7698,27 +7612,17 @@ async fn handle_submit_turn(
             .await;
         }
     };
-    if let bcode_session_models::TurnAdmission::Accepted(receipt) = &admission {
-        let mut events = state
-            .sessions
-            .session_events_range(
-                session_id,
-                receipt.accepted_event_sequence,
-                receipt.accepted_event_sequence,
-                1,
-            )
-            .await?;
-        let user_event = events
-            .pop()
-            .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+    if let bcode_session_models::TurnAdmission::Accepted(_) = &admission {
+        let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
         enqueue_followup_command(
             state,
             session_id,
-            FollowupCommand::AdmittedTurn {
+            FollowupCommand::ExecuteTurn {
                 client_id,
                 runtime_context: state.client_runtime_context(client_id).await,
                 user_event: Box::new(user_event),
-                tool_policy,
+                queued_steering: None,
+                completion: None,
             },
         )
         .await?;
@@ -10696,6 +10600,7 @@ async fn run_model_turn_inner(
     command_context: &mut RuntimeCommandContext<'_>,
     phase: &Arc<Mutex<SessionRuntimePhase>>,
 ) -> ModelTurnCompletion {
+    let tool_policy = turn_tool_policy(trigger_event);
     let selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
 
@@ -10712,15 +10617,21 @@ async fn run_model_turn_inner(
     let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
     let remote_catalog_retry_rules =
         remote_catalog_retry_rules(state, provider_plugin_id.as_deref()).await;
-    let static_context =
-        match prepare_static_model_turn_context(state, session_id, trigger_event.sequence).await {
-            Ok(context) => context,
-            Err(error) => {
-                let message = format!("model turn preparation error: {error}");
-                append_system_event(state, session_id, message.clone()).await;
-                return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
-            }
-        };
+    let static_context = match prepare_static_model_turn_context(
+        state,
+        session_id,
+        trigger_event.sequence,
+        tool_policy,
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            let message = format!("model turn preparation error: {error}");
+            append_system_event(state, session_id, message.clone()).await;
+            return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+        }
+    };
     let mut round = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
     let mut last_proactive_compaction_boundary = None;
@@ -10964,6 +10875,7 @@ async fn run_model_turn_inner(
                     outcome.pending_tool_calls,
                     Arc::clone(&cancel_state),
                     command_context,
+                    tool_policy,
                 )
                 .await
                 {
@@ -13307,10 +13219,20 @@ struct StaticModelTurnContext {
     tools: Vec<bcode_model::ToolDefinition>,
 }
 
+fn turn_tool_policy(
+    trigger_event: &bcode_session_models::SessionEvent,
+) -> bcode_session_models::TurnToolPolicy {
+    match &trigger_event.kind {
+        SessionEventKind::UserMessage { admission, .. } => admission.execution.tools,
+        _ => bcode_session_models::TurnToolPolicy::default(),
+    }
+}
+
 async fn prepare_static_model_turn_context(
     state: &ServerState,
     session_id: SessionId,
     trigger_event_sequence: u64,
+    tool_policy: bcode_session_models::TurnToolPolicy,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
     let agent_id = session_agent_selection(state, session_id).await;
     let agent_context = agent_context(state, session_id, &agent_id).await;
@@ -13365,7 +13287,7 @@ async fn prepare_static_model_turn_context(
     let enabled_tools = agent_context
         .as_ref()
         .and_then(|context| context.enabled_tools.clone());
-    let tools = collect_model_tools(state, session_id, enabled_tools).await;
+    let tools = collect_model_tools(state, session_id, enabled_tools, tool_policy).await;
     Ok(StaticModelTurnContext {
         system_prompt,
         system_messages,
@@ -14646,11 +14568,11 @@ fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
     }
 }
 
-fn tool_policy_allows_operation(
-    policy: Option<bcode_session_models::TurnToolPolicy>,
+const fn tool_policy_allows_operation(
+    policy: bcode_session_models::TurnToolPolicy,
     is_read_only: bool,
 ) -> bool {
-    match policy.unwrap_or_default() {
+    match policy {
         bcode_session_models::TurnToolPolicy::Enabled => true,
         bcode_session_models::TurnToolPolicy::ReadOnly => is_read_only,
         bcode_session_models::TurnToolPolicy::Disabled => false,
@@ -14658,7 +14580,7 @@ fn tool_policy_allows_operation(
 }
 
 fn tool_policy_denies_tool(
-    policy: Option<bcode_session_models::TurnToolPolicy>,
+    policy: bcode_session_models::TurnToolPolicy,
     metadata: Option<&ToolPolicyAuthorizationMetadata>,
 ) -> bool {
     metadata.is_none_or(|metadata| !tool_policy_allows_operation(policy, metadata.is_read_only()))
@@ -14668,15 +14590,10 @@ async fn collect_model_tools(
     state: &ServerState,
     session_id: SessionId,
     enabled_tools: Option<Vec<String>>,
+    policy: bcode_session_models::TurnToolPolicy,
 ) -> Vec<bcode_model::ToolDefinition> {
     let enabled_tools = enabled_tools.map(|tools| tools.into_iter().collect::<BTreeSet<_>>());
-    let policy = state
-        .turn_tool_policies
-        .lock()
-        .await
-        .get(&session_id)
-        .copied();
-    if policy == Some(bcode_session_models::TurnToolPolicy::Disabled) {
+    if policy == bcode_session_models::TurnToolPolicy::Disabled {
         return Vec::new();
     }
     let mut tools = Vec::new();
@@ -14807,6 +14724,7 @@ struct ServerAuthorizationCoordinator<'a> {
     session_id: SessionId,
     cancel_state: &'a TurnCancelState,
     call_count: usize,
+    tool_policy: bcode_session_models::TurnToolPolicy,
 }
 
 impl<'a> ServerAuthorizationCoordinator<'a> {
@@ -14815,12 +14733,14 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
         session_id: SessionId,
         cancel_state: &'a TurnCancelState,
         call_count: usize,
+        tool_policy: bcode_session_models::TurnToolPolicy,
     ) -> Self {
         Self {
             state,
             session_id,
             cancel_state,
             call_count,
+            tool_policy,
         }
     }
 
@@ -14839,14 +14759,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
                     ));
                 }
             };
-        let policy = self
-            .state
-            .turn_tool_policies
-            .lock()
-            .await
-            .get(&self.session_id)
-            .copied();
-        if tool_policy_denies_tool(policy, Some(&policy_metadata)) {
+        if tool_policy_denies_tool(self.tool_policy, Some(&policy_metadata)) {
             return ToolAuthorizationDecision::Deny(
                 "tool denied by read-only inspection policy".to_string(),
             );
@@ -15032,6 +14945,7 @@ async fn execute_model_tool_batch(
     calls: Vec<bcode_model::ToolCall>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
+    tool_policy: bcode_session_models::TurnToolPolicy,
 ) -> bool {
     let call_count = calls.len();
     let mut ready = Vec::new();
@@ -15150,6 +15064,7 @@ async fn execute_model_tool_batch(
             session_id,
             cancel_state.as_ref(),
             call_count,
+            tool_policy,
         );
         let authorization =
             coordinator.authorize_batch(&authorization_requests, &authorization_scope);
@@ -22561,11 +22476,11 @@ library = "test"
         enqueue_followup_command(
             &state,
             session_id,
-            FollowupCommand::ContinueFromUserEvent {
+            FollowupCommand::ExecuteTurn {
                 client_id,
                 runtime_context: None,
                 user_event: Box::new(trigger_event),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
+                queued_steering: None,
                 completion: Some(turn_tx),
             },
         )
@@ -24227,9 +24142,15 @@ library = "test"
                 agent_id: session_agent_selection(state, session_id).await,
             },
         };
-        let decision = ServerAuthorizationCoordinator::new(state, session_id, cancel_state, 1)
-            .authorize_one(&request, None)
-            .await;
+        let decision = ServerAuthorizationCoordinator::new(
+            state,
+            session_id,
+            cancel_state,
+            1,
+            bcode_session_models::TurnToolPolicy::Enabled,
+        )
+        .authorize_one(&request, None)
+        .await;
         if let ToolAuthorizationDecision::Deny(reason) | ToolAuthorizationDecision::Ask(reason) =
             decision
         {
@@ -24483,6 +24404,7 @@ library = "test"
                 calls,
                 task_cancel,
                 &mut command_context,
+                bcode_session_models::TurnToolPolicy::Enabled,
             )
             .await
         });
@@ -27820,11 +27742,19 @@ library = "test"
         let (cancel_tx, mut cancel_rx) = mpsc::channel(2);
         let queued_followups = AtomicUsize::new(1);
         followup_tx
-            .send(FollowupCommand::UserMessage {
+            .send(FollowupCommand::ExecuteTurn {
                 client_id: ClientId::new(),
                 runtime_context: None,
-                text: "queued work".to_owned(),
-                placement: bcode_ipc::PromptPlacement::FollowUp,
+                user_event: Box::new(session_event(
+                    SessionId::new(),
+                    1,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: "queued work".to_owned(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )),
+                queued_steering: None,
                 completion: None,
             })
             .await
@@ -27859,11 +27789,19 @@ library = "test"
 
         queued_followups.fetch_add(1, Ordering::AcqRel);
         followup_tx
-            .send(FollowupCommand::UserMessage {
+            .send(FollowupCommand::ExecuteTurn {
                 client_id: ClientId::new(),
                 runtime_context: None,
-                text: "queued followup".to_owned(),
-                placement: bcode_ipc::PromptPlacement::FollowUp,
+                user_event: Box::new(session_event(
+                    SessionId::new(),
+                    1,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: "queued followup".to_owned(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )),
+                queued_steering: None,
                 completion: None,
             })
             .await
@@ -28061,7 +27999,7 @@ library = "test"
             let RuntimeQueueCommand::Followup(command) = command else {
                 panic!("expected followup");
             };
-            let FollowupCommand::ContinueFromUserEvent { user_event, .. } = *command else {
+            let FollowupCommand::ExecuteTurn { user_event, .. } = *command else {
                 panic!("expected persisted steering continuation");
             };
             let SessionEventKind::UserMessage { text, .. } = &user_event.kind else {
@@ -28099,8 +28037,46 @@ library = "test"
     }
 
     #[test]
+    fn turn_tool_policy_comes_from_durable_user_event_admission() {
+        let session_id = SessionId::new();
+        let client_id = ClientId::new();
+        let read_only = session_event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id,
+                text: "inspect".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata {
+                    execution: bcode_session_models::TurnExecutionOptions {
+                        tools: bcode_session_models::TurnToolPolicy::ReadOnly,
+                    },
+                    ..bcode_session_models::TurnAdmissionMetadata::default()
+                },
+            },
+        );
+        let enabled = session_event(
+            session_id,
+            2,
+            SessionEventKind::UserMessage {
+                client_id,
+                text: "implement".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        );
+
+        assert_eq!(
+            turn_tool_policy(&read_only),
+            bcode_session_models::TurnToolPolicy::ReadOnly
+        );
+        assert_eq!(
+            turn_tool_policy(&enabled),
+            bcode_session_models::TurnToolPolicy::Enabled
+        );
+    }
+
+    #[test]
     fn read_only_turn_policy_denies_mutating_and_unknown_tool_calls() {
-        let read_only = Some(bcode_session_models::TurnToolPolicy::ReadOnly);
+        let read_only = bcode_session_models::TurnToolPolicy::ReadOnly;
         let read = policy_metadata(bcode_agent_profile::ToolPolicyOperation::ReadOnly);
         let write = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Mutating);
         let command = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
@@ -28111,20 +28087,19 @@ library = "test"
         assert!(tool_policy_denies_tool(read_only, Some(&command)));
         assert!(tool_policy_denies_tool(read_only, None));
         assert!(!tool_policy_denies_tool(
-            Some(bcode_session_models::TurnToolPolicy::Enabled),
+            bcode_session_models::TurnToolPolicy::Enabled,
             Some(&write)
         ));
     }
 
     #[test]
     fn read_only_turn_policy_allows_only_owner_declared_read_operations() {
-        let read_only = Some(bcode_session_models::TurnToolPolicy::ReadOnly);
+        let read_only = bcode_session_models::TurnToolPolicy::ReadOnly;
         assert!(tool_policy_allows_operation(read_only, true));
         assert!(!tool_policy_allows_operation(read_only, false));
         assert!(tool_policy_allows_operation(
-            Some(bcode_session_models::TurnToolPolicy::Enabled),
+            bcode_session_models::TurnToolPolicy::Enabled,
             false
         ));
-        assert!(tool_policy_allows_operation(None, false));
     }
 }

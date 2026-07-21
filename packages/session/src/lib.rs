@@ -2611,9 +2611,32 @@ impl SessionManager {
         text: String,
         admission: bcode_session_models::TurnAdmissionMetadata,
     ) -> Result<bcode_session_models::TurnAdmission, SessionError> {
+        self.admit_turn_with_events(session_id, client_id, text, admission)
+            .await
+            .map(|(admission, _)| admission)
+    }
+
+    /// Atomically admit an ordinary turn and return both its durable receipt and committed events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist, metadata is invalid, or persistence fails.
+    pub async fn admit_turn_with_events(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    ) -> Result<
+        (
+            bcode_session_models::TurnAdmission,
+            Vec<bcode_session_models::SessionEvent>,
+        ),
+        SessionError,
+    > {
         self.admit_turn_result(session_id, client_id, text, admission)
             .await
-            .map(|result| result.admission)
+            .map(|result| (result.admission, result.events))
     }
 
     async fn admit_turn_result(
