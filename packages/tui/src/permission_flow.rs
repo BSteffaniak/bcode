@@ -138,7 +138,17 @@ async fn resolve_permission_dialog(
         .map(|batch| batch.batch_id.clone());
     let resolved = if apply_to_batch {
         let batch_id = batch_id.expect("batch action requires batch correlation");
-        client.resolve_permission_batch(batch_id, approved).await? > 0
+        match execute_session_view_action(
+            client,
+            SessionViewAction::ResolvePermissionBatch { batch_id, approved },
+        )
+        .await?
+        {
+            SessionViewActionOutcome::PermissionBatchResolved { resolved_count } => {
+                resolved_count > 0
+            }
+            _ => return Err(bcode_client::ClientError::UnexpectedResponse.into()),
+        }
     } else {
         match execute_session_view_action(
             client,

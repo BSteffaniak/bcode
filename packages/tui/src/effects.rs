@@ -340,16 +340,8 @@ pub enum TuiEffectResult {
         daemon_connected: bool,
         /// Session that was hydrated.
         session_id: SessionId,
-        /// Model status, if available.
-        model: Option<bcode_ipc::SessionModelStatus>,
-        /// Active skills captured during bounded attach hydration.
-        active_skills: Option<Vec<bcode_skill_models::SkillContextResponse>>,
-        /// Runtime work snapshots, if available.
-        runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
-        /// Active plugin-owned status contributions, replacing the previous set atomically.
-        plugin_status: Vec<bcode_session_view_models::PluginStatusView>,
-        /// First non-critical error encountered.
-        error: Option<String>,
+        /// Hydrated semantic/runtime status.
+        hydration: Box<SessionStatusHydration>,
     },
     /// Targeted model projection refresh completed.
     SessionModelStatusLoaded {
@@ -523,12 +515,15 @@ impl TuiEffectResult {
                 daemon_connected,
                 error,
                 ..
-            }
-            | Self::SessionStatusLoaded {
-                daemon_connected,
-                error,
-                ..
             } => DaemonObservation::from_optional_error(*daemon_connected, error.as_deref()),
+            Self::SessionStatusLoaded {
+                daemon_connected,
+                hydration,
+                ..
+            } => DaemonObservation::from_optional_error(
+                *daemon_connected,
+                hydration.error.as_deref(),
+            ),
             Self::SessionModelStatusLoaded { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
@@ -584,7 +579,23 @@ pub struct SkillActionResult {
     pub acceptance: Option<MessageAcceptance>,
 }
 
-/// Submit-message effect success payload.
+/// Attached session status hydration payload.
+#[derive(Debug)]
+pub struct SessionStatusHydration {
+    /// Model status, if available.
+    pub model: Option<bcode_ipc::SessionModelStatus>,
+    /// Active skills captured during bounded attach hydration.
+    pub active_skills: Option<Vec<bcode_skill_models::SkillContextResponse>>,
+    /// Runtime work snapshots, if available.
+    pub runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
+    /// Pending interactive requests, if available.
+    pub interactions: Option<Vec<bcode_session_view_models::InteractionViewSummary>>,
+    /// Active plugin-owned status contributions.
+    pub plugin_status: Vec<bcode_session_view_models::PluginStatusView>,
+    /// First non-critical error encountered.
+    pub error: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct SubmitMessageResult {
     /// Session that received the message.
@@ -677,11 +688,14 @@ impl TuiEffect {
             Self::LoadSessionStatus { session_id } => TuiEffectResult::SessionStatusLoaded {
                 daemon_connected: false,
                 session_id,
-                model: None,
-                active_skills: None,
-                runtime_work: None,
-                plugin_status: Vec::new(),
-                error: Some(client_error.to_string()),
+                hydration: Box::new(SessionStatusHydration {
+                    model: None,
+                    active_skills: None,
+                    runtime_work: None,
+                    interactions: None,
+                    plugin_status: Vec::new(),
+                    error: Some(client_error.to_string()),
+                }),
             },
             Self::LoadSessionModelStatus { session_id } => {
                 TuiEffectResult::SessionModelStatusLoaded {
@@ -1051,6 +1065,13 @@ impl TuiEffect {
         }
     }
 
+    async fn run_session_status_effect(
+        client: &BcodeClient,
+        session_id: SessionId,
+    ) -> TuiEffectResult {
+        Box::pin(load_session_status(client, session_id)).await
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
@@ -1080,7 +1101,7 @@ impl TuiEffect {
                 launch_working_directory,
             } => load_draft_status(&client, launch_working_directory).await,
             Self::LoadSessionStatus { session_id } => {
-                Box::pin(load_session_status(&client, session_id)).await
+                Box::pin(Self::run_session_status_effect(&client, session_id)).await
             }
             Self::LoadSessionModelStatus { session_id } => {
                 TuiEffectResult::SessionModelStatusLoaded {
@@ -1656,29 +1677,71 @@ async fn load_plugin_session_status(
     (contributions, first_error)
 }
 
+async fn load_pending_interactions(
+    client: &BcodeClient,
+    session_id: SessionId,
+) -> Result<Vec<bcode_session_view_models::InteractionViewSummary>, ClientError> {
+    let mut interactions = Vec::new();
+    for request in client
+        .list_interactive_tool_requests()
+        .await?
+        .into_iter()
+        .filter(|request| request.session_id == session_id)
+    {
+        let interaction_id = request.interaction_id.clone();
+        let snapshot = client
+            .interaction_snapshot(interaction_id.clone())
+            .await?
+            .map_or(request.request, |snapshot| snapshot.snapshot);
+        let surface_kind = request.surface_kind.clone();
+        interactions.push(bcode_session_view_models::InteractionViewSummary {
+            interaction_id,
+            kind: request
+                .interaction_kind
+                .unwrap_or_else(|| surface_kind.clone()),
+            surface_kind,
+            tool_call_id: Some(request.tool_call_id),
+            title: Some(request.tool_name),
+            required: request.required,
+            snapshot: Some(snapshot),
+            resolved: false,
+            resolution: None,
+            render_target: request.render_target,
+            turn_behavior: request.turn_behavior,
+        });
+    }
+    Ok(interactions)
+}
+
 async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> TuiEffectResult {
     let (model, model_error) =
         optional_client_result(client.session_model_status(session_id)).await;
     let (
         (active_skills, skills_error),
         (runtime_work, runtime_work_error),
+        (interactions, interactions_error),
         (plugin_status, plugin_error),
     ) = tokio::join!(
         optional_client_result(client.active_skills(session_id)),
         optional_client_result(client.list_runtime_work(session_id)),
+        optional_client_result(load_pending_interactions(client, session_id)),
         load_plugin_session_status(client, session_id),
     );
     TuiEffectResult::SessionStatusLoaded {
         daemon_connected: model.is_some() || active_skills.is_some() || runtime_work.is_some(),
         session_id,
-        model,
-        active_skills,
-        runtime_work,
-        plugin_status,
-        error: model_error
-            .or(skills_error)
-            .or(runtime_work_error)
-            .or(plugin_error),
+        hydration: Box::new(SessionStatusHydration {
+            model,
+            active_skills,
+            runtime_work,
+            interactions,
+            plugin_status,
+            error: model_error
+                .or(skills_error)
+                .or(runtime_work_error)
+                .or(interactions_error)
+                .or(plugin_error),
+        }),
     }
 }
 

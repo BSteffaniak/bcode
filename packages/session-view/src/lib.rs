@@ -250,6 +250,17 @@ impl SessionView {
         }
     }
 
+    /// Replace authoritative pending permissions supplied by daemon hydration.
+    pub fn set_pending_permissions(
+        &mut self,
+        permissions: Vec<bcode_session_view_models::PermissionView>,
+    ) {
+        if self.snapshot.permissions != permissions {
+            self.snapshot.permissions = permissions;
+            self.bump_revision();
+        }
+    }
+
     /// Insert or replace an authoritative pending permission hydrated from the daemon.
     pub fn upsert_permission(&mut self, permission: bcode_session_view_models::PermissionView) {
         let existing = self
@@ -265,6 +276,40 @@ impl SessionView {
         } else {
             self.snapshot.permissions.push(permission);
             self.bump_revision();
+        }
+    }
+
+    /// Replace authoritative pending interactions supplied by daemon hydration.
+    pub fn set_pending_interactions(&mut self, interactions: Vec<InteractionViewSummary>) {
+        let pending_ids = interactions
+            .iter()
+            .map(|interaction| interaction.interaction_id.clone())
+            .collect::<BTreeSet<_>>();
+        let stale_ids = self
+            .snapshot
+            .interactions
+            .iter()
+            .filter(|interaction| {
+                !interaction.resolved && !pending_ids.contains(&interaction.interaction_id)
+            })
+            .map(|interaction| interaction.interaction_id.clone())
+            .collect::<BTreeSet<_>>();
+        if !stale_ids.is_empty() {
+            self.snapshot.interactions.retain(|interaction| {
+                interaction.resolved || !stale_ids.contains(&interaction.interaction_id)
+            });
+            self.snapshot.transcript.items.retain(|item| {
+                !matches!(
+                    &item.kind,
+                    TranscriptViewItemKind::Interaction { interaction }
+                        if stale_ids.contains(&interaction.interaction_id)
+                )
+            });
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        }
+        for interaction in interactions {
+            self.upsert_interaction(interaction);
         }
     }
 
@@ -755,6 +800,7 @@ impl SessionView {
                         kind: interaction_kind
                             .clone()
                             .unwrap_or_else(|| surface_kind.clone()),
+                        surface_kind: surface_kind.clone(),
                         tool_call_id: Some(tool_call_id.clone()),
                         title: Some(tool_name.clone()),
                         required: *required,
@@ -789,6 +835,7 @@ impl SessionView {
                     InteractionViewSummary {
                         interaction_id: interaction_id.clone(),
                         kind: "unknown".to_owned(),
+                        surface_kind: String::new(),
                         tool_call_id: Some(tool_call_id.clone()),
                         title: None,
                         required: false,
@@ -805,17 +852,25 @@ impl SessionView {
                 permission_id,
                 tool_call_id,
                 tool_name,
+                arguments_json,
+                policy_source,
                 policy_reason,
                 ..
             } => {
                 let permission = bcode_session_view_models::PermissionView {
                     permission_id: permission_id.clone(),
+                    session_id: Some(event.session_id),
                     tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments_json: arguments_json.clone(),
+                    batch: None,
+                    agent_id: String::new(),
                     title: Some(format!("Permission requested: {tool_name}")),
+                    policy_source: policy_source.clone(),
                     detail: policy_reason.clone(),
                     resolved: false,
                     approved: None,
-                    can_remember: true,
+                    can_remember: false,
                 };
                 upsert_by(
                     &mut self.snapshot.permissions,
@@ -2417,6 +2472,55 @@ mod tests {
             &view.snapshot().transcript.items[0].kind,
             TranscriptViewItemKind::SystemMessage { message } if message.text == "status"
         ));
+    }
+
+    #[test]
+    fn authoritative_interaction_hydration_removes_stale_pending_state() {
+        let interaction = |id: &str| InteractionViewSummary {
+            interaction_id: id.to_owned(),
+            kind: "question".to_owned(),
+            surface_kind: "question.inline".to_owned(),
+            tool_call_id: Some("call".to_owned()),
+            title: Some("Question".to_owned()),
+            required: true,
+            snapshot: Some(serde_json::json!({"questions": []})),
+            resolved: false,
+            resolution: None,
+            render_target: InteractiveToolRenderTarget::TranscriptToolCall,
+            turn_behavior: InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+        };
+        let mut view = SessionView::new();
+        view.set_pending_interactions(vec![interaction("interaction-1")]);
+        assert_eq!(view.snapshot().interactions.len(), 1);
+
+        view.set_pending_interactions(Vec::new());
+        assert!(view.snapshot().interactions.is_empty());
+        assert!(view.snapshot().transcript.items.is_empty());
+    }
+
+    #[test]
+    fn authoritative_permission_hydration_removes_stale_pending_state() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.set_pending_permissions(vec![bcode_session_view_models::PermissionView {
+            permission_id: "permission-1".to_owned(),
+            session_id: Some(session_id),
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: "{}".to_owned(),
+            batch: None,
+            agent_id: "build".to_owned(),
+            title: Some("Permission requested: shell.run".to_owned()),
+            policy_source: None,
+            detail: None,
+            resolved: false,
+            approved: None,
+            can_remember: false,
+        }]);
+        assert_eq!(view.snapshot().permissions.len(), 1);
+
+        view.set_pending_permissions(Vec::new());
+        assert!(view.snapshot().permissions.is_empty());
     }
 
     #[test]

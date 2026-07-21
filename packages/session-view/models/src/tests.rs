@@ -66,3 +66,22 @@ fn runtime_work_view_deserializes_legacy_shape() {
     assert_eq!(work.label, "");
     assert!(!work.cancellable);
 }
+
+#[test]
+fn permission_view_deserializes_legacy_shape() {
+    let permission: PermissionView = serde_json::from_value(serde_json::json!({
+        "permission_id": "permission-1",
+        "tool_call_id": "call-1",
+        "title": "Permission requested",
+        "detail": null,
+        "resolved": false,
+        "approved": null,
+        "can_remember": false
+    }))
+    .expect("legacy permission view");
+
+    assert_eq!(permission.session_id, None);
+    assert_eq!(permission.tool_name, "");
+    assert_eq!(permission.batch, None);
+    assert_eq!(permission.policy_source, None);
+}

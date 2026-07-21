@@ -483,15 +483,44 @@ impl From<PluginVisualDescriptor> for PluginVisualView {
     }
 }
 
+/// Renderer-neutral authorization-batch correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionBatchView {
+    /// Host-assigned batch identifier.
+    pub batch_id: String,
+    /// Zero-based provider-order call index.
+    pub call_index: usize,
+    /// Total calls in the authorization batch.
+    pub call_count: usize,
+}
+
 /// Pending permission request visible to renderers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionView {
     /// Permission identifier.
     pub permission_id: String,
+    /// Session containing the checkpoint, when supplied by authoritative hydration.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
     /// Associated provider tool call identifier.
     pub tool_call_id: String,
+    /// Tool name.
+    #[serde(default)]
+    pub tool_name: String,
+    /// Raw tool argument JSON.
+    #[serde(default)]
+    pub arguments_json: String,
+    /// Complete-batch correlation, when this checkpoint belongs to a batch.
+    #[serde(default)]
+    pub batch: Option<PermissionBatchView>,
+    /// Agent requesting permission.
+    #[serde(default)]
+    pub agent_id: String,
     /// Human-readable title.
     pub title: Option<String>,
+    /// Policy source requesting approval.
+    #[serde(default)]
+    pub policy_source: Option<String>,
     /// Human-readable detail/body text.
     pub detail: Option<String>,
     /// Whether the permission has been resolved.
@@ -669,6 +698,9 @@ pub struct InteractionViewSummary {
     pub interaction_id: String,
     /// Interaction kind.
     pub kind: String,
+    /// Renderer-specific surface key supplied by the interaction owner.
+    #[serde(default)]
+    pub surface_kind: String,
     /// Associated tool call identifier, when known.
     pub tool_call_id: Option<String>,
     /// Optional title for display.
@@ -746,6 +778,8 @@ pub enum SessionViewActionOutcome {
     Cancelled { cancelled: bool },
     /// Permission resolution result.
     PermissionResolved { resolved: bool },
+    /// Permission batch resolution result.
+    PermissionBatchResolved { resolved_count: usize },
     /// Interaction resolution result.
     InteractionResolved { resolved: bool },
     /// Interaction input response as generic JSON.
@@ -782,6 +816,13 @@ pub enum SessionViewAction {
         approved: bool,
         /// Whether the decision should be remembered.
         remember: bool,
+    },
+    /// Resolve every pending permission in one authorization batch.
+    ResolvePermissionBatch {
+        /// Authorization batch id.
+        batch_id: String,
+        /// Whether the batch is approved.
+        approved: bool,
     },
     /// Submit semantic input to an interactive tool/controller.
     SubmitInteractionInput {

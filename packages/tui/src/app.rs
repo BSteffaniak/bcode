@@ -1373,6 +1373,35 @@ impl BmuxApp {
         self.session_view.snapshot().active_skills.len()
     }
 
+    /// Replace authoritative pending permission state in the shared session view.
+    pub fn set_pending_permission_views(
+        &mut self,
+        permissions: Vec<bcode_session_view_models::PermissionView>,
+    ) {
+        self.session_view.set_pending_permissions(permissions);
+    }
+
+    /// Replace authoritative pending interaction state in the shared session view.
+    pub fn set_pending_interactions(
+        &mut self,
+        interactions: Vec<bcode_session_view_models::InteractionViewSummary>,
+    ) {
+        self.session_view.set_pending_interactions(interactions);
+    }
+
+    /// Return renderer-neutral interaction state by id.
+    #[must_use]
+    pub fn interaction_view(
+        &self,
+        interaction_id: &str,
+    ) -> Option<&bcode_session_view_models::InteractionViewSummary> {
+        self.session_view
+            .snapshot()
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == interaction_id)
+    }
+
     /// Return active plugin-owned session status contributions.
     pub fn plugin_status(
         &self,

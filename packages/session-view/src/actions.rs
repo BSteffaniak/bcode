@@ -44,6 +44,11 @@ pub async fn execute_session_view_action(
             approved,
             remember,
         } => execute_resolve_permission(client, permission_id, approved, remember).await,
+        SessionViewAction::ResolvePermissionBatch { batch_id, approved } => {
+            Ok(SessionViewActionOutcome::PermissionBatchResolved {
+                resolved_count: client.resolve_permission_batch(batch_id, approved).await?,
+            })
+        }
         SessionViewAction::SubmitInteractionInput {
             interaction_id,
             input,

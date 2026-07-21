@@ -885,6 +885,7 @@ mod tests {
         let interaction = InteractionViewSummary {
             interaction_id: "interaction-1".to_owned(),
             kind: "bcode.question".to_owned(),
+            surface_kind: "bcode.question.inline".to_owned(),
             tool_call_id: Some("call-1".to_owned()),
             title: Some("Choose".to_owned()),
             required: true,

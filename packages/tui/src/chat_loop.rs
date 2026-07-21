@@ -582,21 +582,9 @@ fn apply_effect_result(
         TuiEffectResult::SessionStatusLoaded {
             daemon_connected: _,
             session_id,
-            model,
-            active_skills,
-            runtime_work,
-            plugin_status,
-            error,
+            hydration,
         } => {
-            apply_session_status_result(
-                chat,
-                session_id,
-                model,
-                active_skills,
-                runtime_work,
-                plugin_status,
-                error,
-            );
+            apply_session_status_result(chat, session_id, *hydration);
         }
         TuiEffectResult::SessionModelStatusLoaded { session_id, result } => {
             if chat.session_id == Some(session_id) {
@@ -789,12 +777,16 @@ fn apply_draft_status_result(
 fn apply_session_status_result(
     chat: &mut ActiveChat,
     session_id: bcode_session_models::SessionId,
-    model: Option<bcode_ipc::SessionModelStatus>,
-    active_skills: Option<Vec<bcode_skill_models::SkillContextResponse>>,
-    runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
-    plugin_status: Vec<bcode_session_view_models::PluginStatusView>,
-    error: Option<String>,
+    hydration: super::effects::SessionStatusHydration,
 ) {
+    let super::effects::SessionStatusHydration {
+        model,
+        active_skills,
+        runtime_work,
+        interactions,
+        plugin_status,
+        error,
+    } = hydration;
     if chat.session_id != Some(session_id) {
         return;
     }
@@ -815,6 +807,9 @@ fn apply_session_status_result(
     }
     if let Some(work) = runtime_work {
         chat.app.apply_runtime_work_snapshots(&work);
+    }
+    if let Some(interactions) = interactions {
+        chat.app.set_pending_interactions(interactions);
     }
     let skill_count = chat.app.active_skill_count();
     if let Some(error) = error {
@@ -881,17 +876,51 @@ fn apply_newer_history_result(
     }
 }
 
+fn permission_summary_view(
+    permission: bcode_ipc::PermissionSummary,
+) -> bcode_session_view_models::PermissionView {
+    let title = Some(format!("Permission requested: {}", permission.tool_name));
+    let detail = permission.policy_reason.clone();
+    bcode_session_view_models::PermissionView {
+        permission_id: permission.permission_id,
+        session_id: Some(permission.session_id),
+        tool_call_id: permission.tool_call_id,
+        tool_name: permission.tool_name,
+        arguments_json: permission.arguments_json,
+        batch: permission
+            .batch
+            .map(|batch| bcode_session_view_models::PermissionBatchView {
+                batch_id: batch.batch_id,
+                call_index: batch.call_index,
+                call_count: batch.call_count,
+            }),
+        agent_id: permission.agent_id,
+        title,
+        policy_source: permission.policy_source,
+        detail,
+        resolved: false,
+        approved: None,
+        can_remember: permission.can_remember_policy,
+    }
+}
+
 fn apply_permission_list_result(
-    chat: &ActiveChat,
+    chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     result: Result<Vec<bcode_ipc::PermissionSummary>, ClientError>,
 ) {
     match result {
         Ok(permissions) => {
+            let active_permissions = permissions
+                .iter()
+                .filter(|permission| Some(permission.session_id) == chat.session_id)
+                .cloned()
+                .map(permission_summary_view)
+                .collect::<Vec<_>>();
+            chat.app
+                .set_pending_permission_views(active_permissions.clone());
             if loop_state.permission_dialog.is_none()
-                && let Some(permission) = permissions
-                    .into_iter()
-                    .find(|permission| Some(permission.session_id) == chat.session_id)
+                && let Some(permission) = active_permissions.into_iter().next()
             {
                 loop_state.permission_dialog = Some(PermissionDialogState::new(permission));
             }
@@ -1276,7 +1305,7 @@ fn close_permission_dialog_for_session(
 ) {
     if permission_dialog
         .as_ref()
-        .is_some_and(|dialog| dialog.permission().session_id == session_id)
+        .is_some_and(|dialog| dialog.permission().session_id == Some(session_id))
     {
         *permission_dialog = None;
     }
@@ -1621,8 +1650,8 @@ async fn absorb_bcode_event(
                     loop_state.permission_dialog = None;
                     loop_state.replace_effect(TuiEffect::ListPermissions);
                 }
-                maybe_open_interactive_surface(loop_state, &event.kind).await;
                 chat.app.absorb_session_event(&event);
+                maybe_open_interactive_surface(chat, loop_state, &event.kind).await;
             }
             true
         }
@@ -1656,16 +1685,21 @@ async fn absorb_bcode_event(
     }
 }
 
-async fn maybe_open_interactive_surface(loop_state: &mut ChatLoopState, event: &SessionEventKind) {
-    let SessionEventKind::InteractiveToolRequestCreated {
-        interaction_id,
-        surface_kind,
-        request_json,
-        ..
-    } = event
-    else {
+async fn maybe_open_interactive_surface(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    event: &SessionEventKind,
+) {
+    let SessionEventKind::InteractiveToolRequestCreated { interaction_id, .. } = event else {
         return;
     };
+    let Some(interaction) = chat.app.interaction_view(interaction_id) else {
+        return;
+    };
+    let request_json = interaction
+        .snapshot
+        .as_ref()
+        .map_or_else(|| "{}".to_owned(), serde_json::Value::to_string);
     let runtime = loop_state.plugin_runtime.get_or_insert_with(|| {
         super::plugin_tui::load_default_runtime_with_static_bundled(
             &bcode_bundled_plugins::static_bundled_plugins(),
@@ -1674,9 +1708,9 @@ async fn maybe_open_interactive_surface(loop_state: &mut ChatLoopState, event: &
     });
     let opened = InteractiveSurfaceState::open(
         runtime,
-        interaction_id.clone(),
-        surface_kind.clone(),
-        request_json,
+        interaction.interaction_id.clone(),
+        interaction.surface_kind.clone(),
+        &request_json,
     )
     .await;
     loop_state.interactive_surface = opened.ok();
@@ -2223,11 +2257,42 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn permission_hydration_preserves_batch_and_policy_semantics() {
+        let session_id = bcode_session_models::SessionId::new();
+        let permission = permission_summary_view(bcode_ipc::PermissionSummary {
+            permission_id: "permission-1".to_owned(),
+            session_id,
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"cargo test"}"#.to_owned(),
+            batch: Some(bcode_ipc::PermissionBatchCorrelation {
+                batch_id: "batch-1".to_owned(),
+                call_index: 1,
+                call_count: 3,
+            }),
+            agent_id: "build".to_owned(),
+            policy_source: Some("skill".to_owned()),
+            policy_reason: Some("requires approval".to_owned()),
+            can_remember_policy: true,
+        });
+
+        assert_eq!(permission.session_id, Some(session_id));
+        assert_eq!(permission.tool_name, "shell.run");
+        assert_eq!(permission.policy_source.as_deref(), Some("skill"));
+        assert_eq!(permission.detail.as_deref(), Some("requires approval"));
+        assert!(permission.can_remember);
+        let batch = permission.batch.expect("batch correlation");
+        assert_eq!(batch.batch_id, "batch-1");
+        assert_eq!(batch.call_index, 1);
+        assert_eq!(batch.call_count, 3);
+    }
+
+    #[test]
     fn cancellation_closes_only_the_matching_session_permission_dialog() {
         let session_id = bcode_session_models::SessionId::new();
         let other_session_id = bcode_session_models::SessionId::new();
         let permission = |session_id| {
-            PermissionDialogState::new(bcode_ipc::PermissionSummary {
+            PermissionDialogState::new(permission_summary_view(bcode_ipc::PermissionSummary {
                 permission_id: "permission-1".to_owned(),
                 session_id,
                 tool_call_id: "call-1".to_owned(),
@@ -2242,7 +2307,7 @@ mod scheduler_tests {
                 policy_source: None,
                 policy_reason: None,
                 can_remember_policy: false,
-            })
+            }))
         };
         let mut dialog = Some(permission(session_id));
 

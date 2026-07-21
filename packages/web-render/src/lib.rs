@@ -318,11 +318,25 @@ async fn hydrate_pending_permissions(
         .into_iter()
         .filter(|permission| permission.session_id == session_id)
     {
+        let title = Some(format!("Permission requested: {}", permission.tool_name));
+        let detail = permission.policy_reason.clone();
         view.upsert_permission(bcode_session_view_models::PermissionView {
             permission_id: permission.permission_id,
+            session_id: Some(permission.session_id),
             tool_call_id: permission.tool_call_id,
-            title: Some(format!("Permission requested: {}", permission.tool_name)),
-            detail: permission.policy_reason,
+            tool_name: permission.tool_name,
+            arguments_json: permission.arguments_json,
+            batch: permission
+                .batch
+                .map(|batch| bcode_session_view_models::PermissionBatchView {
+                    batch_id: batch.batch_id,
+                    call_index: batch.call_index,
+                    call_count: batch.call_count,
+                }),
+            agent_id: permission.agent_id,
+            title,
+            policy_source: permission.policy_source,
+            detail,
             resolved: false,
             approved: None,
             can_remember: permission.can_remember_policy,
@@ -346,11 +360,13 @@ async fn hydrate_pending_interactions(
             .interaction_snapshot(interaction_id.clone())
             .await?
             .map_or(request.request, |snapshot| snapshot.snapshot);
+        let surface_kind = request.surface_kind.clone();
         view.upsert_interaction(InteractionViewSummary {
             interaction_id,
             kind: request
                 .interaction_kind
-                .unwrap_or_else(|| request.surface_kind.clone()),
+                .unwrap_or_else(|| surface_kind.clone()),
+            surface_kind,
             tool_call_id: Some(request.tool_call_id),
             title: Some(request.tool_name),
             required: request.required,

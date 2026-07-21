@@ -30,7 +30,7 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
         agent_id: &permission.agent_id,
         risk: &presentation.risk,
         policy_source: permission.policy_source.as_deref(),
-        policy_reason: permission.policy_reason.as_deref(),
+        policy_reason: permission.detail.as_deref(),
         details: &presentation.details,
         raw_details: presentation.raw_details.as_deref(),
         width: area.width.saturating_sub(4),
@@ -105,7 +105,7 @@ pub fn action_areas(dialog: Rect) -> (Rect, Rect) {
 struct PermissionRowsInput<'a> {
     state: &'a PermissionDialogState,
     tool_name: &'a str,
-    batch: Option<&'a bcode_ipc::PermissionBatchCorrelation>,
+    batch: Option<&'a bcode_session_view_models::PermissionBatchView>,
     agent_id: &'a str,
     risk: &'a str,
     policy_source: Option<&'a str>,
@@ -242,7 +242,7 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
     let (approve_area, _) = action_areas(dialog);
     let buttons = action_buttons(
         state.permission().batch.is_some(),
-        state.permission().can_remember_policy,
+        state.permission().can_remember,
     );
     let focused = state.focused_action_index();
     ActionRow::new(&buttons)
@@ -313,8 +313,8 @@ const fn muted_style() -> Style {
 
 #[cfg(test)]
 mod tests {
-    use bcode_ipc::PermissionSummary;
     use bcode_session_models::SessionId;
+    use bcode_session_view_models::{PermissionBatchView, PermissionView};
     use bmux_tui::buffer::Buffer;
     use uuid::Uuid;
 
@@ -331,17 +331,20 @@ mod tests {
 
     #[test]
     fn shell_permission_renders_semantic_fields_not_raw_json() {
-        let state = PermissionDialogState::new(PermissionSummary {
+        let state = PermissionDialogState::new(PermissionView {
             permission_id: "perm-1".to_owned(),
-            session_id: SessionId(Uuid::nil()),
+            session_id: Some(SessionId(Uuid::nil())),
             tool_call_id: "call-1".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"cargo check --workspace","cwd":"/repo"}"#.to_owned(),
             batch: None,
             agent_id: "build".to_owned(),
+            title: Some("Permission requested: shell.run".to_owned()),
             policy_source: None,
-            policy_reason: None,
-            can_remember_policy: false,
+            detail: None,
+            resolved: false,
+            approved: None,
+            can_remember: false,
         });
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
@@ -358,21 +361,24 @@ mod tests {
 
     #[test]
     fn batched_permission_renders_position_and_batch_actions() {
-        let state = PermissionDialogState::new(PermissionSummary {
+        let state = PermissionDialogState::new(PermissionView {
             permission_id: "perm-batch".to_owned(),
-            session_id: SessionId(Uuid::nil()),
+            session_id: Some(SessionId(Uuid::nil())),
             tool_call_id: "call-2".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"cargo check"}"#.to_owned(),
-            batch: Some(bcode_ipc::PermissionBatchCorrelation {
+            batch: Some(PermissionBatchView {
                 batch_id: "batch-1".to_owned(),
                 call_index: 1,
                 call_count: 3,
             }),
             agent_id: "build".to_owned(),
+            title: Some("Permission requested: shell.run".to_owned()),
             policy_source: None,
-            policy_reason: None,
-            can_remember_policy: false,
+            detail: None,
+            resolved: false,
+            approved: None,
+            can_remember: false,
         });
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);

@@ -1,18 +1,18 @@
 //! TUI permission modal state.
 
-use bcode_ipc::PermissionSummary;
+use bcode_session_view_models::PermissionView;
 
 /// Pending permission dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionDialogState {
-    permission: PermissionSummary,
+    permission: PermissionView,
     focused_action: usize,
 }
 
 impl PermissionDialogState {
     /// Create state for a permission summary.
     #[must_use]
-    pub const fn new(permission: PermissionSummary) -> Self {
+    pub const fn new(permission: PermissionView) -> Self {
         Self {
             permission,
             focused_action: 0,
@@ -21,7 +21,7 @@ impl PermissionDialogState {
 
     /// Return the permission summary.
     #[must_use]
-    pub const fn permission(&self) -> &PermissionSummary {
+    pub const fn permission(&self) -> &PermissionView {
         &self.permission
     }
 
@@ -36,7 +36,7 @@ impl PermissionDialogState {
     pub const fn focused_remember(&self) -> bool {
         match (
             self.permission.batch.is_some(),
-            self.permission.can_remember_policy,
+            self.permission.can_remember,
             self.focused_action,
         ) {
             (true, true, 2 | 5) | (false, true, 1 | 3) => true,
@@ -49,7 +49,7 @@ impl PermissionDialogState {
     pub const fn focused_batch(&self) -> bool {
         match (
             self.permission.batch.is_some(),
-            self.permission.can_remember_policy,
+            self.permission.can_remember,
             self.focused_action,
         ) {
             (true, true, 1 | 4) | (true, false, 1 | 3) => true,
@@ -68,7 +68,7 @@ impl PermissionDialogState {
     pub const fn focused_approval(&self) -> bool {
         match (
             self.permission.batch.is_some(),
-            self.permission.can_remember_policy,
+            self.permission.can_remember,
         ) {
             (true, true) => self.focused_action < 3,
             (true, false) | (false, true) => self.focused_action < 2,
@@ -81,7 +81,7 @@ impl PermissionDialogState {
     pub const fn focused_label(&self) -> &'static str {
         match (
             self.permission.batch.is_some(),
-            self.permission.can_remember_policy,
+            self.permission.can_remember,
             self.focused_action,
         ) {
             (true | false, true, 0) | (true, false, 0) => "approve once",
@@ -112,7 +112,7 @@ impl PermissionDialogState {
     const fn action_count(&self) -> usize {
         match (
             self.permission.batch.is_some(),
-            self.permission.can_remember_policy,
+            self.permission.can_remember,
         ) {
             (true, true) => 6,
             (true, false) | (false, true) => 4,
@@ -124,30 +124,33 @@ impl PermissionDialogState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_ipc::PermissionSummary;
     use bcode_session_models::SessionId;
+    use bcode_session_view_models::{PermissionBatchView, PermissionView};
     use uuid::Uuid;
 
-    fn permission(can_remember_policy: bool) -> PermissionSummary {
+    fn permission(can_remember_policy: bool) -> PermissionView {
         permission_with_batch(can_remember_policy, false)
     }
 
-    fn permission_with_batch(can_remember_policy: bool, batched: bool) -> PermissionSummary {
-        PermissionSummary {
+    fn permission_with_batch(can_remember_policy: bool, batched: bool) -> PermissionView {
+        PermissionView {
             permission_id: "perm".to_string(),
-            session_id: SessionId(Uuid::nil()),
+            session_id: Some(SessionId(Uuid::nil())),
             tool_call_id: "call".to_string(),
             tool_name: "tool".to_string(),
             arguments_json: "{}".to_string(),
-            batch: batched.then(|| bcode_ipc::PermissionBatchCorrelation {
+            batch: batched.then(|| PermissionBatchView {
                 batch_id: "batch".to_string(),
                 call_index: 1,
                 call_count: 3,
             }),
             agent_id: "build".to_string(),
+            title: Some("Permission requested: tool".to_owned()),
             policy_source: can_remember_policy.then(|| "skill".to_string()),
-            policy_reason: can_remember_policy.then(|| "skill asks".to_string()),
-            can_remember_policy,
+            detail: can_remember_policy.then(|| "skill asks".to_string()),
+            resolved: false,
+            approved: None,
+            can_remember: can_remember_policy,
         }
     }
 
