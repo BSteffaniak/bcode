@@ -909,6 +909,10 @@ impl BmuxApp {
                 .runtime
                 .context_occupancy
                 .as_ref(),
+            self.session_view
+                .snapshot()
+                .runtime
+                .cumulative_metered_tokens,
         )
     }
 
@@ -2270,7 +2274,7 @@ impl BmuxApp {
                 self.apply_context_occupancy((**occupancy).clone());
             }
             SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
-                self.apply_provider_stream_event(event);
+                self.apply_shared_provider_stream_progress(event);
             }
         }
     }
@@ -2418,12 +2422,12 @@ impl BmuxApp {
             }
             SessionEventKind::PermissionResolved {
                 permission_id,
-                approved,
+                approved: _,
             } => {
                 if application.live_activity() {
                     self.set_activity(ActivityState::PreparingFollowUpRequest);
                 }
-                self.set_permission_status(permission_id, *approved);
+                self.set_permission_status(permission_id);
             }
             SessionEventKind::ModelChanged { provider, model } => {
                 self.apply_model_changed(provider, model);
@@ -3043,7 +3047,23 @@ impl BmuxApp {
         }
     }
 
-    fn set_permission_status(&mut self, permission_id: &str, approved: bool) {
+    fn set_permission_status(&mut self, permission_id: &str) {
+        let approved = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.kind {
+                bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                    if permission.permission_id == permission_id && permission.resolved =>
+                {
+                    permission.approved
+                }
+                _ => None,
+            })
+            .unwrap_or(false);
         let status = if approved {
             "permission approved"
         } else {
@@ -3611,17 +3631,28 @@ impl BmuxApp {
     }
 
     fn permission_tool_call_id(&self, permission_id: &str) -> Option<String> {
-        self.transcript.iter().rev().find_map(|item| {
-            let TranscriptItemKind::PermissionRequest {
-                permission_id: item_permission_id,
-                tool_call_id,
-                ..
-            } = item.kind()
-            else {
-                return None;
-            };
-            (item_permission_id == permission_id).then(|| tool_call_id.clone())
-        })
+        self.session_view
+            .snapshot()
+            .permissions
+            .iter()
+            .find(|permission| permission.permission_id == permission_id)
+            .map(|permission| permission.tool_call_id.clone())
+            .or_else(|| {
+                self.session_view
+                    .snapshot()
+                    .transcript
+                    .items
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.kind {
+                        bcode_session_view_models::TranscriptViewItemKind::Permission {
+                            permission,
+                        } if permission.permission_id == permission_id => {
+                            Some(permission.tool_call_id.clone())
+                        }
+                        _ => None,
+                    })
+            })
     }
 
     fn finish_tool_request_preview(&mut self, tool_call_id: &str) {
@@ -3645,13 +3676,30 @@ impl BmuxApp {
         usage: &bcode_session_models::SessionTokenUsage,
         application: SessionEventApplication,
     ) {
-        self.token_usage.absorb(usage);
+        let projected_usage = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.kind {
+                bcode_session_view_models::TranscriptViewItemKind::Usage { usage }
+                    if usage.turn_id == turn_id =>
+                {
+                    Some(&usage.usage)
+                }
+                _ => None,
+            })
+            .unwrap_or(usage);
+        self.token_usage.absorb(projected_usage);
         if application.live_activity()
-            && let Some(tokens) = usage.metered_total_tokens()
+            && let Some(tokens) = projected_usage.metered_total_tokens()
         {
             self.status = format!("tokens: {tokens}");
         }
-        self.transcript.push(model_usage_item(turn_id, usage));
+        self.transcript
+            .push(model_usage_item(turn_id, projected_usage));
     }
 
     fn finish_model_turn(
@@ -3851,6 +3899,39 @@ impl BmuxApp {
             }
             SessionTracePayload::ToolPolicyEvaluated { .. }
             | SessionTracePayload::ToolInvocationStreamEvent(_) => {}
+        }
+    }
+
+    fn apply_shared_provider_stream_progress(&mut self, event: &ProviderStreamEvent) {
+        let progress = self
+            .session_view
+            .snapshot()
+            .runtime
+            .provider_progress
+            .clone();
+        match event {
+            ProviderStreamEvent::ToolCallFinished { tool_name, .. } => {
+                if matches!(self.activity, ActivityState::ProviderStream { .. }) {
+                    self.set_activity(ActivityState::PreparingToolExecution {
+                        name: tool_name.clone(),
+                    });
+                }
+            }
+            ProviderStreamEvent::RetryScheduled { .. } => {
+                if let Some(progress) = progress {
+                    self.set_activity(ActivityState::RetryWait {
+                        message: progress.detail,
+                        retry_at_unix: progress.retry_at_unix.unwrap_or_default(),
+                    });
+                }
+            }
+            _ => {
+                if let Some(progress) = progress {
+                    self.set_activity(ActivityState::ProviderStream {
+                        detail: progress.detail,
+                    });
+                }
+            }
         }
     }
 
@@ -4174,7 +4255,6 @@ fn tool_request_status(arguments_json: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TokenUsageMeter {
-    session_tokens: u64,
     session_cost_micros: Option<u64>,
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
@@ -4188,9 +4268,6 @@ struct TokenUsageMeter {
 
 impl TokenUsageMeter {
     fn absorb(&mut self, usage: &bcode_session_models::SessionTokenUsage) {
-        if let Some(tokens) = usage.metered_total_tokens() {
-            self.session_tokens = self.session_tokens.saturating_add(u64::from(tokens));
-        }
         if let Some(pricing) = &self.pricing {
             let usage = bcode_model::TokenUsage {
                 input_tokens: usage.input_tokens,
@@ -4242,6 +4319,7 @@ impl TokenUsageMeter {
     fn footer_summary(
         &self,
         occupancy: Option<&bcode_session_models::RequestContextOccupancy>,
+        cumulative_metered_tokens: u64,
     ) -> String {
         let mut parts = vec![self.context_summary(occupancy)];
         if self.provider_reuse_active {
@@ -4272,7 +4350,10 @@ impl TokenUsageMeter {
         {
             parts.push(format!("cache points {points}"));
         }
-        parts.push(format!("spent {} tok", compact_u64(self.session_tokens)));
+        parts.push(format!(
+            "spent {} tok",
+            compact_u64(cumulative_metered_tokens)
+        ));
         if let Some(cost_micros) = self.session_cost_micros {
             parts.push(format!("~{}", format_usd_micros(cost_micros)));
         }

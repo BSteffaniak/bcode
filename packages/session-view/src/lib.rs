@@ -554,9 +554,27 @@ impl SessionView {
                     self.bump_revision();
                 }
             }
-            SessionEventKind::ModelUsage { usage, .. } => {
+            SessionEventKind::ModelUsage { turn_id, usage } => {
+                if let Some(tokens) = usage.metered_total_tokens() {
+                    self.snapshot.runtime.cumulative_metered_tokens = self
+                        .snapshot
+                        .runtime
+                        .cumulative_metered_tokens
+                        .saturating_add(u64::from(tokens));
+                }
                 self.snapshot.runtime.latest_usage = Some(usage.clone());
-                self.bump_revision();
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::Usage {
+                        usage: bcode_session_view_models::UsageView {
+                            turn_id: turn_id.clone(),
+                            usage: usage.clone(),
+                        },
+                    },
+                );
             }
             SessionEventKind::ContextCompacted { summary, .. } => {
                 self.set_context_occupancy(None);
@@ -1431,7 +1449,10 @@ fn provider_progress_detail(event: &bcode_session_models::ProviderStreamEvent) -
             tool_name,
             argument_bytes,
             ..
-        } => format!("assembling {tool_name} arguments ({argument_bytes} bytes received)"),
+        } => format!(
+            "assembling {tool_name} arguments ({} received)",
+            format_provider_bytes(*argument_bytes)
+        ),
         bcode_session_models::ProviderStreamEvent::ToolCallFinished { tool_name, .. } => {
             format!("provider stream tool finished: {tool_name}")
         }
@@ -1450,6 +1471,22 @@ fn provider_progress_detail(event: &bcode_session_models::ProviderStreamEvent) -
         bcode_session_models::ProviderStreamEvent::RetryScheduled { message, .. } => {
             message.clone()
         }
+    }
+}
+
+fn format_provider_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if bytes >= MIB {
+        let whole = bytes / MIB;
+        let decimal = (bytes % MIB) * 10 / MIB;
+        format!("{whole}.{decimal} MiB")
+    } else if bytes >= KIB {
+        let whole = bytes / KIB;
+        let decimal = (bytes % KIB) * 10 / KIB;
+        format!("{whole}.{decimal} KiB")
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -1529,6 +1566,7 @@ fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
         TranscriptViewItemKind::ToolInvocation { .. }
         | TranscriptViewItemKind::Permission { .. }
         | TranscriptViewItemKind::RuntimeWork { .. }
+        | TranscriptViewItemKind::Usage { .. }
         | TranscriptViewItemKind::Interaction { .. }
         | TranscriptViewItemKind::PluginVisual { .. }
         | TranscriptViewItemKind::ToolContribution { .. } => {}
@@ -1544,6 +1582,7 @@ fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) {
         TranscriptViewItemKind::ToolInvocation { .. }
         | TranscriptViewItemKind::Permission { .. }
         | TranscriptViewItemKind::RuntimeWork { .. }
+        | TranscriptViewItemKind::Usage { .. }
         | TranscriptViewItemKind::Interaction { .. }
         | TranscriptViewItemKind::PluginVisual { .. }
         | TranscriptViewItemKind::ToolContribution { .. } => {}
@@ -1983,7 +2022,7 @@ mod tests {
         assert_eq!(progress.turn_id, "turn-1");
         assert_eq!(
             progress.detail,
-            "assembling shell.run arguments (128 bytes received)"
+            "assembling shell.run arguments (128 B received)"
         );
         assert_eq!(progress.retry_at_unix, None);
 
@@ -2449,6 +2488,7 @@ mod tests {
         );
         assert_eq!(runtime.agent_id.as_deref(), Some("build"));
         assert_eq!(runtime.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(runtime.cumulative_metered_tokens, 15);
         assert_eq!(
             runtime
                 .latest_usage
@@ -2468,10 +2508,15 @@ mod tests {
             runtime.last_turn_outcome,
             Some(bcode_session_models::ModelTurnOutcome::Completed)
         );
-        assert!(matches!(
-            &view.snapshot().transcript.items[0].kind,
+        assert!(view.snapshot().transcript.items.iter().any(|item| matches!(
+            &item.kind,
+            TranscriptViewItemKind::Usage { usage }
+                if usage.turn_id == "turn-1" && usage.usage.total_tokens == Some(15)
+        )));
+        assert!(view.snapshot().transcript.items.iter().any(|item| matches!(
+            &item.kind,
             TranscriptViewItemKind::SystemMessage { message } if message.text == "status"
-        ));
+        )));
     }
 
     #[test]

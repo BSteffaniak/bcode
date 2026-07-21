@@ -127,7 +127,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 7;
+    pub const SCHEMA_VERSION: u16 = 9;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -198,7 +198,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 7;
+    pub const SCHEMA_VERSION: u16 = 9;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -291,6 +291,8 @@ pub enum TranscriptViewItemKind {
     Permission { permission: PermissionView },
     /// Runtime work status block.
     RuntimeWork { work: RuntimeWorkView },
+    /// Provider-neutral model usage accounting.
+    Usage { usage: UsageView },
     /// Interactive request block.
     Interaction { interaction: InteractionViewSummary },
     /// System/status message.
@@ -301,6 +303,15 @@ pub enum TranscriptViewItemKind {
     ToolContribution {
         contribution: bcode_session_models::ToolContributionEvent,
     },
+}
+
+/// Renderer-neutral model usage transcript item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageView {
+    /// Model turn identifier.
+    pub turn_id: String,
+    /// Provider-neutral usage accounting.
+    pub usage: SessionTokenUsage,
 }
 
 /// Chat text plus renderer-neutral annotations.
@@ -644,6 +655,9 @@ pub struct SessionRuntimeViewState {
     pub reasoning_summary: Option<String>,
     /// Authoritative active request-context occupancy.
     pub context_occupancy: Option<RequestContextOccupancy>,
+    /// Cumulative metered tokens observed across model usage events in the current projection.
+    #[serde(default)]
+    pub cumulative_metered_tokens: u64,
     /// Most recently observed model usage.
     pub latest_usage: Option<SessionTokenUsage>,
     /// Active model turn identifier, when a turn is running or cancelling.

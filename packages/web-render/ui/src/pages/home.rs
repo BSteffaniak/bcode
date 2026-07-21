@@ -651,6 +651,13 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
                 div color="#c9d1d9" { (permission.detail.as_deref().unwrap_or("No details provided.")) }
             }
         },
+        TranscriptViewItemKind::Usage { usage } => container! {
+            div color="#8b949e" font-size=12 {
+                "input " (usage.usage.input_tokens.map_or_else(|| "unknown".to_owned(), |value| value.to_string()))
+                " · output " (usage.usage.output_tokens.map_or_else(|| "unknown".to_owned(), |value| value.to_string()))
+                " · total " (usage.usage.metered_total_tokens().map_or_else(|| "unknown".to_owned(), |value| value.to_string()))
+            }
+        },
         TranscriptViewItemKind::RuntimeWork { work } => container! {
             div {
                 div color="#f0f6fc" { (work.message.as_deref().unwrap_or("Runtime work")) }
@@ -767,6 +774,7 @@ const fn item_label(kind: &TranscriptViewItemKind) -> &'static str {
         TranscriptViewItemKind::ToolInvocation { .. } => "tool",
         TranscriptViewItemKind::Permission { .. } => "permission",
         TranscriptViewItemKind::RuntimeWork { .. } => "runtime work",
+        TranscriptViewItemKind::Usage { .. } => "usage",
         TranscriptViewItemKind::Interaction { .. } => "interaction",
         TranscriptViewItemKind::SystemMessage { .. } => "system",
         TranscriptViewItemKind::PluginVisual { .. } => "plugin visual",

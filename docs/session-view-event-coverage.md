@@ -22,13 +22,13 @@ Status meanings:
 | `ToolCallRequested` | Updates `ToolInvocationProjection`, tool map, and transcript tool item. | Updates tool contexts, active calls, activity, and transcript presentation. | **Complete** for generic tool semantics; terminal live-preview/activity behavior stays TUI-owned. |
 | `ToolCallFinished` | Updates the shared tool item and semantic/raw result. | Updates activity, active calls, artifacts, and terminal result presentation. | **Partial**: generic lifecycle/result is present; artifact-fetch and terminal activity behavior remain renderer/host concerns. |
 | `PermissionRequested` | Adds permission state and a permission transcript item; renderer hosts hydrate authoritative pending permissions including batch, policy, tool, and agent metadata. | Native permission dialog consumes the same shared permission model while retaining terminal-only focus/input behavior. | **Complete** for event and attach semantics. |
-| `PermissionResolved` | Updates both permission side state and its transcript item. | Replaces terminal permission presentation. | **Complete** for event semantics. |
+| `PermissionResolved` | Updates both permission side state and its transcript item. | Terminal permission-result presentation and tool-call correlation consume the resolved shared permission item. | **Complete** for event semantics. |
 | `ModelChanged` | Updates selected provider and requested/effective model state. | Updates selected provider/model and model display state. | **Complete** for durable selection semantics; authoritative attach hydration comes from `SessionModelStatus`. |
 | `SystemMessage` | Appends a semantic system transcript item. | Appends a system transcript item. | **Complete**. |
 | `AgentChanged` | Updates selected agent state. | Updates current agent selection. | **Complete** for durable selection semantics. |
 | `ModelTurnStarted` | Records active turn identity and clears cancellation state. | Sets live activity to preparing a model request. | **Complete** for semantic turn identity; renderer activity presentation remains local. |
 | `ModelTurnFinished` | Clears matching active turn, records outcome/message, and emits a system error item for failures. | Finishes turn activity and appends an error system message when needed. | **Complete** for semantic outcome/status. |
-| `ModelUsage` | Stores most recently observed provider-neutral usage. | Updates usage meter and transcript usage presentation. | **Partial**: shared accounting state is present; richer transcript/meter presentation remains renderer-owned. |
+| `ModelUsage` | Stores most recently observed provider-neutral usage, cumulative metered tokens, and a semantic usage transcript item. | Terminal usage presentation and footer spend-token accounting consume shared usage; pricing/cache/request-trace enrichment remains terminal-local. | **Complete** for generic accounting and transcript state; richer renderer presentation remains local. |
 | `ContextCompacted` | Appends a semantic context-compaction system item. | Appends compaction transcript presentation. | **Complete** for portable semantic status. |
 | `SessionRenamed` | Updates title. | Header consumes shared title metadata and keeps terminal-local status feedback. | **Complete** for persistent session metadata. |
 | `TraceEvent` | No-op. | Applies live trace telemetry only; replay ignores it. | **Intentional no-op** for shared transcript until a concrete cross-renderer trace view is required. |
@@ -67,7 +67,7 @@ Status meanings:
 | `ToolOutputDelta` | Applies the stream event to shared tool projection/output. | Updates terminal tool output and viewport. | **Complete** for generic semantic output. |
 | `ToolArgumentPreview` | Replaces one tool-call-keyed plugin visual preview with stable identity. | Updates terminal live preview and viewport. | **Complete** for semantic preview state; viewport behavior remains renderer-owned. |
 | `RequestContextOccupancyChanged` | Replaces authoritative current occupancy while rejecting stale epoch/sequence updates. | Footer context accounting consumes shared occupancy. | **Complete**. |
-| `ProviderStreamProgress` | Projects turn-correlated human-readable progress and retry timing. | Updates provider stream status. | **Complete** for semantic progress; animation/timers remain renderer-owned. |
+| `ProviderStreamProgress` | Projects turn-correlated human-readable progress and retry timing. | Live provider-stream activity consumes the shared projected detail/timing; trace-only diagnostics remain terminal-local. | **Complete** for semantic progress; animation/timers remain renderer-owned. |
 
 ## Migration order derived from the matrix
 
