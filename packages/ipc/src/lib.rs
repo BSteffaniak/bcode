@@ -438,6 +438,11 @@ pub enum Request {
         tool_call_id: String,
         action: bcode_tool::PluginInvocationAction,
     },
+    /// Resolve every currently pending checkpoint in one exact authorization batch.
+    ResolvePermissionBatch {
+        batch_id: String,
+        approved: bool,
+    },
 }
 
 /// Server stop request policy.
@@ -1264,6 +1269,9 @@ pub enum ResponsePayload {
         bytes: Vec<u8>,
     },
     PluginInvocationActionAccepted,
+    PermissionBatchResolved {
+        resolved: usize,
+    },
 }
 
 /// Structured error response.
@@ -2022,6 +2030,17 @@ mod tests {
         let decoded: PermissionSummary =
             serde_json::from_value(value).expect("summary without batch should decode");
         assert_eq!(decoded.batch, None);
+    }
+
+    #[test]
+    fn permission_batch_resolution_request_round_trips() {
+        let request = Request::ResolvePermissionBatch {
+            batch_id: "permission-batch-4".to_string(),
+            approved: true,
+        };
+        let encoded = encode(&request).expect("batch resolution request should encode");
+        let decoded: Request = decode(&encoded).expect("batch resolution request should decode");
+        assert_eq!(decoded, request);
     }
 
     #[test]

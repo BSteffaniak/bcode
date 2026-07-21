@@ -26,6 +26,7 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
     let rows = permission_rows(&PermissionRowsInput {
         state,
         tool_name: &permission.tool_name,
+        batch: permission.batch.as_ref(),
         agent_id: &permission.agent_id,
         risk: &presentation.risk,
         policy_source: permission.policy_source.as_deref(),
@@ -83,7 +84,7 @@ fn modal_frame() -> ModalFrame {
 pub fn action_areas(dialog: Rect) -> (Rect, Rect) {
     let content = dialog.inset(Insets::new(2, 3, 2, 3));
     let y = content.bottom().saturating_sub(1);
-    let actions = action_buttons(false);
+    let actions = action_buttons(false, false);
     let areas =
         ActionRow::new(&actions)
             .spacing(2)
@@ -104,6 +105,7 @@ pub fn action_areas(dialog: Rect) -> (Rect, Rect) {
 struct PermissionRowsInput<'a> {
     state: &'a PermissionDialogState,
     tool_name: &'a str,
+    batch: Option<&'a bcode_ipc::PermissionBatchCorrelation>,
     agent_id: &'a str,
     risk: &'a str,
     policy_source: Option<&'a str>,
@@ -121,6 +123,18 @@ fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
     )]));
     rows.push(Line::default());
     push_metadata_row(&mut rows, "tool", input.tool_name, input.width);
+    if let Some(batch) = input.batch {
+        push_metadata_row(
+            &mut rows,
+            "batch",
+            &format!(
+                "{} of {}",
+                batch.call_index.saturating_add(1),
+                batch.call_count
+            ),
+            input.width,
+        );
+    }
     push_metadata_row(&mut rows, "agent", input.agent_id, input.width);
     push_metadata_row(&mut rows, "risk", input.risk, input.width);
     if let Some(source) = input
@@ -226,17 +240,11 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
         content.height.saturating_add(4),
     );
     let (approve_area, _) = action_areas(dialog);
-    let buttons = action_buttons(state.permission().can_remember_policy);
-    let focused = if state.permission().can_remember_policy {
-        match (state.focused_approval(), state.focused_remember()) {
-            (true, false) => 0,
-            (true, true) => 1,
-            (false, false) => 2,
-            (false, true) => 3,
-        }
-    } else {
-        usize::from(!state.focused_approval())
-    };
+    let buttons = action_buttons(
+        state.permission().batch.is_some(),
+        state.permission().can_remember_policy,
+    );
+    let focused = state.focused_action_index();
     ActionRow::new(&buttons)
         .focused(focused)
         .spacing(2)
@@ -248,19 +256,32 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
         );
 }
 
-fn action_buttons(can_remember_policy: bool) -> Vec<ActionButton> {
-    if can_remember_policy {
-        vec![
+fn action_buttons(has_batch: bool, can_remember_policy: bool) -> Vec<ActionButton> {
+    match (has_batch, can_remember_policy) {
+        (true, true) => vec![
+            ActionButton::new("approve_once", "Approve once"),
+            ActionButton::new("approve_batch", "Approve batch"),
+            ActionButton::new("remember_allow", "Remember allow"),
+            ActionButton::new("deny_once", "Deny once"),
+            ActionButton::new("deny_batch", "Deny batch"),
+            ActionButton::new("remember_deny", "Remember deny"),
+        ],
+        (true, false) => vec![
+            ActionButton::new("approve_once", "Approve once"),
+            ActionButton::new("approve_batch", "Approve batch"),
+            ActionButton::new("deny_once", "Deny once"),
+            ActionButton::new("deny_batch", "Deny batch"),
+        ],
+        (false, true) => vec![
             ActionButton::new("approve_once", "Approve once"),
             ActionButton::new("remember_allow", "Remember allow"),
             ActionButton::new("deny_once", "Deny once"),
             ActionButton::new("remember_deny", "Remember deny"),
-        ]
-    } else {
-        vec![
+        ],
+        (false, false) => vec![
             ActionButton::new("approve", "Approve"),
             ActionButton::new("deny", "Deny"),
-        ]
+        ],
     }
 }
 
@@ -333,5 +354,37 @@ mod tests {
 
         assert!(rendered.contains("cargo check --workspace"));
         assert!(!rendered.contains("{\"command\""));
+    }
+
+    #[test]
+    fn batched_permission_renders_position_and_batch_actions() {
+        let state = PermissionDialogState::new(PermissionSummary {
+            permission_id: "perm-batch".to_owned(),
+            session_id: SessionId(Uuid::nil()),
+            tool_call_id: "call-2".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"cargo check"}"#.to_owned(),
+            batch: Some(bcode_ipc::PermissionBatchCorrelation {
+                batch_id: "batch-1".to_owned(),
+                call_index: 1,
+                call_count: 3,
+            }),
+            agent_id: "build".to_owned(),
+            policy_source: None,
+            policy_reason: None,
+            can_remember_policy: false,
+        });
+        let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+
+        render_permission_dialog(&state, &mut frame);
+        let rendered = (0..30)
+            .filter_map(|row| frame.buffer().row_symbols(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("2 of 3"));
+        assert!(rendered.contains("Approve batch"));
+        assert!(rendered.contains("Deny batch"));
     }
 }

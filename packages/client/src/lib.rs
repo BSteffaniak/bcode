@@ -2047,6 +2047,28 @@ impl BcodeClient {
         }
     }
 
+    /// Resolve all currently pending checkpoints in one authorization batch.
+    ///
+    /// Batch decisions never persist a remembered policy rule; each targeted checkpoint receives
+    /// the same one-time decision. Returns the number of checkpoints resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn resolve_permission_batch(
+        &self,
+        batch_id: String,
+        approved: bool,
+    ) -> Result<usize, ClientError> {
+        match self
+            .send_request(Request::ResolvePermissionBatch { batch_id, approved })
+            .await?
+        {
+            ResponsePayload::PermissionBatchResolved { resolved } => Ok(resolved),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List pending interactive tool requests.
     ///
     /// # Errors

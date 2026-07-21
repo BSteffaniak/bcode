@@ -213,6 +213,7 @@ pub struct ServerState {
         Mutex<BTreeMap<(SessionId, SkillId), RequiredSkillModelOverride>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
+    pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
     pending_interactive_tools: Mutex<BTreeMap<String, PendingInteractiveToolRequest>>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
@@ -992,6 +993,39 @@ struct PendingPermission {
     skill_decision_key: Option<SkillToolDecisionKey>,
 }
 
+#[derive(Debug, Default)]
+struct PendingPermissionBatch {
+    decision: Mutex<Option<bool>>,
+}
+
+struct PendingPermissionBatchRegistration {
+    batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
+    batch_id: String,
+}
+
+impl PendingPermissionBatchRegistration {
+    fn register(
+        batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
+        batch_id: String,
+        batch: Arc<PendingPermissionBatch>,
+    ) -> Self {
+        batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(batch_id.clone(), batch);
+        Self { batches, batch_id }
+    }
+}
+
+impl Drop for PendingPermissionBatchRegistration {
+    fn drop(&mut self) {
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.batch_id);
+    }
+}
+
 #[derive(Clone)]
 struct PendingInteractiveToolRequest {
     summary: bcode_ipc::InteractiveToolRequestSummary,
@@ -1087,6 +1121,7 @@ impl ServerState {
             required_skill_model_overrides: Mutex::default(),
             session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
+            pending_permission_batches: Arc::new(StdMutex::default()),
             pending_interactive_tools: Mutex::default(),
             active_plugin_invocations: Arc::default(),
             active_artifacts: Arc::default(),
@@ -2208,6 +2243,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CancelSessionTurn { .. } => "cancel_session_turn",
         Request::ListPermissions => "list_permissions",
         Request::ResolvePermission { .. } => "resolve_permission",
+        Request::ResolvePermissionBatch { .. } => "resolve_permission_batch",
         Request::AddPermissionRule { .. } => "add_permission_rule",
         Request::ListPluginServices => "list_plugin_services",
         Request::ListPluginContributions => "list_plugin_contributions",
@@ -2707,6 +2743,7 @@ async fn handle_agent_permission_plugin_request(
         } => handle_set_session_agent(request_id, state, writer, session_id, agent_id).await,
         Request::ListPermissions
         | Request::ResolvePermission { .. }
+        | Request::ResolvePermissionBatch { .. }
         | Request::ListInteractiveToolRequests
         | Request::ResolveInteractiveToolRequest { .. } => {
             handle_permission_interaction_request(request, request_id, state, writer).await
@@ -2794,6 +2831,9 @@ async fn handle_permission_interaction_request(
                 remember,
             )
             .await
+        }
+        Request::ResolvePermissionBatch { batch_id, approved } => {
+            handle_resolve_permission_batch(request_id, state, writer, &batch_id, approved).await
         }
         Request::ListInteractiveToolRequests => {
             handle_list_interactive_tool_requests(request_id, state, writer).await
@@ -9450,22 +9490,12 @@ async fn handle_add_permission_rule(
     }
 }
 
-async fn handle_resolve_permission(
-    request_id: u64,
+async fn resolve_pending_permission(
     state: &ServerState,
-    writer: &SharedWriter,
-    permission_id: &str,
+    permission: PendingPermission,
     approved: bool,
     remember: bool,
-) -> Result<(), ServerError> {
-    let Some(permission) = state.pending_permissions.lock().await.remove(permission_id) else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::PermissionResolved { resolved: false }),
-        )
-        .await;
-    };
+) {
     if remember && let Some(key) = permission.skill_decision_key.clone() {
         remember_skill_tool_decision(
             key,
@@ -9485,10 +9515,126 @@ async fn handle_resolve_permission(
         approved,
     )
     .await;
+}
+
+async fn take_pending_permission_for_individual(
+    state: &ServerState,
+    permission_id: &str,
+) -> Option<PendingPermission> {
+    let candidate = state
+        .pending_permissions
+        .lock()
+        .await
+        .get(permission_id)
+        .cloned()?;
+    let Some(correlation) = candidate.summary.batch.as_ref() else {
+        return state.pending_permissions.lock().await.remove(permission_id);
+    };
+    let batch = state
+        .pending_permission_batches
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&correlation.batch_id)
+        .cloned();
+    let Some(batch) = batch else {
+        state.pending_permissions.lock().await.remove(permission_id);
+        return None;
+    };
+    let batch_decision = batch.decision.lock().await;
+    if batch_decision.is_some() {
+        return None;
+    }
+    let permission = state.pending_permissions.lock().await.remove(permission_id);
+    drop(batch_decision);
+    permission
+}
+
+async fn handle_resolve_permission(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    permission_id: &str,
+    approved: bool,
+    remember: bool,
+) -> Result<(), ServerError> {
+    let Some(permission) = take_pending_permission_for_individual(state, permission_id).await
+    else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::PermissionResolved { resolved: false }),
+        )
+        .await;
+    };
+    resolve_pending_permission(state, permission, approved, remember).await;
     send_response(
         writer,
         request_id,
         Response::Ok(ResponsePayload::PermissionResolved { resolved: true }),
+    )
+    .await
+}
+
+async fn resolve_permission_batch(state: &ServerState, batch_id: &str, approved: bool) -> usize {
+    let Some(batch) = state
+        .pending_permission_batches
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(batch_id)
+        .cloned()
+    else {
+        return 0;
+    };
+    let mut batch_decision = batch.decision.lock().await;
+    if batch_decision.is_some() {
+        return 0;
+    }
+    *batch_decision = Some(approved);
+    drop(batch_decision);
+
+    let permissions = {
+        let permission_ids = {
+            let pending = state.pending_permissions.lock().await;
+            pending
+                .iter()
+                .filter(|(_, permission)| {
+                    permission
+                        .summary
+                        .batch
+                        .as_ref()
+                        .is_some_and(|batch| batch.batch_id == batch_id)
+                })
+                .map(|(permission_id, _)| permission_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut pending = state.pending_permissions.lock().await;
+        let mut permissions = Vec::with_capacity(permission_ids.len());
+        for permission_id in permission_ids {
+            if let Some(permission) = pending.remove(&permission_id) {
+                permissions.push(permission);
+            }
+        }
+        permissions
+    };
+    let resolved = permissions.len();
+    for permission in permissions {
+        resolve_pending_permission(state, permission, approved, false).await;
+    }
+    resolved
+}
+
+async fn handle_resolve_permission_batch(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    batch_id: &str,
+    approved: bool,
+) -> Result<(), ServerError> {
+    let resolved = resolve_permission_batch(state, batch_id, approved).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PermissionBatchResolved { resolved }),
     )
     .await
 }
@@ -14857,7 +15003,13 @@ impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
     ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
         Box::pin(async move {
             let batch_id = next_permission_batch_id(self.state).await;
-            Ok(futures::future::join_all(requests.iter().map(|request| {
+            let batch_state = Arc::new(PendingPermissionBatch::default());
+            let _registration = PendingPermissionBatchRegistration::register(
+                Arc::clone(&self.state.pending_permission_batches),
+                batch_id.clone(),
+                batch_state,
+            );
+            let decisions = futures::future::join_all(requests.iter().map(|request| {
                 self.authorize_one(
                     request,
                     Some(PermissionBatchCorrelation {
@@ -14867,7 +15019,8 @@ impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
                     }),
                 )
             }))
-            .await)
+            .await;
+            Ok(decisions)
         })
     }
 }
@@ -16909,6 +17062,41 @@ struct PermissionPolicyContext {
     batch: Option<PermissionBatchCorrelation>,
 }
 
+async fn register_pending_permission(
+    state: &ServerState,
+    pending: &PendingPermission,
+    event: SessionEventKind,
+) -> Result<(), bool> {
+    let batch_state = pending.summary.batch.as_ref().and_then(|batch| {
+        state
+            .pending_permission_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&batch.batch_id)
+            .cloned()
+    });
+    if pending.summary.batch.is_some() && batch_state.is_none() {
+        return Err(false);
+    }
+    let batch_decision = if let Some(batch_state) = batch_state.as_ref() {
+        let decision = batch_state.decision.lock().await;
+        if let Some(decision) = *decision {
+            return Err(decision);
+        }
+        Some(decision)
+    } else {
+        None
+    };
+    state
+        .pending_permissions
+        .lock()
+        .await
+        .insert(pending.summary.permission_id.clone(), pending.clone());
+    append_permission_requested_event(state, pending.summary.session_id, event).await;
+    drop(batch_decision);
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn request_tool_permission(
     state: &ServerState,
@@ -16920,11 +17108,6 @@ async fn request_tool_permission(
     policy_context: PermissionPolicyContext,
 ) -> bool {
     let permission_id = next_permission_id(state).await;
-    state.metrics.add_counter_with_labels(
-        "tool.permission.request_total",
-        1,
-        tool_permission_metric_labels(tool_name, "requested"),
-    );
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
     let agent_id = session_agent_selection(state, session_id).await;
     let pending = PendingPermission {
@@ -16944,26 +17127,24 @@ async fn request_tool_permission(
         notify: Arc::new(Notify::new()),
         skill_decision_key: policy_context.skill_decision_key,
     };
-    state
-        .pending_permissions
-        .lock()
-        .await
-        .insert(permission_id.clone(), pending.clone());
-    append_permission_requested_event(
-        state,
-        session_id,
-        SessionEventKind::PermissionRequested {
-            permission_id: permission_id.clone(),
-            tool_call_id: call.id.clone(),
-            producer_plugin_id: Some(producer_plugin_id.to_owned()),
-            tool_name: tool_name.to_string(),
-            arguments_json,
-            legacy_request_presentation: None,
-            policy_source: policy_context.source,
-            policy_reason: policy_context.reason,
-        },
-    )
-    .await;
+    let event = SessionEventKind::PermissionRequested {
+        permission_id: permission_id.clone(),
+        tool_call_id: call.id.clone(),
+        producer_plugin_id: Some(producer_plugin_id.to_owned()),
+        tool_name: tool_name.to_string(),
+        arguments_json,
+        legacy_request_presentation: None,
+        policy_source: policy_context.source,
+        policy_reason: policy_context.reason,
+    };
+    if let Err(decision) = register_pending_permission(state, &pending, event).await {
+        return decision;
+    }
+    state.metrics.add_counter_with_labels(
+        "tool.permission.request_total",
+        1,
+        tool_permission_metric_labels(tool_name, "requested"),
+    );
     append_trace_event(
         state,
         session_id,
@@ -17063,6 +17244,17 @@ fn tool_permission_metric_labels(tool_name: &str, outcome: &str) -> MetricLabels
     labels.insert("tool_name".to_owned(), tool_name.to_owned());
     labels.insert("outcome".to_owned(), outcome.to_owned());
     labels
+}
+
+#[cfg(test)]
+async fn permission_batch_decision(state: &ServerState, batch_id: &str) -> Option<bool> {
+    let batch = state
+        .pending_permission_batches
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(batch_id)
+        .cloned()?;
+    *batch.decision.lock().await
 }
 
 async fn next_permission_batch_id(state: &ServerState) -> String {
@@ -24068,8 +24260,122 @@ library = "test"
             .lock()
             .await
             .remove(&permission.summary.permission_id);
-        *permission.decision.lock().await = Some(true);
-        permission.notify.notify_waiters();
+        resolve_pending_permission(state, permission.clone(), true, false).await;
+    }
+
+    fn pending_permission_for_batch(
+        permission_id: &str,
+        session_id: SessionId,
+        call_index: usize,
+        batch_id: &str,
+    ) -> PendingPermission {
+        PendingPermission {
+            summary: PermissionSummary {
+                permission_id: permission_id.to_string(),
+                session_id,
+                tool_call_id: format!("call-{call_index}"),
+                tool_name: "example.tool".to_string(),
+                arguments_json: "{}".to_string(),
+                batch: Some(PermissionBatchCorrelation {
+                    batch_id: batch_id.to_string(),
+                    call_index,
+                    call_count: 3,
+                }),
+                agent_id: "build".to_string(),
+                policy_source: None,
+                policy_reason: None,
+                can_remember_policy: false,
+            },
+            decision: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+            skill_decision_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_permission_resolution_is_latched_and_batch_scoped() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        let first_batch = Arc::new(PendingPermissionBatch::default());
+        let second_batch = Arc::new(PendingPermissionBatch::default());
+        state
+            .pending_permission_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([
+                ("batch-1".to_string(), first_batch),
+                ("batch-2".to_string(), second_batch),
+            ]);
+        let first = pending_permission_for_batch("perm-1", session_id, 0, "batch-1");
+        let second = pending_permission_for_batch("perm-2", session_id, 1, "batch-1");
+        let unrelated = pending_permission_for_batch("perm-3", session_id, 0, "batch-2");
+        state.pending_permissions.lock().await.extend([
+            ("perm-1".to_string(), first.clone()),
+            ("perm-2".to_string(), second.clone()),
+            ("perm-3".to_string(), unrelated.clone()),
+        ]);
+
+        let individual = take_pending_permission_for_individual(&state, "perm-1")
+            .await
+            .expect("per-call decision should win before batch latch");
+        resolve_pending_permission(&state, individual, false, false).await;
+        assert_eq!(resolve_permission_batch(&state, "batch-1", true).await, 1);
+        assert_eq!(*first.decision.lock().await, Some(false));
+        assert_eq!(*second.decision.lock().await, Some(true));
+        assert_eq!(*unrelated.decision.lock().await, None);
+        assert_eq!(
+            permission_batch_decision(&state, "batch-1").await,
+            Some(true)
+        );
+        assert_eq!(permission_batch_decision(&state, "batch-2").await, None);
+        assert_eq!(resolve_permission_batch(&state, "batch-1", false).await, 0);
+        assert_eq!(
+            state
+                .pending_permissions
+                .lock()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["perm-3"]
+        );
+        let after_latch = pending_permission_for_batch("perm-4", session_id, 2, "batch-1");
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("perm-4".to_string(), after_latch);
+        assert!(
+            take_pending_permission_for_individual(&state, "perm-4")
+                .await
+                .is_none(),
+            "batch latch must prevent a later per-call decision from winning"
+        );
+        state.pending_permissions.lock().await.remove("perm-4");
+
+        let late = request_tool_permission(
+            &state,
+            session_id,
+            &bcode_model::ToolCall {
+                id: "call-late".to_string(),
+                name: "example.tool".to_string(),
+                arguments: serde_json::Value::Null,
+            },
+            "example.tool",
+            "example.plugin",
+            &TurnCancelState::default(),
+            PermissionPolicyContext {
+                batch: Some(PermissionBatchCorrelation {
+                    batch_id: "batch-1".to_string(),
+                    call_index: 2,
+                    call_count: 3,
+                }),
+                ..PermissionPolicyContext::default()
+            },
+        )
+        .await;
+        assert!(late, "late sibling must inherit the latched batch decision");
+        assert_eq!(state.pending_permissions.lock().await.len(), 1);
     }
 
     async fn wait_for_pending_permissions(
@@ -24254,7 +24560,17 @@ library = "test"
             "no shell invocation may start while one batch decision remains unresolved"
         );
         let final_permission = pending.next().expect("fifth shell permission");
-        approve_pending_permission_for_test(state.as_ref(), &final_permission).await;
+        let batch_id = final_permission
+            .summary
+            .batch
+            .as_ref()
+            .expect("fifth shell batch correlation")
+            .batch_id
+            .clone();
+        assert_eq!(
+            resolve_permission_batch(state.as_ref(), &batch_id, true).await,
+            1
+        );
 
         assert!(
             tokio::time::timeout(Duration::from_secs(10), task)

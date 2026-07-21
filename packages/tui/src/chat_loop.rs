@@ -1595,6 +1595,7 @@ async fn absorb_bcode_event(
                         .is_some_and(|dialog| dialog.permission_id() == permission_id)
                 {
                     loop_state.permission_dialog = None;
+                    loop_state.replace_effect(TuiEffect::ListPermissions);
                 }
                 maybe_open_interactive_surface(loop_state, &event.kind).await;
                 chat.app.absorb_session_event(&event);

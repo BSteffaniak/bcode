@@ -353,6 +353,15 @@ if ! rg -U 'PermissionBatchCorrelation \{[\s\S]{0,220}batch_id:[\s\S]{0,220}call
   violations=1
 fi
 
+if ! rg -U 'ResolvePermissionBatch \{[\s\S]{0,120}batch_id: String,[\s\S]{0,120}approved: bool' packages/ipc/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: safe batch permission resolution request was removed." >&2
+  violations=1
+fi
+if ! rg -U 'batch_decision = batch\.decision\.lock\(\)\.await;[\s\S]{0,220}\*batch_decision = Some\(approved\)[\s\S]{0,900}batch\.batch_id == batch_id' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: batch permission resolution is not latched and batch-scoped." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi
