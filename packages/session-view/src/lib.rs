@@ -895,7 +895,20 @@ impl SessionView {
             .iter_mut()
             .find(|existing| existing.work_id == work.work_id)
         {
-            *existing = work;
+            *existing = work.clone();
+            let id = TranscriptViewItemId::runtime_work(&work.work_id);
+            if let Some(item) = self
+                .snapshot
+                .transcript
+                .items
+                .iter_mut()
+                .find(|item| item.id == id)
+            {
+                item.kind = TranscriptViewItemKind::RuntimeWork { work };
+                item.revision = item.revision.saturating_add(1);
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+            }
         } else {
             self.snapshot.runtime_work.push(work.clone());
             self.push_item(
@@ -1900,6 +1913,50 @@ mod tests {
         let tool = view.snapshot().tools.get("tool-1").expect("tool");
         assert_eq!(tool.status, ToolInvocationViewStatus::Finished);
         assert_eq!(tool.result_text.as_deref(), Some("durable output"));
+    }
+
+    #[test]
+    fn runtime_work_updates_collection_and_transcript_item() {
+        let session_id = SessionId::new();
+        let work_id = bcode_session_models::WorkId::new("work-1");
+        let snapshot = build_session_view_snapshot(&[
+            event(
+                session_id,
+                1,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: work_id.clone(),
+                    kind: bcode_session_models::RuntimeWorkKind::Tool,
+                    label: "tool".to_owned(),
+                    tool_call_id: Some("tool-1".to_owned()),
+                    plugin_id: Some("plugin".to_owned()),
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(10),
+                    cancellable: true,
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::RuntimeWorkProgress {
+                    work_id,
+                    message: "halfway".to_owned(),
+                    completed_units: Some(1),
+                    total_units: Some(2),
+                    progress_at_ms: Some(20),
+                },
+            ),
+        ]);
+
+        assert_eq!(snapshot.runtime_work[0].message.as_deref(), Some("halfway"));
+        assert!(matches!(
+            &snapshot.transcript.items[0].kind,
+            TranscriptViewItemKind::RuntimeWork { work }
+                if work.message.as_deref() == Some("halfway")
+                    && work.completed_units == Some(1)
+                    && work.total_units == Some(2)
+        ));
     }
 
     #[test]

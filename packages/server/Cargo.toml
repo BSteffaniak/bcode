@@ -62,7 +62,16 @@ bcode_bundled_plugins = { workspace = true, features = [
 bcode_client = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_session_view = { workspace = true }
+bcode_session_view_models = { workspace = true }
 bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_web_render = { workspace = true, features = [
+    "actix",
+    "assets",
+    "html",
+    "static-routes",
+] }
+hyperchad = { workspace = true, features = ["router", "router-form"] }
 switchy = { workspace = true, features = ["database", "database-schema"] }
 tempfile = { workspace = true }
 

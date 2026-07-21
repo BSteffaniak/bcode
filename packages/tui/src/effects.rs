@@ -1131,7 +1131,25 @@ impl TuiEffect {
                 result: client.list_permissions().await,
             },
             Self::SaveDraft { scope, text } => {
-                let result = client.set_composer_draft(scope, text.clone()).await;
+                let scope = match scope {
+                    ComposerDraftScope::Session { session_id } => {
+                        bcode_session_view_models::ComposerDraftViewScope::Session { session_id }
+                    }
+                    ComposerDraftScope::DraftSession {
+                        launch_working_directory,
+                    } => bcode_session_view_models::ComposerDraftViewScope::DraftSession {
+                        launch_working_directory,
+                    },
+                };
+                let result = execute_session_view_action(
+                    &client,
+                    SessionViewAction::UpdateDraft {
+                        scope,
+                        text: text.clone(),
+                    },
+                )
+                .await
+                .map(|_| ());
                 TuiEffectResult::SaveDraft { text, result }
             }
             Self::LoadSlashPalette { query, session_id } => {

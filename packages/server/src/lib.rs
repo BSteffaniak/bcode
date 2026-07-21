@@ -19471,6 +19471,60 @@ mod tests {
     };
     use switchy::database::{DatabaseValue, query::FilterableQuery};
 
+    #[derive(Debug, Clone, serde::Deserialize)]
+    struct FixtureInteractionRequest {
+        initial: String,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    struct FixtureInteractionSnapshot {
+        value: String,
+        activations: u64,
+    }
+
+    struct FixtureInteraction {
+        snapshot: FixtureInteractionSnapshot,
+    }
+
+    impl bcode_plugin_sdk::interaction::PluginInteraction for FixtureInteraction {
+        const KIND: &'static str = "test.fixture";
+
+        type Request = FixtureInteractionRequest;
+        type Snapshot = FixtureInteractionSnapshot;
+
+        fn new(request: Self::Request) -> Self {
+            Self {
+                snapshot: FixtureInteractionSnapshot {
+                    value: request.initial,
+                    activations: 0,
+                },
+            }
+        }
+
+        fn snapshot(&self) -> Self::Snapshot {
+            self.snapshot.clone()
+        }
+
+        fn handle_input(
+            &mut self,
+            input: bcode_tool::InteractionInput,
+        ) -> bcode_tool::InteractionOutput {
+            match input {
+                bcode_tool::InteractionInput::Activate { .. } => {
+                    self.snapshot.activations = self.snapshot.activations.saturating_add(1);
+                    bcode_tool::InteractionOutput::Redraw
+                }
+                bcode_tool::InteractionInput::Submit => bcode_tool::InteractionOutput::Submitted {
+                    payload: serde_json::json!({
+                        "value": self.snapshot.value,
+                        "activations": self.snapshot.activations,
+                    }),
+                },
+                _ => bcode_tool::InteractionOutput::None,
+            }
+        }
+    }
+
     #[derive(Default)]
     struct NonReturningCancelProvider;
 
@@ -24976,6 +25030,315 @@ library = "test"
         }
     }
 
+    async fn next_session_view_event(
+        connection: &mut bcode_client::ClientConnection,
+    ) -> bcode_ipc::Event {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match connection.recv_event().await.expect("session view event") {
+                    event @ (bcode_ipc::Event::Session(_)
+                    | bcode_ipc::Event::SessionLive(_)
+                    | bcode_ipc::Event::SessionViewResyncRequired { .. }) => break event,
+                    bcode_ipc::Event::RuntimeWork(_)
+                    | bcode_ipc::Event::SessionCatalogUpdated { .. } => {}
+                }
+            }
+        })
+        .await
+        .expect("session view event timeout")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn guarded_web_routes_load_daemon_state_and_execute_actions() {
+        let workspace = tempfile::tempdir().expect("web route workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent session manager");
+        let session = sessions
+            .create_session(
+                Some("guarded web route".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session");
+        for index in 0..70 {
+            sessions
+                .append_user_message(session.id, ClientId::new(), format!("route prompt {index}"))
+                .await
+                .expect("route history");
+        }
+        let state = test_server_state_with_fake_provider(sessions);
+        state.session_model_selections.lock().await.insert(
+            session.id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                ..SessionModelSelection::default()
+            },
+        );
+        let state = Arc::new(state);
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let web_state = bcode_web_render::WebRenderState::new(
+            bcode_client::BcodeClient::new(endpoint),
+            "route-token",
+        );
+        let route_state = web_state.clone();
+        let router = bcode_web_render::router_from_state(web_state);
+
+        let unauthorized = router
+            .navigate(hyperchad::router::RouteRequest::from_path(
+                "/",
+                hyperchad::router::RequestInfo::default(),
+            ))
+            .await
+            .expect("unauthorized route")
+            .expect("unauthorized content");
+        assert!(
+            format!("{unauthorized:?}").contains("missing or invalid web renderer access token")
+        );
+
+        let initial = router
+            .navigate(hyperchad::router::RouteRequest::from_path(
+                "/?token=route-token",
+                hyperchad::router::RequestInfo::default(),
+            ))
+            .await
+            .expect("initial route")
+            .expect("initial content");
+        let initial = format!("{initial:?}");
+        assert!(initial.contains("daemon connected"));
+        assert!(!initial.contains("Web renderer error"));
+
+        let selected = router
+            .navigate(hyperchad::router::RouteRequest::from_path(
+                &format!("/session/{}?token=route-token", session.id),
+                hyperchad::router::RequestInfo::default(),
+            ))
+            .await
+            .expect("session route")
+            .expect("session content");
+        assert!(format!("{selected:?}").contains("route prompt 69"));
+
+        let tail = route_state
+            .session_snapshot(session.id)
+            .await
+            .expect("tail snapshot");
+        assert!(tail.transcript.has_older_history);
+        let anchor_sequence = tail
+            .transcript
+            .source_start_sequence
+            .expect("tail source start");
+        let mut history = hyperchad::router::RouteRequest::from_path(
+            "/actions/history-window?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        history.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        history.body = Some(Arc::new(
+            format!(
+                "session_id={}&direction=older&anchor_sequence={anchor_sequence}",
+                session.id
+            )
+            .into_bytes()
+            .into(),
+        ));
+        let history = router
+            .navigate(history)
+            .await
+            .expect("history action route")
+            .expect("history action content");
+        assert!(format!("{history:?}").contains("load newer history"));
+
+        let mut submit = hyperchad::router::RouteRequest::from_path(
+            "/actions/submit-message?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        submit.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        submit.body = Some(Arc::new(
+            format!("session_id={}&text=web-route-message", session.id)
+                .into_bytes()
+                .into(),
+        ));
+        let submit = router
+            .navigate(submit)
+            .await
+            .expect("submit action route")
+            .expect("submit action content");
+        assert!(format!("{submit:?}").contains("message accepted"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let history = state
+                    .sessions
+                    .session_history(session.id)
+                    .await
+                    .expect("submitted history");
+                if history.iter().any(|event| {
+                    matches!(
+                        &event.kind,
+                        SessionEventKind::UserMessage { text, .. } if text == "web-route-message"
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("submitted message persisted");
+
+        let mut action = hyperchad::router::RouteRequest::from_path(
+            "/actions/update-draft/invalid?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        action.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        action.body = Some(Arc::new(b"text=saved-draft".to_vec().into()));
+        let invalid_action = router
+            .navigate(action)
+            .await
+            .expect("invalid action route")
+            .expect("invalid action content");
+        assert!(format!("{invalid_action:?}").contains("invalid session path"));
+
+        let mut action = hyperchad::router::RouteRequest::from_path(
+            &format!("/actions/update-draft/{}?token=route-token", session.id),
+            hyperchad::router::RequestInfo::default(),
+        );
+        action.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        action.body = Some(Arc::new(b"text=saved-draft".to_vec().into()));
+        let action = router
+            .navigate(action)
+            .await
+            .expect("action route")
+            .expect("action content");
+        assert!(format!("{action:?}").contains("draft saved"));
+        assert_eq!(
+            state
+                .sessions
+                .session_composer_draft(session.id)
+                .await
+                .expect("saved draft")
+                .as_deref(),
+            Some("saved-draft")
+        );
+
+        let mut cancel = hyperchad::router::RouteRequest::from_path(
+            "/actions/cancel-turn?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        cancel.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        cancel.body = Some(Arc::new(
+            format!("session_id={}&clear_queue=false", session.id)
+                .into_bytes()
+                .into(),
+        ));
+        let cancel = router
+            .navigate(cancel)
+            .await
+            .expect("cancel action route")
+            .expect("cancel action content");
+        assert!(format!("{cancel:?}").contains("turn cancelled"));
+
+        state
+            .sessions
+            .append_permission_requested(
+                session.id,
+                SessionEventKind::PermissionRequested {
+                    permission_id: "web-route-permission".to_owned(),
+                    tool_call_id: "web-route-call".to_owned(),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    legacy_request_presentation: None,
+                    policy_source: None,
+                    policy_reason: None,
+                },
+            )
+            .await
+            .expect("web permission event");
+        state.pending_permissions.lock().await.insert(
+            "web-route-permission".to_owned(),
+            PendingPermission {
+                summary: PermissionSummary {
+                    permission_id: "web-route-permission".to_owned(),
+                    session_id: session.id,
+                    tool_call_id: "web-route-call".to_owned(),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    batch: None,
+                    agent_id: "build".to_owned(),
+                    policy_source: None,
+                    policy_reason: None,
+                    can_remember_policy: false,
+                },
+                decision: Arc::new(Mutex::new(None)),
+                notify: Arc::new(Notify::new()),
+                skill_decision_key: None,
+            },
+        );
+        let mut permission = hyperchad::router::RouteRequest::from_path(
+            "/actions/permission?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        permission.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        permission.body = Some(Arc::new(
+            format!(
+                "session_id={}&permission_id=web-route-permission&approved=true&remember=false",
+                session.id
+            )
+            .into_bytes()
+            .into(),
+        ));
+        let permission = router
+            .navigate(permission)
+            .await
+            .expect("permission action route")
+            .expect("permission action content");
+        assert!(format!("{permission:?}").contains("permission resolved"));
+        let permission_snapshot = bcode_session_view::build_session_view_snapshot(
+            &state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("permission history"),
+        );
+        assert!(permission_snapshot.permissions.iter().any(|permission| {
+            permission.permission_id == "web-route-permission"
+                && permission.resolved
+                && permission.approved == Some(true)
+        }));
+        server.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn projection_history_pages_cross_real_ipc_bidirectionally() {
@@ -25070,6 +25433,246 @@ library = "test"
                 .source_range,
             Some(latest_range)
         );
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn session_view_live_deltas_resync_and_reconnect_cross_real_ipc() {
+        let workspace = tempfile::tempdir().expect("session view IPC workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent session manager");
+        let session = sessions
+            .create_session(
+                Some("session view IPC".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client
+            .connect("session-view-live-test")
+            .await
+            .expect("connect");
+        let attached = connection
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("initial attach");
+        let mut view = bcode_session_view::SessionView::new();
+        view.apply_history(&attached.history);
+
+        for text in ["live ", "answer"] {
+            state
+                .sessions
+                .publish_live_event(
+                    session_id,
+                    SessionLiveEventKind::AssistantTextDelta {
+                        turn_id: "turn-1".to_owned(),
+                        text: text.to_owned(),
+                    },
+                )
+                .await
+                .expect("live subscriber");
+            let bcode_ipc::Event::SessionLive(event) =
+                next_session_view_event(&mut connection).await
+            else {
+                panic!("expected live session event");
+            };
+            view.apply_live_event(&event);
+        }
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "live answer"
+        ));
+
+        state
+            .sessions
+            .append_assistant_message(session_id, "durable answer".to_owned())
+            .await
+            .expect("durable answer");
+        let bcode_ipc::Event::Session(event) = next_session_view_event(&mut connection).await
+        else {
+            panic!("expected durable session event");
+        };
+        view.apply_event(&event);
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "durable answer"
+        ));
+
+        let client_id = connection.client_id().expect("client id");
+        connection
+            .subscribe_catalog_updates()
+            .await
+            .expect("register event client");
+        let sink = state
+            .event_clients
+            .lock()
+            .await
+            .get(&client_id)
+            .expect("registered event client")
+            .sink
+            .clone();
+        sink.send(bcode_ipc::Event::SessionViewResyncRequired { session_id })
+            .await
+            .expect("resync event");
+        assert!(matches!(
+            next_session_view_event(&mut connection).await,
+            bcode_ipc::Event::SessionViewResyncRequired { session_id: required }
+                if required == session_id
+        ));
+
+        drop(connection);
+        let mut reconnected = client
+            .connect("session-view-reconnect-test")
+            .await
+            .expect("reconnect");
+        let reattached = reconnected
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("reattach");
+        let mut replacement = bcode_session_view::SessionView::new();
+        replacement.apply_history(&reattached.history);
+        assert!(
+            replacement
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .any(|item| matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                        if message.text == "durable answer"
+                ))
+        );
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
+        let workspace = tempfile::tempdir().expect("permission IPC workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent session manager");
+        let session = sessions
+            .create_session(
+                Some("permission IPC".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.id;
+        sessions
+            .append_permission_requested(
+                session_id,
+                SessionEventKind::PermissionRequested {
+                    permission_id: "permission-ipc".to_owned(),
+                    tool_call_id: "call-ipc".to_owned(),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    legacy_request_presentation: None,
+                    policy_source: None,
+                    policy_reason: None,
+                },
+            )
+            .await
+            .expect("permission requested event");
+        let state = Arc::new(test_server_state(sessions));
+        let pending = PendingPermission {
+            summary: PermissionSummary {
+                permission_id: "permission-ipc".to_owned(),
+                session_id,
+                tool_call_id: "call-ipc".to_owned(),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                batch: None,
+                agent_id: "build".to_owned(),
+                policy_source: None,
+                policy_reason: None,
+                can_remember_policy: false,
+            },
+            decision: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+            skill_decision_key: None,
+        };
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("permission-ipc".to_owned(), pending);
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let permissions = client.list_permissions().await.expect("list permissions");
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(permissions[0].permission_id, "permission-ipc");
+        assert!(
+            client
+                .resolve_permission("permission-ipc".to_owned(), true)
+                .await
+                .expect("resolve permission")
+        );
+        assert!(
+            client
+                .list_permissions()
+                .await
+                .expect("list resolved")
+                .is_empty()
+        );
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("permission history");
+        let snapshot = bcode_session_view::build_session_view_snapshot(&history);
+        assert!(snapshot.permissions.iter().any(|permission| {
+            permission.permission_id == "permission-ipc"
+                && permission.resolved
+                && permission.approved == Some(true)
+        }));
         server.abort();
     }
 
@@ -25388,6 +25991,105 @@ library = "test"
         let mut state = test_server_state(sessions);
         state.plugins = plugins;
         state
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generic_interaction_controller_crosses_real_ipc_without_web_specific_code() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(
+                Some("generic interaction".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let state = Arc::new(test_server_state(sessions));
+        let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
+        registry.register_interaction::<FixtureInteraction>();
+        let controller = registry
+            .open(
+                <FixtureInteraction as bcode_plugin_sdk::interaction::PluginInteraction>::KIND,
+                serde_json::json!({"initial": "fixture"}),
+            )
+            .expect("fixture controller");
+        state.pending_interactive_tools.lock().await.insert(
+            "fixture-interaction".to_owned(),
+            PendingInteractiveToolRequest {
+                summary: bcode_ipc::InteractiveToolRequestSummary {
+                    interaction_id: "fixture-interaction".to_owned(),
+                    session_id,
+                    tool_call_id: "fixture-call".to_owned(),
+                    tool_name: "fixture-tool".to_owned(),
+                    interaction_kind: Some(
+                        <FixtureInteraction as bcode_plugin_sdk::interaction::PluginInteraction>::KIND
+                            .to_owned(),
+                    ),
+                    surface_kind: "fixture.surface".to_owned(),
+                    request: serde_json::json!({"initial": "fixture"}),
+                    required: true,
+                    turn_behavior:
+                        bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+                    render_target:
+                        bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall,
+                },
+                controller: Some(Arc::new(Mutex::new(controller))),
+                resolution: Arc::new(Mutex::new(None)),
+                notify: Arc::new(Notify::new()),
+            },
+        );
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let initial = client
+            .interaction_snapshot("fixture-interaction".to_owned())
+            .await
+            .expect("fixture snapshot")
+            .expect("fixture pending");
+        assert_eq!(initial.interaction_kind, "test.fixture");
+        assert_eq!(initial.snapshot["value"], "fixture");
+
+        let redraw = client
+            .submit_interaction_input(
+                "fixture-interaction".to_owned(),
+                bcode_tool::InteractionInput::Activate {
+                    control_id: bcode_tool::InteractionControlId::new("fixture-control"),
+                },
+            )
+            .await
+            .expect("fixture redraw");
+        assert!(matches!(
+            redraw,
+            bcode_ipc::InteractionInputResponse::Redraw { snapshot }
+                if snapshot.snapshot["activations"] == 1
+        ));
+        let submitted = client
+            .submit_interaction_input(
+                "fixture-interaction".to_owned(),
+                bcode_tool::InteractionInput::Submit,
+            )
+            .await
+            .expect("fixture submit");
+        assert!(matches!(
+            submitted,
+            bcode_ipc::InteractionInputResponse::Submitted { payload }
+                if payload["value"] == "fixture" && payload["activations"] == 1
+        ));
+        assert!(state.pending_interactive_tools.lock().await.is_empty());
+        server.abort();
     }
 
     #[cfg(unix)]

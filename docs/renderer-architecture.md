@@ -7,9 +7,9 @@ Bcode's target renderer architecture uses a shared semantic session-view layer r
 The target boundary exists but is not yet the single application boundary:
 
 * `packages/session-view/models` defines renderer-neutral snapshot, transcript, tool, permission, runtime-work, composer, interaction, visual, action, and patch contracts.
-* `packages/session-view` projects a useful subset of bounded history and live events and executes daemon-backed semantic actions.
+* `packages/session-view` projects bounded history and renderer-relevant live events and executes daemon-backed semantic actions.
 * `packages/web-render` consumes this layer for the HyperChad renderer.
-* `packages/tui` still owns its established projection and does not yet consume `bcode_session_view`.
+* `packages/tui` dual-projects session history/live events into `SessionView` for parity protection, but its established terminal transcript still remains the presentation source rather than being adapted from shared semantic items.
 
 Until TUI migration and projection parity are complete, the shared session view is an extraction target and web-renderer contract, not yet the canonical state path for every renderer. The implementation progress tracker should be kept aligned with the audited gaps described here.
 
@@ -37,6 +37,25 @@ Renderers must not depend on TUI frame, key, mouse, or BMUX drawing types. They 
 `packages/web-render/ui` owns HyperChad presentation. Plugin visuals, artifacts, and interaction snapshots have a generic structured-data fallback. Rich visual adapters are registered by exact plugin-owned `(schema, schema_version)` keys and must retain that fallback.
 
 The local web host binds to loopback unless the CLI receives explicit non-loopback opt-in. Each launch generates a capability token; page and action routes validate it before reading daemon state or executing effects, and generated links/forms propagate it. This is a local companion security model, not by itself a production remote-access design.
+
+### Non-loopback access review
+
+The current access model has been reviewed specifically for non-loopback use and is **not approved as production remote access**. Explicit bind opt-in only bypasses the accidental-exposure guard; it does not upgrade the security model.
+
+Current limitations are deliberate and blocking for production remote/mobile deployment:
+
+* The launch capability is carried in URLs and generated form targets. URLs can leak through browser history, logs, copied links, screenshots, referrer handling, and intermediary diagnostics.
+* The capability identifies a renderer launch, not an authenticated human or independently authorized client. There are no user identities, roles, per-session ACLs, or multi-user ownership checks.
+* The host does not provide TLS termination, trusted-proxy validation, origin enforcement, or a complete cross-site request protection policy suitable for hostile networks.
+* Capability rotation is launch-scoped; there is no remote-client enrollment, selective revocation, expiration policy, or security audit trail.
+* The current controls do not promise production-grade abuse protection such as request limits, lockout, or externally observable security events.
+
+Consequently:
+
+* Loopback remains the supported default and the only production-safe mode claimed by this implementation.
+* Non-loopback opt-in is for explicit development/testing environments whose network boundary is already trusted.
+* Documentation and CLI wording must not describe the current opt-in as secure remote access.
+* Production non-loopback support requires a separate design covering authenticated identity, authorization, secure token transport, TLS/proxy trust, CSRF/origin policy, revocation/expiry, auditability, and abuse controls before the product can claim it.
 
 Plugins own domain schemas and renderer-neutral interaction controllers. A renderer may add rich schema-specific adapters, but it must preserve the generic fallback and must not move plugin behavior into renderer code.
 
