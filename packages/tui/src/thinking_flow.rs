@@ -2,6 +2,8 @@
 
 use bcode_client::BcodeClient;
 use bcode_ipc::SessionModelStatus;
+use bcode_session_view::execute_session_view_action;
+use bcode_session_view_models::SessionViewAction;
 use bmux_keyboard::{KeyCode, KeyStroke};
 
 use super::TuiError;
@@ -35,9 +37,15 @@ pub async fn cycle_thinking_effort(
         chat.app.reasoning_visible(),
     );
     if let Some(session_id) = session_id {
-        client
-            .set_session_reasoning(session_id, Some(next_effort.clone()), summary)
-            .await?;
+        execute_session_view_action(
+            client,
+            SessionViewAction::SetReasoning {
+                session_id,
+                effort: Some(next_effort.clone()),
+                summary,
+            },
+        )
+        .await?;
     }
     chat.app
         .set_status(format!("reasoning effort set to {next_effort}"));
@@ -122,9 +130,15 @@ async fn apply_thinking_dialog(
         ));
         return Ok(true);
     };
-    client
-        .set_session_reasoning(session_id, effort, summary)
-        .await?;
+    execute_session_view_action(
+        client,
+        SessionViewAction::SetReasoning {
+            session_id,
+            effort,
+            summary,
+        },
+    )
+    .await?;
     chat.app.set_reasoning_visible(visible);
     if let Ok(status) = client.session_model_status(session_id).await {
         chat.app.apply_model_status(status);

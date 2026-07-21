@@ -9,6 +9,8 @@ use bcode_config::TuiConfig;
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_plugin::PluginRuntimeHost;
 use bcode_session_models::SessionEventKind;
+use bcode_session_view::execute_session_view_action;
+use bcode_session_view_models::SessionViewAction;
 use bmux_keyboard::KeyStroke;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -1934,14 +1936,14 @@ async fn resolve_interactive_surface_dismissed<W: Write>(
         return Ok(());
     };
     let interaction_id = surface.interaction_id().to_owned();
-    context
-        .services
-        .client
-        .resolve_interactive_tool_request(
+    execute_session_view_action(
+        context.services.client,
+        SessionViewAction::ResolveInteraction {
             interaction_id,
-            InteractiveSurfaceState::dismissed_resolution(),
-        )
-        .await?;
+            resolution: InteractiveSurfaceState::dismissed_resolution(),
+        },
+    )
+    .await?;
     chat.app
         .set_status("interactive request dismissed".to_owned());
     Ok(())
@@ -1969,11 +1971,14 @@ async fn handle_interactive_surface_event<W: Write>(
     if let Some(resolution) = surface.handle_event(&event) {
         let interaction_id = surface.interaction_id().to_owned();
         loop_state.interactive_surface = None;
-        context
-            .services
-            .client
-            .resolve_interactive_tool_request(interaction_id, resolution)
-            .await?;
+        execute_session_view_action(
+            context.services.client,
+            SessionViewAction::ResolveInteraction {
+                interaction_id,
+                resolution,
+            },
+        )
+        .await?;
     }
     Ok(true)
 }

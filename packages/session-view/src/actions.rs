@@ -4,7 +4,8 @@ use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
 use bcode_ipc::{ComposerDraftScope, PromptPlacement};
 use bcode_session_models::SessionId;
 use bcode_session_view_models::{
-    ComposerDraftViewScope, PromptPlacementView, SessionViewAction, SessionViewActionOutcome,
+    ComposerDraftViewScope, MessageAcceptanceDispositionView, PromptPlacementView,
+    SessionViewAction, SessionViewActionOutcome,
 };
 use bcode_skill_models::SkillId;
 
@@ -46,17 +47,11 @@ pub async fn execute_session_view_action(
         SessionViewAction::SubmitInteractionInput {
             interaction_id,
             input,
-        } => {
-            let response = client
-                .submit_interaction_input(interaction_id, input)
-                .await?;
-            Ok(SessionViewActionOutcome::InteractionInput {
-                response: serde_json::to_value(response).map_err(|error| ClientError::Server {
-                    code: "interaction_response_encode_failed".to_owned(),
-                    message: error.to_string(),
-                })?,
-            })
-        }
+        } => execute_interaction_input(client, interaction_id, input).await,
+        SessionViewAction::ResolveInteraction {
+            interaction_id,
+            resolution,
+        } => execute_resolve_interaction(client, interaction_id, resolution).await,
         SessionViewAction::UpdateDraft { scope, text } => {
             client
                 .set_composer_draft(composer_draft_scope(scope), text)
@@ -70,6 +65,16 @@ pub async fn execute_session_view_action(
         } => {
             client
                 .set_session_model(session_id, provider_plugin_id, model_id)
+                .await?;
+            Ok(SessionViewActionOutcome::None)
+        }
+        SessionViewAction::SetReasoning {
+            session_id,
+            effort,
+            summary,
+        } => {
+            client
+                .set_session_reasoning(session_id, effort, summary)
                 .await?;
             Ok(SessionViewActionOutcome::None)
         }
@@ -106,6 +111,34 @@ pub async fn execute_session_view_action(
                 .to_owned(),
         }),
     }
+}
+
+async fn execute_interaction_input(
+    client: &BcodeClient,
+    interaction_id: String,
+    input: bcode_tool::InteractionInput,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    let response = client
+        .submit_interaction_input(interaction_id, input)
+        .await?;
+    Ok(SessionViewActionOutcome::InteractionInput {
+        response: serde_json::to_value(response).map_err(|error| ClientError::Server {
+            code: "interaction_response_encode_failed".to_owned(),
+            message: error.to_string(),
+        })?,
+    })
+}
+
+async fn execute_resolve_interaction(
+    client: &BcodeClient,
+    interaction_id: String,
+    resolution: bcode_session_models::InteractiveToolResolution,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    Ok(SessionViewActionOutcome::InteractionResolved {
+        resolved: client
+            .resolve_interactive_tool_request(interaction_id, resolution)
+            .await?,
+    })
 }
 
 async fn execute_submit_message(
@@ -169,6 +202,20 @@ fn message_accepted_outcome(
         queue_position: acceptance
             .queue_position
             .and_then(|position| usize::try_from(position).ok()),
+        disposition: match acceptance.disposition {
+            bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
+                MessageAcceptanceDispositionView::AppliedSteering
+            }
+            bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp => {
+                MessageAcceptanceDispositionView::QueuedFollowUp
+            }
+            bcode_ipc::MessageAcceptanceDisposition::QueuedTurn => {
+                MessageAcceptanceDispositionView::QueuedTurn
+            }
+            bcode_ipc::MessageAcceptanceDisposition::StartedTurn => {
+                MessageAcceptanceDispositionView::StartedTurn
+            }
+        },
     }
 }
 
@@ -218,6 +265,46 @@ mod tests {
     }
 
     #[test]
+    fn message_acceptance_outcome_preserves_all_dispositions() {
+        let session_id = SessionId::new();
+        for (ipc, view) in [
+            (
+                bcode_ipc::MessageAcceptanceDisposition::AppliedSteering,
+                MessageAcceptanceDispositionView::AppliedSteering,
+            ),
+            (
+                bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp,
+                MessageAcceptanceDispositionView::QueuedFollowUp,
+            ),
+            (
+                bcode_ipc::MessageAcceptanceDisposition::QueuedTurn,
+                MessageAcceptanceDispositionView::QueuedTurn,
+            ),
+            (
+                bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
+                MessageAcceptanceDispositionView::StartedTurn,
+            ),
+        ] {
+            assert!(matches!(
+                message_accepted_outcome(
+                    session_id,
+                    MessageAcceptance {
+                        queued: !matches!(
+                            ipc,
+                            bcode_ipc::MessageAcceptanceDisposition::StartedTurn
+                                | bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
+                        ),
+                        queue_position: None,
+                        disposition: ipc,
+                    },
+                ),
+                SessionViewActionOutcome::MessageAccepted { disposition, .. }
+                    if disposition == view
+            ));
+        }
+    }
+
+    #[test]
     fn message_acceptance_outcome_preserves_queue_state() {
         let session_id = SessionId::new();
         assert_eq!(
@@ -233,6 +320,7 @@ mod tests {
                 session_id,
                 queued: true,
                 queue_position: Some(3),
+                disposition: MessageAcceptanceDispositionView::QueuedFollowUp,
             }
         );
     }

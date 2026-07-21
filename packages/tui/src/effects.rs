@@ -1200,9 +1200,16 @@ impl TuiEffect {
                 session_id,
                 provider_plugin_id: provider_plugin_id.clone(),
                 model_id: model_id.clone(),
-                result: client
-                    .set_session_model(session_id, provider_plugin_id, model_id)
-                    .await,
+                result: execute_session_view_action(
+                    &client,
+                    SessionViewAction::SetModel {
+                        session_id,
+                        provider_plugin_id,
+                        model_id,
+                    },
+                )
+                .await
+                .map(|_| ()),
             },
             Self::SetSessionReasoning {
                 session_id,
@@ -1211,9 +1218,16 @@ impl TuiEffect {
                 status,
             } => TuiEffectResult::SetSessionReasoning {
                 status,
-                result: client
-                    .set_session_reasoning(session_id, effort, summary)
-                    .await,
+                result: execute_session_view_action(
+                    &client,
+                    SessionViewAction::SetReasoning {
+                        session_id,
+                        effort,
+                        summary,
+                    },
+                )
+                .await
+                .map(|_| ()),
             },
             Self::CancelRuntimeWork {
                 session_id,
@@ -1286,14 +1300,16 @@ async fn ensure_session_for_foreground_action(
     let session = client
         .create_session_in_working_directory(None, launch_working_directory.clone())
         .await?;
-    let _ = client
-        .set_composer_draft(
-            ComposerDraftScope::DraftSession {
+    let _ = execute_session_view_action(
+        client,
+        SessionViewAction::UpdateDraft {
+            scope: bcode_session_view_models::ComposerDraftViewScope::DraftSession {
                 launch_working_directory,
             },
-            String::new(),
-        )
-        .await;
+            text: String::new(),
+        },
+    )
+    .await;
     let (attached, task) =
         history_flow::attach_session_event_stream(client, session.id, event_sender)
             .await
@@ -1377,6 +1393,80 @@ async fn run_submit_message(
     }
 }
 
+async fn apply_submit_runtime_selections(
+    client: &BcodeClient,
+    session_id: SessionId,
+    provider_plugin_id: Option<String>,
+    model_id: Option<String>,
+    agent_id: Option<String>,
+    reasoning_effort: Option<String>,
+    reasoning_summary: Option<String>,
+) -> Result<(), ClientError> {
+    if let Some(model_id) = model_id {
+        execute_session_view_action(
+            client,
+            SessionViewAction::SetModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+            },
+        )
+        .await?;
+    }
+    if let Some(agent_id) = agent_id {
+        execute_session_view_action(
+            client,
+            SessionViewAction::SetAgent {
+                session_id,
+                agent_id,
+            },
+        )
+        .await?;
+    }
+    execute_session_view_action(
+        client,
+        SessionViewAction::SetReasoning {
+            session_id,
+            effort: reasoning_effort,
+            summary: reasoning_summary,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn message_acceptance_from_action_outcome(
+    outcome: &SessionViewActionOutcome,
+) -> Result<MessageAcceptance, ClientError> {
+    let SessionViewActionOutcome::MessageAccepted {
+        queued,
+        queue_position,
+        disposition,
+        ..
+    } = outcome
+    else {
+        return Err(ClientError::UnexpectedResponse);
+    };
+    Ok(MessageAcceptance {
+        queued: *queued,
+        queue_position: queue_position.and_then(|position| u32::try_from(position).ok()),
+        disposition: match disposition {
+            bcode_session_view_models::MessageAcceptanceDispositionView::AppliedSteering => {
+                bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
+            }
+            bcode_session_view_models::MessageAcceptanceDispositionView::QueuedFollowUp => {
+                bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
+            }
+            bcode_session_view_models::MessageAcceptanceDispositionView::QueuedTurn => {
+                bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
+            }
+            bcode_session_view_models::MessageAcceptanceDispositionView::StartedTurn => {
+                bcode_ipc::MessageAcceptanceDisposition::StartedTurn
+            }
+        },
+    })
+}
+
 async fn submit_message(
     client: &BcodeClient,
     request: SubmitMessageRequest,
@@ -1402,14 +1492,16 @@ async fn submit_message(
         let session = client
             .create_session_in_working_directory(None, launch_working_directory.clone())
             .await?;
-        let _ = client
-            .set_composer_draft(
-                ComposerDraftScope::DraftSession {
+        let _ = execute_session_view_action(
+            client,
+            SessionViewAction::UpdateDraft {
+                scope: bcode_session_view_models::ComposerDraftViewScope::DraftSession {
                     launch_working_directory: launch_working_directory.clone(),
                 },
-                String::new(),
-            )
-            .await;
+                text: String::new(),
+            },
+        )
+        .await;
         let (attached, task) =
             history_flow::attach_session_event_stream(client, session.id, event_sender)
                 .await
@@ -1434,20 +1526,31 @@ async fn submit_message(
         event_task = Some(task);
         session_id
     };
-    if let Some(model_id) = model_id {
-        client
-            .set_session_model(session_id, provider_plugin_id, model_id)
-            .await?;
-    }
-    if let Some(agent_id) = agent_id.clone() {
-        client.set_session_agent(session_id, agent_id).await?;
-    }
-    client
-        .set_session_reasoning(session_id, reasoning_effort, reasoning_summary)
-        .await?;
-    let acceptance = client
-        .send_user_message(session_id, message, placement)
-        .await?;
+    apply_submit_runtime_selections(
+        client,
+        session_id,
+        provider_plugin_id,
+        model_id,
+        agent_id.clone(),
+        reasoning_effort,
+        reasoning_summary,
+    )
+    .await?;
+    let placement = match placement {
+        PromptPlacement::Steering => bcode_session_view_models::PromptPlacementView::Steering,
+        PromptPlacement::FollowUp => bcode_session_view_models::PromptPlacementView::FollowUp,
+    };
+    let outcome = execute_session_view_action(
+        client,
+        SessionViewAction::SubmitMessage {
+            session_id: Some(session_id),
+            launch_working_directory: None,
+            text: message,
+            placement,
+        },
+    )
+    .await?;
+    let acceptance = message_acceptance_from_action_outcome(&outcome)?;
     Ok(SubmitMessageResult {
         session_id,
         created_session,
@@ -1592,9 +1695,15 @@ async fn cycle_thinking_effort(
     };
     let summary = current_summary.or_else(|| status.reasoning_summary.clone());
     if let Some(session_id) = session_id {
-        client
-            .set_session_reasoning(session_id, Some(next_effort.clone()), summary.clone())
-            .await?;
+        execute_session_view_action(
+            client,
+            SessionViewAction::SetReasoning {
+                session_id,
+                effort: Some(next_effort.clone()),
+                summary: summary.clone(),
+            },
+        )
+        .await?;
     }
     Ok(ThinkingCycleResult {
         next_effort: Some(next_effort),

@@ -3,6 +3,8 @@
 use std::io::Write;
 
 use bcode_client::BcodeClient;
+use bcode_session_view::execute_session_view_action;
+use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::terminal::Terminal;
@@ -167,15 +169,28 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
         chat.app.set_status("No active session".to_owned());
         return;
     };
-    match client.cancel_session_turn(session_id).await {
-        Ok(true) => {
+    match execute_session_view_action(
+        client,
+        SessionViewAction::CancelTurn {
+            session_id,
+            clear_queue: false,
+        },
+    )
+    .await
+    {
+        Ok(SessionViewActionOutcome::Cancelled { cancelled: true }) => {
             chat.app.set_cancelling();
             chat.app
                 .set_status("turn cancellation requested".to_owned());
         }
-        Ok(false) => {
+        Ok(SessionViewActionOutcome::Cancelled { cancelled: false }) => {
             chat.app.set_idle();
             chat.app.set_status("no active turn".to_owned());
+        }
+        Ok(_) => {
+            chat.app.set_idle();
+            chat.app
+                .set_status("cancel returned an unexpected response".to_owned());
         }
         Err(error) => {
             chat.app.set_idle();

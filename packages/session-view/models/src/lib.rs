@@ -9,9 +9,9 @@
 //! browser DOM primitives, daemon clients, or application orchestration.
 
 use bcode_session_models::{
-    ClientId, InteractiveToolRenderTarget, InteractiveToolTurnBehavior, ModelTurnOutcome,
-    PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkStatus, SessionId, SessionSummary,
-    SessionTokenUsage, ToolArtifact, ToolInvocationResult, WorkId,
+    ClientId, InteractiveToolRenderTarget, InteractiveToolResolution, InteractiveToolTurnBehavior,
+    ModelTurnOutcome, PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkStatus,
+    SessionId, SessionSummary, SessionTokenUsage, ToolArtifact, ToolInvocationResult, WorkId,
 };
 use bcode_tool::InteractionInput;
 use serde::{Deserialize, Serialize};
@@ -616,6 +616,20 @@ pub enum ComposerDraftViewScope {
     DraftSession { launch_working_directory: PathBuf },
 }
 
+/// Renderer-neutral message acceptance disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageAcceptanceDispositionView {
+    /// Message was applied to the active turn as steering.
+    AppliedSteering,
+    /// Message was queued as a follow-up.
+    QueuedFollowUp,
+    /// Message was queued as a future turn.
+    QueuedTurn,
+    /// Message started a new turn.
+    StartedTurn,
+}
+
 /// Result of executing a renderer-neutral session action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -630,11 +644,15 @@ pub enum SessionViewActionOutcome {
         queued: bool,
         /// Queue position, when queued.
         queue_position: Option<usize>,
+        /// Authoritative admission disposition.
+        disposition: MessageAcceptanceDispositionView,
     },
     /// Cancellation request result.
     Cancelled { cancelled: bool },
     /// Permission resolution result.
     PermissionResolved { resolved: bool },
+    /// Interaction resolution result.
+    InteractionResolved { resolved: bool },
     /// Interaction input response as generic JSON.
     InteractionInput { response: serde_json::Value },
 }
@@ -677,6 +695,13 @@ pub enum SessionViewAction {
         /// Semantic interaction input.
         input: InteractionInput,
     },
+    /// Resolve an interactive request with a final semantic resolution.
+    ResolveInteraction {
+        /// Interaction id.
+        interaction_id: String,
+        /// Final interaction resolution.
+        resolution: InteractiveToolResolution,
+    },
     /// Request a switch to another session.
     SwitchSession {
         /// Target session.
@@ -697,6 +722,15 @@ pub enum SessionViewAction {
         provider_plugin_id: Option<String>,
         /// Model id.
         model_id: String,
+    },
+    /// Set reasoning selections for a session.
+    SetReasoning {
+        /// Target session.
+        session_id: SessionId,
+        /// Reasoning effort selection.
+        effort: Option<String>,
+        /// Reasoning summary selection.
+        summary: Option<String>,
     },
     /// Set the selected agent for a session.
     SetAgent {

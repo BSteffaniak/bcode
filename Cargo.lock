@@ -2230,6 +2230,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_session_view_models",
  "bcode_skill_models",
+ "bcode_tool",
  "serde_json",
 ]
 

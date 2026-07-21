@@ -7,6 +7,8 @@ use bcode_agent_profile::AgentInfo;
 use bcode_client::{AttachedSessionHistory, BcodeClient, SessionCatalogWatcher, SessionList};
 use bcode_ipc::{Event as BcodeEvent, SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_session_models::SessionId;
+use bcode_session_view::execute_session_view_action;
+use bcode_session_view_models::{ComposerDraftViewScope, SessionViewAction};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -339,18 +341,25 @@ pub async fn persist_draft_session<W: Write>(
             return Err(error.into());
         }
     };
-    let _ = client
-        .set_composer_draft(
-            bcode_ipc::ComposerDraftScope::DraftSession {
+    let _ = execute_session_view_action(
+        client,
+        SessionViewAction::UpdateDraft {
+            scope: ComposerDraftViewScope::DraftSession {
                 launch_working_directory: std::env::current_dir()?,
             },
-            String::new(),
-        )
-        .await;
+            text: String::new(),
+        },
+    )
+    .await;
     if draft_agent_id != "build" {
-        if let Err(error) = client
-            .set_session_agent(session.id, draft_agent_id.clone())
-            .await
+        if let Err(error) = execute_session_view_action(
+            client,
+            SessionViewAction::SetAgent {
+                session_id: session.id,
+                agent_id: draft_agent_id.clone(),
+            },
+        )
+        .await
         {
             helpers::report_client_issue(&mut chat.app, "session agent unavailable", &error);
             return Err(error.into());
@@ -394,9 +403,15 @@ async fn commit_draft_reasoning(
 ) -> Result<(), TuiError> {
     let effort = app.reasoning_effort().map(ToOwned::to_owned);
     let summary = app.reasoning_summary().map(ToOwned::to_owned);
-    client
-        .set_session_reasoning(session_id, effort, summary)
-        .await?;
+    execute_session_view_action(
+        client,
+        SessionViewAction::SetReasoning {
+            session_id,
+            effort,
+            summary,
+        },
+    )
+    .await?;
     Ok(())
 }
 
