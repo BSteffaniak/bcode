@@ -311,8 +311,17 @@ fn prepare_resume(state: &mut LoopState) -> Result<(), String> {
     ) {
         return Err("this loop is terminal and cannot be resumed".to_owned());
     }
-    if !matches!(state.state, RunState::Paused | RunState::Failed) {
-        return Err("only paused or failed loops can be resumed".to_owned());
+    let recoverable_evaluation = state.state == RunState::Evaluating
+        && state.pending_operation.is_none()
+        && state
+            .latest_evaluation
+            .as_ref()
+            .is_some_and(|evaluation| !evaluation.condition_met);
+    if !matches!(state.state, RunState::Paused | RunState::Failed) && !recoverable_evaluation {
+        return Err(
+            "only paused, failed, or completed-incomplete evaluation loops can be resumed"
+                .to_owned(),
+        );
     }
     state.cancel_requested = false;
     transition(state, RunState::Ready)?;
@@ -997,6 +1006,17 @@ fn next_iteration(state: &LoopState) -> Option<u64> {
         .then(|| state.current_iteration.saturating_add(1))
 }
 
+fn apply_evaluation(state: &mut LoopState, evaluation: Evaluation) -> Result<bool, String> {
+    state.latest_evaluation = Some(evaluation.clone());
+    if evaluation.condition_met {
+        transition(state, RunState::Completed)?;
+        state.stop_reason = Some(evaluation.summary);
+        return Ok(true);
+    }
+    transition(state, RunState::Ready)?;
+    Ok(false)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_loop(mut state: LoopState) {
     if let Err(reason) = reconcile_pending_operation(&mut state).await {
@@ -1127,16 +1147,17 @@ async fn run_loop(mut state: LoopState) {
                 return;
             }
         };
-        state.latest_evaluation = Some(evaluation.clone());
-        if evaluation.condition_met {
-            if !transition_or_fail(&mut state, RunState::Completed) {
+        let completed = match apply_evaluation(&mut state, evaluation) {
+            Ok(completed) => completed,
+            Err(error) => {
+                fail_run(&mut state, error);
                 return;
             }
-            state.stop_reason = Some(evaluation.summary);
-            let _saved = save_state(&state);
+        };
+        let _saved = save_state(&state);
+        if completed {
             return;
         }
-        let _saved = save_state(&state);
     }
 }
 
@@ -1989,6 +2010,22 @@ mod tests {
             assert!(state.stop_reason.is_none());
         }
 
+        let mut stranded = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            3,
+        );
+        stranded.state = RunState::Evaluating;
+        stranded.current_iteration = 1;
+        stranded.latest_evaluation = Some(Evaluation {
+            condition_met: false,
+            evidence: vec!["work remains".to_owned()],
+            summary: "not done".to_owned(),
+        });
+        prepare_resume(&mut stranded).expect("completed incomplete evaluation should resume");
+        assert_eq!(stranded.state, RunState::Ready);
+
         for terminal in [
             RunState::Completed,
             RunState::LimitReached,
@@ -2250,6 +2287,56 @@ mod tests {
         ] {
             assert!(parse_evaluation(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn incomplete_evaluation_returns_to_ready_for_the_next_iteration() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.current_iteration = 1;
+        state.state = RunState::Evaluating;
+        let completed = apply_evaluation(
+            &mut state,
+            Evaluation {
+                condition_met: false,
+                evidence: vec!["work remains".to_owned()],
+                summary: "not done".to_owned(),
+            },
+        )
+        .expect("evaluation transition");
+
+        assert!(!completed);
+        assert_eq!(state.state, RunState::Ready);
+        assert_eq!(next_iteration(&state), Some(2));
+    }
+
+    #[test]
+    fn completed_evaluation_terminates_the_loop() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "iterate".to_owned(),
+            "complete".to_owned(),
+            20,
+        );
+        state.current_iteration = 1;
+        state.state = RunState::Evaluating;
+        let completed = apply_evaluation(
+            &mut state,
+            Evaluation {
+                condition_met: true,
+                evidence: vec!["verified".to_owned()],
+                summary: "done".to_owned(),
+            },
+        )
+        .expect("evaluation transition");
+
+        assert!(completed);
+        assert_eq!(state.state, RunState::Completed);
+        assert_eq!(state.stop_reason.as_deref(), Some("done"));
     }
 
     #[test]
