@@ -46,7 +46,6 @@ use super::keymap::{BmuxAction, BmuxKeyActivation, BmuxKeyBinding, BmuxScope};
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
-use super::runtime_work_view::RuntimeWorkViewState;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::tool_render_projection::semantic_result_supersedes_live_preview;
@@ -298,7 +297,6 @@ pub struct BmuxApp {
     live_preview_frames_requested: u64,
     live_preview_duplicates_skipped: u64,
     live_preview_truncated_snapshots: u64,
-    runtime_work: RuntimeWorkViewState,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
     viewport: TranscriptViewport,
@@ -321,8 +319,6 @@ pub struct BmuxApp {
     activity_started_at: Instant,
     daemon_connection: DaemonConnectionState,
     status: String,
-    plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
-    active_skills: BTreeSet<bcode_skill_models::SkillId>,
     key_hints: String,
     jump_to_latest_key_label: String,
     tui_config: TuiConfig,
@@ -516,7 +512,6 @@ impl BmuxApp {
             live_preview_frames_requested: 0,
             live_preview_duplicates_skipped: 0,
             live_preview_truncated_snapshots: 0,
-            runtime_work: RuntimeWorkViewState::default(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
@@ -539,8 +534,6 @@ impl BmuxApp {
             activity_started_at: now,
             daemon_connection: DaemonConnectionState::Connecting,
             status: String::from("Connecting to daemon… Enter submits; Esc/Ctrl-C exits."),
-            plugin_status: Vec::new(),
-            active_skills: BTreeSet::new(),
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
             tui_config: TuiConfig::default(),
@@ -1325,27 +1318,33 @@ impl BmuxApp {
 
     /// Replace active skills from the bounded attach/reconnect snapshot.
     pub fn set_active_skills(&mut self, skills: &[bcode_skill_models::SkillContextResponse]) {
-        self.active_skills = skills.iter().map(|skill| skill.skill_id.clone()).collect();
+        self.session_view.set_active_skill_ids(
+            skills
+                .iter()
+                .map(|skill| skill.skill_id.to_string())
+                .collect(),
+        );
     }
 
-    /// Return the number of active skills maintained by session events.
+    /// Return the number of active skills maintained by shared session state.
     #[must_use]
     pub fn active_skill_count(&self) -> usize {
-        self.active_skills.len()
+        self.session_view.snapshot().active_skills.len()
     }
 
     /// Return active plugin-owned session status contributions.
-    #[must_use]
-    pub fn plugin_status(&self) -> &[bcode_plugin_sdk::SessionStatusContribution] {
-        &self.plugin_status
+    pub fn plugin_status(
+        &self,
+    ) -> impl Iterator<Item = &bcode_session_view_models::PluginStatusView> {
+        self.session_view.snapshot().plugin_status.values()
     }
 
     /// Atomically replace active plugin-owned session status contributions.
     pub fn set_plugin_status(
         &mut self,
-        plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
+        plugin_status: Vec<bcode_session_view_models::PluginStatusView>,
     ) {
-        self.plugin_status = plugin_status;
+        self.session_view.set_plugin_status(plugin_status);
     }
 
     /// Return configured key hints for the status line.
@@ -2409,11 +2408,9 @@ impl BmuxApp {
                 skill_id, reason, ..
             } => self.push_skill_suggested(skill_id, reason.as_deref()),
             SessionEventKind::SkillActivated { skill_id, .. } => {
-                self.active_skills.insert(skill_id.clone());
                 self.status = format!("activated skill: {skill_id}");
             }
             SessionEventKind::SkillDeactivated { skill_id, .. } => {
-                self.active_skills.remove(skill_id);
                 self.status = format!("deactivated skill: {skill_id}");
             }
             SessionEventKind::SkillContextLoaded {
@@ -2453,7 +2450,7 @@ impl BmuxApp {
             | SessionEventKind::RuntimeWorkProgress { .. }
                 if application.live_activity() =>
             {
-                self.apply_runtime_work_event(event);
+                self.apply_shared_runtime_work_activity();
             }
             SessionEventKind::RuntimeWorkFinished {
                 work_id,
@@ -2462,7 +2459,7 @@ impl BmuxApp {
                 ..
             } => {
                 if application.live_activity() {
-                    self.apply_runtime_work_event(event);
+                    self.apply_shared_runtime_work_activity();
                 }
                 if work_id.0.starts_with("ralph:")
                     && matches!(
@@ -2498,15 +2495,8 @@ impl BmuxApp {
     }
 
     pub fn apply_runtime_work_snapshots(&mut self, snapshots: &[bcode_ipc::RuntimeWorkSnapshot]) {
-        self.runtime_work.apply_snapshots(snapshots);
-        let status = self.runtime_work.status_label();
-        if self.runtime_work.is_cancelling() {
-            self.set_cancelling();
-        } else if let Some(detail) = status {
-            self.set_activity(ActivityState::RuntimeWork { detail });
-        } else {
-            self.set_activity(ActivityState::Idle);
-        }
+        self.session_view.set_runtime_work_snapshots(snapshots);
+        self.apply_shared_runtime_work_activity();
     }
 
     /// Return whether the composer cursor should be visible.
@@ -3613,12 +3603,16 @@ impl BmuxApp {
         }
     }
 
-    fn apply_runtime_work_event(&mut self, event: &SessionEvent) {
-        self.runtime_work.apply_event(event);
-        let status = self.runtime_work.status_label();
-        if self.runtime_work.is_cancelling() {
+    fn apply_shared_runtime_work_activity(&mut self) {
+        let runtime_work = &self.session_view.snapshot().runtime_work;
+        if runtime_work
+            .iter()
+            .any(|work| work.status == bcode_session_models::RuntimeWorkStatus::Cancelling)
+        {
             self.set_cancelling();
-        } else if let Some(detail) = status {
+        } else if let Some(detail) =
+            bcode_session_view_models::runtime_work_status_label(runtime_work)
+        {
             self.set_activity(ActivityState::RuntimeWork { detail });
         } else {
             self.set_activity(ActivityState::Idle);
@@ -4818,7 +4812,7 @@ mod tests {
                     && permission.approved == Some(true)
         )));
         assert_eq!(
-            app.runtime_work.status_label().as_deref(),
+            bcode_session_view_models::runtime_work_status_label(&shared.runtime_work).as_deref(),
             Some("running tool: shell — halfway")
         );
         assert!(shared.runtime_work.iter().any(|work| {
@@ -4872,6 +4866,52 @@ mod tests {
         assert!(item.text().contains("context compaction"));
         assert!(!item.text().contains(secret));
         assert!(!item.text().contains("portable summary"));
+    }
+
+    #[test]
+    fn authoritative_active_skill_snapshot_drives_shared_tui_state() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_active_skills(&[bcode_skill_models::SkillContextResponse {
+            skill_id: bcode_skill_models::SkillId::new("review"),
+            context: String::new(),
+            source: bcode_skill_models::SkillSource {
+                kind: bcode_skill_models::SkillSourceKind::Plugin,
+                label: "test".to_owned(),
+                path: None,
+                precedence: 0,
+            },
+            bytes_loaded: 0,
+            truncated: false,
+            model_policy: None,
+        }]);
+
+        assert_eq!(app.active_skill_count(), 1);
+        assert!(app.session_view_snapshot().active_skills.contains("review"));
+    }
+
+    #[test]
+    fn authoritative_runtime_work_snapshot_drives_tui_activity() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.apply_runtime_work_snapshots(&[bcode_ipc::RuntimeWorkSnapshot {
+            work_id: bcode_session_models::WorkId::new("tool-1"),
+            kind: bcode_session_models::RuntimeWorkKind::Tool,
+            label: "shell".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            status: bcode_session_models::RuntimeWorkStatus::Running,
+            cancellable: true,
+        }]);
+
+        assert!(matches!(
+            app.activity(),
+            ActivityState::RuntimeWork { detail } if detail == "running tool: shell"
+        ));
+        let work = &app.session_view_snapshot().runtime_work[0];
+        assert_eq!(work.label, "shell");
+        assert!(work.cancellable);
+
+        app.apply_runtime_work_snapshots(&[]);
+        assert!(matches!(app.activity(), ActivityState::Idle));
+        assert!(app.session_view_snapshot().runtime_work.is_empty());
     }
 
     #[test]

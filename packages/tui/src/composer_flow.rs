@@ -471,8 +471,9 @@ mod tests {
     #[test]
     fn active_plugin_status_does_not_block_ordinary_composer_staging() {
         let mut app = super::super::app::BmuxApp::new_with_history(None, &[], &[], false);
-        app.set_plugin_status(vec![bcode_plugin_sdk::SessionStatusContribution {
-            contribution_id: "loop-active".to_owned(),
+        app.set_plugin_status(vec![bcode_session_view_models::PluginStatusView {
+            plugin_id: "bcode.loop".to_owned(),
+            note_id: "loop-active".to_owned(),
             text: "Loop active".to_owned(),
             priority: 1,
             metadata: std::collections::BTreeMap::new(),
@@ -481,7 +482,12 @@ mod tests {
         app.stage_submission();
 
         assert_eq!(app.take_pending_submission(), "manual steering");
-        assert_eq!(app.plugin_status()[0].text, "Loop active");
+        assert_eq!(
+            app.plugin_status()
+                .next()
+                .map(|status| status.text.as_str()),
+            Some("Loop active")
+        );
     }
 
     #[test]

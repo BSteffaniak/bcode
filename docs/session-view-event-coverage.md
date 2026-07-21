@@ -34,16 +34,16 @@ Status meanings:
 | `TraceEvent` | No-op. | Applies live trace telemetry only; replay ignores it. | **Intentional no-op** for shared transcript until a concrete cross-renderer trace view is required. |
 | `SkillInvoked` | Appends a renderer-neutral skill invocation status item. | Appends a skill transcript item. | **Complete** for semantic status. |
 | `SkillSuggested` | Appends a suggestion status item when a reason exists. | Appends a suggestion when a reason exists. | **Complete**. |
-| `SkillActivated` | Adds the skill to renderer-neutral active-skill state. | Updates active skill set and status. | **Complete** for semantic state. |
-| `SkillDeactivated` | Removes the skill from renderer-neutral active-skill state. | Updates active skill set and status. | **Complete** for semantic state. |
+| `SkillActivated` | Adds the skill to renderer-neutral active-skill state. | Consumes the shared active-skill set for counts and keeps a terminal-local status message. | **Complete** for semantic state. |
+| `SkillDeactivated` | Removes the skill from renderer-neutral active-skill state. | Consumes the shared active-skill set for counts and keeps a terminal-local status message. | **Complete** for semantic state. |
 | `SkillContextLoaded` | Appends renderer-neutral source/size/truncation/preview status. | Updates skill context status. | **Complete** for user-visible semantics. |
 | `SkillInvocationFailed` | Appends renderer-neutral skill failure status. | Appends a skill error item. | **Complete**. |
 | `AssistantReasoningDelta` | Appends reasoning content and updates thinking state. | Updates terminal thinking/reasoning stream subject to renderer visibility. | **Complete** for semantic content. |
 | `AssistantReasoningMessage` | Finishes reasoning content and thinking state. | Finishes terminal reasoning presentation subject to renderer visibility. | **Complete** for semantic content. |
-| `RuntimeWorkStarted` | Upserts runtime-work state and adds its transcript item. | Applies live runtime-work state; replay generally leaves it to status hydration. | **Complete** for event semantics. |
-| `RuntimeWorkCancelRequested` | Marks runtime work as cancelling. | Applies live runtime-work state. | **Complete** for event semantics. |
-| `RuntimeWorkFinished` | Marks runtime work finished. | Applies live state and emits additional Ralph failure presentation. | **Partial**: generic runtime state is present; Ralph-specific status remains plugin/TUI behavior. |
-| `RuntimeWorkProgress` | Updates message and units. | Applies live runtime-work state. | **Complete** for event semantics. |
+| `RuntimeWorkStarted` | Upserts typed runtime-work state (kind, stable label, status, cancellability) and adds its transcript item. | Consumes the shared projection for live activity; authoritative attach/reconnect snapshots replace shared active state. | **Complete** for generic runtime semantics. |
+| `RuntimeWorkCancelRequested` | Marks shared runtime work as cancelling while retaining its semantic label/progress. | Consumes the shared projection for cancelling activity. | **Complete** for generic runtime semantics. |
+| `RuntimeWorkFinished` | Removes work from shared active state, preserves a terminal transcript item, and blocks late revival. | Consumes the shared projection for generic activity and emits additional Ralph failure presentation. | **Partial**: generic runtime state is shared; Ralph-specific status remains plugin/TUI behavior. |
+| `RuntimeWorkProgress` | Updates shared message and progress units. | Consumes the shared projection for live activity. | **Complete** for generic runtime semantics. |
 | `ModelTurnCancelRequested` | Records active turn identity and cancellation state. | Marks the active turn as cancelling and updates status. | **Complete** for semantic turn cancellation state. |
 | `ToolInvocationStream` | Updates tool projection/output and appends generic visual updates. | Updates terminal output, preview, artifacts, and visual state. | **Complete** for generic stream semantics; terminal preview/artifact rendering remains renderer-specific. |
 | `WorkingDirectoryChanged` | Updates working directory. | Updates working directory and appends a warning system message. | **Partial**: metadata is present; shared semantic warning/status is absent. |
@@ -55,7 +55,7 @@ Status meanings:
 | `InteractiveToolRequestResolved` | Marks the interaction resolved, stores resolution JSON, and updates its transcript item. | Resolves/replaces native surface output or adds a resolution item. | **Complete** for durable generic semantics. |
 | `ProviderContextCompacted` | Clears stale occupancy and appends portable provider/model compaction status. | Appends provider compaction presentation. | **Complete** for portable semantic status. |
 | `RequestContextObserved` | Projects authoritative occupancy from the durable observation. | Classified as transcript-affecting but has no direct `BmuxApp` branch; other status hydration supplies occupancy. | **Complete** for authoritative occupancy semantics. |
-| `PluginStatusNote` | Upserts plugin/note-keyed structured status and one stable transcript item. | TUI transcript projection renders plugin status; host refreshes plugin-owned status. | **Complete** for durable status-note semantics. |
+| `PluginStatusNote` | Upserts plugin/note-keyed structured status and one stable transcript item. | TUI transcript projection renders durable plugin status and the statusline consumes shared hydrated plugin-status semantics. | **Complete** for durable and hydrated status-note semantics. |
 | `LegacyEvent` | No-op. | Compatibility-only event with no application behavior. | **Intentional no-op**. |
 
 ## Live `SessionLiveEventKind` coverage

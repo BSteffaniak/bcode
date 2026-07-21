@@ -1547,8 +1547,9 @@ fn header_and_footer_include_model_agent_and_token_context() {
 #[test]
 fn plugin_status_is_rendered_and_atomic_replacement_removes_stale_text() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.set_plugin_status(vec![bcode_plugin_sdk::SessionStatusContribution {
-        contribution_id: "test".to_owned(),
+    app.set_plugin_status(vec![bcode_session_view_models::PluginStatusView {
+        plugin_id: "test-plugin".to_owned(),
+        note_id: "test".to_owned(),
         text: "Plugin active · normal messages remain usable".to_owned(),
         priority: 20,
         metadata: std::collections::BTreeMap::new(),

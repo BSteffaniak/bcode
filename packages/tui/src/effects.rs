@@ -347,7 +347,7 @@ pub enum TuiEffectResult {
         /// Runtime work snapshots, if available.
         runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
         /// Active plugin-owned status contributions, replacing the previous set atomically.
-        plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
+        plugin_status: Vec<bcode_session_view_models::PluginStatusView>,
         /// First non-critical error encountered.
         error: Option<String>,
     },
@@ -359,7 +359,7 @@ pub enum TuiEffectResult {
     /// Targeted plugin status projection refresh completed.
     PluginStatusLoaded {
         session_id: SessionId,
-        plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
+        plugin_status: Vec<bcode_session_view_models::PluginStatusView>,
         error: Option<String>,
     },
     /// Agent metadata load completed.
@@ -1591,7 +1591,7 @@ async fn load_plugin_session_status(
     client: &BcodeClient,
     session_id: SessionId,
 ) -> (
-    Vec<bcode_plugin_sdk::SessionStatusContribution>,
+    Vec<bcode_session_view_models::PluginStatusView>,
     Option<String>,
 ) {
     let services = match client.plugin_services().await {
@@ -1604,6 +1604,7 @@ async fn load_plugin_session_status(
         .into_iter()
         .filter(|service| service.interface_id == bcode_plugin_sdk::SESSION_STATUS_INTERFACE_ID)
     {
+        let plugin_id = service.plugin_id.clone();
         let payload =
             match serde_json::to_vec(&bcode_plugin_sdk::SessionStatusRequest { session_id }) {
                 Ok(payload) => payload,
@@ -1625,7 +1626,17 @@ async fn load_plugin_session_status(
                 match serde_json::from_slice::<bcode_plugin_sdk::SessionStatusResponse>(
                     &response.payload,
                 ) {
-                    Ok(response) => contributions.extend(response.contribution),
+                    Ok(response) => {
+                        contributions.extend(response.contribution.map(|contribution| {
+                            bcode_session_view_models::PluginStatusView {
+                                plugin_id: plugin_id.clone(),
+                                note_id: contribution.contribution_id,
+                                text: contribution.text,
+                                priority: contribution.priority,
+                                metadata: contribution.metadata,
+                            }
+                        }));
+                    }
                     Err(error) => {
                         first_error.get_or_insert_with(|| error.to_string());
                     }

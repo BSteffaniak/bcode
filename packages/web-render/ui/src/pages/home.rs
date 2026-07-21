@@ -271,7 +271,10 @@ fn runtime_work_section(runtime_work: &[bcode_session_view_models::RuntimeWorkVi
             @for work in runtime_work {
                 div background="#0d1117" border="1, #30363d" border-radius=6 padding=10 margin-bottom=8 {
                     div color="#f0f6fc" {
-                        (work.work_id.to_string()) " · " (format!("{:?}", work.status))
+                        (work.label) " · " (format!("{:?}", work.status))
+                    }
+                    div color="#8b949e" font-size=11 margin-top=3 {
+                        (work.work_id.to_string()) " · " (format!("{:?}", work.kind))
                     }
                     @if let Some(message) = &work.message {
                         div color="#8b949e" font-size=12 margin-top=4 { (message) }
@@ -768,7 +771,10 @@ mod tests {
         snapshot.session_id = Some(bcode_session_models::SessionId::new());
         snapshot.runtime_work.push(RuntimeWorkView {
             work_id: WorkId::new("work-1"),
+            kind: bcode_session_models::RuntimeWorkKind::Tool,
+            label: "index workspace".to_owned(),
             status: RuntimeWorkStatus::Running,
+            cancellable: true,
             message: Some("indexing".to_owned()),
             completed_units: Some(2),
             total_units: Some(4),
@@ -781,6 +787,7 @@ mod tests {
         assert!(rendered.contains("composer"));
         assert!(rendered.contains("daemon connected · session attached"));
         assert!(rendered.contains("runtime work"));
+        assert!(rendered.contains("index workspace"));
         assert!(rendered.contains("work-1"));
     }
 

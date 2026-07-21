@@ -73,6 +73,70 @@ impl SessionView {
         }
     }
 
+    /// Replace active plugin status supplied by renderer attachment hydration.
+    pub fn set_plugin_status(&mut self, plugin_status: impl IntoIterator<Item = PluginStatusView>) {
+        let plugin_status = plugin_status
+            .into_iter()
+            .map(|status| (format!("{}:{}", status.plugin_id, status.note_id), status))
+            .collect();
+        if self.snapshot.plugin_status != plugin_status {
+            self.snapshot.plugin_status = plugin_status;
+            self.bump_revision();
+        }
+    }
+
+    /// Replace active skill identifiers supplied by the daemon.
+    pub fn set_active_skill_ids(&mut self, skill_ids: BTreeSet<String>) {
+        if self.snapshot.active_skills != skill_ids {
+            self.snapshot.active_skills = skill_ids;
+            self.bump_revision();
+        }
+    }
+
+    /// Replace active runtime work from an authoritative daemon snapshot.
+    pub fn set_runtime_work_snapshots(&mut self, snapshots: &[bcode_ipc::RuntimeWorkSnapshot]) {
+        for snapshot in snapshots {
+            if matches!(
+                snapshot.status,
+                bcode_session_models::RuntimeWorkStatus::Completed
+                    | bcode_session_models::RuntimeWorkStatus::Cancelled
+                    | bcode_session_models::RuntimeWorkStatus::Failed
+                    | bcode_session_models::RuntimeWorkStatus::TimedOut
+            ) {
+                self.terminal_runtime_work.insert(snapshot.work_id.clone());
+            } else {
+                self.terminal_runtime_work.remove(&snapshot.work_id);
+            }
+        }
+        let runtime_work = snapshots
+            .iter()
+            .filter(|snapshot| {
+                !matches!(
+                    snapshot.status,
+                    bcode_session_models::RuntimeWorkStatus::Completed
+                        | bcode_session_models::RuntimeWorkStatus::Cancelled
+                        | bcode_session_models::RuntimeWorkStatus::Failed
+                        | bcode_session_models::RuntimeWorkStatus::TimedOut
+                )
+            })
+            .map(|snapshot| bcode_session_view_models::RuntimeWorkView {
+                work_id: snapshot.work_id.clone(),
+                kind: snapshot.kind,
+                label: snapshot.label.clone(),
+                status: snapshot.status,
+                cancellable: snapshot.cancellable,
+                message: None,
+                completed_units: None,
+                total_units: None,
+                updated_at_ms: None,
+            })
+            .collect::<Vec<_>>();
+        if self.snapshot.runtime_work != runtime_work {
+            self.snapshot.runtime_work = runtime_work;
+            self.bump_revision();
+        }
+    }
+
     /// Replace attached runtime selections supplied by the daemon.
     pub fn set_runtime_selection(
         &mut self,
@@ -464,6 +528,7 @@ impl SessionView {
                         plugin_id: plugin_id.clone(),
                         note_id: note_id.clone(),
                         text: text.clone(),
+                        priority: 0,
                         metadata: metadata.clone(),
                     },
                 );
@@ -621,8 +686,10 @@ impl SessionView {
             }
             SessionEventKind::RuntimeWorkStarted {
                 work_id,
+                kind,
                 label,
                 started_at_ms,
+                cancellable,
                 ..
             } => {
                 if self.terminal_runtime_work.contains(work_id) {
@@ -630,8 +697,11 @@ impl SessionView {
                 }
                 self.upsert_runtime_work(bcode_session_view_models::RuntimeWorkView {
                     work_id: work_id.clone(),
+                    kind: *kind,
+                    label: label.clone(),
                     status: bcode_session_models::RuntimeWorkStatus::Running,
-                    message: Some(label.clone()),
+                    cancellable: *cancellable,
+                    message: None,
                     completed_units: None,
                     total_units: None,
                     updated_at_ms: *started_at_ms,
@@ -647,16 +717,26 @@ impl SessionView {
                 if self.terminal_runtime_work.contains(work_id) {
                     return;
                 }
+                let existing = self
+                    .snapshot
+                    .runtime_work
+                    .iter()
+                    .find(|work| work.work_id == *work_id);
+                let kind = existing.map_or(bcode_session_models::RuntimeWorkKind::Tool, |work| {
+                    work.kind
+                });
+                let label = existing.map_or_else(|| work_id.to_string(), |work| work.label.clone());
+                let cancellable = existing.is_some_and(|work| work.cancellable);
+                let status = existing
+                    .map_or(bcode_session_models::RuntimeWorkStatus::Running, |work| {
+                        work.status
+                    });
                 self.upsert_runtime_work(bcode_session_view_models::RuntimeWorkView {
                     work_id: work_id.clone(),
-                    status: self
-                        .snapshot
-                        .runtime_work
-                        .iter()
-                        .find(|work| work.work_id == *work_id)
-                        .map_or(bcode_session_models::RuntimeWorkStatus::Running, |work| {
-                            work.status
-                        }),
+                    kind,
+                    label,
+                    status,
+                    cancellable,
                     message: Some(message.clone()),
                     completed_units: *completed_units,
                     total_units: *total_units,
@@ -671,10 +751,24 @@ impl SessionView {
                 if self.terminal_runtime_work.contains(work_id) {
                     return;
                 }
+                let existing = self
+                    .snapshot
+                    .runtime_work
+                    .iter()
+                    .find(|work| work.work_id == *work_id);
+                let kind = existing.map_or(bcode_session_models::RuntimeWorkKind::Tool, |work| {
+                    work.kind
+                });
+                let label = existing.map_or_else(|| work_id.to_string(), |work| work.label.clone());
+                let cancellable = existing.is_some_and(|work| work.cancellable);
+                let message = existing.and_then(|work| work.message.clone());
                 self.upsert_runtime_work(bcode_session_view_models::RuntimeWorkView {
                     work_id: work_id.clone(),
+                    kind,
+                    label,
                     status: bcode_session_models::RuntimeWorkStatus::Cancelling,
-                    message: Some("Cancellation requested".to_owned()),
+                    cancellable,
+                    message,
                     completed_units: None,
                     total_units: None,
                     updated_at_ms: *requested_at_ms,
@@ -690,9 +784,22 @@ impl SessionView {
                 if !self.terminal_runtime_work.insert(work_id.clone()) {
                     return;
                 }
+                let existing = self
+                    .snapshot
+                    .runtime_work
+                    .iter()
+                    .find(|work| work.work_id == *work_id);
+                let kind = existing.map_or(bcode_session_models::RuntimeWorkKind::Tool, |work| {
+                    work.kind
+                });
+                let label = existing.map_or_else(|| work_id.to_string(), |work| work.label.clone());
+                let cancellable = existing.is_some_and(|work| work.cancellable);
                 self.finish_runtime_work(bcode_session_view_models::RuntimeWorkView {
                     work_id: work_id.clone(),
+                    kind,
+                    label,
                     status: *status,
+                    cancellable,
                     message: message.clone(),
                     completed_units: None,
                     total_units: None,
@@ -1957,6 +2064,81 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_plugin_status_replaces_shared_state_atomically() {
+        let mut view = SessionView::new();
+        view.set_plugin_status([PluginStatusView {
+            plugin_id: "plugin".to_owned(),
+            note_id: "loop".to_owned(),
+            text: "Loop active".to_owned(),
+            priority: 7,
+            metadata: BTreeMap::new(),
+        }]);
+
+        let status = view
+            .snapshot()
+            .plugin_status
+            .get("plugin:loop")
+            .expect("plugin status");
+        assert_eq!(status.text, "Loop active");
+        assert_eq!(status.priority, 7);
+
+        view.set_plugin_status([]);
+        assert!(view.snapshot().plugin_status.is_empty());
+    }
+
+    #[test]
+    fn authoritative_runtime_work_snapshots_replace_state_and_block_terminal_revival() {
+        let session_id = SessionId::new();
+        let work_id = bcode_session_models::WorkId::new("snapshot-work");
+        let mut view = SessionView::new();
+        view.set_runtime_work_snapshots(&[bcode_ipc::RuntimeWorkSnapshot {
+            work_id: work_id.clone(),
+            kind: bcode_session_models::RuntimeWorkKind::PluginInvocation,
+            label: "plugin call".to_owned(),
+            tool_call_id: None,
+            status: bcode_session_models::RuntimeWorkStatus::Running,
+            cancellable: true,
+        }]);
+
+        let work = &view.snapshot().runtime_work[0];
+        assert_eq!(
+            work.kind,
+            bcode_session_models::RuntimeWorkKind::PluginInvocation
+        );
+        assert_eq!(work.label, "plugin call");
+        assert!(work.cancellable);
+
+        view.set_runtime_work_snapshots(&[bcode_ipc::RuntimeWorkSnapshot {
+            work_id: work_id.clone(),
+            kind: bcode_session_models::RuntimeWorkKind::PluginInvocation,
+            label: "plugin call".to_owned(),
+            tool_call_id: None,
+            status: bcode_session_models::RuntimeWorkStatus::Cancelled,
+            cancellable: true,
+        }]);
+        assert!(view.snapshot().runtime_work.is_empty());
+        view.set_runtime_work_snapshots(&[]);
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind: bcode_session_models::RuntimeWorkKind::PluginInvocation,
+                label: "late start".to_owned(),
+                tool_call_id: None,
+                plugin_id: Some("plugin".to_owned()),
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(1),
+                cancellable: true,
+            },
+        ));
+        assert!(view.snapshot().runtime_work.is_empty());
+    }
+
+    #[test]
     fn runtime_work_terminal_state_leaves_sibling_active_and_rejects_late_revival() {
         let session_id = SessionId::new();
         let first = bcode_session_models::WorkId::new("work-1");
@@ -1991,6 +2173,12 @@ mod tests {
 
         assert_eq!(view.snapshot().runtime_work.len(), 1);
         assert_eq!(view.snapshot().runtime_work[0].work_id, second);
+        assert_eq!(
+            view.snapshot().runtime_work[0].kind,
+            bcode_session_models::RuntimeWorkKind::Tool
+        );
+        assert_eq!(view.snapshot().runtime_work[0].label, "second");
+        assert!(view.snapshot().runtime_work[0].cancellable);
         assert!(view.snapshot().transcript.items.iter().any(|item| {
             matches!(
                 &item.kind,

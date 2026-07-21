@@ -10,13 +10,17 @@
 
 use bcode_session_models::{
     ClientId, InteractiveToolRenderTarget, InteractiveToolResolution, InteractiveToolTurnBehavior,
-    ModelTurnOutcome, PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkStatus,
-    SessionId, SessionSummary, SessionTokenUsage, ToolArtifact, ToolInvocationResult, WorkId,
+    ModelTurnOutcome, PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkKind,
+    RuntimeWorkStatus, SessionId, SessionSummary, SessionTokenUsage, ToolArtifact,
+    ToolInvocationResult, WorkId,
 };
 use bcode_tool::InteractionInput;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+
+#[cfg(test)]
+mod tests;
 
 /// Monotonic revision for renderer-visible view state.
 pub type ViewRevision = u64;
@@ -114,7 +118,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 4;
+    pub const SCHEMA_VERSION: u16 = 5;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -176,7 +180,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 4;
+    pub const SCHEMA_VERSION: u16 = 5;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -482,6 +486,9 @@ pub struct PluginStatusView {
     pub note_id: String,
     /// Human-readable status text.
     pub text: String,
+    /// Lower values are retained before higher values in constrained layouts.
+    #[serde(default)]
+    pub priority: u16,
     /// Plugin-owned structured status metadata.
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
@@ -491,8 +498,17 @@ pub struct PluginStatusView {
 pub struct RuntimeWorkView {
     /// Work identifier.
     pub work_id: WorkId,
+    /// Runtime work category.
+    #[serde(default)]
+    pub kind: RuntimeWorkKind,
+    /// Stable human-readable work label.
+    #[serde(default)]
+    pub label: String,
     /// Current status.
     pub status: RuntimeWorkStatus,
+    /// Whether the work accepts cancellation requests.
+    #[serde(default)]
+    pub cancellable: bool,
     /// Latest human-readable message.
     pub message: Option<String>,
     /// Completed units, when known.
@@ -501,6 +517,60 @@ pub struct RuntimeWorkView {
     pub total_units: Option<u64>,
     /// Last status/progress timestamp in Unix milliseconds.
     pub updated_at_ms: Option<u64>,
+}
+
+impl RuntimeWorkView {
+    /// Return whether this work has reached a terminal status.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            RuntimeWorkStatus::Completed
+                | RuntimeWorkStatus::Cancelled
+                | RuntimeWorkStatus::Failed
+                | RuntimeWorkStatus::TimedOut
+        )
+    }
+}
+
+/// Return the renderer-neutral aggregate activity label for active runtime work.
+#[must_use]
+pub fn runtime_work_status_label(runtime_work: &[RuntimeWorkView]) -> Option<String> {
+    let running_tools = runtime_work
+        .iter()
+        .filter(|work| {
+            work.kind == RuntimeWorkKind::Tool && work.status == RuntimeWorkStatus::Running
+        })
+        .count();
+    if running_tools > 1 {
+        return Some(format!("running {running_tools} tools"));
+    }
+    let work = runtime_work
+        .iter()
+        .min_by(|left, right| left.work_id.cmp(&right.work_id))?;
+    let prefix = match work.status {
+        RuntimeWorkStatus::Queued => "queued",
+        RuntimeWorkStatus::Cancelling => "cancelling",
+        RuntimeWorkStatus::Running => match work.kind {
+            RuntimeWorkKind::ModelTurn => "running",
+            RuntimeWorkKind::Tool => "running tool",
+            RuntimeWorkKind::PluginInvocation => "running plugin",
+            RuntimeWorkKind::EventDelivery => "delivering event",
+        },
+        RuntimeWorkStatus::Completed
+        | RuntimeWorkStatus::Cancelled
+        | RuntimeWorkStatus::Failed
+        | RuntimeWorkStatus::TimedOut => return None,
+    };
+    let detail = match (work.label.is_empty(), work.message.as_deref()) {
+        (true, Some(message)) => message.to_owned(),
+        (true, None) => work.work_id.to_string(),
+        (false, Some(message)) if message != work.label => {
+            format!("{} — {message}", work.label)
+        }
+        (false, _) => work.label.clone(),
+    };
+    Some(format!("{prefix}: {detail}"))
 }
 
 /// Renderer-neutral model, agent, context, and turn state.

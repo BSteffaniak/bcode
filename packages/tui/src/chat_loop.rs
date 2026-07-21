@@ -792,7 +792,7 @@ fn apply_session_status_result(
     model: Option<bcode_ipc::SessionModelStatus>,
     active_skills: Option<Vec<bcode_skill_models::SkillContextResponse>>,
     runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
-    plugin_status: Vec<bcode_plugin_sdk::SessionStatusContribution>,
+    plugin_status: Vec<bcode_session_view_models::PluginStatusView>,
     error: Option<String>,
 ) {
     if chat.session_id != Some(session_id) {
