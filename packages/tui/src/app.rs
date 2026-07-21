@@ -260,13 +260,9 @@ pub struct BmuxApp {
     session_id: Option<SessionId>,
     session_title: Option<String>,
     working_directory: Option<std::path::PathBuf>,
-    selected_provider_plugin_id: Option<String>,
-    selected_model_id: Option<String>,
     selected_auth_profile: Option<String>,
     selected_context_format_version: Option<u16>,
     selected_compatibility_key: Option<String>,
-    context_occupancy: Option<bcode_session_models::RequestContextOccupancy>,
-    current_agent_id: String,
     current_agent_accent: Option<String>,
     pending_agent_id: Option<String>,
     pending_agent_accent: Option<String>,
@@ -276,8 +272,6 @@ pub struct BmuxApp {
     theme_transition: ThemeTransitionState,
     reasoning_visible: bool,
     thinking_label: String,
-    reasoning_effort: Option<String>,
-    reasoning_summary: Option<String>,
     reasoning_support: ReasoningSupport,
     reasoning_default_effort: Option<String>,
     reasoning_default_summary: Option<String>,
@@ -475,13 +469,9 @@ impl BmuxApp {
             session_id,
             session_title: None,
             working_directory: None,
-            selected_provider_plugin_id: None,
-            selected_model_id: None,
             selected_auth_profile: None,
             selected_context_format_version: None,
             selected_compatibility_key: None,
-            context_occupancy: None,
-            current_agent_id: "build".to_owned(),
             current_agent_accent: None,
             pending_agent_id: None,
             pending_agent_accent: None,
@@ -491,8 +481,6 @@ impl BmuxApp {
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
             reasoning_visible: true,
             thinking_label: "reasoning output shown · unsupported".to_owned(),
-            reasoning_effort: None,
-            reasoning_summary: None,
             reasoning_support: ReasoningSupport::Unsupported,
             reasoning_default_effort: None,
             reasoning_default_summary: None,
@@ -737,19 +725,32 @@ impl BmuxApp {
     /// Return the currently selected provider plugin id, if explicit.
     #[must_use]
     pub fn selected_provider_plugin_id(&self) -> Option<&str> {
-        self.selected_provider_plugin_id.as_deref()
+        self.session_view
+            .snapshot()
+            .runtime
+            .provider_plugin_id
+            .as_deref()
     }
 
     /// Return the currently selected model id, if explicit.
     #[must_use]
     pub fn selected_model_id(&self) -> Option<&str> {
-        self.selected_model_id.as_deref()
+        self.session_view
+            .snapshot()
+            .runtime
+            .requested_model_id
+            .as_deref()
     }
 
     /// Return the current agent id.
     #[must_use]
     pub fn current_agent_id(&self) -> &str {
-        &self.current_agent_id
+        self.session_view
+            .snapshot()
+            .runtime
+            .agent_id
+            .as_deref()
+            .unwrap_or("build")
     }
 
     /// Return the pending agent id for the next submission, if one is staged.
@@ -826,7 +827,7 @@ impl BmuxApp {
     pub fn display_agent_id(&self) -> &str {
         self.pending_agent_id
             .as_deref()
-            .unwrap_or(&self.current_agent_id)
+            .unwrap_or_else(|| self.current_agent_id())
     }
 
     /// Return the configured current agent accent, if known.
@@ -845,7 +846,8 @@ impl BmuxApp {
 
     /// Set the current agent id.
     pub fn set_current_agent_id(&mut self, agent_id: impl Into<String>) {
-        self.current_agent_id = agent_id.into();
+        let agent_id = agent_id.into();
+        self.session_view.set_agent_id(Some(agent_id));
         self.current_agent_accent = None;
         self.clear_pending_agent_fields();
         self.sync_theme_target(Instant::now());
@@ -853,7 +855,8 @@ impl BmuxApp {
 
     /// Set the current agent id and optional configured accent.
     pub fn set_current_agent(&mut self, agent_id: impl Into<String>, accent: Option<String>) {
-        self.current_agent_id = agent_id.into();
+        let agent_id = agent_id.into();
+        self.session_view.set_agent_id(Some(agent_id));
         self.current_agent_accent = accent;
         self.clear_pending_agent_fields();
         self.sync_theme_target(Instant::now());
@@ -874,7 +877,7 @@ impl BmuxApp {
     /// Commit the staged agent selection locally and return its id, if present.
     pub fn take_pending_agent(&mut self) -> Option<String> {
         let agent_id = self.pending_agent_id.take()?;
-        self.current_agent_id.clone_from(&agent_id);
+        self.session_view.set_agent_id(Some(agent_id.clone()));
         self.current_agent_accent = self.pending_agent_accent.take();
         self.sync_theme_target(Instant::now());
         Some(agent_id)
@@ -898,8 +901,7 @@ impl BmuxApp {
 
     fn reasoning_header_label(&self) -> Option<&str> {
         self.reasoning_support.is_supported().then(|| {
-            self.reasoning_effort
-                .as_deref()
+            self.reasoning_effort()
                 .or(self.reasoning_default_effort.as_deref())
                 .unwrap_or("supported")
         })
@@ -908,8 +910,13 @@ impl BmuxApp {
     /// Return the token/context footer summary.
     #[must_use]
     pub fn token_summary(&self) -> String {
-        self.token_usage
-            .footer_summary(self.context_occupancy.as_ref())
+        self.token_usage.footer_summary(
+            self.session_view
+                .snapshot()
+                .runtime
+                .context_occupancy
+                .as_ref(),
+        )
     }
 
     /// Return the composer content area from the latest render.
@@ -1080,30 +1087,71 @@ impl BmuxApp {
 
     /// Apply restored session runtime selection to the app.
     pub fn apply_runtime_selection(&mut self, selection: bcode_ipc::SessionRuntimeSelection) {
-        if selection.provider_plugin_id.is_some() {
-            self.selected_provider_plugin_id = selection.provider_plugin_id;
+        let provider_plugin_id = selection
+            .provider_plugin_id
+            .or_else(|| self.selected_provider_plugin_id().map(ToOwned::to_owned));
+        let requested_model_id = selection
+            .requested_model_id
+            .or(selection.model_id)
+            .or_else(|| self.selected_model_id().map(ToOwned::to_owned));
+        let effective_model_id = selection.effective_model_id.or_else(|| {
+            self.session_view
+                .snapshot()
+                .runtime
+                .effective_model_id
+                .clone()
+        });
+        let context_occupancy = self
+            .session_view
+            .snapshot()
+            .runtime
+            .context_occupancy
+            .clone();
+        self.session_view.set_runtime_selection(
+            provider_plugin_id,
+            requested_model_id,
+            effective_model_id,
+            selection.reasoning_effort,
+            selection.reasoning_summary,
+            context_occupancy,
+        );
+        if let Some(agent_id) = selection.agent_id {
+            self.set_current_agent_id(agent_id);
         }
-        if selection.model_id.is_some() {
-            self.selected_model_id = selection.requested_model_id.or(selection.model_id);
-        }
-        self.reasoning_effort = selection.reasoning_effort;
-        self.reasoning_summary = selection.reasoning_summary;
         self.refresh_thinking_label();
     }
 
     /// Apply hydrated model metadata to the app.
     pub fn apply_model_status(&mut self, status: bcode_ipc::SessionModelStatus) {
-        if status.provider_plugin_id.is_some() {
-            self.selected_provider_plugin_id = status.provider_plugin_id;
-        }
-        if status.model_id.is_some() {
-            self.selected_model_id = status.requested_model_id.or(status.model_id);
-        }
-        self.selected_auth_profile = status.auth_profile;
+        let provider_plugin_id = status
+            .provider_plugin_id
+            .clone()
+            .or_else(|| self.selected_provider_plugin_id().map(ToOwned::to_owned));
+        let requested_model_id = status
+            .requested_model_id
+            .clone()
+            .or_else(|| status.model_id.clone())
+            .or_else(|| self.selected_model_id().map(ToOwned::to_owned));
+        let effective_model_id = status.effective_model_id.clone().or_else(|| {
+            self.session_view
+                .snapshot()
+                .runtime
+                .effective_model_id
+                .clone()
+        });
+        self.session_view.set_model_selection(
+            provider_plugin_id,
+            requested_model_id,
+            effective_model_id,
+        );
+        self.selected_auth_profile.clone_from(&status.auth_profile);
         self.selected_context_format_version = status.context_format_version;
-        self.selected_compatibility_key = status.compatibility_key;
-        self.reasoning_effort = status.reasoning_effort.clone();
-        self.reasoning_summary = status.reasoning_summary.clone();
+        self.selected_compatibility_key
+            .clone_from(&status.compatibility_key);
+        self.session_view.set_reasoning_selection(
+            status.reasoning_effort.clone(),
+            status.reasoning_summary.clone(),
+        );
         self.reasoning_support = if status.reasoning.is_some() {
             ReasoningSupport::Supported
         } else {
@@ -1121,8 +1169,8 @@ impl BmuxApp {
         let model = status
             .context_window
             .map(|context_window| bcode_model::ModelInfo {
-                model_id: self.selected_model_id.clone().unwrap_or_default(),
-                display_name: self.selected_model_id.clone().unwrap_or_default(),
+                model_id: self.selected_model_id().unwrap_or_default().to_owned(),
+                display_name: self.selected_model_id().unwrap_or_default().to_owned(),
                 is_default: false,
                 context_window: Some(context_window),
                 max_output_tokens: status.max_output_tokens,
@@ -1478,21 +1526,28 @@ impl BmuxApp {
         summary: Option<String>,
         visible: bool,
     ) {
-        self.reasoning_effort = effort;
-        self.reasoning_summary = summary;
+        self.session_view.set_reasoning_selection(effort, summary);
         self.set_reasoning_visible(visible);
     }
 
     /// Return the selected reasoning effort, if any.
     #[must_use]
     pub fn reasoning_effort(&self) -> Option<&str> {
-        self.reasoning_effort.as_deref()
+        self.session_view
+            .snapshot()
+            .runtime
+            .reasoning_effort
+            .as_deref()
     }
 
     /// Return the selected reasoning summary, if any.
     #[must_use]
     pub fn reasoning_summary(&self) -> Option<&str> {
-        self.reasoning_summary.as_deref()
+        self.session_view
+            .snapshot()
+            .runtime
+            .reasoning_summary
+            .as_deref()
     }
 
     /// Apply configured reasoning output visibility.
@@ -1511,13 +1566,11 @@ impl BmuxApp {
             return;
         }
         let effort = self
-            .reasoning_effort
-            .as_deref()
+            .reasoning_effort()
             .or(self.reasoning_default_effort.as_deref())
             .unwrap_or("provider default");
         let summary = self
-            .reasoning_summary
-            .as_deref()
+            .reasoning_summary()
             .or(self.reasoning_default_summary.as_deref())
             .unwrap_or("not requested");
         self.thinking_label = format!("{display} · effort: {effort} · visible summary: {summary}");
@@ -2364,8 +2417,8 @@ impl BmuxApp {
                 self.apply_model_changed(provider, model);
             }
             SessionEventKind::ReasoningChanged { effort, summary } => {
-                self.reasoning_effort.clone_from(effort);
-                self.reasoning_summary.clone_from(summary);
+                self.session_view
+                    .set_reasoning_selection(effort.clone(), summary.clone());
                 self.refresh_thinking_label();
             }
             SessionEventKind::ModelTurnStarted { .. } if application.live_activity() => {
@@ -2656,19 +2709,20 @@ impl BmuxApp {
 
     /// Apply a locally selected model before a persisted session exists.
     pub fn apply_local_model_selection(&mut self, provider: Option<String>, model: &str) {
-        self.selected_provider_plugin_id = provider;
-        self.selected_model_id = model_to_display_selection(model);
+        self.session_view
+            .set_model_selection(provider, model_to_display_selection(model), None);
         self.token_usage.clear_model_info();
-        let provider_label = self
-            .selected_provider_plugin_id
-            .as_deref()
-            .unwrap_or("auto");
+        let provider_label = self.selected_provider_plugin_id().unwrap_or("auto");
         self.status = format!("model selected for next session: {provider_label}/{model}");
     }
 
     fn apply_model_changed(&mut self, provider: &str, model: &str) {
-        self.selected_provider_plugin_id = provider_to_display_selection(provider);
-        self.selected_model_id = model_to_display_selection(model);
+        let selected_model = model_to_display_selection(model);
+        self.session_view.set_model_selection(
+            provider_to_display_selection(provider),
+            selected_model.clone(),
+            selected_model,
+        );
         self.token_usage.clear_model_info();
         self.status = format!("model: {provider}/{model}");
     }
@@ -3623,17 +3677,11 @@ impl BmuxApp {
         &mut self,
         occupancy: Option<bcode_session_models::RequestContextOccupancy>,
     ) {
-        if occupancy.as_ref().is_none_or(|next| {
-            self.context_occupancy
-                .as_ref()
-                .is_none_or(|current| next.observation_sequence >= current.observation_sequence)
-        }) {
-            self.context_occupancy = occupancy;
-        }
+        self.session_view.set_context_occupancy(occupancy);
     }
 
     fn clear_context_occupancy(&mut self) {
-        self.context_occupancy = None;
+        self.session_view.set_context_occupancy(None);
     }
 
     fn push_compaction(&mut self, summary: &str) {
@@ -5007,7 +5055,12 @@ mod tests {
             observation: snapshot(true, 2_500),
         };
         app.apply_context_occupancy(Some(occupancy));
-        let hydrated = app.context_occupancy.as_ref().expect("hydrated occupancy");
+        let hydrated = app
+            .session_view_snapshot()
+            .runtime
+            .context_occupancy
+            .as_ref()
+            .expect("hydrated occupancy");
         let meter = TokenUsageMeter {
             context_window: Some(10_000),
             ..TokenUsageMeter::default()
@@ -5031,7 +5084,12 @@ mod tests {
                 occupancy: Box::new(Some(occupancy)),
             },
         });
-        let live = app.context_occupancy.as_ref().expect("live occupancy");
+        let live = app
+            .session_view_snapshot()
+            .runtime
+            .context_occupancy
+            .as_ref()
+            .expect("live occupancy");
         let meter = TokenUsageMeter {
             context_window: Some(10_000),
             ..TokenUsageMeter::default()
@@ -5057,7 +5115,9 @@ mod tests {
         });
 
         assert_eq!(
-            app.context_occupancy
+            app.session_view_snapshot()
+                .runtime
+                .context_occupancy
                 .as_ref()
                 .map(|value| value.observation.context_tokens.tokens()),
             Some(2_500)
@@ -5069,7 +5129,12 @@ mod tests {
                 occupancy: Box::new(None),
             },
         });
-        assert!(app.context_occupancy.is_none());
+        assert!(
+            app.session_view_snapshot()
+                .runtime
+                .context_occupancy
+                .is_none()
+        );
     }
 
     #[test]

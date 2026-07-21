@@ -54,7 +54,7 @@ Status meanings:
 | `InteractiveToolRequestCreated` | Adds `InteractionViewSummary` and a transcript interaction item. | Adds a terminal interaction item and opens a native surface in host flow. | **Complete** for durable generic metadata; native surface opening remains TUI-only. |
 | `InteractiveToolRequestResolved` | Marks the interaction resolved, stores resolution JSON, and updates its transcript item. | Resolves/replaces native surface output or adds a resolution item. | **Complete** for durable generic semantics. |
 | `ProviderContextCompacted` | Clears stale occupancy and appends portable provider/model compaction status. | Appends provider compaction presentation. | **Complete** for portable semantic status. |
-| `RequestContextObserved` | Projects authoritative occupancy from the durable observation. | Classified as transcript-affecting but has no direct `BmuxApp` branch; other status hydration supplies occupancy. | **Complete** for authoritative occupancy semantics. |
+| `RequestContextObserved` | Projects authoritative occupancy from the durable observation with epoch/sequence stale-update rejection. | Footer context accounting consumes shared occupancy; attach/model-status hydration updates the same shared state. | **Complete** for authoritative occupancy semantics. |
 | `PluginStatusNote` | Upserts plugin/note-keyed structured status and one stable transcript item. | TUI transcript projection renders durable plugin status and the statusline consumes shared hydrated plugin-status semantics. | **Complete** for durable and hydrated status-note semantics. |
 | `LegacyEvent` | No-op. | Compatibility-only event with no application behavior. | **Intentional no-op**. |
 
@@ -66,7 +66,7 @@ Status meanings:
 | `AssistantReasoningDelta` | Cumulatively updates reasoning item and thinking state. | Updates reasoning stream and terminal visibility/anchoring. | **Complete** for semantic content. |
 | `ToolOutputDelta` | Applies the stream event to shared tool projection/output. | Updates terminal tool output and viewport. | **Complete** for generic semantic output. |
 | `ToolArgumentPreview` | Replaces one tool-call-keyed plugin visual preview with stable identity. | Updates terminal live preview and viewport. | **Complete** for semantic preview state; viewport behavior remains renderer-owned. |
-| `RequestContextOccupancyChanged` | Replaces authoritative current occupancy. | Updates current context occupancy. | **Complete**. |
+| `RequestContextOccupancyChanged` | Replaces authoritative current occupancy while rejecting stale epoch/sequence updates. | Footer context accounting consumes shared occupancy. | **Complete**. |
 | `ProviderStreamProgress` | Projects turn-correlated human-readable progress and retry timing. | Updates provider stream status. | **Complete** for semantic progress; animation/timers remain renderer-owned. |
 
 ## Migration order derived from the matrix

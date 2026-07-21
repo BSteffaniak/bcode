@@ -137,6 +137,59 @@ impl SessionView {
         }
     }
 
+    /// Replace renderer-selected model identity while retaining unrelated runtime state.
+    pub fn set_model_selection(
+        &mut self,
+        provider_plugin_id: Option<String>,
+        requested_model_id: Option<String>,
+        effective_model_id: Option<String>,
+    ) {
+        let runtime = &mut self.snapshot.runtime;
+        if runtime.provider_plugin_id != provider_plugin_id
+            || runtime.requested_model_id != requested_model_id
+            || runtime.effective_model_id != effective_model_id
+        {
+            runtime.provider_plugin_id = provider_plugin_id;
+            runtime.requested_model_id = requested_model_id;
+            runtime.effective_model_id = effective_model_id;
+            self.bump_revision();
+        }
+    }
+
+    /// Replace renderer-selected reasoning identity while retaining unrelated runtime state.
+    pub fn set_reasoning_selection(
+        &mut self,
+        reasoning_effort: Option<String>,
+        reasoning_summary: Option<String>,
+    ) {
+        let runtime = &mut self.snapshot.runtime;
+        if runtime.reasoning_effort != reasoning_effort
+            || runtime.reasoning_summary != reasoning_summary
+        {
+            runtime.reasoning_effort = reasoning_effort;
+            runtime.reasoning_summary = reasoning_summary;
+            self.bump_revision();
+        }
+    }
+
+    /// Replace authoritative request-context occupancy when it is newer than current state.
+    pub fn set_context_occupancy(
+        &mut self,
+        occupancy: Option<bcode_session_models::RequestContextOccupancy>,
+    ) {
+        let should_replace = match (&self.snapshot.runtime.context_occupancy, &occupancy) {
+            (_, None) | (None, Some(_)) => true,
+            (Some(current), Some(next)) => {
+                (next.context_epoch, next.observation_sequence)
+                    >= (current.context_epoch, current.observation_sequence)
+            }
+        };
+        if should_replace && self.snapshot.runtime.context_occupancy != occupancy {
+            self.snapshot.runtime.context_occupancy = occupancy;
+            self.bump_revision();
+        }
+    }
+
     /// Replace attached runtime selections supplied by the daemon.
     pub fn set_runtime_selection(
         &mut self,
@@ -152,18 +205,16 @@ impl SessionView {
             || runtime.requested_model_id != requested_model_id
             || runtime.effective_model_id != effective_model_id
             || runtime.reasoning_effort != reasoning_effort
-            || runtime.reasoning_summary != reasoning_summary
-            || runtime.context_occupancy != context_occupancy;
-        if !changed {
-            return;
+            || runtime.reasoning_summary != reasoning_summary;
+        if changed {
+            runtime.provider_plugin_id = provider_plugin_id;
+            runtime.requested_model_id = requested_model_id;
+            runtime.effective_model_id = effective_model_id;
+            runtime.reasoning_effort = reasoning_effort;
+            runtime.reasoning_summary = reasoning_summary;
+            self.bump_revision();
         }
-        runtime.provider_plugin_id = provider_plugin_id;
-        runtime.requested_model_id = requested_model_id;
-        runtime.effective_model_id = effective_model_id;
-        runtime.reasoning_effort = reasoning_effort;
-        runtime.reasoning_summary = reasoning_summary;
-        runtime.context_occupancy = context_occupancy;
-        self.bump_revision();
+        self.set_context_occupancy(context_occupancy);
     }
 
     /// Replace attached agent selection supplied by the daemon.
@@ -385,6 +436,7 @@ impl SessionView {
                 self.bump_revision();
             }
             SessionEventKind::ContextCompacted { summary, .. } => {
+                self.set_context_occupancy(None);
                 self.push_item(
                     TranscriptViewItemId::event(event.sequence),
                     event.sequence,
@@ -398,7 +450,7 @@ impl SessionView {
                 );
             }
             SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
-                self.snapshot.runtime.context_occupancy = None;
+                self.set_context_occupancy(None);
                 self.push_item(
                     TranscriptViewItemId::event(event.sequence),
                     event.sequence,
@@ -413,13 +465,11 @@ impl SessionView {
                 );
             }
             SessionEventKind::RequestContextObserved { observation } => {
-                self.snapshot.runtime.context_occupancy =
-                    Some(bcode_session_models::RequestContextOccupancy {
-                        context_epoch: observation.request.context_epoch,
-                        observation_sequence: event.sequence,
-                        observation: observation.clone(),
-                    });
-                self.bump_revision();
+                self.set_context_occupancy(Some(bcode_session_models::RequestContextOccupancy {
+                    context_epoch: observation.request.context_epoch,
+                    observation_sequence: event.sequence,
+                    observation: observation.clone(),
+                }));
             }
             SessionEventKind::SkillInvoked {
                 skill_id,
@@ -902,11 +952,7 @@ impl SessionView {
                 self.bump_revision();
             }
             SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
-                self.snapshot
-                    .runtime
-                    .context_occupancy
-                    .clone_from(occupancy.as_ref());
-                self.bump_revision();
+                self.set_context_occupancy((**occupancy).clone());
             }
         }
     }
@@ -1771,6 +1817,62 @@ mod tests {
             &view.snapshot().transcript.items[0].kind,
             TranscriptViewItemKind::Interaction { interaction } if interaction.resolved
         ));
+    }
+
+    #[test]
+    fn context_occupancy_rejects_stale_epochs_and_sequences() {
+        let occupancy = |context_epoch, observation_sequence, tokens| {
+            let observation = RequestContextObservation {
+                request: ModelRequestIdentity {
+                    provider_plugin_id: "provider".to_owned(),
+                    requested_model_id: None,
+                    effective_model_id: "model".to_owned(),
+                    request_id: format!("request-{context_epoch}-{observation_sequence}"),
+                    model_turn_id: "turn".to_owned(),
+                    round: 0,
+                    request_fingerprint: "fingerprint".to_owned(),
+                    effective_auth_profile: None,
+                    context_format_version: None,
+                    compatibility_key: None,
+                    context_epoch,
+                },
+                context_through_sequence: observation_sequence,
+                context_tokens: bcode_session_models::RequestContextTokenCount::Estimated(tokens),
+                local_estimate: bcode_session_models::LocalContextEstimate {
+                    tokens,
+                    algorithm_version: 1,
+                },
+            };
+            bcode_session_models::RequestContextOccupancy {
+                context_epoch,
+                observation_sequence,
+                observation,
+            }
+        };
+        let mut view = SessionView::new();
+        view.set_context_occupancy(Some(occupancy(2, 10, 2_000)));
+        view.set_context_occupancy(Some(occupancy(1, 100, 1_000)));
+        view.set_context_occupancy(Some(occupancy(2, 9, 1_500)));
+
+        let current = view
+            .snapshot()
+            .runtime
+            .context_occupancy
+            .as_ref()
+            .expect("context occupancy");
+        assert_eq!(current.context_epoch, 2);
+        assert_eq!(current.observation_sequence, 10);
+        assert_eq!(current.observation.context_tokens.tokens(), 2_000);
+
+        view.set_context_occupancy(Some(occupancy(3, 1, 500)));
+        let current = view
+            .snapshot()
+            .runtime
+            .context_occupancy
+            .as_ref()
+            .expect("new context epoch");
+        assert_eq!(current.context_epoch, 3);
+        assert_eq!(current.observation.context_tokens.tokens(), 500);
     }
 
     #[test]
