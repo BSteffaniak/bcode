@@ -128,4 +128,5 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     vtable
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_plugin!(MetricsPlugin, include_str!("../bcode-plugin.toml"));

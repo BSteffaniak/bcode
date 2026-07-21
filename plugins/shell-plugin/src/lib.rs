@@ -1685,6 +1685,7 @@ pub fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     registry
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]

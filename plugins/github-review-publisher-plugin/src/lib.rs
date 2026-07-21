@@ -735,6 +735,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     )
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_plugin!(
     GitHubReviewPublisherPlugin,
     include_str!("../bcode-plugin.toml")

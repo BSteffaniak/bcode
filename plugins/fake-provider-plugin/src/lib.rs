@@ -708,6 +708,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     )
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_concurrent_plugin!(
     FakeProviderPlugin,
     include_str!("../bcode-plugin.toml")

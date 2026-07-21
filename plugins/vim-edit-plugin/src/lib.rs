@@ -1237,6 +1237,7 @@ pub fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     registry
 }
 
+#[cfg(not(feature = "static-bundled"))]
 export_plugin!(VimEditPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]

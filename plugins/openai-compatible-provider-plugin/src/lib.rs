@@ -8359,6 +8359,7 @@ mod tests {
     }
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_concurrent_plugin!(
     OpenAiCompatibleProviderPlugin,
     include_str!("../bcode-plugin.toml")

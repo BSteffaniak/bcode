@@ -9860,13 +9860,13 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
+#[cfg(not(feature = "static-bundled"))]
 export_plugin!(BlimsPlugin, MANIFEST);
 
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable =
-        bcode_plugin_sdk::static_plugin_vtable!(BlimsPlugin, include_str!("../bcode-plugin.toml"));
+    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(BlimsPlugin, MANIFEST);
     vtable.cli_registration = Some(cli::registration);
     vtable
 }

@@ -885,6 +885,7 @@ pub fn ocr_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     registry
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_plugin!(OcrPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]

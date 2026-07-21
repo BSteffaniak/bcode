@@ -388,6 +388,7 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
+#[cfg(not(feature = "static-bundled"))]
 export_plugin!(DefaultAgentsPlugin, MANIFEST);
 
 #[cfg(feature = "static-bundled")]

@@ -358,6 +358,7 @@ fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) 
     frame.write_line(Rect::new(area.x, y, area.width, 1), &line.into());
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_plugin!(SkillsPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]

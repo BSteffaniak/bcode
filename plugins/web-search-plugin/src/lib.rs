@@ -2535,6 +2535,7 @@ pub fn web_search_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     registry
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.toml"));
 #[cfg(test)]
 mod tests {

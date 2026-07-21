@@ -314,6 +314,48 @@ fn worktree_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundled_plugin_sources_gate_dynamic_abi_exports() {
+        let mut offenders = Vec::new();
+        for source in plugin_source_paths() {
+            let contents = std::fs::read_to_string(&source)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", source.display()));
+            for export_macro in ["export_plugin!", "export_concurrent_plugin!"] {
+                let mut search_start = 0;
+                while let Some(relative_index) = contents[search_start..].find(export_macro) {
+                    let index = search_start + relative_index;
+                    let preceding = &contents[..index];
+                    let immediately_preceding = preceding
+                        .rsplit_once('\n')
+                        .map_or(preceding, |(before_line, _)| before_line)
+                        .rsplit_once('\n')
+                        .map_or(preceding, |(_, line)| line)
+                        .trim();
+                    if immediately_preceding != "#[cfg(not(feature = \"static-bundled\"))]" {
+                        offenders.push(format!("{}:{export_macro}", source.display()));
+                    }
+                    search_start = index + export_macro.len();
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "static bundled plugins must not export duplicate dynamic ABI symbols: {offenders:#?}"
+        );
+    }
+
+    fn plugin_source_paths() -> Vec<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let mut paths = std::fs::read_dir(root)
+            .expect("plugin root should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("src/lib.rs"))
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
     #[cfg(feature = "static-bundled-loop-plugin")]
     #[test]
     fn disabling_loop_removes_all_manifest_contributions() {
