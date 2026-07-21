@@ -1,19 +1,18 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Model-callable tool contract types for bcode"
+description = "Serializable model types for Bcode tool runtime contracts"
 edition     = { workspace = true }
-keywords    = ["bcode", "tool", "plugin"]
+keywords    = ["bcode", "tool", "models"]
 license     = { workspace = true }
-name        = "bcode_tool"
+name        = "bcode_tool_models"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_tool_models = { workspace = true }
-serde             = { workspace = true, features = ["derive", "std"] }
-serde_json        = { workspace = true }
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
 
 [features]
 default          = []

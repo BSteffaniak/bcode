@@ -42,8 +42,9 @@ use bcode_model::{
 use bcode_session_models::SessionId;
 use bcode_tool::{
     PreparedToolInvocation, ToolAuthorizationFact, ToolDefinition, ToolExecutionOptions,
-    ToolInvocationDescriptor, ToolInvocationResponse, ToolPreparationRequest,
-    ToolPreparationResponse, ToolResultContent as InvocationToolResultContent,
+    ToolInvocationDescriptor, ToolInvocationLifecycleEvent, ToolInvocationResponse,
+    ToolPreparationRequest, ToolPreparationResponse,
+    ToolResultContent as InvocationToolResultContent,
 };
 use futures::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,7 +53,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -725,6 +726,9 @@ pub trait ToolInvoker: Send + Sync {
     }
 
     /// Execute a previously prepared invocation.
+    ///
+    /// The runtime emits the canonical started and terminal lifecycle stages around this future.
+    /// Implementations may emit only progress and waiting lifecycle updates through `scope`.
     fn invoke_tool<'a>(
         &'a self,
         tool: &'a RegisteredTool,
@@ -1425,6 +1429,14 @@ impl AgentRuntime {
             return Ok(empty_batch_output());
         }
         rounds.begin_round()?;
+        let provider_round = rounds.completed_rounds();
+        tracing::debug!(
+            provider_round,
+            batch_size = calls.len(),
+            parallel = options.parallel,
+            configured_max_concurrency = ?options.max_concurrency.map(NonZeroUsize::get),
+            "canonical provider tool batch admitted"
+        );
         if !scope.control().accepts_normal_output() {
             return Ok(cancelled_batch_output(calls.len()));
         }
@@ -1463,11 +1475,35 @@ impl AgentRuntime {
                 continue;
             }
             let concurrency = batch_concurrency(options, group.len());
+            let serialization_reason = if !options.parallel {
+                Some("sequential_mode")
+            } else if options
+                .max_concurrency
+                .is_some_and(|limit| limit.get() < group.len())
+            {
+                Some("concurrency_bound")
+            } else {
+                None
+            };
+            tracing::debug!(
+                provider_round,
+                batch_size = calls.len(),
+                group_size = group.len(),
+                configured_max_concurrency = ?options.max_concurrency.map(NonZeroUsize::get),
+                effective_concurrency = concurrency,
+                serialization_reason,
+                "canonical tool execution group scheduled"
+            );
+            let observed_concurrency = Arc::new(BatchConcurrencyObservation::default());
             let group_indices = group.iter().map(|call| call.index);
-            let executions = stream::iter(group.iter().cloned().map(|prepared| async move {
-                let index = prepared.index;
-                let result = invoke_prepared_tool(invoker, prepared, scope).await;
-                (index, result)
+            let executions = stream::iter(group.iter().cloned().map(|prepared| {
+                let observed_concurrency = Arc::clone(&observed_concurrency);
+                async move {
+                    let _active = observed_concurrency.enter();
+                    let index = prepared.index;
+                    let result = invoke_prepared_tool(invoker, prepared, scope).await;
+                    (index, result)
+                }
             }))
             .buffer_unordered(concurrency)
             .collect::<Vec<_>>();
@@ -1479,6 +1515,13 @@ impl AgentRuntime {
                     .collect(),
                 completions = executions => completions,
             };
+            tracing::debug!(
+                provider_round,
+                batch_size = calls.len(),
+                group_size = group.len(),
+                observed_concurrency = observed_concurrency.peak(),
+                "canonical tool execution group completed"
+            );
             terminal.extend(completions);
         }
 
@@ -2317,6 +2360,34 @@ fn tool_invocation_descriptor(call: &ToolCall) -> ToolInvocationDescriptor {
     }
 }
 
+#[derive(Default)]
+struct BatchConcurrencyObservation {
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl BatchConcurrencyObservation {
+    fn enter(&self) -> BatchConcurrencyGuard<'_> {
+        let active = self.active.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        self.peak.fetch_max(active, Ordering::AcqRel);
+        BatchConcurrencyGuard { observation: self }
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Acquire)
+    }
+}
+
+struct BatchConcurrencyGuard<'a> {
+    observation: &'a BatchConcurrencyObservation,
+}
+
+impl Drop for BatchConcurrencyGuard<'_> {
+    fn drop(&mut self) {
+        self.observation.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn batch_concurrency(options: ToolExecutionOptions, batch_len: usize) -> usize {
     options
         .max_concurrency
@@ -2331,6 +2402,72 @@ fn provider_batch_execution_groups(
         vec![prepared]
     } else {
         prepared.into_iter().map(|call| vec![call]).collect()
+    }
+}
+
+struct InvocationLifecycleGuard {
+    scope: InvocationScope,
+    terminal: bool,
+}
+
+impl InvocationLifecycleGuard {
+    fn start(scope: InvocationScope) -> Self {
+        let event = ToolInvocationLifecycleEvent {
+            invocation_id: scope.invocation_id().to_string(),
+            sequence: 0,
+            stage: bcode_tool::ToolInvocationLifecycleStage::Started,
+            message: None,
+            metadata: serde_json::Value::Null,
+        };
+        let _ = scope
+            .turn()
+            .emit(ScopedTurnEvent::InvocationLifecycle(event));
+        Self {
+            scope,
+            terminal: false,
+        }
+    }
+
+    fn finish(&mut self, stage: bcode_tool::ToolInvocationLifecycleStage) -> bool {
+        debug_assert!(matches!(
+            stage,
+            bcode_tool::ToolInvocationLifecycleStage::Completed
+                | bcode_tool::ToolInvocationLifecycleStage::Failed
+        ));
+        self.terminal = true;
+        self.scope
+            .emit_invocation_terminal(ToolInvocationLifecycleEvent {
+                invocation_id: self.scope.invocation_id().to_string(),
+                sequence: u64::MAX,
+                stage,
+                message: None,
+                metadata: serde_json::Value::Null,
+            })
+    }
+
+    fn cancel(&mut self) -> bool {
+        self.terminal = true;
+        self.scope
+            .emit_cancellation_lifecycle(ToolInvocationLifecycleEvent {
+                invocation_id: self.scope.invocation_id().to_string(),
+                sequence: u64::MAX,
+                stage: bcode_tool::ToolInvocationLifecycleStage::Cancelled,
+                message: None,
+                metadata: serde_json::Value::Null,
+            })
+    }
+}
+
+impl Drop for InvocationLifecycleGuard {
+    fn drop(&mut self) {
+        if self.terminal {
+            return;
+        }
+        if self.scope.accepts_work() {
+            let _ = self.finish(bcode_tool::ToolInvocationLifecycleStage::Failed);
+        } else {
+            let _ = self.cancel();
+        }
     }
 }
 
@@ -2355,6 +2492,7 @@ where
         let _ = invocation_scope.unregister_cancellation();
         return Err(RuntimeError::Cancelled);
     }
+    let mut lifecycle = InvocationLifecycleGuard::start(invocation_scope.clone());
     let invocation = invoker
         .invoke_tool(&prepared.tool, &prepared.invocation, &invocation_scope)
         .await
@@ -2363,8 +2501,19 @@ where
             message: error.to_string(),
         });
     let _ = invocation_scope.unregister_cancellation();
-    let invocation = invocation?;
+    let invocation = match invocation {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            if invocation_scope.accepts_work() {
+                let _ = lifecycle.finish(bcode_tool::ToolInvocationLifecycleStage::Failed);
+            } else {
+                let _ = lifecycle.cancel();
+            }
+            return Err(error);
+        }
+    };
     if !scope.control().accepts_normal_output() {
+        let _ = lifecycle.cancel();
         return Err(RuntimeError::Cancelled);
     }
     let output = tool_execution_output(&prepared.call, invocation);
@@ -2373,9 +2522,20 @@ where
             continue;
         }
         if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
+            if invocation_scope.accepts_work() {
+                let _ = lifecycle.finish(bcode_tool::ToolInvocationLifecycleStage::Failed);
+            } else {
+                let _ = lifecycle.cancel();
+            }
             return Err(RuntimeError::Cancelled);
         }
     }
+    let stage = if output.invocation.is_error {
+        bcode_tool::ToolInvocationLifecycleStage::Failed
+    } else {
+        bcode_tool::ToolInvocationLifecycleStage::Completed
+    };
+    let _ = lifecycle.finish(stage);
     Ok(output)
 }
 
@@ -2590,6 +2750,20 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn batch_concurrency_observation_tracks_peak_and_releases_active_work() {
+        let observation = BatchConcurrencyObservation::default();
+        let first = observation.enter();
+        let second = observation.enter();
+        assert_eq!(observation.active.load(Ordering::Acquire), 2);
+        assert_eq!(observation.peak(), 2);
+        drop(first);
+        assert_eq!(observation.active.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(observation.active.load(Ordering::Acquire), 0);
+        assert_eq!(observation.peak(), 2);
+    }
 
     struct FakeProvider {
         events: VecDeque<ProviderTurnEvent>,
@@ -3729,7 +3903,7 @@ mod tests {
                 assert!(scope.emit_lifecycle(ToolInvocationLifecycleEvent {
                     invocation_id: invocation_id.clone(),
                     sequence: 1,
-                    stage: ToolInvocationLifecycleStage::Started,
+                    stage: ToolInvocationLifecycleStage::Progress,
                     message: None,
                     metadata: serde_json::Value::Null,
                 }));
@@ -3789,7 +3963,7 @@ mod tests {
                 assert!(scope.emit_lifecycle(ToolInvocationLifecycleEvent {
                     invocation_id,
                     sequence: 2,
-                    stage: ToolInvocationLifecycleStage::Completed,
+                    stage: ToolInvocationLifecycleStage::Waiting,
                     message: None,
                     metadata: serde_json::Value::Null,
                 }));
@@ -3845,17 +4019,169 @@ mod tests {
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 6);
         assert!(matches!(
             events.as_slice(),
             [
-                ScopedTurnEvent::InvocationLifecycle(_),
+                ScopedTurnEvent::InvocationLifecycle(ToolInvocationLifecycleEvent {
+                    stage: ToolInvocationLifecycleStage::Started,
+                    ..
+                }),
+                ScopedTurnEvent::InvocationLifecycle(ToolInvocationLifecycleEvent {
+                    stage: ToolInvocationLifecycleStage::Progress,
+                    ..
+                }),
                 ScopedTurnEvent::Contribution(_),
-                ScopedTurnEvent::InvocationLifecycle(_),
-                ScopedTurnEvent::Runtime(AgentRuntimeEvent::ToolResult(_))
+                ScopedTurnEvent::InvocationLifecycle(ToolInvocationLifecycleEvent {
+                    stage: ToolInvocationLifecycleStage::Waiting,
+                    ..
+                }),
+                ScopedTurnEvent::Runtime(AgentRuntimeEvent::ToolResult(_)),
+                ScopedTurnEvent::InvocationLifecycle(ToolInvocationLifecycleEvent {
+                    stage: ToolInvocationLifecycleStage::Completed,
+                    ..
+                })
             ]
         ));
         drop(events);
+    }
+
+    #[derive(Debug, Default)]
+    struct LifecycleOutcomeInvoker;
+
+    impl ToolInvoker for LifecycleOutcomeInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            Box::pin(async {
+                Ok(ToolPreparationResponse {
+                    authorization: Vec::new(),
+                    descriptor: serde_json::Value::Null,
+                })
+            })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            invocation: &'a PreparedToolInvocation,
+            _scope: &'a InvocationScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            Box::pin(async move {
+                match invocation.invocation.tool_name.as_str() {
+                    "invoke-error" => Err(RuntimeError::ToolExecution {
+                        tool_name: "invoke-error".to_string(),
+                        message: "failed".to_string(),
+                    }),
+                    "reported-error" => Ok(ToolInvocationResponse {
+                        output: "reported failure".to_string(),
+                        is_error: true,
+                        content: Vec::new(),
+                        full_output: None,
+                        host_action: None,
+                        result: None,
+                    }),
+                    _ => Ok(ToolInvocationResponse {
+                        output: "ok".to_string(),
+                        is_error: false,
+                        content: Vec::new(),
+                        full_output: None,
+                        host_action: None,
+                        result: None,
+                    }),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_emits_exactly_one_started_and_terminal_lifecycle_per_invocation() {
+        let host = Arc::new(DirectInvocationHost::default());
+        let scope = TurnScope::new("turn", TurnGeneration::new(1), host.clone());
+        let catalog = UnifiedToolCatalog::new()
+            .with_inline_tool(tool_definition("success"))
+            .with_inline_tool(tool_definition("reported-error"))
+            .with_inline_tool(tool_definition("invoke-error"));
+        let calls = [
+            ToolCall {
+                id: "success-call".to_string(),
+                name: "success".to_string(),
+                arguments: serde_json::Value::Null,
+            },
+            ToolCall {
+                id: "reported-error-call".to_string(),
+                name: "reported-error".to_string(),
+                arguments: serde_json::Value::Null,
+            },
+            ToolCall {
+                id: "invoke-error-call".to_string(),
+                name: "invoke-error".to_string(),
+                arguments: serde_json::Value::Null,
+            },
+        ];
+        let mut rounds = ToolRoundState::new(1);
+
+        let output = AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &LifecycleOutcomeInvoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &scope,
+            )
+            .await
+            .expect("batch should execute");
+
+        assert!(output.results[0].is_ok());
+        assert!(output.results[1].is_ok());
+        assert!(output.results[2].is_err());
+        let lifecycle = host
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|event| match event {
+                ScopedTurnEvent::InvocationLifecycle(event) => {
+                    Some((event.invocation_id.clone(), event.stage))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle,
+            vec![
+                (
+                    "success-call".to_string(),
+                    ToolInvocationLifecycleStage::Started
+                ),
+                (
+                    "success-call".to_string(),
+                    ToolInvocationLifecycleStage::Completed
+                ),
+                (
+                    "reported-error-call".to_string(),
+                    ToolInvocationLifecycleStage::Started,
+                ),
+                (
+                    "reported-error-call".to_string(),
+                    ToolInvocationLifecycleStage::Failed,
+                ),
+                (
+                    "invoke-error-call".to_string(),
+                    ToolInvocationLifecycleStage::Started,
+                ),
+                (
+                    "invoke-error-call".to_string(),
+                    ToolInvocationLifecycleStage::Failed,
+                ),
+            ]
+        );
     }
 
     #[derive(Debug)]
@@ -4387,7 +4713,8 @@ mod tests {
                 ("second".to_string(), Arc::clone(&second)),
             ]),
         };
-        let scope = TurnScope::without_events("turn", TurnGeneration::new(13));
+        let host = Arc::new(DirectInvocationHost::default());
+        let scope = TurnScope::new("turn", TurnGeneration::new(13), host.clone());
         let control = scope.control();
         let mut rounds = ToolRoundState::new(1);
         let runtime = AgentRuntime::new();
@@ -4424,6 +4751,43 @@ mod tests {
                 .results
                 .iter()
                 .all(|result| matches!(result, Err(RuntimeError::Cancelled)))
+        );
+        let lifecycle = host
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|event| match event {
+                ScopedTurnEvent::InvocationLifecycle(event) => {
+                    Some((event.invocation_id.clone(), event.stage))
+                }
+                _ => None,
+            })
+            .fold(
+                BTreeMap::<String, Vec<_>>::new(),
+                |mut by_invocation, (id, stage)| {
+                    by_invocation.entry(id).or_default().push(stage);
+                    by_invocation
+                },
+            );
+        assert_eq!(
+            lifecycle,
+            BTreeMap::from([
+                (
+                    "call-1".to_string(),
+                    vec![
+                        ToolInvocationLifecycleStage::Started,
+                        ToolInvocationLifecycleStage::Cancelled,
+                    ],
+                ),
+                (
+                    "call-2".to_string(),
+                    vec![
+                        ToolInvocationLifecycleStage::Started,
+                        ToolInvocationLifecycleStage::Cancelled,
+                    ],
+                ),
+            ])
         );
     }
 
@@ -4839,7 +5203,8 @@ mod tests {
             },
         ];
         let invoker = ContractTestInvoker::new(2);
-        let scope = TurnScope::without_events("turn", TurnGeneration::new(3));
+        let host = Arc::new(DirectInvocationHost::default());
+        let scope = TurnScope::new("turn", TurnGeneration::new(3), host.clone());
         let control = scope.control();
         let mut rounds = ToolRoundState::new(1);
         let cancellation = async {
@@ -4874,6 +5239,31 @@ mod tests {
                 .results
                 .iter()
                 .all(|result| matches!(result, Err(RuntimeError::Cancelled)))
+        );
+        let lifecycle = {
+            let events = host
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ScopedTurnEvent::InvocationLifecycle(event) => {
+                        Some((event.invocation_id.clone(), event.stage))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lifecycle,
+            vec![
+                ("call-1".to_string(), ToolInvocationLifecycleStage::Started),
+                (
+                    "call-1".to_string(),
+                    ToolInvocationLifecycleStage::Cancelled,
+                ),
+            ]
         );
     }
 

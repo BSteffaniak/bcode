@@ -91,6 +91,15 @@ pub struct SessionViewSnapshot {
     pub latest_sequence: Option<u64>,
     /// Renderer-neutral transcript items.
     pub transcript: TranscriptViewDocument,
+    /// Active opaque contributions keyed by invocation and contribution identity.
+    #[serde(default)]
+    pub contributions: BTreeMap<String, bcode_session_models::ToolContributionEvent>,
+    /// Active renderer-neutral exchange requests keyed by invocation and exchange identity.
+    #[serde(default)]
+    pub active_exchanges: BTreeMap<String, bcode_session_models::ToolExchangeRequest>,
+    /// Active invocation lifecycle keyed by invocation identifier.
+    #[serde(default)]
+    pub active_invocations: BTreeMap<String, bcode_session_models::ToolInvocationLifecycleEvent>,
     /// Active or recently observed tool invocations keyed by provider tool call id.
     pub tools: BTreeMap<String, ToolInvocationView>,
     /// Pending permission requests visible to renderers.
@@ -118,7 +127,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 5;
+    pub const SCHEMA_VERSION: u16 = 7;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -131,6 +140,9 @@ impl SessionViewSnapshot {
             working_directory: None,
             latest_sequence: None,
             transcript: TranscriptViewDocument::default(),
+            contributions: BTreeMap::new(),
+            active_exchanges: BTreeMap::new(),
+            active_invocations: BTreeMap::new(),
             tools: BTreeMap::new(),
             permissions: Vec::new(),
             runtime_work: Vec::new(),
@@ -158,6 +170,12 @@ pub struct SessionViewPatch {
     pub session_id: Option<SessionId>,
     /// Transcript item operations.
     pub transcript: Vec<TranscriptViewPatchOp>,
+    /// Opaque contribution updates keyed by invocation and contribution identity.
+    pub contributions: BTreeMap<String, bcode_session_models::ToolContributionEvent>,
+    /// Active exchange updates keyed by invocation and exchange identity.
+    pub active_exchanges: BTreeMap<String, bcode_session_models::ToolExchangeRequest>,
+    /// Invocation lifecycle updates keyed by invocation identifier.
+    pub active_invocations: BTreeMap<String, bcode_session_models::ToolInvocationLifecycleEvent>,
     /// Tool updates keyed by tool call id.
     pub tools: BTreeMap<String, ToolInvocationView>,
     /// Permission updates.
@@ -180,7 +198,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 5;
+    pub const SCHEMA_VERSION: u16 = 7;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -191,6 +209,9 @@ impl SessionViewPatch {
             revision,
             session_id: None,
             transcript: Vec::new(),
+            contributions: BTreeMap::new(),
+            active_exchanges: BTreeMap::new(),
+            active_invocations: BTreeMap::new(),
             tools: BTreeMap::new(),
             permissions: Vec::new(),
             runtime_work: Vec::new(),
@@ -276,6 +297,10 @@ pub enum TranscriptViewItemKind {
     SystemMessage { message: ChatMessageView },
     /// Generic plugin visual payload.
     PluginVisual { visual: PluginVisualView },
+    /// Opaque schema-versioned tool contribution with generic fallback rendering.
+    ToolContribution {
+        contribution: bcode_session_models::ToolContributionEvent,
+    },
 }
 
 /// Chat text plus renderer-neutral annotations.

@@ -7,6 +7,7 @@ use bcode::{
     ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCall, ToolDefinition,
     ToolExchangeRequest, ToolExchangeResolution, ToolInvocationInput,
     ToolInvocationInputResolution, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
+    TurnEventObservability,
 };
 use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
 use std::sync::{Arc, Mutex};
@@ -310,6 +311,82 @@ async fn assert_reentrant_shell_batch_overlaps(plugins: bcode_plugin::PluginRunt
         output.results
     );
     assert!((0..2).all(|index| workspace.path().join(format!(".overlap-{index}")).exists()));
+}
+
+#[derive(Debug, Default)]
+struct ContributionObserver {
+    contributions: Mutex<Vec<bcode_tool::ToolContributionEvent>>,
+    lifecycle: Mutex<Vec<bcode_tool::ToolInvocationLifecycleEvent>>,
+}
+
+impl TurnEventObservability for ContributionObserver {
+    fn observe(&self, event: &bcode::ScopedTurnEvent) {
+        match event {
+            bcode::ScopedTurnEvent::Contribution(contribution) => self
+                .contributions
+                .lock()
+                .expect("contribution observation lock")
+                .push(contribution.clone()),
+            bcode::ScopedTurnEvent::InvocationLifecycle(lifecycle) => self
+                .lifecycle
+                .lock()
+                .expect("lifecycle observation lock")
+                .push(lifecycle.clone()),
+            bcode::ScopedTurnEvent::Runtime(_) => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn static_and_dynamic_shell_contributions_are_observable_headlessly() {
+    for plugins in [static_shell_runtime(), dynamic_shell_runtime()] {
+        let observer = Arc::new(ContributionObserver::default());
+        let agent = Agent::builder()
+            .plugin_runtime(plugins)
+            .plugin_tool(shell_definition(), "bcode.shell")
+            .authorization_coordinator(Arc::new(AllowAuthorization))
+            .event_observability(observer.clone())
+            .build();
+        let output = agent
+            .execute_tool_call(&ToolCall {
+                id: "shell-contribution".to_owned(),
+                name: "shell.run".to_owned(),
+                arguments: serde_json::json!({"command": "printf shell-contribution"}),
+            })
+            .await
+            .expect("shell contribution invocation");
+        assert!(!output.invocation.is_error, "{}", output.invocation.output);
+        let contributions = observer
+            .contributions
+            .lock()
+            .expect("contribution observations");
+        assert_eq!(contributions.len(), 1);
+        let contribution = &contributions[0];
+        assert_eq!(contribution.invocation_id, "shell-contribution");
+        assert_eq!(contribution.producer_id, "bcode.shell");
+        assert_eq!(contribution.schema, "bcode.shell.run.summary");
+        assert_eq!(
+            contribution.persistence,
+            bcode_tool::ToolContributionPersistence::Durable
+        );
+        assert!(
+            contribution
+                .payload
+                .to_string()
+                .contains("shell-contribution")
+        );
+        drop(contributions);
+        let lifecycle = observer.lifecycle.lock().expect("lifecycle observations");
+        assert!(lifecycle.iter().any(|event| {
+            event.invocation_id == "shell-contribution"
+                && event.stage == bcode_tool::ToolInvocationLifecycleStage::Progress
+                && event
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("starting command"))
+        }));
+    }
 }
 
 #[cfg(unix)]

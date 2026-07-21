@@ -9,9 +9,10 @@ use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
-    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolInvocationStreamEvent,
-    ToolList, ToolPluginVisualMetadata, ToolSideEffect, ToolVisualPayloadSelector,
+    ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
+    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolList,
+    ToolPluginVisualMetadata, ToolSideEffect, ToolVisualPayloadSelector,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -58,14 +59,24 @@ impl ProgressReporter {
             .sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .saturating_add(1);
-        let event = ToolInvocationStreamEvent::Status {
-            tool_call_id: self.tool_call_id.clone(),
-            sequence,
-            message: message.into(),
-        };
+        let event = progress_lifecycle_event(&self.tool_call_id, sequence, message.into());
         if let Ok(payload) = serde_json::to_vec(&event) {
             self.events.emit(&payload);
         }
+    }
+}
+
+fn progress_lifecycle_event(
+    invocation_id: &str,
+    sequence: u64,
+    message: String,
+) -> ToolInvocationLifecycleEvent {
+    ToolInvocationLifecycleEvent {
+        invocation_id: invocation_id.to_owned(),
+        sequence,
+        stage: ToolInvocationLifecycleStage::Progress,
+        message: Some(message),
+        metadata: serde_json::Value::Null,
     }
 }
 
@@ -2528,6 +2539,18 @@ bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_uses_neutral_invocation_lifecycle_contract() {
+        let event = progress_lifecycle_event("web-call", 6, "searching".to_owned());
+        let encoded = serde_json::to_vec(&event).expect("lifecycle should encode");
+        let decoded: ToolInvocationLifecycleEvent =
+            serde_json::from_slice(&encoded).expect("lifecycle should decode");
+        assert_eq!(decoded.invocation_id, "web-call");
+        assert_eq!(decoded.sequence, 6);
+        assert_eq!(decoded.stage, ToolInvocationLifecycleStage::Progress);
+        assert_eq!(decoded.message.as_deref(), Some("searching"));
+    }
 
     #[test]
     fn web_search_output_is_usable_without_presentation_events() {

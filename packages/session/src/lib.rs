@@ -67,11 +67,19 @@ const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'stati
                 | bcode_session_models::ToolInvocationStreamEvent::ArtifactUpdate { .. }
                 | bcode_session_models::ToolInvocationStreamEvent::LegacyPresentation { .. },
         } => Some("tool_invocation_stream"),
+        SessionEventKind::ToolContribution { event }
+            if matches!(
+                event.persistence,
+                bcode_session_models::ToolContributionPersistence::Transient
+            ) =>
+        {
+            Some("tool_contribution")
+        }
         _ => None,
     }
 }
 
-const MAX_DURABLE_TOOL_STREAM_EVENT_BYTES: usize = 64 * 1024;
+const MAX_DURABLE_GENERIC_EVENT_BYTES: usize = 64 * 1024;
 
 fn ensure_durable_session_event_kind(
     kind: &SessionEventKind,
@@ -88,11 +96,14 @@ fn ensure_durable_session_event_kind(
         }
         return Err(SessionError::LiveEventPersistenceRejected { event_kind });
     }
-    if matches!(kind, SessionEventKind::ToolInvocationStream { .. }) {
+    if matches!(
+        kind,
+        SessionEventKind::ToolInvocationStream { .. } | SessionEventKind::ToolContribution { .. }
+    ) {
         let payload_bytes = serde_json::to_vec(kind)
             .map_err(|error| SessionError::EventSerialization(error.to_string()))?
             .len();
-        if payload_bytes > MAX_DURABLE_TOOL_STREAM_EVENT_BYTES {
+        if payload_bytes > MAX_DURABLE_GENERIC_EVENT_BYTES {
             if let Some(metrics) = metrics {
                 metrics.increment_counter("session.event.oversized_persistence_rejected");
                 metrics.record_histogram(
@@ -103,7 +114,7 @@ fn ensure_durable_session_event_kind(
             return Err(SessionError::DurableEventPayloadTooLarge {
                 event_kind: "tool_invocation_stream",
                 payload_bytes,
-                max_bytes: MAX_DURABLE_TOOL_STREAM_EVENT_BYTES,
+                max_bytes: MAX_DURABLE_GENERIC_EVENT_BYTES,
             });
         }
     }
@@ -261,13 +272,25 @@ pub struct SessionStore {
     lease_owner: SessionLeaseOwnerContext,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionFormatMarker {
+    family: String,
+    epoch: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionManifest {
     schema_version: u32,
+    session_format: SessionFormatMarker,
     summary: SessionSummary,
 }
 
-const SESSION_MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// Current bounded session-manifest metadata schema.
+pub const SESSION_MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// Stable family identifier for canonical Bcode session stores.
+pub const SESSION_FORMAT_FAMILY: &str = "bcode.session";
+/// Current canonical session format epoch.
+pub const CURRENT_SESSION_FORMAT_EPOCH: u32 = 2;
 
 impl SessionStore {
     /// Create an event store rooted at the provided directory.
@@ -319,7 +342,14 @@ impl SessionStore {
         for summary in summaries {
             let summary = match self.load_session_manifest(summary.id) {
                 Ok(Some(manifest_summary)) => manifest_summary,
-                Ok(None) | Err(_) => summary,
+                Ok(None) => summary,
+                Err(error) => {
+                    eprintln!(
+                        "skipping session {} with unsupported manifest metadata: {error}",
+                        summary.id
+                    );
+                    continue;
+                }
             };
             sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
         }
@@ -360,7 +390,9 @@ impl SessionStore {
             let Some(session_id) = canonical_session_id_from_dir(&path) else {
                 continue;
             };
-            if !db::session_db_path(&self.root, session_id).exists() {
+            if self.session_manifest_path(session_id).exists()
+                || !db::session_db_path(&self.root, session_id).exists()
+            {
                 continue;
             }
             summaries.push(SessionSummary {
@@ -410,10 +442,44 @@ impl SessionStore {
             return Ok(None);
         }
         let contents = fs::read(&path)?;
-        let manifest: SessionManifest = serde_json::from_slice(&contents)
+        let value: serde_json::Value = serde_json::from_slice(&contents)
+            .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        let schema_version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64);
+        if schema_version != Some(u64::from(SESSION_MANIFEST_SCHEMA_VERSION)) {
+            return Err(SessionStoreError::CatalogLoad(format!(
+                "unsupported session manifest schema version {schema_version:?}"
+            )));
+        }
+        let format_family = value
+            .pointer("/session_format/family")
+            .and_then(serde_json::Value::as_str);
+        let format_epoch = value
+            .pointer("/session_format/epoch")
+            .and_then(serde_json::Value::as_u64);
+        if format_family != Some(SESSION_FORMAT_FAMILY)
+            || format_epoch != Some(u64::from(CURRENT_SESSION_FORMAT_EPOCH))
+        {
+            return Err(SessionStoreError::CatalogLoad(format!(
+                "unsupported session format family={format_family:?} epoch={format_epoch:?}"
+            )));
+        }
+        let manifest: SessionManifest = serde_json::from_value(value)
             .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
         if manifest.schema_version != SESSION_MANIFEST_SCHEMA_VERSION {
-            return Ok(None);
+            return Err(SessionStoreError::CatalogLoad(format!(
+                "unsupported session manifest schema version {}",
+                manifest.schema_version
+            )));
+        }
+        if manifest.session_format.family != SESSION_FORMAT_FAMILY
+            || manifest.session_format.epoch != CURRENT_SESSION_FORMAT_EPOCH
+        {
+            return Err(SessionStoreError::CatalogLoad(format!(
+                "unsupported session format family={} epoch={}",
+                manifest.session_format.family, manifest.session_format.epoch
+            )));
         }
         if manifest.summary.id != session_id {
             return Err(SessionStoreError::CatalogLoad(format!(
@@ -498,6 +564,10 @@ impl SessionStore {
         summary.client_count = 0;
         let manifest = SessionManifest {
             schema_version: SESSION_MANIFEST_SCHEMA_VERSION,
+            session_format: SessionFormatMarker {
+                family: SESSION_FORMAT_FAMILY.to_owned(),
+                epoch: CURRENT_SESSION_FORMAT_EPOCH,
+            },
             summary,
         };
         let temp_path = path.with_extension("json.tmp");
@@ -3688,8 +3758,10 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendToolCallRequestedInput, MAX_DURABLE_TOOL_STREAM_EVENT_BYTES, SessionError,
-        SessionHealth, SessionLeaseOwnerContext, SessionManager, db, lease,
+        AppendToolCallRequestedInput, CURRENT_SESSION_FORMAT_EPOCH,
+        MAX_DURABLE_GENERIC_EVENT_BYTES, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
+        SessionError, SessionHealth, SessionLeaseOwnerContext, SessionManager, SessionStore, db,
+        lease,
     };
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
@@ -3832,7 +3904,7 @@ mod tests {
                     event: ToolInvocationStreamEvent::Status {
                         tool_call_id: "call".to_owned(),
                         sequence: 1,
-                        message: "x".repeat(MAX_DURABLE_TOOL_STREAM_EVENT_BYTES),
+                        message: "x".repeat(MAX_DURABLE_GENERIC_EVENT_BYTES),
                     },
                 },
             )
@@ -3846,7 +3918,7 @@ mod tests {
             }
         ));
 
-        let large_semantic_message = "y".repeat(MAX_DURABLE_TOOL_STREAM_EVENT_BYTES + 1);
+        let large_semantic_message = "y".repeat(MAX_DURABLE_GENERIC_EVENT_BYTES + 1);
         manager
             .append_event(
                 session.id,
@@ -6773,6 +6845,58 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
+    #[test]
+    fn bounded_manifest_rejects_old_format_without_opening_session_database() {
+        let root = unique_temp_dir();
+        let session_id = SessionId::new();
+        let session_dir = db::session_dir_path(&root, session_id);
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        std::fs::write(
+            session_dir.join("manifest.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "summary": {
+                    "id": session_id,
+                    "name": null,
+                    "explicit_name": null,
+                    "derived_title": null,
+                    "title_source": "empty_draft",
+                    "client_count": 0,
+                    "created_at_ms": 0,
+                    "updated_at_ms": 0,
+                    "working_directory": root,
+                    "import": null,
+                    "fork": null
+                }
+            })
+            .to_string(),
+        )
+        .expect("old manifest");
+        std::fs::write(db::session_db_path(&root, session_id), b"not a database")
+            .expect("database sentinel");
+        let store = SessionStore::new(&root);
+        let error = store
+            .load_session_manifest(session_id)
+            .expect_err("old format should be rejected from its manifest");
+        assert!(
+            error
+                .to_string()
+                .contains("manifest schema version Some(1)")
+        );
+        assert!(
+            store
+                .load_catalog()
+                .expect("bounded catalog load")
+                .is_empty(),
+            "unsupported manifests must not fall back to canonical DB discovery"
+        );
+        assert_eq!(
+            std::fs::read(db::session_db_path(&root, session_id)).expect("database sentinel"),
+            b"not a database"
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
     #[tokio::test]
     async fn persistent_sessions_write_manifest_and_scoped_catalog() {
         let root = unique_temp_dir();
@@ -6790,10 +6914,16 @@ mod tests {
             .await
             .expect("session should create");
 
-        assert!(
-            root.join(session.id.to_string())
-                .join("manifest.json")
-                .exists()
+        let manifest_path = root.join(session.id.to_string()).join("manifest.json");
+        assert!(manifest_path.exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest should read"))
+                .expect("manifest should decode");
+        assert_eq!(manifest["schema_version"], SESSION_MANIFEST_SCHEMA_VERSION);
+        assert_eq!(manifest["session_format"]["family"], SESSION_FORMAT_FAMILY);
+        assert_eq!(
+            manifest["session_format"]["epoch"],
+            CURRENT_SESSION_FORMAT_EPOCH
         );
         assert!(
             db::namespaced_catalog_db_path(&root, "test-build").exists(),
@@ -6920,6 +7050,100 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn transient_contribution_is_rejected_before_durable_append() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("persistent manager");
+        let session = manager
+            .create_session(
+                Some("transient contribution".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let result = manager
+            .append_event(
+                session.id,
+                SessionEventKind::ToolContribution {
+                    event: bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call".to_owned(),
+                        contribution_id: "transient".to_owned(),
+                        sequence: 1,
+                        producer_id: "producer".to_owned(),
+                        schema: "example.transient".to_owned(),
+                        schema_version: 1,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        payload: serde_json::json!({"must_not_persist": true}),
+                    },
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionError::LiveEventPersistenceRejected {
+                event_kind: "tool_contribution"
+            })
+        ));
+        assert!(
+            !manager
+                .session_history(session.id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ToolContribution { .. }))
+        );
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    #[tokio::test]
+    async fn unknown_durable_contribution_replays_opaquely() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("persistent manager");
+        let session = manager
+            .create_session(
+                Some("opaque contribution".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call".to_owned(),
+            contribution_id: "opaque".to_owned(),
+            sequence: 9,
+            producer_id: "future.producer".to_owned(),
+            schema: "future.unknown/schema".to_owned(),
+            schema_version: 4_294_967_000,
+            operation: bcode_session_models::ToolContributionOperation::Append,
+            persistence: bcode_session_models::ToolContributionPersistence::Durable,
+            payload: serde_json::json!({"nested": [1, {"future": true}], "number": 1.25}),
+        };
+        manager
+            .append_event(
+                session.id,
+                SessionEventKind::ToolContribution {
+                    event: contribution.clone(),
+                },
+            )
+            .await
+            .expect("durable contribution append");
+        drop(manager);
+
+        let restored = SessionManager::persistent(&root).expect("restore manager");
+        let replayed = restored
+            .session_history(session.id)
+            .await
+            .expect("replayed history")
+            .into_iter()
+            .find_map(|event| match event.kind {
+                SessionEventKind::ToolContribution { event } => Some(event),
+                _ => None,
+            })
+            .expect("durable contribution");
+        assert_eq!(replayed, contribution);
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
     }
 
     #[tokio::test]
@@ -7377,6 +7601,131 @@ mod tests {
                     interaction_id: "interaction".to_string(),
                     tool_call_id: "call".to_string(),
                     resolution_json: "{}".to_string(),
+                },
+            ),
+            (
+                40,
+                "ProviderContextCompacted",
+                SessionEventKind::ProviderContextCompacted {
+                    snapshot: bcode_session_models::ProviderContextSnapshot {
+                        provider_plugin_id: "provider".to_string(),
+                        model_id: "model".to_string(),
+                        auth_profile: None,
+                        format_version: 1,
+                        compatibility_key: "key".to_string(),
+                        messages_json: "[]".to_string(),
+                        portable_summary: "summary".to_string(),
+                        origin:
+                            bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
+                        request_id: None,
+                        request_fingerprint: None,
+                    },
+                    compacted_through_sequence: 1,
+                },
+            ),
+            (
+                41,
+                "RequestContextObserved",
+                SessionEventKind::RequestContextObserved {
+                    observation: bcode_session_models::RequestContextObservation {
+                        request: bcode_session_models::ModelRequestIdentity {
+                            provider_plugin_id: "provider".to_string(),
+                            requested_model_id: None,
+                            effective_model_id: "model".to_string(),
+                            request_id: "request".to_string(),
+                            model_turn_id: "turn".to_string(),
+                            round: 0,
+                            request_fingerprint: "fingerprint".to_string(),
+                            effective_auth_profile: None,
+                            context_format_version: None,
+                            compatibility_key: None,
+                            context_epoch: 0,
+                        },
+                        context_through_sequence: 1,
+                        context_tokens: bcode_session_models::RequestContextTokenCount::Estimated(
+                            1,
+                        ),
+                        local_estimate: bcode_session_models::LocalContextEstimate {
+                            tokens: 1,
+                            algorithm_version: 1,
+                        },
+                    },
+                },
+            ),
+            (
+                42,
+                "PluginStatusNote",
+                SessionEventKind::PluginStatusNote {
+                    plugin_id: "plugin".to_string(),
+                    note_id: "note".to_string(),
+                    text: "status".to_string(),
+                    metadata: BTreeMap::new(),
+                },
+            ),
+            (
+                43,
+                "LegacyEvent",
+                SessionEventKind::LegacyEvent {
+                    event_type: "legacy".to_string(),
+                    payload: serde_json::Value::Null,
+                },
+            ),
+            (
+                44,
+                "ToolInvocationLifecycle",
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call".to_string(),
+                        sequence: 1,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                        message: None,
+                        metadata: serde_json::Value::Null,
+                    },
+                },
+            ),
+            (
+                45,
+                "ToolContribution",
+                SessionEventKind::ToolContribution {
+                    event: bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call".to_string(),
+                        contribution_id: "surface".to_string(),
+                        sequence: 1,
+                        producer_id: "producer".to_string(),
+                        schema: "example.unknown".to_string(),
+                        schema_version: 7,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        payload: serde_json::json!({"opaque": true}),
+                    },
+                },
+            ),
+            (
+                46,
+                "ToolExchangeRequested",
+                SessionEventKind::ToolExchangeRequested {
+                    request: bcode_session_models::ToolExchangeRequest {
+                        invocation_id: "call".to_string(),
+                        exchange_id: "question".to_string(),
+                        producer_id: "producer".to_string(),
+                        schema: "example.question".to_string(),
+                        schema_version: 1,
+                        payload: serde_json::json!({"opaque": "request"}),
+                        response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                    },
+                },
+            ),
+            (
+                47,
+                "ToolExchangeResolved",
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: "call".to_string(),
+                        exchange_id: "question".to_string(),
+                        resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"opaque": "response"}),
+                        },
+                    },
                 },
             ),
         ]

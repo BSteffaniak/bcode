@@ -119,7 +119,7 @@ use std::pin::Pin;
 use std::process::Command;
 use std::sync::{
     Arc, Mutex as StdMutex,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -2175,7 +2175,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
         | Request::ReadSessionArtifact { session_id, .. }
-        | Request::PluginInvocationAction { session_id, .. }
+        | Request::InvocationInput { session_id, .. }
         | Request::SessionHistory { session_id }
         | Request::SessionHistoryPage { session_id, .. }
         | Request::AttachSession { session_id }
@@ -2222,7 +2222,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RenameSession { .. } => "rename_session",
         Request::DeleteSession { .. } => "delete_session",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
-        Request::PluginInvocationAction { .. } => "plugin_invocation_action",
+        Request::InvocationInput { .. } => "invocation_input",
         Request::SessionHistory { .. } => "session_history",
         Request::SessionHistoryPage { .. } => "session_history_page",
         Request::AttachSession { .. } => "attach_session",
@@ -2454,20 +2454,8 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::PluginInvocationAction {
-            session_id,
-            tool_call_id,
-            action,
-        } => {
-            handle_plugin_invocation_action(
-                request_id,
-                state,
-                writer,
-                session_id,
-                &tool_call_id,
-                &action,
-            )
-            .await
+        Request::InvocationInput { session_id, input } => {
+            handle_invocation_input(request_id, state, writer, session_id, input).await
         }
         Request::ForkSession {
             source_session_id,
@@ -5241,7 +5229,6 @@ const ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY: usize = 64;
 struct ActivePluginInvocation {
     producer_plugin_id: String,
     inputs: mpsc::Sender<ToolInvocationInput>,
-    next_input_id: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -5268,7 +5255,7 @@ impl ActivePluginInvocationRegistration {
             .lock()
             .map_err(|_| "active plugin invocation registry poisoned".to_owned())?;
         if entries.contains_key(&key) {
-            return Err("plugin invocation action route is already active".to_owned());
+            return Err("plugin invocation input route is already active".to_owned());
         }
         entries.insert(key.clone(), invocation);
         drop(entries);
@@ -5306,52 +5293,37 @@ impl Drop for ActivePluginInvocationRegistration {
     }
 }
 
-fn enqueue_plugin_invocation_input(
+fn enqueue_invocation_input(
     active: &ActivePluginInvocation,
-    tool_call_id: &str,
-    action: &bcode_tool::PluginInvocationAction,
+    input: ToolInvocationInput,
 ) -> Result<(), String> {
-    if action.producer_plugin_id.trim().is_empty() {
-        return Err("plugin invocation input producer id must not be empty".to_owned());
+    if input.producer_id.trim().is_empty() {
+        return Err("invocation input producer id must not be empty".to_owned());
     }
-    if action.schema.trim().is_empty() || action.schema_version == 0 {
-        return Err("plugin invocation input schema and version must be valid".to_owned());
+    if input.schema.trim().is_empty() || input.schema_version == 0 {
+        return Err("invocation input schema and version must be valid".to_owned());
     }
-    if !action.payload.is_object() {
-        return Err("plugin invocation input payload must be a JSON object".to_owned());
+    if input.input_id.trim().is_empty() {
+        return Err("invocation input id must not be empty".to_owned());
     }
-    let encoded = serde_json::to_vec(action).map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_vec(&input).map_err(|error| error.to_string())?;
     if encoded.len() > 64 * 1024 {
-        return Err("plugin invocation input exceeds 64 KiB".to_owned());
+        return Err("invocation input exceeds 64 KiB".to_owned());
     }
-    let input_id = active.next_input_id.fetch_add(1, Ordering::Relaxed);
-    active
-        .inputs
-        .try_send(ToolInvocationInput {
-            invocation_id: tool_call_id.to_owned(),
-            input_id: format!("{tool_call_id}-input-{input_id}"),
-            producer_id: action.producer_plugin_id.clone(),
-            schema: action.schema.clone(),
-            schema_version: action.schema_version,
-            payload: action.payload.clone(),
-        })
-        .map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => {
-                "plugin invocation input queue is full".to_owned()
-            }
-            mpsc::error::TrySendError::Closed(_) => {
-                "plugin invocation input route is closed".to_owned()
-            }
-        })
+    active.inputs.try_send(input).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => "plugin invocation input queue is full".to_owned(),
+        mpsc::error::TrySendError::Closed(_) => {
+            "plugin invocation input route is closed".to_owned()
+        }
+    })
 }
 
-async fn handle_plugin_invocation_action(
+async fn handle_invocation_input(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
-    tool_call_id: &str,
-    action: &bcode_tool::PluginInvocationAction,
+    input: ToolInvocationInput,
 ) -> Result<(), ServerError> {
     let result = state
         .active_plugin_invocations
@@ -5359,21 +5331,19 @@ async fn handle_plugin_invocation_action(
         .map_err(|_| "active plugin invocation registry poisoned".to_owned())
         .and_then(|invocations| {
             let active = invocations
-                .get(&(session_id, tool_call_id.to_owned()))
+                .get(&(session_id, input.invocation_id.clone()))
                 .ok_or_else(|| "plugin invocation is not active".to_owned())?;
-            if active.producer_plugin_id != action.producer_plugin_id {
-                return Err(
-                    "plugin invocation action producer does not own the invocation".to_owned(),
-                );
+            if active.producer_plugin_id != input.producer_id {
+                return Err("invocation input producer does not own the invocation".to_owned());
             }
-            enqueue_plugin_invocation_input(active, tool_call_id, action)
+            enqueue_invocation_input(active, input)
         });
     match result {
         Ok(()) => {
             send_response(
                 writer,
                 request_id,
-                Response::Ok(ResponsePayload::PluginInvocationActionAccepted),
+                Response::Ok(ResponsePayload::InvocationInputAccepted),
             )
             .await
         }
@@ -5381,7 +5351,7 @@ async fn handle_plugin_invocation_action(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("plugin_invocation_action_failed", error)),
+                Response::Err(ErrorResponse::new("invocation_input_failed", error)),
             )
             .await
         }
@@ -15244,16 +15214,17 @@ async fn execute_model_tool_batch(
         ))
         .buffer_unordered(execution_count)
         .collect::<Vec<_>>();
-        let ProviderCallWait::Completed(executed) = wait_for_provider_call(
+        let finalized = wait_for_finalizable_provider_call(
             state,
             session_id,
             command_context,
             cancel_state.as_ref(),
             Box::pin(executions),
         )
-        .await
-        else {
-            return false;
+        .await;
+        let executed = match finalized {
+            FinalizedProviderCall::Completed(executed)
+            | FinalizedProviderCall::Cancelled(executed) => executed,
         };
         results.extend(executed);
     }
@@ -15289,6 +15260,44 @@ async fn execute_model_tool(
         .await;
         return None;
     }
+    let _invocation_permit = if let Some(permits) = invocation_permits {
+        Some(tokio::select! {
+            biased;
+            () = cancel_state.cancelled() => {
+                cancel_registered_runtime_work(
+                    state,
+                    session_id,
+                    WorkId::new(format!("tool_{}", call.id)),
+                    None,
+                )
+                .await;
+                return None;
+            }
+            permit = permits.acquire_owned() => {
+                match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return None,
+                }
+            }
+        })
+    } else {
+        None
+    };
+    if cancel_state.is_cancelled() {
+        return None;
+    }
+    append_tool_invocation_lifecycle_event(
+        state,
+        session_id,
+        bcode_session_models::ToolInvocationLifecycleEvent {
+            invocation_id: call.id.clone(),
+            sequence: 0,
+            stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+            message: None,
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await;
     let tool_labels =
         tool_invocation_metric_labels(session_id, &call.name, producer_plugin_id.as_deref());
     let tool_span = state
@@ -15304,7 +15313,7 @@ async fn execute_model_tool(
         &plugin_id,
         &policy_metadata,
         cancel_state.as_ref(),
-        invocation_permits,
+        None,
     )
     .await
     .unwrap_or_else(|error| ToolInvocationResponse {
@@ -15316,9 +15325,22 @@ async fn execute_model_tool(
         result: None,
     });
     if cancel_state.is_cancelled() {
+        append_tool_invocation_terminal_event(
+            state,
+            session_id,
+            &call.id,
+            bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+        )
+        .await;
         tool_span.finish_err();
         return None;
     }
+    let lifecycle_stage = if result.is_error {
+        bcode_session_models::ToolInvocationLifecycleStage::Failed
+    } else {
+        bcode_session_models::ToolInvocationLifecycleStage::Completed
+    };
+    append_tool_invocation_terminal_event(state, session_id, &call.id, lifecycle_stage).await;
     let semantic_result = result.result.clone().map(service_tool_result_to_session);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_bytes = artifact_output.len();
@@ -15816,19 +15838,44 @@ impl InvocationExchangeBroker for ServerExchangeBroker<'_> {
             if self.cancel_state.is_cancelled() {
                 return ToolExchangeResolution::Cancelled;
             }
-            resolve_server_exchange(
+            if request.invocation_id != self.call.id {
+                return ToolExchangeResolution::Failed {
+                    code: "invocation_id_mismatch".to_owned(),
+                    message: "exchange does not belong to the active invocation".to_owned(),
+                };
+            }
+            if request.exchange_id.trim().is_empty() {
+                return ToolExchangeResolution::Failed {
+                    code: "invalid_exchange_id".to_owned(),
+                    message: "exchange ID must not be empty".to_owned(),
+                };
+            }
+            append_tool_exchange_requested_event(self.state, self.session_id, request.clone())
+                .await;
+            let resolution = resolve_server_exchange(
                 self.state,
                 self.session_id,
                 self.call,
                 self.plugin_id,
-                request,
+                request.clone(),
                 self.cancel_state,
             )
             .await
             .unwrap_or_else(|message| ToolExchangeResolution::Failed {
                 code: "server_exchange_failed".to_string(),
                 message,
-            })
+            });
+            append_tool_exchange_resolved_event(
+                self.state,
+                self.session_id,
+                bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: request.invocation_id,
+                    exchange_id: request.exchange_id,
+                    resolution: resolution.clone(),
+                },
+            )
+            .await;
+            resolution
         })
     }
 }
@@ -16027,7 +16074,6 @@ async fn invoke_model_tool(
         ActivePluginInvocation {
             producer_plugin_id: plugin_id.to_string(),
             inputs: input_sender,
-            next_input_id: Arc::new(AtomicU64::new(1)),
         },
     )?;
     let request = ToolInvocationRequest {
@@ -16109,11 +16155,36 @@ async fn invoke_model_tool(
             event = invocation.next_event() => {
                 match event.map_err(|error| error.to_string())? {
                     StreamingServiceInvocationEvent::Event(payload) => {
-                        if !cancel_state.is_cancelled()
-                            && let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
-                        {
-                            let event = normalize_tool_stream_event_sequence(event, &mut stream_sequences);
-                            tool_output_publisher.push_stream_event(state, session_id, event).await;
+                        if !cancel_state.is_cancelled() {
+                            if let Ok(lifecycle) = serde_json::from_slice::<
+                                bcode_session_models::ToolInvocationLifecycleEvent,
+                            >(&payload)
+                            {
+                                append_plugin_tool_lifecycle_event(
+                                    state,
+                                    session_id,
+                                    &call.id,
+                                    lifecycle,
+                                )
+                                .await;
+                            } else if let Ok(contribution) = serde_json::from_slice::<
+                                bcode_session_models::ToolContributionEvent,
+                            >(&payload)
+                            {
+                                append_tool_contribution_event(state, session_id, contribution)
+                                    .await;
+                            } else if let Ok(event) = serde_json::from_slice::<
+                                ServiceToolInvocationStreamEvent,
+                            >(&payload)
+                            {
+                                let event = normalize_tool_stream_event_sequence(
+                                    event,
+                                    &mut stream_sequences,
+                                );
+                                tool_output_publisher
+                                    .push_stream_event(state, session_id, event)
+                                    .await;
+                            }
                         }
                     }
                     StreamingServiceInvocationEvent::Response(response) => {
@@ -16128,7 +16199,17 @@ async fn invoke_model_tool(
     while !cancel_state.is_cancelled()
         && let Some(payload) = invocation.try_recv_event()
     {
-        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
+        if let Ok(lifecycle) =
+            serde_json::from_slice::<bcode_session_models::ToolInvocationLifecycleEvent>(&payload)
+        {
+            append_plugin_tool_lifecycle_event(state, session_id, &call.id, lifecycle).await;
+        } else if let Ok(contribution) =
+            serde_json::from_slice::<bcode_session_models::ToolContributionEvent>(&payload)
+        {
+            append_tool_contribution_event(state, session_id, contribution).await;
+        } else if let Ok(event) =
+            serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
+        {
             let event = normalize_tool_stream_event_sequence(event, &mut stream_sequences);
             tool_output_publisher
                 .push_stream_event(state, session_id, event)
@@ -16152,6 +16233,74 @@ async fn invoke_model_tool(
         .await;
     }
     Ok(response)
+}
+
+async fn append_tool_exchange_requested_event(
+    state: &ServerState,
+    session_id: SessionId,
+    request: bcode_session_models::ToolExchangeRequest,
+) {
+    match state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::ToolExchangeRequested { request },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => tracing::warn!(%error, "failed to append tool exchange request"),
+    }
+}
+
+async fn append_tool_exchange_resolved_event(
+    state: &ServerState,
+    session_id: SessionId,
+    event: bcode_session_models::ToolExchangeResolutionEvent,
+) {
+    match state
+        .sessions
+        .append_event(session_id, SessionEventKind::ToolExchangeResolved { event })
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => tracing::warn!(%error, "failed to append tool exchange resolution"),
+    }
+}
+
+async fn append_plugin_tool_lifecycle_event(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+    event: bcode_session_models::ToolInvocationLifecycleEvent,
+) {
+    if event.invocation_id == invocation_id
+        && matches!(
+            event.stage,
+            bcode_session_models::ToolInvocationLifecycleStage::Progress
+                | bcode_session_models::ToolInvocationLifecycleStage::Waiting
+        )
+    {
+        append_tool_invocation_lifecycle_event(state, session_id, event).await;
+    }
+}
+
+async fn append_tool_contribution_event(
+    state: &ServerState,
+    session_id: SessionId,
+    event: bcode_session_models::ToolContributionEvent,
+) {
+    if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
+        return;
+    }
+    match state
+        .sessions
+        .append_event(session_id, SessionEventKind::ToolContribution { event })
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => tracing::warn!(%error, "failed to append tool contribution event"),
+    }
 }
 
 async fn resolve_interactive_tool_request(
@@ -16475,6 +16624,10 @@ async fn append_tool_stream_event(
     }
     if let ToolInvocationStreamEvent::Finished { tool_call_id, .. } = &event {
         remove_active_plugin_visual(state, session_id, tool_call_id);
+        return;
+    }
+    if matches!(event, ToolInvocationStreamEvent::Started { .. }) {
+        return;
     }
     if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
         if let Err(error) = update_active_artifact(state, session_id, &event) {
@@ -17774,6 +17927,44 @@ async fn tool_request_visual_descriptor(
     live_tool_argument_preview_from_fields(&metadata, &fields).map(|preview| preview.visual)
 }
 
+async fn append_tool_invocation_lifecycle_event(
+    state: &ServerState,
+    session_id: SessionId,
+    event: bcode_session_models::ToolInvocationLifecycleEvent,
+) {
+    match state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::ToolInvocationLifecycle { event },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => tracing::warn!("failed to append tool invocation lifecycle: {error}"),
+    }
+}
+
+async fn append_tool_invocation_terminal_event(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+    terminal_stage: bcode_session_models::ToolInvocationLifecycleStage,
+) {
+    append_tool_invocation_lifecycle_event(
+        state,
+        session_id,
+        bcode_session_models::ToolInvocationLifecycleEvent {
+            invocation_id: invocation_id.to_owned(),
+            sequence: u64::MAX,
+            stage: terminal_stage,
+            message: None,
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await;
+}
+
 async fn append_tool_request_event(
     state: &ServerState,
     session_id: SessionId,
@@ -18818,6 +19009,10 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
         SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
         SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
+        SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
+        SessionEventKind::ToolContribution { .. } => "tool_contribution",
+        SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
+        SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
@@ -19852,7 +20047,7 @@ library = "test"
                 invocation_id: "call-1".to_string(),
                 input_id: "input-1".to_string(),
                 producer_id: "bcode.shell".to_string(),
-                schema: "bcode.shell.invocation-action".to_string(),
+                schema: "bcode.shell.invocation-input".to_string(),
                 schema_version: 1,
                 payload: serde_json::json!({"type": "resize", "columns": 100, "rows": 30}),
             })
@@ -19882,7 +20077,7 @@ library = "test"
                 invocation_id: "call-1".to_string(),
                 input_id: "late".to_string(),
                 producer_id: "bcode.shell".to_string(),
-                schema: "bcode.shell.invocation-action".to_string(),
+                schema: "bcode.shell.invocation-input".to_string(),
                 schema_version: 1,
                 payload: serde_json::Value::Null,
             }),
@@ -20174,35 +20369,36 @@ library = "test"
         );
     }
     #[test]
-    fn generic_plugin_invocation_actions_enqueue_opaque_bounded_inputs() {
+    fn generic_invocation_inputs_enqueue_opaque_bounded_payloads() {
         let (sender, mut receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
         let active = ActivePluginInvocation {
             producer_plugin_id: "example.plugin".to_owned(),
             inputs: sender,
-            next_input_id: Arc::new(AtomicU64::new(1)),
         };
-        let action = bcode_tool::PluginInvocationAction {
-            producer_plugin_id: "example.plugin".to_owned(),
-            schema: "example.invocation-action".to_owned(),
+        let input = ToolInvocationInput {
+            invocation_id: "call-1".to_owned(),
+            input_id: "input-1".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.invocation-input".to_owned(),
             schema_version: 1,
             payload: serde_json::json!({
                 "plugin_owned_type": "opaque-example",
                 "nested": {"value": 42},
             }),
         };
-        enqueue_plugin_invocation_input(&active, "call-1", &action).expect("enqueue input");
-        let input = receiver.try_recv().expect("queued input");
-        assert_eq!(input.invocation_id, "call-1");
-        assert_eq!(input.input_id, "call-1-input-1");
-        assert_eq!(input.schema, action.schema);
-        assert_eq!(input.payload, action.payload);
+        enqueue_invocation_input(&active, input.clone()).expect("enqueue input");
+        let queued = receiver.try_recv().expect("queued input");
+        assert_eq!(queued, input);
 
-        let mut invalid = action.clone();
-        invalid.payload = serde_json::json!("not-object");
-        assert!(enqueue_plugin_invocation_input(&active, "call-1", &invalid).is_err());
-        let mut oversized = action;
+        let mut opaque_scalar = input.clone();
+        opaque_scalar.input_id = "input-scalar".to_owned();
+        opaque_scalar.payload = serde_json::json!("not-an-object");
+        enqueue_invocation_input(&active, opaque_scalar.clone())
+            .expect("opaque scalar payload should remain uninterpreted");
+        assert_eq!(receiver.try_recv().expect("queued scalar"), opaque_scalar);
+        let mut oversized = input;
         oversized.payload = serde_json::json!({"payload": "x".repeat(65 * 1024)});
-        assert!(enqueue_plugin_invocation_input(&active, "call-1", &oversized).is_err());
+        assert!(enqueue_invocation_input(&active, oversized).is_err());
     }
 
     #[tokio::test]
@@ -20211,19 +20407,22 @@ library = "test"
         let active = ActivePluginInvocation {
             producer_plugin_id: "example.plugin".to_string(),
             inputs: sender,
-            next_input_id: Arc::new(AtomicU64::new(1)),
         };
-        let action = bcode_tool::PluginInvocationAction {
-            producer_plugin_id: "example.plugin".to_string(),
+        let input = ToolInvocationInput {
+            invocation_id: "call-1".to_owned(),
+            input_id: "input-1".to_owned(),
+            producer_id: "example.plugin".to_string(),
             schema: "example.input".to_string(),
             schema_version: 1,
             payload: serde_json::json!({}),
         };
-        for _ in 0..ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY {
-            enqueue_plugin_invocation_input(&active, "call", &action).expect("queue input");
+        for index in 0..ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY {
+            let mut queued = input.clone();
+            queued.input_id = format!("input-{index}");
+            enqueue_invocation_input(&active, queued).expect("queue input");
         }
         assert_eq!(
-            enqueue_plugin_invocation_input(&active, "call", &action),
+            enqueue_invocation_input(&active, input),
             Err("plugin invocation input queue is full".to_string())
         );
     }
@@ -20241,7 +20440,6 @@ library = "test"
             ActivePluginInvocation {
                 producer_plugin_id: "example.plugin".to_owned(),
                 inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
-                next_input_id: Arc::new(AtomicU64::new(1)),
             },
         )
         .expect("register invocation");
@@ -20261,7 +20459,6 @@ library = "test"
                 ActivePluginInvocation {
                     producer_plugin_id: "other.plugin".to_owned(),
                     inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
-                    next_input_id: Arc::new(AtomicU64::new(1)),
                 },
             )
             .is_err()
@@ -20297,7 +20494,6 @@ library = "test"
             ActivePluginInvocation {
                 producer_plugin_id: "fixture.plugin".to_owned(),
                 inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
-                next_input_id: Arc::new(AtomicU64::new(1)),
             },
         )
         .expect("register invocation");
@@ -20463,7 +20659,6 @@ library = "test"
             ActivePluginInvocation {
                 producer_plugin_id: "fixture.plugin".to_owned(),
                 inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
-                next_input_id: Arc::new(AtomicU64::new(1)),
             },
         )
         .expect("registration");
@@ -20588,7 +20783,6 @@ library = "test"
             ActivePluginInvocation {
                 producer_plugin_id: "fixture.plugin".to_owned(),
                 inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
-                next_input_id: Arc::new(AtomicU64::new(1)),
             },
         )
         .expect("registration");
@@ -24661,6 +24855,60 @@ library = "test"
             ),
             session_event(
                 7,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call-1".to_owned(),
+                        sequence: 1,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+                        message: Some("LIFECYCLE_PRIVATE".to_owned()),
+                        metadata: serde_json::json!({"private": "LIFECYCLE_METADATA_PRIVATE"}),
+                    },
+                },
+            ),
+            session_event(
+                8,
+                SessionEventKind::ToolContribution {
+                    event: bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        contribution_id: "private".to_owned(),
+                        sequence: 1,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.unknown".to_owned(),
+                        schema_version: 99,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        payload: serde_json::json!({"private": "CONTRIBUTION_PRIVATE"}),
+                    },
+                },
+            ),
+            session_event(
+                9,
+                SessionEventKind::ToolExchangeRequested {
+                    request: bcode_session_models::ToolExchangeRequest {
+                        invocation_id: "call-1".to_owned(),
+                        exchange_id: "private-exchange".to_owned(),
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.private-exchange".to_owned(),
+                        schema_version: 1,
+                        payload: serde_json::json!({"private": "GENERIC_EXCHANGE_REQUEST_PRIVATE"}),
+                        response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                    },
+                },
+            ),
+            session_event(
+                10,
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        exchange_id: "private-exchange".to_owned(),
+                        resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"private": "GENERIC_EXCHANGE_RESPONSE_PRIVATE"}),
+                        },
+                    },
+                },
+            ),
+            session_event(
+                11,
                 SessionEventKind::ToolCallFinished {
                     tool_call_id: "call-1".to_owned(),
                     result: "safe-result".to_owned(),
@@ -24686,6 +24934,11 @@ library = "test"
             "PRIVATE_POLICY_REASON",
             "PLUGIN_STATUS_PRIVATE",
             "PLUGIN_METADATA_PRIVATE",
+            "LIFECYCLE_PRIVATE",
+            "LIFECYCLE_METADATA_PRIVATE",
+            "CONTRIBUTION_PRIVATE",
+            "GENERIC_EXCHANGE_REQUEST_PRIVATE",
+            "GENERIC_EXCHANGE_RESPONSE_PRIVATE",
         ] {
             assert!(!encoded.contains(marker), "model context leaked {marker}");
         }
@@ -24932,6 +25185,25 @@ library = "test"
             ToolInvocationServiceResolution::Failed { code, .. }
                 if code == "invocation_id_mismatch"
         ));
+    }
+
+    fn test_server_state_with_filesystem_plugin(sessions: SessionManager) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+            bcode_filesystem_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.filesystem".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load filesystem plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state
     }
 
     fn test_server_state_with_shell_plugin(sessions: SessionManager) -> ServerState {
@@ -25298,6 +25570,290 @@ library = "test"
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn server_persists_filesystem_progress_as_neutral_lifecycle_only() {
+        let workspace = tempfile::tempdir().expect("filesystem progress workspace");
+        std::fs::write(workspace.path().join("sentinel.txt"), "sentinel")
+            .expect("filesystem fixture");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent filesystem progress sessions");
+        let session_id = sessions
+            .create_session(
+                Some("filesystem progress".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("filesystem progress session")
+            .id;
+        let mut state = test_server_state_with_filesystem_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let result = execute_model_tool(
+            &state,
+            session_id,
+            bcode_model::ToolCall {
+                id: "filesystem-progress".to_owned(),
+                name: "filesystem.list".to_owned(),
+                arguments: serde_json::json!({"path": workspace.path(), "max_entries": 10}),
+            },
+            workspace.path().to_path_buf(),
+            "bcode.filesystem".to_owned(),
+            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Read {
+                paths: vec![workspace.path().display().to_string()],
+            }),
+            Arc::new(TurnCancelState::default()),
+            None,
+        )
+        .await
+        .expect("filesystem list result");
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("filesystem progress history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationLifecycle { event }
+                if event.invocation_id == "filesystem-progress"
+                    && event.stage
+                        == bcode_session_models::ToolInvocationLifecycleStage::Progress
+                    && event.message.as_deref() == Some("list: scanning entries")
+        )));
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Status { .. }
+            }
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_persists_shell_owned_contribution_opaquely() {
+        let workspace = tempfile::tempdir().expect("shell contribution workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent shell contribution sessions");
+        let session_id = sessions
+            .create_session(
+                Some("shell contribution".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("shell contribution session")
+            .id;
+        let mut state = test_server_state_with_shell_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let result = execute_model_tool(
+            &state,
+            session_id,
+            bcode_model::ToolCall {
+                id: "shell-contribution".to_owned(),
+                name: "shell.run".to_owned(),
+                arguments: serde_json::json!({"command": "printf server-contribution"}),
+            },
+            workspace.path().to_path_buf(),
+            "bcode.shell".to_owned(),
+            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
+                command: Some("printf server-contribution".to_owned()),
+            }),
+            Arc::new(TurnCancelState::default()),
+            None,
+        )
+        .await
+        .expect("shell contribution result");
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("shell contribution history");
+        let contribution = history
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolContribution { event } => Some(event),
+                _ => None,
+            })
+            .expect("durable shell contribution");
+        assert_eq!(contribution.invocation_id, "shell-contribution");
+        assert_eq!(contribution.producer_id, "bcode.shell");
+        assert_eq!(contribution.schema, "bcode.shell.run.summary");
+        assert!(
+            contribution
+                .payload
+                .to_string()
+                .contains("server-contribution")
+        );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationLifecycle { event }
+                if event.invocation_id == "shell-contribution"
+                    && event.stage
+                        == bcode_session_models::ToolInvocationLifecycleStage::Progress
+                    && event
+                        .message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("starting command"))
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_tool_error_persists_failed_generic_lifecycle() {
+        let workspace = tempfile::tempdir().expect("failed shell workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent failed shell sessions");
+        let session_id = sessions
+            .create_session(
+                Some("failed shell lifecycle".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("failed shell session")
+            .id;
+        let mut state = test_server_state_with_shell_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let result = execute_model_tool(
+            &state,
+            session_id,
+            bcode_model::ToolCall {
+                id: "failed-shell".to_owned(),
+                name: "shell.run".to_owned(),
+                arguments: serde_json::json!({"command": "false"}),
+            },
+            workspace.path().to_path_buf(),
+            "bcode.shell".to_owned(),
+            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
+                command: Some("false".to_owned()),
+            }),
+            Arc::new(TurnCancelState::default()),
+            None,
+        )
+        .await
+        .expect("failed shell should produce a tool result");
+        assert!(result.is_error);
+
+        let stages = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("failed lifecycle history")
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                SessionEventKind::ToolInvocationLifecycle { event }
+                    if event.invocation_id == "failed-shell" =>
+                {
+                    Some(event.stage)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                bcode_session_models::ToolInvocationLifecycleStage::Started,
+                bcode_session_models::ToolInvocationLifecycleStage::Progress,
+                bcode_session_models::ToolInvocationLifecycleStage::Failed,
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_tool_cancellation_persists_exact_generic_lifecycle() {
+        let workspace = tempfile::tempdir().expect("cancelled shell workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent cancelled shell sessions");
+        let session_id = sessions
+            .create_session(
+                Some("cancelled shell lifecycle".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("cancelled shell session")
+            .id;
+        let mut state = test_server_state_with_shell_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let call = bcode_model::ToolCall {
+            id: "cancelled-shell".to_owned(),
+            name: "shell.run".to_owned(),
+            arguments: serde_json::json!({"command": "sleep 30"}),
+        };
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let policy = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
+            command: Some("sleep 30".to_owned()),
+        });
+        let invocation = execute_model_tool(
+            &state,
+            session_id,
+            call,
+            workspace.path().to_path_buf(),
+            "bcode.shell".to_owned(),
+            policy,
+            Arc::clone(&cancel_state),
+            None,
+        );
+        let cancellation =
+            async {
+                loop {
+                    let history = state
+                        .sessions
+                        .session_history(session_id)
+                        .await
+                        .expect("lifecycle history");
+                    if history.iter().any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::ToolInvocationLifecycle { event }
+                        if event.invocation_id == "cancelled-shell"
+                            && event.stage
+                                == bcode_session_models::ToolInvocationLifecycleStage::Started
+                )) {
+                    let snapshot = bcode_session_view::build_session_view_snapshot(&history);
+                    assert!(snapshot.active_invocations.contains_key("cancelled-shell"));
+                    break;
+                }
+                    tokio::task::yield_now().await;
+                }
+                cancel_state.close();
+            };
+        let (response, ()) = tokio::join!(invocation, cancellation);
+        assert!(
+            response.is_none(),
+            "cancelled shell must not publish a tool result"
+        );
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("terminal lifecycle history");
+        let stages = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationLifecycle { event }
+                    if event.invocation_id == "cancelled-shell" =>
+                {
+                    Some(event.stage)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                bcode_session_models::ToolInvocationLifecycleStage::Started,
+                bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+            ]
+        );
+        assert!(
+            bcode_session_view::build_session_view_snapshot(&history)
+                .active_invocations
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn server_same_batch_shell_calls_overlap_after_complete_authorization() {
@@ -25459,6 +26015,33 @@ library = "test"
                 .collect::<Vec<_>>(),
         )
         .await;
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("parallel shell history");
+        for index in 0..5 {
+            let invocation_id = format!("parallel-shell-{index}");
+            let stages = history
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    SessionEventKind::ToolInvocationLifecycle { event }
+                        if event.invocation_id == invocation_id =>
+                    {
+                        Some(event.stage)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                stages,
+                vec![
+                    bcode_session_models::ToolInvocationLifecycleStage::Started,
+                    bcode_session_models::ToolInvocationLifecycleStage::Progress,
+                    bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                ]
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -25907,6 +26490,7 @@ library = "test"
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn projection_history_pages_cross_real_ipc_bidirectionally() {
         let workspace = tempfile::tempdir().expect("projection IPC workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
@@ -25928,6 +26512,22 @@ library = "test"
                 .await
                 .expect("append projection message");
         }
+        let lifecycle = bcode_session_models::ToolInvocationLifecycleEvent {
+            invocation_id: "ipc-lifecycle".to_owned(),
+            sequence: 7,
+            stage: bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+            message: Some("opaque IPC lifecycle".to_owned()),
+            metadata: serde_json::json!({"opaque": [1, 2, 3]}),
+        };
+        sessions
+            .append_event(
+                session.id,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: lifecycle.clone(),
+                },
+            )
+            .await
+            .expect("append lifecycle event");
 
         let state = Arc::new(test_server_state(sessions));
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
@@ -25958,6 +26558,10 @@ library = "test"
             )
             .await
             .expect("latest page");
+        assert!(latest.history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationLifecycle { event } if event == &lifecycle
+        )));
         let latest_window = latest.projection_window.expect("latest metadata");
         let latest_range = latest_window.source_range.expect("latest range");
         assert!(latest_window.has_older);
@@ -26503,12 +27107,13 @@ library = "test"
                     .get(&(session_id, call.id.clone()))
                     .cloned();
                 if let Some(active) = routed {
-                    enqueue_plugin_invocation_input(
+                    enqueue_invocation_input(
                         &active,
-                        &call.id,
-                        &bcode_tool::PluginInvocationAction {
-                            producer_plugin_id: "bcode.shell".to_string(),
-                            schema: "bcode.shell.invocation-action".to_string(),
+                        ToolInvocationInput {
+                            invocation_id: call.id.clone(),
+                            input_id: "resize-100x30".to_owned(),
+                            producer_id: "bcode.shell".to_string(),
+                            schema: "bcode.shell.invocation-input".to_string(),
                             schema_version: 1,
                             payload: serde_json::json!({
                                 "type": "resize",
@@ -26801,6 +27406,23 @@ library = "test"
             .expect("question history");
         assert!(history.iter().any(|event| matches!(
             &event.kind,
+            SessionEventKind::ToolExchangeRequested { request }
+                if request.invocation_id == "question-call"
+                    && request.exchange_id == "question-call-question"
+                    && request.schema == "bcode.question.request"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolExchangeResolved { event }
+                if event.invocation_id == "question-call"
+                    && event.exchange_id == "question-call-question"
+                    && matches!(
+                        event.resolution,
+                        bcode_session_models::ToolExchangeResolution::Responded { .. }
+                    )
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
             SessionEventKind::InteractiveToolRequestResolved {
                 interaction_id,
                 ..
@@ -27066,7 +27688,7 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn tool_stream_lifecycle_events_remain_durable() {
+    async fn legacy_tool_stream_lifecycle_events_are_not_newly_persisted() {
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(Some("test".to_owned()), test_working_directory())
@@ -27098,11 +27720,11 @@ library = "test"
             .session_history(session_id)
             .await
             .expect("history should read");
-        assert!(history.iter().any(|event| matches!(
+        assert!(!history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ToolInvocationStream { event } if event == &started
         )));
-        assert!(history.iter().any(|event| matches!(
+        assert!(!history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ToolInvocationStream { event } if event == &finished
         )));

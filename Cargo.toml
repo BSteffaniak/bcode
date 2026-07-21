@@ -70,6 +70,7 @@ members = [
     "packages/tesseract-ocr",
     "packages/tesseract-sys",
     "packages/tool",
+    "packages/tool/models",
     "packages/tool-runtime",
     "packages/tui",
     "packages/tui-components",
@@ -158,6 +159,7 @@ bcode_syntax_render                     = { version = "0.0.1-alpha.0", default-f
 bcode_tesseract_ocr                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tesseract-ocr" }
 bcode_tesseract_sys                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tesseract-sys" }
 bcode_tool                              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
+bcode_tool_models                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool/models" }
 bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 bcode_tui_components                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }

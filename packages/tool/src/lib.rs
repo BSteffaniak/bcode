@@ -7,14 +7,17 @@
 pub mod contracts;
 pub mod interaction;
 
+pub use bcode_tool_models::{
+    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
+    ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResolutionEvent,
+    ToolExchangeResponsePolicy, ToolInvocationInput, ToolInvocationInputResolution,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+};
 pub use contracts::{
     PreparedToolInvocation, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
-    ToolAuthorizationFact, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolExchangeRequest, ToolExchangeResolution,
-    ToolExchangeResponsePolicy, ToolExecutionOptions, ToolHostContextEntry,
-    ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationServiceRequest,
-    ToolInvocationServiceResolution, ToolPreparationRequest, ToolPreparationResponse,
+    ToolAuthorizationFact, ToolExecutionOptions, ToolHostContextEntry, ToolInvocationDescriptor,
+    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolPreparationRequest,
+    ToolPreparationResponse,
 };
 
 pub use interaction::{
@@ -380,19 +383,6 @@ pub enum ToolSideEffect {
     ReadOnly,
     WriteFiles,
     ExecuteProcess,
-}
-
-/// Versioned opaque action routed to an active plugin-owned invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginInvocationAction {
-    /// Plugin that owns interpretation of this action.
-    pub producer_plugin_id: String,
-    /// Plugin-owned action payload schema.
-    pub schema: String,
-    /// Version of the plugin-owned payload schema.
-    pub schema_version: u32,
-    /// Opaque plugin-owned payload.
-    pub payload: serde_json::Value,
 }
 
 /// Tool invocation request.

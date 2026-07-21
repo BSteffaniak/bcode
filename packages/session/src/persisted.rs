@@ -484,6 +484,18 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         message: Option<String>,
     },
+    ToolInvocationLifecycle {
+        event: bcode_session_models::ToolInvocationLifecycleEvent,
+    },
+    ToolContribution {
+        event: bcode_session_models::ToolContributionEvent,
+    },
+    ToolExchangeRequested {
+        request: bcode_session_models::ToolExchangeRequest,
+    },
+    ToolExchangeResolved {
+        event: bcode_session_models::ToolExchangeResolutionEvent,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -848,6 +860,18 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 requested_at_ms: *requested_at_ms,
                 client_id: *client_id,
             },
+            SessionEventKind::ToolInvocationLifecycle { event } => Self::ToolInvocationLifecycle {
+                event: event.clone(),
+            },
+            SessionEventKind::ToolContribution { event } => Self::ToolContribution {
+                event: event.clone(),
+            },
+            SessionEventKind::ToolExchangeRequested { request } => Self::ToolExchangeRequested {
+                request: request.clone(),
+            },
+            SessionEventKind::ToolExchangeResolved { event } => Self::ToolExchangeResolved {
+                event: event.clone(),
+            },
             SessionEventKind::ToolInvocationStream { event } => Self::ToolInvocationStream {
                 event: event.clone(),
             },
@@ -1209,6 +1233,16 @@ impl PersistedSessionEventKind {
                 requested_at_ms,
                 client_id,
             },
+            Self::ToolInvocationLifecycle { event } => {
+                SessionEventKind::ToolInvocationLifecycle { event }
+            }
+            Self::ToolContribution { event } => SessionEventKind::ToolContribution { event },
+            Self::ToolExchangeRequested { request } => {
+                SessionEventKind::ToolExchangeRequested { request }
+            }
+            Self::ToolExchangeResolved { event } => {
+                SessionEventKind::ToolExchangeResolved { event }
+            }
             Self::ToolInvocationStream { event } => {
                 SessionEventKind::ToolInvocationStream { event }
             }
@@ -1735,6 +1769,48 @@ mod tests {
                 turn_id: "turn".to_string(),
                 requested_at_ms: Some(11),
                 client_id: None,
+            },
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call".to_string(),
+                    sequence: 1,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                    message: Some("started".to_string()),
+                    metadata: serde_json::json!({"opaque": true}),
+                },
+            },
+            SessionEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call".to_string(),
+                    contribution_id: "surface".to_string(),
+                    sequence: 1,
+                    producer_id: "producer".to_string(),
+                    schema: "example.unknown".to_string(),
+                    schema_version: 7,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    payload: serde_json::json!({"opaque": [1, 2, 3]}),
+                },
+            },
+            SessionEventKind::ToolExchangeRequested {
+                request: bcode_session_models::ToolExchangeRequest {
+                    invocation_id: "call".to_string(),
+                    exchange_id: "question".to_string(),
+                    producer_id: "producer".to_string(),
+                    schema: "example.question".to_string(),
+                    schema_version: 4,
+                    payload: serde_json::json!({"opaque": "request"}),
+                    response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                },
+            },
+            SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: "call".to_string(),
+                    exchange_id: "question".to_string(),
+                    resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                        payload: serde_json::json!({"opaque": "response"}),
+                    },
+                },
             },
             SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::Finished {

@@ -608,6 +608,22 @@ fn non_streaming_item(event: &SessionEvent) -> Option<(TranscriptProjectionItemK
         SessionEventKind::PermissionResolved { .. } => {
             Some((TranscriptProjectionItemKind::Permission, 0))
         }
+        SessionEventKind::ToolInvocationLifecycle { event } => Some((
+            TranscriptProjectionItemKind::Other,
+            event.message.as_ref().map_or(0, String::len),
+        )),
+        SessionEventKind::ToolContribution { event } => Some((
+            TranscriptProjectionItemKind::Other,
+            serde_json::to_vec(event).map_or(0, |encoded| encoded.len()),
+        )),
+        SessionEventKind::ToolExchangeRequested { request } => Some((
+            TranscriptProjectionItemKind::Other,
+            serde_json::to_vec(request).map_or(0, |encoded| encoded.len()),
+        )),
+        SessionEventKind::ToolExchangeResolved { event } => Some((
+            TranscriptProjectionItemKind::Other,
+            serde_json::to_vec(event).map_or(0, |encoded| encoded.len()),
+        )),
         SessionEventKind::ContextCompacted { summary, .. } => Some((
             TranscriptProjectionItemKind::ContextCompaction,
             summary.len(),

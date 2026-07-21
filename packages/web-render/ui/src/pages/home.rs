@@ -141,6 +141,9 @@ pub fn home(
                         }
                     }
 
+                    @if !snapshot.active_invocations.is_empty() {
+                        (active_invocations_section(&snapshot.active_invocations))
+                    }
                     @if !snapshot.runtime_work.is_empty() {
                         (runtime_work_section(&snapshot.runtime_work))
                     }
@@ -259,6 +262,26 @@ fn runtime_state_section(snapshot: &SessionViewSnapshot) -> Containers {
                 div { span color="#8b949e" { "agent " } span color="#c9d1d9" { (agent) } }
                 div { span color="#8b949e" { "turn " } span color="#c9d1d9" { (turn) } }
                 div { span color="#8b949e" { "context " } span color="#c9d1d9" { (context) } }
+            }
+        }
+    }
+}
+
+fn active_invocations_section(
+    active: &BTreeMap<String, bcode_session_models::ToolInvocationLifecycleEvent>,
+) -> Containers {
+    container! {
+        section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
+            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "active invocations" }
+            @for (invocation_id, lifecycle) in active {
+                div background="#0d1117" border="1, #30363d" border-radius=6 padding=10 margin-bottom=8 {
+                    div color="#f0f6fc" {
+                        (lifecycle.message.as_deref().unwrap_or(invocation_id))
+                    }
+                    div color="#8b949e" font-size=11 margin-top=3 {
+                        (invocation_id) " · " (format!("{:?}", lifecycle.stage))
+                    }
+                }
             }
         }
     }
@@ -646,6 +669,10 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
         TranscriptViewItemKind::PluginVisual { visual } => {
             render_plugin_visual("plugin visual", visual)
         }
+        TranscriptViewItemKind::ToolContribution { contribution } => {
+            let fallback = serde_json::to_value(contribution).unwrap_or(serde_json::Value::Null);
+            json_panel("tool contribution", &fallback)
+        }
     }
 }
 
@@ -743,6 +770,7 @@ const fn item_label(kind: &TranscriptViewItemKind) -> &'static str {
         TranscriptViewItemKind::Interaction { .. } => "interaction",
         TranscriptViewItemKind::SystemMessage { .. } => "system",
         TranscriptViewItemKind::PluginVisual { .. } => "plugin visual",
+        TranscriptViewItemKind::ToolContribution { .. } => "tool contribution",
     }
 }
 
@@ -994,6 +1022,47 @@ mod tests {
         let rendered = format!("{:?}", transcript_item_body(&kind));
         assert!(rendered.contains("fixture.visual"));
         assert!(rendered.contains("visual-payload"));
+    }
+
+    #[test]
+    fn unknown_contribution_keeps_complete_opaque_envelope_in_render_tree() {
+        let kind = TranscriptViewItemKind::ToolContribution {
+            contribution: bcode_session_models::ToolContributionEvent {
+                invocation_id: "call".to_owned(),
+                contribution_id: "surface".to_owned(),
+                sequence: 9,
+                producer_id: "future.producer".to_owned(),
+                schema: "future.unknown/schema".to_owned(),
+                schema_version: 77,
+                operation: bcode_session_models::ToolContributionOperation::Append,
+                persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                payload: serde_json::json!({"sentinel": "opaque-web"}),
+            },
+        };
+        let rendered = format!("{:?}", transcript_item_body(&kind));
+        assert!(rendered.contains("future.unknown/schema"));
+        assert!(rendered.contains("opaque-web"));
+        assert!(rendered.contains("append"));
+    }
+
+    #[test]
+    fn shell_contribution_keeps_shared_payload_in_web_render_tree() {
+        let kind = TranscriptViewItemKind::ToolContribution {
+            contribution: bcode_session_models::ToolContributionEvent {
+                invocation_id: "shell-call".to_owned(),
+                contribution_id: "shell-run-summary".to_owned(),
+                sequence: 1,
+                producer_id: "bcode.shell".to_owned(),
+                schema: "bcode.shell.run.summary".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                payload: serde_json::json!({"output": "shell-render-sentinel"}),
+            },
+        };
+        let rendered = format!("{:?}", transcript_item_body(&kind));
+        assert!(rendered.contains("bcode.shell.run.summary"));
+        assert!(rendered.contains("shell-render-sentinel"));
     }
 
     #[test]

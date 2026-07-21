@@ -1383,6 +1383,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2144,6 +2145,7 @@ dependencies = [
  "bcode_config",
  "bcode_daemon_lifecycle",
  "bcode_fake_provider_plugin",
+ "bcode_filesystem_plugin",
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",
@@ -2217,6 +2219,7 @@ name = "bcode_session_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_skill_models",
+ "bcode_tool_models",
  "serde",
  "serde_json",
  "uuid",
@@ -2228,6 +2231,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
  "bcode_ipc",
+ "bcode_session",
  "bcode_session_models",
  "bcode_session_view_models",
  "bcode_skill_models",
@@ -2359,6 +2363,15 @@ dependencies = [
 
 [[package]]
 name = "bcode_tool"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_tool_models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_tool_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",

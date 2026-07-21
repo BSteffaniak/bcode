@@ -13,9 +13,10 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
-    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolPluginVisualMetadata, ToolResultContent, ToolSideEffect, ToolVisualPayloadSelector,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationLifecycleEvent,
+    ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolList, ToolPluginVisualMetadata, ToolResultContent, ToolSideEffect,
+    ToolVisualPayloadSelector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -67,6 +68,20 @@ struct ProgressReporter {
     next_visited_report: usize,
 }
 
+fn progress_lifecycle_event(
+    invocation_id: &str,
+    sequence: u64,
+    message: String,
+) -> ToolInvocationLifecycleEvent {
+    ToolInvocationLifecycleEvent {
+        invocation_id: invocation_id.to_owned(),
+        sequence,
+        stage: ToolInvocationLifecycleStage::Progress,
+        message: Some(message),
+        metadata: serde_json::Value::Null,
+    }
+}
+
 impl ProgressReporter {
     const fn new(events: ServiceEventEmitter, tool_call_id: String) -> Self {
         Self {
@@ -79,11 +94,7 @@ impl ProgressReporter {
 
     fn emit(&mut self, message: impl Into<String>) {
         self.sequence = self.sequence.saturating_add(1);
-        let event = ToolInvocationStreamEvent::Status {
-            tool_call_id: self.tool_call_id.clone(),
-            sequence: self.sequence,
-            message: message.into(),
-        };
+        let event = progress_lifecycle_event(&self.tool_call_id, self.sequence, message.into());
         if let Ok(payload) = serde_json::to_vec(&event) {
             self.events.emit(&payload);
         }
@@ -2490,6 +2501,18 @@ bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_uses_neutral_invocation_lifecycle_contract() {
+        let event = progress_lifecycle_event("filesystem-call", 4, "searching".to_owned());
+        let encoded = serde_json::to_vec(&event).expect("lifecycle should encode");
+        let decoded: ToolInvocationLifecycleEvent =
+            serde_json::from_slice(&encoded).expect("lifecycle should decode");
+        assert_eq!(decoded.invocation_id, "filesystem-call");
+        assert_eq!(decoded.sequence, 4);
+        assert_eq!(decoded.stage, ToolInvocationLifecycleStage::Progress);
+        assert_eq!(decoded.message.as_deref(), Some("searching"));
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

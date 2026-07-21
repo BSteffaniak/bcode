@@ -2481,7 +2481,16 @@ impl BmuxApp {
             SessionEventKind::TraceEvent { trace } if application.live_activity() => {
                 self.apply_trace_event(trace);
             }
-            SessionEventKind::RuntimeWorkStarted { .. }
+            SessionEventKind::ToolContribution {
+                event: contribution,
+            } => {
+                let fallback = serde_json::to_string_pretty(contribution)
+                    .unwrap_or_else(|_| contribution.payload.to_string());
+                self.transcript
+                    .push(TranscriptItem::new("Tool contribution", fallback));
+            }
+            SessionEventKind::ToolInvocationLifecycle { .. }
+            | SessionEventKind::RuntimeWorkStarted { .. }
             | SessionEventKind::RuntimeWorkCancelRequested { .. }
             | SessionEventKind::RuntimeWorkProgress { .. }
                 if application.live_activity() =>
@@ -3639,7 +3648,8 @@ impl BmuxApp {
     }
 
     fn apply_shared_runtime_work_activity(&mut self) {
-        let runtime_work = &self.session_view.snapshot().runtime_work;
+        let snapshot = self.session_view.snapshot();
+        let runtime_work = &snapshot.runtime_work;
         if runtime_work
             .iter()
             .any(|work| work.status == bcode_session_models::RuntimeWorkStatus::Cancelling)
@@ -3648,6 +3658,14 @@ impl BmuxApp {
         } else if let Some(detail) =
             bcode_session_view_models::runtime_work_status_label(runtime_work)
         {
+            self.set_activity(ActivityState::RuntimeWork { detail });
+        } else if !snapshot.active_invocations.is_empty() {
+            let count = snapshot.active_invocations.len();
+            let detail = if count == 1 {
+                "running tool".to_owned()
+            } else {
+                format!("running {count} tools")
+            };
             self.set_activity(ActivityState::RuntimeWork { detail });
         } else {
             self.set_activity(ActivityState::Idle);
@@ -4544,6 +4562,10 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::RuntimeWorkCancelRequested { .. }
         | SessionEventKind::RuntimeWorkProgress { .. }
         | SessionEventKind::RuntimeWorkFinished { .. }
+        | SessionEventKind::ToolContribution { .. }
+        | SessionEventKind::ToolExchangeRequested { .. }
+        | SessionEventKind::ToolExchangeResolved { .. }
+        | SessionEventKind::ToolInvocationLifecycle { .. }
         | SessionEventKind::ToolInvocationStream { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::PluginStatusNote { .. }
@@ -4894,6 +4916,43 @@ mod tests {
     }
 
     #[test]
+    fn generic_lifecycle_drives_tui_activity_until_terminal_event() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, stage| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence,
+                    stage,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        };
+
+        app.absorb_session_event(&event(
+            1,
+            bcode_session_models::ToolInvocationLifecycleStage::Started,
+        ));
+        assert!(matches!(
+            app.activity(),
+            ActivityState::RuntimeWork { detail } if detail == "running tool"
+        ));
+
+        app.absorb_session_event(&event(
+            2,
+            bcode_session_models::ToolInvocationLifecycleStage::Completed,
+        ));
+        assert!(matches!(app.activity(), ActivityState::Idle));
+    }
+
+    #[test]
     fn authoritative_runtime_work_snapshot_drives_tui_activity() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         app.apply_runtime_work_snapshots(&[bcode_ipc::RuntimeWorkSnapshot {
@@ -5187,6 +5246,67 @@ mod tests {
             Some("call")
         );
         assert!(app.transcript()[0].streaming());
+    }
+
+    #[test]
+    fn unknown_contribution_uses_terminal_generic_json_fallback() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.absorb_session_event(&bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call".to_owned(),
+                    contribution_id: "surface".to_owned(),
+                    sequence: 1,
+                    producer_id: "future.producer".to_owned(),
+                    schema: "future.unknown/schema".to_owned(),
+                    schema_version: 77,
+                    operation: bcode_session_models::ToolContributionOperation::Append,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    payload: serde_json::json!({"sentinel": "opaque-tui"}),
+                },
+            },
+        });
+        let fallback = app.transcript().last().expect("contribution transcript");
+        assert_eq!(fallback.role(), "Tool contribution");
+        assert!(fallback.text().contains("future.unknown/schema"));
+        assert!(fallback.text().contains("opaque-tui"));
+    }
+
+    #[test]
+    fn shell_contribution_uses_terminal_json_fallback() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.absorb_session_event(&bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "shell-call".to_owned(),
+                    contribution_id: "shell-run-summary".to_owned(),
+                    sequence: 1,
+                    producer_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.run.summary".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    payload: serde_json::json!({"output": "shell-render-sentinel"}),
+                },
+            },
+        });
+        let fallback = app
+            .transcript()
+            .last()
+            .expect("shell contribution transcript");
+        assert_eq!(fallback.role(), "Tool contribution");
+        assert!(fallback.text().contains("bcode.shell.run.summary"));
+        assert!(fallback.text().contains("shell-render-sentinel"));
     }
 
     #[test]

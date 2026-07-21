@@ -164,7 +164,7 @@ impl ToolInvoker for ParallelInvoker {
             assert!(scope.emit_lifecycle(ToolInvocationLifecycleEvent {
                 invocation_id: scope.invocation_id().to_string(),
                 sequence: 0,
-                stage: ToolInvocationLifecycleStage::Started,
+                stage: ToolInvocationLifecycleStage::Progress,
                 message: None,
                 metadata: serde_json::Value::Null,
             }));

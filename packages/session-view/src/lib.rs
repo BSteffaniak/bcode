@@ -31,6 +31,8 @@ pub struct SessionView {
     tool_item_ids: BTreeMap<String, TranscriptViewItemId>,
     interaction_item_ids: BTreeMap<String, TranscriptViewItemId>,
     tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
+    contribution_sequences: BTreeMap<String, u64>,
+    terminal_invocations: BTreeSet<String>,
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
 }
 
@@ -49,6 +51,8 @@ impl SessionView {
             tool_item_ids: BTreeMap::new(),
             interaction_item_ids: BTreeMap::new(),
             tool_invocation_projections: BTreeMap::new(),
+            contribution_sequences: BTreeMap::new(),
+            terminal_invocations: BTreeSet::new(),
             terminal_runtime_work: BTreeSet::new(),
         }
     }
@@ -389,6 +393,31 @@ impl SessionView {
                     text,
                 );
             }
+            SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
+                use bcode_session_models::ToolInvocationLifecycleStage;
+                if self.terminal_invocations.contains(&lifecycle.invocation_id) {
+                    return;
+                }
+                match lifecycle.stage {
+                    ToolInvocationLifecycleStage::Started
+                    | ToolInvocationLifecycleStage::Progress
+                    | ToolInvocationLifecycleStage::Waiting => {
+                        self.snapshot
+                            .active_invocations
+                            .insert(lifecycle.invocation_id.clone(), lifecycle.clone());
+                    }
+                    ToolInvocationLifecycleStage::Completed
+                    | ToolInvocationLifecycleStage::Cancelled
+                    | ToolInvocationLifecycleStage::Failed => {
+                        self.snapshot
+                            .active_invocations
+                            .remove(&lifecycle.invocation_id);
+                        self.terminal_invocations
+                            .insert(lifecycle.invocation_id.clone());
+                    }
+                }
+                self.bump_revision();
+            }
             SessionEventKind::ToolCallRequested { tool_call_id, .. }
             | SessionEventKind::ToolCallFinished { tool_call_id, .. } => {
                 self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
@@ -611,6 +640,53 @@ impl SessionView {
                         message: ChatMessageView::plain(format!(
                             "Skill {skill_id} failed: {error}"
                         )),
+                    },
+                );
+            }
+            SessionEventKind::ToolExchangeRequested { request } => {
+                self.snapshot.active_exchanges.insert(
+                    format!("{}:{}", request.invocation_id, request.exchange_id),
+                    request.clone(),
+                );
+                self.bump_revision();
+            }
+            SessionEventKind::ToolExchangeResolved { event: resolution } => {
+                self.snapshot.active_exchanges.remove(&format!(
+                    "{}:{}",
+                    resolution.invocation_id, resolution.exchange_id
+                ));
+                self.bump_revision();
+            }
+            SessionEventKind::ToolContribution {
+                event: contribution,
+            } => {
+                let key = format!(
+                    "{}:{}",
+                    contribution.invocation_id, contribution.contribution_id
+                );
+                let current_sequence = self.contribution_sequences.get(&key).copied();
+                if current_sequence.is_none_or(|sequence| contribution.sequence > sequence) {
+                    self.contribution_sequences
+                        .insert(key.clone(), contribution.sequence);
+                    match contribution.operation {
+                        bcode_session_models::ToolContributionOperation::Remove => {
+                            self.snapshot.contributions.remove(&key);
+                        }
+                        bcode_session_models::ToolContributionOperation::Upsert
+                        | bcode_session_models::ToolContributionOperation::Append => {
+                            self.snapshot
+                                .contributions
+                                .insert(key, contribution.clone());
+                        }
+                    }
+                }
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::ToolContribution {
+                        contribution: contribution.clone(),
                     },
                 );
             }
@@ -1399,7 +1475,8 @@ fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::Permission { .. }
         | TranscriptViewItemKind::RuntimeWork { .. }
         | TranscriptViewItemKind::Interaction { .. }
-        | TranscriptViewItemKind::PluginVisual { .. } => {}
+        | TranscriptViewItemKind::PluginVisual { .. }
+        | TranscriptViewItemKind::ToolContribution { .. } => {}
     }
 }
 
@@ -1413,7 +1490,8 @@ fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::Permission { .. }
         | TranscriptViewItemKind::RuntimeWork { .. }
         | TranscriptViewItemKind::Interaction { .. }
-        | TranscriptViewItemKind::PluginVisual { .. } => {}
+        | TranscriptViewItemKind::PluginVisual { .. }
+        | TranscriptViewItemKind::ToolContribution { .. } => {}
     }
 }
 
@@ -1506,6 +1584,264 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    fn durable_generic_history(session_id: SessionId) -> Vec<SessionEvent> {
+        let lifecycle = |sequence, stage, message| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call".to_owned(),
+                        sequence,
+                        stage,
+                        message,
+                        metadata: serde_json::json!({"opaque": sequence}),
+                    },
+                },
+            )
+        };
+        let contribution = |source_sequence, contribution_sequence, operation, payload| {
+            event(
+                session_id,
+                source_sequence,
+                SessionEventKind::ToolContribution {
+                    event: bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call".to_owned(),
+                        contribution_id: "surface".to_owned(),
+                        sequence: contribution_sequence,
+                        producer_id: "future.producer".to_owned(),
+                        schema: "future.unknown/schema".to_owned(),
+                        schema_version: 77,
+                        operation,
+                        persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        payload,
+                    },
+                },
+            )
+        };
+        vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::SessionCreated {
+                    name: Some("deterministic".to_owned()),
+                    working_directory: PathBuf::from("/tmp/deterministic"),
+                },
+            ),
+            lifecycle(
+                2,
+                bcode_session_models::ToolInvocationLifecycleStage::Started,
+                None,
+            ),
+            contribution(
+                3,
+                1,
+                bcode_session_models::ToolContributionOperation::Upsert,
+                serde_json::json!({"opaque": [1, 2]}),
+            ),
+            lifecycle(
+                4,
+                bcode_session_models::ToolInvocationLifecycleStage::Progress,
+                Some("working".to_owned()),
+            ),
+            contribution(
+                5,
+                2,
+                bcode_session_models::ToolContributionOperation::Append,
+                serde_json::json!({"future_append": true}),
+            ),
+            contribution(
+                6,
+                3,
+                bcode_session_models::ToolContributionOperation::Remove,
+                serde_json::Value::Null,
+            ),
+            lifecycle(
+                7,
+                bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                None,
+            ),
+            event(
+                session_id,
+                8,
+                SessionEventKind::SystemMessage {
+                    text: "finished".to_owned(),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn durable_mixed_history_replays_to_byte_identical_generic_snapshots() {
+        let history = durable_generic_history(SessionId::new());
+        let decoded = history
+            .iter()
+            .map(|event| {
+                let encoded = bcode_session::persisted::encode_session_event(event)
+                    .expect("durable event should encode");
+                bcode_session::persisted::decode_session_event(&encoded)
+                    .expect("durable event should decode")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, history);
+
+        let first = build_session_view_snapshot(&decoded);
+        let second = build_session_view_snapshot(&decoded);
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::to_vec(&first).expect("first snapshot should encode"),
+            serde_json::to_vec(&second).expect("second snapshot should encode")
+        );
+        assert!(first.active_invocations.is_empty());
+        assert!(first.contributions.is_empty());
+        assert_eq!(first.latest_sequence, Some(8));
+    }
+
+    #[test]
+    fn exchange_lifecycle_projects_opaque_active_state_and_terminal_resolution() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let request_event = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call".to_owned(),
+            exchange_id: "question".to_owned(),
+            producer_id: "future.producer".to_owned(),
+            schema: "future.question/schema".to_owned(),
+            schema_version: 9,
+            payload: serde_json::json!({"opaque_question": true}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let requested = event(
+            session_id,
+            9,
+            SessionEventKind::ToolExchangeRequested {
+                request: request_event.clone(),
+            },
+        );
+        let resolved = event(
+            session_id,
+            10,
+            SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: "call".to_owned(),
+                    exchange_id: "question".to_owned(),
+                    resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                        payload: serde_json::json!({"opaque_answer": 42}),
+                    },
+                },
+            },
+        );
+        view.apply_event(&requested);
+        assert_eq!(
+            view.snapshot().active_exchanges["call:question"],
+            request_event
+        );
+        view.apply_event(&resolved);
+        assert!(view.snapshot().active_exchanges.is_empty());
+    }
+
+    #[test]
+    fn unknown_contribution_uses_opaque_generic_projection_and_terminal_remove() {
+        let session_id = SessionId::new();
+        let contribution = |source_sequence, contribution_sequence, operation, payload| {
+            event(
+                session_id,
+                source_sequence,
+                SessionEventKind::ToolContribution {
+                    event: bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call".to_owned(),
+                        contribution_id: "surface".to_owned(),
+                        sequence: contribution_sequence,
+                        producer_id: "future.producer".to_owned(),
+                        schema: "future.unknown/schema".to_owned(),
+                        schema_version: 77,
+                        operation,
+                        persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        payload,
+                    },
+                },
+            )
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&contribution(
+            1,
+            2,
+            bcode_session_models::ToolContributionOperation::Upsert,
+            serde_json::json!({"opaque": [1, 2]}),
+        ));
+        view.apply_event(&contribution(
+            2,
+            1,
+            bcode_session_models::ToolContributionOperation::Append,
+            serde_json::json!({"late": true}),
+        ));
+        let projected = &view.snapshot().contributions["call:surface"];
+        assert_eq!(projected.sequence, 2);
+        assert_eq!(projected.payload, serde_json::json!({"opaque": [1, 2]}));
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::ToolContribution { contribution }
+                if contribution.schema == "future.unknown/schema"
+                    && contribution.payload == serde_json::json!({"opaque": [1, 2]})
+        ));
+
+        view.apply_event(&contribution(
+            3,
+            3,
+            bcode_session_models::ToolContributionOperation::Remove,
+            serde_json::Value::Null,
+        ));
+        view.apply_event(&contribution(
+            4,
+            2,
+            bcode_session_models::ToolContributionOperation::Upsert,
+            serde_json::json!({"revive": true}),
+        ));
+        assert!(view.snapshot().contributions.is_empty());
+    }
+
+    #[test]
+    fn generic_lifecycle_projection_tracks_only_active_invocations_and_rejects_revival() {
+        let session_id = SessionId::new();
+        let lifecycle = |sequence, stage| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call-1".to_owned(),
+                        sequence,
+                        stage,
+                        message: Some(format!("{stage:?}")),
+                        metadata: serde_json::json!({"opaque": sequence}),
+                    },
+                },
+            )
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&lifecycle(
+            1,
+            bcode_session_models::ToolInvocationLifecycleStage::Started,
+        ));
+        view.apply_event(&lifecycle(
+            2,
+            bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+        ));
+        assert_eq!(
+            view.snapshot().active_invocations["call-1"].stage,
+            bcode_session_models::ToolInvocationLifecycleStage::Waiting
+        );
+
+        view.apply_event(&lifecycle(
+            3,
+            bcode_session_models::ToolInvocationLifecycleStage::Completed,
+        ));
+        view.apply_event(&lifecycle(
+            4,
+            bcode_session_models::ToolInvocationLifecycleStage::Progress,
+        ));
+        assert!(view.snapshot().active_invocations.is_empty());
     }
 
     #[test]

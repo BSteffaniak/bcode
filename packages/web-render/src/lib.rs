@@ -1216,6 +1216,36 @@ mod tests {
     }
 
     #[test]
+    fn web_renders_generic_active_invocation_without_tool_specific_branch() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "opaque-call".to_owned(),
+                    sequence: 0,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+                    message: Some("waiting generically".to_owned()),
+                    metadata: serde_json::json!({"opaque": true}),
+                },
+            },
+        });
+
+        let rendered = format!(
+            "{:?}",
+            bcode_web_render_ui::pages::home::home(view.snapshot(), &[], "token")
+        );
+        assert!(rendered.contains("active invocations"));
+        assert!(rendered.contains("opaque-call"));
+        assert!(rendered.contains("waiting generically"));
+    }
+
+    #[test]
     fn web_projection_keeps_active_sibling_and_does_not_revive_terminal_work() {
         let session_id = SessionId::new();
         let first = bcode_session_models::WorkId::new("work-first");

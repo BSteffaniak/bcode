@@ -19,6 +19,9 @@ bcode_skill_models        = { workspace = true }
 bcode_tool                = { workspace = true }
 serde_json                = { workspace = true, features = ["std"] }
 
+[dev-dependencies]
+bcode_session = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

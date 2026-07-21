@@ -1769,7 +1769,17 @@ async fn execute_plugin_tool(
                 tool_name: descriptor.tool_name.clone(),
                 message: error.to_string(),
             })? {
-            bcode_plugin::StreamingServiceInvocationEvent::Event(_) => {}
+            bcode_plugin::StreamingServiceInvocationEvent::Event(payload) => {
+                if let Ok(event) =
+                    serde_json::from_slice::<bcode_tool::ToolInvocationLifecycleEvent>(&payload)
+                {
+                    let _ = scope.emit_lifecycle(event);
+                } else if let Ok(event) =
+                    serde_json::from_slice::<bcode_tool::ToolContributionEvent>(&payload)
+                {
+                    let _ = scope.emit_contribution(event);
+                }
+            }
             bcode_plugin::StreamingServiceInvocationEvent::Response(response) => {
                 let response = response.map_err(|error| RuntimeError::ToolExecution {
                     tool_name: descriptor.tool_name.clone(),

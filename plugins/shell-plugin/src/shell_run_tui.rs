@@ -31,6 +31,7 @@ struct LiveTerminalReplay {
     output: Vec<u8>,
     frames: Vec<TerminalReplayFrame>,
     pending_resizes: Vec<TerminalReplayFrame>,
+    next_input_sequence: u64,
     last_frame_sequence: u64,
     initial_columns: u16,
     initial_rows: u16,
@@ -74,31 +75,21 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         }
     }
 
-    fn invocation_event_action(
+    fn invocation_event_input(
         &self,
+        invocation_id: &str,
         kind: &str,
         payload: &serde_json::Value,
         event: &bmux_tui::event::Event,
-    ) -> Option<bcode_tool::PluginInvocationAction> {
+    ) -> Option<bcode_tool::ToolInvocationInput> {
         if !self.supports(kind) {
             return None;
         }
         let bmux_tui::event::Event::Resize(size) = event else {
             return None;
         };
-        let key = payload
-            .get("_bcode_runtime")
-            .and_then(|runtime| runtime.get("live_state_key"))
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                payload
-                    .get("live_state_key")
-                    .and_then(serde_json::Value::as_str)
-            });
-        if let Some(key) = key
-            && let Ok(mut replays) = self.live_replays.lock()
-        {
-            let replay = replays.entry(key.to_owned()).or_default();
+        let input_sequence = if let Ok(mut replays) = self.live_replays.lock() {
+            let replay = replays.entry(invocation_id.to_owned()).or_default();
             if replay.initial_columns == 0 || replay.initial_rows == 0 {
                 let runtime = payload.get("_bcode_runtime").unwrap_or(payload);
                 replay.initial_columns =
@@ -111,10 +102,17 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 columns: size.width,
                 rows: size.height,
             });
-        }
-        Some(bcode_tool::PluginInvocationAction {
-            producer_plugin_id: "bcode.shell".to_owned(),
-            schema: "bcode.shell.invocation-action".to_owned(),
+            let sequence = replay.next_input_sequence;
+            replay.next_input_sequence = replay.next_input_sequence.saturating_add(1);
+            sequence
+        } else {
+            return None;
+        };
+        Some(bcode_tool::ToolInvocationInput {
+            input_id: format!("{invocation_id}-input-{input_sequence}"),
+            invocation_id: invocation_id.to_owned(),
+            producer_id: "bcode.shell".to_owned(),
+            schema: "bcode.shell.invocation-input".to_owned(),
             schema_version: 1,
             payload: serde_json::json!({
                 "type": "resize",
@@ -1375,13 +1373,14 @@ mod tests {
                 "live_state_key": key,
             }
         });
-        let action = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_action(
+        let input = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_input(
             &adapter,
+            key,
             "bcode.tool.request.shell.run",
             &payload,
             &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(9, 4)),
         )
-        .expect("resize action");
+        .expect("resize input");
         cumulative.extend_from_slice(second);
         let incoming_frames = vec![
             (1, TerminalReplayFrame::Output(first.clone())),
@@ -1412,7 +1411,7 @@ mod tests {
         let reopened = decode_recording_replay(&summary, recording_frames);
         let reopened_frames = reopened.frames.expect("recording frames");
 
-        assert_eq!(action.producer_plugin_id, "bcode.shell");
+        assert_eq!(input.producer_id, "bcode.shell");
         assert_eq!(live_frames, reopened_frames);
         let live = shell_terminal_stream(12, 3, &live_frames).expect("live terminal stream");
         let reopened =
@@ -1458,8 +1457,9 @@ mod tests {
             &payload,
             &context,
         );
-        let action = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_action(
+        let input = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_input(
             &adapter,
+            "call-resize",
             "bcode.tool.request.shell.run",
             &payload,
             &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(4, 24)),
@@ -1471,25 +1471,30 @@ mod tests {
             &context,
         );
 
-        assert!(action.is_some());
+        assert!(input.is_some());
         assert_ne!(before, after);
         let rendered = after.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("5678\n    ABCD"), "{rendered}");
     }
 
     #[test]
-    fn shell_visual_adapter_owns_resize_action_payload() {
-        let action = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_action(
-            &ShellRunTuiVisualAdapter::default(),
+    fn shell_visual_adapter_owns_resize_input_payload_and_identity() {
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let payload = serde_json::json!({"live_state_key": "stale-renderer-key"});
+        let input = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_input(
+            &adapter,
+            "shell-call",
             "bcode.tool.request.shell.run",
-            &serde_json::json!({}),
+            &payload,
             &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(132, 40)),
         );
         assert_eq!(
-            action,
-            Some(bcode_tool::PluginInvocationAction {
-                producer_plugin_id: "bcode.shell".to_owned(),
-                schema: "bcode.shell.invocation-action".to_owned(),
+            input,
+            Some(bcode_tool::ToolInvocationInput {
+                invocation_id: "shell-call".to_owned(),
+                input_id: "shell-call-input-0".to_owned(),
+                producer_id: "bcode.shell".to_owned(),
+                schema: "bcode.shell.invocation-input".to_owned(),
                 schema_version: 1,
                 payload: serde_json::json!({
                     "type": "resize",
@@ -1498,6 +1503,16 @@ mod tests {
                 }),
             })
         );
+        let repeated = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_input(
+            &adapter,
+            "shell-call",
+            "bcode.tool.request.shell.run",
+            &payload,
+            &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(132, 40)),
+        )
+        .expect("repeated resize input");
+        assert_eq!(repeated.invocation_id, "shell-call");
+        assert_eq!(repeated.input_id, "shell-call-input-1");
     }
 
     #[test]

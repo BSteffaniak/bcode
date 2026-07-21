@@ -790,6 +790,33 @@ impl TurnControl {
         sink.emit(event)
     }
 
+    fn emit_invocation_terminal(
+        &self,
+        sink: &dyn TurnEventSink,
+        mut event: ToolInvocationLifecycleEvent,
+    ) -> bool {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.lifecycle() {
+            TurnLifecycle::Running => {
+                if !matches!(
+                    event.stage,
+                    bcode_tool::ToolInvocationLifecycleStage::Completed
+                        | bcode_tool::ToolInvocationLifecycleStage::Failed
+                ) {
+                    return false;
+                }
+            }
+            TurnLifecycle::Cancelling | TurnLifecycle::Cancelled => {
+                event.stage = bcode_tool::ToolInvocationLifecycleStage::Cancelled;
+            }
+            TurnLifecycle::Completed => return false,
+        }
+        sink.emit(ScopedTurnEvent::InvocationLifecycle(event))
+    }
+
     fn emit_cancellation_lifecycle(
         &self,
         sink: &dyn TurnEventSink,
@@ -928,11 +955,24 @@ impl TurnScope {
         self.control.emit(self.events.as_ref(), event)
     }
 
+    pub(crate) fn emit_invocation_terminal(&self, event: ToolInvocationLifecycleEvent) -> bool {
+        let generation_is_active = self
+            .active_generation
+            .as_ref()
+            .is_none_or(|active| active.load(Ordering::Acquire) == self.generation.get());
+        if !generation_is_active {
+            self.control.record_discarded_normal_event();
+            return false;
+        }
+        self.control
+            .emit_invocation_terminal(self.events.as_ref(), event)
+    }
+
     /// Emit only a cancelled invocation lifecycle event after normal output has closed.
     ///
     /// This explicit bookkeeping path cannot publish normal runtime events or contributions.
     #[must_use]
-    pub fn emit_cancellation_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
+    pub(crate) fn emit_cancellation_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
         self.control
             .emit_cancellation_lifecycle(self.events.as_ref(), event)
     }
@@ -1059,16 +1099,30 @@ impl InvocationScope {
             .unregister_cancellation(&self.invocation_id)
     }
 
-    /// Emit lifecycle output only when it belongs to this active invocation.
+    /// Emit a tool-owned non-terminal lifecycle update.
+    ///
+    /// Started and terminal stages are orchestration-owned and rejected here so every invocation
+    /// has exactly one canonical lifecycle. Tool owners may emit only progress or waiting updates.
     #[must_use]
     pub fn emit_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
         event.invocation_id == self.invocation_id.as_ref()
+            && matches!(
+                event.stage,
+                bcode_tool::ToolInvocationLifecycleStage::Progress
+                    | bcode_tool::ToolInvocationLifecycleStage::Waiting
+            )
             && self.turn.emit(ScopedTurnEvent::InvocationLifecycle(event))
+    }
+
+    #[must_use]
+    pub(crate) fn emit_invocation_terminal(&self, event: ToolInvocationLifecycleEvent) -> bool {
+        event.invocation_id == self.invocation_id.as_ref()
+            && self.turn.emit_invocation_terminal(event)
     }
 
     /// Emit cancelled lifecycle bookkeeping after normal invocation output has closed.
     #[must_use]
-    pub fn emit_cancellation_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
+    pub(crate) fn emit_cancellation_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
         event.invocation_id == self.invocation_id.as_ref()
             && self.turn.emit_cancellation_lifecycle(event)
     }
@@ -1411,6 +1465,42 @@ mod tests {
 
         assert!(!scope.control.register_cancellation("late", late.clone()));
         assert_eq!(late.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tool_owned_started_and_terminal_lifecycle_stages_are_rejected() {
+        let turn = TurnScope::new(
+            "turn",
+            TurnGeneration::new(1),
+            Arc::new(DiscardingTurnEventSink),
+        );
+        let invocation = InvocationScope::new(turn, "invoke");
+        for stage in [
+            bcode_tool::ToolInvocationLifecycleStage::Started,
+            bcode_tool::ToolInvocationLifecycleStage::Completed,
+            bcode_tool::ToolInvocationLifecycleStage::Cancelled,
+            bcode_tool::ToolInvocationLifecycleStage::Failed,
+        ] {
+            assert!(!invocation.emit_lifecycle(ToolInvocationLifecycleEvent {
+                invocation_id: "invoke".to_string(),
+                sequence: 1,
+                stage,
+                message: None,
+                metadata: serde_json::Value::Null,
+            }));
+        }
+        for stage in [
+            bcode_tool::ToolInvocationLifecycleStage::Progress,
+            bcode_tool::ToolInvocationLifecycleStage::Waiting,
+        ] {
+            assert!(invocation.emit_lifecycle(ToolInvocationLifecycleEvent {
+                invocation_id: "invoke".to_string(),
+                sequence: 1,
+                stage,
+                message: None,
+                metadata: serde_json::Value::Null,
+            }));
+        }
     }
 
     #[tokio::test]

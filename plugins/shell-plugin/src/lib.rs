@@ -25,9 +25,10 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolArtifactRef, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolPluginVisualMetadata,
-    ToolSideEffect,
+    ToolArtifactRef, ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
+    ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolList, ToolPluginVisualMetadata, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,7 +38,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -244,7 +245,6 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             context,
             context.events,
             &request.tool_call_id,
-            request.name.as_str(),
             request.arguments,
             request.cwd.as_deref(),
             TerminalRunPaths {
@@ -269,7 +269,6 @@ fn run_shell_tool(
     context: &NativeServiceContext,
     events: ServiceEventEmitter,
     tool_call_id: &str,
-    tool_name: &str,
     arguments: serde_json::Value,
     session_cwd: Option<&std::path::Path>,
     paths: TerminalRunPaths<'_>,
@@ -298,24 +297,15 @@ fn run_shell_tool(
         };
     }
     let arguments_json = serde_json::to_value(&arguments).unwrap_or_else(|_| json!({}));
-    let now_ms = current_unix_millis();
-    emit_tool_stream_event(
+    emit_tool_lifecycle(
         events,
-        &ToolInvocationStreamEvent::Started {
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: tool_name.to_owned(),
-            sequence: 0,
-            terminal: true,
-            columns: Some(arguments.terminal_columns()),
-            rows: Some(arguments.terminal_rows()),
-            started_at_ms: Some(now_ms),
+        &ToolInvocationLifecycleEvent {
+            invocation_id: tool_call_id.to_owned(),
+            sequence: 1,
+            stage: ToolInvocationLifecycleStage::Progress,
+            message: Some(format!("starting command: {}", arguments.command)),
+            metadata: serde_json::Value::Null,
         },
-    );
-    emit_tool_status(
-        events,
-        tool_call_id,
-        0,
-        format!("starting command: {}", arguments.command),
     );
     let response = run_terminal_shell_command(
         events,
@@ -328,13 +318,19 @@ fn run_shell_tool(
             ..paths
         },
     );
-    emit_tool_stream_event(
+    emit_tool_contribution(
         events,
-        &ToolInvocationStreamEvent::Finished {
-            tool_call_id: tool_call_id.to_owned(),
-            sequence: 0,
-            is_error: response.is_error,
-            finished_at_ms: Some(current_unix_millis()),
+        &ToolContributionEvent {
+            invocation_id: tool_call_id.to_owned(),
+            contribution_id: "shell-run-summary".to_owned(),
+            sequence: 1,
+            producer_id: "bcode.shell".to_owned(),
+            schema: "bcode.shell.run.summary".to_owned(),
+            schema_version: 1,
+            operation: ToolContributionOperation::Upsert,
+            persistence: ToolContributionPersistence::Durable,
+            payload: serde_json::from_str(&response.output)
+                .unwrap_or_else(|_| json!({"output": response.output.clone()})),
         },
     );
     response
@@ -650,13 +646,13 @@ impl ShellInvocationActionReader {
                 }
             };
             if input.producer_id != "bcode.shell"
-                || input.schema != "bcode.shell.invocation-action"
+                || input.schema != "bcode.shell.invocation-input"
                 || input.schema_version != 1
             {
                 return Err("unsupported shell invocation input schema".to_owned());
             }
             let event = serde_json::from_value::<ShellInvocationAction>(input.payload)
-                .map_err(|error| format!("invalid shell invocation action: {error}"))?;
+                .map_err(|error| format!("invalid shell invocation input: {error}"))?;
             match event {
                 ShellInvocationAction::Resize { columns, rows } => {
                     if columns == 0 || rows == 0 {
@@ -728,22 +724,30 @@ fn wait_for_terminal_shell_status(
         }
         if cancellation.is_cancelled() {
             cancelled = true;
-            emit_tool_status(
+            emit_tool_lifecycle(
                 events,
-                tool_call_id,
-                1,
-                "cancellation requested; killing terminal process",
+                &ToolInvocationLifecycleEvent {
+                    invocation_id: tool_call_id.to_owned(),
+                    sequence: 2,
+                    stage: ToolInvocationLifecycleStage::Progress,
+                    message: Some("cancellation requested; killing terminal process".to_owned()),
+                    metadata: serde_json::Value::Null,
+                },
             );
             child.kill().map_err(|error| error.to_string())?;
             break child.wait().map_err(|error| error.to_string())?;
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            emit_tool_status(
+            emit_tool_lifecycle(
                 events,
-                tool_call_id,
-                1,
-                "timeout reached; killing terminal process",
+                &ToolInvocationLifecycleEvent {
+                    invocation_id: tool_call_id.to_owned(),
+                    sequence: 2,
+                    stage: ToolInvocationLifecycleStage::Progress,
+                    message: Some("timeout reached; killing terminal process".to_owned()),
+                    metadata: serde_json::Value::Null,
+                },
             );
             child.kill().map_err(|error| error.to_string())?;
             break child.wait().map_err(|error| error.to_string())?;
@@ -1459,14 +1463,6 @@ fn artifact_writer(path: Option<&Path>) -> Result<Box<dyn Write + Send>, String>
     )
 }
 
-fn current_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
 fn shell_recording_commit_observer(
     events: ServiceEventEmitter,
     tool_call_id: &str,
@@ -1498,20 +1494,16 @@ fn shell_recording_commit_observer(
     })
 }
 
-fn emit_tool_status(
-    events: ServiceEventEmitter,
-    tool_call_id: &str,
-    sequence: u64,
-    message: impl Into<String>,
-) {
-    emit_tool_stream_event(
-        events,
-        &ToolInvocationStreamEvent::Status {
-            tool_call_id: tool_call_id.to_owned(),
-            sequence,
-            message: message.into(),
-        },
-    );
+fn emit_tool_lifecycle(events: ServiceEventEmitter, event: &ToolInvocationLifecycleEvent) {
+    if let Ok(payload) = serde_json::to_vec(event) {
+        events.emit(&payload);
+    }
+}
+
+fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
+    if let Ok(payload) = serde_json::to_vec(event) {
+        events.emit(&payload);
+    }
 }
 
 fn emit_tool_stream_event(events: ServiceEventEmitter, event: &ToolInvocationStreamEvent) {
@@ -1751,7 +1743,7 @@ mod tests {
                     invocation_id,
                     input_id: format!("resize-{index}"),
                     producer_id: "bcode.shell".to_string(),
-                    schema: "bcode.shell.invocation-action".to_string(),
+                    schema: "bcode.shell.invocation-input".to_string(),
                     schema_version: 1,
                     payload: json!({"type":"resize","columns":columns,"rows":rows}),
                 },

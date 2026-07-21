@@ -437,6 +437,94 @@ if ! grep -F 'presentation_and_exchange_payloads_are_excluded_from_model_context
   violations=1
 fi
 
+if ! grep -F 'server_question_exchange_completes_original_plugin_invocation' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'exchange_lifecycle_projects_opaque_active_state_and_terminal_resolution' packages/session-view/src/lib.rs >/dev/null ||
+   ! grep -F 'ToolExchangeRequested' packages/session/src/persisted.rs >/dev/null ||
+   ! grep -F 'ToolExchangeResolved' packages/session/src/persisted.rs >/dev/null; then
+  echo "Runtime architecture violation: neutral durable exchange lifecycle coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'server_persists_filesystem_progress_as_neutral_lifecycle_only' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: production neutral plugin progress persistence coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ToolInvocationStreamEvent' \
+  plugins/ocr-plugin/src plugins/filesystem-plugin/src plugins/document-plugin/src \
+  plugins/web-search-plugin/src --glob '*.rs' >/tmp/bcode-migrated-progress-streams.txt; then
+  echo "Runtime architecture violation: migrated OCR/filesystem/document progress reintroduced legacy stream events." >&2
+  cat /tmp/bcode-migrated-progress-streams.txt >&2
+  violations=1
+fi
+
+for plugin_source in \
+  plugins/ocr-plugin/src/lib.rs \
+  plugins/filesystem-plugin/src/lib.rs \
+  plugins/document-plugin/src/lib.rs \
+  plugins/web-search-plugin/src/lib.rs; do
+  if ! grep -F 'progress_uses_neutral_invocation_lifecycle_contract' "$plugin_source" >/dev/null; then
+    echo "Runtime architecture violation: neutral progress lifecycle coverage missing from $plugin_source." >&2
+    violations=1
+  fi
+done
+
+if rg -n 'ToolInvocationStreamEvent::(Started|Status|Finished)|emit_tool_status' \
+  plugins/shell-plugin/src --glob '*.rs' >/tmp/bcode-shell-legacy-lifecycle.txt; then
+  echo "Runtime architecture violation: shell plugin reintroduced legacy invocation lifecycle stream events." >&2
+  cat /tmp/bcode-shell-legacy-lifecycle.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'static_and_dynamic_shell_contributions_are_observable_headlessly' packages/bcode/tests/embedded_scoped_plugin.rs >/dev/null ||
+   ! grep -F 'server_persists_shell_owned_contribution_opaquely' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: shell generic lifecycle/contribution conformance coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'orchestration_emits_exactly_one_started_and_terminal_lifecycle_per_invocation' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'tool_owned_started_and_terminal_lifecycle_stages_are_rejected' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'neutral_batch_cancellation_prevents_queued_start' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'server_tool_cancellation_persists_exact_generic_lifecycle' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'server_tool_error_persists_failed_generic_lifecycle' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'projection_history_pages_cross_real_ipc_bidirectionally' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'generic_lifecycle_drives_tui_activity_until_terminal_event' packages/tui/src/app.rs >/dev/null ||
+   ! grep -F 'web_renders_generic_active_invocation_without_tool_specific_branch' packages/web-render/src/lib.rs >/dev/null ||
+   ! grep -F 'legacy_tool_stream_lifecycle_events_are_not_newly_persisted' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: orchestration-owned lifecycle coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n '\bPluginInvocationAction\b|PluginInvocationActionAccepted|send_plugin_invocation_action|invocation_action_file|cancellation_file' \
+  packages plugins --glob '*.rs' >/tmp/bcode-legacy-invocation-action.txt; then
+  echo "Runtime architecture violation: legacy plugin invocation action transport was reintroduced." >&2
+  cat /tmp/bcode-legacy-invocation-action.txt >&2
+  violations=1
+fi
+
+input_model_declarations="$(rg -l 'pub (struct ToolInvocationInput|enum ToolInvocationInputResolution)' packages --glob '*.rs' | sort)"
+if [[ "$input_model_declarations" != "packages/tool/models/src/lib.rs" ]]; then
+  echo "Runtime architecture violation: invocation input DTOs must be declared only in the tool-models leaf crate." >&2
+  printf '%s\n' "$input_model_declarations" >&2
+  violations=1
+fi
+
+if ! grep -F 'invocation_input_request_round_trips_with_opaque_payload' packages/ipc/src/lib.rs >/dev/null ||
+   ! grep -F 'generic_invocation_inputs_enqueue_opaque_bounded_payloads' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'shell_visual_adapter_owns_resize_input_payload_and_identity' plugins/shell-plugin/src/shell_run_tui.rs >/dev/null; then
+  echo "Runtime architecture violation: neutral invocation input transport coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'batch_size = calls.len()' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'provider_round,' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'configured_max_concurrency = ?options.max_concurrency.map(NonZeroUsize::get)' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'observed_concurrency = observed_concurrency.peak()' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'batch_concurrency_observation_tracks_peak_and_releases_active_work' packages/agent-runtime/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: canonical batch concurrency observability was removed." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

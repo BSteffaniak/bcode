@@ -82,6 +82,9 @@ pub enum SessionDbError {
     /// Strict persisted event decode failed.
     #[error(transparent)]
     PersistedEvent(#[from] PersistedSessionEventError),
+    /// Transient contribution envelopes cannot enter durable session storage.
+    #[error("transient tool contribution {contribution_id} cannot be persisted")]
+    TransientContribution { contribution_id: String },
     /// The durable model-context projection exists but is not current.
     #[error(
         "model-context projection is stale: checkpoint #{checkpoint}, canonical history ends at #{expected}"
@@ -2683,6 +2686,13 @@ async fn validate_append_preconditions_without_writer(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
+    if let SessionEventKind::ToolContribution { event } = &event.kind
+        && event.persistence == bcode_session_models::ToolContributionPersistence::Transient
+    {
+        return Err(SessionDbError::TransientContribution {
+            contribution_id: event.contribution_id.clone(),
+        });
+    }
     let canonical_tail = last_event_sequence_from_database(db).await?;
     let expected_sequence = canonical_tail.map_or(0, |tail| tail.saturating_add(1));
     if event.sequence != expected_sequence {
@@ -3082,6 +3092,37 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
             }
             insert_tool_result_transcript_item(db, event, tool_call_id, *is_error).await?;
         }
+        SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
+            insert_transcript_item(
+                db,
+                event,
+                "runtime",
+                "invocation_lifecycle",
+                match lifecycle.stage {
+                    bcode_session_models::ToolInvocationLifecycleStage::Started
+                    | bcode_session_models::ToolInvocationLifecycleStage::Progress
+                    | bcode_session_models::ToolInvocationLifecycleStage::Waiting => "running",
+                    bcode_session_models::ToolInvocationLifecycleStage::Completed => "complete",
+                    bcode_session_models::ToolInvocationLifecycleStage::Cancelled => "cancelled",
+                    bcode_session_models::ToolInvocationLifecycleStage::Failed => "error",
+                },
+                lifecycle.message.clone(),
+            )
+            .await?;
+        }
+        SessionEventKind::ToolContribution {
+            event: contribution,
+        } => {
+            insert_transcript_item(
+                db,
+                event,
+                "runtime",
+                "tool_contribution",
+                "complete",
+                Some(serde_json::to_string(contribution)?),
+            )
+            .await?;
+        }
         SessionEventKind::ToolInvocationStream { event: stream } => {
             update_tool_transcript_item_end(db, tool_stream_tool_call_id(stream), event.sequence)
                 .await?;
@@ -3341,6 +3382,10 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
         SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
         SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
+        SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
+        SessionEventKind::ToolContribution { .. } => "tool_contribution",
+        SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
+        SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",

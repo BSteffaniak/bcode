@@ -1415,26 +1415,21 @@ impl BcodeClient {
         }
     }
 
-    /// Route an opaque plugin-owned action to an active tool invocation.
+    /// Deliver opaque schema-versioned input to an active invocation.
     ///
     /// # Errors
     ///
-    /// Returns an error when the daemon cannot be reached or rejects the invocation/action.
-    pub async fn send_plugin_invocation_action(
+    /// Returns an error when the daemon cannot be reached or rejects the input.
+    pub async fn send_invocation_input(
         &self,
         session_id: SessionId,
-        tool_call_id: String,
-        action: bcode_tool::PluginInvocationAction,
+        input: bcode_tool::ToolInvocationInput,
     ) -> Result<(), ClientError> {
         match self
-            .send_request(Request::PluginInvocationAction {
-                session_id,
-                tool_call_id,
-                action,
-            })
+            .send_request(Request::InvocationInput { session_id, input })
             .await?
         {
-            ResponsePayload::PluginInvocationActionAccepted => Ok(()),
+            ResponsePayload::InvocationInputAccepted => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

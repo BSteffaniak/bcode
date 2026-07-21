@@ -255,13 +255,14 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         PluginTuiVisualRenderMode::Inline
     }
 
-    /// Route a renderer event into an opaque action for an active plugin invocation.
-    fn invocation_event_action(
+    /// Convert a renderer event into neutral input for an active invocation.
+    fn invocation_event_input(
         &self,
+        _invocation_id: &str,
         _kind: &str,
         _payload: &serde_json::Value,
         _event: &Event,
-    ) -> Option<bcode_tool::PluginInvocationAction> {
+    ) -> Option<bcode_tool::ToolInvocationInput> {
         None
     }
 
@@ -568,18 +569,19 @@ impl PluginTuiRegistry {
             .map(|adapter| adapter.render_mode(kind, payload))
     }
 
-    /// Route a renderer event through a matching visual adapter.
+    /// Convert a renderer event through a matching visual adapter.
     #[must_use]
-    pub fn visual_invocation_event_action(
+    pub fn visual_invocation_event_input(
         &self,
+        invocation_id: &str,
         kind: &str,
         payload: &serde_json::Value,
         event: &Event,
-    ) -> Option<bcode_tool::PluginInvocationAction> {
+    ) -> Option<bcode_tool::ToolInvocationInput> {
         self.visual_adapters
             .iter()
             .find(|adapter| adapter.supports(kind))
-            .and_then(|adapter| adapter.invocation_event_action(kind, payload, event))
+            .and_then(|adapter| adapter.invocation_event_input(invocation_id, kind, payload, event))
     }
 
     /// Return whether the owning visual adapter consumes one artifact reference.

@@ -1796,7 +1796,7 @@ async fn handle_event<W: Write>(
                     super::plugin_tui::load_default_runtime_with_static_bundled(
                         &bcode_bundled_plugins::static_bundled_plugins(),
                     )
-                    .expect("load plugin runtime for visual actions")
+                    .expect("load plugin runtime for visual inputs")
                 });
                 for (tool_call_id, visual) in chat.app.active_plugin_visuals() {
                     let producer = visual.producer_plugin_id.as_deref();
@@ -1808,12 +1808,13 @@ async fn handle_event<W: Write>(
                     ) else {
                         continue;
                     };
-                    let Some(action) = chat
+                    let Some(input) = chat
                         .app
                         .plugin_presentation()
                         .and_then(|presentation| presentation.registry(&route.plugin_id))
                         .and_then(|registry| {
-                            registry.visual_invocation_event_action(
+                            registry.visual_invocation_event_input(
+                                &tool_call_id,
                                 &route.schema,
                                 &visual.payload,
                                 &Event::Resize(size),
@@ -1822,13 +1823,21 @@ async fn handle_event<W: Write>(
                     else {
                         continue;
                     };
+                    if input.invocation_id != tool_call_id {
+                        tracing::warn!(
+                            expected = %tool_call_id,
+                            actual = %input.invocation_id,
+                            "visual adapter returned input for a different invocation"
+                        );
+                        continue;
+                    }
                     if let Err(error) = context
                         .services
                         .client
-                        .send_plugin_invocation_action(session_id, tool_call_id, action)
+                        .send_invocation_input(session_id, input)
                         .await
                     {
-                        tracing::debug!(%error, "active plugin invocation did not accept visual action");
+                        tracing::debug!(%error, "active plugin invocation did not accept visual input");
                     }
                 }
             }

@@ -6978,6 +6978,10 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
         SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
         SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
+        SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
+        SessionEventKind::ToolContribution { .. } => "tool_contribution",
+        SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
+        SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
@@ -7332,6 +7336,43 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             "#{} interactive tool resolved: {interaction_id} ({tool_call_id})",
             event.sequence
         ),
+        SessionEventKind::ToolExchangeRequested { request } => println!(
+            "#{} exchange requested {}:{} schema={}@{} policy={:?} payload={}",
+            event.sequence,
+            request.invocation_id,
+            request.exchange_id,
+            request.schema,
+            request.schema_version,
+            request.response_policy,
+            request.payload
+        ),
+        SessionEventKind::ToolExchangeResolved { event: resolution } => println!(
+            "#{} exchange resolved {}:{} {:?}",
+            event.sequence, resolution.invocation_id, resolution.exchange_id, resolution.resolution
+        ),
+        SessionEventKind::ToolContribution {
+            event: contribution,
+        } => println!(
+            "#{} contribution {}:{} sequence={} schema={}@{} operation={:?} payload={}",
+            event.sequence,
+            contribution.invocation_id,
+            contribution.contribution_id,
+            contribution.sequence,
+            contribution.schema,
+            contribution.schema_version,
+            contribution.operation,
+            contribution.payload
+        ),
+        SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => println!(
+            "#{} invocation {}: {:?}{}",
+            event.sequence,
+            lifecycle.invocation_id,
+            lifecycle.stage,
+            lifecycle
+                .message
+                .as_deref()
+                .map_or_else(String::new, |message| format!(" — {message}"))
+        ),
         SessionEventKind::ToolInvocationStream {
             event: stream_event,
         } => {
@@ -7610,6 +7651,29 @@ fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
         } => {
             println!("{prefix} runtime work finished: {work_id} {status:?}");
         }
+        SessionEventKind::ToolInvocationLifecycle { event } => {
+            print_timeline_invocation_lifecycle(&prefix, event);
+        }
+        SessionEventKind::ToolExchangeRequested { request } => {
+            print_timeline_exchange_request(&prefix, request);
+        }
+        SessionEventKind::ToolExchangeResolved { event } => {
+            print_timeline_exchange_resolution(&prefix, event);
+        }
+        SessionEventKind::ToolContribution {
+            event: contribution,
+        } => {
+            println!(
+                "{prefix} contribution {}:{} sequence={} schema={}@{} operation={:?} payload={}",
+                contribution.invocation_id,
+                contribution.contribution_id,
+                contribution.sequence,
+                contribution.schema,
+                contribution.schema_version,
+                contribution.operation,
+                contribution.payload
+            );
+        }
         SessionEventKind::TraceEvent { trace } => {
             println!(
                 "{prefix} trace {:?}: {}",
@@ -7619,6 +7683,41 @@ fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
         }
         _ => {}
     }
+}
+
+fn print_timeline_invocation_lifecycle(
+    prefix: &str,
+    event: &bcode_session_models::ToolInvocationLifecycleEvent,
+) {
+    println!(
+        "{prefix} invocation {}: {:?}{}",
+        event.invocation_id,
+        event.stage,
+        event
+            .message
+            .as_deref()
+            .map_or_else(String::new, |message| format!(" — {message}"))
+    );
+}
+
+fn print_timeline_exchange_request(
+    prefix: &str,
+    request: &bcode_session_models::ToolExchangeRequest,
+) {
+    println!(
+        "{prefix} exchange requested {}:{} schema={}@{}",
+        request.invocation_id, request.exchange_id, request.schema, request.schema_version
+    );
+}
+
+fn print_timeline_exchange_resolution(
+    prefix: &str,
+    event: &bcode_session_models::ToolExchangeResolutionEvent,
+) {
+    println!(
+        "{prefix} exchange resolved {}:{} {:?}",
+        event.invocation_id, event.exchange_id, event.resolution
+    );
 }
 
 fn provider_stream_event_summary(event: &bcode_session_models::ProviderStreamEvent) -> String {

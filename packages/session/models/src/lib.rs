@@ -11,6 +11,11 @@
 //! required fallback for every other surface.
 
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
+pub use bcode_tool_models::{
+    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
+    ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResolutionEvent,
+    ToolExchangeResponsePolicy, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -243,7 +248,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 32;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 35;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -2073,6 +2078,22 @@ pub enum SessionEventKind {
     LegacyEvent {
         event_type: String,
         payload: serde_json::Value,
+    },
+    /// Renderer-neutral lifecycle for one admitted tool invocation.
+    ToolInvocationLifecycle {
+        event: ToolInvocationLifecycleEvent,
+    },
+    /// Opaque durable renderer contribution. Transient contributions are rejected by persistence.
+    ToolContribution {
+        event: ToolContributionEvent,
+    },
+    /// Renderer-neutral exchange request emitted while an invocation remains active.
+    ToolExchangeRequested {
+        request: ToolExchangeRequest,
+    },
+    /// Terminal renderer-neutral exchange resolution.
+    ToolExchangeResolved {
+        event: ToolExchangeResolutionEvent,
     },
 }
 

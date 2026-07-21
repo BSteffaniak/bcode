@@ -432,11 +432,10 @@ pub enum Request {
         offset: u64,
         length: u32,
     },
-    /// Route an opaque plugin-owned action to an active tool invocation.
-    PluginInvocationAction {
+    /// Deliver opaque schema-versioned input to an active invocation.
+    InvocationInput {
         session_id: SessionId,
-        tool_call_id: String,
-        action: bcode_tool::PluginInvocationAction,
+        input: bcode_tool::ToolInvocationInput,
     },
     /// Resolve every currently pending checkpoint in one exact authorization batch.
     ResolvePermissionBatch {
@@ -1270,7 +1269,7 @@ pub enum ResponsePayload {
         checksum_sha256: Option<String>,
         bytes: Vec<u8>,
     },
-    PluginInvocationActionAccepted,
+    InvocationInputAccepted,
     PermissionBatchResolved {
         resolved: usize,
     },
@@ -2042,6 +2041,26 @@ mod tests {
         };
         let encoded = encode(&request).expect("batch resolution request should encode");
         let decoded: Request = decode(&encoded).expect("batch resolution request should decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn invocation_input_request_round_trips_with_opaque_payload() {
+        let request = Request::InvocationInput {
+            session_id: SessionId::new(),
+            input: bcode_tool::ToolInvocationInput {
+                invocation_id: "call-2".to_owned(),
+                input_id: "resize-132x40".to_owned(),
+                producer_id: "bcode.shell".to_owned(),
+                schema: "bcode.shell.invocation-input".to_owned(),
+                schema_version: 1,
+                payload: serde_json::json!({
+                    "unknown": {"nested": [1, 2, 3]},
+                }),
+            },
+        };
+        let encoded = encode_request(&request).expect("invocation input request should encode");
+        let decoded = decode_request(&encoded).expect("invocation input request should decode");
         assert_eq!(decoded, request);
     }
 
@@ -2821,6 +2840,39 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 requested_at_ms: Some(2),
                 client_id: Some(ClientId::new()),
+            },
+            SessionEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-1".to_string(),
+                    contribution_id: "surface".to_string(),
+                    sequence: 4,
+                    producer_id: "future.producer".to_string(),
+                    schema: "future.unknown/schema".to_string(),
+                    schema_version: 77,
+                    operation: bcode_session_models::ToolContributionOperation::Append,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    payload: serde_json::json!({"opaque": [1, {"future": true}]}),
+                },
+            },
+            SessionEventKind::ToolExchangeRequested {
+                request: bcode_session_models::ToolExchangeRequest {
+                    invocation_id: "call-1".to_string(),
+                    exchange_id: "question".to_string(),
+                    producer_id: "future.producer".to_string(),
+                    schema: "future.question/schema".to_string(),
+                    schema_version: 77,
+                    payload: serde_json::json!({"opaque": "request"}),
+                    response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                },
+            },
+            SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: "call-1".to_string(),
+                    exchange_id: "question".to_string(),
+                    resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                        payload: serde_json::json!({"opaque": "response"}),
+                    },
+                },
             },
             SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::Started {
