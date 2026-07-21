@@ -159,6 +159,12 @@ fn apply_tool_invocation_stream_projection_event(
     event: &ToolInvocationStreamEvent,
 ) {
     let tool_call_id = tool_projection_stream_tool_call_id(event);
+    if projections
+        .get(tool_call_id)
+        .is_some_and(|projection| projection.status == ToolInvocationProjectionStatus::Finished)
+    {
+        return;
+    }
     let projection = tool_invocation_projection_mut(projections, tool_call_id);
     match event {
         ToolInvocationStreamEvent::Started {
@@ -2087,6 +2093,53 @@ mod tests {
             WorkId::new(format!("model_{session_id}-42"))
         );
         assert_eq!(receipt.accepted_event_sequence, 42);
+    }
+
+    #[test]
+    fn late_stream_events_cannot_revive_finished_tool_projection() {
+        let session_id = SessionId::new();
+        let mut projections = BTreeMap::new();
+        let session_event = |sequence, kind| SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        apply_tool_invocation_projection_event(
+            &mut projections,
+            &session_event(
+                1,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_owned(),
+                    result: "done".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ),
+        );
+        apply_tool_invocation_projection_event(
+            &mut projections,
+            &session_event(
+                2,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "call-1".to_owned(),
+                        stream: ToolOutputStream::Stdout,
+                        sequence: 2,
+                        text: "late".to_owned(),
+                        byte_len: 4,
+                    },
+                },
+            ),
+        );
+
+        let projection = projections.get("call-1").expect("projection");
+        assert_eq!(projection.status, ToolInvocationProjectionStatus::Finished);
+        assert_eq!(projection.result_text.as_deref(), Some("done"));
+        assert!(projection.stream_output.is_none());
     }
 
     #[test]

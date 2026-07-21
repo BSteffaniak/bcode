@@ -1216,6 +1216,58 @@ mod tests {
     }
 
     #[test]
+    fn web_projection_keeps_active_sibling_and_does_not_revive_terminal_work() {
+        let session_id = SessionId::new();
+        let first = bcode_session_models::WorkId::new("work-first");
+        let second = bcode_session_models::WorkId::new("work-second");
+        let mut view = SessionView::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let started = |work_id: bcode_session_models::WorkId, label: &str| {
+            bcode_session_models::SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind: bcode_session_models::RuntimeWorkKind::Tool,
+                label: label.to_owned(),
+                tool_call_id: None,
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(1),
+                cancellable: true,
+            }
+        };
+        view.apply_event(&event(1, started(first.clone(), "first")));
+        view.apply_event(&event(2, started(second.clone(), "second")));
+        view.apply_event(&event(
+            3,
+            bcode_session_models::SessionEventKind::RuntimeWorkFinished {
+                work_id: first.clone(),
+                status: bcode_session_models::RuntimeWorkStatus::Completed,
+                finished_at_ms: Some(3),
+                message: None,
+            },
+        ));
+        view.apply_event(&event(4, started(first, "revived-marker-unique")));
+
+        let snapshot = view.snapshot();
+        assert_eq!(snapshot.runtime_work.len(), 1);
+        assert_eq!(snapshot.runtime_work[0].work_id, second);
+        let rendered = format!(
+            "{:?}",
+            bcode_web_render_ui::pages::home::home(snapshot, &[], "token")
+        );
+        assert!(rendered.contains("work-second"));
+        assert!(!rendered.contains("revived-marker-unique"));
+    }
+
+    #[test]
     fn projection_window_metadata_populates_history_availability() {
         let mut snapshot = SessionViewSnapshot::empty();
         let window = ProjectionWindow {

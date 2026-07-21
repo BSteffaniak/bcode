@@ -24560,6 +24560,52 @@ library = "test"
     }
 
     #[test]
+    fn runtime_work_activity_is_excluded_from_model_context() {
+        let session_id = SessionId::new();
+        let work_id = WorkId::new("tool-call-1");
+        for (sequence, kind) in [
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: work_id.clone(),
+                kind: RuntimeWorkKind::Tool,
+                label: "running tool".to_owned(),
+                tool_call_id: Some("call-1".to_owned()),
+                plugin_id: Some("example.plugin".to_owned()),
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(1),
+                cancellable: true,
+            },
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: work_id.clone(),
+                message: "two siblings active".to_owned(),
+                completed_units: Some(1),
+                total_units: Some(2),
+                progress_at_ms: Some(2),
+            },
+            SessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status: RuntimeWorkStatus::Completed,
+                finished_at_ms: Some(3),
+                message: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = bcode_session_models::SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: u64::try_from(sequence).unwrap_or(u64::MAX),
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind,
+            };
+            assert!(non_tool_session_event_to_model_message(&event).is_none());
+        }
+    }
+
+    #[test]
     fn plugin_status_notes_are_excluded_from_model_context() {
         let event = bcode_session_models::SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,

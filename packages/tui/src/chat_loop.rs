@@ -1263,6 +1263,11 @@ fn apply_cancel_runtime_work_result(
     }
 }
 
+fn refresh_permissions_after_cancellation(loop_state: &mut ChatLoopState) {
+    loop_state.abort_matching_effect(&TuiEffect::ListPermissions);
+    loop_state.replace_effect(TuiEffect::ListPermissions);
+}
+
 fn close_permission_dialog_for_session(
     permission_dialog: &mut Option<PermissionDialogState>,
     session_id: bcode_session_models::SessionId,
@@ -1284,12 +1289,14 @@ fn apply_cancel_turn_result(
     match result {
         Ok(true) if Some(session_id) == chat.app.session_id() => {
             close_permission_dialog_for_session(&mut loop_state.permission_dialog, session_id);
+            refresh_permissions_after_cancellation(loop_state);
             chat.app.set_cancelling();
             chat.app
                 .set_status("turn cancellation requested".to_owned());
         }
         Ok(false) if Some(session_id) == chat.app.session_id() => {
             close_permission_dialog_for_session(&mut loop_state.permission_dialog, session_id);
+            refresh_permissions_after_cancellation(loop_state);
             chat.app.set_idle();
             chat.app.set_status("no active turn".to_owned());
         }

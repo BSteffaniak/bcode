@@ -22,7 +22,7 @@ use bcode_session_view_models::{
     ToolInvocationViewStatus, ToolOutputView, ToolResultView, ToolTimingView, TranscriptViewItem,
     TranscriptViewItemId, TranscriptViewItemKind,
 };
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 /// Renderer-neutral session view projection.
 #[derive(Debug, Clone)]
@@ -31,6 +31,7 @@ pub struct SessionView {
     tool_item_ids: BTreeMap<String, TranscriptViewItemId>,
     interaction_item_ids: BTreeMap<String, TranscriptViewItemId>,
     tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
+    terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
 }
 
 impl Default for SessionView {
@@ -48,6 +49,7 @@ impl SessionView {
             tool_item_ids: BTreeMap::new(),
             interaction_item_ids: BTreeMap::new(),
             tool_invocation_projections: BTreeMap::new(),
+            terminal_runtime_work: BTreeSet::new(),
         }
     }
 
@@ -623,6 +625,9 @@ impl SessionView {
                 started_at_ms,
                 ..
             } => {
+                if self.terminal_runtime_work.contains(work_id) {
+                    return;
+                }
                 self.upsert_runtime_work(bcode_session_view_models::RuntimeWorkView {
                     work_id: work_id.clone(),
                     status: bcode_session_models::RuntimeWorkStatus::Running,
@@ -639,6 +644,9 @@ impl SessionView {
                 completed_units,
                 total_units,
             } => {
+                if self.terminal_runtime_work.contains(work_id) {
+                    return;
+                }
                 self.upsert_runtime_work(bcode_session_view_models::RuntimeWorkView {
                     work_id: work_id.clone(),
                     status: self
@@ -660,6 +668,9 @@ impl SessionView {
                 requested_at_ms,
                 ..
             } => {
+                if self.terminal_runtime_work.contains(work_id) {
+                    return;
+                }
                 self.upsert_runtime_work(bcode_session_view_models::RuntimeWorkView {
                     work_id: work_id.clone(),
                     status: bcode_session_models::RuntimeWorkStatus::Cancelling,
@@ -676,7 +687,10 @@ impl SessionView {
                 finished_at_ms,
                 ..
             } => {
-                self.upsert_runtime_work(bcode_session_view_models::RuntimeWorkView {
+                if !self.terminal_runtime_work.insert(work_id.clone()) {
+                    return;
+                }
+                self.finish_runtime_work(bcode_session_view_models::RuntimeWorkView {
                     work_id: work_id.clone(),
                     status: *status,
                     message: message.clone(),
@@ -921,6 +935,33 @@ impl SessionView {
             return;
         }
         self.bump_revision();
+    }
+
+    fn finish_runtime_work(&mut self, work: bcode_session_view_models::RuntimeWorkView) {
+        self.snapshot
+            .runtime_work
+            .retain(|active| active.work_id != work.work_id);
+        let id = TranscriptViewItemId::runtime_work(&work.work_id);
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            item.kind = TranscriptViewItemKind::RuntimeWork { work };
+            item.revision = item.revision.saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        } else {
+            self.push_item(
+                id,
+                0,
+                work.updated_at_ms,
+                false,
+                TranscriptViewItemKind::RuntimeWork { work },
+            );
+        }
     }
 
     fn upsert_interaction_item(
@@ -1913,6 +1954,124 @@ mod tests {
         let tool = view.snapshot().tools.get("tool-1").expect("tool");
         assert_eq!(tool.status, ToolInvocationViewStatus::Finished);
         assert_eq!(tool.result_text.as_deref(), Some("durable output"));
+    }
+
+    #[test]
+    fn runtime_work_terminal_state_leaves_sibling_active_and_rejects_late_revival() {
+        let session_id = SessionId::new();
+        let first = bcode_session_models::WorkId::new("work-1");
+        let second = bcode_session_models::WorkId::new("work-2");
+        let started = |work_id: bcode_session_models::WorkId, label: &str| {
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind: bcode_session_models::RuntimeWorkKind::Tool,
+                label: label.to_owned(),
+                tool_call_id: None,
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(10),
+                cancellable: true,
+            }
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&event(session_id, 1, started(first.clone(), "first")));
+        view.apply_event(&event(session_id, 2, started(second.clone(), "second")));
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::RuntimeWorkFinished {
+                work_id: first.clone(),
+                status: bcode_session_models::RuntimeWorkStatus::Completed,
+                finished_at_ms: Some(30),
+                message: Some("done".to_owned()),
+            },
+        ));
+
+        assert_eq!(view.snapshot().runtime_work.len(), 1);
+        assert_eq!(view.snapshot().runtime_work[0].work_id, second);
+        assert!(view.snapshot().transcript.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TranscriptViewItemKind::RuntimeWork { work }
+                    if work.work_id == first
+                        && work.status == bcode_session_models::RuntimeWorkStatus::Completed
+            )
+        }));
+
+        view.apply_event(&event(session_id, 4, started(first.clone(), "late")));
+        view.apply_event(&event(
+            session_id,
+            5,
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: first,
+                message: "late progress".to_owned(),
+                completed_units: None,
+                total_units: None,
+                progress_at_ms: Some(50),
+            },
+        ));
+        assert_eq!(view.snapshot().runtime_work.len(), 1);
+        assert_eq!(view.snapshot().runtime_work[0].work_id, second);
+
+        let cancelled = bcode_session_models::WorkId::new("work-cancelled");
+        view.apply_event(&event(
+            session_id,
+            6,
+            started(cancelled.clone(), "cancelled"),
+        ));
+        view.apply_event(&event(
+            session_id,
+            7,
+            SessionEventKind::RuntimeWorkFinished {
+                work_id: cancelled.clone(),
+                status: bcode_session_models::RuntimeWorkStatus::Cancelled,
+                finished_at_ms: Some(70),
+                message: None,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            8,
+            started(cancelled.clone(), "late cancelled"),
+        ));
+        assert_eq!(view.snapshot().runtime_work.len(), 1);
+        assert_eq!(view.snapshot().runtime_work[0].work_id, second);
+        assert!(view.snapshot().transcript.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TranscriptViewItemKind::RuntimeWork { work }
+                    if work.work_id == cancelled
+                        && work.status == bcode_session_models::RuntimeWorkStatus::Cancelled
+            )
+        }));
+    }
+
+    #[test]
+    fn terminal_runtime_work_without_visible_start_is_history_only() {
+        let session_id = SessionId::new();
+        let work_id = bcode_session_models::WorkId::new("work-terminal-only");
+        let mut view = SessionView::new();
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::RuntimeWorkFinished {
+                work_id: work_id.clone(),
+                status: bcode_session_models::RuntimeWorkStatus::Completed,
+                finished_at_ms: Some(10),
+                message: Some("complete".to_owned()),
+            },
+        ));
+
+        assert!(view.snapshot().runtime_work.is_empty());
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::RuntimeWork { work }
+                if work.work_id == work_id
+                    && work.status == bcode_session_models::RuntimeWorkStatus::Completed
+        ));
     }
 
     #[test]

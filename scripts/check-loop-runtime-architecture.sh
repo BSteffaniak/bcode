@@ -413,6 +413,16 @@ if ! grep -F '# Scheduler invariants' packages/agent-runtime/src/lib.rs >/dev/nu
   violations=1
 fi
 
+if ! grep -F 'aggregate_activity_remains_until_last_sibling_and_late_start_is_ignored' packages/tui/src/runtime_work_view.rs >/dev/null ||
+   ! grep -F 'runtime_work_terminal_state_leaves_sibling_active_and_rejects_late_revival' packages/session-view/src/lib.rs >/dev/null ||
+   ! grep -F 'terminal_runtime_work_without_visible_start_is_history_only' packages/session-view/src/lib.rs >/dev/null ||
+   ! grep -F 'web_projection_keeps_active_sibling_and_does_not_revive_terminal_work' packages/web-render/src/lib.rs >/dev/null ||
+   ! grep -F 'runtime_work_activity_is_excluded_from_model_context' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'late_stream_events_cannot_revive_finished_tool_projection' packages/session/models/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: grouped activity or terminal late-event suppression coverage was removed." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi
