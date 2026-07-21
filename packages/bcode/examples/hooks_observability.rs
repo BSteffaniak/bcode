@@ -1,6 +1,6 @@
 use bcode::{
-    Action, Agent, AgentConfig, AgentEvent, AgentStreamItem, BcodeError, ModelCallContext,
-    ModelProviderInvoker, PermissionDecision, RuntimeFuture, ToolCall, ToolCallContext,
+    Action, Agent, AgentConfig, AgentEvent, BcodeError, ModelCallContext, ModelProviderInvoker,
+    PermissionDecision, RuntimeFuture, TextStreamItem, ToolCall, ToolCallContext,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -180,12 +180,13 @@ async fn main() -> bcode::Result<()> {
         agent.stream_text_with_provider(ExampleProvider::text("streamed trace"), "trace streaming");
     while let Some(item) = stream.next().await {
         match item {
-            AgentStreamItem::Event(event) => println!("stream event: {event:?}"),
-            AgentStreamItem::Finished(response) => {
-                println!("stream finished: {}ms", response.latency_ms);
+            TextStreamItem::Event(event) => println!("stream event: {event:?}"),
+            TextStreamItem::ScopedEvent(event) => println!("scoped stream event: {event:?}"),
+            TextStreamItem::Finished(response) => {
+                println!("stream finished: {}ms", response.runtime.latency_ms);
                 break;
             }
-            AgentStreamItem::Error(error) => return Err(error.into()),
+            TextStreamItem::Error(error) => return Err(error),
         }
     }
 

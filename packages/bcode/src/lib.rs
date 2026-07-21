@@ -26,11 +26,15 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 #[cfg(feature = "embedded-plugins")]
 use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
 use bcode_session_models::SessionId;
+use futures::Stream;
+use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -40,10 +44,11 @@ pub use bcode_agent_profile::{AgentDecision, EvaluateToolCallResponse};
 pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
     AgentRuntimeStreamItem as AgentStreamItem, AgentTurnRequest, AgentTurnResponse, AllowAllPolicy,
-    CancellationToken, ModelProviderInvoker, PermissionDecision, PermissionPolicy,
-    ProviderRoundPlan, ProviderRoundPlanContext, ProviderRoundPlanner, RegisteredTool,
-    RuntimeError, RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
-    ToolExecutionOutput, ToolRoundObserver, ToolRoundState, ToolSource, UnifiedToolCatalog,
+    CancellationToken, DEFAULT_STREAM_BUFFER_CAPACITY, ModelProviderInvoker, PermissionDecision,
+    PermissionPolicy, ProviderRoundPlan, ProviderRoundPlanContext, ProviderRoundPlanner,
+    RegisteredTool, RuntimeError, RuntimeFuture, RuntimePermissionContext,
+    RuntimePermissionRequest, ToolCatalog, ToolExecutionOutput, ToolRoundObserver, ToolRoundState,
+    ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_agent_runtime::{
     ArtifactCommitGuard, HostTurnEventSink, InvocationArtifactSink, InvocationCapabilities,
@@ -710,22 +715,47 @@ impl StreamTextBuilder {
         self
     }
 
+    /// Configure ordered provider/model fallbacks for this streaming request.
+    #[must_use]
+    pub fn fallback_policy(mut self, policy: FallbackPolicy) -> Self {
+        self.agent = self.agent.fallback_policy(policy);
+        self
+    }
+
+    /// Configure bounded cancellation-aware retries for this streaming request.
+    #[must_use]
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.agent = self.agent.retry_policy(policy);
+        self
+    }
+
+    /// Append model request/response middleware for this streaming request.
+    ///
+    /// Request middleware runs before provider startup. Response middleware runs on the terminal
+    /// response without buffering or rewriting already emitted deltas.
+    #[must_use]
+    pub fn middleware_layer<M>(mut self, middleware: M) -> Self
+    where
+        M: ModelMiddleware + 'static,
+    {
+        self.agent = self.agent.middleware_layer(middleware);
+        self
+    }
+
     /// Run the request with a caller-supplied provider.
     #[must_use]
-    pub fn run<P>(self, provider: P) -> AgentStream
+    pub fn run<P>(self, provider: P) -> TextStream
     where
         P: ModelProviderInvoker + 'static,
     {
         let agent = self.agent.build();
-        agent.runtime.run_streaming_text_turn(
-            provider,
-            agent.turn_request_with_structured_output_messages_and_cancellation(
-                self.prompt,
-                None,
-                self.messages,
-                self.cancellation,
-            ),
-        )
+        let request = agent.turn_request_with_structured_output_messages_and_cancellation(
+            self.prompt,
+            None,
+            self.messages,
+            self.cancellation,
+        );
+        TextStream::start(&agent, provider, request)
     }
 }
 
@@ -733,6 +763,113 @@ impl StreamTextBuilder {
 #[must_use]
 pub fn stream_text_builder() -> StreamTextBuilder {
     StreamTextBuilder::new()
+}
+
+/// Item produced by the high-level text stream.
+#[derive(Debug)]
+pub enum TextStreamItem {
+    /// Normalized provider/runtime event.
+    Event(AgentEvent),
+    /// Non-runtime scoped event from tool invocation lifecycle or renderer-neutral contributions.
+    ScopedEvent(ScopedTurnEvent),
+    /// Final response after response middleware and after-model hooks complete.
+    Finished(GenerateTextResponse),
+    /// SDK or runtime error that terminated the stream.
+    Error(BcodeError),
+}
+
+struct TextStreamFinalizer {
+    request: AgentTurnRequest,
+    context: ModelCallContext,
+    middleware: ModelMiddlewareStack,
+    hooks: AgentHooks,
+}
+
+pin_project! {
+    /// High-level text stream with SDK middleware, hooks, tools, and retry/fallback semantics.
+    ///
+    /// This adapts the canonical scoped provider/tool stream. Runtime events remain available as
+    /// [`TextStreamItem::Event`], while invocation lifecycle and contribution events are retained
+    /// as [`TextStreamItem::ScopedEvent`]. Configured response caches are deliberately bypassed
+    /// because replaying a completed response cannot reproduce trustworthy stream timing or tool
+    /// lifecycle.
+    pub struct TextStream {
+        #[pin]
+        stream: Option<ScopedAgentStream>,
+    }
+}
+
+impl fmt::Debug for TextStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TextStream")
+            .field("active", &self.stream.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TextStream {
+    fn start<P>(agent: &Agent, provider: P, request: AgentTurnRequest) -> Self
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        Self {
+            stream: Some(agent.stream_request(provider, request)),
+        }
+    }
+
+    /// Receive the next high-level text stream item.
+    ///
+    /// This convenience method is equivalent to `futures::StreamExt::next` and does not require
+    /// importing the extension trait.
+    pub async fn next(&mut self) -> Option<TextStreamItem> {
+        let item = self.stream.as_mut()?.next().await?;
+        let terminal = matches!(
+            item,
+            ScopedAgentStreamItem::Finished(_) | ScopedAgentStreamItem::Error(_)
+        );
+        let item = text_stream_item(item);
+        if terminal {
+            self.stream = None;
+        }
+        Some(item)
+    }
+}
+
+impl Stream for TextStream {
+    type Item = TextStreamItem;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        let item = match this.stream.as_mut().as_pin_mut() {
+            Some(stream) => match stream.poll_next(context) {
+                Poll::Ready(Some(item)) => item,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            },
+            None => return Poll::Ready(None),
+        };
+        let terminal = matches!(
+            item,
+            ScopedAgentStreamItem::Finished(_) | ScopedAgentStreamItem::Error(_)
+        );
+        let item = text_stream_item(item);
+        if terminal {
+            this.stream.set(None);
+        }
+        Poll::Ready(Some(item))
+    }
+}
+
+fn text_stream_item(item: ScopedAgentStreamItem) -> TextStreamItem {
+    match item {
+        ScopedAgentStreamItem::Event(ScopedTurnEvent::Runtime(event)) => {
+            TextStreamItem::Event(event)
+        }
+        ScopedAgentStreamItem::Event(event) => TextStreamItem::ScopedEvent(event),
+        ScopedAgentStreamItem::Finished(response) => TextStreamItem::Finished(response),
+        ScopedAgentStreamItem::Error(error) => TextStreamItem::Error(error),
+    }
 }
 
 /// Builder for structured object generation requests.
@@ -949,12 +1086,20 @@ pub fn generate_object_builder<T>() -> GenerateObjectBuilder<T> {
 pub enum ObjectStreamItem<T> {
     /// Raw assistant text delta from the provider.
     RawDelta(String),
-    /// Parsed partial JSON object state from the accumulated stream buffer.
+    /// Parsed best-effort JSON object state reconstructed from the accumulated stream buffer.
+    ///
+    /// Incomplete object/string/array delimiters are closed only when the strict JSON parser
+    /// reports an end-of-input error. Syntactically invalid prefixes are never repaired into a
+    /// partial value. A value is emitted only when it differs from the prior partial value.
     Partial(serde_json::Value),
     /// Parsed partial JSON object state that currently satisfies the configured schema.
+    ///
+    /// A value is emitted only when it differs from the prior validated partial value.
     ValidatedPartial(serde_json::Value),
     /// Non-text runtime event forwarded from the underlying model stream.
     Event(AgentEvent),
+    /// Non-runtime scoped event forwarded from tool invocation lifecycle or contributions.
+    ScopedEvent(ScopedTurnEvent),
     /// Final typed object and the completed runtime response metadata.
     Finished {
         /// Decoded structured object.
@@ -966,57 +1111,129 @@ pub enum ObjectStreamItem<T> {
     Error(BcodeError),
 }
 
-/// Typed asynchronous stream of structured object events.
-#[derive(Debug)]
-pub struct ObjectStream<T> {
-    stream: AgentStream,
-    schema: serde_json::Value,
-    buffer: String,
-    pending: VecDeque<ObjectStreamItem<T>>,
+pin_project! {
+    /// Typed asynchronous stream of structured object events.
+    #[derive(Debug)]
+    pub struct ObjectStream<T> {
+        #[pin]
+        stream: Option<TextStream>,
+        schema: serde_json::Value,
+        buffer: String,
+        last_partial: Option<serde_json::Value>,
+        last_validated_partial: Option<serde_json::Value>,
+        pending: VecDeque<ObjectStreamItem<T>>,
+    }
 }
 
 impl<T> ObjectStream<T>
 where
     T: DeserializeOwned,
 {
+    fn accept_stream_item(&mut self, item: TextStreamItem) {
+        accept_object_stream_item(
+            &self.schema,
+            &mut self.buffer,
+            &mut self.last_partial,
+            &mut self.last_validated_partial,
+            &mut self.pending,
+            item,
+        );
+    }
+
     /// Receive the next structured object stream item.
+    ///
+    /// This convenience method is equivalent to `futures::StreamExt::next` and does not require
+    /// importing the extension trait.
     pub async fn next(&mut self) -> Option<ObjectStreamItem<T>> {
         if let Some(item) = self.pending.pop_front() {
             return Some(item);
         }
         loop {
-            match self.stream.next().await? {
-                AgentStreamItem::Event(AgentEvent::TextDelta(delta)) => {
-                    self.buffer.push_str(&delta);
-                    self.pending.push_back(ObjectStreamItem::RawDelta(delta));
-                    if let Some(value) = json_value_from_text(&self.buffer) {
-                        self.pending
-                            .push_back(ObjectStreamItem::Partial(value.clone()));
-                        if validate_json_schema(&self.schema, &value).is_ok() {
-                            self.pending
-                                .push_back(ObjectStreamItem::ValidatedPartial(value));
-                        }
-                    }
-                }
-                AgentStreamItem::Event(event) => {
-                    self.pending.push_back(ObjectStreamItem::Event(event));
-                }
-                AgentStreamItem::Finished(response) => {
-                    let response = GenerateTextResponse::from(response);
-                    match decode_structured_output(&self.schema, &response.text) {
-                        Ok(object) => self
-                            .pending
-                            .push_back(ObjectStreamItem::Finished { object, response }),
-                        Err(error) => self.pending.push_back(ObjectStreamItem::Error(error)),
-                    }
-                }
-                AgentStreamItem::Error(error) => self
-                    .pending
-                    .push_back(ObjectStreamItem::Error(BcodeError::Runtime(error))),
-            }
+            let item = self.stream.as_mut()?.next().await?;
+            self.accept_stream_item(item);
             if let Some(item) = self.pending.pop_front() {
                 return Some(item);
             }
+        }
+    }
+}
+
+impl<T> Stream for ObjectStream<T>
+where
+    T: DeserializeOwned,
+{
+    type Item = ObjectStreamItem<T>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if let Some(item) = this.pending.pop_front() {
+            return Poll::Ready(Some(item));
+        }
+        loop {
+            let item = match this.stream.as_mut().as_pin_mut() {
+                Some(stream) => match stream.poll_next(context) {
+                    Poll::Ready(Some(item)) => item,
+                    Poll::Ready(None) => return Poll::Ready(None),
+                    Poll::Pending => return Poll::Pending,
+                },
+                None => return Poll::Ready(None),
+            };
+            accept_object_stream_item(
+                this.schema,
+                this.buffer,
+                this.last_partial,
+                this.last_validated_partial,
+                this.pending,
+                item,
+            );
+            if let Some(item) = this.pending.pop_front() {
+                return Poll::Ready(Some(item));
+            }
+        }
+    }
+}
+
+fn accept_object_stream_item<T>(
+    schema: &serde_json::Value,
+    buffer: &mut String,
+    last_partial: &mut Option<serde_json::Value>,
+    last_validated_partial: &mut Option<serde_json::Value>,
+    pending: &mut VecDeque<ObjectStreamItem<T>>,
+    item: TextStreamItem,
+) where
+    T: DeserializeOwned,
+{
+    match item {
+        TextStreamItem::Event(AgentEvent::TextDelta(delta)) => {
+            buffer.push_str(&delta);
+            pending.push_back(ObjectStreamItem::RawDelta(delta));
+            if let Some(value) = json_value_from_text(buffer) {
+                if last_partial.as_ref() != Some(&value) {
+                    pending.push_back(ObjectStreamItem::Partial(value.clone()));
+                    *last_partial = Some(value.clone());
+                }
+                if validate_json_schema(schema, &value).is_ok()
+                    && last_validated_partial.as_ref() != Some(&value)
+                {
+                    pending.push_back(ObjectStreamItem::ValidatedPartial(value.clone()));
+                    *last_validated_partial = Some(value);
+                }
+            }
+        }
+        TextStreamItem::Event(event) => {
+            pending.push_back(ObjectStreamItem::Event(event));
+        }
+        TextStreamItem::ScopedEvent(event) => {
+            pending.push_back(ObjectStreamItem::ScopedEvent(event));
+        }
+        TextStreamItem::Finished(response) => {
+            match decode_structured_output(schema, &response.text) {
+                Ok(object) => pending.push_back(ObjectStreamItem::Finished { object, response }),
+                Err(error) => pending.push_back(ObjectStreamItem::Error(error)),
+            }
+        }
+        TextStreamItem::Error(error) => {
+            pending.push_back(ObjectStreamItem::Error(error));
         }
     }
 }
@@ -1135,6 +1352,19 @@ impl<T> StreamObjectBuilder<T> {
         self
     }
 
+    /// Append model request/response middleware for this structured stream.
+    ///
+    /// Request middleware runs before provider startup. Response middleware runs on the terminal
+    /// response before final schema validation and decoding, without buffering raw deltas.
+    #[must_use]
+    pub fn middleware_layer<M>(mut self, middleware: M) -> Self
+    where
+        M: ModelMiddleware + 'static,
+    {
+        self.agent = self.agent.middleware_layer(middleware);
+        self
+    }
+
     /// Run the request with a caller-supplied provider and schema derived from `T`.
     #[must_use]
     pub fn run<P>(self, provider: P) -> ObjectStream<T>
@@ -1161,27 +1391,39 @@ impl<T> StreamObjectBuilder<T> {
             name,
             schema,
             strict,
-            max_repairs: _,
+            max_repairs,
         } = options;
+        if max_repairs > 0 {
+            return ObjectStream {
+                stream: None,
+                schema,
+                buffer: String::new(),
+                last_partial: None,
+                last_validated_partial: None,
+                pending: VecDeque::from([ObjectStreamItem::Error(
+                    BcodeError::StructuredStreamingRepairsUnsupported { max_repairs },
+                )]),
+            };
+        }
         let structured_output = bcode_model::StructuredOutputRequest {
             name,
             schema: schema.clone(),
             strict,
         };
         let agent = self.agent.build();
-        let stream = agent.runtime.run_streaming_text_turn(
-            provider,
-            agent.turn_request_with_structured_output_messages_and_cancellation(
-                prompt,
-                Some(structured_output),
-                self.messages,
-                self.cancellation,
-            ),
+        let request = agent.turn_request_with_structured_output_messages_and_cancellation(
+            prompt,
+            Some(structured_output),
+            self.messages,
+            self.cancellation,
         );
+        let stream = TextStream::start(&agent, provider, request);
         ObjectStream {
-            stream,
+            stream: Some(stream),
             schema,
             buffer: String::new(),
+            last_partial: None,
+            last_validated_partial: None,
             pending: VecDeque::new(),
         }
     }
@@ -1269,7 +1511,7 @@ where
 /// This is the smallest lean-core streaming helper. It returns normalized [`AgentStreamItem`]
 /// values and does not launch the TUI, require the daemon, or enable app/bundled-plugin features.
 #[must_use]
-pub fn stream_text<P>(provider: P, prompt: impl Into<String>) -> AgentStream
+pub fn stream_text<P>(provider: P, prompt: impl Into<String>) -> TextStream
 where
     P: ModelProviderInvoker + 'static,
 {
@@ -1345,7 +1587,7 @@ pub fn stream_text_with_model<P>(
     provider: P,
     model: impl Into<ModelSelector>,
     prompt: impl Into<String>,
-) -> AgentStream
+) -> TextStream
 where
     P: ModelProviderInvoker + 'static,
 {
@@ -1421,6 +1663,16 @@ pub enum BcodeError {
     /// Structured output repair attempts were exhausted.
     #[error("structured output repair exhausted: {0}")]
     StructuredRepairExhausted(String),
+    /// Structured output repair attempts are not supported for event-native streaming because a
+    /// failed final value cannot be retried without retracting already-visible deltas. Configure
+    /// zero repairs (the default), or use [`GenerateObjectBuilder`] for buffered repair attempts.
+    #[error(
+        "structured output streaming does not support {max_repairs} repair attempts; use generate_object_builder for buffered repairs"
+    )]
+    StructuredStreamingRepairsUnsupported {
+        /// Requested number of repair attempts.
+        max_repairs: u32,
+    },
     /// Session persistence failed.
     #[error("session persistence error: {0}")]
     SessionPersistence(String),
@@ -1586,6 +1838,10 @@ pub trait ModelMiddleware: Send + Sync {
 
     /// Inspect, transform, or reject a successful model response.
     ///
+    /// `response.text` is the canonical transformed assistant text. After all response middleware
+    /// completes, Bcode synchronizes `response.runtime.text` and rebuilds ordered steps from the
+    /// retained runtime events plus that canonical text.
+    ///
     /// # Errors
     ///
     /// Returns an error to replace the successful response with a middleware failure.
@@ -1652,6 +1908,8 @@ impl ModelMiddlewareStack {
         for middleware in self.middleware.iter().rev() {
             response = middleware.after_response(request, response)?;
         }
+        response.runtime.text.clone_from(&response.text);
+        response.steps = generation_steps(&response.runtime);
         Ok(response)
     }
 }
@@ -1828,6 +2086,34 @@ impl InvocationExchangeBroker for HeadlessExchangePolicy {
     }
 }
 
+fn finish_text_response(
+    finalizer: &mut Option<TextStreamFinalizer>,
+    response: AgentTurnResponse,
+) -> TextStreamItem {
+    let Some(finalizer) = finalizer.take() else {
+        return TextStreamItem::Error(BcodeError::Hook(
+            "text stream terminal response was finalized more than once".to_string(),
+        ));
+    };
+    let response = GenerateTextResponse::from(response);
+    let response = finalizer
+        .middleware
+        .after_response(&finalizer.request, response)
+        .and_then(|response| {
+            finalizer.hooks.run_after_model(
+                &finalizer.context,
+                &ModelCallOutcome {
+                    response: response.clone(),
+                },
+            )?;
+            Ok(response)
+        });
+    match response {
+        Ok(response) => TextStreamItem::Finished(response),
+        Err(error) => TextStreamItem::Error(error),
+    }
+}
+
 /// Item produced by the generic scoped agent stream.
 #[derive(Debug)]
 pub enum ScopedAgentStreamItem {
@@ -1839,29 +2125,127 @@ pub enum ScopedAgentStreamItem {
     Error(BcodeError),
 }
 
-/// Generic stream for one complete provider/tool turn across every scoped event family.
-#[derive(Debug)]
-pub struct ScopedAgentStream {
-    stream: bcode_agent_runtime::AgentLoopStream,
-    observer: Arc<SdkToolRoundObserver>,
+pin_project! {
+    /// Generic stream for one complete provider/tool turn across every scoped event family.
+    pub struct ScopedAgentStream {
+        #[pin]
+        stream: Option<bcode_agent_runtime::AgentLoopStream>,
+        observer: Arc<SdkToolRoundObserver>,
+        finalizer: Option<TextStreamFinalizer>,
+        pending: Option<ScopedAgentStreamItem>,
+    }
+}
+
+impl fmt::Debug for ScopedAgentStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopedAgentStream")
+            .field("active", &self.stream.is_some())
+            .field("pending", &self.pending.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ScopedAgentStream {
-    /// Receive the next scoped stream item.
-    pub async fn next(&mut self) -> Option<ScopedAgentStreamItem> {
-        self.stream.next().await.map(|item| match item {
+    fn map_item(
+        &mut self,
+        item: bcode_agent_runtime::AgentLoopStreamItem,
+    ) -> ScopedAgentStreamItem {
+        match item {
             bcode_agent_runtime::AgentLoopStreamItem::Event(event) => {
                 ScopedAgentStreamItem::Event(event)
             }
             bcode_agent_runtime::AgentLoopStreamItem::Finished(response) => {
-                ScopedAgentStreamItem::Finished(response.into())
+                match finish_text_response(&mut self.finalizer, response) {
+                    TextStreamItem::Finished(response) => ScopedAgentStreamItem::Finished(response),
+                    TextStreamItem::Error(error) => ScopedAgentStreamItem::Error(error),
+                    TextStreamItem::Event(_) | TextStreamItem::ScopedEvent(_) => {
+                        unreachable!("finalization cannot produce an event")
+                    }
+                }
             }
-            bcode_agent_runtime::AgentLoopStreamItem::Error(error) => ScopedAgentStreamItem::Error(
-                self.observer
-                    .take_error()
-                    .unwrap_or(BcodeError::Runtime(error)),
-            ),
-        })
+            bcode_agent_runtime::AgentLoopStreamItem::Error(error) => {
+                self.finalizer = None;
+                ScopedAgentStreamItem::Error(
+                    self.observer
+                        .take_error()
+                        .unwrap_or(BcodeError::Runtime(error)),
+                )
+            }
+        }
+    }
+
+    /// Receive the next scoped stream item.
+    ///
+    /// This convenience method is equivalent to `futures::StreamExt::next` and does not require
+    /// importing the extension trait.
+    pub async fn next(&mut self) -> Option<ScopedAgentStreamItem> {
+        if let Some(item) = self.pending.take() {
+            return Some(item);
+        }
+        let item = self.stream.as_mut()?.next().await?;
+        let item = self.map_item(item);
+        if matches!(
+            item,
+            ScopedAgentStreamItem::Finished(_) | ScopedAgentStreamItem::Error(_)
+        ) {
+            self.stream = None;
+        }
+        Some(item)
+    }
+}
+
+impl Stream for ScopedAgentStream {
+    type Item = ScopedAgentStreamItem;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if let Some(item) = this.pending.take() {
+            return Poll::Ready(Some(item));
+        }
+        let item = match this.stream.as_mut().as_pin_mut() {
+            Some(stream) => match stream.poll_next(context) {
+                Poll::Ready(Some(item)) => item,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            },
+            None => return Poll::Ready(None),
+        };
+        let item = map_scoped_stream_item(this.observer, this.finalizer, item);
+        if matches!(
+            item,
+            ScopedAgentStreamItem::Finished(_) | ScopedAgentStreamItem::Error(_)
+        ) {
+            this.stream.set(None);
+        }
+        Poll::Ready(Some(item))
+    }
+}
+
+fn map_scoped_stream_item(
+    observer: &SdkToolRoundObserver,
+    finalizer: &mut Option<TextStreamFinalizer>,
+    item: bcode_agent_runtime::AgentLoopStreamItem,
+) -> ScopedAgentStreamItem {
+    match item {
+        bcode_agent_runtime::AgentLoopStreamItem::Event(event) => {
+            ScopedAgentStreamItem::Event(event)
+        }
+        bcode_agent_runtime::AgentLoopStreamItem::Finished(response) => {
+            match finish_text_response(finalizer, response) {
+                TextStreamItem::Finished(response) => ScopedAgentStreamItem::Finished(response),
+                TextStreamItem::Error(error) => ScopedAgentStreamItem::Error(error),
+                TextStreamItem::Event(_) | TextStreamItem::ScopedEvent(_) => {
+                    unreachable!("finalization cannot produce an event")
+                }
+            }
+        }
+        bcode_agent_runtime::AgentLoopStreamItem::Error(error) => {
+            *finalizer = None;
+            ScopedAgentStreamItem::Error(
+                observer.take_error().unwrap_or(BcodeError::Runtime(error)),
+            )
+        }
     }
 }
 
@@ -1992,8 +2376,18 @@ fn json_object_slice(text: &str) -> Option<&str> {
 }
 
 fn json_value_from_text(text: &str) -> Option<serde_json::Value> {
-    let slice = json_object_slice(text)?;
-    serde_json::from_str(slice).ok()
+    if let Some(slice) = json_object_slice(text) {
+        return serde_json::from_str(slice).ok();
+    }
+    let start = text.find('{')?;
+    let partial = &text[start..];
+    let error = serde_json::from_str::<serde_json::Value>(partial).expect_err(
+        "a partial structured value without a closing object delimiter cannot be valid JSON",
+    );
+    if error.classify() != serde_json::error::Category::Eof {
+        return None;
+    }
+    serde_json::from_str(&partial_json_fixer::fix_json(partial)).ok()
 }
 
 fn validate_json_schema(schema: &serde_json::Value, value: &serde_json::Value) -> Result<()> {
@@ -3916,14 +4310,14 @@ impl Agent {
 
     /// Stream text using the agent's configured embedded provider.
     ///
-    /// The returned stream yields normalized [`AgentStreamItem`] values and does not require the
+    /// The returned stream yields high-level [`TextStreamItem`] values and does not require the
     /// TUI or daemon when an embedded plugin provider is configured.
     ///
     /// # Errors
     ///
     /// Returns an error when no embedded provider is configured.
     #[cfg(feature = "embedded-plugins")]
-    pub fn stream_text(&self, prompt: impl Into<String>) -> Result<AgentStream> {
+    pub fn stream_text(&self, prompt: impl Into<String>) -> Result<TextStream> {
         let provider: Box<dyn ModelProviderInvoker> = self.provider_factory.as_ref().map_or_else(
             || {
                 self.provider
@@ -3933,7 +4327,8 @@ impl Agent {
             },
             |factory| Ok(factory()),
         )?;
-        Ok(self.runtime.run_streaming_text_turn(
+        Ok(TextStream::start(
+            self,
             provider,
             self.turn_request_with_structured_output_messages_and_cancellation(
                 prompt.into(),
@@ -3950,13 +4345,14 @@ impl Agent {
     ///
     /// Returns an error when no provider factory is configured.
     #[cfg(not(feature = "embedded-plugins"))]
-    pub fn stream_text(&self, prompt: impl Into<String>) -> Result<AgentStream> {
+    pub fn stream_text(&self, prompt: impl Into<String>) -> Result<TextStream> {
         let provider = self
             .provider_factory
             .as_ref()
             .map(|factory| factory())
             .ok_or(BcodeError::MissingProvider)?;
-        Ok(self.runtime.run_streaming_text_turn(
+        Ok(TextStream::start(
+            self,
             provider,
             self.turn_request_with_structured_output_messages_and_cancellation(
                 prompt.into(),
@@ -3970,7 +4366,8 @@ impl Agent {
     /// Stream text using the agent's configured embedded provider and cancellation token.
     ///
     /// Cancelling the token requests provider cancellation and terminates the stream with a
-    /// [`RuntimeError::Cancelled`] item.
+    /// [`TextStreamItem::Error`] containing [`BcodeError::Runtime`] and
+    /// [`RuntimeError::Cancelled`].
     ///
     /// # Errors
     ///
@@ -3980,7 +4377,7 @@ impl Agent {
         &self,
         prompt: impl Into<String>,
         cancellation: CancellationToken,
-    ) -> Result<AgentStream> {
+    ) -> Result<TextStream> {
         let provider: Box<dyn ModelProviderInvoker> = self.provider_factory.as_ref().map_or_else(
             || {
                 self.provider
@@ -3990,7 +4387,8 @@ impl Agent {
             },
             |factory| Ok(factory()),
         )?;
-        Ok(self.runtime.run_streaming_text_turn(
+        Ok(TextStream::start(
+            self,
             provider,
             self.turn_request_with_cancellation(prompt.into(), cancellation),
         ))
@@ -4006,13 +4404,14 @@ impl Agent {
         &self,
         prompt: impl Into<String>,
         cancellation: CancellationToken,
-    ) -> Result<AgentStream> {
+    ) -> Result<TextStream> {
         let provider = self
             .provider_factory
             .as_ref()
             .map(|factory| factory())
             .ok_or(BcodeError::MissingProvider)?;
-        Ok(self.runtime.run_streaming_text_turn(
+        Ok(TextStream::start(
+            self,
             provider,
             self.turn_request_with_cancellation(prompt.into(), cancellation),
         ))
@@ -4023,11 +4422,7 @@ impl Agent {
     /// The returned stream yields text deltas, reasoning deltas, tool-call events, warnings, usage,
     /// a final response, or an error.
     #[must_use]
-    pub fn stream_text_with_provider<P>(
-        &self,
-        provider: P,
-        prompt: impl Into<String>,
-    ) -> AgentStream
+    pub fn stream_text_with_provider<P>(&self, provider: P, prompt: impl Into<String>) -> TextStream
     where
         P: ModelProviderInvoker + 'static,
     {
@@ -4037,18 +4432,20 @@ impl Agent {
     /// Stream text using a caller-supplied provider invoker and cancellation token.
     ///
     /// Cancelling the token requests provider cancellation and terminates the stream with a
-    /// [`RuntimeError::Cancelled`] item.
+    /// [`TextStreamItem::Error`] containing [`BcodeError::Runtime`] and
+    /// [`RuntimeError::Cancelled`].
     #[must_use]
     pub fn stream_text_with_provider_and_cancellation<P>(
         &self,
         provider: P,
         prompt: impl Into<String>,
         cancellation: CancellationToken,
-    ) -> AgentStream
+    ) -> TextStream
     where
         P: ModelProviderInvoker + 'static,
     {
-        self.runtime.run_streaming_text_turn(
+        TextStream::start(
+            self,
             provider,
             self.turn_request_with_cancellation(prompt.into(), cancellation),
         )
@@ -4074,6 +4471,33 @@ impl Agent {
     where
         P: ModelProviderInvoker + 'static,
     {
+        self.stream_request(
+            provider,
+            self.turn_request_with_cancellation(prompt.into(), cancellation),
+        )
+    }
+
+    fn stream_request<P>(&self, provider: P, request: AgentTurnRequest) -> ScopedAgentStream
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        let context = self.model_call_context(request.prompt.clone());
+        let request = self
+            .hooks
+            .run_before_model(&context)
+            .and_then(|()| self.middleware.before_request(request));
+        let observer = Arc::new(SdkToolRoundObserver::new(self));
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                return ScopedAgentStream {
+                    stream: None,
+                    observer,
+                    finalizer: None,
+                    pending: Some(ScopedAgentStreamItem::Error(error)),
+                };
+            }
+        };
         let invoker: Arc<dyn ToolInvoker> = self.tool_invoker.clone().unwrap_or_else(|| {
             Arc::new(SdkToolInvoker {
                 handlers: self.inline_tool_handlers.clone(),
@@ -4092,10 +4516,9 @@ impl Agent {
                     )),
                 )
             });
-        let observer = Arc::new(SdkToolRoundObserver::new(self));
         let stream = self.runtime.run_streaming_provider_tool_loop(
             provider,
-            self.turn_request_with_cancellation(prompt.into(), cancellation),
+            request.clone(),
             Arc::new(self.tool_catalog.clone()),
             authorization,
             invoker,
@@ -4107,7 +4530,17 @@ impl Agent {
             observer.clone(),
             Arc::clone(&self.provider_round_planner),
         );
-        ScopedAgentStream { stream, observer }
+        ScopedAgentStream {
+            stream: Some(stream),
+            observer,
+            finalizer: Some(TextStreamFinalizer {
+                request,
+                context,
+                middleware: self.middleware.clone(),
+                hooks: self.hooks.clone(),
+            }),
+            pending: None,
+        }
     }
 
     /// Create mutable tool-round state using this agent's configured maximum.

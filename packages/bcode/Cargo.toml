@@ -38,7 +38,10 @@ bcode_plugin               = { workspace = true, optional = true }
 bcode_plugin_sdk           = { workspace = true }
 bcode_session_models       = { workspace = true }
 bcode_tool                 = { workspace = true }
+futures                    = { workspace = true }
 jsonschema                 = { workspace = true }
+partial-json-fixer         = { workspace = true }
+pin-project-lite           = { workspace = true }
 schemars                   = { workspace = true }
 serde                      = { workspace = true, features = ["derive"] }
 serde_json                 = { workspace = true }

@@ -1,12 +1,13 @@
 use bcode::{
-    AgentStreamItem, CancellationToken, MessageRole, ModelContentBlock, ModelMessage,
-    ModelProviderInvoker, ObjectStreamItem, RuntimeFuture, StopReason, generate_object_builder,
+    CancellationToken, MessageRole, ModelContentBlock, ModelMessage, ModelProviderInvoker,
+    ObjectStreamItem, RuntimeFuture, StopReason, TextStreamItem, generate_object_builder,
     stream_object_builder, stream_text_builder,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelParameters, ModelTurnRequest,
     PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse,
 };
+use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
@@ -129,8 +130,8 @@ async fn stream_and_object_builders_forward_relevant_request_options() {
         .cancellation(CancellationToken::new())
         .prompt("text")
         .run(RecordingProvider::new(Arc::clone(&requests), "text"));
-    while let Some(item) = text_stream.next().await {
-        if matches!(item, AgentStreamItem::Finished(_)) {
+    while let Some(item) = StreamExt::next(&mut text_stream).await {
+        if matches!(item, TextStreamItem::Finished(_)) {
             break;
         }
     }
@@ -169,7 +170,7 @@ async fn stream_and_object_builders_forward_relevant_request_options() {
             Arc::clone(&requests),
             r#"{"value":"streamed"}"#,
         ));
-    while let Some(item) = object_stream.next().await {
+    while let Some(item) = StreamExt::next(&mut object_stream).await {
         if matches!(item, ObjectStreamItem::Finished { .. }) {
             break;
         }

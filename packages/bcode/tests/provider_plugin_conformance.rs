@@ -176,7 +176,9 @@ async fn static_provider_adapter_conforms_for_malformed_calls_and_cancellation()
     while let Some(item) = stream.next().await {
         if matches!(
             item,
-            bcode::AgentStreamItem::Error(bcode::RuntimeError::Cancelled)
+            bcode::TextStreamItem::Error(bcode::BcodeError::Runtime(
+                bcode::RuntimeError::Cancelled
+            ))
         ) {
             cancelled = true;
             break;

@@ -1,6 +1,6 @@
 use bcode::{
-    AgentEvent, AgentStreamItem, CancellationToken, ModelProviderInvoker, ObjectStreamItem,
-    RuntimeFuture,
+    AgentEvent, CancellationToken, ModelProviderInvoker, ObjectStreamItem, RuntimeFuture,
+    TextStreamItem,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -107,13 +107,13 @@ async fn main() -> bcode::Result<()> {
         .run(ExampleProvider::text("hello from the streaming builder"));
     while let Some(item) = stream.next().await {
         match item {
-            AgentStreamItem::Event(AgentEvent::TextDelta(text)) => print!("{text}"),
-            AgentStreamItem::Finished(response) => {
-                println!("\nfinished: {:?}", response.stop_reason);
+            TextStreamItem::Event(AgentEvent::TextDelta(text)) => print!("{text}"),
+            TextStreamItem::Finished(response) => {
+                println!("\nfinished: {:?}", response.runtime.stop_reason);
                 break;
             }
-            AgentStreamItem::Error(error) => return Err(error.into()),
-            AgentStreamItem::Event(_) => {}
+            TextStreamItem::Error(error) => return Err(error),
+            TextStreamItem::Event(_) | TextStreamItem::ScopedEvent(_) => {}
         }
     }
 
@@ -154,7 +154,9 @@ async fn main() -> bcode::Result<()> {
                 break;
             }
             ObjectStreamItem::Error(error) => return Err(error),
-            ObjectStreamItem::Partial(_) | ObjectStreamItem::Event(_) => {}
+            ObjectStreamItem::Partial(_)
+            | ObjectStreamItem::Event(_)
+            | ObjectStreamItem::ScopedEvent(_) => {}
         }
     }
 

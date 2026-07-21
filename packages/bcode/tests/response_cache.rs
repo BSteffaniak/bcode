@@ -94,6 +94,44 @@ impl ModelProviderInvoker for CountingProvider {
     }
 }
 
+struct PanicCache;
+
+impl ModelResponseCache for PanicCache {
+    fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+        panic!("streaming must not read the buffered response cache")
+    }
+
+    fn put(
+        &self,
+        _request: &AgentTurnRequest,
+        _response: &GenerateTextResponse,
+    ) -> bcode::Result<()> {
+        panic!("streaming must not write the buffered response cache")
+    }
+}
+
+#[tokio::test]
+async fn streaming_explicitly_bypasses_buffered_response_cache() {
+    let agent = bcode::Agent::builder()
+        .response_cache(Arc::new(PanicCache))
+        .build();
+    let mut stream = agent.stream_text_with_provider(CountingProvider::default(), "stream me");
+    let mut finished = false;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            bcode::TextStreamItem::Finished(response) => {
+                assert_eq!(response.text, "cached response");
+                finished = true;
+            }
+            bcode::TextStreamItem::Error(error) => panic!("stream failed: {error}"),
+            bcode::TextStreamItem::Event(_) | bcode::TextStreamItem::ScopedEvent(_) => {}
+        }
+    }
+
+    assert!(finished);
+}
+
 #[tokio::test]
 async fn response_cache_short_circuits_provider_after_first_response() {
     let cache = Arc::new(MemoryCache::default());

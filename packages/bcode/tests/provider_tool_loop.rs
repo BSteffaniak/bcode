@@ -1,8 +1,9 @@
 use bcode::{
-    Agent, AgentEvent, BcodeError, ModelContentBlock, ModelProviderInvoker, PreparationScope,
-    PreparedToolInvocation, ProviderRoundPlan, ProviderRoundPlanContext, ProviderRoundPlanner,
-    RegisteredTool, RuntimeFuture, ScopedAgentStreamItem, ScopedTurnEvent, ToolCall,
-    ToolDefinition, ToolInvoker, ToolPreparationRequest, ToolPreparationResponse,
+    Agent, AgentEvent, BcodeError, GenerationStep, ModelContentBlock, ModelProviderInvoker,
+    PreparationScope, PreparedToolInvocation, ProviderRoundPlan, ProviderRoundPlanContext,
+    ProviderRoundPlanner, RegisteredTool, RuntimeFuture, ScopedAgentStreamItem, ScopedTurnEvent,
+    TextStreamItem, ToolCall, ToolDefinition, ToolInvoker, ToolPreparationRequest,
+    ToolPreparationResponse, stream_text_builder,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, MessageRole, ModelTurnRequest,
@@ -14,6 +15,7 @@ use bcode_tool::{
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationResponse,
     ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
 };
+use futures::StreamExt;
 use std::collections::VecDeque;
 use std::future::pending;
 use std::num::NonZeroUsize;
@@ -180,6 +182,9 @@ impl ToolInvoker for ParallelInvoker {
                 payload: serde_json::Value::Null,
             }));
             self.barrier.wait().await;
+            if invocation.invocation.tool_name == "first" {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(ToolInvocationResponse {
                 output: invocation.invocation.invocation_id.clone(),
@@ -422,6 +427,102 @@ async fn failing_before_tool_hook_prevents_canonical_batch_invocation() {
 }
 
 #[tokio::test]
+async fn stream_text_builder_uses_canonical_tool_loop_and_retains_scoped_events() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = BatchProvider::new(requests);
+    let (invoker, maximum) = invoker();
+    let mut stream = stream_text_builder()
+        .prompt("stream tools")
+        .configure_agent(|_builder| agent_builder(invoker))
+        .run(provider);
+    let mut tool_results = Vec::new();
+    let mut saw_scoped_event = false;
+    let mut finished = None;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            TextStreamItem::Event(AgentEvent::ToolResult(result)) => {
+                tool_results.push(result.call_id);
+            }
+            TextStreamItem::ScopedEvent(_) => saw_scoped_event = true,
+            TextStreamItem::Finished(response) => finished = Some(response.text),
+            TextStreamItem::Error(error) => panic!("stream failed: {error}"),
+            TextStreamItem::Event(_) => {}
+        }
+    }
+
+    assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    assert_eq!(tool_results.len(), 2);
+    assert!(saw_scoped_event);
+    assert_eq!(finished.as_deref(), Some("done"));
+}
+
+#[tokio::test]
+async fn scoped_stream_exposes_provider_order_and_concurrent_completion_order() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = BatchProvider::new(requests);
+    let (invoker, _) = invoker();
+    let mut stream = agent(invoker).stream(provider, "stream ordered tools");
+    let mut calls = Vec::new();
+    let mut results = Vec::new();
+    let mut terminal = None;
+    let mut terminal_seen = false;
+
+    while let Some(item) = stream.next().await {
+        assert!(
+            !terminal_seen,
+            "no item may follow the terminal stream item"
+        );
+        match item {
+            ScopedAgentStreamItem::Event(ScopedTurnEvent::Runtime(
+                AgentEvent::ToolCallFinished(call),
+            )) => calls.push(call.id),
+            ScopedAgentStreamItem::Event(ScopedTurnEvent::Runtime(AgentEvent::ToolResult(
+                result,
+            ))) => results.push(result.call_id),
+            ScopedAgentStreamItem::Finished(response) => {
+                assert_eq!(response.text, "done");
+                terminal = Some(response);
+                terminal_seen = true;
+            }
+            ScopedAgentStreamItem::Error(error) => panic!("stream failed: {error}"),
+            ScopedAgentStreamItem::Event(_) => {}
+        }
+    }
+
+    assert_eq!(calls, ["call-first", "call-second"]);
+    assert_eq!(
+        results,
+        ["call-second", "call-first"],
+        "streamed tool-result events follow completion order"
+    );
+    assert!(terminal_seen);
+    let terminal = terminal.expect("stream should retain a completed response");
+    let terminal_calls = terminal
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            GenerationStep::ToolCall { call, .. } => Some(call.id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let terminal_results = terminal
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            GenerationStep::ToolResult { result, .. } => Some(result.call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_calls, ["call-first", "call-second"]);
+    assert_eq!(terminal_results, ["call-first", "call-second"]);
+    assert!(matches!(
+        terminal.steps.last(),
+        Some(GenerationStep::FinalResponse { text, .. }) if text == "done"
+    ));
+}
+
+#[tokio::test]
 async fn generic_stream_exposes_runtime_lifecycle_and_contribution_events() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let provider = BatchProvider::new(requests);
@@ -432,7 +533,7 @@ async fn generic_stream_exposes_runtime_lifecycle_and_contribution_events() {
     let mut contribution = false;
     let mut finished = None;
 
-    while let Some(item) = stream.next().await {
+    while let Some(item) = StreamExt::next(&mut stream).await {
         match item {
             ScopedAgentStreamItem::Event(ScopedTurnEvent::Runtime(AgentEvent::ToolResult(_))) => {
                 runtime = true

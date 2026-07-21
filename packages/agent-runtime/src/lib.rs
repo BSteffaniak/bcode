@@ -46,15 +46,16 @@ use bcode_tool::{
     ToolPreparationRequest, ToolPreparationResponse,
     ToolResultContent as InvocationToolResultContent,
 };
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
@@ -65,6 +66,9 @@ pub type RuntimeFuture<'a, T> =
 
 /// Agent runtime result alias.
 pub type Result<T> = std::result::Result<T, RuntimeError>;
+
+/// Default maximum number of stream items retained for a consumer.
+pub const DEFAULT_STREAM_BUFFER_CAPACITY: usize = 256;
 
 /// Errors produced by the reusable agent runtime.
 #[derive(Debug, Error)]
@@ -90,6 +94,12 @@ pub enum RuntimeError {
     Timeout {
         /// Configured timeout for the turn.
         timeout: Duration,
+    },
+    /// The runtime stream consumer did not keep up with provider events.
+    #[error("agent stream buffer reached its capacity of {capacity} items")]
+    StreamBufferFull {
+        /// Configured maximum number of queued stream items.
+        capacity: usize,
     },
     /// Provider completed a tool-call round without supplying any completed calls.
     #[error("provider finished with tool_call but emitted no completed tool calls")]
@@ -351,15 +361,68 @@ pub enum AgentRuntimeStreamItem {
 }
 
 /// Typed asynchronous stream of agent runtime events.
+///
+/// Runtime-created streams use a bounded queue. If the consumer fills that queue, the runtime
+/// cancels the turn and emits [`RuntimeError::StreamBufferFull`] through the terminal slot.
 #[derive(Debug)]
 pub struct AgentRuntimeStream {
-    receiver: mpsc::UnboundedReceiver<AgentRuntimeStreamItem>,
+    receiver: mpsc::Receiver<AgentRuntimeStreamItem>,
+    terminal: Arc<Mutex<Option<AgentRuntimeStreamItem>>>,
+    lifecycle: Arc<StreamLifecycle>,
+}
+
+#[derive(Debug)]
+struct StreamLifecycle {
+    cancellation: CancellationToken,
+    completed: AtomicBool,
+}
+
+impl StreamLifecycle {
+    const fn new(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            completed: AtomicBool::new(false),
+        }
+    }
+
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+    }
+
+    fn cancel_if_running(&self) {
+        if !self.completed.load(Ordering::Acquire) {
+            self.cancellation.cancel();
+        }
+    }
 }
 
 impl AgentRuntimeStream {
     /// Receive the next stream item.
+    ///
+    /// This convenience method is equivalent to [`StreamExt::next`] and does not require importing
+    /// the extension trait.
     pub async fn next(&mut self) -> Option<AgentRuntimeStreamItem> {
-        self.receiver.recv().await
+        match self.receiver.recv().await {
+            Some(item) => Some(item),
+            None => take_terminal(&self.terminal),
+        }
+    }
+}
+
+impl Stream for AgentRuntimeStream {
+    type Item = AgentRuntimeStreamItem;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.receiver.poll_recv(context) {
+            Poll::Ready(None) => Poll::Ready(take_terminal(&self.terminal)),
+            other => other,
+        }
+    }
+}
+
+impl Drop for AgentRuntimeStream {
+    fn drop(&mut self) {
+        self.lifecycle.cancel_if_running();
     }
 }
 
@@ -375,21 +438,75 @@ pub enum AgentLoopStreamItem {
 }
 
 /// Unified stream for one complete canonical provider/tool conversation.
+///
+/// Provider events retain occurrence order. Concurrent tool lifecycle, contribution, and
+/// [`AgentRuntimeEvent::ToolResult`] stream events may interleave or arrive in completion order and
+/// must be correlated by invocation/call ID and sequence. After the complete batch settles,
+/// tool-result messages supplied to the next provider round and returned batch outputs are restored
+/// to provider call order. Exactly one [`AgentLoopStreamItem::Finished`] or
+/// [`AgentLoopStreamItem::Error`] is delivered last.
+///
+/// Runtime-created streams use a bounded queue. If the consumer fills that queue, the runtime
+/// cancels the turn and emits [`RuntimeError::StreamBufferFull`] through the terminal slot.
 #[derive(Debug)]
 pub struct AgentLoopStream {
-    receiver: mpsc::UnboundedReceiver<AgentLoopStreamItem>,
+    receiver: mpsc::Receiver<AgentLoopStreamItem>,
+    terminal: Arc<Mutex<Option<AgentLoopStreamItem>>>,
+    lifecycle: Arc<StreamLifecycle>,
 }
 
 impl AgentLoopStream {
     /// Receive the next scoped stream item.
+    ///
+    /// This convenience method is equivalent to [`StreamExt::next`] and does not require importing
+    /// the extension trait.
     pub async fn next(&mut self) -> Option<AgentLoopStreamItem> {
-        self.receiver.recv().await
+        match self.receiver.recv().await {
+            Some(item) => Some(item),
+            None => take_terminal(&self.terminal),
+        }
+    }
+}
+
+impl Stream for AgentLoopStream {
+    type Item = AgentLoopStreamItem;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.receiver.poll_recv(context) {
+            Poll::Ready(None) => Poll::Ready(take_terminal(&self.terminal)),
+            other => other,
+        }
+    }
+}
+
+impl Drop for AgentLoopStream {
+    fn drop(&mut self) {
+        self.lifecycle.cancel_if_running();
+    }
+}
+
+fn take_terminal<T>(terminal: &Mutex<Option<T>>) -> Option<T> {
+    terminal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+fn store_terminal<T>(terminal: &Mutex<Option<T>>, item: T) {
+    let mut terminal = terminal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if terminal.is_none() {
+        *terminal = Some(item);
     }
 }
 
 struct LoopStreamEventSink {
     configured: Arc<dyn TurnEventSink>,
-    sender: mpsc::UnboundedSender<AgentLoopStreamItem>,
+    sender: mpsc::Sender<AgentLoopStreamItem>,
+    terminal: Arc<Mutex<Option<AgentLoopStreamItem>>>,
+    cancellation: CancellationToken,
+    capacity: usize,
 }
 
 impl TurnEventSink for LoopStreamEventSink {
@@ -397,7 +514,23 @@ impl TurnEventSink for LoopStreamEventSink {
         if !self.configured.emit(event.clone()) {
             return false;
         }
-        self.sender.send(AgentLoopStreamItem::Event(event)).is_ok()
+        match self.sender.try_send(AgentLoopStreamItem::Event(event)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                store_terminal(
+                    &self.terminal,
+                    AgentLoopStreamItem::Error(RuntimeError::StreamBufferFull {
+                        capacity: self.capacity,
+                    }),
+                );
+                self.cancellation.cancel();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.cancellation.cancel();
+                false
+            }
+        }
     }
 }
 
@@ -415,7 +548,28 @@ impl ToolCatalog for SharedToolCatalog {
 
 #[derive(Debug, Clone)]
 struct RuntimeStreamEventSink {
-    sender: Option<mpsc::UnboundedSender<AgentRuntimeStreamItem>>,
+    sender: Option<mpsc::Sender<AgentRuntimeStreamItem>>,
+    terminal: Option<Arc<Mutex<Option<AgentRuntimeStreamItem>>>>,
+    cancellation: Option<CancellationToken>,
+    capacity: usize,
+}
+
+impl Default for RuntimeStreamEventSink {
+    fn default() -> Self {
+        Self {
+            sender: None,
+            terminal: None,
+            cancellation: None,
+            capacity: DEFAULT_STREAM_BUFFER_CAPACITY,
+        }
+    }
+}
+
+struct StreamOutput {
+    sender: mpsc::Sender<AgentRuntimeStreamItem>,
+    terminal: Arc<Mutex<Option<AgentRuntimeStreamItem>>>,
+    cancellation: CancellationToken,
+    capacity: usize,
 }
 
 impl TurnEventSink for RuntimeStreamEventSink {
@@ -423,9 +577,32 @@ impl TurnEventSink for RuntimeStreamEventSink {
         let ScopedTurnEvent::Runtime(event) = event else {
             return false;
         };
-        self.sender
-            .as_ref()
-            .is_none_or(|sender| sender.send(AgentRuntimeStreamItem::Event(event)).is_ok())
+        let Some(sender) = &self.sender else {
+            return true;
+        };
+        match sender.try_send(AgentRuntimeStreamItem::Event(event)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Some(terminal) = &self.terminal {
+                    store_terminal(
+                        terminal,
+                        AgentRuntimeStreamItem::Error(RuntimeError::StreamBufferFull {
+                            capacity: self.capacity,
+                        }),
+                    );
+                }
+                if let Some(cancellation) = &self.cancellation {
+                    cancellation.cancel();
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                if let Some(cancellation) = &self.cancellation {
+                    cancellation.cancel();
+                }
+                false
+            }
+        }
     }
 }
 
@@ -1006,6 +1183,7 @@ impl PermissionPolicy for AllowAllPolicy {
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     poll_interval: Duration,
+    stream_buffer_capacity: NonZeroUsize,
     turns: TurnScopeOwner,
 }
 
@@ -1056,6 +1234,8 @@ impl Default for AgentRuntime {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_millis(50),
+            stream_buffer_capacity: NonZeroUsize::new(DEFAULT_STREAM_BUFFER_CAPACITY)
+                .expect("default stream buffer capacity must be positive"),
             turns: TurnScopeOwner::new(),
         }
     }
@@ -1073,6 +1253,23 @@ impl AgentRuntime {
     pub const fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
         self.poll_interval = poll_interval;
         self
+    }
+
+    /// Configure the maximum number of queued items for each runtime-created stream.
+    ///
+    /// When a consumer falls behind and this bound is reached, the runtime cancels the turn and
+    /// terminates the stream with [`RuntimeError::StreamBufferFull`] rather than growing memory
+    /// without bound.
+    #[must_use]
+    pub const fn with_stream_buffer_capacity(mut self, capacity: NonZeroUsize) -> Self {
+        self.stream_buffer_capacity = capacity;
+        self
+    }
+
+    /// Return the configured maximum number of queued stream items.
+    #[must_use]
+    pub const fn stream_buffer_capacity(&self) -> NonZeroUsize {
+        self.stream_buffer_capacity
     }
 
     /// Allocate and activate the runtime's next monotonic turn scope.
@@ -1127,11 +1324,19 @@ impl AgentRuntime {
     where
         P: ModelProviderInvoker + 'static,
     {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let capacity = self.stream_buffer_capacity.get();
+        let (sender, receiver) = mpsc::channel(capacity);
+        let terminal = Arc::new(Mutex::new(None));
+        let lifecycle = Arc::new(StreamLifecycle::new(request.cancellation.clone()));
+        let task_lifecycle = Arc::clone(&lifecycle);
+        let task_terminal = Arc::clone(&terminal);
         let runtime = self.clone();
         let stream_events: Arc<dyn TurnEventSink> = Arc::new(LoopStreamEventSink {
             configured: events,
-            sender: sender.clone(),
+            sender,
+            terminal: Arc::clone(&terminal),
+            cancellation: request.cancellation.clone(),
+            capacity,
         });
         tokio::spawn(async move {
             let catalog = SharedToolCatalog(catalog);
@@ -1155,9 +1360,14 @@ impl AgentRuntime {
                 Ok(response) => AgentLoopStreamItem::Finished(response),
                 Err(error) => AgentLoopStreamItem::Error(error),
             };
-            let _ = sender.send(item);
+            task_lifecycle.complete();
+            store_terminal(&task_terminal, item);
         });
-        AgentLoopStream { receiver }
+        AgentLoopStream {
+            receiver,
+            terminal,
+            lifecycle,
+        }
     }
 
     /// Run a complete provider/tool conversation through one canonical turn scope.
@@ -1547,26 +1757,41 @@ impl AgentRuntime {
     #[must_use]
     pub fn run_streaming_text_turn<P>(
         &self,
-        provider: P,
+        mut provider: P,
         request: AgentTurnRequest,
     ) -> AgentRuntimeStream
     where
         P: ModelProviderInvoker + 'static,
     {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let capacity = self.stream_buffer_capacity.get();
+        let (sender, receiver) = mpsc::channel(capacity);
+        let terminal = Arc::new(Mutex::new(None));
+        let lifecycle = Arc::new(StreamLifecycle::new(request.cancellation.clone()));
+        let task_lifecycle = Arc::clone(&lifecycle);
+        let task_terminal = Arc::clone(&terminal);
         let runtime = self.clone();
         tokio::spawn(async move {
-            let mut provider = provider;
+            let stream = StreamOutput {
+                sender: sender.clone(),
+                terminal: Arc::clone(&task_terminal),
+                cancellation: request.cancellation.clone(),
+                capacity,
+            };
             let result = runtime
-                .run_text_turn_internal(&mut provider, request, Some(&sender))
+                .run_text_turn_internal(&mut provider, request, Some(stream))
                 .await;
             let item = match result {
                 Ok(response) => AgentRuntimeStreamItem::Finished(response),
                 Err(error) => AgentRuntimeStreamItem::Error(error),
             };
-            let _ = sender.send(item);
+            task_lifecycle.complete();
+            store_terminal(&task_terminal, item);
         });
-        AgentRuntimeStream { receiver }
+        AgentRuntimeStream {
+            receiver,
+            terminal,
+            lifecycle,
+        }
     }
 
     /// Run one provider turn inside an existing canonical turn scope.
@@ -1678,17 +1903,29 @@ impl AgentRuntime {
         &self,
         provider: &mut P,
         request: AgentTurnRequest,
-        stream: Option<&mpsc::UnboundedSender<AgentRuntimeStreamItem>>,
+        stream: Option<StreamOutput>,
     ) -> Result<AgentTurnResponse>
     where
         P: ModelProviderInvoker,
     {
+        let stream_sink = stream.map_or_else(
+            || RuntimeStreamEventSink {
+                sender: None,
+                terminal: None,
+                cancellation: None,
+                capacity: self.stream_buffer_capacity.get(),
+            },
+            |stream| RuntimeStreamEventSink {
+                sender: Some(stream.sender),
+                terminal: Some(stream.terminal),
+                cancellation: Some(stream.cancellation),
+                capacity: stream.capacity,
+            },
+        );
         let mut active_turn = ActiveRuntimeTurn::new(
             self.turns.clone(),
             "text-turn",
-            Arc::new(RuntimeStreamEventSink {
-                sender: stream.cloned(),
-            }),
+            Arc::new(stream_sink),
             InvocationCapabilities::default(),
         );
         let response = self
@@ -2861,6 +3098,41 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
 
+    #[derive(Debug)]
+    struct AcceptingEventSink;
+
+    impl TurnEventSink for AcceptingEventSink {
+        fn emit(&self, _event: ScopedTurnEvent) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn provider_tool_stream_sink_reports_bounded_overflow() {
+        let capacity = 1;
+        let (sender, _receiver) = mpsc::channel(capacity);
+        let terminal = Arc::new(Mutex::new(None));
+        let cancellation = CancellationToken::new();
+        let sink = LoopStreamEventSink {
+            configured: Arc::new(AcceptingEventSink),
+            sender,
+            terminal: Arc::clone(&terminal),
+            cancellation: cancellation.clone(),
+            capacity,
+        };
+        let event = ScopedTurnEvent::Runtime(AgentRuntimeEvent::TurnStarted);
+
+        assert!(sink.emit(event.clone()));
+        assert!(!sink.emit(event));
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(
+            take_terminal(&terminal),
+            Some(AgentLoopStreamItem::Error(RuntimeError::StreamBufferFull {
+                capacity: 1
+            }))
+        ));
+    }
+
     #[test]
     fn batch_concurrency_observation_tracks_peak_and_releases_active_work() {
         let observation = BatchConcurrencyObservation::default();
@@ -3419,7 +3691,7 @@ mod tests {
                 &RuntimePermissionContext::default(),
                 &[],
                 ToolExecutionOptions::default(),
-                Arc::new(RuntimeStreamEventSink { sender: None }),
+                Arc::new(RuntimeStreamEventSink::default()),
                 InvocationCapabilities::default(),
                 &NoopToolRoundObserver,
                 &NoopProviderRoundPlanner,
@@ -3460,7 +3732,7 @@ mod tests {
                 &RuntimePermissionContext::default(),
                 &[],
                 ToolExecutionOptions::default(),
-                Arc::new(RuntimeStreamEventSink { sender: None }),
+                Arc::new(RuntimeStreamEventSink::default()),
                 InvocationCapabilities::default(),
                 &NoopToolRoundObserver,
                 &NoopProviderRoundPlanner,
@@ -3501,7 +3773,7 @@ mod tests {
                     parallel: false,
                     ..ToolExecutionOptions::default()
                 },
-                Arc::new(RuntimeStreamEventSink { sender: None }),
+                Arc::new(RuntimeStreamEventSink::default()),
                 InvocationCapabilities::default(),
                 &NoopToolRoundObserver,
                 &NoopProviderRoundPlanner,
@@ -3572,7 +3844,7 @@ mod tests {
                 &RuntimePermissionContext::default(),
                 &[],
                 ToolExecutionOptions::default(),
-                Arc::new(RuntimeStreamEventSink { sender: None }),
+                Arc::new(RuntimeStreamEventSink::default()),
                 InvocationCapabilities::default(),
                 &observer,
                 &NoopProviderRoundPlanner,
@@ -3675,7 +3947,7 @@ mod tests {
                 &RuntimePermissionContext::default(),
                 &[],
                 ToolExecutionOptions::default(),
-                Arc::new(RuntimeStreamEventSink { sender: None }),
+                Arc::new(RuntimeStreamEventSink::default()),
                 InvocationCapabilities::default(),
                 &NoopToolRoundObserver,
                 &planner,
@@ -3729,7 +4001,7 @@ mod tests {
             &context,
             &[],
             ToolExecutionOptions::default(),
-            Arc::new(RuntimeStreamEventSink { sender: None }),
+            Arc::new(RuntimeStreamEventSink::default()),
             InvocationCapabilities::default(),
             &NoopToolRoundObserver,
             &BlockingProviderPlanner,
@@ -3782,7 +4054,7 @@ mod tests {
             &context,
             &[],
             ToolExecutionOptions::default(),
-            Arc::new(RuntimeStreamEventSink { sender: None }),
+            Arc::new(RuntimeStreamEventSink::default()),
             InvocationCapabilities::default(),
             &NoopToolRoundObserver,
             &DelayedProviderPlanner,
@@ -3841,7 +4113,7 @@ mod tests {
                 &RuntimePermissionContext::default(),
                 &[],
                 ToolExecutionOptions::default(),
-                Arc::new(RuntimeStreamEventSink { sender: None }),
+                Arc::new(RuntimeStreamEventSink::default()),
                 InvocationCapabilities::default(),
                 &NoopToolRoundObserver,
                 &NoopProviderRoundPlanner,
@@ -4408,7 +4680,7 @@ mod tests {
         ];
         let scope = runtime.begin_turn_scope(
             "turn",
-            Arc::new(RuntimeStreamEventSink { sender: None }),
+            Arc::new(RuntimeStreamEventSink::default()),
             InvocationCapabilities::new(broker.clone(), host.clone(), host.clone(), host),
         );
         let task_runtime = runtime.clone();
@@ -4474,7 +4746,7 @@ mod tests {
         ];
         let scope = runtime.begin_turn_scope(
             "turn",
-            Arc::new(RuntimeStreamEventSink { sender: None }),
+            Arc::new(RuntimeStreamEventSink::default()),
             InvocationCapabilities::new(broker.clone(), host.clone(), host.clone(), host),
         );
         let task_runtime = runtime.clone();
@@ -5616,7 +5888,7 @@ mod tests {
         let mut reasoning_delta = None;
         let mut final_text = None;
 
-        while let Some(item) = stream.next().await {
+        while let Some(item) = StreamExt::next(&mut stream).await {
             match item {
                 AgentRuntimeStreamItem::Event(AgentRuntimeEvent::TextDelta(text)) => {
                     text_delta = Some(text);
@@ -5636,6 +5908,43 @@ mod tests {
         assert_eq!(text_delta.as_deref(), Some("hello"));
         assert_eq!(reasoning_delta.as_deref(), Some("thinking"));
         assert_eq!(final_text.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_reports_overflow_without_unbounded_queueing() {
+        let provider = FakeProvider::new([
+            ProviderTurnEvent::TextDelta {
+                text: "hello".to_string(),
+            },
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]);
+        let runtime = AgentRuntime::new().with_stream_buffer_capacity(
+            NonZeroUsize::new(1).expect("test capacity should be positive"),
+        );
+        let mut stream =
+            runtime.run_streaming_text_turn(provider, AgentTurnRequest::new("test-model", "hello"));
+
+        tokio::task::yield_now().await;
+
+        let first = stream.next().await;
+        assert!(matches!(
+            first,
+            Some(AgentRuntimeStreamItem::Event(
+                AgentRuntimeEvent::TurnStarted
+            ))
+        ));
+        let terminal = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .expect("overflow should terminate the stream");
+        assert!(matches!(
+            terminal,
+            Some(AgentRuntimeStreamItem::Error(
+                RuntimeError::StreamBufferFull { capacity: 1 }
+            ))
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
@@ -5754,6 +6063,145 @@ mod tests {
 
         assert!(cancelled);
     }
+    #[derive(Debug, Default)]
+    struct ProviderLifecycle {
+        started: AtomicBool,
+        polling: AtomicBool,
+        poll_count: AtomicUsize,
+        cancelled: AtomicBool,
+        finished: AtomicBool,
+        dropped: AtomicBool,
+        release_poll: Notify,
+    }
+
+    #[derive(Clone, Copy)]
+    enum LifecyclePollOutcome {
+        Finish,
+        ProviderError,
+        Flood,
+        ToolCall,
+        Pending,
+    }
+
+    struct LifecyclePollProvider {
+        lifecycle: Arc<ProviderLifecycle>,
+        outcome: LifecyclePollOutcome,
+    }
+
+    impl Drop for LifecyclePollProvider {
+        fn drop(&mut self) {
+            self.lifecycle.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl ModelProviderInvoker for LifecyclePollProvider {
+        fn start_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a ModelTurnRequest,
+        ) -> RuntimeFuture<'a, StartTurnResponse> {
+            self.lifecycle.started.store(true, Ordering::Release);
+            Box::pin(async {
+                Ok(StartTurnResponse {
+                    provider_turn_id: "lifecycle".to_string(),
+                })
+            })
+        }
+
+        fn poll_turn_events<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a PollTurnEventsRequest,
+        ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+            Box::pin(async move {
+                let poll_count = self.lifecycle.poll_count.fetch_add(1, Ordering::AcqRel);
+                self.lifecycle.polling.store(true, Ordering::Release);
+                if poll_count == 0 {
+                    self.lifecycle.release_poll.notified().await;
+                }
+                match self.outcome {
+                    LifecyclePollOutcome::ProviderError => Ok(PollTurnEventsResponse {
+                        events: vec![ProviderTurnEvent::Error {
+                            error: ProviderError {
+                                code: "lifecycle_error".to_string(),
+                                category: bcode_model::ProviderErrorCategory::ProviderInternal,
+                                message: "provider failed".to_string(),
+                                retryable: false,
+                                provider_message: None,
+                                retry: None,
+                            },
+                        }],
+                    }),
+                    LifecyclePollOutcome::Flood => Ok(PollTurnEventsResponse {
+                        events: vec![
+                            ProviderTurnEvent::TextDelta {
+                                text: "first".to_string(),
+                            },
+                            ProviderTurnEvent::TextDelta {
+                                text: "second".to_string(),
+                            },
+                            ProviderTurnEvent::TurnFinished {
+                                stop_reason: StopReason::EndTurn,
+                            },
+                        ],
+                    }),
+                    LifecyclePollOutcome::ToolCall if poll_count == 0 => {
+                        Ok(PollTurnEventsResponse {
+                            events: vec![
+                                ProviderTurnEvent::ToolCallFinished {
+                                    call: ToolCall {
+                                        id: "lifecycle-call".to_string(),
+                                        name: "fails".to_string(),
+                                        arguments: serde_json::json!({}),
+                                    },
+                                },
+                                ProviderTurnEvent::TurnFinished {
+                                    stop_reason: StopReason::ToolCall,
+                                },
+                            ],
+                        })
+                    }
+                    LifecyclePollOutcome::Finish | LifecyclePollOutcome::ToolCall => {
+                        Ok(PollTurnEventsResponse {
+                            events: vec![ProviderTurnEvent::TurnFinished {
+                                stop_reason: StopReason::EndTurn,
+                            }],
+                        })
+                    }
+                    LifecyclePollOutcome::Pending => std::future::pending().await,
+                }
+            })
+        }
+
+        fn cancel_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a CancelTurnRequest,
+        ) -> RuntimeFuture<'a, AckResponse> {
+            self.lifecycle.cancelled.store(true, Ordering::Release);
+            Box::pin(async { Ok(AckResponse::default()) })
+        }
+
+        fn finish_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a FinishTurnRequest,
+        ) -> RuntimeFuture<'a, AckResponse> {
+            self.lifecycle.finished.store(true, Ordering::Release);
+            Box::pin(async { Ok(AckResponse::default()) })
+        }
+    }
+
+    async fn wait_for_flag(flag: &AtomicBool, message: &str) {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !flag.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{message}"));
+    }
+
     struct BlockingPollProvider;
 
     impl ModelProviderInvoker for BlockingPollProvider {
@@ -5815,5 +6263,373 @@ mod tests {
         .expect("cancellation should interrupt a blocked provider poll");
 
         assert!(cancelled);
+    }
+
+    #[derive(Debug)]
+    struct FailingLifecycleToolInvoker;
+
+    impl ToolInvoker for FailingLifecycleToolInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            Box::pin(async {
+                Ok(ToolPreparationResponse {
+                    authorization: Vec::new(),
+                    descriptor: serde_json::Value::Null,
+                })
+            })
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _invocation: &'a PreparedToolInvocation,
+            _scope: &'a InvocationScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            Box::pin(async {
+                Err(RuntimeError::ToolExecution {
+                    tool_name: "fails".to_string(),
+                    message: "synthetic tool failure".to_string(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_overflow_cleans_provider_task_and_active_turn() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let runtime = AgentRuntime::new().with_stream_buffer_capacity(
+            NonZeroUsize::new(1).expect("test capacity should be positive"),
+        );
+        let mut stream = runtime.run_streaming_text_turn(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Flood,
+            },
+            AgentTurnRequest::new("test-model", "hello"),
+        );
+        wait_for_flag(
+            &lifecycle.polling,
+            "provider should enter polling before overflow",
+        )
+        .await;
+        lifecycle.release_poll.notify_one();
+        wait_for_flag(
+            &lifecycle.dropped,
+            "provider task should terminate after overflow",
+        )
+        .await;
+
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            if matches!(item, AgentRuntimeStreamItem::Error(_)) {
+                terminal = Some(item);
+            }
+        }
+
+        assert!(matches!(
+            terminal,
+            Some(AgentRuntimeStreamItem::Error(
+                RuntimeError::StreamBufferFull { capacity: 1 }
+            ))
+        ));
+        assert!(lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_failure_is_model_visible_and_releases_runtime_scope() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let runtime = AgentRuntime::new();
+        let mut request = AgentTurnRequest::new("test-model", "hello");
+        request.tools.push(tool_definition("fails"));
+        let catalog =
+            Arc::new(UnifiedToolCatalog::new().with_inline_tool(tool_definition("fails")));
+        let mut stream = runtime.run_streaming_provider_tool_loop(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::ToolCall,
+            },
+            request,
+            catalog,
+            Arc::new(AllowBatchAuthorization::default()),
+            Arc::new(FailingLifecycleToolInvoker),
+            RuntimePermissionContext::default(),
+            Vec::new(),
+            ToolExecutionOptions::default(),
+            Arc::new(AcceptingEventSink),
+            InvocationCapabilities::default(),
+            Arc::new(NoopToolRoundObserver),
+            Arc::new(NoopProviderRoundPlanner),
+        );
+        wait_for_flag(
+            &lifecycle.polling,
+            "provider should enter polling before tool failure",
+        )
+        .await;
+        lifecycle.release_poll.notify_one();
+
+        let mut saw_tool_error = false;
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                AgentLoopStreamItem::Event(ScopedTurnEvent::Runtime(
+                    AgentRuntimeEvent::ToolResult(result),
+                )) if result.is_error => saw_tool_error = true,
+                AgentLoopStreamItem::Finished(_) | AgentLoopStreamItem::Error(_) => {
+                    terminal = Some(item);
+                }
+                AgentLoopStreamItem::Event(_) => {}
+            }
+        }
+        wait_for_flag(
+            &lifecycle.dropped,
+            "provider task should terminate after tool failure",
+        )
+        .await;
+
+        assert!(saw_tool_error);
+        assert!(matches!(terminal, Some(AgentLoopStreamItem::Finished(_))));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn normal_stream_completion_finishes_and_releases_provider_turn() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_text_turn(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Finish,
+            },
+            AgentTurnRequest::new("test-model", "hello"),
+        );
+        wait_for_flag(
+            &lifecycle.polling,
+            "provider should enter polling before completion",
+        )
+        .await;
+        lifecycle.release_poll.notify_one();
+
+        let mut terminals = Vec::new();
+        while let Some(item) = stream.next().await {
+            if matches!(
+                item,
+                AgentRuntimeStreamItem::Finished(_) | AgentRuntimeStreamItem::Error(_)
+            ) {
+                terminals.push(item);
+            }
+        }
+        wait_for_flag(
+            &lifecycle.dropped,
+            "provider task should terminate after completion",
+        )
+        .await;
+
+        assert_eq!(terminals.len(), 1);
+        assert!(matches!(
+            terminals.first(),
+            Some(AgentRuntimeStreamItem::Finished(_))
+        ));
+        assert!(!lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn provider_stream_failure_cancels_finishes_and_releases_turn() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_text_turn(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::ProviderError,
+            },
+            AgentTurnRequest::new("test-model", "hello"),
+        );
+        wait_for_flag(
+            &lifecycle.polling,
+            "provider should enter polling before failure",
+        )
+        .await;
+        lifecycle.release_poll.notify_one();
+
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            if matches!(item, AgentRuntimeStreamItem::Error(_)) {
+                terminal = Some(item);
+            }
+        }
+        wait_for_flag(
+            &lifecycle.dropped,
+            "provider task should terminate after failure",
+        )
+        .await;
+
+        assert!(matches!(
+            terminal,
+            Some(AgentRuntimeStreamItem::Error(RuntimeError::Provider { .. }))
+        ));
+        assert!(lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn stream_timeout_cancels_finishes_and_releases_provider_turn() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let runtime = AgentRuntime::new();
+        let mut request = AgentTurnRequest::new("test-model", "hello");
+        request.timeout = Duration::from_millis(20);
+        let mut stream = runtime.run_streaming_text_turn(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Pending,
+            },
+            request,
+        );
+
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            if matches!(item, AgentRuntimeStreamItem::Error(_)) {
+                terminal = Some(item);
+            }
+        }
+        wait_for_flag(
+            &lifecycle.dropped,
+            "provider task should terminate after timeout",
+        )
+        .await;
+
+        assert!(matches!(
+            terminal,
+            Some(AgentRuntimeStreamItem::Error(RuntimeError::Timeout { .. }))
+        ));
+        assert!(lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn early_stream_drop_cleans_active_provider_turn_and_task() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let runtime = AgentRuntime::new();
+        let stream = runtime.run_streaming_text_turn(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Pending,
+            },
+            AgentTurnRequest::new("test-model", "hello"),
+        );
+        wait_for_flag(
+            &lifecycle.polling,
+            "provider should enter polling before drop",
+        )
+        .await;
+
+        drop(stream);
+
+        wait_for_flag(
+            &lifecycle.dropped,
+            "provider task should terminate after drop",
+        )
+        .await;
+        assert!(lifecycle.started.load(Ordering::Acquire));
+        assert!(lifecycle.polling.load(Ordering::Acquire));
+        assert!(lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_completion_race_has_one_terminal_and_cleans_provider() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let cancellation = CancellationToken::new();
+        let mut request = AgentTurnRequest::new("test-model", "hello");
+        request.cancellation = cancellation.clone();
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_text_turn(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Finish,
+            },
+            request,
+        );
+        wait_for_flag(
+            &lifecycle.polling,
+            "provider should enter polling before cancellation race",
+        )
+        .await;
+
+        cancellation.cancel();
+        lifecycle.release_poll.notify_one();
+
+        let mut terminals = Vec::new();
+        while let Some(item) = stream.next().await {
+            if matches!(
+                item,
+                AgentRuntimeStreamItem::Finished(_) | AgentRuntimeStreamItem::Error(_)
+            ) {
+                terminals.push(item);
+            }
+        }
+        wait_for_flag(
+            &lifecycle.dropped,
+            "provider task should terminate after cancellation race",
+        )
+        .await;
+
+        assert_eq!(terminals.len(), 1);
+        assert!(matches!(
+            terminals.first(),
+            Some(AgentRuntimeStreamItem::Error(RuntimeError::Cancelled))
+        ));
+        assert!(lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_cancels_blocked_provider_poll() {
+        let cancellation = CancellationToken::new();
+        let mut request = AgentTurnRequest::new("test-model", "hello");
+        request.cancellation = cancellation.clone();
+        let runtime = AgentRuntime::new();
+        let stream = runtime.run_streaming_text_turn(BlockingPollProvider, request);
+
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_millis(100), cancellation.cancelled())
+            .await
+            .expect("dropping the stream should request turn cancellation");
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn dropping_completed_stream_does_not_cancel_request_token() {
+        let cancellation = CancellationToken::new();
+        let mut request = AgentTurnRequest::new("test-model", "hello");
+        request.cancellation = cancellation.clone();
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_text_turn(
+            FakeProvider::new([ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            }]),
+            request,
+        );
+
+        while let Some(item) = stream.next().await {
+            if matches!(item, AgentRuntimeStreamItem::Finished(_)) {
+                break;
+            }
+        }
+        drop(stream);
+
+        assert!(!cancellation.is_cancelled());
     }
 }

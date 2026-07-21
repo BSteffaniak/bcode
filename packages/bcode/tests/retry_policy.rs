@@ -1,4 +1,7 @@
-use bcode::{ModelProviderInvoker, RetryPolicy, RuntimeFuture, StopReason, generate_text_builder};
+use bcode::{
+    ModelProviderInvoker, RetryPolicy, RuntimeFuture, StopReason, TextStreamItem,
+    generate_text_builder, stream_text_builder,
+};
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse,
@@ -66,6 +69,28 @@ impl ModelProviderInvoker for FlakyProvider {
     ) -> RuntimeFuture<'a, AckResponse> {
         Box::pin(async { Ok(AckResponse::default()) })
     }
+}
+
+#[tokio::test]
+async fn streaming_retry_policy_recovers_and_preserves_event_delivery() {
+    let mut stream = stream_text_builder()
+        .prompt("retry stream")
+        .retry_policy(RetryPolicy::new(1, Duration::ZERO))
+        .run(FlakyProvider::default());
+    let mut delta = None;
+    let mut finished = None;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            TextStreamItem::Event(bcode::AgentEvent::TextDelta(text)) => delta = Some(text),
+            TextStreamItem::Finished(response) => finished = Some(response.text),
+            TextStreamItem::Error(error) => panic!("stream failed: {error}"),
+            TextStreamItem::Event(_) | TextStreamItem::ScopedEvent(_) => {}
+        }
+    }
+
+    assert_eq!(delta.as_deref(), Some("recovered"));
+    assert_eq!(finished.as_deref(), Some("recovered"));
 }
 
 #[tokio::test]
