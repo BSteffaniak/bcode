@@ -26,6 +26,18 @@ sshenv_vault           = { workspace = true }
 thiserror              = { workspace = true }
 tokio                  = { workspace = true, features = ["time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+sshenv_vault = { workspace = true, features = [
+    "linux-secret-service",
+    "tpm-device-seal",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sshenv_vault = { workspace = true, features = ["macos-keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sshenv_vault = { workspace = true, features = ["windows-dpapi"] }
+
 [features]
 default          = []
 fail-on-warnings = []
