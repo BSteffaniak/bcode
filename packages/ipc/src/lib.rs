@@ -1105,6 +1105,8 @@ pub enum ResponsePayload {
         draft: Option<String>,
         #[serde(default)]
         runtime_selection: SessionRuntimeSelection,
+        #[serde(default)]
+        projection_window: Option<bcode_session_models::ProjectionWindow>,
     },
     MessageSent,
     TurnCancellationRequested {
@@ -2202,6 +2204,45 @@ mod tests {
     }
 
     #[test]
+    fn attached_projection_window_round_trips() {
+        let session_id = SessionId::new();
+        let response = Response::Ok(ResponsePayload::Attached {
+            session_id,
+            session: SessionSummary {
+                id: session_id,
+                name: None,
+                explicit_name: None,
+                derived_title: None,
+                title_source: bcode_session_models::SessionTitleSource::EmptyDraft,
+                client_count: 1,
+                created_at_ms: 10,
+                updated_at_ms: 20,
+                working_directory: "/tmp/bcode-window-test".into(),
+                import: None,
+                fork: None,
+            },
+            history: Vec::new(),
+            input_history: Vec::new(),
+            import_warnings: Vec::new(),
+            draft: None,
+            runtime_selection: SessionRuntimeSelection::default(),
+            projection_window: Some(bcode_session_models::ProjectionWindow {
+                projection: bcode_session_models::SessionProjectionKind::Transcript,
+                transcript_items: Vec::new(),
+                source_range: None,
+                has_older: true,
+                has_newer: false,
+                scanned_events: 4,
+            }),
+        });
+
+        let encoded = encode(&response).expect("response should encode");
+        let decoded: Response = decode(&encoded).expect("response should decode");
+
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn attached_response_carries_canonical_session_summary() {
         let session_id: SessionId = "00000000-0000-0000-0000-000000000001"
             .parse()
@@ -2227,6 +2268,7 @@ mod tests {
             import_warnings: Vec::new(),
             draft: Some("draft text".to_owned()),
             runtime_selection: SessionRuntimeSelection::default(),
+            projection_window: None,
         });
 
         let encoded = encode(&response).expect("response should encode");
@@ -2865,6 +2907,7 @@ mod tests {
                     import_warnings: Vec::new(),
                     draft: Some("draft text".to_owned()),
                     runtime_selection: SessionRuntimeSelection::default(),
+                    projection_window: None,
                 }),
                 Response::Ok(ResponsePayload::SessionHistory {
                     session_id,
@@ -2926,6 +2969,7 @@ mod tests {
                 import_warnings: Vec::new(),
                 draft: None,
                 runtime_selection: SessionRuntimeSelection::default(),
+                projection_window: None,
             }),
             Response::Ok(ResponsePayload::SessionHistory {
                 session_id,

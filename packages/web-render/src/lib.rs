@@ -9,8 +9,14 @@ use std::net::IpAddr;
 use std::str::FromStr as _;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use bcode_client::{AttachedSessionHistory, BcodeClient, ClientError, SessionWatchEvent};
-use bcode_session_models::{SessionId, SessionSummary};
+use bcode_client::{
+    AttachedSessionHistory, BcodeClient, ClientError, SessionWatchEvent, SessionWatcher,
+};
+use bcode_session_models::{
+    ProjectionWindow, ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
+    ProjectionWindowRequest, ProjectionWindowTarget, SessionId, SessionProjectionKind,
+    SessionSummary,
+};
 use bcode_session_view::{SessionView, execute_session_view_action};
 use bcode_session_view_models::{
     ComposerDraftViewScope, InteractionViewSummary, PromptPlacementView, SessionViewAction,
@@ -45,6 +51,9 @@ pub const fn validate_bind_address(
 
 /// Number of recent history events projected into the first web-render snapshot.
 pub const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
+
+/// Delay between failed daemon watcher reconnection attempts.
+const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Default viewport meta tag for responsive web rendering.
 pub static VIEWPORT: LazyLock<String> =
@@ -146,9 +155,13 @@ impl WebRenderState {
         let renderer_tx = Arc::clone(&self.renderer_tx);
         let watched_sessions = Arc::clone(&self.watched_sessions);
         tokio::spawn(async move {
-            if let Err(error) =
-                watch_session_updates(client, access_token, session_id, Arc::clone(&renderer_tx))
-                    .await
+            if let Err(error) = Box::pin(watch_session_updates(
+                client,
+                access_token,
+                session_id,
+                Arc::clone(&renderer_tx),
+            ))
+            .await
             {
                 tracing::error!("web session watcher failed for {session_id}: {error}");
             }
@@ -214,9 +227,7 @@ impl WebRenderState {
         session_id: bcode_session_models::SessionId,
     ) -> Result<SessionViewSnapshot, ClientError> {
         let mut connection = self.client.connect("bcode-web-render").await?;
-        let attached = connection
-            .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
-            .await?;
+        let attached = attach_web_projection_window(&mut connection, session_id).await?;
         session_view_from_attached_history(&self.client, attached).await
     }
 }
@@ -324,11 +335,53 @@ async fn hydrate_pending_interactions(
     Ok(())
 }
 
+const fn web_projection_window_request() -> ProjectionWindowRequest {
+    ProjectionWindowRequest {
+        projection: SessionProjectionKind::Transcript,
+        anchor: ProjectionWindowAnchor::Latest,
+        direction: ProjectionWindowDirection::Backward,
+        target: ProjectionWindowTarget {
+            min_items: Some(64),
+            min_estimated_rows: None,
+            min_bytes: None,
+            width_columns: None,
+        },
+        limits: ProjectionWindowLimits {
+            max_items: INITIAL_HISTORY_EVENT_LIMIT,
+            max_events_scanned: INITIAL_HISTORY_EVENT_LIMIT.saturating_mul(4),
+            max_bytes: 2 * 1024 * 1024,
+        },
+    }
+}
+
+async fn attach_web_projection_window(
+    connection: &mut bcode_client::ClientConnection,
+    session_id: SessionId,
+) -> Result<AttachedSessionHistory, ClientError> {
+    connection
+        .attach_session_projection_window_with_input_history(
+            session_id,
+            web_projection_window_request(),
+        )
+        .await
+}
+
+const fn apply_projection_window_metadata(
+    snapshot: &mut SessionViewSnapshot,
+    projection_window: Option<&ProjectionWindow>,
+) {
+    if let Some(window) = projection_window {
+        snapshot.transcript.has_older_history = window.has_older;
+        snapshot.transcript.has_newer_history = window.has_newer;
+    }
+}
+
 fn snapshot_from_view(
     view: &SessionView,
     attached: &AttachedSessionHistory,
 ) -> SessionViewSnapshot {
     let mut snapshot = view.snapshot().clone();
+    apply_projection_window_metadata(&mut snapshot, attached.projection_window.as_ref());
     snapshot.session_id = Some(attached.session.id);
     snapshot.title = attached.session.title().map(ToOwned::to_owned);
     snapshot.working_directory = Some(attached.session.working_directory.clone());
@@ -792,48 +845,137 @@ pub async fn init(state: &WebRenderState) -> Result<AppBuilder, ClientError> {
     ))
 }
 
+async fn attach_watched_session(
+    client: &BcodeClient,
+    session_id: SessionId,
+) -> Result<(SessionWatcher, AttachedSessionHistory, SessionView), ClientError> {
+    let mut watcher = client
+        .watch_session_projection_window(session_id, web_projection_window_request())
+        .await?;
+    let attached = watcher
+        .take_initial()
+        .ok_or(ClientError::UnexpectedResponse)?;
+    let mut view = view_from_attached_history(&attached);
+    hydrate_session_model_status(client, session_id, &mut view).await?;
+    hydrate_pending_permissions(client, session_id, &mut view).await?;
+    hydrate_pending_interactions(client, session_id, &mut view).await?;
+    Ok((watcher, attached, view))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableEventDisposition {
+    Apply,
+    IgnoreDuplicate,
+    ResyncGap,
+}
+
+const fn durable_event_disposition(
+    latest_sequence: Option<u64>,
+    sequence: u64,
+) -> DurableEventDisposition {
+    match latest_sequence {
+        Some(latest) if sequence <= latest => DurableEventDisposition::IgnoreDuplicate,
+        Some(latest) if sequence > latest.saturating_add(1) => DurableEventDisposition::ResyncGap,
+        _ => DurableEventDisposition::Apply,
+    }
+}
+
+fn browser_update_sender(
+    renderer_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+) -> Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>> {
+    renderer_tx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 async fn watch_session_updates(
     client: BcodeClient,
     access_token: Arc<str>,
     session_id: SessionId,
     renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
 ) -> Result<(), ClientError> {
-    let mut watcher = client
-        .watch_session(session_id, INITIAL_HISTORY_EVENT_LIMIT)
-        .await?;
-    let mut attached = watcher
-        .take_initial()
-        .ok_or(ClientError::UnexpectedResponse)?;
-    let mut view = view_from_attached_history(&attached);
-    hydrate_pending_interactions(&client, session_id, &mut view).await?;
+    let (mut watcher, mut attached, mut view) = loop {
+        match attach_watched_session(&client, session_id).await {
+            Ok(state) => break state,
+            Err(error) => {
+                if browser_update_sender(&renderer_tx).is_none() {
+                    return Ok(());
+                }
+                tracing::warn!("web session watcher attach failed for {session_id}: {error}");
+                tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
+            }
+        }
+    };
 
     loop {
-        match watcher.next_event().await? {
+        let event = match watcher.next_event().await {
+            Ok(event) => event,
+            Err(error) => {
+                if browser_update_sender(&renderer_tx).is_none() {
+                    return Ok(());
+                }
+                tracing::warn!("web session watcher disconnected for {session_id}: {error}");
+                tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
+                match attach_watched_session(&client, session_id).await {
+                    Ok((new_watcher, new_attached, new_view)) => {
+                        watcher = new_watcher;
+                        attached = new_attached;
+                        view = new_view;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "web session watcher reconnect failed for {session_id}: {error}"
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let mut resync = false;
+        match event {
             SessionWatchEvent::Durable(event) => {
-                if view
-                    .snapshot()
-                    .latest_sequence
-                    .is_none_or(|sequence| event.sequence > sequence)
-                {
-                    view.apply_event(&event);
+                match durable_event_disposition(view.snapshot().latest_sequence, event.sequence) {
+                    DurableEventDisposition::Apply => view.apply_event(&event),
+                    DurableEventDisposition::IgnoreDuplicate => {}
+                    DurableEventDisposition::ResyncGap => {
+                        tracing::warn!(
+                            "web session watcher detected event gap for {session_id}: latest={:?}, received={}",
+                            view.snapshot().latest_sequence,
+                            event.sequence
+                        );
+                        resync = true;
+                    }
                 }
             }
             SessionWatchEvent::Live(event) => view.apply_live_event(&event),
-            SessionWatchEvent::ResyncRequired => {
-                let mut connection = client.connect("bcode-web-render-resync").await?;
-                attached = connection
-                    .attach_session_recent_with_input_history(
-                        session_id,
-                        INITIAL_HISTORY_EVENT_LIMIT,
-                    )
-                    .await?;
-                view = view_from_attached_history(&attached);
-            }
+            SessionWatchEvent::ResyncRequired => resync = true,
         }
 
-        hydrate_session_model_status(&client, session_id, &mut view).await?;
-        hydrate_pending_permissions(&client, session_id, &mut view).await?;
-        hydrate_pending_interactions(&client, session_id, &mut view).await?;
+        if resync {
+            let state = loop {
+                match attach_watched_session(&client, session_id).await {
+                    Ok(state) => break state,
+                    Err(error) => {
+                        if browser_update_sender(&renderer_tx).is_none() {
+                            return Ok(());
+                        }
+                        tracing::warn!(
+                            "web session watcher resync failed for {session_id}: {error}"
+                        );
+                        tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
+                    }
+                }
+            };
+            (watcher, attached, view) = state;
+        } else {
+            hydrate_session_model_status(&client, session_id, &mut view).await?;
+            hydrate_pending_permissions(&client, session_id, &mut view).await?;
+            hydrate_pending_interactions(&client, session_id, &mut view).await?;
+        }
+
         let sessions = client.list_sessions().await?;
         if let Some(summary) = sessions.iter().find(|summary| summary.id == session_id) {
             attached.session.clone_from(summary);
@@ -843,13 +985,10 @@ async fn watch_session_updates(
             snapshot: snapshot_from_view(&view, &attached),
             sessions,
         };
-        let sender = renderer_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(sender) = sender
-            && sender.send(update).await.is_err()
-        {
+        let Some(sender) = browser_update_sender(&renderer_tx) else {
+            return Ok(());
+        };
+        if sender.send(update).await.is_err() {
             return Ok(());
         }
     }
@@ -893,6 +1032,48 @@ pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_window_metadata_populates_history_availability() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        let window = ProjectionWindow {
+            projection: SessionProjectionKind::Transcript,
+            transcript_items: Vec::new(),
+            source_range: None,
+            has_older: true,
+            has_newer: false,
+            scanned_events: 12,
+        };
+
+        apply_projection_window_metadata(&mut snapshot, Some(&window));
+
+        assert!(snapshot.transcript.has_older_history);
+        assert!(!snapshot.transcript.has_newer_history);
+    }
+
+    #[test]
+    fn durable_event_disposition_detects_duplicates_and_gaps() {
+        assert_eq!(
+            durable_event_disposition(None, 7),
+            DurableEventDisposition::Apply
+        );
+        assert_eq!(
+            durable_event_disposition(Some(7), 7),
+            DurableEventDisposition::IgnoreDuplicate
+        );
+        assert_eq!(
+            durable_event_disposition(Some(7), 6),
+            DurableEventDisposition::IgnoreDuplicate
+        );
+        assert_eq!(
+            durable_event_disposition(Some(7), 8),
+            DurableEventDisposition::Apply
+        );
+        assert_eq!(
+            durable_event_disposition(Some(7), 9),
+            DurableEventDisposition::ResyncGap
+        );
+    }
 
     #[test]
     fn web_renderer_init_smoke_test() {

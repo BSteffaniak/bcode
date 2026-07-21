@@ -286,6 +286,7 @@ pub struct BmuxApp {
     composer: TextInputState,
     input_history: InputHistory,
     transcript: TranscriptDocument,
+    session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
@@ -503,6 +504,7 @@ impl BmuxApp {
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
+            session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
@@ -959,6 +961,13 @@ impl BmuxApp {
     /// Insert pasted text into the composer.
     pub fn paste_composer_text(&mut self, text: &str) {
         TextInputControl::new(&composer_policy()).handle_paste(&mut self.composer, text);
+    }
+
+    /// Return renderer-neutral semantic session state used for parity migration.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn session_view_snapshot(&self) -> &bcode_session_view_models::SessionViewSnapshot {
+        self.session_view.snapshot()
     }
 
     /// Return transcript items.
@@ -1971,6 +1980,7 @@ impl BmuxApp {
     /// Absorb replayed history events.
     pub fn absorb_history(&mut self, events: &[SessionEvent]) {
         self.latest_history_sequence = events.last().map(|event| event.sequence);
+        self.session_view.apply_history(events);
         self.transcript_window.append_history(events);
         for event in events {
             self.apply_session_event(event, SessionEventApplication::Replay);
@@ -1980,6 +1990,8 @@ impl BmuxApp {
 
     fn rebuild_transcript_from_history(&mut self) {
         let events = self.transcript_window.events().to_vec();
+        self.session_view = bcode_session_view::SessionView::new();
+        self.session_view.apply_history(&events);
         self.transcript.replace(Vec::new());
         self.tool_call_contexts.clear();
         self.tool_invocation_projections.clear();
@@ -2124,12 +2136,14 @@ impl BmuxApp {
         if event_affects_transcript_rows(event) {
             self.transcript_window.append_live_event(event);
         }
+        self.session_view.apply_event(event);
         self.apply_session_event(event, SessionEventApplication::Live);
         self.trim_resident_transcript_window_if_needed();
     }
 
     /// Absorb one live-only session event.
     pub fn absorb_session_live_event(&mut self, event: &SessionLiveEvent) {
+        self.session_view.apply_live_event(event);
         match &event.kind {
             SessionLiveEventKind::AssistantTextDelta { text, .. } => {
                 let should_anchor = self.should_anchor_new_assistant_stream();
@@ -4591,6 +4605,62 @@ mod tests {
                 algorithm_version: 1,
             },
         }
+    }
+
+    #[test]
+    fn shared_session_view_tracks_tui_history_and_live_events() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = vec![
+            bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "hello".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            },
+            bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                    text: "hi".to_owned(),
+                },
+            },
+        ];
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+        assert_eq!(app.session_view_snapshot().transcript.items.len(), 2);
+        assert!(matches!(
+            &app.session_view_snapshot().transcript.items[0].kind,
+            bcode_session_view_models::TranscriptViewItemKind::UserMessage { message }
+                if message.text == "hello"
+        ));
+        assert!(matches!(
+            &app.session_view_snapshot().transcript.items[1].kind,
+            bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "hi"
+        ));
+
+        app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-2".to_owned(),
+                text: "live".to_owned(),
+            },
+        });
+
+        assert!(matches!(
+            &app.session_view_snapshot().transcript.items[2].kind,
+            bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "live"
+        ));
     }
 
     #[test]

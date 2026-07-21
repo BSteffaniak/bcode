@@ -32,12 +32,12 @@ Status meanings:
 | `ContextCompacted` | Appends a semantic context-compaction system item. | Appends compaction transcript presentation. | **Complete** for portable semantic status. |
 | `SessionRenamed` | Updates title. | Updates title and terminal status. | **Complete** for persistent session metadata. |
 | `TraceEvent` | No-op. | Applies live trace telemetry only; replay ignores it. | **Intentional no-op** for shared transcript until a concrete cross-renderer trace view is required. |
-| `SkillInvoked` | No-op. | Appends a skill transcript item. | **Missing**: project renderer-relevant skill invocation status. |
-| `SkillSuggested` | No-op. | Appends a suggestion when a reason exists. | **Missing** when a reason is present; reasonless events are presentation no-ops. |
-| `SkillActivated` | No-op. | Updates active skill set and status. | **Missing**: add active-skill view state. |
-| `SkillDeactivated` | No-op. | Updates active skill set and status. | **Missing**: add active-skill view state. |
-| `SkillContextLoaded` | No-op. | Updates skill context status. | **Missing**: add renderer-neutral skill context status if it remains user-visible. |
-| `SkillInvocationFailed` | No-op. | Appends a skill error item. | **Missing**: project semantic skill failure. |
+| `SkillInvoked` | Appends a renderer-neutral skill invocation status item. | Appends a skill transcript item. | **Complete** for semantic status. |
+| `SkillSuggested` | Appends a suggestion status item when a reason exists. | Appends a suggestion when a reason exists. | **Complete**. |
+| `SkillActivated` | Adds the skill to renderer-neutral active-skill state. | Updates active skill set and status. | **Complete** for semantic state. |
+| `SkillDeactivated` | Removes the skill from renderer-neutral active-skill state. | Updates active skill set and status. | **Complete** for semantic state. |
+| `SkillContextLoaded` | Appends renderer-neutral source/size/truncation/preview status. | Updates skill context status. | **Complete** for user-visible semantics. |
+| `SkillInvocationFailed` | Appends renderer-neutral skill failure status. | Appends a skill error item. | **Complete**. |
 | `AssistantReasoningDelta` | Appends reasoning content and updates thinking state. | Updates terminal thinking/reasoning stream subject to renderer visibility. | **Complete** for semantic content. |
 | `AssistantReasoningMessage` | Finishes reasoning content and thinking state. | Finishes terminal reasoning presentation subject to renderer visibility. | **Complete** for semantic content. |
 | `RuntimeWorkStarted` | Upserts runtime-work state and adds its transcript item. | Applies live runtime-work state; replay generally leaves it to status hydration. | **Complete** for event semantics. |
@@ -49,15 +49,14 @@ Status meanings:
 | `WorkingDirectoryChanged` | Updates working directory. | Updates working directory and appends a warning system message. | **Partial**: metadata is present; shared semantic warning/status is absent. |
 | `SessionImported` | No-op. | No-op in `BmuxApp`. | **Intentional no-op**; provenance remains session metadata/catalog-owned. |
 | `SessionForked` | No-op. | No-op in `BmuxApp`. | **Intentional no-op**; provenance remains session metadata/catalog-owned. |
-| `RalphLifecycle` | No-op. | Appends a Ralph system message; host also refreshes plugin status. | **Missing** from shared generic/plugin status presentation. |
+| `RalphLifecycle` | Appends portable Ralph lifecycle status. | Appends a Ralph system message; host also refreshes plugin status. | **Complete** for durable semantic status. |
 | `ReasoningChanged` | Updates reasoning effort/summary selection. | Updates reasoning effort/summary selection and label. | **Complete** for selection metadata; renderer label presentation remains local. |
 | `InteractiveToolRequestCreated` | Adds `InteractionViewSummary` and a transcript interaction item. | Adds a terminal interaction item and opens a native surface in host flow. | **Complete** for durable generic metadata; native surface opening remains TUI-only. |
 | `InteractiveToolRequestResolved` | Marks the interaction resolved, stores resolution JSON, and updates its transcript item. | Resolves/replaces native surface output or adds a resolution item. | **Complete** for durable generic semantics. |
 | `ProviderContextCompacted` | Clears stale occupancy and appends portable provider/model compaction status. | Appends provider compaction presentation. | **Complete** for portable semantic status. |
 | `RequestContextObserved` | Projects authoritative occupancy from the durable observation. | Classified as transcript-affecting but has no direct `BmuxApp` branch; other status hydration supplies occupancy. | **Complete** for authoritative occupancy semantics. |
-| `PluginStatusNote` | No-op. | No direct `BmuxApp` branch; host refreshes plugin-owned status. | **Missing** from shared plugin status view. |
-| `PluginAutomationTurnStarted` | No-op. | No direct `BmuxApp` branch; host refreshes plugin-owned status. | **Missing** from shared plugin automation/status view. |
-| `PluginAutomationTurnFinished` | No-op. | No direct `BmuxApp` branch; host refreshes plugin-owned status. | **Missing** from shared plugin automation/status view. |
+| `PluginStatusNote` | Upserts plugin/note-keyed structured status and one stable transcript item. | TUI transcript projection renders plugin status; host refreshes plugin-owned status. | **Complete** for durable status-note semantics. |
+| `LegacyEvent` | No-op. | Compatibility-only event with no application behavior. | **Intentional no-op**. |
 
 ## Live `SessionLiveEventKind` coverage
 
@@ -66,14 +65,12 @@ Status meanings:
 | `AssistantTextDelta` | Cumulatively updates the active assistant item. | Updates assistant stream and terminal anchoring. | **Complete** for semantic content. |
 | `AssistantReasoningDelta` | Cumulatively updates reasoning item and thinking state. | Updates reasoning stream and terminal visibility/anchoring. | **Complete** for semantic content. |
 | `ToolOutputDelta` | Applies the stream event to shared tool projection/output. | Updates terminal tool output and viewport. | **Complete** for generic semantic output. |
-| `ToolArgumentPreview` | Adds the plugin visual preview to transcript. | Updates terminal live preview and viewport. | **Partial**: visual content is represented, but shared replacement/identity rules for repeated previews need refinement. |
+| `ToolArgumentPreview` | Replaces one tool-call-keyed plugin visual preview with stable identity. | Updates terminal live preview and viewport. | **Complete** for semantic preview state; viewport behavior remains renderer-owned. |
 | `RequestContextOccupancyChanged` | Replaces authoritative current occupancy. | Updates current context occupancy. | **Complete**. |
-| `ProviderStreamProgress` | No-op. | Updates provider stream status. | **Missing**: define renderer-neutral provider progress state where user-visible. |
+| `ProviderStreamProgress` | Projects turn-correlated human-readable progress and retry timing. | Updates provider stream status. | **Complete** for semantic progress; animation/timers remain renderer-owned. |
 
 ## Migration order derived from the matrix
 
-1. Add skill and plugin-owned status/automation semantics.
-2. Refine live tool-preview identity/replacement semantics.
-3. Build parity fixtures for all rows marked **Complete** or **Partial** before moving TUI consumers and removing duplicate projection.
+1. Build parity fixtures for all rows marked **Complete** or **Partial** before moving TUI consumers and removing duplicate projection.
 
 The matrix must be updated whenever a new `SessionEventKind` or `SessionLiveEventKind` variant is added. Architecture tests should eventually enforce that every variant is explicitly classified.

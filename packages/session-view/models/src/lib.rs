@@ -15,21 +15,58 @@ use bcode_session_models::{
 };
 use bcode_tool::InteractionInput;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Monotonic revision for renderer-visible view state.
 pub type ViewRevision = u64;
 
-/// Stable identifier for a transcript item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct TranscriptViewItemId(pub u64);
+/// Stable, source-derived identifier for a transcript item.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TranscriptViewItemId(String);
 
 impl TranscriptViewItemId {
-    /// Return the raw identifier value.
+    /// Create an identifier from a stable namespaced key.
     #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Create an identifier for an event-owned transcript item.
+    #[must_use]
+    pub fn event(sequence: u64) -> Self {
+        Self(format!("event:{sequence}"))
+    }
+
+    /// Create an identifier for a tool invocation.
+    #[must_use]
+    pub fn tool(tool_call_id: &str) -> Self {
+        Self(format!("tool:{tool_call_id}"))
+    }
+
+    /// Create an identifier for a permission request.
+    #[must_use]
+    pub fn permission(permission_id: &str) -> Self {
+        Self(format!("permission:{permission_id}"))
+    }
+
+    /// Create an identifier for runtime work.
+    #[must_use]
+    pub fn runtime_work(work_id: &WorkId) -> Self {
+        Self(format!("runtime-work:{work_id}"))
+    }
+
+    /// Create an identifier for an interaction.
+    #[must_use]
+    pub fn interaction(interaction_id: &str) -> Self {
+        Self(format!("interaction:{interaction_id}"))
+    }
+
+    /// Return the stable identifier value.
+    #[must_use]
+    pub fn get(&self) -> &str {
+        &self.0
     }
 }
 
@@ -56,6 +93,12 @@ pub struct SessionViewSnapshot {
     pub permissions: Vec<PermissionView>,
     /// Runtime work entries visible to renderers.
     pub runtime_work: Vec<RuntimeWorkView>,
+    /// Active skills selected for the session.
+    #[serde(default)]
+    pub active_skills: BTreeSet<String>,
+    /// Latest plugin-owned status notes keyed by plugin and note identity.
+    #[serde(default)]
+    pub plugin_status: BTreeMap<String, PluginStatusView>,
     /// Composer state.
     pub composer: ComposerViewState,
     /// Current reasoning/thinking display state.
@@ -71,7 +114,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 2;
+    pub const SCHEMA_VERSION: u16 = 4;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -87,6 +130,8 @@ impl SessionViewSnapshot {
             tools: BTreeMap::new(),
             permissions: Vec::new(),
             runtime_work: Vec::new(),
+            active_skills: BTreeSet::new(),
+            plugin_status: BTreeMap::new(),
             composer: ComposerViewState::default(),
             thinking: ThinkingViewState::default(),
             runtime: SessionRuntimeViewState::default(),
@@ -115,6 +160,10 @@ pub struct SessionViewPatch {
     pub permissions: Vec<PermissionView>,
     /// Runtime-work updates.
     pub runtime_work: Vec<RuntimeWorkView>,
+    /// Active skill-set replacement, when changed.
+    pub active_skills: Option<BTreeSet<String>>,
+    /// Plugin status updates keyed by plugin and note identity.
+    pub plugin_status: BTreeMap<String, PluginStatusView>,
     /// Composer replacement, when changed.
     pub composer: Option<ComposerViewState>,
     /// Thinking state replacement, when changed.
@@ -127,7 +176,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 2;
+    pub const SCHEMA_VERSION: u16 = 4;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -141,6 +190,8 @@ impl SessionViewPatch {
             tools: BTreeMap::new(),
             permissions: Vec::new(),
             runtime_work: Vec::new(),
+            active_skills: None,
+            plugin_status: BTreeMap::new(),
             composer: None,
             thinking: None,
             runtime: None,
@@ -416,6 +467,19 @@ pub struct PermissionView {
     pub can_remember: bool,
 }
 
+/// Latest plugin-owned status note visible to renderers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStatusView {
+    /// Plugin that owns the status.
+    pub plugin_id: String,
+    /// Stable note identity within the plugin/session.
+    pub note_id: String,
+    /// Human-readable status text.
+    pub text: String,
+    /// Plugin-owned structured status metadata.
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
 /// Runtime work visible to renderers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkView {
@@ -460,6 +524,19 @@ pub struct SessionRuntimeViewState {
     pub last_turn_outcome: Option<ModelTurnOutcome>,
     /// Most recent completed turn message, when supplied.
     pub last_turn_message: Option<String>,
+    /// Current provider-stream progress, when an active stream exposed status.
+    pub provider_progress: Option<ProviderProgressView>,
+}
+
+/// Renderer-neutral provider stream progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderProgressView {
+    /// Model turn associated with the progress.
+    pub turn_id: String,
+    /// Human-readable semantic progress detail.
+    pub detail: String,
+    /// Scheduled retry time in Unix seconds, when waiting to retry.
+    pub retry_at_unix: Option<u64>,
 }
 
 /// Composer state shared by renderers.

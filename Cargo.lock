@@ -2391,6 +2391,8 @@ dependencies = [
  "bcode_ralph",
  "bcode_server",
  "bcode_session_models",
+ "bcode_session_view",
+ "bcode_session_view_models",
  "bcode_settings",
  "bcode_shell_plugin",
  "bcode_skill_models",

@@ -1733,6 +1733,7 @@ async fn async_session_open_preserves_typed_draft() {
         import_warnings: Vec::new(),
         draft: None,
         runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
+        projection_window: None,
     };
 
     super::session_flow::complete_switch_session(
@@ -1823,6 +1824,7 @@ async fn async_session_open_completion_preserves_plugin_host() {
         import_warnings: Vec::new(),
         draft: None,
         runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
+        projection_window: None,
     };
 
     super::session_flow::complete_switch_session(

@@ -240,6 +240,8 @@ pub struct AttachedSessionHistory {
     pub import_warnings: Vec<SessionImportWarning>,
     pub draft: Option<String>,
     pub runtime_selection: bcode_ipc::SessionRuntimeSelection,
+    /// Projection-window metadata when the attach used a semantic projection request.
+    pub projection_window: Option<bcode_session_models::ProjectionWindow>,
 }
 
 const CLIENT_RUNTIME_ENV_VARS: &[&str] = &[
@@ -829,6 +831,27 @@ impl BcodeClient {
         let mut connection = self.connect("bcode-session-view").await?;
         let initial = connection
             .attach_session_recent_with_input_history(session_id, history_limit)
+            .await?;
+        Ok(SessionWatcher {
+            connection,
+            session_id,
+            initial: Some(initial),
+        })
+    }
+
+    /// Create an event-driven session watcher with a bounded semantic projection window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the attachment.
+    pub async fn watch_session_projection_window(
+        &self,
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+    ) -> Result<SessionWatcher, ClientError> {
+        let mut connection = self.connect("bcode-session-view").await?;
+        let initial = connection
+            .attach_session_projection_window_with_input_history(session_id, request)
             .await?;
         Ok(SessionWatcher {
             connection,
@@ -2445,6 +2468,7 @@ impl ClientConnection {
                 import_warnings,
                 draft,
                 runtime_selection,
+                projection_window,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -2454,6 +2478,7 @@ impl ClientConnection {
                 import_warnings,
                 draft,
                 runtime_selection,
+                projection_window,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -2494,6 +2519,7 @@ impl ClientConnection {
                 import_warnings,
                 draft,
                 runtime_selection,
+                projection_window,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -2503,6 +2529,7 @@ impl ClientConnection {
                 import_warnings,
                 draft,
                 runtime_selection,
+                projection_window,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -2531,6 +2558,7 @@ impl ClientConnection {
                 import_warnings,
                 draft,
                 runtime_selection,
+                projection_window,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -2540,6 +2568,7 @@ impl ClientConnection {
                 import_warnings,
                 draft,
                 runtime_selection,
+                projection_window,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }

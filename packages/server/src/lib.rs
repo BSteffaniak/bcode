@@ -6003,6 +6003,7 @@ async fn handle_attach_session(
                     import_warnings: Vec::new(),
                     draft,
                     runtime_selection: session_runtime_selection_payload(state, session_id).await,
+                    projection_window: None,
                 }),
             )
             .await?;
@@ -6210,6 +6211,7 @@ async fn finish_attach_session_projection_window_success(
     window_attachment: bcode_session::SessionProjectionWindowAttachment,
     timings: AttachRecentTimings,
 ) -> Result<(), ServerError> {
+    let projection_window = window_attachment.projection_window;
     let attachment = window_attachment.attachment;
     state.metrics.record_histogram(
         "server.attach_projection_window.session_attach_duration_ms",
@@ -6225,7 +6227,7 @@ async fn finish_attach_session_projection_window_success(
     );
     state.metrics.record_histogram(
         "server.attach_projection_window.projection_item_count",
-        usize_to_u64(window_attachment.projection_window.transcript_items.len()),
+        usize_to_u64(projection_window.transcript_items.len()),
     );
     let restore_started_at = Instant::now();
     restore_active_skills_from_history(&attachment.history, state, session_id).await;
@@ -6267,6 +6269,7 @@ async fn finish_attach_session_projection_window_success(
         import_warnings: Vec::new(),
         draft,
         runtime_selection,
+        projection_window: Some(projection_window),
     });
     let send_started_at = Instant::now();
     send_response(context.writer, context.request_id, response).await?;
@@ -6355,6 +6358,7 @@ async fn finish_attach_session_recent_success(
             import_warnings: Vec::new(),
             draft,
             runtime_selection: session_runtime_selection_payload(state, session_id).await,
+            projection_window: None,
         }),
     )
     .await?;

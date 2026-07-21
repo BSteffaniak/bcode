@@ -11,44 +11,46 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-arboard                  = { workspace = true }
-bcode_agent_profile      = { workspace = true }
-bcode_bundled_plugins    = { workspace = true }
-bcode_client             = { workspace = true }
-bcode_code_review_models = { workspace = true }
-bcode_command            = { workspace = true }
-bcode_config             = { workspace = true }
-bcode_daemon_lifecycle   = { workspace = true }
-bcode_ipc                = { workspace = true }
-bcode_markdown_render    = { workspace = true }
-bcode_model              = { workspace = true }
-bcode_plugin             = { workspace = true }
-bcode_plugin_sdk         = { workspace = true, features = ["tui"] }
-bcode_provider_auth      = { workspace = true }
-bcode_ralph              = { workspace = true }
-bcode_server             = { workspace = true }
-bcode_session_models     = { workspace = true }
-bcode_settings           = { workspace = true }
-bcode_skill_models       = { workspace = true }
-bcode_syntax_render      = { workspace = true }
-bcode_tool               = { workspace = true }
-bcode_tui_components     = { workspace = true }
-bcode_worktree_models    = { workspace = true }
-bmux_keyboard            = { workspace = true }
-bmux_terminal_grid       = { workspace = true }
-bmux_text_edit           = { workspace = true }
-bmux_tui                 = { workspace = true, features = ["crossterm"] }
-bmux_tui_components      = { workspace = true, features = ["text-input"] }
-crossterm                = { workspace = true, features = ["bracketed-paste", "events"] }
-image                    = { workspace = true }
-png                      = { workspace = true }
-serde                    = { workspace = true, features = ["derive", "std"] }
-serde_json               = { workspace = true }
-thiserror                = { workspace = true }
-tokio                    = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-tracing                  = { workspace = true }
-unicode-segmentation     = { workspace = true }
-uuid                     = { workspace = true, features = ["v4"] }
+arboard                   = { workspace = true }
+bcode_agent_profile       = { workspace = true }
+bcode_bundled_plugins     = { workspace = true }
+bcode_client              = { workspace = true }
+bcode_code_review_models  = { workspace = true }
+bcode_command             = { workspace = true }
+bcode_config              = { workspace = true }
+bcode_daemon_lifecycle    = { workspace = true }
+bcode_ipc                 = { workspace = true }
+bcode_markdown_render     = { workspace = true }
+bcode_model               = { workspace = true }
+bcode_plugin              = { workspace = true }
+bcode_plugin_sdk          = { workspace = true, features = ["tui"] }
+bcode_provider_auth       = { workspace = true }
+bcode_ralph               = { workspace = true }
+bcode_server              = { workspace = true }
+bcode_session_models      = { workspace = true }
+bcode_session_view        = { workspace = true }
+bcode_session_view_models = { workspace = true }
+bcode_settings            = { workspace = true }
+bcode_skill_models        = { workspace = true }
+bcode_syntax_render       = { workspace = true }
+bcode_tool                = { workspace = true }
+bcode_tui_components      = { workspace = true }
+bcode_worktree_models     = { workspace = true }
+bmux_keyboard             = { workspace = true }
+bmux_terminal_grid        = { workspace = true }
+bmux_text_edit            = { workspace = true }
+bmux_tui                  = { workspace = true, features = ["crossterm"] }
+bmux_tui_components       = { workspace = true, features = ["text-input"] }
+crossterm                 = { workspace = true, features = ["bracketed-paste", "events"] }
+image                     = { workspace = true }
+png                       = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+serde_json                = { workspace = true }
+thiserror                 = { workspace = true }
+tokio                     = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing                   = { workspace = true }
+unicode-segmentation      = { workspace = true }
+uuid                      = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }

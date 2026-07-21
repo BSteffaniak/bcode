@@ -17,8 +17,8 @@ use bcode_session_models::{
     ToolInvocationStreamEvent, apply_tool_invocation_projection_event,
 };
 use bcode_session_view_models::{
-    ChatMessageView, ComposerViewState, InteractionViewSummary, PluginVisualView,
-    SessionViewSnapshot, TextFormat, ThinkingViewState, ToolInvocationView,
+    ChatMessageView, ComposerViewState, InteractionViewSummary, PluginStatusView, PluginVisualView,
+    ProviderProgressView, SessionViewSnapshot, TextFormat, ThinkingViewState, ToolInvocationView,
     ToolInvocationViewStatus, ToolOutputView, ToolResultView, ToolTimingView, TranscriptViewItem,
     TranscriptViewItemId, TranscriptViewItemKind,
 };
@@ -28,7 +28,6 @@ use std::collections::{BTreeMap, btree_map::Entry};
 #[derive(Debug, Clone)]
 pub struct SessionView {
     snapshot: SessionViewSnapshot,
-    next_item_id: u64,
     tool_item_ids: BTreeMap<String, TranscriptViewItemId>,
     interaction_item_ids: BTreeMap<String, TranscriptViewItemId>,
     tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
@@ -46,7 +45,6 @@ impl SessionView {
     pub fn new() -> Self {
         Self {
             snapshot: SessionViewSnapshot::empty(),
-            next_item_id: 1,
             tool_item_ids: BTreeMap::new(),
             interaction_item_ids: BTreeMap::new(),
             tool_invocation_projections: BTreeMap::new(),
@@ -136,7 +134,16 @@ impl SessionView {
     #[allow(clippy::too_many_lines)]
     pub fn apply_event(&mut self, event: &SessionEvent) {
         self.snapshot.session_id = Some(event.session_id);
-        self.snapshot.latest_sequence = Some(event.sequence);
+        if event.sequence != 0 {
+            if self
+                .snapshot
+                .latest_sequence
+                .is_some_and(|sequence| event.sequence <= sequence)
+            {
+                return;
+            }
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
         apply_tool_invocation_projection_event(&mut self.tool_invocation_projections, event);
 
         match &event.kind {
@@ -153,6 +160,7 @@ impl SessionView {
                     self.snapshot.title = Some(derive_session_title_from_prompt(text));
                 }
                 self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
@@ -163,6 +171,7 @@ impl SessionView {
             }
             SessionEventKind::AssistantDelta { text } => {
                 self.push_or_append_streaming_message(
+                    TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     StreamingMessageKind::Assistant,
@@ -171,6 +180,7 @@ impl SessionView {
             }
             SessionEventKind::AssistantMessage { text } => {
                 self.finish_or_push_message(
+                    TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     StreamingMessageKind::Assistant,
@@ -184,6 +194,7 @@ impl SessionView {
                     streaming: true,
                 };
                 self.push_or_append_streaming_message(
+                    TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     StreamingMessageKind::Reasoning,
@@ -197,6 +208,7 @@ impl SessionView {
                     streaming: false,
                 };
                 self.finish_or_push_message(
+                    TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     StreamingMessageKind::Reasoning,
@@ -215,6 +227,10 @@ impl SessionView {
                 } = stream
                 {
                     self.push_item(
+                        TranscriptViewItemId::new(format!(
+                            "tool-visual:{tool_call_id}:{}",
+                            stream_sequence(stream)
+                        )),
                         event.sequence,
                         Some(event.timestamp_ms),
                         *streaming,
@@ -226,6 +242,7 @@ impl SessionView {
             }
             SessionEventKind::SystemMessage { text } => {
                 self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
@@ -252,6 +269,7 @@ impl SessionView {
             SessionEventKind::ModelTurnStarted { turn_id } => {
                 self.snapshot.runtime.active_turn_id = Some(turn_id.clone());
                 self.snapshot.runtime.cancelling = false;
+                self.snapshot.runtime.provider_progress = None;
                 self.bump_revision();
             }
             SessionEventKind::ModelTurnCancelRequested { turn_id, .. } => {
@@ -268,10 +286,12 @@ impl SessionView {
                     self.snapshot.runtime.active_turn_id = None;
                 }
                 self.snapshot.runtime.cancelling = false;
+                self.snapshot.runtime.provider_progress = None;
                 self.snapshot.runtime.last_turn_outcome = Some(*outcome);
                 self.snapshot.runtime.last_turn_message.clone_from(message);
                 if *outcome == bcode_session_models::ModelTurnOutcome::Error {
                     self.push_item(
+                        TranscriptViewItemId::event(event.sequence),
                         event.sequence,
                         Some(event.timestamp_ms),
                         false,
@@ -292,6 +312,7 @@ impl SessionView {
             }
             SessionEventKind::ContextCompacted { summary, .. } => {
                 self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
@@ -305,6 +326,7 @@ impl SessionView {
             SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
                 self.snapshot.runtime.context_occupancy = None;
                 self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
@@ -324,6 +346,146 @@ impl SessionView {
                         observation: observation.clone(),
                     });
                 self.bump_revision();
+            }
+            SessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                ..
+            } => {
+                let source = source
+                    .as_ref()
+                    .map_or_else(String::new, |source| format!("\nSource: {}", source.label));
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain(format!(
+                            "Invoked skill {skill_id}{source}\nArguments: {arguments}"
+                        )),
+                    },
+                );
+            }
+            SessionEventKind::SkillSuggested {
+                skill_id,
+                reason: Some(reason),
+                ..
+            } => {
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain(format!(
+                            "Suggested skill {skill_id}\nReason: {reason}"
+                        )),
+                    },
+                );
+            }
+            SessionEventKind::SkillActivated { skill_id, .. }
+                if self.snapshot.active_skills.insert(skill_id.to_string()) =>
+            {
+                self.bump_revision();
+            }
+            SessionEventKind::SkillDeactivated { skill_id, .. }
+                if self.snapshot.active_skills.remove(skill_id.as_str()) =>
+            {
+                self.bump_revision();
+            }
+            SessionEventKind::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                source,
+                preview,
+                ..
+            } => {
+                let source = source
+                    .as_ref()
+                    .map_or_else(String::new, |source| format!("\nSource: {}", source.label));
+                let preview = preview.as_deref().map_or_else(String::new, |preview| {
+                    if preview.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\nPreview:\n{preview}")
+                    }
+                });
+                let suffix = if *truncated { " (truncated)" } else { "" };
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain(format!(
+                            "Loaded skill context {skill_id}{source}\nBytes: {bytes_loaded}{suffix}{preview}"
+                        )),
+                    },
+                );
+            }
+            SessionEventKind::SkillInvocationFailed {
+                skill_id, error, ..
+            } => {
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain(format!(
+                            "Skill {skill_id} failed: {error}"
+                        )),
+                    },
+                );
+            }
+            SessionEventKind::PluginStatusNote {
+                plugin_id,
+                note_id,
+                text,
+                metadata,
+            } => {
+                let key = format!("{plugin_id}:{note_id}");
+                self.snapshot.plugin_status.insert(
+                    key,
+                    PluginStatusView {
+                        plugin_id: plugin_id.clone(),
+                        note_id: note_id.clone(),
+                        text: text.clone(),
+                        metadata: metadata.clone(),
+                    },
+                );
+                self.upsert_item(
+                    TranscriptViewItemId::new(format!("plugin-status:{plugin_id}:{note_id}")),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain(text.clone()),
+                    },
+                );
+            }
+            SessionEventKind::RalphLifecycle {
+                loop_name,
+                state_dir,
+                kind,
+                message,
+                ..
+            } => {
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain(format!(
+                            "Ralph {kind}\nLoop: {loop_name}\n{message}\nState: {}",
+                            state_dir.display()
+                        )),
+                    },
+                );
             }
             SessionEventKind::InteractiveToolRequestCreated {
                 interaction_id,
@@ -411,6 +573,7 @@ impl SessionView {
                     |permission| permission.permission_id.as_str(),
                 );
                 self.push_item(
+                    TranscriptViewItemId::permission(permission_id),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
@@ -533,21 +696,23 @@ impl SessionView {
     pub fn apply_live_event(&mut self, event: &SessionLiveEvent) {
         self.snapshot.session_id = Some(event.session_id);
         match &event.kind {
-            SessionLiveEventKind::AssistantTextDelta { text, .. } => {
+            SessionLiveEventKind::AssistantTextDelta { turn_id, text } => {
                 self.push_or_append_streaming_message(
+                    TranscriptViewItemId::new(format!("assistant-turn:{turn_id}")),
                     0,
                     None,
                     StreamingMessageKind::Assistant,
                     text,
                 );
             }
-            SessionLiveEventKind::AssistantReasoningDelta { text, .. } => {
+            SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
                 self.snapshot.thinking = ThinkingViewState {
                     visible: true,
                     active_text: Some(text.clone()),
                     streaming: true,
                 };
                 self.push_or_append_streaming_message(
+                    TranscriptViewItemId::new(format!("reasoning-turn:{turn_id}")),
                     0,
                     None,
                     StreamingMessageKind::Reasoning,
@@ -573,7 +738,9 @@ impl SessionView {
                 preview,
                 ..
             } => {
-                self.push_item(
+                let id = TranscriptViewItemId::new(format!("tool-preview:{tool_call_id}"));
+                self.upsert_item(
+                    id,
                     0,
                     None,
                     true,
@@ -591,7 +758,20 @@ impl SessionView {
                     });
                 self.upsert_tool_item(tool_call_id, 0, None);
             }
-            SessionLiveEventKind::ProviderStreamProgress { .. } => {}
+            SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
+                self.snapshot.runtime.provider_progress = Some(ProviderProgressView {
+                    turn_id: turn_id.clone(),
+                    detail: provider_progress_detail(event),
+                    retry_at_unix: match event {
+                        bcode_session_models::ProviderStreamEvent::RetryScheduled {
+                            retry_at_unix,
+                            ..
+                        } => Some(*retry_at_unix),
+                        _ => None,
+                    },
+                });
+                self.bump_revision();
+            }
             SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
                 self.snapshot
                     .runtime
@@ -606,22 +786,16 @@ impl SessionView {
         self.snapshot.revision = self.snapshot.revision.saturating_add(1);
     }
 
-    const fn next_transcript_item_id(&mut self) -> TranscriptViewItemId {
-        let id = TranscriptViewItemId(self.next_item_id);
-        self.next_item_id = self.next_item_id.saturating_add(1);
-        id
-    }
-
     fn push_item(
         &mut self,
+        id: TranscriptViewItemId,
         sequence: u64,
         timestamp_ms: Option<u64>,
         streaming: bool,
         kind: TranscriptViewItemKind,
     ) -> TranscriptViewItemId {
-        let id = self.next_transcript_item_id();
         self.snapshot.transcript.items.push(TranscriptViewItem {
-            id,
+            id: id.clone(),
             revision: 0,
             sequence: (sequence != 0).then_some(sequence),
             timestamp_ms,
@@ -631,6 +805,33 @@ impl SessionView {
         self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
         self.bump_revision();
         id
+    }
+
+    fn upsert_item(
+        &mut self,
+        id: TranscriptViewItemId,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+        streaming: bool,
+        kind: TranscriptViewItemKind,
+    ) {
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            item.kind = kind;
+            item.streaming = streaming;
+            item.sequence = (sequence != 0).then_some(sequence).or(item.sequence);
+            item.timestamp_ms = timestamp_ms.or(item.timestamp_ms);
+            item.revision = item.revision.saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+            return;
+        }
+        self.push_item(id, sequence, timestamp_ms, streaming, kind);
     }
 
     fn upsert_tool_item(&mut self, tool_call_id: &str, sequence: u64, timestamp_ms: Option<u64>) {
@@ -643,7 +844,7 @@ impl SessionView {
             .insert(tool_call_id.to_owned(), tool.clone());
         match self.tool_item_ids.entry(tool_call_id.to_owned()) {
             Entry::Occupied(entry) => {
-                let id = *entry.get();
+                let id = entry.get().clone();
                 if let Some(item) = self
                     .snapshot
                     .transcript
@@ -666,6 +867,7 @@ impl SessionView {
             }
             Entry::Vacant(_) => {
                 let id = self.push_item(
+                    TranscriptViewItemId::tool(tool_call_id),
                     sequence,
                     timestamp_ms,
                     matches!(tool.status, ToolInvocationViewStatus::Running),
@@ -689,6 +891,7 @@ impl SessionView {
         } else {
             self.snapshot.runtime_work.push(work.clone());
             self.push_item(
+                TranscriptViewItemId::runtime_work(&work.work_id),
                 0,
                 work.updated_at_ms,
                 false,
@@ -721,6 +924,7 @@ impl SessionView {
         }
         self.snapshot.interactions.push(interaction.clone());
         let id = self.push_item(
+            TranscriptViewItemId::interaction(&interaction.interaction_id),
             sequence,
             timestamp_ms,
             false,
@@ -736,7 +940,7 @@ impl SessionView {
         let Some(id) = self
             .interaction_item_ids
             .get(&interaction.interaction_id)
-            .copied()
+            .cloned()
         else {
             return;
         };
@@ -757,6 +961,7 @@ impl SessionView {
 
     fn push_or_append_streaming_message(
         &mut self,
+        id: TranscriptViewItemId,
         sequence: u64,
         timestamp_ms: Option<u64>,
         kind: StreamingMessageKind,
@@ -777,6 +982,7 @@ impl SessionView {
             return;
         }
         self.push_item(
+            id,
             sequence,
             timestamp_ms,
             true,
@@ -786,6 +992,7 @@ impl SessionView {
 
     fn finish_or_push_message(
         &mut self,
+        id: TranscriptViewItemId,
         sequence: u64,
         timestamp_ms: Option<u64>,
         kind: StreamingMessageKind,
@@ -799,6 +1006,7 @@ impl SessionView {
             .rev()
             .find(|item| item.streaming && streaming_item_matches(&item.kind, kind))
         {
+            item.id = id;
             replace_text_in_item(item, text);
             item.streaming = false;
             item.revision = item.revision.saturating_add(1);
@@ -807,11 +1015,46 @@ impl SessionView {
             return;
         }
         self.push_item(
+            id,
             sequence,
             timestamp_ms,
             false,
             kind.item_kind(text.to_owned()),
         );
+    }
+}
+
+fn provider_progress_detail(event: &bcode_session_models::ProviderStreamEvent) -> String {
+    match event {
+        bcode_session_models::ProviderStreamEvent::TurnStarted => {
+            "provider stream started".to_owned()
+        }
+        bcode_session_models::ProviderStreamEvent::ToolCallStarted { tool_name, .. } => {
+            format!("provider stream tool started: {tool_name}")
+        }
+        bcode_session_models::ProviderStreamEvent::ToolCallProgress {
+            tool_name,
+            argument_bytes,
+            ..
+        } => format!("assembling {tool_name} arguments ({argument_bytes} bytes received)"),
+        bcode_session_models::ProviderStreamEvent::ToolCallFinished { tool_name, .. } => {
+            format!("provider stream tool finished: {tool_name}")
+        }
+        bcode_session_models::ProviderStreamEvent::NoProgressWarning {
+            idle_seconds,
+            active_tool_call,
+        } => active_tool_call.as_ref().map_or_else(
+            || format!("provider stream idle for {idle_seconds}s"),
+            |tool| {
+                format!(
+                    "provider stream idle for {idle_seconds}s while assembling {}",
+                    tool.tool_name
+                )
+            },
+        ),
+        bcode_session_models::ProviderStreamEvent::RetryScheduled { message, .. } => {
+            message.clone()
+        }
     }
 }
 
@@ -907,6 +1150,19 @@ fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::RuntimeWork { .. }
         | TranscriptViewItemKind::Interaction { .. }
         | TranscriptViewItemKind::PluginVisual { .. } => {}
+    }
+}
+
+const fn stream_sequence(event: &ToolInvocationStreamEvent) -> u64 {
+    match event {
+        ToolInvocationStreamEvent::Started { sequence, .. }
+        | ToolInvocationStreamEvent::OutputDelta { sequence, .. }
+        | ToolInvocationStreamEvent::VisualUpdate { sequence, .. }
+        | ToolInvocationStreamEvent::ArtifactUpdate { sequence, .. }
+        | ToolInvocationStreamEvent::Status { sequence, .. }
+        | ToolInvocationStreamEvent::LegacyPresentation { sequence, .. }
+        | ToolInvocationStreamEvent::Finished { sequence, .. } => *sequence,
+        ToolInvocationStreamEvent::LegacyTransientPruned { .. } => 0,
     }
 }
 
@@ -1044,6 +1300,254 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn projects_provider_stream_progress() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ProviderStreamProgress {
+                turn_id: "turn-1".to_owned(),
+                event: bcode_session_models::ProviderStreamEvent::ToolCallProgress {
+                    tool_call_id: "tool-1".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    argument_bytes: 128,
+                },
+            },
+        });
+
+        let progress = view
+            .snapshot()
+            .runtime
+            .provider_progress
+            .as_ref()
+            .expect("provider progress should be projected");
+        assert_eq!(progress.turn_id, "turn-1");
+        assert_eq!(
+            progress.detail,
+            "assembling shell.run arguments (128 bytes received)"
+        );
+        assert_eq!(progress.retry_at_unix, None);
+
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ProviderStreamProgress {
+                turn_id: "turn-1".to_owned(),
+                event: bcode_session_models::ProviderStreamEvent::RetryScheduled {
+                    message: "retrying".to_owned(),
+                    retry_at_unix: 42,
+                },
+            },
+        });
+        let progress = view
+            .snapshot()
+            .runtime
+            .provider_progress
+            .as_ref()
+            .expect("retry progress should be projected");
+        assert_eq!(progress.detail, "retrying");
+        assert_eq!(progress.retry_at_unix, Some(42));
+    }
+
+    #[test]
+    fn projects_skill_and_plugin_status_semantics() {
+        let session_id = SessionId::new();
+        let skill_id = bcode_skill_models::SkillId::new("renderer-skill");
+        let snapshot = build_session_view_snapshot(&[
+            event(
+                session_id,
+                1,
+                SessionEventKind::SkillActivated {
+                    skill_id: skill_id.clone(),
+                    source: None,
+                    mode: bcode_skill_models::SkillActivationMode::Explicit,
+                    activated_at_ms: 10,
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::SkillInvoked {
+                    skill_id: skill_id.clone(),
+                    arguments: "carefully".to_owned(),
+                    source: None,
+                    invoked_at_ms: 20,
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::PluginStatusNote {
+                    plugin_id: "bcode.loop".to_owned(),
+                    note_id: "run".to_owned(),
+                    text: "iteration running".to_owned(),
+                    metadata: BTreeMap::from([("iteration".to_owned(), serde_json::json!(2))]),
+                },
+            ),
+            event(
+                session_id,
+                4,
+                SessionEventKind::PluginStatusNote {
+                    plugin_id: "bcode.loop".to_owned(),
+                    note_id: "run".to_owned(),
+                    text: "iteration finished".to_owned(),
+                    metadata: BTreeMap::from([("iteration".to_owned(), serde_json::json!(2))]),
+                },
+            ),
+            event(
+                session_id,
+                5,
+                SessionEventKind::SkillDeactivated {
+                    skill_id,
+                    deactivated_at_ms: 50,
+                },
+            ),
+        ]);
+
+        assert!(snapshot.active_skills.is_empty());
+        let status = snapshot
+            .plugin_status
+            .get("bcode.loop:run")
+            .expect("plugin status should be projected");
+        assert_eq!(status.text, "iteration finished");
+        let status_items = snapshot
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.id.get() == "plugin-status:bcode.loop:run")
+            .collect::<Vec<_>>();
+        assert_eq!(status_items.len(), 1);
+        assert_eq!(status_items[0].revision, 1);
+        assert!(snapshot.transcript.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TranscriptViewItemKind::SystemMessage { message }
+                    if message.text.contains("Invoked skill renderer-skill")
+            )
+        }));
+    }
+
+    #[test]
+    fn source_derived_item_ids_survive_bounded_window_shifts() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::SessionCreated {
+                    name: None,
+                    working_directory: PathBuf::from("/tmp/project"),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "hello".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "tool-1".to_owned(),
+                    producer_plugin_id: Some("shell".to_owned()),
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+        ];
+
+        let full = build_session_view_snapshot(&events);
+        let shifted = build_session_view_snapshot(&events[1..]);
+        let full_ids = full
+            .transcript
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let shifted_ids = shifted
+            .transcript
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(full_ids, shifted_ids);
+        assert_eq!(full_ids[0].get(), "event:2");
+        assert_eq!(full_ids[1].get(), "tool:tool-1");
+    }
+
+    #[test]
+    fn duplicate_durable_events_do_not_mutate_the_view() {
+        let session_id = SessionId::new();
+        let event = event(
+            session_id,
+            1,
+            SessionEventKind::SystemMessage {
+                text: "once".to_owned(),
+            },
+        );
+        let mut view = SessionView::new();
+        view.apply_event(&event);
+        let snapshot = view.snapshot().clone();
+
+        view.apply_event(&event);
+
+        assert_eq!(view.snapshot(), &snapshot);
+    }
+
+    #[test]
+    fn repeated_live_tool_previews_replace_one_stable_item() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for (argument_bytes, title) in [(3, "first"), (6, "second")] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolArgumentPreview {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "tool-1".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    argument_bytes,
+                    preview: bcode_session_models::LiveToolArgumentPreview {
+                        visual: bcode_session_models::PluginVisualDescriptor {
+                            visual_id: Some("preview-1".to_owned()),
+                            producer_plugin_id: Some("shell".to_owned()),
+                            schema: "shell.preview".to_owned(),
+                            schema_version: 1,
+                            title: Some(title.to_owned()),
+                            subtitle: None,
+                            payload: serde_json::json!({"title": title}),
+                        },
+                        streaming_status: None,
+                        argument_bytes,
+                    },
+                },
+            });
+        }
+
+        let previews = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| matches!(item.kind, TranscriptViewItemKind::PluginVisual { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].id.get(), "tool-preview:tool-1");
+        assert_eq!(previews[0].revision, 1);
+        assert!(matches!(
+            &previews[0].kind,
+            TranscriptViewItemKind::PluginVisual { visual }
+                if visual.descriptor.title.as_deref() == Some("second")
+        ));
     }
 
     #[test]
