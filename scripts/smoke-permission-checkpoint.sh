@@ -122,15 +122,16 @@ if [[ -z "${permission_id}" ]]; then
     exit 1
 fi
 "${root}/target/debug/bcode" permission approve "${permission_id}" >/dev/null
-for _ in {1..50}; do
-    if [[ -f "${target_file}" ]] && grep -q "approved-content" "${target_file}"; then
+for _ in {1..100}; do
+    if [[ -f "${target_file}" ]] && grep -q "approved-content" "${target_file}" \
+        && "${root}/target/debug/bcode" session history "${session_id}" | grep "assistant: fake tool result: .*wrote" >/dev/null; then
         break
     fi
     sleep 0.1
 done
 grep -q "approved-content" "${target_file}"
 "${root}/target/debug/bcode" session history "${session_id}" | grep "permission resolved" >/dev/null
-"${root}/target/debug/bcode" session history "${session_id}" | grep "tool call finished (ok): .*wrote" >/dev/null
+"${root}/target/debug/bcode" session history "${session_id}" | grep "assistant: fake tool result: .*wrote" >/dev/null
 
 "${root}/target/debug/bcode" server stop >/dev/null
 wait "${server_pid}"

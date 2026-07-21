@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Smoke tests own isolated process state and must not inherit the invoking daemon.
+unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workdir="$(mktemp -d)"
+workdir="$(mktemp -d /tmp/bcode-smoke.XXXXXX)"
 server_pid=""
 cleanup() {
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
@@ -14,6 +17,8 @@ cleanup() {
 trap cleanup EXIT
 
 cd "${root}"
+
+cargo build --quiet -p bcode --features app
 
 cargo build --quiet -p bcode_fake_provider_plugin -p bcode_shell_plugin
 
@@ -50,7 +55,7 @@ name = "Fake Model Provider"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${fake_dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -66,7 +71,7 @@ name = "Shell Tools"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${shell_dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -74,7 +79,8 @@ EOF
 
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
-export BCODE_SOCKET="${workdir}/bcode.sock"
+mkdir -p "${workdir}/tmp"
+export TMPDIR="${workdir}/tmp"
 export BCODE_STATE_DIR="${workdir}/state"
 cat >"${BCODE_CONFIG}" <<EOF
 [plugins]
@@ -84,68 +90,62 @@ enabled = ["bcode.fake-provider", "bcode.shell"]
 provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 
-[permissions]
-allow_shell_command_prefixes = ["printf policy-allowed"]
-deny_shell_command_prefixes = ["printf policy-denied"]
+[agent.build.permission]
+command = { "*" = "ask", "printf policy-allowed*" = "allow", "printf policy-denied*" = "deny" }
 EOF
 
-cargo run --quiet -p bcode -- server run >"${workdir}/server.log" 2>&1 &
+"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..100}; do
-    if cargo run --quiet -p bcode -- server status >/dev/null 2>&1; then
+    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
         break
     fi
     sleep 0.1
 done
 
-session_id="$(cargo run --quiet -p bcode -- session create permission-policy-smoke)"
-cargo run --quiet -p bcode -- send "${session_id}" "tool-shell printf policy-allowed-shell" >/dev/null
-for _ in {1..50}; do
-    if cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "policy-allowed-shell"; then
+session_id="$("${root}/target/debug/bcode" session create permission-policy-smoke)"
+"${root}/target/debug/bcode" send "${session_id}" "tool-shell printf policy-allowed-shell" >/dev/null
+for _ in {1..100}; do
+    if "${root}/target/debug/bcode" session history "${session_id}" | grep "assistant: fake tool result: .*policy-allowed-shell" >/dev/null; then
         break
     fi
     sleep 0.1
 done
-if [[ -n "$(cargo run --quiet -p bcode -- permission list)" ]]; then
+if [[ -n "$("${root}/target/debug/bcode" permission list)" ]]; then
     echo "allow_tools policy should not leave a pending permission" >&2
-    cargo run --quiet -p bcode -- permission list >&2 || true
+    "${root}/target/debug/bcode" permission list >&2 || true
     exit 1
 fi
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "permission requested"
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "permission resolved: .*approved=true"
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "policy-allowed-shell"
+"${root}/target/debug/bcode" session history "${session_id}" | grep "assistant: fake tool result: .*policy-allowed-shell" >/dev/null
 
-blocked_session_id="$(cargo run --quiet -p bcode -- session create permission-policy-deny-smoke)"
-cargo run --quiet -p bcode -- send "${blocked_session_id}" "tool-shell printf policy-denied-shell" >/dev/null
-for _ in {1..50}; do
-    if cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission denied"; then
+blocked_session_id="$("${root}/target/debug/bcode" session create permission-policy-deny-smoke)"
+"${root}/target/debug/bcode" send "${blocked_session_id}" "tool-shell printf policy-denied-shell" >/dev/null
+for _ in {1..100}; do
+    if "${root}/target/debug/bcode" session history "${blocked_session_id}" | grep "tool call finished (error): .*denied shell command .*policy-denied-shell" >/dev/null; then
         break
     fi
     sleep 0.1
 done
-if [[ -n "$(cargo run --quiet -p bcode -- permission list)" ]]; then
+if [[ -n "$("${root}/target/debug/bcode" permission list)" ]]; then
     echo "deny policy should not leave a pending permission" >&2
-    cargo run --quiet -p bcode -- permission list >&2 || true
+    "${root}/target/debug/bcode" permission list >&2 || true
     exit 1
 fi
-cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission requested"
-cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission resolved: .*approved=false"
-cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission denied"
+"${root}/target/debug/bcode" session history "${blocked_session_id}" | grep "tool call finished (error): .*denied shell command .*policy-denied-shell" >/dev/null
 
-cargo run --quiet -p bcode -- permission allow-shell-prefix "printf cli-added" | grep -q "permission rule added"
-grep -q "printf cli-added" "${BCODE_CONFIG}"
-cli_rule_session_id="$(cargo run --quiet -p bcode -- session create permission-policy-cli-rule-smoke)"
-cargo run --quiet -p bcode -- send "${cli_rule_session_id}" "tool-shell printf cli-added-rule" >/dev/null
-for _ in {1..50}; do
-    if cargo run --quiet -p bcode -- session history "${cli_rule_session_id}" | grep -q "cli-added-rule"; then
+"${root}/target/debug/bcode" permission add --agent build --category command --pattern "printf cli-added*" --action allow | grep "permission rule added" >/dev/null
+grep -q "printf cli-added" "${BCODE_STATE_DIR}/permissions.toml"
+cli_rule_session_id="$("${root}/target/debug/bcode" session create permission-policy-cli-rule-smoke)"
+"${root}/target/debug/bcode" send "${cli_rule_session_id}" "tool-shell printf cli-added-rule" >/dev/null
+for _ in {1..100}; do
+    if "${root}/target/debug/bcode" session history "${cli_rule_session_id}" | grep "assistant: fake tool result: .*cli-added-rule" >/dev/null; then
         break
     fi
     sleep 0.1
 done
-cargo run --quiet -p bcode -- session history "${cli_rule_session_id}" | grep -q "permission resolved: .*approved=true"
-cargo run --quiet -p bcode -- session history "${cli_rule_session_id}" | grep -q "cli-added-rule"
+"${root}/target/debug/bcode" session history "${cli_rule_session_id}" | grep "assistant: fake tool result: .*cli-added-rule" >/dev/null
 
-cargo run --quiet -p bcode -- server stop >/dev/null
+"${root}/target/debug/bcode" server stop >/dev/null
 wait "${server_pid}"
 server_pid=""
 

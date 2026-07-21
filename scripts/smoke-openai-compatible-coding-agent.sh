@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Smoke tests own isolated process state and must not inherit the invoking daemon.
+unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workdir="$(mktemp -d)"
+workdir="$(mktemp -d /tmp/bcode-smoke.XXXXXX)"
 server_pid=""
 mock_pid=""
 cleanup() {
@@ -19,6 +22,8 @@ cleanup() {
 trap cleanup EXIT
 
 cd "${root}"
+
+cargo build --quiet -p bcode --features app
 
 cargo build --quiet \
     -p bcode_openai_compatible_provider_plugin \
@@ -163,7 +168,7 @@ name = "OpenAI-Compatible Model Provider"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${openai_dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -183,7 +188,7 @@ name = "Filesystem Tools"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${fs_dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -199,7 +204,7 @@ name = "Shell Tools"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${shell_dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -207,7 +212,8 @@ EOF
 
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
-export BCODE_SOCKET="${workdir}/bcode.sock"
+mkdir -p "${workdir}/tmp"
+export TMPDIR="${workdir}/tmp"
 export BCODE_STATE_DIR="${workdir}/state"
 export BCODE_OPENAI_API_KEY="mock-key"
 export BCODE_OPENAI_BASE_URL="http://127.0.0.1:${mock_port}"
@@ -221,24 +227,25 @@ enabled = ["bcode.openai-compatible", "bcode.filesystem", "bcode.shell"]
 provider_plugin_id = "bcode.openai-compatible"
 model_id = "mock-coding-model"
 
-[permissions]
-allow_path_prefixes = ["${workdir}"]
-allow_shell_command_prefixes = ["grep -q"]
+[agent.build.permission]
+external_directory = "allow"
+command = { "*" = "ask", "grep -q *" = "allow", "printf validation-ok" = "allow" }
+write = { "**" = "allow" }
 EOF
 
-cargo run --quiet -p bcode -- server run >"${workdir}/server.log" 2>&1 &
+"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..100}; do
-    if cargo run --quiet -p bcode -- server status >/dev/null 2>&1; then
+    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
         break
     fi
     sleep 0.1
 done
 
-session_id="$(cargo run --quiet -p bcode -- session create openai-coding-smoke)"
-cargo run --quiet -p bcode -- send "${session_id}" "create the dogfood smoke file and validate it" >/dev/null
+session_id="$("${root}/target/debug/bcode" session create openai-coding-smoke)"
+"${root}/target/debug/bcode" send "${session_id}" "create the dogfood smoke file and validate it" >/dev/null
 for _ in {1..150}; do
-    if cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "bcode-coding-smoke-ok"; then
+    if "${root}/target/debug/bcode" session history "${session_id}" | grep "bcode-coding-smoke-ok" >/dev/null; then
         break
     fi
     sleep 0.1
@@ -246,12 +253,12 @@ done
 
 [[ -f "${target_file}" ]]
 grep -q "dogfood smoke ok" "${target_file}"
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "filesystem.write"
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "shell.run"
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "validation-ok"
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "bcode-coding-smoke-ok"
+"${root}/target/debug/bcode" session history "${session_id}" | grep "filesystem.write" >/dev/null
+"${root}/target/debug/bcode" session history "${session_id}" | grep "shell.run" >/dev/null
+"${root}/target/debug/bcode" session history "${session_id}" | grep "validation-ok" >/dev/null
+"${root}/target/debug/bcode" session history "${session_id}" | grep "bcode-coding-smoke-ok" >/dev/null
 
-cargo run --quiet -p bcode -- server stop >/dev/null
+"${root}/target/debug/bcode" server stop >/dev/null
 wait "${server_pid}"
 server_pid=""
 

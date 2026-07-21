@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Smoke tests own isolated process state and must not inherit the invoking daemon.
+unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
+
 if [[ -z "${BCODE_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}" ]]; then
     echo "smoke-openai-compatible-provider: SKIP (set BCODE_OPENAI_API_KEY or OPENAI_API_KEY)"
     exit 0
 fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workdir="$(mktemp -d)"
+workdir="$(mktemp -d /tmp/bcode-smoke.XXXXXX)"
 server_pid=""
 cleanup() {
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
@@ -19,6 +22,8 @@ cleanup() {
 trap cleanup EXIT
 
 cd "${root}"
+
+cargo build --quiet -p bcode --features app
 
 cargo build --quiet -p bcode_openai_compatible_provider_plugin
 
@@ -52,7 +57,7 @@ name = "OpenAI-Compatible Model Provider"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -60,7 +65,8 @@ EOF
 
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
-export BCODE_SOCKET="${workdir}/bcode.sock"
+mkdir -p "${workdir}/tmp"
+export TMPDIR="${workdir}/tmp"
 export BCODE_STATE_DIR="${workdir}/state"
 cat >"${BCODE_CONFIG}" <<EOF
 [plugins]
@@ -71,21 +77,27 @@ provider_plugin_id = "bcode.openai-compatible"
 model_id = "${BCODE_OPENAI_MODEL:-${OPENAI_MODEL:-gpt-4.1-mini}}"
 EOF
 
-cargo run --quiet -p bcode -- server run >"${workdir}/server.log" 2>&1 &
+"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..100}; do
-    if cargo run --quiet -p bcode -- server status >/dev/null 2>&1; then
+    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
         break
     fi
     sleep 0.1
 done
 
-cargo run --quiet -p bcode -- model list | grep -q "${BCODE_OPENAI_MODEL:-${OPENAI_MODEL:-gpt-4.1-mini}}"
-session_id="$(cargo run --quiet -p bcode -- session create openai-compatible-smoke)"
-cargo run --quiet -p bcode -- send "${session_id}" "Reply with exactly: bcode-openai-smoke" >/dev/null
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -qi "bcode-openai-smoke"
+"${root}/target/debug/bcode" model list | grep "${BCODE_OPENAI_MODEL:-${OPENAI_MODEL:-gpt-4.1-mini}}" >/dev/null
+session_id="$("${root}/target/debug/bcode" session create openai-compatible-smoke)"
+"${root}/target/debug/bcode" send "${session_id}" "Reply with exactly: bcode-openai-smoke" >/dev/null
+for _ in {1..300}; do
+    if "${root}/target/debug/bcode" session history "${session_id}" | grep -i "assistant:.*bcode-openai-smoke" >/dev/null >/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+"${root}/target/debug/bcode" session history "${session_id}" | grep -i "assistant:.*bcode-openai-smoke" >/dev/null
 
-cargo run --quiet -p bcode -- server stop >/dev/null
+"${root}/target/debug/bcode" server stop >/dev/null
 wait "${server_pid}"
 server_pid=""
 
