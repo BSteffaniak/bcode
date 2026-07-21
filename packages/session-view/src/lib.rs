@@ -65,6 +65,27 @@ impl SessionView {
         self.snapshot
     }
 
+    /// Apply canonical session metadata from an attach or catalog response.
+    pub fn set_session_summary(&mut self, summary: bcode_session_models::SessionSummary) {
+        let title = summary.title().map(ToOwned::to_owned);
+        let changed = self.snapshot.session_id != Some(summary.id)
+            || title
+                .as_ref()
+                .is_some_and(|title| self.snapshot.title.as_ref() != Some(title))
+            || self.snapshot.working_directory != Some(summary.working_directory.clone())
+            || self.snapshot.session_summary.as_ref() != Some(&summary);
+        if !changed {
+            return;
+        }
+        self.snapshot.session_id = Some(summary.id);
+        if title.is_some() {
+            self.snapshot.title = title;
+        }
+        self.snapshot.working_directory = Some(summary.working_directory.clone());
+        self.snapshot.session_summary = Some(summary);
+        self.bump_revision();
+    }
+
     /// Replace composer draft state.
     pub fn set_composer(&mut self, composer: ComposerViewState) {
         if self.snapshot.composer != composer {

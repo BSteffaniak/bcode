@@ -13,7 +13,7 @@ Status meanings:
 
 | Event | `SessionView` behavior | Established TUI behavior | Shared status / next action |
 |---|---|---|---|
-| `SessionCreated` | Sets title and working directory. | Sets an explicit title; working directory is also hydrated by attach state. | **Complete** for event semantics. |
+| `SessionCreated` | Sets title and working directory. | Header/session metadata consumes the shared projection. | **Complete** for event semantics. |
 | `ClientAttached` | No-op. | No-op. | **Intentional no-op**. |
 | `ClientDetached` | No-op. | No-op. | **Intentional no-op**. |
 | `UserMessage` | Derives a title when absent and appends a semantic user message. | Clears active tool state, updates input history/pending submission state, derives a title, and appends a terminal transcript item. | **Partial**: semantic transcript coverage is present; renderer-local pending/anchor behavior remains TUI-owned. |
@@ -30,7 +30,7 @@ Status meanings:
 | `ModelTurnFinished` | Clears matching active turn, records outcome/message, and emits a system error item for failures. | Finishes turn activity and appends an error system message when needed. | **Complete** for semantic outcome/status. |
 | `ModelUsage` | Stores most recently observed provider-neutral usage. | Updates usage meter and transcript usage presentation. | **Partial**: shared accounting state is present; richer transcript/meter presentation remains renderer-owned. |
 | `ContextCompacted` | Appends a semantic context-compaction system item. | Appends compaction transcript presentation. | **Complete** for portable semantic status. |
-| `SessionRenamed` | Updates title. | Updates title and terminal status. | **Complete** for persistent session metadata. |
+| `SessionRenamed` | Updates title. | Header consumes shared title metadata and keeps terminal-local status feedback. | **Complete** for persistent session metadata. |
 | `TraceEvent` | No-op. | Applies live trace telemetry only; replay ignores it. | **Intentional no-op** for shared transcript until a concrete cross-renderer trace view is required. |
 | `SkillInvoked` | Appends a renderer-neutral skill invocation status item. | Appends a skill transcript item. | **Complete** for semantic status. |
 | `SkillSuggested` | Appends a suggestion status item when a reason exists. | Appends a suggestion when a reason exists. | **Complete**. |
@@ -46,7 +46,7 @@ Status meanings:
 | `RuntimeWorkProgress` | Updates shared message and progress units. | Consumes the shared projection for live activity. | **Complete** for generic runtime semantics. |
 | `ModelTurnCancelRequested` | Records active turn identity and cancellation state. | Marks the active turn as cancelling and updates status. | **Complete** for semantic turn cancellation state. |
 | `ToolInvocationStream` | Updates tool projection/output and appends generic visual updates. | Updates terminal output, preview, artifacts, and visual state. | **Complete** for generic stream semantics; terminal preview/artifact rendering remains renderer-specific. |
-| `WorkingDirectoryChanged` | Updates working directory. | Updates working directory and appends a warning system message. | **Partial**: metadata is present; shared semantic warning/status is absent. |
+| `WorkingDirectoryChanged` | Updates working directory. | Consumes shared working-directory metadata and appends a terminal-local warning system message. | **Partial**: metadata is shared; warning presentation remains terminal-local. |
 | `SessionImported` | No-op. | No-op in `BmuxApp`. | **Intentional no-op**; provenance remains session metadata/catalog-owned. |
 | `SessionForked` | No-op. | No-op in `BmuxApp`. | **Intentional no-op**; provenance remains session metadata/catalog-owned. |
 | `RalphLifecycle` | Appends portable Ralph lifecycle status. | Appends a Ralph system message; host also refreshes plugin status. | **Complete** for durable semantic status. |

@@ -258,8 +258,6 @@ impl ReasoningSupport {
 #[derive(Debug, Clone)]
 pub struct BmuxApp {
     session_id: Option<SessionId>,
-    session_title: Option<String>,
-    working_directory: Option<std::path::PathBuf>,
     selected_auth_profile: Option<String>,
     selected_context_format_version: Option<u16>,
     selected_compatibility_key: Option<String>,
@@ -467,8 +465,6 @@ impl BmuxApp {
         };
         let mut app = Self {
             session_id,
-            session_title: None,
-            working_directory: None,
             selected_auth_profile: None,
             selected_context_format_version: None,
             selected_compatibility_key: None,
@@ -655,13 +651,13 @@ impl BmuxApp {
     /// Return the current session title, if known.
     #[must_use]
     pub fn session_title(&self) -> Option<&str> {
-        self.session_title.as_deref()
+        self.session_view.snapshot().title.as_deref()
     }
 
     /// Return the current working directory, if known.
     #[must_use]
     pub fn working_directory(&self) -> Option<&std::path::Path> {
-        self.working_directory.as_deref()
+        self.session_view.snapshot().working_directory.as_deref()
     }
 
     /// Apply canonical session metadata from an attach/list response.
@@ -673,10 +669,7 @@ impl BmuxApp {
     /// in the TUI cache without duplicating fallback logic.
     pub fn apply_session_summary(&mut self, summary: &bcode_session_models::SessionSummary) {
         self.session_id = Some(summary.id);
-        if let Some(t) = summary.title() {
-            self.session_title = Some(t.to_owned());
-        }
-        self.working_directory = Some(summary.working_directory.clone());
+        self.session_view.set_session_summary(summary.clone());
     }
 
     /// Apply terminal UI configuration.
@@ -2270,21 +2263,12 @@ impl BmuxApp {
             self.viewport.preserve_for_append();
         }
         match &event.kind {
-            SessionEventKind::SessionCreated { name: Some(n), .. } => {
-                self.session_title = Some(n.clone());
-            }
             SessionEventKind::UserMessage { text, .. } => {
                 self.active_tool_calls.clear();
                 self.active_plugin_visuals.clear();
                 self.tool_activity_seen = false;
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
                 self.pending_assistant_stream_anchor = false;
-                if self.session_title.is_none() {
-                    // Local display heuristic: derive a title from the first user message
-                    // so the header is never stuck on "Untitled session". Mirrors the
-                    // server-side title inference logic.
-                    self.session_title = Some(derive_session_title_from_prompt(text));
-                }
                 self.push_committed_user_message(
                     event.sequence,
                     text,
@@ -2774,7 +2758,6 @@ impl BmuxApp {
     }
 
     fn rename_session(&mut self, name: Option<&str>) {
-        self.session_title = name.map(ToOwned::to_owned);
         self.set_session_name_status(name);
     }
 
@@ -2825,7 +2808,6 @@ impl BmuxApp {
         old_working_directory: &std::path::Path,
         new_working_directory: &std::path::Path,
     ) {
-        self.working_directory = Some(new_working_directory.to_path_buf());
         let message =
             working_directory_changed_message(old_working_directory, new_working_directory);
         self.transcript.push(TranscriptItem::new("System", message));
@@ -4585,31 +4567,6 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SkillDeactivated { .. }
         | SessionEventKind::SkillContextLoaded { .. }
         | SessionEventKind::TraceEvent { .. } => false,
-    }
-}
-
-fn derive_session_title_from_prompt(prompt: &str) -> String {
-    let first = prompt
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("```") && !line.starts_with("---"))
-        .unwrap_or(prompt);
-    let cleaned = first
-        .trim_start_matches(|c: char| {
-            matches!(c, '#' | '-' | '*' | '>' | '`' | ':' | ';') || c.is_whitespace()
-        })
-        .trim();
-    let squished: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    if squished.is_empty() {
-        return "New session".to_string();
-    }
-    if squished.len() > 64 {
-        let mut out = String::with_capacity(67);
-        out.push_str(&squished[..61]);
-        out.push_str("...");
-        out
-    } else {
-        squished
     }
 }
 
