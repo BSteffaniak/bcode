@@ -56,7 +56,9 @@ Classification:
 Catalog discovery is best-effort, bounded, and non-mutating:
 
 * Enumerate UUID-shaped directories directly under the canonical session root.
-* Merge namespaced catalog rows, legacy catalog rows, and manifests as display caches.
+* Merge namespaced catalog rows, legacy catalog rows, and manifests as display caches. Known legacy
+  manifest schemas remain eligible for bounded display discovery; unknown future schemas and
+  inconsistent identities fail closed without opening the session database.
 * Ensure every directory containing `session.db` remains represented even when all caches are
   missing or stale.
 * Do not run schema migration, projection rebuild, repair, or full canonical replay while listing.

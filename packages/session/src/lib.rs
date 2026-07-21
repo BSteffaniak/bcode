@@ -447,6 +447,22 @@ impl SessionStore {
         let schema_version = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64);
+        if schema_version == Some(1) {
+            let summary: SessionSummary =
+                serde_json::from_value(value.get("summary").cloned().ok_or_else(|| {
+                    SessionStoreError::CatalogLoad(
+                        "legacy session manifest is missing its summary".to_owned(),
+                    )
+                })?)
+                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+            if summary.id != session_id {
+                return Err(SessionStoreError::CatalogLoad(format!(
+                    "session manifest id mismatch: expected {session_id}, found {}",
+                    summary.id
+                )));
+            }
+            return Ok(Some(summary));
+        }
         if schema_version != Some(u64::from(SESSION_MANIFEST_SCHEMA_VERSION)) {
             return Err(SessionStoreError::CatalogLoad(format!(
                 "unsupported session manifest schema version {schema_version:?}"
@@ -3760,8 +3776,8 @@ mod tests {
     use super::{
         AppendToolCallRequestedInput, CURRENT_SESSION_FORMAT_EPOCH,
         MAX_DURABLE_GENERIC_EVENT_BYTES, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
-        SessionError, SessionHealth, SessionLeaseOwnerContext, SessionManager, SessionStore, db,
-        lease,
+        SessionCatalogLoadStatus, SessionError, SessionHealth, SessionLeaseOwnerContext,
+        SessionManager, SessionStore, db, lease,
     };
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
@@ -6845,8 +6861,8 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
-    #[test]
-    fn bounded_manifest_rejects_old_format_without_opening_session_database() {
+    #[tokio::test]
+    async fn bounded_manifest_lists_known_legacy_format_without_opening_session_database() {
         let root = unique_temp_dir();
         let session_id = SessionId::new();
         let session_dir = db::session_dir_path(&root, session_id);
@@ -6857,13 +6873,13 @@ mod tests {
                 "schema_version": 1,
                 "summary": {
                     "id": session_id,
-                    "name": null,
-                    "explicit_name": null,
+                    "name": "legacy session",
+                    "explicit_name": "legacy session",
                     "derived_title": null,
-                    "title_source": "empty_draft",
+                    "title_source": "explicit",
                     "client_count": 0,
-                    "created_at_ms": 0,
-                    "updated_at_ms": 0,
+                    "created_at_ms": 1,
+                    "updated_at_ms": 2,
                     "working_directory": root,
                     "import": null,
                     "fork": null
@@ -6872,27 +6888,151 @@ mod tests {
             .to_string(),
         )
         .expect("old manifest");
-        std::fs::write(db::session_db_path(&root, session_id), b"not a database")
-            .expect("database sentinel");
+        let legacy_db_path = db::session_db_path(&root, session_id);
+        std::fs::write(&legacy_db_path, b"not a database").expect("database sentinel");
+        let current_session_id = SessionId::new();
+        let current_session_dir = db::session_dir_path(&root, current_session_id);
+        std::fs::create_dir_all(&current_session_dir).expect("current session dir");
+        std::fs::write(
+            current_session_dir.join("manifest.json"),
+            serde_json::json!({
+                "schema_version": SESSION_MANIFEST_SCHEMA_VERSION,
+                "session_format": {
+                    "family": SESSION_FORMAT_FAMILY,
+                    "epoch": CURRENT_SESSION_FORMAT_EPOCH
+                },
+                "summary": {
+                    "id": current_session_id,
+                    "name": "current session",
+                    "explicit_name": "current session",
+                    "derived_title": null,
+                    "title_source": "explicit",
+                    "client_count": 0,
+                    "created_at_ms": 3,
+                    "updated_at_ms": 4,
+                    "working_directory": root,
+                    "import": null,
+                    "fork": null
+                }
+            })
+            .to_string(),
+        )
+        .expect("current manifest");
+        let current_db_path = db::session_db_path(&root, current_session_id);
+        std::fs::write(&current_db_path, b"also not a database").expect("database sentinel");
         let store = SessionStore::new(&root);
-        let error = store
+        let summary = store
             .load_session_manifest(session_id)
-            .expect_err("old format should be rejected from its manifest");
+            .expect("known legacy manifest should load")
+            .expect("manifest summary");
+        assert_eq!(summary.id, session_id);
+        assert_eq!(summary.display_title(), "legacy session");
+        let catalog = store.load_catalog().expect("bounded catalog load");
+        assert_eq!(catalog.len(), 2);
+        assert!(catalog.contains_key(&session_id));
+        assert!(catalog.contains_key(&current_session_id));
+
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        manager
+            .wait_catalog_loaded()
+            .await
+            .expect("catalog should load");
+        let sessions = manager.list_sessions(&root).await;
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|summary| summary.id == session_id));
         assert!(
-            error
+            sessions
+                .iter()
+                .any(|summary| summary.id == current_session_id)
+        );
+        let entries = manager.all_session_catalog_entries().await;
+        assert!(
+            entries
+                .iter()
+                .all(|entry| matches!(entry.load_status, SessionCatalogLoadStatus::SummaryOnly))
+        );
+        assert_eq!(
+            std::fs::read(&legacy_db_path).expect("legacy database sentinel"),
+            b"not a database",
+            "passive listing must not open or mutate the legacy database"
+        );
+        assert_eq!(
+            std::fs::read(&current_db_path).expect("current database sentinel"),
+            b"also not a database",
+            "passive listing must not open or mutate the current database"
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn bounded_manifest_rejects_unknown_and_inconsistent_metadata() {
+        let root = unique_temp_dir();
+        let future_session_id = SessionId::new();
+        let future_session_dir = db::session_dir_path(&root, future_session_id);
+        std::fs::create_dir_all(&future_session_dir).expect("future session dir");
+        std::fs::write(
+            future_session_dir.join("manifest.json"),
+            serde_json::json!({
+                "schema_version": SESSION_MANIFEST_SCHEMA_VERSION + 1,
+                "summary": { "id": future_session_id }
+            })
+            .to_string(),
+        )
+        .expect("future manifest");
+        let future_db_path = db::session_db_path(&root, future_session_id);
+        std::fs::write(&future_db_path, b"future database sentinel").expect("database sentinel");
+
+        let mismatched_session_id = SessionId::new();
+        let mismatched_session_dir = db::session_dir_path(&root, mismatched_session_id);
+        std::fs::create_dir_all(&mismatched_session_dir).expect("mismatched session dir");
+        std::fs::write(
+            mismatched_session_dir.join("manifest.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "summary": {
+                    "id": SessionId::new(),
+                    "name": null,
+                    "client_count": 0,
+                    "created_at_ms": 0,
+                    "updated_at_ms": 0,
+                    "working_directory": root
+                }
+            })
+            .to_string(),
+        )
+        .expect("mismatched manifest");
+        let mismatched_db_path = db::session_db_path(&root, mismatched_session_id);
+        std::fs::write(&mismatched_db_path, b"mismatched database sentinel")
+            .expect("database sentinel");
+
+        let store = SessionStore::new(&root);
+        assert!(
+            store
+                .load_session_manifest(future_session_id)
+                .expect_err("future manifest should fail closed")
                 .to_string()
-                .contains("manifest schema version Some(1)")
+                .contains("unsupported session manifest schema version")
+        );
+        assert!(
+            store
+                .load_session_manifest(mismatched_session_id)
+                .expect_err("mismatched manifest should fail closed")
+                .to_string()
+                .contains("session manifest id mismatch")
         );
         assert!(
             store
                 .load_catalog()
                 .expect("bounded catalog load")
-                .is_empty(),
-            "unsupported manifests must not fall back to canonical DB discovery"
+                .is_empty()
         );
         assert_eq!(
-            std::fs::read(db::session_db_path(&root, session_id)).expect("database sentinel"),
-            b"not a database"
+            std::fs::read(&future_db_path).expect("future database sentinel"),
+            b"future database sentinel"
+        );
+        assert_eq!(
+            std::fs::read(&mismatched_db_path).expect("mismatched database sentinel"),
+            b"mismatched database sentinel"
         );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
