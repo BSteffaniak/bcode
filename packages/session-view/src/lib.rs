@@ -1960,6 +1960,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_compaction_view_hides_opaque_payloads() {
+        let secret = "secret-opaque-view-value";
+        let session_id = SessionId::new();
+        let snapshot = build_session_view_snapshot(&[event(
+            session_id,
+            1,
+            SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence: 0,
+                snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
+                    provider_plugin_id: "provider".to_owned(),
+                    model_id: "model".to_owned(),
+                    compatibility_key: "surface".to_owned(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: format!(r#"[{{"encrypted":"{secret}"}}]"#),
+                    portable_summary: "portable summary".to_owned(),
+                },
+            },
+        )]);
+
+        let TranscriptViewItemKind::SystemMessage { message } = &snapshot.transcript.items[0].kind
+        else {
+            panic!("expected provider compaction system message");
+        };
+        assert!(message.text.contains("Provider context compacted"));
+        assert!(!message.text.contains(secret));
+        assert!(!message.text.contains("portable summary"));
+    }
+
+    #[test]
     fn projects_tool_invocation_output() {
         let session_id = SessionId::new();
         let snapshot = build_session_view_snapshot(&[

@@ -1542,6 +1542,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_compaction_transcript_hides_opaque_payloads() {
+        let secret = "secret-opaque-transcript-value";
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence: 0,
+                snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
+                    provider_plugin_id: "provider".to_owned(),
+                    model_id: "model".to_owned(),
+                    compatibility_key: "surface".to_owned(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: format!(r#"[{{"encrypted":"{secret}"}}]"#),
+                    portable_summary: "portable summary".to_owned(),
+                },
+            },
+        };
+
+        let items = transcript_items_from_events_with_reasoning(&[event], false);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].text().contains("provider compacted context"));
+        assert!(!items[0].text().contains(secret));
+        assert!(!items[0].text().contains("portable summary"));
+    }
+
+    #[test]
     fn plugin_status_note_projects_as_compact_plugin_transcript_item() {
         let session_id = bcode_session_models::SessionId::new();
         let events = [SessionEvent {

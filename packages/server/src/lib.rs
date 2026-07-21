@@ -10815,6 +10815,18 @@ async fn run_model_turn_inner(
                 };
                 request = prepared.request;
                 context_projection = prepared.context_projection;
+                append_context_compaction_trace(
+                    state,
+                    session_id,
+                    CompactionTraceKind::Diagnostic,
+                    "request_rebuilt_after_compaction",
+                    0,
+                    true,
+                    Some(format!(
+                        "rebuilt provider request once after compacting through #{compacted_through_sequence}"
+                    )),
+                )
+                .await;
             }
             Ok(None) | Err(CompactionError::PlanUnavailable(_)) => {}
             Err(CompactionError::Cancelled) => {
@@ -20736,6 +20748,190 @@ library = "test"
         }
     }
 
+    async fn append_test_turn(
+        sessions: &SessionManager,
+        session_id: SessionId,
+        user_text: String,
+        assistant_text: String,
+    ) {
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: user_text,
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("append user");
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::AssistantMessage {
+                    text: assistant_text,
+                },
+            )
+            .await
+            .expect("append assistant");
+    }
+
+    async fn append_test_history(
+        sessions: &SessionManager,
+        session_id: SessionId,
+        turns: usize,
+        chars_per_message: usize,
+    ) {
+        for index in 0..turns {
+            append_test_turn(
+                sessions,
+                session_id,
+                format!("historical user {index} {}", "x".repeat(chars_per_message)),
+                format!(
+                    "historical assistant {index} {}",
+                    "y".repeat(chars_per_message)
+                ),
+            )
+            .await;
+        }
+    }
+
+    async fn append_test_tool_result(
+        sessions: &SessionManager,
+        session_id: SessionId,
+        tool_call_id: &str,
+        result: String,
+    ) {
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: tool_call_id.to_owned(),
+                    producer_plugin_id: Some("test.tool".to_owned()),
+                    tool_name: "test.large".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            )
+            .await
+            .expect("tool request");
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: tool_call_id.to_owned(),
+                    result,
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            )
+            .await
+            .expect("tool result");
+    }
+
+    async fn append_large_followup_fixture(sessions: &SessionManager, session_id: SessionId) {
+        for index in 0..8 {
+            append_test_turn(
+                sessions,
+                session_id,
+                format!("historical user {index} {}", "x".repeat(800)),
+                format!("historical assistant {index} {}", "y".repeat(800)),
+            )
+            .await;
+        }
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active tool turn".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("active user");
+        append_test_tool_result(sessions, session_id, "call-large", "z".repeat(20_000)).await;
+    }
+
+    async fn run_test_model_turn(
+        state: &ServerState,
+        session_id: SessionId,
+        trigger: &SessionEvent,
+        runtime_context: ClientRuntimeContext,
+    ) -> ModelTurnCompletion {
+        let mut permit = SessionTurnPermit::new(session_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::new(Mutex::new(None)),
+        );
+        run_model_turn(
+            state,
+            &mut permit,
+            trigger,
+            ClientId::new(),
+            Some(runtime_context),
+            &mut command_context,
+            &Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+        )
+        .await
+    }
+
+    async fn run_test_model_turn_with_summary_steering(
+        state: &ServerState,
+        session_id: SessionId,
+        trigger: &SessionEvent,
+        runtime_context: ClientRuntimeContext,
+        steering: String,
+    ) -> ModelTurnCompletion {
+        let mut permit = SessionTurnPermit::new(session_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::new(Mutex::new(None)),
+        );
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        bcode_fake_provider_plugin::reset_fake_compaction_started();
+        let turn = run_model_turn(
+            state,
+            &mut permit,
+            trigger,
+            ClientId::new(),
+            Some(runtime_context),
+            &mut command_context,
+            &phase,
+        );
+        let append_steering = async {
+            while !bcode_fake_provider_plugin::fake_compaction_summary_started() {
+                tokio::task::yield_now().await;
+            }
+            steering_tx
+                .send(SteeringCommand {
+                    client_id: ClientId::new(),
+                    text: steering,
+                    completion: None,
+                })
+                .await
+                .expect("steering should queue");
+        };
+        tokio::join!(turn, append_steering).0
+    }
+
     #[test]
     fn managed_compaction_continuation_rebases_to_replacement_projection() {
         let record = ProviderStateRecord {
@@ -20988,6 +21184,41 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn recreated_daemon_and_plugin_host_rediscovers_changed_capability() {
+        let selection = |managed: bool| SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: if managed {
+                    BTreeMap::from([("fake_managed_compaction".to_owned(), "true".to_owned())])
+                } else {
+                    BTreeMap::new()
+                },
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+        let before_restart = test_server_state_with_fake_provider(SessionManager::default());
+        assert_eq!(
+            automatic_compaction_policy(&before_restart, &selection(false))
+                .await
+                .decision
+                .strategy,
+            AutomaticCompactionStrategy::OverflowOnly
+        );
+        drop(before_restart);
+
+        let after_restart = test_server_state_with_fake_provider(SessionManager::default());
+        assert_eq!(
+            automatic_compaction_policy(&after_restart, &selection(true))
+                .await
+                .decision
+                .strategy,
+            AutomaticCompactionStrategy::ProviderManaged
+        );
+    }
+
+    #[tokio::test]
     async fn automatic_compaction_policy_rediscovers_surface_capabilities_without_stale_cache() {
         let state = test_server_state_with_fake_provider(SessionManager::default());
         let selection = |settings| SessionModelSelection {
@@ -21192,6 +21423,60 @@ library = "test"
     }
 
     #[test]
+    fn provider_state_restart_reloads_compaction_rebase_and_prevents_stale_reuse() {
+        let path = std::env::temp_dir().join(format!(
+            "bcode-provider-state-compaction-restart-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let session_id = SessionId::new();
+        let reuse_key = "provider|model|profile|format-v1".to_string();
+        let store = ProviderStateStore {
+            path: path.clone(),
+            records: BTreeMap::from([(
+                reuse_key.clone(),
+                ProviderStateRecord {
+                    session_id: Some(session_id),
+                    continuation: Some(ProviderContinuationState {
+                        provider_response_id: "post-compaction-response".to_string(),
+                        reusable_message_count: 12,
+                        updated_sequence: 12,
+                        rebase_on_next_projection: true,
+                    }),
+                    ..ProviderStateRecord::default()
+                },
+            )]),
+        };
+        store.save();
+
+        let mut restarted = ProviderStateStore::load(path.clone());
+        assert!(
+            restarted
+                .continuation_for_projection(&reuse_key, 4)
+                .is_some_and(|continuation| continuation.provider_response_id
+                    == "post-compaction-response"
+                    && continuation.reusable_message_count == 4
+                    && !continuation.rebase_on_next_projection)
+        );
+        let restarted_again = ProviderStateStore::load(path.clone());
+        assert!(
+            restarted_again
+                .records
+                .get(&reuse_key)
+                .is_some_and(|record| {
+                    record.continuation.as_ref().is_some_and(|continuation| {
+                        continuation.reusable_message_count == 4
+                            && !continuation.rebase_on_next_projection
+                    })
+                })
+        );
+
+        restarted.invalidate_continuations(session_id);
+        let after_invalidation = ProviderStateStore::load(path.clone());
+        assert!(!after_invalidation.records.contains_key(&reuse_key));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn provider_state_invalidation_removes_only_target_session_records() {
         let first_session = SessionId::new();
         let second_session = SessionId::new();
@@ -21235,6 +21520,71 @@ library = "test"
         assert_eq!(loaded.records.len(), 1);
         assert!(loaded.records.contains_key("second"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn exact_request_usage_uses_captured_attempt_identity_without_history_lookup() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("exact usage".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+        let attempt = ModelRequestAttempt {
+            identity: bcode_session_models::ModelRequestIdentity {
+                provider_plugin_id: "provider-at-request-time".to_owned(),
+                requested_model_id: Some("requested-alias".to_owned()),
+                effective_model_id: "effective-at-request-time".to_owned(),
+                request_id: "request-round-2".to_owned(),
+                model_turn_id: "model-turn".to_owned(),
+                round: 2,
+                request_fingerprint: "request-fingerprint".to_owned(),
+                effective_auth_profile: Some("auth-at-request-time".to_owned()),
+                context_format_version: Some(3),
+                compatibility_key: Some("surface-at-request-time".to_owned()),
+                context_epoch: 0,
+            },
+            provider_turn_id: "provider-turn".to_owned(),
+            reuse_key: Some("reuse-key".to_owned()),
+            request_message_count: 4,
+            context_through_sequence: 7,
+            portable_context: "portable".to_owned(),
+            local_estimate: bcode_session_models::LocalContextEstimate {
+                tokens: 90,
+                algorithm_version: LOCAL_CONTEXT_ESTIMATOR_VERSION,
+            },
+            managed_compaction_persisted: false,
+        };
+
+        append_exact_request_context_observation(
+            &state,
+            session_id,
+            bcode_model::ExactRequestInputTokens::new(84),
+            Some(&attempt),
+            "provider-turn",
+        )
+        .await;
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        let observation = history
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::RequestContextObserved { observation } => Some(observation),
+                _ => None,
+            })
+            .expect("exact observation");
+        assert_eq!(observation.request, attempt.identity);
+        assert_eq!(observation.context_through_sequence, 7);
+        assert_eq!(
+            observation.context_tokens,
+            bcode_session_models::RequestContextTokenCount::ProviderExact(84)
+        );
+        assert_eq!(observation.local_estimate, attempt.local_estimate);
     }
 
     #[test]
@@ -27156,6 +27506,32 @@ library = "test"
                 .iter()
                 .any(|event| matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
         );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::TraceEvent { trace }
+                        if matches!(
+                            &trace.payload,
+                            SessionTracePayload::ContextCompaction { reason, .. }
+                                if reason == "request_rebuilt_after_compaction"
+                        )
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::UserMessage { text, .. }
+                        if text == "continue after proactive compaction"
+                ))
+                .count(),
+            1
+        );
         assert_eq!(permit.turn_entries, 1);
     }
 
@@ -27398,6 +27774,443 @@ library = "test"
             .session_history(session_id)
             .await
             .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_native_success_during_summary_persists_no_marker() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("cancel summary".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        for text in ["first turn", "second turn", "active turn"] {
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.to_string(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )
+                .await
+                .expect("append user turn");
+            sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("response to {text}"),
+                    },
+                )
+                .await
+                .expect("append assistant turn");
+        }
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-model".to_string()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([
+                    ("fake_native_compaction".to_string(), "true".to_string()),
+                    ("fake_turn_delay_ms".to_string(), "100".to_string()),
+                ]),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+        let cancel_state = TurnCancelState::default();
+        bcode_fake_provider_plugin::reset_fake_compaction_started();
+
+        let compaction = compact_session_context_with_limit(
+            &state,
+            session_id,
+            &selection,
+            None,
+            None,
+            &cancel_state,
+            None,
+        );
+        let cancellation = async {
+            while !bcode_fake_provider_plugin::fake_compaction_summary_started() {
+                tokio::task::yield_now().await;
+            }
+            cancel_state.cancel().await;
+        };
+        let (result, ()) = tokio::join!(compaction, cancellation);
+        assert!(matches!(result, Err(CompactionError::Cancelled)));
+        assert!(bcode_fake_provider_plugin::fake_compaction_started());
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn large_tool_result_followup_triggers_one_useful_proactive_compaction() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("large followup".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        append_large_followup_fixture(&sessions, session_id).await;
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.auto_compaction.keep_recent_tokens = 1;
+        state.tool_output_context_chars = 20_000;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            ..SessionModelSelection::default()
+        };
+        let history = state
+            .sessions
+            .model_context_events(session_id)
+            .await
+            .expect("context");
+        let followup_messages =
+            session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
+        let followup_tokens = estimated_model_messages_tokens(&followup_messages);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::new(Mutex::new(None)),
+        );
+
+        let compacted = maybe_auto_compact_session_context(
+            &state,
+            session_id,
+            &selection,
+            &TurnCancelState::default(),
+            &mut command_context,
+            ProactiveCompactionEvaluation {
+                candidate_input_tokens: followup_tokens,
+                requested_max_output_tokens: None,
+                decision: CompactionDecision {
+                    strategy: AutomaticCompactionStrategy::LocalProactive,
+                    overflow_recovery: false,
+                    reason: "test",
+                },
+                previous_compacted_through_sequence: None,
+            },
+        )
+        .await
+        .expect("followup compaction")
+        .expect("followup should compact");
+
+        let persisted = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            persisted
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+                .count(),
+            1
+        );
+        let context = state
+            .sessions
+            .model_context_events(session_id)
+            .await
+            .expect("context");
+        assert!(context.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolCallFinished { tool_call_id, .. }
+                if tool_call_id == "call-large"
+        )));
+        assert!(
+            compacted
+                < context
+                    .iter()
+                    .map(|event| event.sequence)
+                    .max()
+                    .unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuilt_proactive_request_that_remains_unfit_is_terminal() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
+        let session_id = sessions
+            .create_session(Some("rebuilt unfit".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        append_test_history(&sessions, session_id, 20, 1_000).await;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active request must remain intact".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("trigger");
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.auto_compaction.keep_recent_tokens = 1;
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([
+                (
+                    "model_metadata.fake-echo.context_window".to_owned(),
+                    "7000".to_owned(),
+                ),
+                ("fake_turn_delay_ms".to_owned(), "100".to_owned()),
+            ]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                provider_context: provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        let runtime_context = ClientRuntimeContext {
+            selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            selected_model_id: Some("fake-echo".to_owned()),
+            provider_context,
+            ..ClientRuntimeContext::default()
+        };
+        let completion = run_test_model_turn_with_summary_steering(
+            &state,
+            session_id,
+            &trigger,
+            runtime_context,
+            "z".repeat(30_000),
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Error);
+        assert!(completion.message.as_deref().is_some_and(|message| {
+            message.contains("request remains too large after compaction")
+        }));
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::TraceEvent { trace }
+                        if matches!(
+                            &trace.payload,
+                            SessionTracePayload::ContextCompaction { reason, .. }
+                                if reason == "request_rebuilt_after_compaction"
+                        )
+                ))
+                .count(),
+            1,
+            "completion: {completion:?}"
+        );
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if trace.phase == SessionTracePhase::ModelProviderRoundStarted
+        )));
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_cancellation_persists_no_marker() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("cancel proactive".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let session_id = summary.id;
+        for index in 0..14 {
+            append_test_turn(
+                &sessions,
+                session_id,
+                format!("historical user {index} {}", "x".repeat(1_000)),
+                format!("historical assistant {index} {}", "y".repeat(1_000)),
+            )
+            .await;
+        }
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active turn".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("append active turn");
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.auto_compaction.keep_recent_tokens = 1;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([("fake_turn_delay_ms".to_owned(), "100".to_owned())]),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+        let cancel_state = TurnCancelState::default();
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::new(Mutex::new(None)),
+        );
+        bcode_fake_provider_plugin::reset_fake_compaction_started();
+
+        let compaction = maybe_auto_compact_session_context(
+            &state,
+            session_id,
+            &selection,
+            &cancel_state,
+            &mut command_context,
+            ProactiveCompactionEvaluation {
+                candidate_input_tokens: 7_900,
+                requested_max_output_tokens: None,
+                decision: CompactionDecision {
+                    strategy: AutomaticCompactionStrategy::LocalProactive,
+                    overflow_recovery: false,
+                    reason: "test",
+                },
+                previous_compacted_through_sequence: None,
+            },
+        );
+        let cancellation = async {
+            while !bcode_fake_provider_plugin::fake_compaction_summary_started() {
+                tokio::task::yield_now().await;
+            }
+            cancel_state.cancel().await;
+        };
+        let (result, ()) = tokio::join!(compaction, cancellation);
+        assert!(matches!(result, Err(CompactionError::Cancelled)));
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn overflow_compaction_cancellation_persists_no_marker() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("cancel overflow".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let session_id = summary.id;
+        for index in 0..8 {
+            append_test_turn(
+                &sessions,
+                session_id,
+                format!("overflow user {index} {}", "x".repeat(500)),
+                format!("overflow assistant {index} {}", "y".repeat(500)),
+            )
+            .await;
+        }
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active overflow turn".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("append trigger");
+        let state = test_server_state_with_fake_provider(sessions);
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([("fake_turn_delay_ms".to_owned(), "100".to_owned())]),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+        let cancel_state = TurnCancelState::default();
+        let error = bcode_model::ProviderError {
+            category: bcode_model::ProviderErrorCategory::ContextLength,
+            code: "context_length_exceeded".to_owned(),
+            message: "too large".to_owned(),
+            retryable: false,
+            retry: None,
+            provider_message: None,
+        };
+        bcode_fake_provider_plugin::reset_fake_compaction_started();
+
+        let compaction = compact_session_after_context_overflow(
+            &state,
+            session_id,
+            &selection,
+            trigger.sequence,
+            &error,
+            &cancel_state,
+        );
+        let cancellation = async {
+            while !bcode_fake_provider_plugin::fake_compaction_summary_started() {
+                tokio::task::yield_now().await;
+            }
+            cancel_state.cancel().await;
+        };
+        let (result, ()) = tokio::join!(compaction, cancellation);
+        assert!(matches!(
+            result,
+            Err(ModelTurnCompletion {
+                outcome: ModelTurnOutcome::Cancelled,
+                ..
+            })
+        ));
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
         assert!(!history.iter().any(|event| matches!(
             event.kind,
             SessionEventKind::ContextCompacted { .. }
@@ -27858,6 +28671,280 @@ library = "test"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn automatic_nothing_to_compact_is_trace_only() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("automatic no-op".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+
+        let result = compact_session_context_with_limit(
+            &state,
+            session_id,
+            &SessionModelSelection::default(),
+            None,
+            None,
+            &TurnCancelState::default(),
+            Some(CompactionProgressRequirement {
+                minimum_reclaimable_tokens: 1,
+                previous_compacted_through_sequence: None,
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(CompactionError::PlanUnavailable(_))));
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if trace.phase == SessionTracePhase::ContextCompactionSkipped
+                    && matches!(
+                        &trace.payload,
+                        SessionTracePayload::ContextCompaction { reason, .. }
+                            if reason == "protected_tail_consumes_history"
+                    )
+        )));
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::SystemMessage { .. }
+                | SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )));
+    }
+
+    #[test]
+    fn provider_compaction_metric_labels_hide_opaque_payloads() {
+        let secret = "secret-opaque-log-value";
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 7,
+            timestamp_ms: 1,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence: 6,
+                snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
+                    provider_plugin_id: "provider".to_owned(),
+                    model_id: "model".to_owned(),
+                    compatibility_key: "surface".to_owned(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: format!(r#"[{{"encrypted":"{secret}"}}]"#),
+                    portable_summary: "portable summary".to_owned(),
+                },
+            },
+        };
+
+        let labels = session_event_metric_labels(&event);
+        assert_eq!(
+            labels.get("event_type").map(String::as_str),
+            Some("provider_context_compacted")
+        );
+        assert!(labels.values().all(|value| !value.contains(secret)));
+        assert!(
+            labels
+                .values()
+                .all(|value| !value.contains("portable summary"))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_rounds_do_not_recompact_an_unchanged_boundary() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
+        let session_id = sessions
+            .create_session(
+                Some("tool round churn".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        append_test_history(&sessions, session_id, 12, 1_000).await;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "run repeated fake tools".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("trigger");
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.auto_compaction.keep_recent_tokens = 1;
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([
+                (
+                    "model_metadata.fake-echo.context_window".to_owned(),
+                    "7000".to_owned(),
+                ),
+                ("fake_tool_rounds".to_owned(), "5".to_owned()),
+            ]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            provider_context: provider_context.clone(),
+            ..SessionModelSelection::default()
+        };
+        state
+            .session_model_selections
+            .lock()
+            .await
+            .insert(session_id, selection);
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                selected_model_id: Some("fake-echo".to_owned()),
+                provider_context,
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ToolCallFinished { .. }))
+                .count(),
+            5,
+            "completion: {completion:?}; history: {history:#?}"
+        );
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::SystemMessage { text }
+                if text.contains("auto compaction failed")
+        )));
+    }
+
+    #[tokio::test]
+    async fn repeated_automatic_attempts_do_not_compact_unchanged_or_tiny_prefixes() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("compaction churn".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let session_id = summary.id;
+        for index in 0..5 {
+            append_test_turn(
+                &sessions,
+                session_id,
+                format!("large user {index} {}", "x".repeat(2_000)),
+                format!("large assistant {index} {}", "y".repeat(2_000)),
+            )
+            .await;
+        }
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.keep_recent_tokens = 1;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            ..SessionModelSelection::default()
+        };
+        let first = compact_session_context_with_limit(
+            &state,
+            session_id,
+            &selection,
+            None,
+            None,
+            &TurnCancelState::default(),
+            None,
+        )
+        .await
+        .expect("initial compaction");
+
+        let unchanged = compact_session_context_with_limit(
+            &state,
+            session_id,
+            &selection,
+            None,
+            None,
+            &TurnCancelState::default(),
+            Some(CompactionProgressRequirement {
+                minimum_reclaimable_tokens: 1,
+                previous_compacted_through_sequence: Some(first.compacted_through_sequence),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            unchanged,
+            Err(CompactionError::PlanUnavailable(_))
+        ));
+
+        for index in 0..2 {
+            append_test_turn(
+                &state.sessions,
+                session_id,
+                format!("tiny user {index}"),
+                format!("tiny assistant {index}"),
+            )
+            .await;
+        }
+        let tiny = compact_session_context_with_limit(
+            &state,
+            session_id,
+            &selection,
+            None,
+            None,
+            &TurnCancelState::default(),
+            Some(CompactionProgressRequirement {
+                minimum_reclaimable_tokens: 10_000,
+                previous_compacted_through_sequence: Some(first.compacted_through_sequence),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            tiny,
+            Err(CompactionError::InsufficientProgress { .. })
+        ));
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

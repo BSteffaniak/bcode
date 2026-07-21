@@ -181,6 +181,9 @@ impl RequestContextOccupancy {
             RequestContextTokenCount::ProviderExact(_) => current.is_some_and(|occupancy| {
                 occupancy.context_epoch == context_epoch
                     && occupancy.observation.matches_request_attempt(&observation)
+                    && occupancy
+                        .observation
+                        .is_compatible_anchor(&observation.request)
             }),
         };
         accept

@@ -320,6 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn official_success_response_preserves_compaction_output() {
+        let item = serde_json::json!({
+            "type": "compaction",
+            "id": "cmp_official",
+            "encrypted_content": "opaque",
+            "future_field": { "preserved": true }
+        });
+        let output = validate_compact_response(ResponsesCompactBody {
+            object: "response.compaction".to_string(),
+            output: vec![item.clone()],
+        })
+        .expect("official response.compaction payload should validate");
+
+        assert_eq!(output, vec![item]);
+    }
+
+    #[test]
     fn compact_response_requires_object_nonempty_output_and_valid_item() {
         for body in [
             ResponsesCompactBody {

@@ -23,12 +23,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static FAKE_COMPACTION_STARTED: AtomicBool = AtomicBool::new(false);
+static FAKE_COMPACTION_SUMMARY_STARTED: AtomicBool = AtomicBool::new(false);
 static FAKE_MANAGED_COMPACTION_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Reset the provider-compaction start signal used by static runtime tests.
 #[cfg(feature = "static-bundled")]
 pub fn reset_fake_compaction_started() {
     FAKE_COMPACTION_STARTED.store(false, Ordering::Release);
+    FAKE_COMPACTION_SUMMARY_STARTED.store(false, Ordering::Release);
     FAKE_MANAGED_COMPACTION_EMITTED.store(false, Ordering::Release);
 }
 
@@ -37,6 +39,13 @@ pub fn reset_fake_compaction_started() {
 #[must_use]
 pub fn fake_managed_compaction_emitted() -> bool {
     FAKE_MANAGED_COMPACTION_EMITTED.load(Ordering::Acquire)
+}
+
+/// Return whether a fake compaction-summary model turn has started.
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn fake_compaction_summary_started() -> bool {
+    FAKE_COMPACTION_SUMMARY_STARTED.load(Ordering::Acquire)
 }
 
 /// Return whether a fake provider-native compaction call has started.
@@ -55,6 +64,7 @@ pub struct FakeProviderPlugin {
 #[derive(Debug, Default)]
 struct FakeProviderState {
     next_turn: u64,
+    tool_rounds_emitted: u64,
     turns: BTreeMap<String, FakeTurn>,
     overflow_emitted: bool,
 }
@@ -210,6 +220,13 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
+        let is_compaction_request = request
+            .metadata
+            .get("bcode_request_kind")
+            .is_some_and(|kind| kind == "compaction");
+        if is_compaction_request {
+            FAKE_COMPACTION_SUMMARY_STARTED.store(true, Ordering::Release);
+        }
         let mut state = self
             .state
             .lock()
@@ -219,11 +236,13 @@ impl FakeProviderPlugin {
         let request_input_tokens = fake_request_input_tokens(&request);
         let user_text = last_user_text(&request.messages);
         let tool_result = last_tool_result(&request.messages);
-        let tool_call = if tool_result.is_none() {
-            fake_tool_call(&user_text, state.next_turn)
-        } else {
-            None
-        };
+        let tool_call = repeated_fake_tool_call(&mut state, &request, is_compaction_request)
+            .or_else(|| {
+                tool_result
+                    .is_none()
+                    .then(|| fake_tool_call(&user_text, state.next_turn))
+                    .flatten()
+            });
         let text = tool_result.map_or_else(
             || format!("fake: {user_text}"),
             |result| format!("fake tool result: {result}"),
@@ -453,6 +472,31 @@ fn models(has_context_window: bool) -> ModelList {
         }],
         catalog: bcode_model::ModelCatalogHints::default(),
     }
+}
+
+fn configured_fake_tool_rounds(request: &ModelTurnRequest) -> u64 {
+    request
+        .provider_context
+        .settings
+        .get("fake_tool_rounds")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default()
+}
+
+fn repeated_fake_tool_call(
+    state: &mut FakeProviderState,
+    request: &ModelTurnRequest,
+    is_compaction_request: bool,
+) -> Option<ToolCall> {
+    if is_compaction_request || state.tool_rounds_emitted >= configured_fake_tool_rounds(request) {
+        return None;
+    }
+    state.tool_rounds_emitted += 1;
+    Some(ToolCall {
+        id: format!("fake-tool-{}", state.next_turn),
+        name: "fake.missing-tool".to_string(),
+        arguments: serde_json::json!({ "round": state.next_turn }),
+    })
 }
 
 fn fake_tool_call(user_text: &str, next_turn: u64) -> Option<ToolCall> {

@@ -6409,6 +6409,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_context_read_uses_projection_without_replay_or_mutation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "projected context".to_string(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ))
+        .await
+        .expect("append projected event");
+
+        db.database()
+            .update("events")
+            .value("payload", "corrupt canonical payload")
+            .where_eq("event_seq", seq_to_value(0))
+            .execute(db.database())
+            .await
+            .expect("corrupt canonical payload after projection");
+        let projection_state_before = db
+            .database()
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+            .execute_first(db.database())
+            .await
+            .expect("projection state query")
+            .expect("projection state");
+        let canonical_payload_before = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", seq_to_value(0))
+            .execute_first(db.database())
+            .await
+            .expect("canonical event query")
+            .expect("canonical event");
+
+        let context = db.model_context_events().await.expect("projected context");
+
+        assert!(context.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "projected context"
+        )));
+        let projection_state_after = db
+            .database()
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+            .execute_first(db.database())
+            .await
+            .expect("projection state query")
+            .expect("projection state");
+        let canonical_payload_after = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", seq_to_value(0))
+            .execute_first(db.database())
+            .await
+            .expect("canonical event query")
+            .expect("canonical event");
+        assert_eq!(projection_state_after, projection_state_before);
+        assert_eq!(canonical_payload_after, canonical_payload_before);
+    }
+
+    #[tokio::test]
     async fn model_context_events_start_at_latest_compaction() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();

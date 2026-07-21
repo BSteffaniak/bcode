@@ -2206,6 +2206,69 @@ mod tests {
     }
 
     #[test]
+    fn exact_context_observation_requires_matching_request_surface_and_epoch() {
+        let projected = RequestContextOccupancy::project_estimate(
+            None,
+            invocation("request", 3),
+            7,
+            estimate(80, 1),
+        );
+        let current = RequestContextOccupancy::reconcile(None, 3, 8, projected.clone())
+            .expect("estimate should establish occupancy");
+        let exact = RequestContextObservation {
+            context_tokens: RequestContextTokenCount::ProviderExact(75),
+            ..projected
+        };
+
+        for mutate in [
+            |request: &mut ModelRequestIdentity| request.provider_plugin_id = "other".to_string(),
+            |request: &mut ModelRequestIdentity| request.effective_model_id = "other".to_string(),
+            |request: &mut ModelRequestIdentity| {
+                request.effective_auth_profile = Some("other".to_string());
+            },
+            |request: &mut ModelRequestIdentity| {
+                request.request_fingerprint = "other".to_string();
+            },
+            |request: &mut ModelRequestIdentity| request.context_epoch = 4,
+        ] {
+            let mut mismatched = exact.clone();
+            mutate(&mut mismatched.request);
+            assert_eq!(
+                RequestContextOccupancy::reconcile(Some(&current), 3, 9, mismatched),
+                Some(current.clone())
+            );
+        }
+
+        let accepted = RequestContextOccupancy::reconcile(Some(&current), 3, 9, exact)
+            .expect("matching exact observation should be accepted");
+        assert_eq!(
+            accepted.observation.context_tokens,
+            RequestContextTokenCount::ProviderExact(75)
+        );
+    }
+
+    #[test]
+    fn compaction_epoch_invalidates_prior_exact_context_anchor() {
+        let projected = RequestContextOccupancy::project_estimate(
+            None,
+            invocation("request", 3),
+            7,
+            estimate(80, 1),
+        );
+        let current = RequestContextOccupancy::reconcile(None, 3, 8, projected.clone())
+            .expect("estimate should establish occupancy");
+        let exact = RequestContextObservation {
+            context_tokens: RequestContextTokenCount::ProviderExact(75),
+            ..projected
+        };
+
+        assert_eq!(
+            RequestContextOccupancy::reconcile(Some(&current), 4, 9, exact),
+            Some(current)
+        );
+    }
+
+    #[test]
     fn estimator_version_change_disables_calibration() {
         let anchor = RequestContextOccupancy {
             context_epoch: 3,

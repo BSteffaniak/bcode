@@ -4837,6 +4837,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_compaction_tui_hides_opaque_payloads() {
+        let secret = "secret-opaque-tui-value";
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence: 0,
+                snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
+                    provider_plugin_id: "provider".to_owned(),
+                    model_id: "model".to_owned(),
+                    compatibility_key: "surface".to_owned(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: format!(r#"[{{"encrypted":"{secret}"}}]"#),
+                    portable_summary: "portable summary".to_owned(),
+                },
+            },
+        }];
+
+        let app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        assert_eq!(app.transcript.len(), 1);
+        let item = &app.transcript.items()[0];
+        assert!(item.text().contains("context compaction"));
+        assert!(!item.text().contains(secret));
+        assert!(!item.text().contains("portable summary"));
+    }
+
+    #[test]
     fn history_with_reasoning_change_builds_without_recursive_rebuild() {
         let session_id = bcode_session_models::SessionId::new();
         let history = vec![bcode_session_models::SessionEvent {
@@ -4918,6 +4953,49 @@ mod tests {
             meter.context_summary(Some(&occupancy)),
             "~407,295/372k 100%+"
         );
+    }
+
+    #[test]
+    fn hydrated_estimated_occupancy_preserves_source_and_approximate_rendering() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let occupancy = bcode_session_models::RequestContextOccupancy {
+            context_epoch: 3,
+            observation_sequence: 7,
+            observation: snapshot(true, 2_500),
+        };
+        app.apply_context_occupancy(Some(occupancy));
+        let hydrated = app.context_occupancy.as_ref().expect("hydrated occupancy");
+        let meter = TokenUsageMeter {
+            context_window: Some(10_000),
+            ..TokenUsageMeter::default()
+        };
+
+        assert!(hydrated.observation.context_tokens.is_estimated());
+        assert_eq!(meter.context_summary(Some(hydrated)), "~2,500/10k 25%");
+    }
+
+    #[test]
+    fn live_exact_occupancy_preserves_exact_source_and_rendering() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let occupancy = bcode_session_models::RequestContextOccupancy {
+            context_epoch: 3,
+            observation_sequence: 7,
+            observation: snapshot(false, 2_500),
+        };
+        app.absorb_session_live_event(&SessionLiveEvent {
+            session_id: SessionId::new(),
+            kind: SessionLiveEventKind::RequestContextOccupancyChanged {
+                occupancy: Box::new(Some(occupancy)),
+            },
+        });
+        let live = app.context_occupancy.as_ref().expect("live occupancy");
+        let meter = TokenUsageMeter {
+            context_window: Some(10_000),
+            ..TokenUsageMeter::default()
+        };
+
+        assert!(!live.observation.context_tokens.is_estimated());
+        assert_eq!(meter.context_summary(Some(live)), "2,500/10k 25%");
     }
 
     #[test]
