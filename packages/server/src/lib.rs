@@ -24506,6 +24506,65 @@ library = "test"
     }
 
     #[test]
+    fn stream_read_decode_catalog_pattern_matches_stream_error() {
+        let state = test_server_state(SessionManager::default());
+        let pattern = bcode_model_catalog_models::RecoverableErrorPattern {
+            id: "bcode.openai-compatible.stream-read-decode-failed".to_string(),
+            enabled_by_default: true,
+            scope: bcode_model_catalog_models::RecoverableErrorPatternScope {
+                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                ..bcode_model_catalog_models::RecoverableErrorPatternScope::default()
+            },
+            r#match: bcode_model_catalog_models::RecoverableErrorPatternMatch {
+                code: Some("stream_read_failed".to_string()),
+                message_contains: Some("error decoding response body".to_string()),
+                ..bcode_model_catalog_models::RecoverableErrorPatternMatch::default()
+            },
+        };
+        let rule = remote_pattern_retry_rule(&pattern).expect("pattern should convert");
+        let error = bcode_model::ProviderError {
+            code: "stream_read_failed".to_string(),
+            category: bcode_model::ProviderErrorCategory::Network,
+            message:
+                "provider stream failed while reading response body: error decoding response body"
+                    .to_string(),
+            retryable: true,
+            provider_message: None,
+            retry: None,
+        };
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+            ..SessionModelSelection::default()
+        };
+
+        let policy = matching_provider_retry_policy(
+            &state,
+            &error,
+            &selection,
+            &[],
+            std::slice::from_ref(&rule),
+        )
+        .expect("catalog retry pattern should match");
+
+        assert_eq!(
+            policy.id,
+            "custom.bcode.openai-compatible.stream-read-decode-failed"
+        );
+        assert_eq!(policy.max_retries, 3);
+
+        let unrelated_error = bcode_model::ProviderError {
+            message: "provider stream failed while reading response body: connection reset"
+                .to_string(),
+            ..error
+        };
+        assert!(!custom_retry_rule_matches(
+            &rule,
+            &unrelated_error,
+            &selection
+        ));
+    }
+
+    #[test]
     fn user_retry_rule_deep_merges_over_provider_rule() {
         let provider_rule = bcode_model::ProviderRetryRule {
             id: "provider.rule".to_string(),

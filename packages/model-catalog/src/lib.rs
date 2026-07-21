@@ -1500,6 +1500,20 @@ mod tests {
                 .recoverable_error_patterns
                 .iter()
                 .any(|pattern| {
+                    pattern.id == "bcode.openai-compatible.stream-read-decode-failed"
+                        && pattern.scope.provider_plugin_id.as_deref()
+                            == Some("bcode.openai-compatible")
+                        && pattern.r#match.code.as_deref() == Some("stream_read_failed")
+                        && pattern.r#match.message_contains.as_deref()
+                            == Some("error decoding response body")
+                })
+        );
+        assert!(
+            provider
+                .error_handling
+                .recoverable_error_patterns
+                .iter()
+                .any(|pattern| {
                     pattern.id == "bcode.openai-compatible.unsupported-content-type"
                         && pattern.scope.provider_plugin_id.as_deref()
                             == Some("bcode.openai-compatible")
