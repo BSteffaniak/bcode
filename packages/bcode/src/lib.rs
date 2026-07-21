@@ -941,11 +941,19 @@ pub enum BcodeError {
     #[error("agent runtime error: {0}")]
     Runtime(#[from] RuntimeError),
     /// No provider is configured for a requested model operation.
-    #[error("no provider configured")]
+    #[error(
+        "no model provider is configured; pass a provider to the request, configure an Agent provider factory, or enable `embedded-plugins` and attach a plugin runtime"
+    )]
     MissingProvider,
     /// Embedded plugin runtime is required for this operation.
-    #[error("embedded plugin runtime is not configured")]
+    #[error(
+        "embedded plugin runtime is not configured; enable the `embedded-plugins` feature and call `Bcode::builder().plugin_runtime(...)`"
+    )]
     MissingPluginRuntime,
+    /// Loading Bcode configuration failed.
+    #[cfg(feature = "config")]
+    #[error("failed to load Bcode provider defaults: {0}")]
+    Config(#[from] bcode_config::ConfigError),
     /// Hook callback failed.
     #[error("hook error: {0}")]
     Hook(String),
@@ -977,7 +985,9 @@ pub enum BcodeError {
     #[error("tool execution error: {0}")]
     ToolExecution(String),
     /// Provider setup or capability discovery failed.
-    #[error("provider configuration error: {0}")]
+    #[error(
+        "provider configuration failed: {0}; verify the provider plugin is enabled and its credentials, endpoint, and model settings are configured"
+    )]
     ProviderConfiguration(String),
     /// Plugin loading or execution setup failed.
     #[cfg(feature = "embedded-plugins")]
@@ -1865,6 +1875,55 @@ impl ProviderRegistry {
         Self::default()
     }
 
+    /// Build provider defaults from an already loaded Bcode configuration.
+    ///
+    /// Process environment provider/model overrides are applied using the same resolution rules as
+    /// the Bcode application.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn from_config(config: &bcode_config::BcodeConfig) -> Self {
+        Self::from_config_environment(config, &bcode_config::ProcessConfigEnvironment)
+    }
+
+    /// Build provider defaults from a Bcode configuration and explicit environment.
+    ///
+    /// This deterministic variant is useful for applications that snapshot their environment and
+    /// for tests that must not mutate process-global environment variables.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn from_config_environment(
+        config: &bcode_config::BcodeConfig,
+        environment: &impl bcode_config::ConfigEnvironment,
+    ) -> Self {
+        let selection = config.resolved_model_selection_with_environment(environment);
+        Self::from_resolved_model_selection(&selection)
+    }
+
+    /// Load Bcode configuration from its normal layered paths and build provider defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an existing config layer cannot be read, parsed, or composed.
+    #[cfg(feature = "config")]
+    pub fn load() -> Result<Self> {
+        Ok(Self::from_config(&bcode_config::load_config()?))
+    }
+
+    #[cfg(feature = "config")]
+    fn from_resolved_model_selection(selection: &bcode_config::ResolvedModelSelection) -> Self {
+        let mut registry = Self::new();
+        if let Some(provider_plugin_id) = selection.provider_plugin_id.as_deref() {
+            registry = registry.provider(provider_plugin_id);
+        }
+        if let Some(model_id) = selection.model_id.as_deref() {
+            registry.default_model = Some(selection.provider_plugin_id.as_deref().map_or_else(
+                || ModelSelector::new(model_id),
+                |provider_plugin_id| ModelSelector::with_provider(provider_plugin_id, model_id),
+            ));
+        }
+        registry
+    }
+
     /// Register a provider by plugin ID.
     #[must_use]
     pub fn provider(mut self, provider_plugin_id: impl Into<String>) -> Self {
@@ -1974,6 +2033,19 @@ impl Bcode {
     #[must_use]
     pub fn builder() -> BcodeBuilder {
         BcodeBuilder::default()
+    }
+
+    /// Build an SDK handle using provider/model defaults from Bcode's layered configuration.
+    ///
+    /// Enable the `config` feature to use this constructor. This configures selection defaults;
+    /// embedded provider execution still requires `embedded-plugins` and a plugin runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an existing config layer cannot be read, parsed, or composed.
+    #[cfg(feature = "config")]
+    pub fn configured() -> Result<Self> {
+        Ok(Self::builder().load_provider_defaults()?.build())
     }
 
     /// Start building an agent attached to this SDK handle.
@@ -2127,6 +2199,40 @@ impl BcodeBuilder {
         self
     }
 
+    /// Configure provider/model defaults from an already loaded Bcode configuration.
+    ///
+    /// Process environment provider/model overrides are applied using Bcode's standard resolution
+    /// rules. Explicit builder calls made after this method can replace these defaults.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn provider_defaults_from_config(mut self, config: &bcode_config::BcodeConfig) -> Self {
+        self.provider_registry = ProviderRegistry::from_config(config);
+        self
+    }
+
+    /// Configure provider/model defaults from a Bcode configuration and explicit environment.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn provider_defaults_from_config_environment(
+        mut self,
+        config: &bcode_config::BcodeConfig,
+        environment: &impl bcode_config::ConfigEnvironment,
+    ) -> Self {
+        self.provider_registry = ProviderRegistry::from_config_environment(config, environment);
+        self
+    }
+
+    /// Load Bcode's layered configuration and configure its provider/model defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an existing config layer cannot be read, parsed, or composed.
+    #[cfg(feature = "config")]
+    pub fn load_provider_defaults(mut self) -> Result<Self> {
+        self.provider_registry = ProviderRegistry::load()?;
+        Ok(self)
+    }
+
     /// Configure the default provider/model selector for agents built from this SDK handle.
     #[must_use]
     pub fn default_model(mut self, model: impl Into<ModelSelector>) -> Self {
@@ -2232,6 +2338,27 @@ pub struct PersistedSession {
     pub messages: Vec<ModelMessage>,
 }
 
+/// Persistence adapter for SDK-managed conversation sessions.
+///
+/// Adapters own their storage behavior and should return `Ok(None)` when no persisted session
+/// exists. Corrupt, stale, or otherwise unusable state should return a descriptive [`BcodeError`]
+/// rather than silently discarding data.
+pub trait SessionPersistenceAdapter: Send + Sync {
+    /// Load a persisted session, or return `Ok(None)` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persisted state exists but cannot be read or safely decoded.
+    fn load(&self) -> Result<Option<PersistedSession>>;
+
+    /// Save the complete persisted session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot be encoded or durably stored by the adapter.
+    fn save(&self, session: &PersistedSession) -> Result<()>;
+}
+
 /// Explicit local JSON session store for SDK-managed persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSessionStore {
@@ -2315,6 +2442,16 @@ impl LocalSessionStore {
     }
 }
 
+impl SessionPersistenceAdapter for LocalSessionStore {
+    fn load(&self) -> Result<Option<PersistedSession>> {
+        Self::load(self)
+    }
+
+    fn save(&self, session: &PersistedSession) -> Result<()> {
+        Self::save(self, session)
+    }
+}
+
 /// In-memory SDK session state for continuing conversations without persistence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InMemorySession {
@@ -2358,11 +2495,22 @@ impl InMemorySession {
 }
 
 /// Stateful agent wrapper that keeps conversation history in memory.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentSession {
     agent: Agent,
     session: InMemorySession,
-    store: Option<LocalSessionStore>,
+    persistence: Option<Arc<dyn SessionPersistenceAdapter>>,
+}
+
+impl fmt::Debug for AgentSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentSession")
+            .field("agent", &self.agent)
+            .field("session", &self.session)
+            .field("persistence", &self.persistence.is_some())
+            .finish()
+    }
 }
 
 impl AgentSession {
@@ -2372,15 +2520,21 @@ impl AgentSession {
         Self {
             agent,
             session,
-            store: None,
+            persistence: None,
         }
+    }
+
+    /// Attach a persistence adapter and save after successful turns.
+    #[must_use]
+    pub fn with_persistence(mut self, persistence: Arc<dyn SessionPersistenceAdapter>) -> Self {
+        self.persistence = Some(persistence);
+        self
     }
 
     /// Attach an explicit local session store and save after successful turns.
     #[must_use]
-    pub fn with_store(mut self, store: LocalSessionStore) -> Self {
-        self.store = Some(store);
-        self
+    pub fn with_store(self, store: LocalSessionStore) -> Self {
+        self.with_persistence(Arc::new(store))
     }
 
     /// Return the wrapped agent.
@@ -2395,10 +2549,10 @@ impl AgentSession {
         &self.session
     }
 
-    /// Return the configured local store, when persistence was explicitly enabled.
+    /// Return the configured persistence adapter, when persistence was explicitly enabled.
     #[must_use]
-    pub const fn store(&self) -> Option<&LocalSessionStore> {
-        self.store.as_ref()
+    pub fn persistence(&self) -> Option<&dyn SessionPersistenceAdapter> {
+        self.persistence.as_deref()
     }
 
     /// Return the session payload that can be saved by caller-managed persistence.
@@ -2410,18 +2564,18 @@ impl AgentSession {
         }
     }
 
-    /// Save to the configured local store.
+    /// Save to the configured persistence adapter.
     ///
     /// # Errors
     ///
-    /// Returns an error when this session has no configured store or when saving fails.
+    /// Returns an error when this session has no configured adapter or when saving fails.
     pub fn save(&self) -> Result<()> {
-        let store = self.store.as_ref().ok_or_else(|| {
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
             BcodeError::SessionPersistence(
-                "local session storage is not configured for this session".to_string(),
+                "session persistence is not configured for this session".to_string(),
             )
         })?;
-        store.save(&self.persisted_session())
+        persistence.save(&self.persisted_session())
     }
 
     /// Export the in-memory session transcript for caller-managed persistence.
@@ -2489,7 +2643,7 @@ impl AgentSession {
         self.session
             .messages
             .push(assistant_message(response.text.clone()));
-        if self.store.is_some() {
+        if self.persistence.is_some() {
             self.save()?;
         }
         Ok(response)
@@ -2522,7 +2676,7 @@ impl AgentSession {
         self.session
             .messages
             .push(assistant_message(response.text.clone()));
-        if self.store.is_some() {
+        if self.persistence.is_some() {
             self.save()?;
         }
         Ok(response)
@@ -3374,20 +3528,32 @@ impl Agent {
         AgentSession::new(self, InMemorySession::from_messages(messages))
     }
 
-    /// Create a stateful session backed by an explicit local store.
+    /// Create a stateful session backed by an extensible persistence adapter.
     ///
     /// # Errors
     ///
-    /// Returns an error when the store exists but cannot be read or requires repair.
-    pub fn session_with_store(mut self, store: LocalSessionStore) -> Result<AgentSession> {
-        let persisted = store.load()?;
+    /// Returns an error when persisted state exists but cannot be read or requires repair.
+    pub fn session_with_persistence(
+        mut self,
+        persistence: Arc<dyn SessionPersistenceAdapter>,
+    ) -> Result<AgentSession> {
+        let persisted = persistence.load()?;
         let session = if let Some(persisted) = persisted {
             self.session_id = persisted.session_id;
             InMemorySession::from_messages(persisted.messages)
         } else {
             InMemorySession::new()
         };
-        Ok(AgentSession::new(self, session).with_store(store))
+        Ok(AgentSession::new(self, session).with_persistence(persistence))
+    }
+
+    /// Create a stateful session backed by an explicit local store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store exists but cannot be read or requires repair.
+    pub fn session_with_store(self, store: LocalSessionStore) -> Result<AgentSession> {
+        self.session_with_persistence(Arc::new(store))
     }
 
     /// Return the configured agent name.

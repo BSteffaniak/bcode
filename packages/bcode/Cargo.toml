@@ -31,6 +31,7 @@ bcode_agent_runtime     = { workspace = true }
 bcode_bundled_plugins   = { workspace = true, optional = true }
 bcode_cli               = { workspace = true, optional = true }
 bcode_client            = { workspace = true, optional = true }
+bcode_config            = { workspace = true, optional = true }
 bcode_model             = { workspace = true }
 bcode_plugin            = { workspace = true, optional = true }
 bcode_plugin_sdk        = { workspace = true }
@@ -52,7 +53,7 @@ tempfile              = { workspace = true }
 tokio                 = { workspace = true, features = ["macros", "rt"] }
 
 [features]
-app = ["cli", "static-bundled-plugins", "bundled-ocr-tesseract"]
+app = ["config", "cli", "static-bundled-plugins", "bundled-ocr-tesseract"]
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
 bundled-ocr-tesseract-all = [
     "bundled-ocr-tesseract-v5-3-4",
@@ -75,6 +76,7 @@ bundled-ocr-tesseract-v5-5-2 = [
 ]
 bundled-plugins = ["dep:bcode_bundled_plugins"]
 cli = ["dep:bcode_cli"]
+config = ["dep:bcode_config"]
 daemon-client = ["dep:bcode_client"]
 default = []
 embedded-plugins = ["dep:bcode_plugin"]

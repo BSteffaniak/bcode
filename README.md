@@ -24,16 +24,67 @@ println!("{}", response.text);
 # }
 ```
 
+### Builder-first quickstart
+
+Dedicated request builders are the primary API. They keep advanced options discoverable while still accepting any caller-supplied `ModelProviderInvoker`:
+
+```rust,no_run
+use bcode::{ModelProviderInvoker, generate_text_builder};
+use std::time::Duration;
+
+# async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
+let response = generate_text_builder()
+    .model("example-provider:example-model")
+    .system("Answer concisely.")
+    .prompt("Why is the sky blue?")
+    .metadata("request-id", "demo-1")
+    .timeout(Duration::from_secs(30))
+    .run(&mut provider)
+    .await?;
+println!("{}", response.text);
+# Ok(())
+# }
+```
+
+For the smallest stateless call, use the thin helper; it delegates to the same builder:
+
+```rust,no_run
+# use bcode::ModelProviderInvoker;
+# async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
+let response = bcode::generate_text(&mut provider, "Say hello").await?;
+# Ok(())
+# }
+```
+
+Progressively add `stream_text_builder`, `generate_object_builder::<T>`, `stream_object_builder::<T>`, tools, hooks, or sessions without changing the provider/model concepts.
+
 ### Runtime modes and features
 
-* Embedded mode runs in-process and does not require daemon IPC. Enable `embedded-plugins` when the application wants to host plugin-backed providers/tools itself.
-* Daemon mode is a separate programmatic path. Enable `daemon-client` to use `BcodeClient` through the SDK facade without pulling TUI code into the default library path.
-* The CLI/TUI product is behind the `app` feature, which enables the full CLI/TUI and bundled-plugin feature set. Library users should keep `default-features = false` unless they intentionally want product packaging.
-* Bundled OCR and static bundled plugin features are opt-in through the `bcode` crate feature flags used by the app package.
+* With `default-features = false`, the lean SDK includes builders, caller-supplied providers, tools, hooks, structured output, and lightweight session APIs; it does not include config loading, daemon IPC, the TUI, OCR, or bundled plugins.
+* Enable `config` to load provider/model defaults from Bcode's layered config and environment rules.
+* Enable `embedded-plugins` to host plugin-backed providers and tools directly in-process; this does not require daemon IPC.
+* Enable `daemon-client` for the separate `BcodeClient` daemon path; it does not enable the TUI.
+* Enable `app` only for the complete Bcode CLI/TUI product and its bundled plugin/OCR packaging. Individual static bundled plugin features remain opt-in for custom embedded distributions.
 
-### Providers
+### Provider registry and defaults
 
-For tests, examples, or custom integrations, implement `ModelProviderInvoker` and call `Agent::run`. When a provider ends a round with one or more tool calls, `run` automatically executes the complete batch and sends results back in provider order until the provider finishes. Provider factories can instead be configured on `AgentBuilder` for `Agent::generate_text` and `Agent::stream_text`. Plugin-backed embedded applications can create a plugin runtime host and pass it through `Agent::builder().plugin_runtime(...)` with the `embedded-plugins` feature enabled.
+Provider selection uses `ModelSelector`; `"provider:model"` selects both values, while `"model"` leaves provider routing to the configured invoker. Explicit defaults stay lean:
+
+```rust
+use bcode::{Bcode, ProviderRegistry};
+
+let registry = ProviderRegistry::new()
+    .provider("example-provider")
+    .default_model("example-provider:example-model");
+let sdk = Bcode::builder().provider_registry(registry).build();
+assert_eq!(sdk.default_model_selector().unwrap().model_id(), "example-model");
+```
+
+With the `config` feature, `Bcode::configured()` or `Bcode::builder().load_provider_defaults()` reads the normal layered Bcode configuration. `provider_defaults_from_config(...)` accepts an already loaded config, and `provider_defaults_from_config_environment(...)` supports deterministic environment snapshots. Configured defaults select a provider/model; actual embedded execution additionally requires `embedded-plugins` plus `plugin_runtime(...)`.
+
+Environment resolution follows the application rules, including `BCODE_MODEL_PROVIDER`/`BCODE_PROVIDER`, provider-specific model variables such as `BCODE_OPENAI_MODEL` or `BCODE_BEDROCK_MODEL`, and credential-based provider detection. Explicit builder selections can override defaults.
+
+For tests, examples, or custom integrations, implement `ModelProviderInvoker` and run a request builder. When a provider ends a round with tool calls, the runtime executes the complete batch and returns results in provider order until the provider finishes. Provider factories can instead be configured on `AgentBuilder`. Embedded applications create a plugin runtime host and pass it through `Bcode::builder().plugin_runtime(...)` or `Agent::builder().plugin_runtime(...)`.
 
 ### Custom tools
 
@@ -70,7 +121,9 @@ Use `Agent::stream(provider, prompt)` for a complete provider/tool turn. It yiel
 
 ### Structured output
 
-Use `Agent::generate_object_with_provider::<T, _>(...)` for serde-typed extraction. `StructuredOutputOptions::for_type::<T>()` derives a JSON Schema from `schemars`; `StructuredOutputOptions::json_schema(...)` accepts explicit schemas. Bcode requests provider-native structured output where available, validates returned JSON locally, and supports explicit repair attempts with `with_max_repairs(...)`.
+Use `generate_object_builder::<T>()` for serde-typed extraction. `StructuredOutputOptions::for_type::<T>()` derives a JSON Schema from `schemars`; `StructuredOutputOptions::json_schema(...)` accepts explicit schemas. Bcode requests provider-native structured output where available, validates returned JSON locally, and supports explicit repair attempts with `with_max_repairs(...)`.
+
+For incremental UI updates, use `stream_object_builder::<T>()`. `ObjectStreamItem::RawDelta` contains each raw fragment, `Partial` contains a parseable JSON prefix, `ValidatedPartial` is emitted only when the partial value passes the configured schema, and `Finished` contains the final decoded `T` plus the complete response. `Error` reports provider, timeout, cancellation, JSON, schema, and decode failures. The `stream_object(...)` helper delegates to the same builder.
 
 ### Hooks and observability
 
@@ -78,7 +131,9 @@ Use `Agent::generate_object_with_provider::<T, _>(...)` for serde-typed extracti
 
 ### Optional sessions and persistence
 
-Stateless calls do not require a session. For in-memory conversations, call `Agent::session()` or `Agent::session_from_messages(...)`; transcripts can be exported with `InMemorySession::into_messages()` for caller-managed persistence. For explicit local JSON persistence, use `LocalSessionStore` with `Agent::session_with_store(...)`. Missing stores start empty, while empty or corrupt stores return repair/replacement errors instead of silently rebuilding or replaying unbounded history.
+Stateless calls do not require a session. For in-memory conversations, call `Agent::session()` or `Agent::session_from_messages(...)`; transcripts can be exported with `InMemorySession::into_messages()` for caller-managed persistence. For extensible SDK-managed persistence, implement `SessionPersistenceAdapter` and call `Agent::session_with_persistence(...)`; adapters load/save complete `PersistedSession` values and can target databases, object stores, or application services without TUI/server dependencies. `LocalSessionStore` is the built-in explicit JSON adapter and remains available through `session_with_store(...)`. Missing stores start empty, while empty or corrupt stores return repair/replacement errors instead of silently rebuilding or replaying unbounded history.
+
+Daemon-backed session catalogs, attach/history operations, model selection, input submission, and cancellation remain intentionally `bcode_client`-only. Enable `daemon-client` and use the re-exported `BcodeClient`; embedded `AgentSession` persistence adapters do not silently connect to or depend on a daemon.
 
 See `packages/bcode/examples/` for runnable examples covering text generation, streaming, custom tools, hooks/observability, structured output, local sessions, and daemon-client setup.
 
