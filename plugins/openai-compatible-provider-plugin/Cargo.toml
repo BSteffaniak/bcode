@@ -27,7 +27,6 @@ reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sshenv_vault = { workspace = true }
 tokio = { workspace = true, features = [
     "io-util",
     "macros",
@@ -48,6 +47,9 @@ sshenv_vault = { workspace = true, features = ["macos-keychain"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 sshenv_vault = { workspace = true, features = ["windows-dpapi"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
+sshenv_vault = { workspace = true }
 
 [features]
 default          = []

@@ -33,6 +33,9 @@ sshenv_vault = { workspace = true, features = ["macos-keychain"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 sshenv_vault = { workspace = true, features = ["windows-dpapi"] }
 
+[target.'cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
+sshenv_vault = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []
