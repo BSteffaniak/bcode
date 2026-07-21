@@ -36,6 +36,31 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+struct InvocationOperationDuration {
+    operation: &'static str,
+    started: Instant,
+}
+
+impl InvocationOperationDuration {
+    fn start(operation: &'static str) -> Self {
+        Self {
+            operation,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for InvocationOperationDuration {
+    fn drop(&mut self) {
+        tracing::debug!(
+            operation = self.operation,
+            duration_ms = self.started.elapsed().as_millis(),
+            "neutral invocation operation completed"
+        );
+    }
+}
 
 /// Monotonic identity assigned by a host to one turn within its owning runtime/session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -603,6 +628,8 @@ pub struct TurnControl {
     cancellation: CancellationToken,
     publication_gate: Mutex<()>,
     cancellations: Mutex<BTreeMap<String, Arc<dyn InvocationCancellation>>>,
+    queued_cancellations: AtomicU64,
+    running_cancellations: AtomicU64,
     discarded_normal_events: AtomicU64,
 }
 
@@ -612,12 +639,18 @@ impl fmt::Debug for TurnControl {
             .debug_struct("TurnControl")
             .field("lifecycle", &self.lifecycle())
             .field("registered_cancellations", &self.cancellation_count())
+            .field("queued_cancellations", &self.queued_cancellation_count())
+            .field("running_cancellations", &self.running_cancellation_count())
             .field(
                 "discarded_normal_events",
                 &self.discarded_normal_event_count(),
             )
             .finish_non_exhaustive()
     }
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 impl Default for TurnControl {
@@ -627,6 +660,8 @@ impl Default for TurnControl {
             cancellation: CancellationToken::new(),
             publication_gate: Mutex::new(()),
             cancellations: Mutex::new(BTreeMap::new()),
+            queued_cancellations: AtomicU64::new(0),
+            running_cancellations: AtomicU64::new(0),
             discarded_normal_events: AtomicU64::new(0),
         }
     }
@@ -661,10 +696,17 @@ impl TurnControl {
     ///
     /// Returns `true` only for the caller that transitions this turn from running to cancelling.
     pub fn begin_cancellation(&self) -> bool {
+        let started = Instant::now();
         let Some(handles) = self.close_for_cancellation() else {
             return false;
         };
         Self::signal_cancellation_handles(handles);
+        tracing::debug!(
+            duration_ms = started.elapsed().as_millis(),
+            queued_cancellations = self.queued_cancellation_count(),
+            running_cancellations = self.running_cancellation_count(),
+            "neutral turn cancellation signalled"
+        );
         true
     }
 
@@ -766,6 +808,28 @@ impl TurnControl {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    /// Return the number of admitted invocations cancelled before they started running.
+    #[must_use]
+    pub fn queued_cancellation_count(&self) -> u64 {
+        self.queued_cancellations.load(Ordering::Acquire)
+    }
+
+    /// Return the number of running invocations cancelled by the scheduler.
+    #[must_use]
+    pub fn running_cancellation_count(&self) -> u64 {
+        self.running_cancellations.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_queued_cancellations(&self, count: usize) {
+        self.queued_cancellations
+            .fetch_add(usize_to_u64_saturating(count), Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_running_cancellations(&self, count: usize) {
+        self.running_cancellations
+            .fetch_add(usize_to_u64_saturating(count), Ordering::Relaxed);
     }
 
     /// Return the number of normal events rejected after closure or supersession.
@@ -1140,6 +1204,7 @@ impl InvocationScope {
     /// across clones. Duplicate IDs fail locally and are never forwarded to the host broker. The
     /// returned resolution is terminal for this request.
     pub async fn request_exchange(&self, request: ToolExchangeRequest) -> ToolExchangeResolution {
+        let _duration = InvocationOperationDuration::start("exchange");
         if request.invocation_id != self.invocation_id.as_ref() {
             return ToolExchangeResolution::Failed {
                 code: "invocation_id_mismatch".to_string(),
@@ -1181,6 +1246,7 @@ impl InvocationScope {
 
     /// Wait for one unsolicited input, bounded by turn cancellation.
     pub async fn receive_input(&self) -> ToolInvocationInputResolution {
+        let _duration = InvocationOperationDuration::start("input_wait");
         if !self.accepts_work() {
             return ToolInvocationInputResolution::Cancelled;
         }
@@ -1214,6 +1280,7 @@ impl InvocationScope {
         &self,
         request: ToolInvocationServiceRequest,
     ) -> ToolInvocationServiceResolution {
+        let _duration = InvocationOperationDuration::start("service");
         if request.invocation_id != self.invocation_id.as_ref() {
             return ToolInvocationServiceResolution::Failed {
                 code: "invocation_id_mismatch".to_string(),
@@ -1247,6 +1314,7 @@ impl InvocationScope {
         &self,
         request: ToolArtifactWriteRequest,
     ) -> ToolArtifactWriteResolution {
+        let _duration = InvocationOperationDuration::start("artifact");
         if request.invocation_id != self.invocation_id.as_ref() {
             return ToolArtifactWriteResolution::Failed {
                 code: "invocation_id_mismatch".to_string(),

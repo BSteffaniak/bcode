@@ -519,9 +519,48 @@ fi
 if ! grep -F 'batch_size = calls.len()' packages/agent-runtime/src/lib.rs >/dev/null ||
    ! grep -F 'provider_round,' packages/agent-runtime/src/lib.rs >/dev/null ||
    ! grep -F 'configured_max_concurrency = ?options.max_concurrency.map(NonZeroUsize::get)' packages/agent-runtime/src/lib.rs >/dev/null ||
-   ! grep -F 'observed_concurrency = observed_concurrency.peak()' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'observed_concurrency = execution.observed_concurrency' packages/agent-runtime/src/lib.rs >/dev/null ||
    ! grep -F 'batch_concurrency_observation_tracks_peak_and_releases_active_work' packages/agent-runtime/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: canonical batch concurrency observability was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'Some("sequential_mode")' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'Some("concurrency_bound")' packages/agent-runtime/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: canonical scheduler serialization reason tracing was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'plugin_serialization_reason(PluginConcurrency::Exclusive)' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'plugin service invocation serialized by host' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'plugin_serialization_reason_is_only_reentrancy_exclusivity' packages/plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: plugin-host reentrancy serialization tracing was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'queued_cancellations = queued' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'running_cancellations = running' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'discarded_late_events = scope.control().discarded_normal_event_count()' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'assert_eq!(control.queued_cancellation_count(), 1)' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'assert_eq!(control.running_cancellation_count(), 1)' packages/agent-runtime/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: neutral cancellation/discard accounting was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'RuntimePhaseDuration::start("preparation", Some(provider_round))' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'RuntimePhaseDuration::start("authorization", Some(provider_round))' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'RuntimePhaseDuration::start("batch", Some(provider_round))' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'RuntimePhaseDuration::start("invocation", None)' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'InvocationOperationDuration::start("exchange")' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'InvocationOperationDuration::start("input_wait")' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'InvocationOperationDuration::start("service")' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'InvocationOperationDuration::start("artifact")' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F '"neutral turn cancellation signalled"' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F '"plugin.queue_wait.duration_ms"' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F '"plugin.resource_wait.duration_ms"' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F '"runtime_work.cleanup_duration_ms"' packages/server/src/runtime_work.rs >/dev/null ||
+   ! grep -F '"provider.cleanup_duration_ms"' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: neutral runtime phase duration diagnostics were removed." >&2
   violations=1
 fi
 

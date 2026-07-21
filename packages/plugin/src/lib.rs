@@ -1299,6 +1299,13 @@ pub enum PluginConcurrency {
     Limited(usize),
 }
 
+const fn plugin_serialization_reason(concurrency: PluginConcurrency) -> Option<&'static str> {
+    match concurrency {
+        PluginConcurrency::Exclusive => Some("plugin_host_reentrancy"),
+        PluginConcurrency::Concurrent | PluginConcurrency::Limited(_) => None,
+    }
+}
+
 /// Plugin invocation scheduling class.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1805,6 +1812,16 @@ impl PluginExecutorHandle {
     ) -> Result<StreamingServiceInvocation, PluginLoadError> {
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
+                tracing::debug!(
+                    target: "bcode_plugin::runtime",
+                    plugin_id = %self.manifest.id,
+                    class = ?class,
+                    scope = ?scope,
+                    interface_id = %interface_id,
+                    operation = %operation,
+                    serialization_reason = plugin_serialization_reason(self.concurrency),
+                    "plugin service invocation serialized by host"
+                );
                 let invocation = PluginInvocation {
                     id: invocation_id,
                     class,
@@ -1900,6 +1917,16 @@ impl PluginExecutorHandle {
         };
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
+                tracing::debug!(
+                    target: "bcode_plugin::runtime",
+                    plugin_id = %self.manifest.id,
+                    class = ?invocation.class,
+                    scope = ?invocation.scope,
+                    interface_id = %invocation.interface_id,
+                    operation = %invocation.operation,
+                    serialization_reason = plugin_serialization_reason(self.concurrency),
+                    "plugin service invocation serialized by host"
+                );
                 let (response, receiver) = oneshot::channel();
                 let invocation = PluginInvocation {
                     response,
@@ -3796,6 +3823,22 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn plugin_serialization_reason_is_only_reentrancy_exclusivity() {
+        assert_eq!(
+            plugin_serialization_reason(PluginConcurrency::Exclusive),
+            Some("plugin_host_reentrancy")
+        );
+        assert_eq!(
+            plugin_serialization_reason(PluginConcurrency::Concurrent),
+            None
+        );
+        assert_eq!(
+            plugin_serialization_reason(PluginConcurrency::Limited(2)),
+            None
+        );
+    }
 
     #[test]
     fn manifest_config_supports_aliases_and_categories() {

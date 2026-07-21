@@ -1430,6 +1430,7 @@ impl AgentRuntime {
         }
         rounds.begin_round()?;
         let provider_round = rounds.completed_rounds();
+        let _batch_duration = RuntimePhaseDuration::start("batch", Some(provider_round));
         tracing::debug!(
             provider_round,
             batch_size = calls.len(),
@@ -1438,10 +1439,12 @@ impl AgentRuntime {
             "canonical provider tool batch admitted"
         );
         if !scope.control().accepts_normal_output() {
+            record_scheduler_cancellations(scope, calls.len(), 0);
             return Ok(cancelled_batch_output(calls.len()));
         }
 
         let mut terminal = BTreeMap::<usize, Result<ToolExecutionOutput>>::new();
+        let preparation_duration = RuntimePhaseDuration::start("preparation", Some(provider_round));
         let prepared = prepare_runtime_tool_batch(
             catalog,
             invoker,
@@ -1452,23 +1455,31 @@ impl AgentRuntime {
             &mut terminal,
         )
         .await;
+        drop(preparation_duration);
 
         if !scope.control().accepts_normal_output() {
+            record_scheduler_cancellations(scope, prepared.len(), 0);
             insert_cancelled_calls(&mut terminal, &prepared);
             return Ok(ordered_batch_output(calls.len(), terminal));
         }
 
+        let authorization_duration =
+            RuntimePhaseDuration::start("authorization", Some(provider_round));
         let approved =
             authorize_runtime_tool_batch(authorization, prepared, context, scope, &mut terminal)
-                .await?;
+                .await;
+        drop(authorization_duration);
+        let approved = approved?;
 
         if !scope.control().accepts_normal_output() {
+            record_scheduler_cancellations(scope, approved.len(), 0);
             insert_cancelled_calls(&mut terminal, &approved);
             return Ok(ordered_batch_output(calls.len(), terminal));
         }
 
         for group in provider_batch_execution_groups(approved, options.parallel) {
             if !scope.control().accepts_normal_output() {
+                record_scheduler_cancellations(scope, group.len(), 0);
                 for call in group {
                     terminal.insert(call.index, Err(RuntimeError::Cancelled));
                 }
@@ -1494,35 +1505,22 @@ impl AgentRuntime {
                 serialization_reason,
                 "canonical tool execution group scheduled"
             );
-            let observed_concurrency = Arc::new(BatchConcurrencyObservation::default());
-            let group_indices = group.iter().map(|call| call.index);
-            let executions = stream::iter(group.iter().cloned().map(|prepared| {
-                let observed_concurrency = Arc::clone(&observed_concurrency);
-                async move {
-                    let _active = observed_concurrency.enter();
-                    let index = prepared.index;
-                    let result = invoke_prepared_tool(invoker, prepared, scope).await;
-                    (index, result)
-                }
-            }))
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>();
-            let cancellation = scope.control().cancellation();
-            let completions = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => group_indices
-                    .map(|index| (index, Err(RuntimeError::Cancelled)))
-                    .collect(),
-                completions = executions => completions,
-            };
+            let execution = execute_runtime_tool_group(invoker, &group, concurrency, scope).await;
+            if execution.queued_cancellations != 0 || execution.running_cancellations != 0 {
+                record_scheduler_cancellations(
+                    scope,
+                    execution.queued_cancellations,
+                    execution.running_cancellations,
+                );
+            }
+            terminal.extend(execution.completions);
             tracing::debug!(
                 provider_round,
                 batch_size = calls.len(),
                 group_size = group.len(),
-                observed_concurrency = observed_concurrency.peak(),
+                observed_concurrency = execution.observed_concurrency,
                 "canonical tool execution group completed"
             );
-            terminal.extend(completions);
         }
 
         Ok(ordered_batch_output(calls.len(), terminal))
@@ -1963,6 +1961,44 @@ fn finished_event(
     }
 }
 
+struct RuntimePhaseDuration {
+    phase: &'static str,
+    provider_round: Option<u32>,
+    started: Instant,
+}
+
+impl RuntimePhaseDuration {
+    fn start(phase: &'static str, provider_round: Option<u32>) -> Self {
+        Self {
+            phase,
+            provider_round,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RuntimePhaseDuration {
+    fn drop(&mut self) {
+        tracing::debug!(
+            provider_round = ?self.provider_round,
+            phase = self.phase,
+            duration_ms = self.started.elapsed().as_millis(),
+            "canonical runtime phase completed"
+        );
+    }
+}
+
+fn record_scheduler_cancellations(scope: &TurnScope, queued: usize, running: usize) {
+    scope.control().record_queued_cancellations(queued);
+    scope.control().record_running_cancellations(running);
+    tracing::debug!(
+        queued_cancellations = queued,
+        running_cancellations = running,
+        discarded_late_events = scope.control().discarded_normal_event_count(),
+        "canonical tool scheduler observed cancellation"
+    );
+}
+
 fn insert_cancelled_calls(
     terminal: &mut BTreeMap<usize, Result<ToolExecutionOutput>>,
     calls: &[PreparedRuntimeToolCall],
@@ -1999,6 +2035,7 @@ where
     let decisions = tokio::select! {
         biased;
         () = cancellation.cancelled() => {
+            record_scheduler_cancellations(scope, prepared.len(), 0);
             insert_cancelled_calls(terminal, &prepared);
             return Ok(Vec::new());
         }
@@ -2046,6 +2083,7 @@ where
     let mut prepared = Vec::with_capacity(calls.len());
     for (index, call) in calls.iter().enumerate() {
         if !scope.control().accepts_normal_output() {
+            scope.control().record_queued_cancellations(1);
             terminal.insert(index, Err(RuntimeError::Cancelled));
             continue;
         }
@@ -2360,6 +2398,73 @@ fn tool_invocation_descriptor(call: &ToolCall) -> ToolInvocationDescriptor {
     }
 }
 
+struct RuntimeToolGroupExecution {
+    completions: Vec<(usize, Result<ToolExecutionOutput>)>,
+    observed_concurrency: usize,
+    queued_cancellations: usize,
+    running_cancellations: usize,
+}
+
+async fn execute_runtime_tool_group<I>(
+    invoker: &I,
+    group: &[PreparedRuntimeToolCall],
+    concurrency: usize,
+    scope: &TurnScope,
+) -> RuntimeToolGroupExecution
+where
+    I: ToolInvoker + ?Sized,
+{
+    let observation = Arc::new(BatchConcurrencyObservation::default());
+    let mut remaining = group.iter().map(|call| call.index).collect::<BTreeSet<_>>();
+    let mut completions = Vec::with_capacity(group.len());
+    let mut executions = Box::pin(
+        stream::iter(group.iter().cloned().map(|prepared| {
+            let observation = Arc::clone(&observation);
+            async move {
+                let _active = observation.enter();
+                let index = prepared.index;
+                let result = invoke_prepared_tool(invoker, prepared, scope).await;
+                (index, result)
+            }
+        }))
+        .buffer_unordered(concurrency),
+    );
+    let cancellation = scope.control().cancellation();
+    let (queued_cancellations, running_cancellations) = loop {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                let running = observation.active();
+                let queued = remaining.len().saturating_sub(running);
+                completions.extend(
+                    remaining
+                        .iter()
+                        .copied()
+                        .map(|index| (index, Err(RuntimeError::Cancelled))),
+                );
+                break (queued, running);
+            }
+            completion = executions.next() => {
+                let Some((index, result)) = completion else {
+                    break (0, 0);
+                };
+                remaining.remove(&index);
+                completions.push((index, result));
+                if remaining.is_empty() {
+                    break (0, 0);
+                }
+            }
+        }
+    };
+    drop(executions);
+    RuntimeToolGroupExecution {
+        completions,
+        observed_concurrency: observation.peak(),
+        queued_cancellations,
+        running_cancellations,
+    }
+}
+
 #[derive(Default)]
 struct BatchConcurrencyObservation {
     active: AtomicUsize,
@@ -2375,6 +2480,10 @@ impl BatchConcurrencyObservation {
 
     fn peak(&self) -> usize {
         self.peak.load(Ordering::Acquire)
+    }
+
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
     }
 }
 
@@ -2479,6 +2588,7 @@ async fn invoke_prepared_tool<I>(
 where
     I: ToolInvoker + ?Sized,
 {
+    let _invocation_duration = RuntimePhaseDuration::start("invocation", None);
     if !scope.control().accepts_normal_output() {
         return Err(RuntimeError::Cancelled);
     }
@@ -5234,6 +5344,9 @@ mod tests {
         let output = output.expect("batch orchestration should finish");
 
         assert_eq!(invoker.started.load(Ordering::SeqCst), 1);
+        assert_eq!(control.running_cancellation_count(), 1);
+        assert_eq!(control.queued_cancellation_count(), 1);
+        assert_eq!(control.discarded_normal_event_count(), 0);
         assert!(
             output
                 .results
