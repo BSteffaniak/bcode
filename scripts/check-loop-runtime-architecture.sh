@@ -270,7 +270,7 @@ if rg -n 'stream::iter\(cancellations\)|for_each_concurrent\(' packages/server/s
   cat /tmp/bcode-awaited-runtime-cleanup.txt >&2
   violations=1
 fi
-if ! rg -U 'for \(cleanup_work_id, cancellation\) in cancellations \{\n[[:space:]]+tokio::spawn\(async move \{\n[[:space:]]+let result = cancellation\.cancel\(\)\.await;' packages/server/src/runtime_work.rs >/dev/null; then
+if ! rg -U 'for \(cleanup_work_id, kind, cancellation\) in cancellations \{[\s\S]{0,160}tokio::spawn\(async move \{[\s\S]{0,160}let result = cancellation\.cancel\(\)\.await;' packages/server/src/runtime_work.rs >/dev/null; then
   echo "Runtime architecture violation: registered runtime cleanup handles are not detached after capture." >&2
   violations=1
 fi
@@ -366,6 +366,26 @@ if ! rg -U 'ResolvePermissionBatch \{[\s\S]{0,120}batch_id: String,[\s\S]{0,120}
 fi
 if ! rg -U 'batch_decision = batch\.decision\.lock\(\)\.await;[\s\S]{0,220}\*batch_decision = Some\(approved\)[\s\S]{0,900}batch\.batch_id == batch_id' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: batch permission resolution is not latched and batch-scoped." >&2
+  violations=1
+fi
+
+if ! rg -U 'close_session_turn\(state, session_id\)\.await;[\s\S]{0,160}cancel_pending_permissions_for_session\(state, session_id\)\.await;[\s\S]{0,500}acknowledge_cancel_command' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: turn cancellation no longer closes permission checkpoints before acknowledgement." >&2
+  violations=1
+fi
+if ! rg -U 'PermissionResolved[\s\S]{0,500}snapshot\.permissions\.remove' packages/session-view/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: resolved permission checkpoints remain active in renderer-neutral session view state." >&2
+  violations=1
+fi
+
+if ! rg -U 'runtime_work\.cleanup_total[\s\S]{0,500}runtime_work\.cleanup_duration_ms' packages/server/src/runtime_work.rs >/dev/null ||
+   ! rg -U 'provider\.cleanup_total[\s\S]{0,500}provider\.cleanup_duration_ms' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: detached runtime/provider cleanup diagnostics are incomplete." >&2
+  violations=1
+fi
+
+if rg -U 'labels\.insert\([\s\S]{0,120}"(tool_call_id|call_id|batch_id|invocation_id|permission_id)"' packages plugins --glob '*.rs' >/dev/null; then
+  echo "Runtime architecture violation: aggregate metric labels contain unique call or batch identity." >&2
   violations=1
 fi
 

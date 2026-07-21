@@ -724,7 +724,7 @@ fn apply_effect_result(
             apply_cancel_runtime_work_result(chat, &work_id, result);
         }
         TuiEffectResult::CancelTurn { session_id, result } => {
-            apply_cancel_turn_result(chat, session_id, result);
+            apply_cancel_turn_result(chat, loop_state, session_id, result);
         }
         TuiEffectResult::CycleThinkingEffort { session_id, result } => {
             apply_thinking_cycle_result(chat, session_id, *result);
@@ -1263,18 +1263,33 @@ fn apply_cancel_runtime_work_result(
     }
 }
 
+fn close_permission_dialog_for_session(
+    permission_dialog: &mut Option<PermissionDialogState>,
+    session_id: bcode_session_models::SessionId,
+) {
+    if permission_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.permission().session_id == session_id)
+    {
+        *permission_dialog = None;
+    }
+}
+
 fn apply_cancel_turn_result(
     chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
     session_id: bcode_session_models::SessionId,
     result: Result<bool, ClientError>,
 ) {
     match result {
         Ok(true) if Some(session_id) == chat.app.session_id() => {
+            close_permission_dialog_for_session(&mut loop_state.permission_dialog, session_id);
             chat.app.set_cancelling();
             chat.app
                 .set_status("turn cancellation requested".to_owned());
         }
         Ok(false) if Some(session_id) == chat.app.session_id() => {
+            close_permission_dialog_for_session(&mut loop_state.permission_dialog, session_id);
             chat.app.set_idle();
             chat.app.set_status("no active turn".to_owned());
         }
@@ -2184,6 +2199,36 @@ mod scheduler_tests {
             opening_session_id: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         }
+    }
+
+    #[test]
+    fn cancellation_closes_only_the_matching_session_permission_dialog() {
+        let session_id = bcode_session_models::SessionId::new();
+        let other_session_id = bcode_session_models::SessionId::new();
+        let permission = |session_id| {
+            PermissionDialogState::new(bcode_ipc::PermissionSummary {
+                permission_id: "permission-1".to_owned(),
+                session_id,
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "example.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                batch: Some(bcode_ipc::PermissionBatchCorrelation {
+                    batch_id: "batch-1".to_owned(),
+                    call_index: 0,
+                    call_count: 2,
+                }),
+                agent_id: "build".to_owned(),
+                policy_source: None,
+                policy_reason: None,
+                can_remember_policy: false,
+            })
+        };
+        let mut dialog = Some(permission(session_id));
+
+        close_permission_dialog_for_session(&mut dialog, other_session_id);
+        assert!(dialog.is_some());
+        close_permission_dialog_for_session(&mut dialog, session_id);
+        assert!(dialog.is_none());
     }
 
     #[test]

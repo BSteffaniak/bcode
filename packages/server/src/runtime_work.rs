@@ -1,4 +1,5 @@
 use bcode_ipc::RuntimeWorkSnapshot;
+use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_plugin::PluginInvocationCancelHandle;
 use bcode_session_models::{RuntimeWorkKind, RuntimeWorkStatus, SessionId, WorkId};
 use std::collections::BTreeMap;
@@ -131,9 +132,19 @@ struct ActiveRuntimeWork {
 #[derive(Debug, Default)]
 pub struct RuntimeWorkManager {
     active: Mutex<BTreeMap<(SessionId, WorkId), ActiveRuntimeWork>>,
+    metrics: MetricsRegistry,
 }
 
 impl RuntimeWorkManager {
+    /// Create a runtime work manager with aggregate cleanup diagnostics.
+    #[must_use]
+    pub fn with_metrics(metrics: MetricsRegistry) -> Self {
+        Self {
+            active: Mutex::default(),
+            metrics,
+        }
+    }
+
     /// Register active work and return whether it should be advertised as cancellable.
     pub async fn start(&self, session_id: SessionId, spec: RuntimeWorkSpec) -> bool {
         let cancellable = spec.cancellation.is_cancellable();
@@ -188,7 +199,11 @@ impl RuntimeWorkManager {
             }
             work.cancelled = true;
             cancelled_work_ids.push(next_work_id.clone());
-            cancellations.push((next_work_id.clone(), work.spec.cancellation.clone()));
+            cancellations.push((
+                next_work_id.clone(),
+                work.spec.kind,
+                work.spec.cancellation.clone(),
+            ));
             let children = active
                 .iter()
                 .filter(|((child_session_id, _), child)| {
@@ -200,9 +215,28 @@ impl RuntimeWorkManager {
             pending.extend(children);
         }
         drop(active);
-        for (cleanup_work_id, cancellation) in cancellations {
+        for (cleanup_work_id, kind, cancellation) in cancellations {
+            let metrics = self.metrics.clone();
             tokio::spawn(async move {
+                let started_at = std::time::Instant::now();
                 let result = cancellation.cancel().await;
+                let outcome = if result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                let mut labels = MetricLabels::new();
+                labels.insert(
+                    "work_kind".to_owned(),
+                    runtime_work_kind_label(kind).to_owned(),
+                );
+                labels.insert("outcome".to_owned(), outcome.to_owned());
+                metrics.add_counter_with_labels("runtime_work.cleanup_total", 1, labels.clone());
+                metrics.record_histogram_with_labels(
+                    "runtime_work.cleanup_duration_ms",
+                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    labels,
+                );
                 match result {
                     Ok(()) => tracing::debug!(
                         target: "bcode_server::cleanup",
@@ -251,6 +285,15 @@ impl RuntimeWorkManager {
                 cancellable: work.spec.cancellation.is_cancellable(),
             })
             .collect()
+    }
+}
+
+const fn runtime_work_kind_label(kind: RuntimeWorkKind) -> &'static str {
+    match kind {
+        RuntimeWorkKind::ModelTurn => "model_turn",
+        RuntimeWorkKind::Tool => "tool",
+        RuntimeWorkKind::PluginInvocation => "plugin_invocation",
+        RuntimeWorkKind::EventDelivery => "event_delivery",
     }
 }
 
@@ -431,7 +474,8 @@ mod tests {
     }
     #[tokio::test]
     async fn cleanup_failure_is_diagnostic_only_after_local_cancellation() {
-        let manager = RuntimeWorkManager::default();
+        let metrics = MetricsRegistry::default();
+        let manager = RuntimeWorkManager::with_metrics(metrics.clone());
         let session_id = SessionId::new();
         let work_id = WorkId::new("failed-cleanup");
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -454,6 +498,32 @@ mod tests {
             RuntimeWorkStatus::Cancelling
         );
         wait_for_count(&attempts, 1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while metrics
+                .snapshot()
+                .counters
+                .get("runtime_work.cleanup_total")
+                .copied()
+                != Some(1)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup diagnostic should be recorded");
+        let report = metrics.report();
+        assert!(report.events.iter().any(|event| {
+            event.name == "runtime_work.cleanup_total"
+                && event.labels.get("work_kind").map(String::as_str) == Some("tool")
+                && event.labels.get("outcome").map(String::as_str) == Some("failed")
+                && !event.labels.contains_key("work_id")
+        }));
+        assert!(
+            metrics
+                .snapshot()
+                .histograms
+                .contains_key("runtime_work.cleanup_duration_ms")
+        );
         assert_eq!(
             manager.active_for_session(session_id).await[0].status,
             RuntimeWorkStatus::Cancelling,

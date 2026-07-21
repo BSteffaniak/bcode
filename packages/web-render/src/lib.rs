@@ -1171,6 +1171,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn web_projection_closes_resolved_permission_but_preserves_transcript_record() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        view.apply_event(&event(
+            1,
+            bcode_session_models::SessionEventKind::PermissionRequested {
+                permission_id: "permission-1".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("example.plugin".to_owned()),
+                tool_name: "example.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                legacy_request_presentation: None,
+                policy_source: None,
+                policy_reason: None,
+            },
+        ));
+        assert_eq!(view.snapshot().permissions.len(), 1);
+
+        view.apply_event(&event(
+            2,
+            bcode_session_models::SessionEventKind::PermissionResolved {
+                permission_id: "permission-1".to_owned(),
+                approved: false,
+            },
+        ));
+
+        assert!(view.snapshot().permissions.is_empty());
+        assert!(view.snapshot().transcript.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                    if permission.resolved && permission.approved == Some(false)
+            )
+        }));
+    }
+
+    #[test]
     fn projection_window_metadata_populates_history_availability() {
         let mut snapshot = SessionViewSnapshot::empty();
         let window = ProjectionWindow {

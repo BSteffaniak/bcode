@@ -593,15 +593,15 @@ impl SessionView {
                 approved,
                 ..
             } => {
-                if let Some(permission) = self
+                if let Some(index) = self
                     .snapshot
                     .permissions
-                    .iter_mut()
-                    .find(|permission| permission.permission_id == *permission_id)
+                    .iter()
+                    .position(|permission| permission.permission_id == *permission_id)
                 {
+                    let mut permission = self.snapshot.permissions.remove(index);
                     permission.resolved = true;
                     permission.approved = Some(*approved);
-                    let permission = permission.clone();
                     if let Some(item) = self.snapshot.transcript.items.iter_mut().find(|item| {
                         matches!(
                             &item.kind,
@@ -1762,8 +1762,7 @@ mod tests {
             },
         ));
 
-        assert!(view.snapshot().permissions[0].resolved);
-        assert_eq!(view.snapshot().permissions[0].approved, Some(true));
+        assert!(view.snapshot().permissions.is_empty());
         assert!(matches!(
             &view.snapshot().transcript.items[0].kind,
             TranscriptViewItemKind::Permission { permission }

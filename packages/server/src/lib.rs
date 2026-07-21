@@ -975,9 +975,19 @@ struct PendingPermission {
     skill_decision_key: Option<SkillToolDecisionKey>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PendingPermissionBatch {
+    session_id: SessionId,
     decision: Mutex<Option<bool>>,
+}
+
+impl PendingPermissionBatch {
+    fn new(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            decision: Mutex::new(None),
+        }
+    }
 }
 
 struct PendingPermissionBatchRegistration {
@@ -1094,7 +1104,7 @@ impl ServerState {
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
             turn_admission_locks: Mutex::default(),
-            runtime_work: RuntimeWorkManager::default(),
+            runtime_work: RuntimeWorkManager::with_metrics(init.metrics.clone()),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
             session_model_selections: Mutex::default(),
@@ -6973,6 +6983,42 @@ async fn service_cancel_commands(
     }
 }
 
+async fn cancel_pending_permissions_for_session(state: &ServerState, session_id: SessionId) {
+    let batches = state
+        .pending_permission_batches
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .filter(|batch| batch.session_id == session_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for batch in batches {
+        let mut decision = batch.decision.lock().await;
+        if decision.is_none() {
+            *decision = Some(false);
+        }
+    }
+
+    let permissions = {
+        let mut pending = state.pending_permissions.lock().await;
+        let permission_ids = pending
+            .iter()
+            .filter(|(_, permission)| permission.summary.session_id == session_id)
+            .map(|(permission_id, _)| permission_id.clone())
+            .collect::<Vec<_>>();
+        let mut permissions = Vec::with_capacity(permission_ids.len());
+        for permission_id in permission_ids {
+            if let Some(permission) = pending.remove(&permission_id) {
+                permissions.push(permission);
+            }
+        }
+        permissions
+    };
+    for permission in permissions {
+        resolve_pending_permission(state, permission, false, false).await;
+    }
+}
+
 async fn process_cancel_turn_command(
     state: &ServerState,
     session_id: SessionId,
@@ -6981,6 +7027,7 @@ async fn process_cancel_turn_command(
     command: CancelCommand,
 ) {
     let current_turn = close_session_turn(state, session_id).await;
+    cancel_pending_permissions_for_session(state, session_id).await;
     if command.clear_queue {
         let cleared = drain_followup_commands(followup_commands);
         if cleared > 0 {
@@ -8831,11 +8878,13 @@ async fn close_session_turn(
 
 fn dispatch_provider_turn_cleanup(
     plugins: bcode_plugin::PluginRuntimeHost,
+    metrics: MetricsRegistry,
     provider_plugin_id: String,
     request: CancelTurnRequest,
     scope: PluginInvocationScope,
 ) {
     tokio::spawn(async move {
+        let started_at = Instant::now();
         let result = plugins
             .invoke_service_json_scoped::<_, bcode_model::AckResponse>(
                 &provider_plugin_id,
@@ -8845,6 +8894,20 @@ fn dispatch_provider_turn_cleanup(
                 scope,
             )
             .await;
+        let outcome = if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
+        let mut labels = MetricLabels::new();
+        labels.insert("cleanup_kind".to_owned(), "provider_turn".to_owned());
+        labels.insert("outcome".to_owned(), outcome.to_owned());
+        metrics.add_counter_with_labels("provider.cleanup_total", 1, labels.clone());
+        metrics.record_histogram_with_labels(
+            "provider.cleanup_duration_ms",
+            elapsed_ms(started_at),
+            labels,
+        );
         match result {
             Ok(_) => tracing::debug!(
                 target: "bcode_server::cleanup",
@@ -8885,6 +8948,7 @@ async fn finish_session_turn_cancellation(
         if let Some(provider_plugin_id) = provider_plugin_id {
             dispatch_provider_turn_cleanup(
                 state.plugins.clone(),
+                state.metrics.clone(),
                 provider_plugin_id,
                 CancelTurnRequest {
                     provider_turn_id: model.provider_turn_id.clone(),
@@ -14925,7 +14989,7 @@ impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
     ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
         Box::pin(async move {
             let batch_id = next_permission_batch_id(self.state).await;
-            let batch_state = Arc::new(PendingPermissionBatch::default());
+            let batch_state = Arc::new(PendingPermissionBatch::new(self.session_id));
             let _registration = PendingPermissionBatchRegistration::register(
                 Arc::clone(&self.state.pending_permission_batches),
                 batch_id.clone(),
@@ -15213,12 +15277,8 @@ async fn execute_model_tool(
         .await;
         return None;
     }
-    let tool_labels = tool_invocation_metric_labels(
-        session_id,
-        &call.id,
-        &call.name,
-        producer_plugin_id.as_deref(),
-    );
+    let tool_labels =
+        tool_invocation_metric_labels(session_id, &call.name, producer_plugin_id.as_deref());
     let tool_span = state
         .metrics
         .span("tool.invocation")
@@ -15301,13 +15361,11 @@ async fn execute_model_tool(
 
 fn tool_invocation_metric_labels(
     session_id: SessionId,
-    tool_call_id: &str,
     tool_name: &str,
     plugin_id: Option<&str>,
 ) -> MetricLabels {
     let mut labels = MetricLabels::new();
     labels.insert("session_id".to_owned(), session_id.to_string());
-    labels.insert("tool_call_id".to_owned(), tool_call_id.to_owned());
     labels.insert("tool_name".to_owned(), tool_name.to_owned());
     if let Some(plugin_id) = plugin_id {
         labels.insert("plugin_id".to_owned(), plugin_id.to_owned());
@@ -17031,6 +17089,9 @@ async fn request_tool_permission(
     cancel_state: &TurnCancelState,
     policy_context: PermissionPolicyContext,
 ) -> bool {
+    if cancel_state.is_cancelled() {
+        return false;
+    }
     let permission_id = next_permission_id(state).await;
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
     let agent_id = session_agent_selection(state, session_id).await;
@@ -17121,6 +17182,14 @@ async fn request_tool_permission(
         tokio::select! {
             () = pending.notify.notified() => {}
             () = cancel_state.cancelled() => {
+                let removed = state
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .remove(&pending.summary.permission_id);
+                if removed.is_none() {
+                    continue;
+                }
                 let duration_ms = elapsed_ms(wait_start);
                 state.metrics.record_histogram_with_labels(
                     "tool.permission.wait_duration_ms",
@@ -17145,11 +17214,6 @@ async fn request_tool_permission(
                     },
                 )
                 .await;
-                state
-                    .pending_permissions
-                    .lock()
-                    .await
-                    .remove(&pending.summary.permission_id);
                 append_permission_resolved_event(
                     state,
                     session_id,
@@ -19462,6 +19526,47 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn provider_cleanup_failure_records_aggregate_diagnostic() {
+        let metrics = MetricsRegistry::default();
+        dispatch_provider_turn_cleanup(
+            bcode_plugin::PluginHost::default().into(),
+            metrics.clone(),
+            "missing.provider".to_owned(),
+            CancelTurnRequest {
+                provider_turn_id: "provider-turn".to_owned(),
+            },
+            PluginInvocationScope::Global,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while metrics
+                .snapshot()
+                .counters
+                .get("provider.cleanup_total")
+                .copied()
+                != Some(1)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider cleanup diagnostic");
+        let report = metrics.report();
+        assert!(report.events.iter().any(|event| {
+            event.name == "provider.cleanup_total"
+                && event.labels.get("cleanup_kind").map(String::as_str) == Some("provider_turn")
+                && event.labels.get("outcome").map(String::as_str) == Some("failed")
+                && !event.labels.contains_key("provider_turn_id")
+        }));
+        assert!(
+            metrics
+                .snapshot()
+                .histograms
+                .contains_key("provider.cleanup_duration_ms")
+        );
+    }
+
+    #[tokio::test]
     async fn non_returning_provider_cleanup_cannot_delay_local_completion() {
         NON_RETURNING_CANCEL_STARTED.store(false, Ordering::SeqCst);
         NON_RETURNING_CANCEL_RELEASED.store(false, Ordering::SeqCst);
@@ -19479,6 +19584,7 @@ library = "test"
         tokio::time::timeout(Duration::from_millis(100), async {
             dispatch_provider_turn_cleanup(
                 plugins,
+                MetricsRegistry::default(),
                 "test.non-returning-provider".to_string(),
                 CancelTurnRequest {
                     provider_turn_id: "provider-turn".to_string(),
@@ -24332,8 +24438,8 @@ library = "test"
     async fn batch_permission_resolution_is_latched_and_batch_scoped() {
         let state = test_server_state(SessionManager::default());
         let session_id = SessionId::new();
-        let first_batch = Arc::new(PendingPermissionBatch::default());
-        let second_batch = Arc::new(PendingPermissionBatch::default());
+        let first_batch = Arc::new(PendingPermissionBatch::new(session_id));
+        let second_batch = Arc::new(PendingPermissionBatch::new(session_id));
         state
             .pending_permission_batches
             .lock()
@@ -24412,6 +24518,121 @@ library = "test"
         .await;
         assert!(late, "late sibling must inherit the latched batch decision");
         assert_eq!(state.pending_permissions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn cancelling_session_denies_and_closes_only_its_pending_permissions() {
+        let sessions = SessionManager::default();
+        let target = sessions
+            .create_session(Some("target".to_owned()), test_working_directory())
+            .await
+            .expect("target session");
+        let unrelated = sessions
+            .create_session(Some("unrelated".to_owned()), test_working_directory())
+            .await
+            .expect("unrelated session");
+        let state = Arc::new(test_server_state(sessions));
+        let target_batch = Arc::new(PendingPermissionBatch::new(target.id));
+        let unrelated_batch = Arc::new(PendingPermissionBatch::new(unrelated.id));
+        state
+            .pending_permission_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([
+                ("target-batch".to_owned(), Arc::clone(&target_batch)),
+                ("unrelated-batch".to_owned(), Arc::clone(&unrelated_batch)),
+            ]);
+        let unrelated_permission =
+            pending_permission_for_batch("unrelated-1", unrelated.id, 0, "unrelated-batch");
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("unrelated-1".to_owned(), unrelated_permission.clone());
+
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let mut tasks = Vec::new();
+        for index in 0..2 {
+            let task_state = Arc::clone(&state);
+            let task_cancel = Arc::clone(&cancel_state);
+            tasks.push(tokio::spawn(async move {
+                request_tool_permission(
+                    task_state.as_ref(),
+                    target.id,
+                    &bcode_model::ToolCall {
+                        id: format!("target-call-{index}"),
+                        name: "example.tool".to_owned(),
+                        arguments: serde_json::Value::Null,
+                    },
+                    "example.tool",
+                    "example.plugin",
+                    task_cancel.as_ref(),
+                    PermissionPolicyContext {
+                        batch: Some(PermissionBatchCorrelation {
+                            batch_id: "target-batch".to_owned(),
+                            call_index: index,
+                            call_count: 2,
+                        }),
+                        ..PermissionPolicyContext::default()
+                    },
+                )
+                .await
+            }));
+        }
+        let pending = wait_for_pending_permissions(state.as_ref(), 3).await;
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|permission| permission.summary.session_id == target.id)
+                .count(),
+            2
+        );
+
+        cancel_state.close();
+        cancel_pending_permissions_for_session(state.as_ref(), target.id).await;
+
+        for task in tasks {
+            assert!(!task.await.expect("permission waiter"));
+        }
+        assert_eq!(*target_batch.decision.lock().await, Some(false));
+        assert_eq!(*unrelated_batch.decision.lock().await, None);
+        assert_eq!(*unrelated_permission.decision.lock().await, None);
+        assert_eq!(
+            state
+                .pending_permissions
+                .lock()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["unrelated-1"]
+        );
+        let history = state
+            .sessions
+            .session_history(target.id)
+            .await
+            .expect("target history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::PermissionRequested { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::PermissionResolved {
+                        approved: false,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
     }
 
     async fn wait_for_pending_permissions(
@@ -25372,6 +25593,33 @@ library = "test"
                 ralph_store,
             },
         )
+    }
+
+    #[test]
+    fn tool_invocation_metric_labels_exclude_unique_call_identity() {
+        let labels =
+            tool_invocation_metric_labels(SessionId::new(), "example.tool", Some("example.plugin"));
+
+        assert_eq!(
+            labels.get("tool_name").map(String::as_str),
+            Some("example.tool")
+        );
+        assert_eq!(
+            labels.get("plugin_id").map(String::as_str),
+            Some("example.plugin")
+        );
+        for forbidden in [
+            "tool_call_id",
+            "call_id",
+            "batch_id",
+            "invocation_id",
+            "permission_id",
+        ] {
+            assert!(
+                !labels.contains_key(forbidden),
+                "forbidden label: {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -26960,9 +27208,8 @@ library = "test"
             .await
             .expect("session should be created");
         let session_id = summary.id;
-        let state = test_server_state(sessions);
-        let cancel_state = TurnCancelState::default();
-        cancel_state.cancel().await;
+        let state = Arc::new(test_server_state(sessions));
+        let cancel_state = Arc::new(TurnCancelState::default());
         let definition = ServiceToolDefinition {
             name: "example.tool".to_owned(),
             description: "example".to_owned(),
@@ -26978,16 +27225,34 @@ library = "test"
             arguments: serde_json::json!({}),
         };
 
-        let approved = request_tool_permission(
-            &state,
-            session_id,
-            &call,
-            &definition.name,
-            "test.plugin",
-            &cancel_state,
-            PermissionPolicyContext::default(),
-        )
-        .await;
+        let task_state = Arc::clone(&state);
+        let task_cancel = Arc::clone(&cancel_state);
+        let task_call = call.clone();
+        let tool_name = definition.name.clone();
+        let task = tokio::spawn(async move {
+            request_tool_permission(
+                task_state.as_ref(),
+                session_id,
+                &task_call,
+                &tool_name,
+                "test.plugin",
+                task_cancel.as_ref(),
+                PermissionPolicyContext::default(),
+            )
+            .await
+        });
+        let permission = wait_for_pending_permissions(state.as_ref(), 1)
+            .await
+            .into_iter()
+            .next()
+            .expect("pending permission");
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .remove(&permission.summary.permission_id);
+        resolve_pending_permission(state.as_ref(), permission, false, false).await;
+        let approved = task.await.expect("permission task");
 
         assert!(!approved);
         let history = state
