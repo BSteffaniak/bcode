@@ -128,6 +128,17 @@ impl FakeProviderPlugin {
                     Ok(request) => request,
                     Err(error) => return invalid_request(&error),
                 };
+                if request
+                    .provider_context
+                    .settings
+                    .get("fake_context_capabilities_failure")
+                    .is_some_and(|value| value == "true")
+                {
+                    return ServiceResponse::error(
+                        "capability_discovery_failed",
+                        "fake context capability discovery failed",
+                    );
+                }
                 json_response(&fake_context_capabilities(&request))
             }
             OP_COMPACT_CONTEXT => Self::compact_context(&context.request),

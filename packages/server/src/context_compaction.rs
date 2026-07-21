@@ -410,17 +410,63 @@ pub async fn provider_context_management_capabilities(
 pub struct AutomaticCompactionPolicy {
     pub decision: CompactionDecision,
     pub capabilities: Option<bcode_model::ContextManagementCapabilities>,
+    pub capability_reason: String,
 }
 
 pub async fn automatic_compaction_policy(
     state: &ServerState,
     selection: &SessionModelSelection,
 ) -> AutomaticCompactionPolicy {
-    let capabilities = provider_context_management_capabilities(state, selection).await;
+    let Some(provider_plugin_id) = selection.provider_plugin_id.as_deref() else {
+        let decision = resolve_compaction_decision(state.auto_compaction.mode, None);
+        return AutomaticCompactionPolicy {
+            decision,
+            capabilities: None,
+            capability_reason: "no provider plugin is selected".to_string(),
+        };
+    };
+    let result = state
+        .plugins
+        .invoke_service_json::<_, bcode_model::ContextManagementCapabilities>(
+            provider_plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_CONTEXT_MANAGEMENT_CAPABILITIES,
+            &bcode_model::ContextManagementCapabilitiesRequest {
+                provider_context: selection.provider_context.clone(),
+                model_id: selection.model_id.clone(),
+            },
+        )
+        .await;
+    let (capabilities, capability_reason) = match result {
+        Ok(capabilities) => {
+            let reason = if capabilities.provider_managed {
+                match capabilities.context_format.as_ref() {
+                    Some(format)
+                        if format.version > 0 && !format.compatibility_key.trim().is_empty() =>
+                    {
+                        format!(
+                            "provider advertises managed compaction format version {} with compatibility key {:?}",
+                            format.version, format.compatibility_key
+                        )
+                    }
+                    _ => "provider advertises managed compaction without a valid context format"
+                        .to_string(),
+                }
+            } else {
+                "provider does not advertise managed compaction".to_string()
+            };
+            (Some(capabilities), reason)
+        }
+        Err(error) => (
+            None,
+            format!("context-management capability discovery failed: {error}"),
+        ),
+    };
     let decision = resolve_compaction_decision(state.auto_compaction.mode, capabilities.as_ref());
     AutomaticCompactionPolicy {
         decision,
         capabilities,
+        capability_reason,
     }
 }
 

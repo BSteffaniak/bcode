@@ -10644,8 +10644,10 @@ async fn run_model_turn_inner(
         0,
         false,
         Some(format!(
-            "automatic compaction strategy {:?}: {}",
-            compaction_decision.strategy, compaction_decision.reason
+            "automatic compaction strategy {:?}: {}; capability: {}",
+            compaction_decision.strategy,
+            compaction_decision.reason,
+            compaction_policy.capability_reason
         )),
     )
     .await;
@@ -20782,6 +20784,79 @@ library = "test"
         assert_eq!(
             resolve_compaction_decision(bcode_config::CompactionMode::Off, None).strategy,
             AutomaticCompactionStrategy::Disabled
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_policy_rediscovers_surface_capabilities_without_stale_cache() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        let selection = |settings| SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-echo".to_string()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings,
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        };
+
+        let unsupported = automatic_compaction_policy(&state, &selection(BTreeMap::new())).await;
+        assert_eq!(
+            unsupported.decision.strategy,
+            AutomaticCompactionStrategy::OverflowOnly
+        );
+        assert_eq!(
+            unsupported.capability_reason,
+            "provider does not advertise managed compaction"
+        );
+
+        let supported = automatic_compaction_policy(
+            &state,
+            &selection(BTreeMap::from([(
+                "fake_managed_compaction".to_string(),
+                "true".to_string(),
+            )])),
+        )
+        .await;
+        assert_eq!(
+            supported.decision.strategy,
+            AutomaticCompactionStrategy::ProviderManaged
+        );
+        assert!(
+            supported
+                .capability_reason
+                .contains("bcode.fake-provider/context-v1")
+        );
+
+        let failed = automatic_compaction_policy(
+            &state,
+            &selection(BTreeMap::from([(
+                "fake_context_capabilities_failure".to_string(),
+                "true".to_string(),
+            )])),
+        )
+        .await;
+        assert_eq!(
+            failed.decision.strategy,
+            AutomaticCompactionStrategy::OverflowOnly
+        );
+        assert!(
+            failed
+                .capability_reason
+                .contains("capability discovery failed")
+        );
+
+        let supported_again = automatic_compaction_policy(
+            &state,
+            &selection(BTreeMap::from([(
+                "fake_managed_compaction".to_string(),
+                "true".to_string(),
+            )])),
+        )
+        .await;
+        assert_eq!(
+            supported_again.decision.strategy,
+            AutomaticCompactionStrategy::ProviderManaged
         );
     }
 
