@@ -626,6 +626,24 @@ if ! grep -F 'permission_batch_correlation_survives_session_view_projection' pac
   violations=1
 fi
 
+if ! grep -F 'transient_contribution_is_published_live_only_with_verified_identity' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'transient_contribution_projects_live_and_remove_is_terminal' packages/session-view/src/lib.rs >/dev/null ||
+   ! grep -F 'transient_contribution_updates_and_removes_one_live_fallback' packages/tui/src/app.rs >/dev/null; then
+  echo "Runtime architecture violation: transient contribution live-only routing coverage was removed." >&2
+  violations=1
+fi
+
+if ! scripts/check-plugin-presentation-manifests.sh; then
+  violations=1
+fi
+
+if ! grep -F 'generic_live_contribution_description_preserves_opaque_identity_and_payload' packages/cli/src/lib.rs >/dev/null ||
+   ! grep -F 'SessionWatchEvent::ResyncRequired' packages/cli/src/lib.rs >/dev/null ||
+   ! grep -F 'Event::Session(event) | Event::RuntimeWork(event)' packages/client/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic client/CLI session event handling was removed." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

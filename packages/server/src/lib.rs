@@ -16226,8 +16226,13 @@ async fn invoke_model_tool(
                                 bcode_session_models::ToolContributionEvent,
                             >(&payload)
                             {
-                                append_tool_contribution_event(state, session_id, contribution)
-                                    .await;
+                                append_tool_contribution_event(
+                                    state,
+                                    session_id,
+                                    &call.id,
+                                    contribution,
+                                )
+                                .await;
                             } else if let Ok(event) = serde_json::from_slice::<
                                 ServiceToolInvocationStreamEvent,
                             >(&payload)
@@ -16261,7 +16266,7 @@ async fn invoke_model_tool(
         } else if let Ok(contribution) =
             serde_json::from_slice::<bcode_session_models::ToolContributionEvent>(&payload)
         {
-            append_tool_contribution_event(state, session_id, contribution).await;
+            append_tool_contribution_event(state, session_id, &call.id, contribution).await;
         } else if let Ok(event) =
             serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
         {
@@ -16343,9 +16348,22 @@ async fn append_plugin_tool_lifecycle_event(
 async fn append_tool_contribution_event(
     state: &ServerState,
     session_id: SessionId,
+    invocation_id: &str,
     event: bcode_session_models::ToolContributionEvent,
 ) {
+    if event.invocation_id != invocation_id {
+        tracing::warn!(
+            expected_invocation_id = invocation_id,
+            actual_invocation_id = event.invocation_id,
+            "discarded tool contribution with mismatched invocation identity"
+        );
+        return;
+    }
     if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
+        state
+            .sessions
+            .publish_live_event(session_id, SessionLiveEventKind::ToolContribution { event })
+            .await;
         return;
     }
     match state
@@ -27712,6 +27730,57 @@ library = "test"
                 event: ToolInvocationStreamEvent::OutputDelta { .. }
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn transient_contribution_is_published_live_only_with_verified_identity() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created")
+            .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call-1".to_owned(),
+            contribution_id: "surface".to_owned(),
+            sequence: 1,
+            producer_id: "test.plugin".to_owned(),
+            schema: "test.surface".to_owned(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            payload: serde_json::json!({"live": true}),
+        };
+
+        append_tool_contribution_event(&state, session_id, "call-1", contribution.clone()).await;
+        assert_eq!(
+            attachment
+                .live_events
+                .recv()
+                .await
+                .expect("live contribution")
+                .kind,
+            SessionLiveEventKind::ToolContribution {
+                event: contribution.clone(),
+            }
+        );
+        assert!(
+            !state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ToolContribution { .. }))
+        );
+
+        append_tool_contribution_event(&state, session_id, "other-call", contribution).await;
+        assert!(attachment.live_events.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -319,6 +319,12 @@ impl TranscriptItem {
         &self.text
     }
 
+    /// Replace display text.
+    pub fn replace_text(&mut self, text: String) {
+        self.text = text;
+        self.bump_revision();
+    }
+
     /// Append text to this transcript item.
     pub fn append_text(&mut self, text: &str) {
         self.text.push_str(text);

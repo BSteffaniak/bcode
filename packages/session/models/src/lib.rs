@@ -808,6 +808,10 @@ pub enum SessionLiveEventKind {
     /// Opaque visual updates currently share this live transport, but active-artifact snapshots
     /// must replace their cumulative payload before durable visual compatibility can be removed.
     ToolOutputDelta { event: ToolInvocationStreamEvent },
+    /// Opaque renderer contribution published only to currently attached clients.
+    ///
+    /// Transient contributions are never persisted, indexed, or replayed.
+    ToolContribution { event: ToolContributionEvent },
     /// Live-only tool argument visual derived from partial tool-call arguments.
     ToolArgumentPreview {
         /// Model turn associated with this preview update.

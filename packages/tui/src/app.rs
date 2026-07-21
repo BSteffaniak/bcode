@@ -284,6 +284,8 @@ pub struct BmuxApp {
     tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
     active_artifact_revisions: BTreeMap<(String, String, String), u64>,
+    transient_contribution_items:
+        BTreeMap<String, (u64, Option<crate::transcript::TranscriptItemId>)>,
     live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
     live_preview_revision: u64,
     live_preview_frames_requested: u64,
@@ -491,6 +493,7 @@ impl BmuxApp {
             tool_invocation_projections: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
             active_artifact_revisions: BTreeMap::new(),
+            transient_contribution_items: BTreeMap::new(),
             live_tool_previews: BTreeMap::new(),
             live_preview_revision: 0,
             live_preview_frames_requested: 0,
@@ -2251,6 +2254,9 @@ impl BmuxApp {
                 self.viewport.preserve_for_append();
                 self.apply_tool_stream_event(event, SessionEventApplication::Live);
             }
+            SessionLiveEventKind::ToolContribution {
+                event: contribution,
+            } => self.apply_live_contribution(contribution),
             SessionLiveEventKind::ToolArgumentPreview {
                 tool_call_id,
                 tool_name,
@@ -2275,6 +2281,51 @@ impl BmuxApp {
             }
             SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
                 self.apply_shared_provider_stream_progress(event);
+            }
+        }
+    }
+
+    fn apply_live_contribution(
+        &mut self,
+        contribution: &bcode_session_models::ToolContributionEvent,
+    ) {
+        let key = format!(
+            "{}:{}",
+            contribution.invocation_id, contribution.contribution_id
+        );
+        if self
+            .transient_contribution_items
+            .get(&key)
+            .is_some_and(|(sequence, _)| contribution.sequence <= *sequence)
+        {
+            return;
+        }
+        match contribution.operation {
+            bcode_session_models::ToolContributionOperation::Remove => {
+                if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
+                    self.transcript.retain(|item| item.id() != id);
+                }
+                self.transient_contribution_items
+                    .insert(key, (contribution.sequence, None));
+            }
+            bcode_session_models::ToolContributionOperation::Upsert
+            | bcode_session_models::ToolContributionOperation::Append => {
+                let fallback = serde_json::to_string_pretty(contribution)
+                    .unwrap_or_else(|_| contribution.payload.to_string());
+                if let Some((_, Some(id))) = self.transient_contribution_items.get(&key).copied() {
+                    self.transcript.mutate_rev_find(
+                        |item| item.id() == id,
+                        |item| item.replace_text(fallback.clone()),
+                    );
+                    self.transient_contribution_items
+                        .insert(key, (contribution.sequence, Some(id)));
+                } else {
+                    let item = TranscriptItem::new("Tool contribution", fallback);
+                    let id = item.id();
+                    self.transient_contribution_items
+                        .insert(key, (contribution.sequence, Some(id)));
+                    self.transcript.push(item);
+                }
             }
         }
     }
@@ -2517,6 +2568,13 @@ impl BmuxApp {
             SessionEventKind::ToolContribution {
                 event: contribution,
             } => {
+                let key = format!(
+                    "{}:{}",
+                    contribution.invocation_id, contribution.contribution_id
+                );
+                if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
+                    self.transcript.retain(|item| item.id() != id);
+                }
                 let fallback = serde_json::to_string_pretty(contribution)
                     .unwrap_or_else(|_| contribution.payload.to_string());
                 self.transcript
@@ -5386,6 +5444,54 @@ mod tests {
         assert_eq!(fallback.role(), "Tool contribution");
         assert!(fallback.text().contains("future.unknown/schema"));
         assert!(fallback.text().contains("opaque-tui"));
+    }
+
+    #[test]
+    fn transient_contribution_updates_and_removes_one_live_fallback() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let live = |sequence, operation, sentinel| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call".to_owned(),
+                    contribution_id: "surface".to_owned(),
+                    sequence,
+                    producer_id: "future.producer".to_owned(),
+                    schema: "future.unknown/schema".to_owned(),
+                    schema_version: 77,
+                    operation,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    payload: serde_json::json!({"sentinel": sentinel}),
+                },
+            },
+        };
+
+        app.absorb_session_live_event(&live(
+            1,
+            bcode_session_models::ToolContributionOperation::Upsert,
+            "first",
+        ));
+        app.absorb_session_live_event(&live(
+            2,
+            bcode_session_models::ToolContributionOperation::Append,
+            "second",
+        ));
+        assert_eq!(app.transcript().len(), 1);
+        assert!(app.transcript()[0].text().contains("second"));
+        assert!(!app.transcript()[0].text().contains("first"));
+
+        app.absorb_session_live_event(&live(
+            3,
+            bcode_session_models::ToolContributionOperation::Remove,
+            "removed",
+        ));
+        app.absorb_session_live_event(&live(
+            2,
+            bcode_session_models::ToolContributionOperation::Upsert,
+            "stale",
+        ));
+        assert!(app.transcript().is_empty());
     }
 
     #[test]

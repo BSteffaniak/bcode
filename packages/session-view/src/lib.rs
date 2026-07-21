@@ -727,21 +727,35 @@ impl SessionView {
                     "{}:{}",
                     contribution.invocation_id, contribution.contribution_id
                 );
-                let current_sequence = self.contribution_sequences.get(&key).copied();
-                if current_sequence.is_none_or(|sequence| contribution.sequence > sequence) {
-                    self.contribution_sequences
-                        .insert(key.clone(), contribution.sequence);
-                    match contribution.operation {
-                        bcode_session_models::ToolContributionOperation::Remove => {
-                            self.snapshot.contributions.remove(&key);
-                        }
-                        bcode_session_models::ToolContributionOperation::Upsert
-                        | bcode_session_models::ToolContributionOperation::Append => {
-                            self.snapshot
-                                .contributions
-                                .insert(key, contribution.clone());
-                        }
+                if self
+                    .contribution_sequences
+                    .get(&key)
+                    .is_some_and(|sequence| contribution.sequence <= *sequence)
+                {
+                    return;
+                }
+                self.contribution_sequences
+                    .insert(key.clone(), contribution.sequence);
+                match contribution.operation {
+                    bcode_session_models::ToolContributionOperation::Remove => {
+                        self.snapshot.contributions.remove(&key);
                     }
+                    bcode_session_models::ToolContributionOperation::Upsert
+                    | bcode_session_models::ToolContributionOperation::Append => {
+                        self.snapshot
+                            .contributions
+                            .insert(key.clone(), contribution.clone());
+                    }
+                }
+                let live_item_id = TranscriptViewItemId::new(format!("live-contribution:{key}"));
+                let item_count = self.snapshot.transcript.items.len();
+                self.snapshot
+                    .transcript
+                    .items
+                    .retain(|item| item.id != live_item_id);
+                if self.snapshot.transcript.items.len() != item_count {
+                    self.snapshot.transcript.revision =
+                        self.snapshot.transcript.revision.saturating_add(1);
                 }
                 self.push_item(
                     TranscriptViewItemId::event(event.sequence),
@@ -1116,6 +1130,9 @@ impl SessionView {
                 };
                 self.apply_event(&synthetic);
             }
+            SessionLiveEventKind::ToolContribution {
+                event: contribution,
+            } => self.apply_live_contribution(contribution),
             SessionLiveEventKind::ToolArgumentPreview {
                 tool_call_id,
                 tool_name,
@@ -1158,6 +1175,56 @@ impl SessionView {
             }
             SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
                 self.set_context_occupancy((**occupancy).clone());
+            }
+        }
+    }
+
+    fn apply_live_contribution(
+        &mut self,
+        contribution: &bcode_session_models::ToolContributionEvent,
+    ) {
+        let key = format!(
+            "{}:{}",
+            contribution.invocation_id, contribution.contribution_id
+        );
+        if self
+            .contribution_sequences
+            .get(&key)
+            .is_some_and(|sequence| contribution.sequence <= *sequence)
+        {
+            return;
+        }
+        self.contribution_sequences
+            .insert(key.clone(), contribution.sequence);
+        let item_id = TranscriptViewItemId::new(format!("live-contribution:{key}"));
+        match contribution.operation {
+            bcode_session_models::ToolContributionOperation::Remove => {
+                self.snapshot.contributions.remove(&key);
+                let item_count = self.snapshot.transcript.items.len();
+                self.snapshot
+                    .transcript
+                    .items
+                    .retain(|item| item.id != item_id);
+                if self.snapshot.transcript.items.len() != item_count {
+                    self.snapshot.transcript.revision =
+                        self.snapshot.transcript.revision.saturating_add(1);
+                }
+                self.bump_revision();
+            }
+            bcode_session_models::ToolContributionOperation::Upsert
+            | bcode_session_models::ToolContributionOperation::Append => {
+                self.snapshot
+                    .contributions
+                    .insert(key, contribution.clone());
+                self.upsert_item(
+                    item_id,
+                    0,
+                    None,
+                    true,
+                    TranscriptViewItemKind::ToolContribution {
+                        contribution: contribution.clone(),
+                    },
+                );
             }
         }
     }
@@ -1900,6 +1967,76 @@ mod tests {
             serde_json::json!({"revive": true}),
         ));
         assert!(view.snapshot().contributions.is_empty());
+    }
+
+    #[test]
+    fn transient_contribution_projects_live_and_remove_is_terminal() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let live = |sequence, operation, payload| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call".to_owned(),
+                    contribution_id: "surface".to_owned(),
+                    sequence,
+                    producer_id: "future.producer".to_owned(),
+                    schema: "future.unknown/schema".to_owned(),
+                    schema_version: 77,
+                    operation,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    payload,
+                },
+            },
+        };
+
+        view.apply_live_event(&live(
+            1,
+            bcode_session_models::ToolContributionOperation::Upsert,
+            serde_json::json!({"opaque": 1}),
+        ));
+        view.apply_live_event(&live(
+            2,
+            bcode_session_models::ToolContributionOperation::Append,
+            serde_json::json!({"opaque": 2}),
+        ));
+        let durable = event(
+            session_id,
+            10,
+            SessionEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call".to_owned(),
+                    contribution_id: "surface".to_owned(),
+                    sequence: 3,
+                    producer_id: "future.producer".to_owned(),
+                    schema: "future.unknown/schema".to_owned(),
+                    schema_version: 77,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    payload: serde_json::json!({"opaque": "durable"}),
+                },
+            },
+        );
+        view.apply_event(&durable);
+        assert_eq!(
+            view.snapshot().contributions["call:surface"].payload,
+            serde_json::json!({"opaque": "durable"})
+        );
+        assert_eq!(view.snapshot().transcript.items.len(), 1);
+        assert!(!view.snapshot().transcript.items[0].streaming);
+
+        view.apply_live_event(&live(
+            4,
+            bcode_session_models::ToolContributionOperation::Remove,
+            serde_json::Value::Null,
+        ));
+        view.apply_live_event(&live(
+            2,
+            bcode_session_models::ToolContributionOperation::Upsert,
+            serde_json::json!({"revive": true}),
+        ));
+        assert!(view.snapshot().contributions.is_empty());
+        assert_eq!(view.snapshot().transcript.items.len(), 1);
     }
 
     #[test]

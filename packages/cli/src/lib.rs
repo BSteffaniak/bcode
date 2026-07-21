@@ -9,9 +9,9 @@ mod session_cleanup;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
+use bcode_client::{BcodeClient, ClientError, DaemonAvailability, SessionWatchEvent};
 use bcode_config::AuthMode;
-use bcode_ipc::{Event, PermissionSummary, ServerStatus, default_endpoint};
+use bcode_ipc::{PermissionSummary, ServerStatus, default_endpoint};
 use bcode_model_provider_runtime::{
     BlockingModelProviderInvoker, SingleTurnRequest, SingleTurnStatus, run_single_turn_blocking,
 };
@@ -23,7 +23,7 @@ use bcode_session_import::{
 };
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
-    SessionHistoryQuery, SessionId,
+    SessionHistoryQuery, SessionId, SessionLiveEvent, SessionLiveEventKind,
 };
 use bcode_worktree_models::WorktreeCreateRequest;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -7196,20 +7196,34 @@ fn print_permission(permission: &PermissionSummary) {
 
 async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    let mut connection = client.connect("bcode-attach").await?;
-    let history = connection.attach_session(session_id).await?;
-    for event in history {
+    let mut watcher = client
+        .watch_session(session_id, SESSION_CLI_PAGE_LIMIT)
+        .await?;
+    for event in watcher
+        .take_initial()
+        .expect("new session watcher must include bounded initial state")
+        .history
+    {
         print_session_event(&event);
     }
 
     loop {
         tokio::select! {
-            event = connection.recv_event() => {
+            event = watcher.next_event() => {
                 match event? {
-                    Event::Session(event) | Event::RuntimeWork(event) => print_session_event(&event),
-                    Event::SessionLive(_)
-                    | Event::SessionViewResyncRequired { .. }
-                    | Event::SessionCatalogUpdated { .. } => {}
+                    SessionWatchEvent::Durable(event) => print_session_event(&event),
+                    SessionWatchEvent::Live(event) => print_session_live_event(&event),
+                    SessionWatchEvent::ResyncRequired => {
+                        println!("session view resync required; replacing from bounded recent history");
+                        watcher = client.watch_session(session_id, SESSION_CLI_PAGE_LIMIT).await?;
+                        for event in watcher
+                            .take_initial()
+                            .expect("replacement watcher must include bounded initial state")
+                            .history
+                        {
+                            print_session_event(&event);
+                        }
+                    }
                 }
             }
             signal = tokio::signal::ctrl_c() => {
@@ -7220,6 +7234,52 @@ async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+fn print_session_live_event(event: &SessionLiveEvent) {
+    println!("{}", session_live_event_description(event));
+}
+
+fn session_live_event_description(event: &SessionLiveEvent) -> String {
+    match &event.kind {
+        SessionLiveEventKind::ToolContribution {
+            event: contribution,
+        } => format!(
+            "live contribution {}:{} sequence={} schema={}@{} operation={:?} payload={}",
+            contribution.invocation_id,
+            contribution.contribution_id,
+            contribution.sequence,
+            contribution.schema,
+            contribution.schema_version,
+            contribution.operation,
+            contribution.payload
+        ),
+        SessionLiveEventKind::AssistantTextDelta { turn_id, text } => {
+            format!("live assistant delta ({turn_id}): {text}")
+        }
+        SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
+            format!("live reasoning delta ({turn_id}): {text}")
+        }
+        SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
+            format!("live provider progress ({turn_id}): {event:?}")
+        }
+        SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
+            format!("live context occupancy: {occupancy:?}")
+        }
+        SessionLiveEventKind::ToolArgumentPreview {
+            tool_call_id,
+            tool_name,
+            argument_bytes,
+            preview,
+            ..
+        } => format!(
+            "live tool preview {tool_name} ({tool_call_id}) bytes={argument_bytes} schema={}@{} payload={}",
+            preview.visual.schema, preview.visual.schema_version, preview.visual.payload
+        ),
+        SessionLiveEventKind::ToolOutputDelta { event } => {
+            format!("live tool output: {event:?}")
+        }
+    }
 }
 
 async fn send_message(session_id: SessionId, message: String) -> Result<(), CliError> {
@@ -8001,6 +8061,31 @@ mod context_compaction_tests {
             messages_json: "opaque-secret".to_string(),
             portable_summary: "portable-secret".to_string(),
         }
+    }
+
+    #[test]
+    fn generic_live_contribution_description_preserves_opaque_identity_and_payload() {
+        let event = SessionLiveEvent {
+            session_id: SessionId::new(),
+            kind: SessionLiveEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-1".to_owned(),
+                    contribution_id: "surface".to_owned(),
+                    sequence: 7,
+                    producer_id: "future.producer".to_owned(),
+                    schema: "future.unknown/schema".to_owned(),
+                    schema_version: 42,
+                    operation: bcode_session_models::ToolContributionOperation::Append,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    payload: serde_json::json!({"opaque_cli": [1, 2, 3]}),
+                },
+            },
+        };
+
+        let description = session_live_event_description(&event);
+        assert!(description.contains("call-1:surface"));
+        assert!(description.contains("future.unknown/schema@42"));
+        assert!(description.contains("opaque_cli"));
     }
 
     #[test]

@@ -678,7 +678,9 @@ impl SessionWatcher {
     pub async fn next_event(&mut self) -> Result<SessionWatchEvent, ClientError> {
         loop {
             match self.connection.recv_event().await? {
-                Event::Session(event) => return Ok(SessionWatchEvent::Durable(Box::new(event))),
+                Event::Session(event) | Event::RuntimeWork(event) => {
+                    return Ok(SessionWatchEvent::Durable(Box::new(event)));
+                }
                 Event::SessionLive(event) => {
                     return Ok(SessionWatchEvent::Live(Box::new(event)));
                 }
@@ -687,9 +689,7 @@ impl SessionWatcher {
                 } if required == self.initial_session_id() => {
                     return Ok(SessionWatchEvent::ResyncRequired);
                 }
-                Event::RuntimeWork(_)
-                | Event::SessionCatalogUpdated { .. }
-                | Event::SessionViewResyncRequired { .. } => {}
+                Event::SessionCatalogUpdated { .. } | Event::SessionViewResyncRequired { .. } => {}
             }
         }
     }

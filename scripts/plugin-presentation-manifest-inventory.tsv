@@ -1,0 +1,19 @@
+# Plugin presentation manifest inventory
+# Regenerate only after auditing each changed manifest. Empty schema/surface columns are represented by '-'.
+# plugin_id<TAB>visual_adapter_schemas<TAB>tui_surface_kinds
+bcode.code_review	-	code-review-home,code-review
+bcode.document	bcode.document.request,bcode.document.extract_result,bcode.document.status	-
+bcode.eval	-	eval-run-picker,eval-run-viewer
+bcode.filesystem	bcode.filesystem.change,bcode.filesystem.request,bcode.filesystem.read,bcode.filesystem.image,bcode.filesystem.exists,bcode.filesystem.list,bcode.filesystem.find,bcode.filesystem.grep,bcode.filesystem.stat,bcode.filesystem.artifact.metadata,bcode.filesystem.artifact.read,bcode.filesystem.artifact.grep	-
+bcode.git	bcode.git.clone_request,bcode.git.clone_result	-
+bcode.loop	-	loop.start
+bcode.metrics	-	metrics-dashboard
+bcode.model	-	model.status,model.serverStatus,runtime.status,model.select
+bcode.ocr	bcode.ocr.request,bcode.ocr.extract_result,bcode.ocr.status	-
+bcode.question	bcode.question.outcome	bcode.question.inline
+bcode.ralph	-	ralph-home
+bcode.shell	bcode.tool.request.shell.run,bcode.shell.run	-
+bcode.skills	-	skills.list,skills.active
+bcode.vim-edit	bcode.vim-edit.request.preview,bcode.vim-edit.request.apply,bcode.vim-edit.live,bcode.vim-edit.playback	tool.vim-edit.playback
+bcode.web-search	bcode.web-search.search_request,bcode.web-search.fetch_request,bcode.web-search.status_request,bcode.web-search.inspect_request,bcode.web-search.search_results,bcode.web-search.fetch_result,bcode.web-search.status,bcode.web-search.inspect_result	-
+bcode.worktree	bcode.worktree.request,bcode.worktree.list,bcode.worktree.create_result,bcode.worktree.remove_result	command.work-tree.attach,command.work-tree.createSession,command.work-tree.remove
