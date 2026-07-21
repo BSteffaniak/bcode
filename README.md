@@ -88,7 +88,9 @@ For tests, examples, or custom integrations, implement `ModelProviderInvoker` an
 
 ### Custom tools
 
-Register synchronous inline tools with `Agent::builder().inline_tool(...)`; handlers receive a transport-free `ToolInvocationDescriptor`. For Rust-typed inputs and outputs, use `TypedTool::<Input, Output>::new(...)` with `typed_tool(...)`: Bcode derives the input JSON Schema, decodes provider arguments into `Input`, and serializes `Output` into a structured JSON tool result. Use `scoped_inline_tool(...)` for asynchronous tools that also need exchanges, unsolicited input, nested services, artifact writes, lifecycle events, contributions, or cancellation through `InvocationScope`. Tool definitions remain compatible with `bcode_tool::ToolDefinition`, and provider-requested batches use the same registered tools and configured execution options as direct calls.
+Register synchronous inline tools with `Agent::builder().inline_tool(...)`; handlers receive a transport-free `ToolInvocationDescriptor`. For Rust-typed inputs and outputs, use `TypedTool::<Input, Output>::new(...)` with `typed_tool(...)`: Bcode derives the input JSON Schema, decodes provider arguments into `Input`, and serializes `Output` into a structured JSON tool result. Inline tools are best for application-local behavior that should run in the embedding process. Use `tool_choice(ToolChoice::Auto | None | Required | Tool { .. })` to control provider tool selection where supported. Inline handler failures fail the turn by default; `tool_failure_policy(ToolFailurePolicy::ReturnToModel)` converts them into model-visible error results for recovery. Use `scoped_inline_tool(...)` for asynchronous local tools that also need exchanges, unsolicited input, nested services, artifact writes, lifecycle events, contributions, or cancellation through `InvocationScope`.
+
+Use plugin-backed tools when behavior should be discoverable from plugin manifests, independently packaged or disabled, permission/capability described by the plugin owner, or shared with the Bcode product. Enable `embedded-plugins`, construct a `PluginRuntimeHost`, and pass it to `Bcode::builder().plugin_runtime(...)`. `Bcode::discover_tools()` queries only manifests declaring `bcode.tool/v1` and returns plugin-owned definitions plus routing IDs; register selected definitions with `plugin_tool(...)`. Custom distributions can enable individual `static-bundled-*-plugin` features; `bundled-plugins` exposes bundled registrations without implicitly enabling the complete app, while `app` is reserved for full CLI/TUI packaging. Both inline and plugin tools retain `bcode_tool::ToolDefinition` compatibility, and provider-requested batches use the same registered tools and execution options as direct calls.
 
 Advanced hosts can inject typed adapters without implementing orchestration:
 
@@ -115,6 +117,10 @@ Agent::builder()
 # }
 ```
 
+### Multi-step generation metadata
+
+Every completed `GenerateTextResponse` includes ordered `GenerationStep` values in addition to the raw runtime events. `Model` steps identify the zero-based provider round and aggregate its text, reasoning, and usage; `ToolCall` and `ToolResult` preserve model/runtime boundaries; `FinalResponse` records final text, stop reason, and total latency. This gives application code a stable step-oriented view while retaining `response.runtime.events` for event-level diagnostics.
+
 ### Streaming events
 
 Use `Agent::stream(provider, prompt)` for a complete provider/tool turn. It yields `ScopedAgentStreamItem` values whose events are generic `ScopedTurnEvent` runtime, invocation-lifecycle, or contribution envelopes, followed by a final response or error. `Agent::stream_text_with_provider(...)` remains the provider-only compatibility stream.
@@ -125,13 +131,58 @@ Use `generate_object_builder::<T>()` for serde-typed extraction. `StructuredOutp
 
 For incremental UI updates, use `stream_object_builder::<T>()`. `ObjectStreamItem::RawDelta` contains each raw fragment, `Partial` contains a parseable JSON prefix, `ValidatedPartial` is emitted only when the partial value passes the configured schema, and `Finished` contains the final decoded `T` plus the complete response. `Error` reports provider, timeout, cancellation, JSON, schema, and decode failures. The `stream_object(...)` helper delegates to the same builder.
 
+### Middleware and reliability
+
+Non-streaming text and structured requests support transport-independent `ModelMiddleware`. A middleware layer receives the complete `AgentTurnRequest` before provider invocation and the `GenerateTextResponse` after success. Layers run in registration order before the request and unwind in reverse order afterward:
+
+```rust,no_run
+use bcode::{AgentTurnRequest, GenerateTextResponse, ModelMiddleware, ModelProviderInvoker};
+
+struct RedactAndBudget;
+
+impl ModelMiddleware for RedactAndBudget {
+    fn before_request(&self, mut request: AgentTurnRequest) -> bcode::Result<AgentTurnRequest> {
+        if request.prompt.len() > 8_000 {
+            return Err(bcode::BcodeError::Hook("request budget exceeded".into()));
+        }
+        request.prompt = request.prompt.replace("secret", "[redacted]");
+        Ok(request)
+    }
+
+    fn after_response(
+        &self,
+        _request: &AgentTurnRequest,
+        response: GenerateTextResponse,
+    ) -> bcode::Result<GenerateTextResponse> {
+        // Inspect response.runtime.usage, latency_ms, warnings, and events here.
+        Ok(response)
+    }
+}
+
+# async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
+let response = bcode::generate_text_builder()
+    .prompt("Do not reveal this secret")
+    .middleware_layer(RedactAndBudget)
+    .fallback_policy(
+        bcode::FallbackPolicy::new().fallback("backup-provider:backup-model"),
+    )
+    .run(&mut provider)
+    .await?;
+# Ok(())
+# }
+```
+
+Middleware can implement rate-limit/budget rejection, redaction and safety transforms, response auditing, and tracing without server or TUI dependencies. For response caching, implement `ModelResponseCache` and attach it with `response_cache(...)`; the application owns key construction, expiration, capacity, and storage, while Bcode performs lookup after request middleware and stores successful provider responses before response middleware. `RetryPolicy` retries only provider-originated failures through the runtime's cancellation-aware retry boundary; `FallbackPolicy` instead switches through an ordered list of provider/model selectors. Configure one planner directly when custom behavior must combine retry, fallback, compaction, or request rebuilding. Timeout, cancellation, permission, tool, middleware, cache, and validation failures remain terminal by default. Streaming continues to expose typed events and cancellation directly; response-transform and response-cache middleware intentionally do not buffer or rewrite streams.
+
 ### Hooks and observability
 
 `AgentBuilder` supports `on_before_model`, `on_after_model`, `on_before_tool`, and `on_after_tool` hooks. Hook contexts expose model IDs, prompts, tool calls, metadata, latency, and runtime events so applications can add logging, metrics, policy checks, or tracing without depending on TUI internals.
 
 ### Optional sessions and persistence
 
-Stateless calls do not require a session. For in-memory conversations, call `Agent::session()` or `Agent::session_from_messages(...)`; transcripts can be exported with `InMemorySession::into_messages()` for caller-managed persistence. For extensible SDK-managed persistence, implement `SessionPersistenceAdapter` and call `Agent::session_with_persistence(...)`; adapters load/save complete `PersistedSession` values and can target databases, object stores, or application services without TUI/server dependencies. `LocalSessionStore` is the built-in explicit JSON adapter and remains available through `session_with_store(...)`. Missing stores start empty, while empty or corrupt stores return repair/replacement errors instead of silently rebuilding or replaying unbounded history.
+Stateless calls do not require a session. For frontend-oriented conversations, call `Agent::chat()` and `AgentSession::send(...)`; `session()` and `generate_text_with_provider(...)` remain the explicit equivalents. The chat/session wrapper exposes the visible transcript, append, retry/regenerate, branch/fork, and import/export operations.
+
+Applications can attach memory, retrieval, summaries, or profile context through `SessionContextProvider`. Context providers return normal `ModelMessage` values for each request, but those injected messages are not appended to or persisted with the visible transcript. For extensible SDK-managed persistence, implement `SessionPersistenceAdapter` and call `Agent::session_with_persistence(...)`; adapters load/save complete `PersistedSession` values and can target databases, object stores, or application services without TUI/server dependencies. `LocalSessionStore` is the built-in explicit JSON adapter and remains available through `session_with_store(...)`. Missing stores start empty, while empty or corrupt stores return repair/replacement errors instead of silently rebuilding or replaying unbounded history.
 
 Daemon-backed session catalogs, attach/history operations, model selection, input submission, and cancellation remain intentionally `bcode_client`-only. Enable `daemon-client` and use the re-exported `BcodeClient`; embedded `AgentSession` persistence adapters do not silently connect to or depend on a daemon.
 

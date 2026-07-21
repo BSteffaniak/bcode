@@ -27,7 +27,13 @@ async fn main() -> bcode::Result<()> {
         models.models.len()
     );
 
-    let agent = bcode.agent().name("embedded-fake-provider").build();
+    let discovered = bcode.discover_tools().await?;
+    println!("discovered plugin tools: {}", discovered.len());
+    let agent = bcode
+        .agent_with_discovered_tools()
+        .await?
+        .name("embedded-fake-provider")
+        .build();
 
     let response = agent.generate_text("hello embedded plugins").await?;
     println!("{}", response.text);

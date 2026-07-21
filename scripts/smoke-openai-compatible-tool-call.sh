@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Smoke tests own isolated process state and must not inherit the invoking daemon.
+unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workdir="$(mktemp -d)"
+workdir="$(mktemp -d /tmp/bcode-smoke.XXXXXX)"
 server_pid=""
 mock_pid=""
 cleanup() {
@@ -19,6 +22,8 @@ cleanup() {
 trap cleanup EXIT
 
 cd "${root}"
+
+cargo build --quiet -p bcode --features app
 
 cargo build --quiet -p bcode_openai_compatible_provider_plugin -p bcode_filesystem_plugin
 
@@ -129,7 +134,7 @@ name = "OpenAI-Compatible Model Provider"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${openai_dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -149,7 +154,7 @@ name = "Filesystem Tools"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${fs_dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -157,7 +162,8 @@ EOF
 
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
-export BCODE_SOCKET="${workdir}/bcode.sock"
+mkdir -p "${workdir}/tmp"
+export TMPDIR="${workdir}/tmp"
 export BCODE_STATE_DIR="${workdir}/state"
 export BCODE_OPENAI_API_KEY="mock-key"
 export BCODE_OPENAI_BASE_URL="http://127.0.0.1:${mock_port}"
@@ -172,29 +178,29 @@ provider_plugin_id = "bcode.openai-compatible"
 model_id = "mock-model"
 EOF
 
-cargo run --quiet -p bcode -- server run >"${workdir}/server.log" 2>&1 &
+"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..100}; do
-    if cargo run --quiet -p bcode -- server status >/dev/null 2>&1; then
+    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
         break
     fi
     sleep 0.1
 done
 
-cargo run --quiet -p bcode -- model list | grep -q "mock-tool-model"
-session_id="$(cargo run --quiet -p bcode -- session create openai-tool-smoke)"
-cargo run --quiet -p bcode -- send "${session_id}" "read the provided file using the filesystem tool" >/dev/null
+"${root}/target/debug/bcode" model list | grep "mock-tool-model" >/dev/null
+session_id="$("${root}/target/debug/bcode" session create openai-tool-smoke)"
+"${root}/target/debug/bcode" send "${session_id}" "read the provided file using the filesystem tool" >/dev/null
 for _ in {1..100}; do
-    if cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "mock-openai-tool-loop-ok"; then
+    if "${root}/target/debug/bcode" session history "${session_id}" | grep "mock-openai-tool-loop-ok" >/dev/null; then
         break
     fi
     sleep 0.1
 done
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "filesystem.read"
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "mock-openai-tool-content"
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "mock-openai-tool-loop-ok"
+"${root}/target/debug/bcode" session history "${session_id}" | grep "filesystem.read" >/dev/null
+"${root}/target/debug/bcode" session history "${session_id}" | grep "mock-openai-tool-content" >/dev/null
+"${root}/target/debug/bcode" session history "${session_id}" | grep "mock-openai-tool-loop-ok" >/dev/null
 
-cargo run --quiet -p bcode -- server stop >/dev/null
+"${root}/target/debug/bcode" server stop >/dev/null
 wait "${server_pid}"
 server_pid=""
 

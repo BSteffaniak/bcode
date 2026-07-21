@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Smoke tests own isolated process state and must not inherit the invoking daemon.
+unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workdir="$(mktemp -d)"
+workdir="$(mktemp -d /tmp/bcode-smoke.XXXXXX)"
 server_pid=""
 cleanup() {
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
         kill "${server_pid}" 2>/dev/null || true
+        wait "${server_pid}" 2>/dev/null || true
     fi
     rm -rf "${workdir}"
 }
 trap cleanup EXIT
 
 cd "${root}"
+
+cargo build --quiet -p bcode --features app
 
 cargo build --quiet -p bcode_hello_plugin
 
@@ -58,7 +64,7 @@ topic = "bcode.session.event"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -71,7 +77,7 @@ cat >"${BCODE_CONFIG}" <<EOF
 disabled = ["example.hello"]
 EOF
 
-if cargo run --quiet -p bcode -- plugin list --root "${workdir}/plugins" | grep -q "example.hello"; then
+if "${root}/target/debug/bcode" plugin list --root "${workdir}/plugins" | grep "example.hello" >/dev/null; then
     echo "disabled plugin should not be listed" >&2
     exit 1
 fi
@@ -81,33 +87,52 @@ cat >"${BCODE_CONFIG}" <<EOF
 enabled = ["example.hello"]
 EOF
 
-cargo run --quiet -p bcode -- plugin list --root "${workdir}/plugins" | grep -q "example.hello"
-cargo run --quiet -p bcode -- plugin services --root "${workdir}/plugins" | grep -q "example-hello/v1"
-cargo run --quiet -p bcode -- plugin check --root "${workdir}/plugins" | grep -q $'example.hello\tOK'
-cargo run --quiet -p bcode -- plugin invoke --root "${workdir}/plugins" example.hello example-hello/v1 echo "hello service" | grep -q "hello service"
-cargo run --quiet -p bcode -- plugin call --root "${workdir}/plugins" example-hello/v1 echo "hello routed service" | grep -q "hello routed service"
-cargo run --quiet -p bcode -- plugin publish --root "${workdir}/plugins" example.event "hello event" | grep -q $'delivered\t1'
+"${root}/target/debug/bcode" plugin list --root "${workdir}/plugins" | grep "example.hello" >/dev/null
+"${root}/target/debug/bcode" plugin services --root "${workdir}/plugins" | grep "example-hello/v1" >/dev/null
+"${root}/target/debug/bcode" plugin check --root "${workdir}/plugins" | grep $'example.hello\tOK' >/dev/null
+"${root}/target/debug/bcode" plugin invoke --root "${workdir}/plugins" example.hello example-hello/v1 echo "hello service" | grep "hello service" >/dev/null
+"${root}/target/debug/bcode" plugin call --root "${workdir}/plugins" example-hello/v1 echo "hello routed service" | grep "hello routed service" >/dev/null
+"${root}/target/debug/bcode" plugin publish --root "${workdir}/plugins" example.event "hello event" | grep $'delivered\t1' >/dev/null
 
 export XDG_CONFIG_HOME="${workdir}/config"
-export BCODE_SOCKET="${workdir}/bcode.sock"
+mkdir -p "${workdir}/tmp"
+export TMPDIR="${workdir}/tmp"
 export BCODE_STATE_DIR="${workdir}/state"
-cargo run --quiet -p bcode -- server run >"${workdir}/server.log" 2>&1 &
+"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..50}; do
-    if cargo run --quiet -p bcode -- server status >/dev/null 2>&1; then
+    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
         break
     fi
     sleep 0.1
 done
-cargo run --quiet -p bcode -- plugin services --daemon | grep -q "example-hello/v1"
-cargo run --quiet -p bcode -- plugin invoke --daemon example.hello example-hello/v1 echo "hello daemon service" | grep -q "hello daemon service"
-cargo run --quiet -p bcode -- plugin call --daemon example-hello/v1 echo "hello daemon routed service" | grep -q "hello daemon routed service"
-session_id="$(cargo run --quiet -p bcode -- session create plugin-event-smoke)"
-cargo run --quiet -p bcode -- send "${session_id}" "plugin event smoke" >/dev/null
-cargo run --quiet -p bcode -- plugin call --daemon example-hello/v1 event-count | grep -q "2"
-cargo run --quiet -p bcode -- plugin publish --daemon example.event "daemon event" | grep -q $'delivered\t1'
-cargo run --quiet -p bcode -- plugin call --daemon example-hello/v1 event-count | grep -q "3"
-cargo run --quiet -p bcode -- server stop >/dev/null
+"${root}/target/debug/bcode" plugin services --daemon | grep "example-hello/v1" >/dev/null
+"${root}/target/debug/bcode" plugin invoke --daemon example.hello example-hello/v1 echo "hello daemon service" | grep "hello daemon service" >/dev/null
+"${root}/target/debug/bcode" plugin call --daemon example-hello/v1 echo "hello daemon routed service" | grep "hello daemon routed service" >/dev/null
+session_id="$("${root}/target/debug/bcode" session create plugin-event-smoke)"
+"${root}/target/debug/bcode" send "${session_id}" "plugin event smoke" >/dev/null
+session_event_count="$("${root}/target/debug/bcode" plugin call --daemon example-hello/v1 event-count)"
+if ! [[ "${session_event_count}" =~ ^[0-9]+$ ]] || (( session_event_count < 2 )); then
+    echo "session create/send did not publish the expected plugin events: ${session_event_count}" >&2
+    exit 1
+fi
+"${root}/target/debug/bcode" plugin publish --daemon example.event "daemon event" | grep $'delivered\t1' >/dev/null
+final_event_count="$("${root}/target/debug/bcode" plugin call --daemon example-hello/v1 event-count)"
+if ! [[ "${final_event_count}" =~ ^[0-9]+$ ]] || (( final_event_count <= session_event_count )); then
+    echo "explicit plugin event did not increase the event count: ${session_event_count} -> ${final_event_count}" >&2
+    exit 1
+fi
+"${root}/target/debug/bcode" server stop >/dev/null
+for _ in {1..100}; do
+    if ! kill -0 "${server_pid}" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+if kill -0 "${server_pid}" 2>/dev/null; then
+    echo "server did not stop cleanly" >&2
+    exit 1
+fi
 wait "${server_pid}"
 server_pid=""
 

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Smoke tests own isolated process state and must not inherit the invoking daemon.
+unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workdir="$(mktemp -d)"
+workdir="$(mktemp -d /tmp/bcode-smoke.XXXXXX)"
 server_pid=""
 cleanup() {
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
@@ -14,6 +17,8 @@ cleanup() {
 trap cleanup EXIT
 
 cd "${root}"
+
+cargo build --quiet -p bcode --features app
 
 cargo build --quiet -p bcode_fake_provider_plugin
 
@@ -47,7 +52,7 @@ name = "Fake Model Provider"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${dylib}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -55,7 +60,8 @@ EOF
 
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
-export BCODE_SOCKET="${workdir}/bcode.sock"
+mkdir -p "${workdir}/tmp"
+export TMPDIR="${workdir}/tmp"
 export BCODE_STATE_DIR="${workdir}/state"
 export BCODE_FAKE_PROVIDER_DELAY_MS="5000"
 cat >"${BCODE_CONFIG}" <<EOF
@@ -67,32 +73,32 @@ provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 EOF
 
-cargo run --quiet -p bcode -- server run >"${workdir}/server.log" 2>&1 &
+"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..100}; do
-    if cargo run --quiet -p bcode -- server status >/dev/null 2>&1; then
+    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
         break
     fi
     sleep 0.1
 done
 
-session_id="$(cargo run --quiet -p bcode -- session create cancel-smoke)"
-cargo run --quiet -p bcode -- send "${session_id}" "cancel me" >/dev/null
+session_id="$("${root}/target/debug/bcode" session create cancel-smoke)"
+"${root}/target/debug/bcode" send "${session_id}" "cancel me" >/dev/null
 sleep 0.3
-cargo run --quiet -p bcode -- cancel "${session_id}" | grep -q "turn cancellation requested"
+"${root}/target/debug/bcode" cancel "${session_id}" | grep "turn cancellation requested" >/dev/null
 for _ in {1..50}; do
-    if cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "model turn cancelled"; then
+    if "${root}/target/debug/bcode" session history "${session_id}" | grep "model turn cancelled" >/dev/null; then
         break
     fi
     sleep 0.1
 done
-cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "model turn cancelled"
-if cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "fake: cancel me"; then
+"${root}/target/debug/bcode" session history "${session_id}" | grep "model turn cancelled" >/dev/null
+if "${root}/target/debug/bcode" session history "${session_id}" | grep "fake: cancel me" >/dev/null; then
     echo "cancelled turn still produced fake response" >&2
     exit 1
 fi
 
-cargo run --quiet -p bcode -- server stop >/dev/null
+"${root}/target/debug/bcode" server stop >/dev/null
 wait "${server_pid}"
 server_pid=""
 

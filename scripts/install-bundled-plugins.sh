@@ -68,7 +68,7 @@ name = "Filesystem Tools"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${fs_dylib_name}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -88,7 +88,7 @@ name = "OpenAI-Compatible Model Provider"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${openai_dylib_name}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -108,7 +108,7 @@ name = "Default Agent Profiles"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${default_agents_dylib_name}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
@@ -128,7 +128,7 @@ name = "Shell Tools"
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = 2
 library = "${shell_dylib_name}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"

@@ -1258,12 +1258,33 @@ pub struct StructuredOutputRequest {
     pub strict: bool,
 }
 
+/// Provider-neutral model tool-choice control.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Let the provider decide whether to call a tool.
+    #[default]
+    Auto,
+    /// Prevent tool calls for this request.
+    None,
+    /// Require at least one tool call.
+    Required,
+    /// Require a specific registered tool.
+    Tool {
+        /// Exact model-callable tool name.
+        name: String,
+    },
+}
+
 /// Provider-neutral policy for model-generated tool calls in one request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallRequestPolicy {
     /// Permit the provider to generate multiple independent tool calls in one response.
     #[serde(default)]
     pub parallel: bool,
+    /// Control whether or which tool the provider should call when supported.
+    #[serde(default)]
+    pub choice: ToolChoice,
 }
 
 /// Start a provider model turn.
@@ -1825,8 +1846,11 @@ mod tests {
 
     #[test]
     fn typed_tool_call_policy_round_trips_parallel_intent() {
-        let policy = ToolCallRequestPolicy { parallel: true };
-        let encoded = serde_json::to_value(policy).expect("policy should encode");
+        let policy = ToolCallRequestPolicy {
+            parallel: true,
+            ..ToolCallRequestPolicy::default()
+        };
+        let encoded = serde_json::to_value(&policy).expect("policy should encode");
         let decoded: ToolCallRequestPolicy =
             serde_json::from_value(encoded).expect("policy should decode");
 

@@ -1,7 +1,7 @@
 #![cfg(feature = "embedded-plugins")]
 
 use bcode::{
-    Agent, HeadlessExchangePolicy, ToolCall, ToolDefinition, ToolExchangeResolution,
+    Agent, Bcode, HeadlessExchangePolicy, ToolCall, ToolDefinition, ToolExchangeResolution,
     ToolInvocationResponse,
 };
 use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
@@ -19,7 +19,7 @@ fn definition() -> ToolDefinition {
     }
 }
 
-fn agent(policy: HeadlessExchangePolicy) -> Agent {
+fn plugin_runtime() -> bcode_plugin::PluginRuntimeHost {
     let bundled = [bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
         bcode_question_plugin::static_plugin(),
@@ -29,12 +29,15 @@ fn agent(policy: HeadlessExchangePolicy) -> Agent {
         &bcode_plugin::PluginSelection::all_enabled(),
     )
     .expect("question plugin manifest should parse");
-    let plugins = bcode_plugin::PluginRuntimeHost::from(
+    bcode_plugin::PluginRuntimeHost::from(
         bcode_plugin::PluginHost::load_static_plugins(&selected)
             .expect("question plugin should load statically"),
-    );
+    )
+}
+
+fn agent(policy: HeadlessExchangePolicy) -> Agent {
     Agent::builder()
-        .plugin_runtime(plugins)
+        .plugin_runtime(plugin_runtime())
         .plugin_tool(definition(), "bcode.question")
         .headless_exchange_policy(policy)
         .build()
@@ -57,6 +60,48 @@ fn question_call(id: &str, required: bool) -> ToolCall {
 fn output(response: ToolInvocationResponse) -> serde_json::Value {
     serde_json::from_str(response.full_output.as_deref().expect("full outcome JSON"))
         .expect("outcome JSON parses")
+}
+
+#[tokio::test]
+async fn sdk_discovers_manifest_declared_plugin_tools_with_owned_metadata() {
+    let sdk = Bcode::builder().plugin_runtime(plugin_runtime()).build();
+
+    let tools = sdk
+        .discover_tools()
+        .await
+        .expect("question tool discovery should succeed");
+    let question = tools
+        .iter()
+        .find(|tool| tool.definition.name == "question")
+        .expect("question plugin should advertise its tool");
+
+    assert_eq!(question.plugin_id, "bcode.question");
+    assert!(!question.definition.description.is_empty());
+    assert!(question.definition.input_schema.is_object());
+    assert_eq!(question.definition.side_effect, ToolSideEffect::ReadOnly);
+}
+
+#[tokio::test]
+async fn discovered_tools_register_without_redeclaring_plugin_metadata() {
+    let sdk = Bcode::builder().plugin_runtime(plugin_runtime()).build();
+    let agent = sdk
+        .agent_with_discovered_tools()
+        .await
+        .expect("question tools should discover")
+        .headless_exchange_policy(HeadlessExchangePolicy::Reject)
+        .build();
+
+    let output = agent
+        .execute_tool_call(&question_call("auto-discovered", true))
+        .await
+        .expect("routing should reach the plugin and produce a model-visible rejection");
+    assert!(output.model_result.is_error);
+    assert!(
+        output
+            .model_result
+            .output
+            .contains("headless_exchange_rejected")
+    );
 }
 
 #[tokio::test]

@@ -13575,6 +13575,7 @@ async fn build_model_turn_request(
         tools,
         tool_call_policy: bcode_model::ToolCallRequestPolicy {
             parallel: state.tool_execution.parallel,
+            ..bcode_model::ToolCallRequestPolicy::default()
         },
         structured_output: None,
         context_management,

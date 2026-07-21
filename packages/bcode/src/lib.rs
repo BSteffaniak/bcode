@@ -11,8 +11,8 @@
 use bcode_agent_permissions::{PermissionAskCallback, ask_callback};
 use bcode_agent_policy::active_tools_for;
 use bcode_agent_runtime::{
-    AgentRuntime, AgentTurnRequest, AgentTurnResponse, PermissionPolicyAuthorization,
-    ToolBatchExecutionOutput, TurnGeneration, TurnScope,
+    AgentRuntime, PermissionPolicyAuthorization, ToolBatchExecutionOutput, TurnGeneration,
+    TurnScope,
 };
 #[cfg(feature = "embedded-plugins")]
 use bcode_model::{
@@ -39,11 +39,11 @@ pub use bcode_agent_policy::{Action, AgentConfig, AgentPermissionConfig, Permiss
 pub use bcode_agent_profile::{AgentDecision, EvaluateToolCallResponse};
 pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
-    AgentRuntimeStreamItem as AgentStreamItem, AllowAllPolicy, CancellationToken,
-    ModelProviderInvoker, PermissionDecision, PermissionPolicy, ProviderRoundPlan,
-    ProviderRoundPlanContext, ProviderRoundPlanner, RegisteredTool, RuntimeError, RuntimeFuture,
-    RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog, ToolExecutionOutput,
-    ToolRoundObserver, ToolRoundState, ToolSource, UnifiedToolCatalog,
+    AgentRuntimeStreamItem as AgentStreamItem, AgentTurnRequest, AgentTurnResponse, AllowAllPolicy,
+    CancellationToken, ModelProviderInvoker, PermissionDecision, PermissionPolicy,
+    ProviderRoundPlan, ProviderRoundPlanContext, ProviderRoundPlanner, RegisteredTool,
+    RuntimeError, RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
+    ToolExecutionOutput, ToolRoundObserver, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_agent_runtime::{
     ArtifactCommitGuard, HostTurnEventSink, InvocationArtifactSink, InvocationCapabilities,
@@ -58,16 +58,18 @@ pub use bcode_client::{
 };
 pub use bcode_model::{
     ContentBlock as ModelContentBlock, MessageRole, ModelInfo, ModelList, ModelMessage,
-    ProviderCapabilities, ProviderTurnEvent, StopReason, ToolCall,
+    ProviderCapabilities, ProviderTurnEvent, StopReason, TokenUsage, ToolCall, ToolChoice,
+    ToolResult,
 };
 pub use bcode_tool::PreparedToolInvocation;
 pub use bcode_tool::{
-    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolDefinition, ToolExchangeRequest,
-    ToolExchangeResolution, ToolExchangeResponsePolicy, ToolExecutionOptions,
-    ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationResponse, ToolInvocationResult, ToolInvocationServiceRequest,
-    ToolInvocationServiceResolution, ToolPolicyMetadata, ToolPreparationRequest,
-    ToolPreparationResponse, ToolSideEffect, ToolUiMetadata,
+    ListToolsRequest, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifactWriteRequest,
+    ToolArtifactWriteResolution, ToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
+    ToolExchangeResponsePolicy, ToolExecutionOptions, ToolInvocationDescriptor,
+    ToolInvocationInput, ToolInvocationInputResolution, ToolInvocationResponse,
+    ToolInvocationResult, ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolList,
+    ToolPolicyMetadata, ToolPreparationRequest, ToolPreparationResponse, ToolSideEffect,
+    ToolUiMetadata,
 };
 
 /// Result alias for Bcode SDK operations.
@@ -138,6 +140,123 @@ impl From<&str> for ModelSelector {
 impl From<String> for ModelSelector {
     fn from(value: String) -> Self {
         Self::from_text(value)
+    }
+}
+
+/// Configurable retry policy for provider invocation failures.
+///
+/// The policy retries only provider-originated failures. Cancellation, timeout, tool, permission,
+/// host-extension, and validation failures remain terminal. Each retry passes through the runtime's
+/// canonical cancellation boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    max_retries: u32,
+    delay: Duration,
+}
+
+impl RetryPolicy {
+    /// Create a retry policy with a maximum retry count and fixed delay.
+    #[must_use]
+    pub const fn new(max_retries: u32, delay: Duration) -> Self {
+        Self { max_retries, delay }
+    }
+
+    /// Return the maximum number of retries after the initial attempt.
+    #[must_use]
+    pub const fn max_retries(self) -> u32 {
+        self.max_retries
+    }
+
+    /// Return the fixed delay before each retry.
+    #[must_use]
+    pub const fn delay(self) -> Duration {
+        self.delay
+    }
+}
+
+impl ProviderRoundPlanner for RetryPolicy {
+    fn plan_round<'a>(
+        &'a self,
+        context: ProviderRoundPlanContext<'a>,
+    ) -> RuntimeFuture<'a, ProviderRoundPlan> {
+        Box::pin(async move {
+            let Some(failure) = context.previous_failure else {
+                return Ok(ProviderRoundPlan::Proceed {
+                    request: context.proposed_request.clone(),
+                });
+            };
+            let retryable = matches!(
+                failure,
+                RuntimeError::ProviderInvocation(_) | RuntimeError::Provider { .. }
+            );
+            Ok(if retryable && context.attempt <= self.max_retries {
+                ProviderRoundPlan::RetryAfter {
+                    request: context.proposed_request.clone(),
+                    delay: self.delay,
+                }
+            } else {
+                ProviderRoundPlan::Fail { error: None }
+            })
+        })
+    }
+}
+
+/// Ordered fallback provider/model policy for provider invocation failures.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FallbackPolicy {
+    fallbacks: Vec<ModelSelector>,
+}
+
+impl FallbackPolicy {
+    /// Create an empty fallback policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a provider/model fallback.
+    #[must_use]
+    pub fn fallback(mut self, selector: impl Into<ModelSelector>) -> Self {
+        self.fallbacks.push(selector.into());
+        self
+    }
+
+    /// Return configured fallbacks in attempt order.
+    #[must_use]
+    pub fn fallbacks(&self) -> &[ModelSelector] {
+        &self.fallbacks
+    }
+}
+
+impl ProviderRoundPlanner for FallbackPolicy {
+    fn plan_round<'a>(
+        &'a self,
+        context: ProviderRoundPlanContext<'a>,
+    ) -> RuntimeFuture<'a, ProviderRoundPlan> {
+        Box::pin(async move {
+            let Some(failure) = context.previous_failure else {
+                return Ok(ProviderRoundPlan::Proceed {
+                    request: context.proposed_request.clone(),
+                });
+            };
+            if !matches!(
+                failure,
+                RuntimeError::ProviderInvocation(_) | RuntimeError::Provider { .. }
+            ) {
+                return Ok(ProviderRoundPlan::Fail { error: None });
+            }
+            let fallback_index = context.attempt.saturating_sub(1) as usize;
+            let Some(selector) = self.fallbacks.get(fallback_index) else {
+                return Ok(ProviderRoundPlan::Fail { error: None });
+            };
+            let mut request = context.proposed_request.clone();
+            request.provider_plugin_id = selector.provider_plugin_id().map(str::to_string);
+            request.model_id = selector.model_id().to_string();
+            Ok(ProviderRoundPlan::RetryAfter {
+                request,
+                delay: Duration::ZERO,
+            })
+        })
     }
 }
 
@@ -243,6 +362,19 @@ impl GenerateTextBuilder {
         Self::default()
     }
 
+    /// Configure advanced agent behavior for this request.
+    ///
+    /// The callback exposes the complete [`AgentBuilder`] for tools, hooks, policy, provider
+    /// context, plugin runtime, execution options, and other advanced settings.
+    #[must_use]
+    pub fn configure_agent<F>(mut self, configure: F) -> Self
+    where
+        F: FnOnce(AgentBuilder) -> AgentBuilder,
+    {
+        self.agent = configure(self.agent);
+        self
+    }
+
     /// Configure the user prompt.
     #[must_use]
     pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -306,6 +438,20 @@ impl GenerateTextBuilder {
         self
     }
 
+    /// Configure how inline tool handler failures affect provider/tool loops.
+    #[must_use]
+    pub fn tool_failure_policy(mut self, policy: ToolFailurePolicy) -> Self {
+        self.agent = self.agent.tool_failure_policy(policy);
+        self
+    }
+
+    /// Configure provider-neutral model tool-choice behavior.
+    #[must_use]
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.agent = self.agent.tool_choice(choice);
+        self
+    }
+
     /// Configure maximum tool rounds.
     #[must_use]
     pub fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
@@ -342,6 +488,37 @@ impl GenerateTextBuilder {
     #[must_use]
     pub fn plugin_tool(mut self, definition: ToolDefinition, plugin_id: impl Into<String>) -> Self {
         self.agent = self.agent.plugin_tool(definition, plugin_id);
+        self
+    }
+
+    /// Configure ordered provider/model fallbacks for provider-originated failures.
+    #[must_use]
+    pub fn fallback_policy(mut self, policy: FallbackPolicy) -> Self {
+        self.agent = self.agent.fallback_policy(policy);
+        self
+    }
+
+    /// Configure fixed-delay retries for provider-originated failures.
+    #[must_use]
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.agent = self.agent.retry_policy(policy);
+        self
+    }
+
+    /// Configure an application-owned response cache for this text-generation request.
+    #[must_use]
+    pub fn response_cache(mut self, cache: Arc<dyn ModelResponseCache>) -> Self {
+        self.agent = self.agent.response_cache(cache);
+        self
+    }
+
+    /// Append model request/response middleware for this text-generation request.
+    #[must_use]
+    pub fn middleware_layer<M>(mut self, middleware: M) -> Self
+    where
+        M: ModelMiddleware + 'static,
+    {
+        self.agent = self.agent.middleware_layer(middleware);
         self
     }
 
@@ -382,6 +559,7 @@ pub fn generate_text_builder() -> GenerateTextBuilder {
 pub struct StreamTextBuilder {
     agent: AgentBuilder,
     prompt: String,
+    messages: Vec<ModelMessage>,
     cancellation: CancellationToken,
 }
 
@@ -390,6 +568,7 @@ impl Default for StreamTextBuilder {
         Self {
             agent: Agent::builder(),
             prompt: String::new(),
+            messages: Vec::new(),
             cancellation: CancellationToken::new(),
         }
     }
@@ -400,6 +579,19 @@ impl StreamTextBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configure advanced agent behavior for this request.
+    ///
+    /// The callback exposes the complete [`AgentBuilder`] for tools, hooks, policy, provider
+    /// context, plugin runtime, execution options, and other advanced settings.
+    #[must_use]
+    pub fn configure_agent<F>(mut self, configure: F) -> Self
+    where
+        F: FnOnce(AgentBuilder) -> AgentBuilder,
+    {
+        self.agent = configure(self.agent);
+        self
     }
 
     /// Configure the user prompt.
@@ -420,6 +612,20 @@ impl StreamTextBuilder {
     #[must_use]
     pub fn system(mut self, system_prompt: impl Into<String>) -> Self {
         self.agent = self.agent.system(system_prompt);
+        self
+    }
+
+    /// Configure prior conversation messages.
+    #[must_use]
+    pub fn messages(mut self, messages: Vec<ModelMessage>) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    /// Append one prior conversation message.
+    #[must_use]
+    pub fn message(mut self, message: ModelMessage) -> Self {
+        self.messages.push(message);
         self
     }
 
@@ -448,6 +654,20 @@ impl StreamTextBuilder {
     #[must_use]
     pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    /// Configure how inline tool handler failures affect provider/tool loops.
+    #[must_use]
+    pub fn tool_failure_policy(mut self, policy: ToolFailurePolicy) -> Self {
+        self.agent = self.agent.tool_failure_policy(policy);
+        self
+    }
+
+    /// Configure provider-neutral model tool-choice behavior.
+    #[must_use]
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.agent = self.agent.tool_choice(choice);
         self
     }
 
@@ -497,7 +717,15 @@ impl StreamTextBuilder {
         P: ModelProviderInvoker + 'static,
     {
         let agent = self.agent.build();
-        agent.stream_text_with_provider_and_cancellation(provider, self.prompt, self.cancellation)
+        agent.runtime.run_streaming_text_turn(
+            provider,
+            agent.turn_request_with_structured_output_messages_and_cancellation(
+                self.prompt,
+                None,
+                self.messages,
+                self.cancellation,
+            ),
+        )
     }
 }
 
@@ -515,7 +743,9 @@ pub fn stream_text_builder() -> StreamTextBuilder {
 pub struct GenerateObjectBuilder<T> {
     agent: AgentBuilder,
     prompt: String,
+    messages: Vec<ModelMessage>,
     options: Option<StructuredOutputOptions>,
+    cancellation: CancellationToken,
     _output: std::marker::PhantomData<T>,
 }
 
@@ -524,7 +754,9 @@ impl<T> Default for GenerateObjectBuilder<T> {
         Self {
             agent: Agent::builder(),
             prompt: String::new(),
+            messages: Vec::new(),
             options: None,
+            cancellation: CancellationToken::new(),
             _output: std::marker::PhantomData,
         }
     }
@@ -535,6 +767,19 @@ impl<T> GenerateObjectBuilder<T> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configure advanced agent behavior for this request.
+    ///
+    /// The callback exposes the complete [`AgentBuilder`] for tools, hooks, policy, provider
+    /// context, plugin runtime, execution options, and other advanced settings.
+    #[must_use]
+    pub fn configure_agent<F>(mut self, configure: F) -> Self
+    where
+        F: FnOnce(AgentBuilder) -> AgentBuilder,
+    {
+        self.agent = configure(self.agent);
+        self
     }
 
     /// Configure the user prompt.
@@ -555,6 +800,20 @@ impl<T> GenerateObjectBuilder<T> {
     #[must_use]
     pub fn system(mut self, system_prompt: impl Into<String>) -> Self {
         self.agent = self.agent.system(system_prompt);
+        self
+    }
+
+    /// Configure prior conversation messages.
+    #[must_use]
+    pub fn messages(mut self, messages: Vec<ModelMessage>) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    /// Append one prior conversation message.
+    #[must_use]
+    pub fn message(mut self, message: ModelMessage) -> Self {
+        self.messages.push(message);
         self
     }
 
@@ -586,6 +845,44 @@ impl<T> GenerateObjectBuilder<T> {
         self
     }
 
+    /// Configure cancellation for this request.
+    #[must_use]
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Configure ordered provider/model fallbacks for provider-originated failures.
+    #[must_use]
+    pub fn fallback_policy(mut self, policy: FallbackPolicy) -> Self {
+        self.agent = self.agent.fallback_policy(policy);
+        self
+    }
+
+    /// Configure fixed-delay retries for provider-originated failures.
+    #[must_use]
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.agent = self.agent.retry_policy(policy);
+        self
+    }
+
+    /// Configure an application-owned response cache for this structured request.
+    #[must_use]
+    pub fn response_cache(mut self, cache: Arc<dyn ModelResponseCache>) -> Self {
+        self.agent = self.agent.response_cache(cache);
+        self
+    }
+
+    /// Append model request/response middleware for this structured request.
+    #[must_use]
+    pub fn middleware_layer<M>(mut self, middleware: M) -> Self
+    where
+        M: ModelMiddleware + 'static,
+    {
+        self.agent = self.agent.middleware_layer(middleware);
+        self
+    }
+
     /// Run the request with a caller-supplied provider.
     ///
     /// # Errors
@@ -603,7 +900,13 @@ impl<T> GenerateObjectBuilder<T> {
             .unwrap_or_else(StructuredOutputOptions::for_type::<T>);
         let agent = self.agent.build();
         agent
-            .generate_object_with_provider_and_options(provider, self.prompt, options)
+            .generate_object_with_provider_and_request_options(
+                provider,
+                self.prompt,
+                options,
+                self.messages,
+                self.cancellation,
+            )
             .await
     }
     /// Run the request with explicit structured-output options and a caller-supplied provider.
@@ -624,7 +927,13 @@ impl<T> GenerateObjectBuilder<T> {
     {
         let agent = self.agent.build();
         agent
-            .generate_object_with_provider_and_options(provider, self.prompt, options)
+            .generate_object_with_provider_and_request_options(
+                provider,
+                self.prompt,
+                options,
+                self.messages,
+                self.cancellation,
+            )
             .await
     }
 }
@@ -717,6 +1026,7 @@ where
 pub struct StreamObjectBuilder<T> {
     agent: AgentBuilder,
     prompt: String,
+    messages: Vec<ModelMessage>,
     options: Option<StructuredOutputOptions>,
     cancellation: CancellationToken,
     _output: std::marker::PhantomData<T>,
@@ -727,6 +1037,7 @@ impl<T> Default for StreamObjectBuilder<T> {
         Self {
             agent: Agent::builder(),
             prompt: String::new(),
+            messages: Vec::new(),
             options: None,
             cancellation: CancellationToken::new(),
             _output: std::marker::PhantomData,
@@ -739,6 +1050,19 @@ impl<T> StreamObjectBuilder<T> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configure advanced agent behavior for this request.
+    ///
+    /// The callback exposes the complete [`AgentBuilder`] for tools, hooks, policy, provider
+    /// context, plugin runtime, execution options, and other advanced settings.
+    #[must_use]
+    pub fn configure_agent<F>(mut self, configure: F) -> Self
+    where
+        F: FnOnce(AgentBuilder) -> AgentBuilder,
+    {
+        self.agent = configure(self.agent);
+        self
     }
 
     /// Configure the user prompt.
@@ -762,10 +1086,31 @@ impl<T> StreamObjectBuilder<T> {
         self
     }
 
+    /// Configure prior conversation messages.
+    #[must_use]
+    pub fn messages(mut self, messages: Vec<ModelMessage>) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    /// Append one prior conversation message.
+    #[must_use]
+    pub fn message(mut self, message: ModelMessage) -> Self {
+        self.messages.push(message);
+        self
+    }
+
     /// Configure structured-output options.
     #[must_use]
     pub fn options(mut self, options: StructuredOutputOptions) -> Self {
         self.options = Some(options);
+        self
+    }
+
+    /// Configure model parameters.
+    #[must_use]
+    pub fn parameters(mut self, parameters: ModelParameters) -> Self {
+        self.agent = self.agent.parameters(parameters);
         self
     }
 
@@ -829,7 +1174,7 @@ impl<T> StreamObjectBuilder<T> {
             agent.turn_request_with_structured_output_messages_and_cancellation(
                 prompt,
                 Some(structured_output),
-                Vec::new(),
+                self.messages,
                 self.cancellation,
             ),
         );
@@ -946,7 +1291,7 @@ where
     T: DeserializeOwned + schemars::JsonSchema,
     P: ModelProviderInvoker,
 {
-    generate_object_builder().prompt(prompt).run(provider).await
+    Box::pin(generate_object_builder().prompt(prompt).run(provider)).await
 }
 
 /// Generate a typed structured object with explicit structured-output options.
@@ -965,10 +1310,12 @@ where
     T: DeserializeOwned,
     P: ModelProviderInvoker,
 {
-    generate_object_builder()
-        .prompt(prompt)
-        .run_with_options(provider, options)
-        .await
+    Box::pin(
+        generate_object_builder()
+            .prompt(prompt)
+            .run_with_options(provider, options),
+    )
+    .await
 }
 
 /// Generate text with a caller-supplied provider and model selector using default agent settings.
@@ -1024,11 +1371,13 @@ where
     T: DeserializeOwned + schemars::JsonSchema,
     P: ModelProviderInvoker,
 {
-    generate_object_builder()
-        .model(model)
-        .prompt(prompt)
-        .run(provider)
-        .await
+    Box::pin(
+        generate_object_builder()
+            .model(model)
+            .prompt(prompt)
+            .run(provider),
+    )
+    .await
 }
 
 /// High-level SDK error.
@@ -1196,6 +1545,116 @@ type ModelBeforeHook = Arc<dyn Fn(&ModelCallContext) -> Result<()> + Send + Sync
 type ModelAfterHook = Arc<dyn Fn(&ModelCallContext, &ModelCallOutcome) -> Result<()> + Send + Sync>;
 type ToolBeforeHook = Arc<dyn Fn(&ToolCallContext) -> Result<()> + Send + Sync>;
 type ToolAfterHook = Arc<dyn Fn(&ToolCallContext, &ToolCallOutcome) -> Result<()> + Send + Sync>;
+
+/// Application-owned cache adapter for completed non-streaming model responses.
+///
+/// The adapter owns cache-key construction, expiration, capacity, and storage. It receives the
+/// complete post-middleware request, so keys can include provider/model selection, messages,
+/// parameters, tools, structured-output schema, and metadata as appropriate.
+pub trait ModelResponseCache: Send + Sync {
+    /// Return a cached response for this request, or `None` on a cache miss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cache lookup fails and the application does not want to continue.
+    fn get(&self, request: &AgentTurnRequest) -> Result<Option<GenerateTextResponse>>;
+
+    /// Store a completed response for this request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cache storage fails and the application treats that failure as
+    /// terminal.
+    fn put(&self, request: &AgentTurnRequest, response: &GenerateTextResponse) -> Result<()>;
+}
+
+/// Middleware for transport-independent model request and response processing.
+///
+/// Middleware runs in registration order before provider invocation and in reverse registration
+/// order after a successful response. Implementations can enforce budgets/rate limits, redact or
+/// transform prompts and messages, attach metadata, inspect usage, populate caches, and emit
+/// tracing without depending on TUI or daemon internals.
+pub trait ModelMiddleware: Send + Sync {
+    /// Transform or reject a complete model request before provider invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error to stop the request before provider execution.
+    fn before_request(&self, request: AgentTurnRequest) -> Result<AgentTurnRequest> {
+        Ok(request)
+    }
+
+    /// Inspect, transform, or reject a successful model response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error to replace the successful response with a middleware failure.
+    fn after_response(
+        &self,
+        _request: &AgentTurnRequest,
+        response: GenerateTextResponse,
+    ) -> Result<GenerateTextResponse> {
+        Ok(response)
+    }
+}
+
+/// Ordered collection of model middleware.
+#[derive(Clone, Default)]
+pub struct ModelMiddlewareStack {
+    middleware: Vec<Arc<dyn ModelMiddleware>>,
+}
+
+impl fmt::Debug for ModelMiddlewareStack {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelMiddlewareStack")
+            .field("middleware", &self.middleware.len())
+            .finish()
+    }
+}
+
+impl ModelMiddlewareStack {
+    /// Create an empty middleware stack.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append middleware to the stack.
+    #[must_use]
+    pub fn layer<M>(mut self, middleware: M) -> Self
+    where
+        M: ModelMiddleware + 'static,
+    {
+        self.middleware.push(Arc::new(middleware));
+        self
+    }
+
+    /// Append shared middleware to the stack.
+    #[must_use]
+    pub fn shared(mut self, middleware: Arc<dyn ModelMiddleware>) -> Self {
+        self.middleware.push(middleware);
+        self
+    }
+
+    fn before_request(&self, mut request: AgentTurnRequest) -> Result<AgentTurnRequest> {
+        for middleware in &self.middleware {
+            request = middleware.before_request(request)?;
+        }
+        Ok(request)
+    }
+
+    fn after_response(
+        &self,
+        request: &AgentTurnRequest,
+        mut response: GenerateTextResponse,
+    ) -> Result<GenerateTextResponse> {
+        for middleware in self.middleware.iter().rev() {
+            response = middleware.after_response(request, response)?;
+        }
+        Ok(response)
+    }
+}
 
 /// Typed SDK hook callbacks for logging, tracing, budgets, and safety checks.
 #[derive(Clone, Default)]
@@ -1573,9 +2032,20 @@ fn text_from_message(message: &ModelMessage) -> Option<String> {
     })
 }
 
+/// Policy for runtime tool invocation failures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolFailurePolicy {
+    /// Fail the complete turn immediately.
+    #[default]
+    FailTurn,
+    /// Convert the failure into an error tool result so the model can recover.
+    ReturnToModel,
+}
+
 #[derive(Clone)]
 struct SdkToolInvoker {
     handlers: BTreeMap<String, InlineToolHandler>,
+    failure_policy: ToolFailurePolicy,
     #[cfg(feature = "embedded-plugins")]
     session_id: SessionId,
     #[cfg(feature = "embedded-plugins")]
@@ -1586,6 +2056,9 @@ impl fmt::Debug for SdkToolInvoker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("SdkToolInvoker");
         debug.field("tools", &self.handlers.keys().collect::<Vec<_>>());
+        debug.field("failure_policy", &self.failure_policy);
+        #[cfg(feature = "embedded-plugins")]
+        debug.field("session_id", &self.session_id);
         #[cfg(feature = "embedded-plugins")]
         debug.field("plugins", &self.plugins.is_some());
         debug.finish()
@@ -1649,12 +2122,23 @@ impl ToolInvoker for SdkToolInvoker {
                             message: "inline tool handler not found".to_string(),
                         }
                     })?;
-                    handler(descriptor, scope.clone()).await.map_err(|message| {
-                        RuntimeError::ToolExecution {
+                    match handler(descriptor, scope.clone()).await {
+                        Ok(response) => Ok(response),
+                        Err(message) if self.failure_policy == ToolFailurePolicy::ReturnToModel => {
+                            Ok(ToolInvocationResponse {
+                                output: message,
+                                is_error: true,
+                                content: Vec::new(),
+                                full_output: None,
+                                host_action: None,
+                                result: None,
+                            })
+                        }
+                        Err(message) => Err(RuntimeError::ToolExecution {
                             tool_name: tool.definition.name.clone(),
                             message,
-                        }
-                    })
+                        }),
+                    }
                 }
                 ToolSource::Plugin { plugin_id } => {
                     #[cfg(feature = "embedded-plugins")]
@@ -2121,6 +2605,15 @@ pub enum BcodeMode {
     Daemon,
 }
 
+/// Plugin-owned tool discovered from a manifest-declared tool service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredPluginTool {
+    /// Plugin that owns and executes the tool.
+    pub plugin_id: String,
+    /// Complete plugin-provided tool definition and metadata.
+    pub definition: ToolDefinition,
+}
+
 /// Top-level SDK handle.
 #[derive(Debug, Clone)]
 pub struct Bcode {
@@ -2227,6 +2720,74 @@ impl Bcode {
             )
             .await
             .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))
+    }
+
+    /// Build an agent builder with every manifest-discovered embedded plugin tool registered.
+    ///
+    /// Definitions and routing IDs come from [`Self::discover_tools`]. Callers can continue
+    /// configuring policy, exchanges, hooks, and model selection on the returned builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded runtime is configured or tool discovery fails.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn agent_with_discovered_tools(&self) -> Result<AgentBuilder> {
+        let mut builder = self.agent();
+        for tool in self.discover_tools().await? {
+            builder = builder.plugin_tool(tool.definition, tool.plugin_id);
+        }
+        Ok(builder)
+    }
+
+    /// Discover tools from every manifest-declared embedded tool service.
+    ///
+    /// Tool definitions, policy metadata, side-effect classification, permission requirements,
+    /// and UI metadata come directly from the owning plugin. Plugins without a declared
+    /// `bcode.tool/v1` service are not queried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded runtime is configured or any declared tool service cannot
+    /// be invoked or decoded.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn discover_tools(&self) -> Result<Vec<DiscoveredPluginTool>> {
+        let plugins = self
+            .plugins
+            .as_ref()
+            .ok_or(BcodeError::MissingPluginRuntime)?;
+        let plugin_ids = plugins
+            .registry()
+            .manifests()
+            .values()
+            .filter(|manifest| {
+                manifest
+                    .services
+                    .iter()
+                    .any(|service| service.interface_id == TOOL_SERVICE_INTERFACE_ID)
+            })
+            .map(|manifest| manifest.id.clone())
+            .collect::<Vec<_>>();
+        let mut discovered = Vec::new();
+        for plugin_id in plugin_ids {
+            let list = plugins
+                .invoke_service_json::<_, ToolList>(
+                    &plugin_id,
+                    TOOL_SERVICE_INTERFACE_ID,
+                    OP_LIST_TOOLS,
+                    &ListToolsRequest::default(),
+                )
+                .await
+                .map_err(|error| BcodeError::ToolExecution(error.to_string()))?;
+            discovered.extend(
+                list.tools
+                    .into_iter()
+                    .map(|definition| DiscoveredPluginTool {
+                        plugin_id: plugin_id.clone(),
+                        definition,
+                    }),
+            );
+        }
+        Ok(discovered)
     }
 
     /// Return models advertised by an embedded provider plugin.
@@ -2601,12 +3162,27 @@ impl InMemorySession {
     }
 }
 
+/// Application-owned context/memory extension for SDK sessions.
+///
+/// Providers can retrieve memory, summaries, user profile context, or application state and return
+/// normal model messages for the next turn. Returned messages are request context only: they are not
+/// appended to or persisted with the visible session transcript.
+pub trait SessionContextProvider: Send + Sync {
+    /// Return context messages for the next turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when context retrieval or construction fails.
+    fn context_messages(&self, session: &InMemorySession) -> Result<Vec<ModelMessage>>;
+}
+
 /// Stateful agent wrapper that keeps conversation history in memory.
 #[derive(Clone)]
 pub struct AgentSession {
     agent: Agent,
     session: InMemorySession,
     persistence: Option<Arc<dyn SessionPersistenceAdapter>>,
+    context_providers: Vec<Arc<dyn SessionContextProvider>>,
 }
 
 impl fmt::Debug for AgentSession {
@@ -2616,6 +3192,7 @@ impl fmt::Debug for AgentSession {
             .field("agent", &self.agent)
             .field("session", &self.session)
             .field("persistence", &self.persistence.is_some())
+            .field("context_providers", &self.context_providers.len())
             .finish()
     }
 }
@@ -2628,7 +3205,28 @@ impl AgentSession {
             agent,
             session,
             persistence: None,
+            context_providers: Vec::new(),
         }
+    }
+
+    /// Attach an application-owned context/memory provider.
+    #[must_use]
+    pub fn with_context_provider<P>(mut self, provider: P) -> Self
+    where
+        P: SessionContextProvider + 'static,
+    {
+        self.context_providers.push(Arc::new(provider));
+        self
+    }
+
+    /// Attach a shared application-owned context/memory provider.
+    #[must_use]
+    pub fn with_shared_context_provider(
+        mut self,
+        provider: Arc<dyn SessionContextProvider>,
+    ) -> Self {
+        self.context_providers.push(provider);
+        self
     }
 
     /// Attach a persistence adapter and save after successful turns.
@@ -2708,6 +3306,15 @@ impl AgentSession {
         self.branch()
     }
 
+    fn request_messages(&self, transcript: &[ModelMessage]) -> Result<Vec<ModelMessage>> {
+        let mut messages = Vec::new();
+        for provider in &self.context_providers {
+            messages.extend(provider.context_messages(&self.session)?);
+        }
+        messages.extend_from_slice(transcript);
+        Ok(messages)
+    }
+
     /// Regenerate the response to the last user message.
     ///
     /// The previous assistant continuation after the last user message is removed, the last user
@@ -2740,7 +3347,7 @@ impl AgentSession {
                 "cannot regenerate because the last user message has no text block".to_string(),
             )
         })?;
-        let prior_messages = self.session.messages[..user_index].to_vec();
+        let prior_messages = self.request_messages(&self.session.messages[..user_index])?;
         let response = self
             .agent
             .generate_text_with_provider_and_history(provider, prompt, prior_messages)
@@ -2754,6 +3361,25 @@ impl AgentSession {
             self.save()?;
         }
         Ok(response)
+    }
+
+    /// Send a user message and append the user/assistant exchange to this chat session.
+    ///
+    /// This is the frontend-oriented alias for [`Self::generate_text_with_provider`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when context retrieval, provider invocation, cancellation, or persistence
+    /// fails.
+    pub async fn send<P>(
+        &mut self,
+        provider: &mut P,
+        message: impl Into<String>,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        self.generate_text_with_provider(provider, message).await
     }
 
     /// Generate text and append user/assistant messages to the in-memory transcript.
@@ -2771,13 +3397,10 @@ impl AgentSession {
         P: ModelProviderInvoker,
     {
         let prompt = prompt.into();
+        let messages = self.request_messages(&self.session.messages)?;
         let response = self
             .agent
-            .generate_text_with_provider_and_history(
-                provider,
-                prompt.clone(),
-                self.session.messages.clone(),
-            )
+            .generate_text_with_provider_and_history(provider, prompt.clone(), messages)
             .await?;
         self.session.messages.push(user_message(prompt));
         self.session
@@ -2807,6 +3430,8 @@ pub struct Agent {
     timeout: Duration,
     max_tool_rounds: u32,
     execution_options: ToolExecutionOptions,
+    tool_choice: ToolChoice,
+    tool_failure_policy: ToolFailurePolicy,
     invocation_capabilities: InvocationCapabilities,
     invocation_event_sink: Arc<dyn TurnEventSink>,
     authorization_coordinator: Option<Arc<dyn ToolAuthorizationCoordinator>>,
@@ -2816,6 +3441,8 @@ pub struct Agent {
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
+    middleware: ModelMiddlewareStack,
+    response_cache: Option<Arc<dyn ModelResponseCache>>,
     policy_config: AgentConfig,
     permission_policy: Arc<dyn PermissionPolicy>,
     #[cfg(feature = "embedded-plugins")]
@@ -2842,6 +3469,8 @@ impl fmt::Debug for Agent {
             .field("timeout", &self.timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("execution_options", &self.execution_options)
+            .field("tool_choice", &self.tool_choice)
+            .field("tool_failure_policy", &self.tool_failure_policy)
             .field("invocation_capabilities", &self.invocation_capabilities)
             .field("invocation_event_sink", &"<sink>")
             .field(
@@ -2857,6 +3486,8 @@ impl fmt::Debug for Agent {
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
             )
             .field("hooks", &self.hooks)
+            .field("middleware", &self.middleware)
+            .field("response_cache", &self.response_cache.is_some())
             .field("policy_config", &self.policy_config)
             .field("permission_policy", &"<policy>");
         #[cfg(feature = "embedded-plugins")]
@@ -3097,6 +3728,28 @@ impl Agent {
         T: DeserializeOwned,
         P: ModelProviderInvoker,
     {
+        self.generate_object_with_provider_and_request_options(
+            provider,
+            prompt,
+            options,
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn generate_object_with_provider_and_request_options<T, P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+        options: StructuredOutputOptions,
+        messages: Vec<ModelMessage>,
+        cancellation: CancellationToken,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        P: ModelProviderInvoker,
+    {
         let prompt = prompt.into();
         let schema = options.schema.clone();
         let structured_output = bcode_model::StructuredOutputRequest {
@@ -3108,10 +3761,12 @@ impl Agent {
         let mut last_error = None;
         for attempt in 0..=options.max_repairs {
             let response = self
-                .generate_text_with_provider_with_structured_output(
+                .generate_text_with_provider_with_options(
                     provider,
                     current_prompt.clone(),
                     Some(structured_output.clone()),
+                    messages.clone(),
+                    cancellation.clone(),
                 )
                 .await?;
             match decode_structured_output(&schema, &response.text) {
@@ -3175,19 +3830,37 @@ impl Agent {
         let prompt = prompt.into();
         let context = self.model_call_context(prompt.clone());
         self.hooks.run_before_model(&context)?;
-        let response = self
-            .run_provider_tool_loop(
-                provider,
-                self.turn_request_with_structured_output_messages_and_cancellation(
-                    prompt,
-                    structured_output,
-                    messages,
-                    cancellation,
-                ),
-                Arc::clone(&self.invocation_event_sink),
-            )
-            .await?;
-        let response = GenerateTextResponse::from(response);
+        let request = self.middleware.before_request(
+            self.turn_request_with_structured_output_messages_and_cancellation(
+                prompt,
+                structured_output,
+                messages,
+                cancellation,
+            ),
+        )?;
+        let response = if let Some(response) = self
+            .response_cache
+            .as_ref()
+            .map(|cache| cache.get(&request))
+            .transpose()?
+            .flatten()
+        {
+            response
+        } else {
+            let response = self
+                .run_provider_tool_loop(
+                    provider,
+                    request.clone(),
+                    Arc::clone(&self.invocation_event_sink),
+                )
+                .await?;
+            let response = GenerateTextResponse::from(response);
+            if let Some(cache) = &self.response_cache {
+                cache.put(&request, &response)?;
+            }
+            response
+        };
+        let response = self.middleware.after_response(&request, response)?;
         self.hooks.run_after_model(
             &context,
             &ModelCallOutcome {
@@ -3360,6 +4033,7 @@ impl Agent {
         let invoker: Arc<dyn ToolInvoker> = self.tool_invoker.clone().unwrap_or_else(|| {
             Arc::new(SdkToolInvoker {
                 handlers: self.inline_tool_handlers.clone(),
+                failure_policy: self.tool_failure_policy,
                 #[cfg(feature = "embedded-plugins")]
                 session_id: self.session_id,
                 #[cfg(feature = "embedded-plugins")]
@@ -3430,6 +4104,7 @@ impl Agent {
     ) -> Result<ToolBatchExecutionOutput> {
         let default_invoker = SdkToolInvoker {
             handlers: self.inline_tool_handlers.clone(),
+            failure_policy: self.tool_failure_policy,
             #[cfg(feature = "embedded-plugins")]
             session_id: self.session_id,
             #[cfg(feature = "embedded-plugins")]
@@ -3523,6 +4198,7 @@ impl Agent {
     {
         let default_invoker = SdkToolInvoker {
             handlers: self.inline_tool_handlers.clone(),
+            failure_policy: self.tool_failure_policy,
             #[cfg(feature = "embedded-plugins")]
             session_id: self.session_id,
             #[cfg(feature = "embedded-plugins")]
@@ -3613,6 +4289,7 @@ impl Agent {
             tools: self.enabled_tool_definitions(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy {
                 parallel: self.execution_options.parallel,
+                choice: self.tool_choice.clone(),
             },
             structured_output: None,
             parameters: self.parameters.clone(),
@@ -3621,6 +4298,12 @@ impl Agent {
             max_tool_rounds: self.max_tool_rounds,
             cancellation,
         }
+    }
+
+    /// Create a frontend-oriented stateful chat session.
+    #[must_use]
+    pub fn chat(self) -> AgentSession {
+        self.session()
     }
 
     /// Create a stateful in-memory session wrapper for this agent.
@@ -3693,6 +4376,8 @@ pub struct AgentBuilder {
     timeout: Duration,
     max_tool_rounds: u32,
     execution_options: ToolExecutionOptions,
+    tool_choice: ToolChoice,
+    tool_failure_policy: ToolFailurePolicy,
     invocation_capabilities: InvocationCapabilities,
     invocation_event_sink: Arc<dyn TurnEventSink>,
     event_persistence: Option<Arc<dyn TurnEventPersistence>>,
@@ -3704,6 +4389,8 @@ pub struct AgentBuilder {
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
+    middleware: ModelMiddlewareStack,
+    response_cache: Option<Arc<dyn ModelResponseCache>>,
     policy_config: AgentConfig,
     permission_ask_callback: Option<PermissionAskCallback>,
     custom_permission_policy: Option<Arc<dyn PermissionPolicy>>,
@@ -3731,6 +4418,8 @@ impl fmt::Debug for AgentBuilder {
             .field("timeout", &self.timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("execution_options", &self.execution_options)
+            .field("tool_choice", &self.tool_choice)
+            .field("tool_failure_policy", &self.tool_failure_policy)
             .field("invocation_capabilities", &self.invocation_capabilities)
             .field("invocation_event_sink", &"<sink>")
             .field("event_persistence", &self.event_persistence.is_some())
@@ -3748,6 +4437,8 @@ impl fmt::Debug for AgentBuilder {
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
             )
             .field("hooks", &self.hooks)
+            .field("middleware", &self.middleware)
+            .field("response_cache", &self.response_cache.is_some())
             .field("policy_config", &self.policy_config)
             .field(
                 "permission_ask_callback",
@@ -3782,6 +4473,8 @@ impl Default for AgentBuilder {
             timeout: Duration::from_mins(2),
             max_tool_rounds: 8,
             execution_options: ToolExecutionOptions::default(),
+            tool_choice: ToolChoice::Auto,
+            tool_failure_policy: ToolFailurePolicy::FailTurn,
             invocation_capabilities: InvocationCapabilities::default(),
             invocation_event_sink: Arc::new(DiscardingSdkTurnEventSink),
             event_persistence: None,
@@ -3793,6 +4486,8 @@ impl Default for AgentBuilder {
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
             hooks: AgentHooks::new(),
+            middleware: ModelMiddlewareStack::new(),
+            response_cache: None,
             policy_config: bcode_agent_policy::agent_config(
                 &bcode_agent_policy::default_config(),
                 bcode_agent_policy::BUILD_AGENT,
@@ -3904,6 +4599,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Configure how inline tool handler failures affect provider/tool loops.
+    #[must_use]
+    pub const fn tool_failure_policy(mut self, policy: ToolFailurePolicy) -> Self {
+        self.tool_failure_policy = policy;
+        self
+    }
+
+    /// Configure provider-neutral model tool-choice behavior.
+    #[must_use]
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = choice;
+        self
+    }
+
     /// Configure canonical tool batch scheduling and execution options.
     #[must_use]
     pub const fn execution_options(mut self, options: ToolExecutionOptions) -> Self {
@@ -4003,6 +4712,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Configure fixed-delay retry behavior for provider-originated failures.
+    #[must_use]
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.provider_round_planner = Arc::new(policy);
+        self
+    }
+
+    /// Configure ordered provider/model fallbacks for provider-originated failures.
+    #[must_use]
+    pub fn fallback_policy(mut self, policy: FallbackPolicy) -> Self {
+        self.provider_round_planner = Arc::new(policy);
+        self
+    }
+
     /// Register a typed inline SDK tool.
     ///
     /// The input schema is derived from `I`. Invocation arguments are decoded before the handler
@@ -4080,6 +4803,30 @@ impl AgentBuilder {
     pub fn plugin_tool(mut self, definition: ToolDefinition, plugin_id: impl Into<String>) -> Self {
         self.tool_catalog
             .insert(RegisteredTool::plugin(definition, plugin_id));
+        self
+    }
+
+    /// Configure an application-owned response cache for non-streaming model requests.
+    #[must_use]
+    pub fn response_cache(mut self, cache: Arc<dyn ModelResponseCache>) -> Self {
+        self.response_cache = Some(cache);
+        self
+    }
+
+    /// Configure model request/response middleware.
+    #[must_use]
+    pub fn middleware(mut self, middleware: ModelMiddlewareStack) -> Self {
+        self.middleware = middleware;
+        self
+    }
+
+    /// Append one model request/response middleware layer.
+    #[must_use]
+    pub fn middleware_layer<M>(mut self, middleware: M) -> Self
+    where
+        M: ModelMiddleware + 'static,
+    {
+        self.middleware = self.middleware.layer(middleware);
         self
     }
 
@@ -4305,6 +5052,8 @@ impl AgentBuilder {
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
             execution_options: self.execution_options,
+            tool_choice: self.tool_choice,
+            tool_failure_policy: self.tool_failure_policy,
             invocation_capabilities: self.invocation_capabilities,
             invocation_event_sink,
             authorization_coordinator: self.authorization_coordinator,
@@ -4314,6 +5063,8 @@ impl AgentBuilder {
             tool_catalog: self.tool_catalog,
             inline_tool_handlers: self.inline_tool_handlers,
             hooks: self.hooks,
+            middleware: self.middleware,
+            response_cache: self.response_cache,
             policy_config: self.policy_config,
             permission_policy,
             #[cfg(feature = "embedded-plugins")]
@@ -4331,11 +5082,52 @@ pub struct GenerateTextRequest {
     pub prompt: String,
 }
 
+/// One normalized step in a completed multi-step generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationStep {
+    /// One provider model round, including accumulated text/reasoning and its latest usage.
+    Model {
+        /// Zero-based provider round.
+        round: u32,
+        /// Assistant text emitted during this model round.
+        text: String,
+        /// Reasoning text emitted during this model round.
+        reasoning: String,
+        /// Latest token usage emitted during this model round.
+        usage: Option<TokenUsage>,
+    },
+    /// A complete model-requested tool call.
+    ToolCall {
+        /// Zero-based provider round that requested the call.
+        round: u32,
+        /// Provider-supplied tool call.
+        call: ToolCall,
+    },
+    /// A model-visible tool result produced by the runtime.
+    ToolResult {
+        /// Zero-based provider round that requested the tool.
+        round: u32,
+        /// Tool result sent back to the provider.
+        result: ToolResult,
+    },
+    /// Final completed response summary.
+    FinalResponse {
+        /// Final accumulated assistant text.
+        text: String,
+        /// Provider-reported stop reason.
+        stop_reason: Option<StopReason>,
+        /// Total generation latency in milliseconds.
+        latency_ms: u128,
+    },
+}
+
 /// Response from text generation.
 #[derive(Debug, Clone)]
 pub struct GenerateTextResponse {
     /// Generated assistant text.
     pub text: String,
+    /// Ordered normalized model/tool/final steps.
+    pub steps: Vec<GenerationStep>,
     /// Runtime response containing metadata and events.
     pub runtime: AgentTurnResponse,
 }
@@ -4344,7 +5136,97 @@ impl From<AgentTurnResponse> for GenerateTextResponse {
     fn from(runtime: AgentTurnResponse) -> Self {
         Self {
             text: runtime.text.clone(),
+            steps: generation_steps(&runtime),
             runtime,
         }
     }
+}
+
+fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
+    struct ModelRound {
+        round: u32,
+        started: bool,
+        text: String,
+        reasoning: String,
+        usage: Option<TokenUsage>,
+    }
+
+    fn flush_model(steps: &mut Vec<GenerationStep>, model: &mut ModelRound) {
+        if model.started {
+            steps.push(GenerationStep::Model {
+                round: model.round,
+                text: std::mem::take(&mut model.text),
+                reasoning: std::mem::take(&mut model.reasoning),
+                usage: model.usage.take(),
+            });
+            model.started = false;
+        }
+    }
+
+    let mut steps = Vec::new();
+    let mut model = ModelRound {
+        round: 0,
+        started: false,
+        text: String::new(),
+        reasoning: String::new(),
+        usage: None,
+    };
+    for event in &runtime.events {
+        match event {
+            AgentEvent::TurnStarted => {
+                if !model.started {
+                    model.round = steps
+                        .iter()
+                        .filter_map(|step| match step {
+                            GenerationStep::Model { round, .. } => Some(round.saturating_add(1)),
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or_default();
+                    model.started = true;
+                }
+            }
+            AgentEvent::TextDelta(delta) => {
+                model.started = true;
+                model.text.push_str(delta);
+            }
+            AgentEvent::ReasoningDelta(delta) => {
+                model.started = true;
+                model.reasoning.push_str(delta);
+            }
+            AgentEvent::Usage(usage) => {
+                model.started = true;
+                model.usage = Some(usage.clone());
+            }
+            AgentEvent::ToolCallFinished(call) => {
+                flush_model(&mut steps, &mut model);
+                steps.push(GenerationStep::ToolCall {
+                    round: model.round,
+                    call: call.clone(),
+                });
+            }
+            AgentEvent::ToolResult(result) => steps.push(GenerationStep::ToolResult {
+                round: model.round,
+                result: result.clone(),
+            }),
+            AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::ToolCallDelta { .. }
+            | AgentEvent::ExactRequestInputTokens(_)
+            | AgentEvent::RequestProjection(_)
+            | AgentEvent::ContextCompacted
+            | AgentEvent::ProviderMetadata { .. }
+            | AgentEvent::RetryScheduled { .. }
+            | AgentEvent::Warning(_)
+            | AgentEvent::ProviderError { .. }
+            | AgentEvent::Finished { .. }
+            | AgentEvent::Cancelled => {}
+        }
+    }
+    flush_model(&mut steps, &mut model);
+    steps.push(GenerationStep::FinalResponse {
+        text: runtime.text.clone(),
+        stop_reason: runtime.stop_reason,
+        latency_ms: runtime.latency_ms,
+    });
+    steps
 }

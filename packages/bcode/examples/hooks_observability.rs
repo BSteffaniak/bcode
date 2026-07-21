@@ -1,6 +1,6 @@
 use bcode::{
-    Action, Agent, AgentConfig, AgentEvent, BcodeError, ModelCallContext, ModelProviderInvoker,
-    PermissionDecision, RuntimeFuture, ToolCall, ToolCallContext,
+    Action, Agent, AgentConfig, AgentEvent, AgentStreamItem, BcodeError, ModelCallContext,
+    ModelProviderInvoker, PermissionDecision, RuntimeFuture, ToolCall, ToolCallContext,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -22,11 +22,13 @@ struct ExampleProvider {
 
 impl ExampleProvider {
     fn new() -> Self {
+        Self::text("observed")
+    }
+
+    fn text(text: impl Into<String>) -> Self {
         Self {
             events: VecDeque::from([
-                ProviderTurnEvent::TextDelta {
-                    text: "observed".to_string(),
-                },
+                ProviderTurnEvent::TextDelta { text: text.into() },
                 ProviderTurnEvent::TurnFinished {
                     stop_reason: StopReason::EndTurn,
                 },
@@ -173,6 +175,27 @@ async fn main() -> bcode::Result<()> {
         .filter(|event| matches!(event, AgentEvent::ProviderMetadata { .. }))
         .count();
     println!("provider metadata events: {provider_metadata_count}");
+
+    let mut stream =
+        agent.stream_text_with_provider(ExampleProvider::text("streamed trace"), "trace streaming");
+    while let Some(item) = stream.next().await {
+        match item {
+            AgentStreamItem::Event(event) => println!("stream event: {event:?}"),
+            AgentStreamItem::Finished(response) => {
+                println!("stream finished: {}ms", response.latency_ms);
+                break;
+            }
+            AgentStreamItem::Error(error) => return Err(error.into()),
+        }
+    }
+
+    let structured: serde_json::Value = agent
+        .generate_object_with_provider(
+            &mut ExampleProvider::text(r#"{"status":"traced"}"#),
+            "trace structured output",
+        )
+        .await?;
+    println!("structured trace: {structured}");
 
     let output = agent
         .execute_tool_call(&ToolCall {

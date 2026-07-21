@@ -647,6 +647,10 @@ struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ChatTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ChatResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -694,7 +698,7 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ResponsesTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
+    tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2889,6 +2893,9 @@ async fn send_chat_completion_request(
             include_usage: true,
         }),
         tools: model_tools_to_chat_tools(request, settings.dialect)?,
+        tool_choice: openai_tool_choice(request, false),
+        parallel_tool_calls: (!request.tools.is_empty())
+            .then_some(request.tool_call_policy.parallel),
         response_format: chat_response_format(request),
         temperature: request.parameters.temperature,
         max_tokens: request.parameters.max_output_tokens,
@@ -3759,10 +3766,7 @@ fn build_responses_request(
         .into_iter()
         .collect(),
         tools: model_tools_to_responses_tools(request, settings.dialect)?,
-        tool_choice: settings
-            .dialect
-            .uses_codex_request_shape()
-            .then_some("auto"),
+        tool_choice: openai_tool_choice(request, true),
         parallel_tool_calls: settings
             .dialect
             .uses_codex_request_shape()
@@ -3787,6 +3791,28 @@ fn build_responses_request(
     })?;
     merge_provider_request_options(&mut body, &request.provider_context.request)?;
     Ok(body)
+}
+
+fn openai_tool_choice(
+    request: &ModelTurnRequest,
+    responses_shape: bool,
+) -> Option<serde_json::Value> {
+    if request.tools.is_empty() && !responses_shape {
+        return None;
+    }
+    Some(match &request.tool_call_policy.choice {
+        bcode_model::ToolChoice::Auto => serde_json::Value::String("auto".to_string()),
+        bcode_model::ToolChoice::None => serde_json::Value::String("none".to_string()),
+        bcode_model::ToolChoice::Required => serde_json::Value::String("required".to_string()),
+        bcode_model::ToolChoice::Tool { name } if responses_shape => serde_json::json!({
+            "type": "function",
+            "name": name
+        }),
+        bcode_model::ToolChoice::Tool { name } => serde_json::json!({
+            "type": "function",
+            "function": { "name": name }
+        }),
+    })
 }
 
 fn chat_response_format(request: &ModelTurnRequest) -> Option<ChatResponseFormat> {
@@ -6833,7 +6859,10 @@ mod tests {
             system_prompt: None,
             messages,
             tools: Vec::new(),
-            tool_call_policy: bcode_model::ToolCallRequestPolicy { parallel: true },
+            tool_call_policy: bcode_model::ToolCallRequestPolicy {
+                parallel: true,
+                ..bcode_model::ToolCallRequestPolicy::default()
+            },
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
@@ -7539,6 +7568,48 @@ mod tests {
             &items[2],
             ResponsesInputItem::Message { role, .. } if role == "user"
         ));
+    }
+
+    #[test]
+    fn responses_request_encodes_typed_tool_choice() {
+        let mut request = test_request(Vec::new());
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "lookup".to_string(),
+            description: "Lookup data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.tool_call_policy.choice = bcode_model::ToolChoice::Tool {
+            name: "lookup".to_string(),
+        };
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let body = build_responses_request(&settings, &request, "model")
+            .expect("typed tool choice should encode");
+
+        assert_eq!(
+            body.get("tool_choice"),
+            Some(&serde_json::json!({"type": "function", "name": "lookup"}))
+        );
+    }
+
+    #[test]
+    fn chat_tool_choice_encodes_required_and_parallel_controls() {
+        let mut request = test_request(Vec::new());
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "lookup".to_string(),
+            description: "Lookup data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.tool_call_policy = bcode_model::ToolCallRequestPolicy {
+            parallel: true,
+            choice: bcode_model::ToolChoice::Required,
+        };
+
+        assert_eq!(
+            openai_tool_choice(&request, false),
+            Some(serde_json::Value::String("required".to_string()))
+        );
+        assert!(request.tool_call_policy.parallel);
     }
 
     #[test]
