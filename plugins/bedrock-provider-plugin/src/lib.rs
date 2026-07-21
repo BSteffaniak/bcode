@@ -2326,6 +2326,52 @@ mod tests {
     }
 
     #[test]
+    fn completed_tool_calls_preserve_bedrock_order_and_exact_ids() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+        accumulator.tool_calls.extend([
+            (
+                1,
+                ToolCallAccumulator {
+                    id: Some("bedrock-call-second".to_owned()),
+                    name: Some("second_tool".to_owned()),
+                    arguments: r#"{"position":2}"#.to_owned(),
+                },
+            ),
+            (
+                0,
+                ToolCallAccumulator {
+                    id: Some("bedrock-call-first".to_owned()),
+                    name: Some("first_tool".to_owned()),
+                    arguments: r#"{"position":1}"#.to_owned(),
+                },
+            ),
+        ]);
+
+        accumulator
+            .finish_tool_calls(&turn)
+            .expect("Bedrock tool calls should finish");
+        let completed = turn
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::ToolCallFinished { call } => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            completed
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["bedrock-call-first", "bedrock-call-second"]
+        );
+        assert_eq!(completed[0].arguments["position"], 1);
+        assert_eq!(completed[1].arguments["position"], 2);
+    }
+
+    #[test]
     fn bedrock_tool_names_are_sanitized() {
         assert_eq!(bedrock_tool_name("filesystem.read"), "filesystem_read");
     }

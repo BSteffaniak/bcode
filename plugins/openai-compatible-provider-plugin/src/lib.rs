@@ -7595,6 +7595,57 @@ mod tests {
     }
 
     #[test]
+    fn completed_tool_calls_preserve_provider_order_and_exact_ids() {
+        let turn = TurnState::default();
+        let calls = BTreeMap::from([
+            (
+                1,
+                ToolCallAccumulator {
+                    id: Some("provider-call-second".to_owned()),
+                    name: Some("second_tool".to_owned()),
+                    arguments: r#"{"position":2}"#.to_owned(),
+                    started: true,
+                },
+            ),
+            (
+                0,
+                ToolCallAccumulator {
+                    id: Some("provider-call-first".to_owned()),
+                    name: Some("first_tool".to_owned()),
+                    arguments: r#"{"position":1}"#.to_owned(),
+                    started: true,
+                },
+            ),
+        ]);
+
+        finish_tool_calls(
+            &turn,
+            &calls,
+            &BTreeMap::new(),
+            OpenAiCompatibleDialect::ResponsesApi,
+        )
+        .expect("provider tool calls should finish");
+        let completed = turn
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::ToolCallFinished { call } => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            completed
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["provider-call-first", "provider-call-second"]
+        );
+        assert_eq!(completed[0].arguments["position"], 1);
+        assert_eq!(completed[1].arguments["position"], 2);
+    }
+
+    #[test]
     fn responses_api_request_maps_typed_parallel_tool_policy() {
         let request = test_request(vec![text_message(MessageRole::User, "hello")]);
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);

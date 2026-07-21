@@ -8,6 +8,20 @@
 //! daemon IPC or TUI code. Higher-level crates supply concrete provider, tool, and permission
 //! implementations. Contract ownership and dependency direction are documented in
 //! `docs/tool-runtime-contract-ownership.md`.
+//!
+//! # Scheduler invariants
+//!
+//! * Provider event occurrence defines batch order; provider call IDs remain opaque and unchanged.
+//! * Every call in the current provider batch is prepared before one complete-batch authorization
+//!   request, and no approved invocation starts until that authorization request resolves.
+//! * Parallel mode overlaps approved calls mechanically, optionally bounded by positive
+//!   `max_concurrency`; sequential mode executes singleton groups. The scheduler never infers
+//!   conflicts from tool names, arguments, commands, paths, URLs, or authorization facts.
+//! * Completion order may differ from provider order, but ordered results are supplied to the next
+//!   provider round only after the complete current batch reaches terminal outcomes. One provider
+//!   batch consumes one tool round.
+//! * Turn cancellation closes queued starts, signals registered active handles, and gates normal
+//!   output before later provider rounds can begin.
 
 pub mod turn;
 
@@ -1237,7 +1251,7 @@ impl AgentRuntime {
         R: ProviderRoundPlanner + ?Sized,
     {
         validate_tool_host_context(host_context)?;
-        request.tool_call_policy.parallel = options.parallel;
+        request.tool_call_policy.parallel &= options.parallel;
         let mut rounds = ToolRoundState::new(request.max_tool_rounds);
         let turn_cancellation = request.cancellation.clone();
         let started = Instant::now();
@@ -2090,7 +2104,7 @@ where
                 .await?;
         }
         proposed_request = request;
-        proposed_request.tool_call_policy.parallel = parallel_tool_calls;
+        proposed_request.tool_call_policy.parallel &= parallel_tool_calls;
         proposed_request.timeout = remaining_turn_duration(started, timeout)?;
         proposed_request.cancellation = turn_cancellation.clone();
         match runtime
@@ -3097,6 +3111,84 @@ mod tests {
         ) -> RuntimeFuture<'a, AckResponse> {
             Box::pin(async { Ok(AckResponse::default()) })
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_loop_preserves_provider_parallel_capability_fallback() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [vec![ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            }]],
+            Arc::clone(&requests),
+        );
+        let request = AgentTurnRequest::new("model", "no tools");
+
+        AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &EmptyToolCatalog,
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(0),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink { sender: None }),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await
+            .expect("unsupported parallel policy fallback should complete");
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].tool_call_policy.parallel,
+            "scheduler support must not upgrade unsupported provider/model capability"
+        );
+        drop(requests);
+    }
+
+    #[tokio::test]
+    async fn canonical_loop_preserves_negotiated_parallel_policy() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [vec![ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            }]],
+            Arc::clone(&requests),
+        );
+        let mut request = AgentTurnRequest::new("model", "no tools");
+        request.tool_call_policy.parallel = true;
+
+        AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &EmptyToolCatalog,
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(0),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink { sender: None }),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await
+            .expect("negotiated parallel policy should complete");
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tool_call_policy.parallel);
+        drop(requests);
     }
 
     #[tokio::test]

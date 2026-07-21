@@ -1,4 +1,28 @@
 //! Turn-scoped lifecycle, cancellation, and event publication primitives.
+//!
+//! # Scope invariants
+//!
+//! * A [`TurnScopeOwner`] allocates monotonic generations and permits only its current generation
+//!   to publish, complete, or cancel; stale scopes cannot affect a replacement turn.
+//! * Cancellation closes local progression and normal publication under one gate before opaque
+//!   active handles are signalled. Normal events from closed or superseded scopes are rejected and
+//!   counted without decoding their payloads.
+//! * An [`InvocationScope`] preserves one exact invocation ID and accepts correlated lifecycle,
+//!   contribution, exchange, input, service, artifact, and cancellation operations only while its
+//!   parent turn owns the active generation.
+//!
+//! # Channel invariants
+//!
+//! * Lifecycle and contribution payloads remain schema-bearing or opaque runtime values; this
+//!   module validates correlation and lifecycle state but does not select renderers or apply tool
+//!   domain policy.
+//! * Exchange, input, and nested-service waits race the same turn cancellation token and cannot
+//!   return a normal response after the scope closes. Duplicate exchange IDs fail locally.
+//! * Artifact sinks may stage privately, but externally visible publication must pass through
+//!   [`ArtifactCommitGuard`], which linearizes commit against cancellation and generation changes.
+//! * Normal event sinks are non-blocking. Any adapter that publishes asynchronously must retain the
+//!   originating scope and re-check it at its final publication boundary. After closure, only an
+//!   invocation-correlated `Cancelled` lifecycle bookkeeping event is accepted.
 
 use crate::{AgentRuntimeEvent, CancellationToken};
 use bcode_tool::{

@@ -389,6 +389,30 @@ if rg -U 'labels\.insert\([\s\S]{0,120}"(tool_call_id|call_id|batch_id|invocatio
   violations=1
 fi
 
+if rg -n 'tool_call_policy\.parallel = options\.parallel|tool_call_policy\.parallel = parallel_tool_calls' packages/agent-runtime/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: canonical runtime upgrades negotiated provider parallel capability from scheduler configuration." >&2
+  violations=1
+fi
+if ! rg -n 'tool_call_policy\.parallel &= options\.parallel' packages/agent-runtime/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: canonical runtime lost sequential fallback for negotiated parallel policy." >&2
+  violations=1
+fi
+
+if ! grep -F 'completed_tool_calls_preserve_provider_order_and_exact_ids' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'completed_tool_calls_preserve_bedrock_order_and_exact_ids' plugins/bedrock-provider-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'canonical_loop_runs_provider_batch_and_ordered_continuation' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F 'server_same_batch_shell_calls_overlap_after_complete_authorization' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: provider order/call identity conformance coverage is incomplete." >&2
+  violations=1
+fi
+
+if ! grep -F '# Scheduler invariants' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! grep -F '# Scope invariants' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F '# Channel invariants' packages/agent-runtime/src/turn.rs >/dev/null; then
+  echo "Runtime architecture violation: canonical scheduler/scope/channel invariants are no longer documented next to code." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi
