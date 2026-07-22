@@ -162,7 +162,6 @@ async fn stateful_chat_preserves_full_visible_and_model_transcript_semantics() {
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })

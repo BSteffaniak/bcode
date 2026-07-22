@@ -58,7 +58,6 @@ async fn model_result_is_bounded_and_redacted_without_mutating_application_resul
                     },
                 ],
                 full_output: Some("application-only super-secret full output".to_string()),
-                host_action: None,
                 result: None,
             })
         })
@@ -149,7 +148,6 @@ async fn text_truncation_preserves_utf8_boundaries() {
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })
@@ -197,7 +195,6 @@ async fn structured_content_count_is_bounded_deterministically() {
                     },
                 ],
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })

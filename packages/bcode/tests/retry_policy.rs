@@ -191,7 +191,6 @@ async fn provider_retry_after_unsafe_tool_result_never_reexecutes_the_tool() {
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             },

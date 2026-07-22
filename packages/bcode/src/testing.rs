@@ -487,7 +487,6 @@ impl ScriptedToolOutcome {
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         })
     }

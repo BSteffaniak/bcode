@@ -566,7 +566,6 @@ async fn tool_advertising_requests_bypass_cache_unless_explicitly_enabled() {
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })
@@ -688,7 +687,6 @@ async fn explicit_safe_tool_cache_preserves_complete_steps_without_reexecution()
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })

@@ -24672,6 +24672,10 @@ library = "test"
                     .to_string(),
             retryable: true,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let selection = SessionModelSelection {
@@ -24718,6 +24722,10 @@ library = "test"
                 message: format!("error code: {}", &code[5..]),
                 retryable: true,
                 provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
                 retry: None,
             };
 
@@ -24736,6 +24744,10 @@ library = "test"
             message: "connection reset".to_string(),
             retryable: true,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         assert_eq!(
@@ -24757,6 +24769,10 @@ library = "test"
                 message: "error code: 520".to_string(),
                 retryable: false,
                 provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
                 retry: None,
             },
             bcode_model::ProviderError {
@@ -24765,6 +24781,10 @@ library = "test"
                 message: "bad request".to_string(),
                 retryable: false,
                 provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
                 retry: None,
             },
             bcode_model::ProviderError {
@@ -24773,6 +24793,10 @@ library = "test"
                 message: "invalid API key".to_string(),
                 retryable: false,
                 provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
                 retry: None,
             },
         ];
