@@ -501,12 +501,7 @@ impl ShellRunTuiVisualAdapter {
         let state = states.entry(key.to_owned()).or_default();
         let content_rows = shell_terminal_stream(input.columns, input.rows, frames).map_or_else(
             || terminal_viewer_rows(input, u16::MAX).len(),
-            |stream| {
-                stream
-                    .grid()
-                    .main_content_tail_rows(MAX_INLINE_TERMINAL_ROWS)
-                    .len()
-            },
+            |stream| live_viewport_content_rows(stream.grid(), MAX_INLINE_TERMINAL_ROWS).len(),
         );
         state.update_rows(content_rows.max(1), MAX_INLINE_TERMINAL_ROWS);
         state.visible_rows()
@@ -735,6 +730,23 @@ fn shell_terminal_stream(
     Some(stream)
 }
 
+fn live_viewport_content_rows(grid: &TerminalGrid, max_rows: usize) -> Vec<PhysicalRow> {
+    let content_end = (0..grid.height())
+        .rev()
+        .find(|&row| {
+            grid.viewport_row_ref(row)
+                .is_some_and(|row| !row.cells().is_empty())
+        })
+        .map_or(0, |row| row.saturating_add(1));
+    let end = content_end
+        .max(grid.cursor().row.saturating_add(1))
+        .min(grid.height());
+    let start = end.saturating_sub(max_rows);
+    (start..end)
+        .filter_map(|row| grid.viewport_row_ref(row).cloned())
+        .collect()
+}
+
 fn shell_terminal_frame_rows(
     input: TerminalViewerInput<'_>,
     frames: &[TerminalReplayFrame],
@@ -748,8 +760,11 @@ fn shell_terminal_frame_rows(
         TerminalViewerSizing::Compact => MAX_INLINE_TERMINAL_ROWS,
         TerminalViewerSizing::Live { max_rows, .. } => max_rows,
     };
-    let mut output = grid
-        .main_content_tail_rows(max_rows)
+    let rows = match input.sizing {
+        TerminalViewerSizing::Compact => grid.main_content_tail_rows(max_rows),
+        TerminalViewerSizing::Live { .. } => live_viewport_content_rows(grid, max_rows),
+    };
+    let mut output = rows
         .iter()
         .map(|row| {
             let mut line = shell_terminal_grid_row_to_line(grid, row);
@@ -1118,6 +1133,65 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn live_terminal_rows(frames: &[TerminalReplayFrame], columns: u16, rows: u16) -> Vec<Line> {
+        shell_terminal_frame_rows(
+            TerminalViewerInput {
+                output: "",
+                columns,
+                rows,
+                exit_code: None,
+                timed_out: None,
+                elapsed: None,
+                output_truncated: false,
+                output_bytes: None,
+                retained_output_bytes: None,
+                show_status: false,
+                sizing: TerminalViewerSizing::Live {
+                    visible_rows: usize::from(rows),
+                    max_rows: MAX_INLINE_TERMINAL_ROWS,
+                },
+            },
+            frames,
+            columns,
+        )
+    }
+
+    #[test]
+    fn live_terminal_rows_render_current_viewport_without_scrolled_progress_history() {
+        let frames = vec![TerminalReplayFrame::Output(
+            b"progress 10%\rprogress 20%\x1b[K\r\ncompile one\r\ncompile two\r\nprogress 30%"
+                .to_vec(),
+        )];
+
+        let rendered = live_terminal_rows(&frames, 40, 3)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!rendered.contains("progress 10%"), "{rendered}");
+        assert!(!rendered.contains("progress 20%"), "{rendered}");
+        assert!(rendered.contains("compile one"), "{rendered}");
+        assert!(rendered.contains("compile two"), "{rendered}");
+        assert!(rendered.contains("progress 30%"), "{rendered}");
+    }
+
+    #[test]
+    fn live_terminal_rows_apply_carriage_return_in_current_viewport() {
+        let frames = vec![TerminalReplayFrame::Output(
+            b"progress 10%\rprogress 100%\x1b[K".to_vec(),
+        )];
+
+        let rendered = live_terminal_rows(&frames, 40, 3)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!rendered.contains("progress 10%"), "{rendered}");
+        assert!(rendered.contains("progress 100%"), "{rendered}");
     }
 
     fn deliver_recording_range(
