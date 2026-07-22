@@ -974,6 +974,53 @@ if ! grep -F 'ShellRecordingFrame::Output' plugins/shell-plugin/src/recording.rs
   violations=1
 fi
 
+if ! grep -F 'fn select_visual_adapter' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'adapter.supports(schema, schema_version, surface)' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'adapter.priority' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F '.visual_adapter(schema, schema_version, "tui", producer)' packages/tui/src/plugin_tui.rs >/dev/null ||
+   ! grep -F "BTreeMap<(&'static str, u32), VisualAdapter>" packages/web-render/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
+   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/web-render/ui/src/pages/home.rs >/dev/null; then
+  echo "Runtime architecture violation: platform-owned schema/version renderer selection or generic fallback coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'pub (surface|platform|renderer|render_target|transcript_mode|render_mode):' \
+  packages/tool/models/src/lib.rs packages/tool/src/contracts.rs packages/agent-runtime/src/turn.rs \
+  >/tmp/bcode-neutral-renderer-selection.txt; then
+  echo "Runtime architecture violation: canonical tool/runtime contracts select a renderer or platform surface." >&2
+  cat /tmp/bcode-neutral-renderer-selection.txt >&2
+  violations=1
+fi
+
+if [[ "$(rg -l '^pub (struct|enum) (ToolContributionEvent|ToolExchangeRequest|ToolExchangeResolution|ToolInvocationInput|ToolInvocationLifecycleEvent)' packages --glob '*.rs')" != "packages/tool/models/src/lib.rs" ]] ||
+   ! grep -F 'pub use bcode_tool_models::{' packages/session/models/src/lib.rs >/dev/null ||
+   ! grep -F 'input: bcode_tool::ToolInvocationInput' packages/ipc/src/lib.rs >/dev/null ||
+   ! grep -F 'pub active_exchanges: BTreeMap<String, bcode_session_models::ToolExchangeRequest>' packages/session-view/models/src/lib.rs >/dev/null ||
+   ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
+   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/web-render/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F 'unsupported_headless_exchange_is_explicit_for_required_and_optional_policies' packages/bcode/tests/headless_exchange.rs >/dev/null; then
+  echo "Runtime architecture violation: IPC, renderer, and headless hosts no longer consume the canonical opaque invocation envelopes." >&2
+  violations=1
+fi
+
+if ! grep -F 'direct_tool_receives_canonical_scope_and_all_capabilities' packages/bcode/tests/scoped_tool.rs >/dev/null ||
+   ! grep -F 'pub fn emit_lifecycle' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'pub fn emit_contribution' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'pub async fn request_exchange' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'pub async fn receive_input' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'pub async fn invoke_service' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'pub async fn write_artifact' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'pub fn cancellation' packages/agent-runtime/src/turn.rs >/dev/null ||
+   ! grep -F 'ServiceBridgeRequest::Exchange(request)' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'ServiceBridgeRequest::ReceiveInput {' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'ServiceBridgeRequest::InvokeService(request)' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'ServiceBridgeRequest::WriteArtifact(request)' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'scope.register_cancellation' packages/bcode/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: an invocation adapter no longer exposes every neutral invocation capability." >&2
+  violations=1
+fi
+
 if ! grep -F 'select_interaction_adapter' packages/plugin-sdk/src/interaction.rs >/dev/null ||
    ! grep -F 'min_schema_version' packages/plugin-sdk/src/interaction.rs >/dev/null ||
    ! grep -F 'platform_id' packages/plugin-sdk/src/interaction.rs >/dev/null ||

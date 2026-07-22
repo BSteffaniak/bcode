@@ -4,9 +4,13 @@ use bcode::{
     ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolCall, ToolDefinition,
     ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResponsePolicy, ToolInvocationInput,
     ToolInvocationInputResolution, ToolInvocationResponse, ToolInvocationServiceRequest,
-    ToolInvocationServiceResolution,
+    ToolInvocationServiceResolution, TurnEventObservability,
 };
-use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
+use bcode_tool::{
+    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolPolicyMetadata, ToolSideEffect,
+    ToolUiMetadata,
+};
 use std::sync::{Arc, Mutex};
 
 fn definition() -> ToolDefinition {
@@ -24,6 +28,16 @@ fn definition() -> ToolDefinition {
 #[derive(Debug, Default)]
 struct Capabilities {
     invocation_ids: Mutex<Vec<String>>,
+    events: Mutex<Vec<bcode::ScopedTurnEvent>>,
+}
+
+impl TurnEventObservability for Capabilities {
+    fn observe(&self, event: &bcode::ScopedTurnEvent) {
+        self.events
+            .lock()
+            .expect("observed events lock")
+            .push(event.clone());
+    }
 }
 
 impl InvocationExchangeBroker for Capabilities {
@@ -125,10 +139,31 @@ async fn direct_tool_receives_canonical_scope_and_all_capabilities() {
         .input_router(capabilities.clone())
         .service_router(capabilities.clone())
         .artifact_sink(capabilities.clone())
+        .event_observability(capabilities.clone())
         .scoped_inline_tool(definition(), |request, scope: InvocationScope| async move {
             let invocation_id = scope.invocation_id().to_string();
             assert_eq!(request.invocation_id, invocation_id);
             assert_eq!(request.tool_name, "scoped");
+            assert!(scope.emit_lifecycle(ToolInvocationLifecycleEvent {
+                invocation_id: invocation_id.clone(),
+                sequence: 1,
+                stage: ToolInvocationLifecycleStage::Progress,
+                message: Some("working".to_string()),
+                metadata: serde_json::Value::Null,
+            }));
+            assert!(scope.emit_contribution(ToolContributionEvent {
+                invocation_id: invocation_id.clone(),
+                contribution_id: "status".to_string(),
+                sequence: 1,
+                producer_id: "scoped-test".to_string(),
+                schema: "test.status".to_string(),
+                schema_version: 1,
+                operation: ToolContributionOperation::Upsert,
+                persistence: ToolContributionPersistence::Transient,
+                artifact: None,
+                payload: serde_json::json!({"working": true}),
+            }));
+            assert!(!scope.cancellation().is_cancelled());
             let exchange = scope
                 .request_exchange(ToolExchangeRequest {
                     invocation_id: invocation_id.clone(),
@@ -196,4 +231,17 @@ async fn direct_tool_receives_canonical_scope_and_all_capabilities() {
             .as_slice(),
         ["call-scoped", "call-scoped", "call-scoped", "call-scoped"]
     );
+    let events = capabilities.events.lock().expect("observed events lock");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        bcode::ScopedTurnEvent::InvocationLifecycle(event)
+            if event.invocation_id == "call-scoped"
+                && event.stage == ToolInvocationLifecycleStage::Progress
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        bcode::ScopedTurnEvent::Contribution(event)
+            if event.invocation_id == "call-scoped"
+                && event.schema == "test.status"
+    )));
 }
