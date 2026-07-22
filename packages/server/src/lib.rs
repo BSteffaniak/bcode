@@ -31754,10 +31754,8 @@ library = "test"
         .expect("append final artifact result");
         assert!(matches!(
             event.kind,
-            SessionEventKind::ToolCallFinished {
-                semantic_result: Some(ref result),
-                ..
-            } if result == &semantic_result
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.result.as_ref() == Some(&semantic_result)
         ));
         let reference = state
             .sessions
@@ -31804,7 +31802,7 @@ library = "test"
             )
             .await
             .expect("transcript projection");
-        assert_eq!(projection.transcript_items.len(), 2);
+        assert_eq!(projection.transcript_items.len(), 1);
         assert!(projection.transcript_items.iter().any(|item| {
             item.kind == bcode_session_models::TranscriptProjectionItemKind::ToolInvocation
                 && item.source_range.end_sequence == event.sequence

@@ -478,9 +478,8 @@ impl SessionView {
                             .remove(&lifecycle.invocation_id);
                         self.snapshot.contributions.retain(|_, contribution| {
                             contribution.invocation_id != lifecycle.invocation_id
-                        });
-                        self.contribution_sequences.retain(|key, _| {
-                            !key.starts_with(&format!("{}:", lifecycle.invocation_id))
+                                || contribution.persistence
+                                    == bcode_session_models::ToolContributionPersistence::Durable
                         });
                         let live_prefix = format!("live-contribution:{}:", lifecycle.invocation_id);
                         let item_count = self.snapshot.transcript.items.len();
@@ -792,6 +791,8 @@ impl SessionView {
                 if self
                     .terminal_invocations
                     .contains(&contribution.invocation_id)
+                    && contribution.persistence
+                        == bcode_session_models::ToolContributionPersistence::Transient
                 {
                     return;
                 }
@@ -3201,6 +3202,59 @@ mod tests {
             TranscriptViewItemKind::SystemMessage { message }
                 if message.text.contains("Treat prior file/path assumptions as possibly stale")
         ));
+    }
+
+    #[test]
+    fn durable_contribution_survives_terminal_lifecycle_and_late_delivery() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: u64::MAX,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call-1".to_owned(),
+            contribution_id: "request".to_owned(),
+            sequence: 1,
+            producer_id: "bcode.test".to_owned(),
+            schema: "bcode.test.request".to_owned(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Durable,
+            artifact: None,
+            payload: serde_json::json!({"value": "rich"}),
+        };
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolContribution {
+                event: contribution.clone(),
+            },
+        ));
+
+        assert_eq!(
+            view.snapshot()
+                .contributions
+                .get("call-1:request")
+                .map(|event| &event.payload),
+            Some(&contribution.payload)
+        );
+        assert!(view.snapshot().transcript.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TranscriptViewItemKind::ToolContribution { contribution: item }
+                    if item == &contribution
+            )
+        }));
     }
 
     #[test]

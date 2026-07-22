@@ -548,6 +548,7 @@ impl BmuxApp {
         self.plugin_presentation = Some(Arc::new(
             crate::plugin_tui::PluginTuiPresentation::from_shared(host),
         ));
+        self.suppress_generic_tool_requests_with_rich_contributions();
     }
 
     /// Set persistent local plugin presentation state.
@@ -556,6 +557,7 @@ impl BmuxApp {
         presentation: Arc<crate::plugin_tui::PluginTuiPresentation>,
     ) {
         self.plugin_presentation = Some(presentation);
+        self.suppress_generic_tool_requests_with_rich_contributions();
     }
 
     /// Return the local plugin runtime used for client-side presentation projection.
@@ -2346,6 +2348,46 @@ impl BmuxApp {
         }
     }
 
+    fn suppress_generic_tool_requests_with_rich_contributions(&mut self) {
+        let contributions = self
+            .session_view
+            .snapshot()
+            .contributions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for contribution in &contributions {
+            self.suppress_generic_tool_request_for_contribution(contribution);
+        }
+    }
+
+    fn suppress_generic_tool_request_for_contribution(
+        &mut self,
+        contribution: &bcode_session_models::ToolContributionEvent,
+    ) {
+        let has_adapter = self.plugin_presentation().is_some_and(|presentation| {
+            presentation
+                .host()
+                .visual_adapter(
+                    &contribution.schema,
+                    contribution.schema_version,
+                    "tui",
+                    Some(&contribution.producer_id),
+                )
+                .is_some()
+        });
+        if !has_adapter {
+            return;
+        }
+        self.transcript.retain(|item| {
+            !matches!(
+                item.kind(),
+                TranscriptItemKind::ToolRequest { tool_call_id, .. }
+                    if tool_call_id == &contribution.invocation_id
+            )
+        });
+    }
+
     fn contribution_backs_active_visual(
         &self,
         contribution: &bcode_session_models::ToolContributionEvent,
@@ -2455,6 +2497,19 @@ impl BmuxApp {
                     result,
                     *is_error,
                     semantic_result.as_ref(),
+                    application,
+                );
+            }
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                if application.live_activity() {
+                    self.set_activity(ActivityState::PreparingFollowUpRequest);
+                }
+                self.finish_shared_active_tool_call(&record.invocation_id);
+                self.push_tool_result(
+                    &record.invocation_id,
+                    &record.model_output,
+                    record.is_error,
+                    record.result.as_ref(),
                     application,
                 );
             }
@@ -2624,12 +2679,17 @@ impl BmuxApp {
                 if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
                     self.transcript.retain(|item| item.id() != id);
                 }
+                if contribution.operation == bcode_session_models::ToolContributionOperation::Remove
+                {
+                    return;
+                }
                 if !self.push_shared_terminal_item(event.sequence) {
                     let fallback = serde_json::to_string_pretty(contribution)
                         .unwrap_or_else(|_| contribution.payload.to_string());
                     self.transcript
                         .push(TranscriptItem::new("Tool contribution", fallback));
                 }
+                self.suppress_generic_tool_request_for_contribution(contribution);
             }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
                 if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started

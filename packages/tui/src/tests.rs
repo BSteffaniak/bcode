@@ -5147,6 +5147,127 @@ fn replayed_legacy_shell_artifact_does_not_read_files_during_render() {
 }
 
 #[test]
+fn canonical_generic_result_record_renders_filesystem_source_viewer() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-read".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.read".to_owned(),
+            arguments_json: serde_json::json!({"path": "src/lib.rs"}).to_string(),
+            working_directory: None,
+            request_visual: None,
+            legacy_request_presentation: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-read".to_owned(),
+                model_output: "model-visible fallback".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(ToolArtifact {
+                        artifact_id: "call-read-filesystem-read".to_owned(),
+                        producer_plugin_id: "bcode.filesystem".to_owned(),
+                        schema: "bcode.filesystem.read".to_owned(),
+                        schema_version: 1,
+                        tool_call_id: Some("call-read".to_owned()),
+                        title: Some("File contents".to_owned()),
+                        metadata: serde_json::json!({
+                            "path": "src/lib.rs",
+                            "start_line": 1,
+                            "end_line": 2,
+                            "total_lines": 2,
+                            "returned_bytes": 26,
+                            "total_bytes": 26,
+                            "truncated": false,
+                            "contents": "pub fn alpha() {}\npub fn beta() {}",
+                        }),
+                        refs: Vec::new(),
+                    }),
+                }),
+            },
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("File contents"), "{rendered}");
+    assert!(rendered.contains("pub fn alpha() {}"), "{rendered}");
+    assert!(rendered.contains("pub fn beta() {}"), "{rendered}");
+    assert!(!rendered.contains("model-visible fallback"), "{rendered}");
+}
+
+#[test]
+fn durable_request_contribution_replaces_raw_arguments_and_survives_lifecycle() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-read".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.read".to_owned(),
+            arguments_json: serde_json::json!({"path": "src/lib.rs", "limit": 20}).to_string(),
+            working_directory: None,
+            request_visual: None,
+            legacy_request_presentation: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationLifecycle {
+            event: bcode_session_models::ToolInvocationLifecycleEvent {
+                invocation_id: "call-read".to_owned(),
+                sequence: u64::MAX,
+                stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                message: None,
+                metadata: serde_json::Value::Null,
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolContribution {
+            event: bcode_session_models::ToolContributionEvent {
+                invocation_id: "call-read".to_owned(),
+                contribution_id: "filesystem-request".to_owned(),
+                sequence: 1,
+                producer_id: "bcode.filesystem".to_owned(),
+                schema: "bcode.filesystem.request".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                artifact: None,
+                payload: serde_json::json!({
+                    "operation": "filesystem.read",
+                    "path": "src/lib.rs",
+                    "limit": 20,
+                }),
+            },
+        },
+    ));
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("filesystem.read"), "{rendered}");
+    assert!(rendered.contains("src/lib.rs"), "{rendered}");
+    assert!(!rendered.contains("arguments"), "{rendered}");
+    assert!(!rendered.contains("call call-read"), "{rendered}");
+}
+
+#[test]
 fn filesystem_write_request_preview_renders_from_plugin_visual_metadata() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
