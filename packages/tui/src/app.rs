@@ -2274,8 +2274,19 @@ impl BmuxApp {
         {
             return;
         }
+        let backs_active_visual = self.contribution_backs_active_visual(contribution);
         match contribution.operation {
             bcode_session_models::ToolContributionOperation::Remove => {
+                if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
+                    self.transcript.retain(|item| item.id() != id);
+                }
+                self.transient_contribution_items
+                    .insert(key, (contribution.sequence, None));
+            }
+            bcode_session_models::ToolContributionOperation::Upsert
+            | bcode_session_models::ToolContributionOperation::Append
+                if backs_active_visual =>
+            {
                 if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
                     self.transcript.retain(|item| item.id() != id);
                 }
@@ -2309,6 +2320,32 @@ impl BmuxApp {
                 }
             }
         }
+    }
+
+    fn contribution_backs_active_visual(
+        &self,
+        contribution: &bcode_session_models::ToolContributionEvent,
+    ) -> bool {
+        let Some(artifact) = contribution.artifact.as_ref() else {
+            return false;
+        };
+        let Some(visual) = self.active_plugin_visuals.get(&contribution.invocation_id) else {
+            return false;
+        };
+        let Some(presentation) = self.plugin_presentation() else {
+            return false;
+        };
+        let producer_plugin_id = visual
+            .producer_plugin_id
+            .as_deref()
+            .unwrap_or(&contribution.producer_id);
+        presentation.accepts_artifact_reference(
+            producer_plugin_id,
+            &visual.schema,
+            visual.schema_version,
+            &artifact.reference_key,
+            artifact.content_type.as_deref(),
+        )
     }
 
     #[allow(clippy::too_many_lines)]

@@ -4980,6 +4980,7 @@ async fn live_shell_recording_chunk_renders_through_active_request_visual() {
 
     let rendered = render_app_text(&mut app);
     assert!(rendered.contains("live red"), "{rendered}");
+    assert_eq!(rendered.matches("live red").count(), 1, "{rendered}");
 }
 
 #[test]
