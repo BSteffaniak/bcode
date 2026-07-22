@@ -22,6 +22,7 @@ serde            = { workspace = true }
 serde_json       = { workspace = true }
 
 [features]
-default          = []
+default          = ["dynamic-export"]
+dynamic-export   = []
 fail-on-warnings = []
 static-bundled   = ["bmux_keyboard", "bmux_tui"]

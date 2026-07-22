@@ -52,9 +52,9 @@ use super::tool_render_projection::semantic_result_supersedes_live_preview;
 use super::transcript::{
     TranscriptItem, TranscriptItemKind, display_tool_result_text,
     generic_tool_result_item_from_projection, live_tool_preview_anchor_item, model_usage_item,
-    permission_request_item, permission_result_item, semantic_tool_result_item_from_raw,
-    streaming_tool_output_item, streaming_tool_visual_item, terminal_item_from_shared,
-    tool_contribution_item, tool_request_item_from_projection, tool_result_item,
+    permission_result_item, semantic_tool_result_item_from_raw, streaming_tool_output_item,
+    streaming_tool_visual_item, terminal_item_from_shared, tool_contribution_item,
+    tool_request_item_from_projection, tool_result_item,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -413,6 +413,7 @@ struct ToolCallContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PermissionRequestInput<'a> {
+    event_sequence: u64,
     permission_id: &'a str,
     tool_call_id: &'a str,
     tool_name: &'a str,
@@ -2398,6 +2399,7 @@ impl BmuxApp {
                 ..
             } => {
                 self.push_permission_request(PermissionRequestInput {
+                    event_sequence: event.sequence,
                     permission_id,
                     tool_call_id,
                     tool_name,
@@ -3015,14 +3017,17 @@ impl BmuxApp {
     }
 
     fn push_permission_request(&mut self, input: PermissionRequestInput<'_>) {
-        self.transcript.push(permission_request_item(
-            input.permission_id,
-            input.tool_call_id,
-            input.tool_name,
-            input.arguments_json,
-            input.policy_source,
-            input.policy_reason,
-        ));
+        if !self.push_shared_terminal_item(input.event_sequence) {
+            self.transcript
+                .push(super::transcript::permission_request_item(
+                    input.permission_id,
+                    input.tool_call_id,
+                    input.tool_name,
+                    input.arguments_json,
+                    input.policy_source,
+                    input.policy_reason,
+                ));
+        }
         if input.application.live_activity() {
             self.set_activity(ActivityState::WaitingPermission {
                 name: input.tool_name.to_owned(),
@@ -5225,13 +5230,27 @@ mod tests {
                     },
                 },
             ),
+            event(
+                4,
+                SessionEventKind::PermissionRequested {
+                    permission_id: "permission-shared".to_owned(),
+                    tool_call_id: "tool-shared".to_owned(),
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: r#"{"command":"printf shared"}"#.to_owned(),
+                    legacy_request_presentation: None,
+                    batch: None,
+                    policy_source: Some("ask".to_owned()),
+                    policy_reason: Some("needs confirmation".to_owned()),
+                },
+            ),
         ];
         for event in &events {
             app.absorb_session_event(event);
         }
 
         let terminal = app.transcript().iter().collect::<Vec<_>>();
-        assert_eq!(terminal.len(), 3);
+        assert_eq!(terminal.len(), 4);
         for (terminal, shared) in terminal
             .iter()
             .zip(&app.session_view_snapshot().transcript.items)

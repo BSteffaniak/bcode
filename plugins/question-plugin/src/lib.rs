@@ -617,7 +617,6 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(QuestionPlugin, include_str!("../bcode-plugin.toml"))
@@ -662,7 +661,7 @@ pub fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     registry
 }
 
-#[cfg(not(feature = "static-bundled"))]
+#[cfg(all(feature = "dynamic-export", not(feature = "static-bundled")))]
 bcode_plugin_sdk::export_plugin!(QuestionPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]

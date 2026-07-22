@@ -367,7 +367,11 @@ mod tests {
                         .rsplit_once('\n')
                         .map_or(preceding, |(_, line)| line)
                         .trim();
-                    if immediately_preceding != "#[cfg(not(feature = \"static-bundled\"))]" {
+                    let allowed_guards = [
+                        "#[cfg(not(feature = \"static-bundled\"))]",
+                        "#[cfg(all(feature = \"dynamic-export\", not(feature = \"static-bundled\")))]",
+                    ];
+                    if !allowed_guards.contains(&immediately_preceding) {
                         offenders.push(format!("{}:{export_macro}", source.display()));
                     }
                     search_start = index + export_macro.len();

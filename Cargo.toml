@@ -2,6 +2,7 @@
 members = [
     "xtask",
     "examples/hello-plugin",
+    "examples/question-dynamic-plugin",
     "plugins/filesystem-plugin",
     "plugins/git-plugin",
     "plugins/code-review-plugin",
@@ -141,6 +142,7 @@ bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-f
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_provider_auth                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth" }
+bcode_question_dynamic_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "examples/question-dynamic-plugin" }
 bcode_question_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/question-plugin" }
 bcode_ralph                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph" }
 bcode_ralph_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/ralph-plugin" }

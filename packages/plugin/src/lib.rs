@@ -4623,7 +4623,10 @@ library = "libexample_plugin.dylib"
         }
         let executable = std::env::current_exe().expect("current test executable path");
         let directory = executable.parent().expect("test executable parent");
-        let prefix = format!("{}bcode_question_plugin", std::env::consts::DLL_PREFIX);
+        let prefix = format!(
+            "{}bcode_question_dynamic_plugin",
+            std::env::consts::DLL_PREFIX
+        );
         std::fs::read_dir(directory)
             .expect("test dependency directory should be readable")
             .filter_map(Result::ok)

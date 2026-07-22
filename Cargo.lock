@@ -2053,6 +2053,7 @@ dependencies = [
  "bcode_hello_plugin",
  "bcode_metrics",
  "bcode_plugin_sdk",
+ "bcode_question_dynamic_plugin",
  "bcode_question_plugin",
  "bcode_tool",
  "bmux_plugin",
@@ -2096,6 +2097,14 @@ dependencies = [
  "sha2 0.10.9",
  "ssh-key",
  "sshenv_vault",
+]
+
+[[package]]
+name = "bcode_question_dynamic_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "bcode_question_plugin",
 ]
 
 [[package]]

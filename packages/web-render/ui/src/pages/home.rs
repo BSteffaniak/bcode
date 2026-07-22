@@ -57,8 +57,14 @@ static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
                 ("bcode.tool.request.shell.run", 1),
                 render_shell_request as VisualAdapter,
             ),
-            (("bcode.filesystem.request", 1), structured),
-            (("bcode.filesystem.change", 1), structured),
+            (
+                ("bcode.filesystem.request", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.change", 1),
+                render_filesystem_change as VisualAdapter,
+            ),
             (("bcode.filesystem.read", 1), structured),
             (("bcode.filesystem.image", 1), structured),
             (("bcode.filesystem.exists", 1), structured),
@@ -816,6 +822,56 @@ fn render_structured_visual(visual: &PluginVisualView) -> Option<Containers> {
     })
 }
 
+fn render_filesystem_request(visual: &PluginVisualView) -> Option<Containers> {
+    let payload = visual
+        .descriptor
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let operation = payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("filesystem");
+    let path = payload.get("path").and_then(serde_json::Value::as_str)?;
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div direction=row gap=8 align-items=center margin-bottom=6 {
+                span color="#58a6ff" { (operation) }
+                span color="#8b949e" { "filesystem" }
+            }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+            @for key in ["pattern", "query", "url", "region"] {
+                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) {
+                    div color="#8b949e" font-size=12 margin-top=4 { (key) ": " (value) }
+                }
+            }
+        }
+    })
+}
+
+fn render_filesystem_change(visual: &PluginVisualView) -> Option<Containers> {
+    let payload = visual
+        .descriptor
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let path = payload.get("path").and_then(serde_json::Value::as_str)?;
+    let old_text = payload.get("old_text").and_then(serde_json::Value::as_str);
+    let new_text = payload.get("new_text").and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (visual.descriptor.title.as_deref().unwrap_or("Filesystem change")) }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(old_text) = old_text {
+                div color="#f85149" font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { "- " (old_text) }
+            }
+            @if let Some(new_text) = new_text {
+                div color="#7ee787" font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { "+ " (new_text) }
+            }
+        }
+    })
+}
+
 fn render_shell_request(visual: &PluginVisualView) -> Option<Containers> {
     let payload = &visual.descriptor.payload;
     let arguments = payload.get("arguments").unwrap_or(payload);
@@ -1307,6 +1363,29 @@ mod tests {
         } else {
             serde_json::json!({"operation": "fixture", "path": "/tmp/fixture"})
         }
+    }
+
+    #[test]
+    fn filesystem_change_adapter_renders_path_and_diff_fields_with_fallback() {
+        let visual = PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: Some("change-1".to_owned()),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            schema: "bcode.filesystem.change".to_owned(),
+            schema_version: 1,
+            title: Some("Edit file".to_owned()),
+            subtitle: None,
+            payload: serde_json::json!({
+                "path": "/tmp/example.rs",
+                "old_text": "old();",
+                "new_text": "new();"
+            }),
+        });
+
+        let rendered = format!("{:?}", render_plugin_visual("plugin visual", &visual));
+        assert!(rendered.contains("/tmp/example.rs"));
+        assert!(rendered.contains("old();"));
+        assert!(rendered.contains("new();"));
+        assert!(rendered.contains("bcode.filesystem.change"));
     }
 
     #[test]

@@ -51,23 +51,6 @@ impl TranscriptDocument {
         self.items.last_mut()
     }
 
-    /// Merge streaming boundary with `prefix`, prepend it, and bump the collection revision.
-    #[cfg(test)]
-    pub fn merge_prepend(&mut self, prefix: &mut Vec<TranscriptItem>) {
-        super::transcript::merge_transcript_boundary(prefix, &mut self.items);
-        prefix.append(&mut self.items);
-        self.items = std::mem::take(prefix);
-        self.bump_revision();
-    }
-
-    /// Merge streaming boundary with `suffix`, append it, and bump the collection revision.
-    #[cfg(test)]
-    pub fn merge_append(&mut self, suffix: &mut Vec<TranscriptItem>) {
-        super::transcript::merge_transcript_boundary(&mut self.items, suffix);
-        self.items.append(suffix);
-        self.bump_revision();
-    }
-
     /// Apply streaming text to the newest matching role and bump the collection revision.
     pub fn push_streaming_item(&mut self, role: &'static str, text: &str) {
         super::transcript::push_streaming_transcript_item(&mut self.items, role, text);

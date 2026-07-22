@@ -427,26 +427,117 @@ impl TranscriptProjector {
     }
 }
 
-/// Merge streaming transcript items across a prepended history boundary.
 #[cfg(test)]
-pub fn merge_transcript_boundary(
-    older: &mut Vec<TranscriptItem>,
-    current: &mut Vec<TranscriptItem>,
+#[allow(clippy::too_many_lines)]
+fn push_transcript_item_from_event(
+    items: &mut Vec<TranscriptItem>,
+    tool_calls: &mut BTreeMap<String, ToolCallContext>,
+    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
+    include_reasoning: bool,
+    event: &SessionEvent,
 ) {
-    let (Some(last_older), Some(first_current)) = (older.last_mut(), current.first()) else {
-        return;
-    };
-    if last_older.role != first_current.role || !last_older.streaming {
-        return;
-    }
-    if first_current.streaming {
-        last_older.text.push_str(&first_current.text);
-        current.remove(0);
-    } else {
-        older.pop();
+    match &event.kind {
+        SessionEventKind::AssistantDelta { text } => {
+            push_streaming_transcript_item(items, "Assistant", text);
+        }
+        SessionEventKind::AssistantMessage { text } => {
+            finish_streaming_transcript_item(items, "Assistant", text);
+        }
+        SessionEventKind::AssistantReasoningDelta { text } if include_reasoning => {
+            push_streaming_transcript_item(items, "Reasoning summary", text);
+        }
+        SessionEventKind::AssistantReasoningMessage { text } if include_reasoning => {
+            finish_streaming_transcript_item(items, "Reasoning summary", text);
+        }
+        SessionEventKind::AssistantReasoningDelta { .. }
+        | SessionEventKind::AssistantReasoningMessage { .. } => {}
+        SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            result: _,
+            is_error,
+            semantic_result,
+            ..
+        } => {
+            if let Some(semantic_result) = semantic_result {
+                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
+                    && let Some(index) = replay.index
+                {
+                    let mut item = semantic_tool_result_item(
+                        tool_call_id,
+                        tool_calls.get(tool_call_id),
+                        semantic_result,
+                        *is_error,
+                    );
+                    apply_replay_timing(&mut item, replay);
+                    if replay.saw_output {
+                        if let Some(existing) = items.get_mut(index) {
+                            existing.set_tool_started_at_ms(replay.started_at_ms);
+                            existing.set_tool_finished_at_ms(replay.finished_at_ms);
+                            existing.finish_streaming();
+                        }
+                    } else if let Some(existing) = items.get_mut(index) {
+                        *existing = item;
+                    } else {
+                        items.push(item);
+                    }
+                    return;
+                }
+                let mut item = semantic_tool_result_item(
+                    tool_call_id,
+                    tool_calls.get(tool_call_id),
+                    semantic_result,
+                    *is_error,
+                );
+                if let Some(replay) = streamed_tool_results.get(tool_call_id) {
+                    apply_replay_timing(&mut item, replay);
+                }
+                items.push(item);
+                return;
+            }
+            let should_render_final =
+                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id) {
+                    if let Some(index) = replay.index
+                        && let Some(item) = items.get_mut(index)
+                    {
+                        item.set_tool_started_at_ms(replay.started_at_ms);
+                        item.set_tool_finished_at_ms(replay.finished_at_ms);
+                        item.finish_streaming();
+                    }
+                    !replay.saw_output
+                } else {
+                    true
+                };
+            if should_render_final
+                && let Some(mut item) = non_streaming_transcript_item_from_event(
+                    event,
+                    tool_calls,
+                    streamed_tool_results,
+                )
+            {
+                if let Some(replay) = streamed_tool_results.get(tool_call_id) {
+                    apply_replay_timing(&mut item, replay);
+                }
+                items.push(item);
+            }
+        }
+        SessionEventKind::ToolInvocationStream { event } => {
+            apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
+        }
+        _ => {
+            if let Some(item) =
+                non_streaming_transcript_item_from_event(event, tool_calls, streamed_tool_results)
+            {
+                items.push(item);
+            }
+        }
     }
 }
 
+/// Append streamed text to the currently open transcript stream for `role`.
+///
+/// Interleaved telemetry rows, such as token usage, may be appended while a model stream is open.
+/// The open stream is therefore the newest streaming row for the same role, not necessarily the
+/// final transcript row.
 /// Build a transcript item for a tool request.
 #[must_use]
 pub fn tool_request_item_from_projection(projection: &ToolInvocationProjection) -> TranscriptItem {
@@ -1047,117 +1138,6 @@ pub fn truncate_block(value: &str, max_chars: usize) -> String {
     output
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_lines)]
-fn push_transcript_item_from_event(
-    items: &mut Vec<TranscriptItem>,
-    tool_calls: &mut BTreeMap<String, ToolCallContext>,
-    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
-    include_reasoning: bool,
-    event: &SessionEvent,
-) {
-    match &event.kind {
-        SessionEventKind::AssistantDelta { text } => {
-            push_streaming_transcript_item(items, "Assistant", text);
-        }
-        SessionEventKind::AssistantMessage { text } => {
-            finish_streaming_transcript_item(items, "Assistant", text);
-        }
-        SessionEventKind::AssistantReasoningDelta { text } if include_reasoning => {
-            push_streaming_transcript_item(items, "Reasoning summary", text);
-        }
-        SessionEventKind::AssistantReasoningMessage { text } if include_reasoning => {
-            finish_streaming_transcript_item(items, "Reasoning summary", text);
-        }
-        SessionEventKind::AssistantReasoningDelta { .. }
-        | SessionEventKind::AssistantReasoningMessage { .. } => {}
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result: _,
-            is_error,
-            semantic_result,
-            ..
-        } => {
-            if let Some(semantic_result) = semantic_result {
-                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
-                    && let Some(index) = replay.index
-                {
-                    let mut item = semantic_tool_result_item(
-                        tool_call_id,
-                        tool_calls.get(tool_call_id),
-                        semantic_result,
-                        *is_error,
-                    );
-                    apply_replay_timing(&mut item, replay);
-                    if replay.saw_output {
-                        if let Some(existing) = items.get_mut(index) {
-                            existing.set_tool_started_at_ms(replay.started_at_ms);
-                            existing.set_tool_finished_at_ms(replay.finished_at_ms);
-                            existing.finish_streaming();
-                        }
-                    } else if let Some(existing) = items.get_mut(index) {
-                        *existing = item;
-                    } else {
-                        items.push(item);
-                    }
-                    return;
-                }
-                let mut item = semantic_tool_result_item(
-                    tool_call_id,
-                    tool_calls.get(tool_call_id),
-                    semantic_result,
-                    *is_error,
-                );
-                if let Some(replay) = streamed_tool_results.get(tool_call_id) {
-                    apply_replay_timing(&mut item, replay);
-                }
-                items.push(item);
-                return;
-            }
-            let should_render_final =
-                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id) {
-                    if let Some(index) = replay.index
-                        && let Some(item) = items.get_mut(index)
-                    {
-                        item.set_tool_started_at_ms(replay.started_at_ms);
-                        item.set_tool_finished_at_ms(replay.finished_at_ms);
-                        item.finish_streaming();
-                    }
-                    !replay.saw_output
-                } else {
-                    true
-                };
-            if should_render_final
-                && let Some(mut item) = non_streaming_transcript_item_from_event(
-                    event,
-                    tool_calls,
-                    streamed_tool_results,
-                )
-            {
-                if let Some(replay) = streamed_tool_results.get(tool_call_id) {
-                    apply_replay_timing(&mut item, replay);
-                }
-                items.push(item);
-            }
-        }
-        SessionEventKind::ToolInvocationStream { event } => {
-            apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
-        }
-        _ => {
-            if let Some(item) =
-                non_streaming_transcript_item_from_event(event, tool_calls, streamed_tool_results)
-            {
-                items.push(item);
-            }
-        }
-    }
-}
-
-/// Append streamed text to the currently open transcript stream for `role`.
-///
-/// Interleaved telemetry rows, such as token usage, may be appended while a model stream is open.
-/// The open stream is therefore the newest streaming row for the same role, not necessarily the
-/// final transcript row.
 pub fn push_streaming_transcript_item(
     items: &mut Vec<TranscriptItem>,
     role: &'static str,
@@ -1428,19 +1408,6 @@ fn working_directory_changed_message(
         display(old_working_directory, old_working_directory),
         display(new_working_directory, old_working_directory)
     )
-}
-
-#[cfg(test)]
-fn apply_semantic_tool_result(
-    items: &mut Vec<TranscriptItem>,
-    tool_call_id: &str,
-    context: Option<&ToolCallContext>,
-    _replay: &mut Option<&mut StreamedToolReplayContext>,
-    result: &ToolInvocationResult,
-    is_error: bool,
-) {
-    let item = semantic_tool_result_item(tool_call_id, context, result, is_error);
-    items.push(item);
 }
 
 #[cfg(test)]

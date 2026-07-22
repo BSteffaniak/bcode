@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "dynamic ABI fixture for the bcode question plugin"
+edition     = { workspace = true }
+keywords    = ["bcode", "question", "plugin", "test"]
+license     = { workspace = true }
+name        = "bcode_question_dynamic_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bcode_plugin_sdk      = { workspace = true }
+bcode_question_plugin = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
