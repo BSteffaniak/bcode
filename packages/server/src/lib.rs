@@ -14145,6 +14145,7 @@ const fn model_cache_capability_name(
         bcode_model::ModelCacheCapability::AutomaticPrefixCache => "automatic_prefix_cache",
         bcode_model::ModelCacheCapability::ExplicitCachePoints => "explicit_cache_points",
         bcode_model::ModelCacheCapability::CacheUsageReporting => "cache_usage_reporting",
+        bcode_model::ModelCacheCapability::ProviderState => "provider_state",
         bcode_model::ModelCacheCapability::PreviousResponseId => "previous_response_id",
     }
 }
@@ -14470,8 +14471,13 @@ impl ConversationProjection {
 
 fn supports_provider_conversation_reuse(cache_info: Option<&bcode_model::ModelCacheInfo>) -> bool {
     cache_info.is_some_and(|info| {
-        info.capabilities
-            .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
+        info.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                bcode_model::ModelCacheCapability::ProviderState
+                    | bcode_model::ModelCacheCapability::PreviousResponseId
+            )
+        })
     })
 }
 
@@ -21994,15 +22000,23 @@ library = "test"
     }
 
     #[test]
-    fn provider_conversation_reuse_requires_declared_previous_response_support() {
+    fn provider_conversation_reuse_requires_declared_native_continuation_support() {
         let unsupported = bcode_model::ModelCacheInfo::default();
-        let supported = bcode_model::ModelCacheInfo {
+        let previous_response_supported = bcode_model::ModelCacheInfo {
             capabilities: BTreeSet::from([bcode_model::ModelCacheCapability::PreviousResponseId]),
+        };
+        let provider_state_supported = bcode_model::ModelCacheInfo {
+            capabilities: BTreeSet::from([bcode_model::ModelCacheCapability::ProviderState]),
         };
 
         assert!(!supports_provider_conversation_reuse(None));
         assert!(!supports_provider_conversation_reuse(Some(&unsupported)));
-        assert!(supports_provider_conversation_reuse(Some(&supported)));
+        assert!(supports_provider_conversation_reuse(Some(
+            &previous_response_supported
+        )));
+        assert!(supports_provider_conversation_reuse(Some(
+            &provider_state_supported
+        )));
     }
 
     #[test]

@@ -1126,6 +1126,8 @@ pub enum ModelCacheCapability {
     AutomaticPrefixCache,
     ExplicitCachePoints,
     CacheUsageReporting,
+    /// Provider-private continuation state, such as encrypted reasoning items.
+    ProviderState,
     PreviousResponseId,
 }
 

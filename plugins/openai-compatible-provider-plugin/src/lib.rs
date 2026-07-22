@@ -543,12 +543,20 @@ enum OpenAiCompatibleDialect {
 }
 
 impl OpenAiCompatibleDialect {
+    const fn supports_provider_state_reuse(self) -> bool {
+        matches!(self, Self::ChatGptCodex)
+    }
+
     const fn supports_native_conversation_reuse(self) -> bool {
+        matches!(self, Self::ResponsesApi) || self.supports_provider_state_reuse()
+    }
+
+    const fn supports_previous_response_id(self) -> bool {
         matches!(self, Self::ResponsesApi)
     }
 
     const fn projects_reused_history(self) -> bool {
-        self.supports_native_conversation_reuse()
+        self.supports_previous_response_id()
     }
 
     const fn supports_parallel_tool_policy(self) -> bool {
@@ -3461,7 +3469,7 @@ fn process_responses_stream_line(
             } else {
                 StreamOutcome::Finished
             };
-            if processor.dialect.supports_native_conversation_reuse()
+            if processor.dialect.supports_previous_response_id()
                 && !processor.suppress_provider_reuse_state
                 && let Some(response_id) = event
                     .get("response")
@@ -4239,7 +4247,7 @@ fn responses_previous_response_id(
 ) -> Option<String> {
     settings
         .dialect
-        .supports_native_conversation_reuse()
+        .supports_previous_response_id()
         .then(|| {
             request
                 .conversation_reuse
@@ -5497,7 +5505,10 @@ fn openai_model_cache_info(dialect: OpenAiCompatibleDialect) -> bcode_model::Mod
         bcode_model::ModelCacheCapability::AutomaticPrefixCache,
         bcode_model::ModelCacheCapability::CacheUsageReporting,
     ]);
-    if dialect.supports_native_conversation_reuse() {
+    if dialect.supports_provider_state_reuse() {
+        capabilities.insert(bcode_model::ModelCacheCapability::ProviderState);
+    }
+    if dialect.supports_previous_response_id() {
         capabilities.insert(bcode_model::ModelCacheCapability::PreviousResponseId);
     }
     bcode_model::ModelCacheInfo { capabilities }
@@ -7650,20 +7661,25 @@ mod tests {
     }
 
     #[test]
-    fn openai_preflight_rejects_reuse_on_unsupported_dialects() {
+    fn openai_preflight_negotiates_reuse_by_dialect() {
         let mut request = test_request(Vec::new());
         request.tool_call_policy.parallel = false;
         request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Auto;
 
-        for dialect in [
+        let chat = test_settings(
+            test_api_key_auth(),
             OpenAiCompatibleDialect::ChatCompletions,
-            OpenAiCompatibleDialect::ChatGptCodex,
-        ] {
-            let settings = test_settings(test_api_key_auth(), dialect);
-            let error = validate_openai_request(&settings, &request)
-                .expect_err("unsupported dialect must reject native reuse");
-            assert_eq!(error.code, "conversation_reuse_unsupported");
-        }
+        );
+        let error = validate_openai_request(&chat, &request)
+            .expect_err("chat completions must reject native reuse");
+        assert_eq!(error.code, "conversation_reuse_unsupported");
+
+        let codex = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+        validate_openai_request(&codex, &request).expect("Codex supports provider-state reuse");
+
+        let responses = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        validate_openai_request(&responses, &request)
+            .expect("Responses supports previous-response reuse");
     }
 
     #[test]
@@ -8353,20 +8369,40 @@ mod tests {
 
     #[test]
     fn model_cache_capabilities_are_dialect_specific() {
-        for dialect in [
-            OpenAiCompatibleDialect::ChatCompletions,
-            OpenAiCompatibleDialect::ChatGptCodex,
-        ] {
-            assert!(
-                !openai_model_cache_info(dialect)
-                    .capabilities
-                    .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
-            );
-        }
+        let chat = openai_model_cache_info(OpenAiCompatibleDialect::ChatCompletions);
         assert!(
-            openai_model_cache_info(OpenAiCompatibleDialect::ResponsesApi)
+            !chat
                 .capabilities
                 .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
+        );
+        assert!(
+            !chat
+                .capabilities
+                .contains(&bcode_model::ModelCacheCapability::ProviderState)
+        );
+
+        let codex = openai_model_cache_info(OpenAiCompatibleDialect::ChatGptCodex);
+        assert!(
+            !codex
+                .capabilities
+                .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
+        );
+        assert!(
+            codex
+                .capabilities
+                .contains(&bcode_model::ModelCacheCapability::ProviderState)
+        );
+
+        let responses = openai_model_cache_info(OpenAiCompatibleDialect::ResponsesApi);
+        assert!(
+            responses
+                .capabilities
+                .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
+        );
+        assert!(
+            !responses
+                .capabilities
+                .contains(&bcode_model::ModelCacheCapability::ProviderState)
         );
     }
 
