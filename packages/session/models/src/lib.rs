@@ -1460,6 +1460,12 @@ pub enum LegacyToolPresentationSection {
     Fields {
         fields: Vec<LegacyLegacyToolPresentationFieldValue>,
     },
+    /// Historical file-change preview retained for persisted session compatibility.
+    Diff {
+        path: Option<String>,
+        old_text: String,
+        new_text: String,
+    },
     Terminal {
         output: String,
         columns: u16,

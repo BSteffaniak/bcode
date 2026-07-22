@@ -1850,6 +1850,60 @@ mod tests {
     }
 
     #[test]
+    fn decodes_legacy_tool_presentation_diff_section() {
+        let payload = serde_json::json!({
+            "schema_version": 25,
+            "sequence": 14_260,
+            "timestamp_ms": 1,
+            "session_id": SessionId::new(),
+            "kind": {
+                "tool_invocation_stream": {
+                    "event": {
+                        "presentation": {
+                            "tool_call_id": "call-1",
+                            "sequence": 2,
+                            "presentation": {
+                                "card": {
+                                    "target": "preview",
+                                    "title": "Edit preview",
+                                    "subtitle": "Applying",
+                                    "sections": [{
+                                        "type": "diff",
+                                        "path": "/tmp/file.rs",
+                                        "old_text": "before",
+                                        "new_text": "after"
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let event = decode_session_event(&payload).expect("legacy diff section should decode");
+        let SessionEventKind::ToolInvocationStream {
+            event:
+                ToolInvocationStreamEvent::LegacyPresentation {
+                    presentation: bcode_session_models::LegacyToolPresentationEvent::Card(card),
+                    ..
+                },
+        } = event.kind
+        else {
+            panic!("expected a legacy presentation card");
+        };
+        assert!(matches!(
+            card.sections.as_slice(),
+            [bcode_session_models::LegacyToolPresentationSection::Diff {
+                path: Some(path),
+                old_text,
+                new_text,
+            }] if path == "/tmp/file.rs" && old_text == "before" && new_text == "after"
+        ));
+    }
+
+    #[test]
     fn rejects_corrupt_event_payload() {
         let payload = serde_json::json!({
             "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,

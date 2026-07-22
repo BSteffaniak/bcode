@@ -5317,6 +5317,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_storage_migration_replays_presentation_diff_sections() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should initialize");
+            let session = manager
+                .create_session(Some("legacy diff".to_owned()), test_working_directory())
+                .await
+                .expect("session should create");
+            manager
+                .append_event(
+                    session.id,
+                    SessionEventKind::ToolInvocationStream {
+                        event: ToolInvocationStreamEvent::Status {
+                            tool_call_id: "call-1".to_owned(),
+                            sequence: 1,
+                            message: "running".to_owned(),
+                        },
+                    },
+                )
+                .await
+                .expect("durable stream event should append");
+            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+                .await
+                .expect("fixture database should open");
+            let payload = serde_json::json!({
+                "schema_version": 25,
+                "sequence": 1,
+                "timestamp_ms": 1,
+                "session_id": session.id,
+                "provenance": null,
+                "kind": {
+                    "tool_invocation_stream": {
+                        "event": {
+                            "presentation": {
+                                "tool_call_id": "call-1",
+                                "sequence": 1,
+                                "presentation": {
+                                    "card": {
+                                        "target": "preview",
+                                        "title": "Edit preview",
+                                        "sections": [{
+                                            "type": "diff",
+                                            "path": "/tmp/file.rs",
+                                            "old_text": "before",
+                                            "new_text": "after"
+                                        }]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string();
+            db.database()
+                .update("events")
+                .value("payload", switchy::database::DatabaseValue::String(payload))
+                .where_eq("event_seq", switchy::database::DatabaseValue::Int64(1))
+                .execute(db.database())
+                .await
+                .expect("legacy diff payload should replace status payload");
+            db.database()
+                .update("session_storage_contract")
+                .value(
+                    "writer_epoch",
+                    switchy::database::DatabaseValue::Int64(i64::from(
+                        db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
+                    )),
+                )
+                .execute(db.database())
+                .await
+                .expect("writer epoch should become legacy");
+            session.id
+        };
+
+        let manager = SessionManager::persistent(&root).expect("manager should reopen");
+        manager
+            .require_write_readiness(session_id)
+            .await
+            .expect("legacy diff event should replay during migration");
+        let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("migrated database should open");
+        assert_eq!(
+            migrated.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        assert!(matches!(
+            migrated
+                .all_events_strict()
+                .await
+                .expect("migrated history should decode")[1]
+                .kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::LegacyPresentation { .. }
+            }
+        ));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn exclusive_load_automatically_migrates_missing_legacy_contract() {
         let root = unique_temp_dir();
         let session_id = {
