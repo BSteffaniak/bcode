@@ -1217,6 +1217,8 @@ pub enum SessionViewActionOutcome {
     SessionForked { fork: Box<SessionForkResult> },
     /// Session clone result.
     SessionCloned { fork: Box<SessionForkResult> },
+    /// Session working-directory change result.
+    WorkingDirectoryChanged { session: Box<SessionSummary> },
     /// Runtime-work cancellation request result.
     RuntimeWorkCancellationRequested { cancelled: bool },
     /// Context compaction request result.
@@ -1325,6 +1327,13 @@ pub enum SessionViewAction {
         session_id: SessionId,
         /// New session name override.
         name: Option<String>,
+    },
+    /// Change a session working directory.
+    ChangeWorkingDirectory {
+        /// Target session.
+        session_id: SessionId,
+        /// New working directory.
+        path: PathBuf,
     },
     /// Request cancellation of a runtime-work item.
     CancelRuntimeWork {

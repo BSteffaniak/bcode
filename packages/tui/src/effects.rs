@@ -1326,9 +1326,18 @@ impl TuiEffect {
             },
             Self::AttachWorktree { session_id, path } => TuiEffectResult::AttachWorktree {
                 path: path.clone(),
-                result: client
-                    .change_session_working_directory(session_id, path)
-                    .await,
+                result: match execute_session_view_action(
+                    &client,
+                    SessionViewAction::ChangeWorkingDirectory { session_id, path },
+                )
+                .await
+                {
+                    Ok(SessionViewActionOutcome::WorkingDirectoryChanged { session }) => {
+                        Ok(*session)
+                    }
+                    Ok(_) => Err(ClientError::UnexpectedResponse),
+                    Err(error) => Err(error),
+                },
             },
             Self::CreateWorktree { request } => TuiEffectResult::CreateWorktree {
                 result: client.create_worktree(request).await,

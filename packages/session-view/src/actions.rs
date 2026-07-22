@@ -80,6 +80,9 @@ pub async fn execute_session_view_action(
         SessionViewAction::CloneSession { session_id, name } => {
             execute_clone_session(client, session_id, name).await
         }
+        SessionViewAction::ChangeWorkingDirectory { session_id, path } => {
+            execute_change_working_directory(client, session_id, path).await
+        }
         SessionViewAction::CancelRuntimeWork {
             session_id,
             work_id,
@@ -216,6 +219,20 @@ async fn execute_clone_session(
 ) -> Result<SessionViewActionOutcome, ClientError> {
     Ok(SessionViewActionOutcome::SessionCloned {
         fork: Box::new(client.clone_session(session_id, name).await?),
+    })
+}
+
+async fn execute_change_working_directory(
+    client: &BcodeClient,
+    session_id: SessionId,
+    path: std::path::PathBuf,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    Ok(SessionViewActionOutcome::WorkingDirectoryChanged {
+        session: Box::new(
+            client
+                .change_session_working_directory(session_id, path)
+                .await?,
+        ),
     })
 }
 
