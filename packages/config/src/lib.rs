@@ -432,7 +432,17 @@ impl BcodeConfig {
     ) -> ResolvedModelSelection {
         let mut selection = ResolvedModelSelection {
             provider_plugin_id: self.model.provider_plugin_id.clone(),
+            provider_source: self
+                .model
+                .provider_plugin_id
+                .as_ref()
+                .map(|_| ModelSelectionSource::Config),
             model_id: self.model.model_id.clone(),
+            model_source: self
+                .model
+                .model_id
+                .as_ref()
+                .map(|_| ModelSelectionSource::Config),
             selected_model_id: self.model.model_id.clone(),
             model_profile: self.model.profile.clone(),
             auth_profile: None,
@@ -445,8 +455,14 @@ impl BcodeConfig {
             && let Some(profile) = self.model.profiles.get(profile_name)
         {
             selection.provider_plugin_id = Some(profile.provider_plugin_id.clone());
+            selection.provider_source = Some(ModelSelectionSource::Profile {
+                name: profile_name.clone(),
+            });
             if profile.model_id.is_some() {
                 selection.model_id.clone_from(&profile.model_id);
+                selection.model_source = Some(ModelSelectionSource::Profile {
+                    name: profile_name.clone(),
+                });
             }
             selection.auth_profile.clone_from(&profile.auth_profile);
             selection.auth_pool.clone_from(&profile.auth_pool);
@@ -459,17 +475,25 @@ impl BcodeConfig {
             && let Some(config_provider) = self.provider_plugin_id_from_config_auth()
         {
             selection.provider_plugin_id = Some(config_provider);
+            selection.provider_source = Some(ModelSelectionSource::AuthConfig);
         }
-        if let Some(env_provider) = provider_plugin_id_from_config_environment(environment) {
+        if let Some((env_provider, provider_source)) =
+            provider_plugin_id_and_source_from_config_environment(environment)
+        {
             let provider_changed =
                 selection.provider_plugin_id.as_deref() != Some(env_provider.as_str());
             selection.provider_plugin_id = Some(env_provider.clone());
-            if let Some(model_id) = model_id_from_config_environment(environment, &env_provider) {
+            selection.provider_source = Some(provider_source);
+            if let Some((model_id, model_source)) =
+                model_id_and_source_from_config_environment(environment, &env_provider)
+            {
                 selection.model_id = Some(model_id);
+                selection.model_source = Some(model_source);
             } else if provider_changed {
                 // Do not pass a persisted model ID for a different provider. Let the selected
                 // provider use its own default model when no provider-specific env model exists.
                 selection.model_id = None;
+                selection.model_source = None;
             }
             if provider_changed {
                 selection.model_profile = None;
@@ -479,10 +503,11 @@ impl BcodeConfig {
             }
         }
         if let Some(provider_plugin_id) = &selection.provider_plugin_id
-            && let Some(model_id) =
-                model_id_from_config_environment(environment, provider_plugin_id)
+            && let Some((model_id, model_source)) =
+                model_id_and_source_from_config_environment(environment, provider_plugin_id)
         {
             selection.model_id = Some(model_id);
+            selection.model_source = Some(model_source);
         }
         self.apply_model_metadata_override(&mut selection);
         selection
@@ -525,11 +550,17 @@ impl BcodeConfig {
             selection.selected_model_id = Some(selected_model_id);
             return;
         };
-        selection.selected_model_id = Some(selected_model_id);
+        selection.selected_model_id = Some(selected_model_id.clone());
         if let Some(provider_plugin_id) = &alias.provider_plugin_id {
             selection.provider_plugin_id = Some(provider_plugin_id.clone());
+            selection.provider_source = Some(ModelSelectionSource::Alias {
+                name: selected_model_id.clone(),
+            });
         }
         selection.model_id = Some(alias.model_id.clone());
+        selection.model_source = Some(ModelSelectionSource::Alias {
+            name: selected_model_id.clone(),
+        });
         let mut request = provider_request_values_from_json(&alias.request);
         request.extend(selection.request.clone());
         selection.request = request;
@@ -585,6 +616,64 @@ pub fn provider_plugin_id_from_config_environment(
         .or_else(|| implicit_provider_plugin_id_from_environment(environment))
 }
 
+fn provider_plugin_id_and_source_from_config_environment(
+    environment: &impl ConfigEnvironment,
+) -> Option<(String, ModelSelectionSource)> {
+    for variable in ["BCODE_MODEL_PROVIDER", "BCODE_PROVIDER"] {
+        if let Some(value) = environment
+            .var(variable)
+            .filter(|value| !value.trim().is_empty())
+            && let Some(provider) = normalize_provider_plugin_id(&value)
+        {
+            return Some((
+                provider,
+                ModelSelectionSource::Environment {
+                    variable: variable.to_string(),
+                },
+            ));
+        }
+    }
+    PROVIDER_ENVIRONMENT_SPECS.iter().find_map(|spec| {
+        spec.signal_env_vars.iter().find_map(|variable| {
+            environment
+                .var(variable)
+                .filter(|value| !value.trim().is_empty())
+                .map(|_| {
+                    (
+                        spec.plugin_id.to_string(),
+                        ModelSelectionSource::Environment {
+                            variable: (*variable).to_string(),
+                        },
+                    )
+                })
+        })
+    })
+}
+
+fn model_id_and_source_from_config_environment(
+    environment: &impl ConfigEnvironment,
+    provider_plugin_id: &str,
+) -> Option<(String, ModelSelectionSource)> {
+    PROVIDER_ENVIRONMENT_SPECS
+        .iter()
+        .find(|spec| spec.plugin_id == provider_plugin_id)
+        .and_then(|spec| {
+            spec.model_env_vars.iter().find_map(|variable| {
+                environment
+                    .var(variable)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| {
+                        (
+                            value,
+                            ModelSelectionSource::Environment {
+                                variable: (*variable).to_string(),
+                            },
+                        )
+                    })
+            })
+        })
+}
+
 fn implicit_provider_plugin_id_from_environment(
     environment: &impl ConfigEnvironment,
 ) -> Option<String> {
@@ -600,16 +689,6 @@ fn normalize_provider_plugin_id(value: &str) -> Option<String> {
         .iter()
         .find(|spec| spec.aliases.contains(&value.as_str()))
         .map(|spec| spec.plugin_id.to_string())
-}
-
-fn model_id_from_config_environment(
-    environment: &impl ConfigEnvironment,
-    provider_plugin_id: &str,
-) -> Option<String> {
-    PROVIDER_ENVIRONMENT_SPECS
-        .iter()
-        .find(|spec| spec.plugin_id == provider_plugin_id)
-        .and_then(|spec| first_env_value_from_slice(environment, spec.model_env_vars))
 }
 
 fn first_env_value<const N: usize>(
@@ -3022,11 +3101,32 @@ pub struct ModelMetadataConfig {
     pub reasoning: ReasoningConfig,
 }
 
+/// Source that selected a resolved provider or model value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSelectionSource {
+    /// Base model configuration selected the value.
+    Config,
+    /// A named model profile selected the value.
+    Profile { name: String },
+    /// A model alias selected or rewrote the value.
+    Alias { name: String },
+    /// Authentication configuration implied the provider.
+    AuthConfig,
+    /// An exact environment variable selected the value.
+    Environment { variable: String },
+}
+
 /// Resolved model selection after applying the active model profile, if any.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedModelSelection {
+    /// Effective provider plugin ID.
     pub provider_plugin_id: Option<String>,
+    /// Winning source of the provider.
+    pub provider_source: Option<ModelSelectionSource>,
+    /// Effective provider-native model ID after alias resolution.
     pub model_id: Option<String>,
+    /// Winning source of the effective model ID.
+    pub model_source: Option<ModelSelectionSource>,
     pub selected_model_id: Option<String>,
     pub model_profile: Option<String>,
     pub auth_profile: Option<String>,
@@ -6171,6 +6271,18 @@ auth_pool = "openai"
         let selection = config.resolved_model_selection_with_environment(&environment);
         assert_eq!(selection.auth_pool.as_deref(), Some("openai"));
         assert_eq!(selection.auth_profile, None);
+        assert_eq!(
+            selection.provider_source,
+            Some(crate::ModelSelectionSource::Profile {
+                name: "openai".to_string()
+            })
+        );
+        assert_eq!(
+            selection.model_source,
+            Some(crate::ModelSelectionSource::Profile {
+                name: "openai".to_string()
+            })
+        );
     }
 
     #[test]
@@ -6632,6 +6744,18 @@ custom_boolean = false
         let selection = config.resolved_model_selection();
         assert_eq!(selection.selected_model_id.as_deref(), Some("gpt-5.5-fast"));
         assert_eq!(selection.model_id.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            selection.provider_source,
+            Some(crate::ModelSelectionSource::Alias {
+                name: "gpt-5.5-fast".to_string()
+            })
+        );
+        assert_eq!(
+            selection.model_source,
+            Some(crate::ModelSelectionSource::Alias {
+                name: "gpt-5.5-fast".to_string()
+            })
+        );
         assert_eq!(
             selection.request.get("service_tier"),
             Some(&bcode_model::ProviderRequestValue::from(serde_json::json!(
@@ -7113,6 +7237,10 @@ mode = "chatgpt"
         assert_eq!(
             selection.provider_plugin_id,
             Some("bcode.openai-compatible".to_string())
+        );
+        assert_eq!(
+            selection.provider_source,
+            Some(crate::ModelSelectionSource::AuthConfig)
         );
 
         restore_provider_env(previous_env);

@@ -11710,6 +11710,10 @@ fn model_no_progress_timeout_error(message: String) -> bcode_model::ProviderErro
         message,
         retryable: true,
         provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
         retry: None,
     }
 }
@@ -14025,13 +14029,9 @@ async fn resolve_parallel_tool_call_capabilities(
                 &(),
             )
             .await
-            .is_ok_and(|capabilities| {
-                capabilities
-                    .capabilities
-                    .contains(&bcode_model::ProviderCapability::ParallelToolCalls)
-            })
+            .ok()
     } else {
-        false
+        None
     };
     let model = resolved_provider_models(
         state,
@@ -14048,15 +14048,21 @@ async fn resolve_parallel_tool_call_capabilities(
             .models
             .into_iter()
             .find(|model| model.model_id == selected_model_id)
-    })
-    .is_some_and(|model| {
-        model
-            .capabilities
-            .contains(&bcode_model::ModelCapability::ParallelToolCalls)
     });
+    let feature =
+        bcode_model::RequestedModelFeature::ToolChoice(bcode_model::ToolChoiceMode::Parallel);
+    let guaranteed = provider
+        .as_ref()
+        .zip(model.as_ref())
+        .is_some_and(|(provider, model)| {
+            provider
+                .feature_support
+                .negotiate(&model.feature_support, feature)
+                .is_guaranteed()
+        });
     bcode_model::ParallelToolCallCapabilities {
-        provider,
-        model,
+        provider: guaranteed,
+        model: guaranteed,
         runtime,
     }
 }
@@ -21566,6 +21572,10 @@ library = "test"
             retryable: false,
             retry: None,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
         };
 
         assert!(should_retry_after_context_overflow(decision, &error, false));
@@ -24398,6 +24408,10 @@ library = "test"
             message: "too many tokens".to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
 
@@ -24412,6 +24426,10 @@ library = "test"
             message: "EOF while parsing a string".to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
 
@@ -24428,6 +24446,10 @@ library = "test"
             message: "try again later".to_string(),
             retryable: true,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let mut state = test_server_state(SessionManager::default());
@@ -24544,6 +24566,10 @@ library = "test"
             message: "exceeded request buffer limit while retrying upstream".to_string(),
             retryable: true,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let selection = SessionModelSelection {
@@ -24584,6 +24610,10 @@ library = "test"
             message: "no_biscuit_no_service".to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let selection = SessionModelSelection {
@@ -24810,6 +24840,10 @@ library = "test"
             message: "bad request".to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let selection = SessionModelSelection::default();
@@ -24919,6 +24953,10 @@ library = "test"
             message: r#"{"detail":"Unsupported content type"}"#.to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let selection = SessionModelSelection {
@@ -24958,6 +24996,10 @@ library = "test"
             message: r#"{"detail":"Unsupported content type"}"#.to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let selection = SessionModelSelection {
@@ -24977,6 +25019,10 @@ library = "test"
             message: "Unsupported content type".to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: Some(Box::new(bcode_model::ProviderRetryHint {
                 retry_after_ms: Some(60_000),
                 retry_at_unix: None,
@@ -25007,6 +25053,10 @@ library = "test"
             message: "try again later".to_string(),
             retryable: true,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: Some(Box::new(bcode_model::ProviderRetryHint {
                 retry_after_ms: Some(60_000),
                 retry_at_unix: None,
@@ -25034,6 +25084,10 @@ library = "test"
             message: "try again later".to_string(),
             retryable: true,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let config = bcode_config::ModelRetryConfig {
@@ -25065,6 +25119,10 @@ library = "test"
             message: "invalid JSON".to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         let invalid_request_error = bcode_model::ProviderError {
@@ -25073,6 +25131,10 @@ library = "test"
             message: "bad request".to_string(),
             retryable: false,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
 
@@ -25088,6 +25150,10 @@ library = "test"
             message: "try again later".to_string(),
             retryable: true,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
             retry: None,
         };
         assert!(should_defer_visible_provider_error(
@@ -25202,6 +25268,7 @@ library = "test"
                 context_window: Some(8_000),
                 max_output_tokens: Some(1_000),
                 capabilities: BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
@@ -25215,6 +25282,7 @@ library = "test"
                 context_window: Some(16_000),
                 max_output_tokens: Some(2_000),
                 capabilities: BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
@@ -29855,6 +29923,10 @@ library = "test"
             retryable: false,
             retry: None,
             provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
         };
         bcode_fake_provider_plugin::reset_fake_compaction_started();
 

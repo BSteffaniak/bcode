@@ -1172,6 +1172,7 @@ impl BmuxApp {
                 context_window: Some(context_window),
                 max_output_tokens: status.max_output_tokens,
                 capabilities: std::collections::BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: status.reasoning.clone(),
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,

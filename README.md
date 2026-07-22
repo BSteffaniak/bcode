@@ -11,6 +11,64 @@ The `bcode` crate can be used directly from Rust applications without launching 
 bcode = { version = "0.0.1-alpha.0", default-features = false }
 ```
 
+The `bcode.model-provider/v1` operation, lifecycle, capability, event, error, retry, timeout, and cancellation requirements are documented in [the model provider contract](docs/model-provider-contract.md). Provider authors can run the public deterministic `bcode_model_provider_runtime::run_provider_conformance_suite` against an in-process adapter, loaded plugin, or proxy. SDK application tests can enable the opt-in `testing` feature for deterministic provider/tool/permission/cache/session/clock fixtures, complete request/lifecycle capture, and stream assertions without native plugins, a daemon, credentials, or network access; see [the deterministic testing guide](docs/sdk-testing.md) and executable [`scripted_provider` example](packages/bcode/examples/scripted_provider.rs). Provider-independent result scoring is separately opt-in through the `evaluation` feature; see [the SDK evaluation guide](docs/sdk-evaluation.md).
+
+For application-defined providers, implement one in-process turn method and wrap it with `InProcessModelProviderAdapter`. The adapter owns provider turn IDs, polling, terminal lifecycle events, cancellation races, and idempotent cleanup; the existing runtime still owns tool loops, policy, timeouts, and optional sessions. See [`packages/bcode/examples/custom_provider.rs`](packages/bcode/examples/custom_provider.rs).
+
+```rust,no_run
+use bcode::{
+    InProcessModelProvider, InProcessModelProviderAdapter, InProcessProviderContext,
+    InProcessProviderFuture, InProcessProviderOutcome, ModelTurnRequest, ProviderTurnEvent,
+};
+
+struct CustomProvider;
+
+impl InProcessModelProvider for CustomProvider {
+    fn run_turn(
+        &self,
+        _request: ModelTurnRequest,
+        context: InProcessProviderContext,
+    ) -> InProcessProviderFuture<'_> {
+        Box::pin(async move {
+            context.events().emit(ProviderTurnEvent::TextDelta {
+                text: "hello from my provider".to_string(),
+            }).expect("turn is active");
+            Ok(InProcessProviderOutcome::EndTurn)
+        })
+    }
+}
+
+let provider = InProcessModelProviderAdapter::new(CustomProvider);
+```
+
+Implement `ModelProviderInvoker` directly only when adapting an existing external polling lifecycle.
+
+Provider-specific request controls stay out of the provider-neutral model API. Opt into a provider feature, then pass its documented typed extension through the agent builder; the extension is serialized in a provider-scoped envelope and rejected if sent to a foreign provider or unsupported API surface. For example, the OpenAI-compatible feature exposes Responses API service tier, truncation, safety identifier, and prompt-cache retention without stringly typed JSON:
+
+```toml
+[dependencies]
+bcode = { version = "0.0.1-alpha.0", default-features = false, features = ["openai-compatible-provider"] }
+```
+
+```rust,no_run
+use bcode::{Agent, openai::{OpenAiResponsesRequestOptions, OpenAiServiceTier}};
+
+let agent = Agent::builder()
+    .model("gpt-5")
+    .provider_extension(&OpenAiResponsesRequestOptions {
+        service_tier: Some(OpenAiServiceTier::Priority),
+        safety_identifier: Some("stable-user-id".to_string()),
+        ..OpenAiResponsesRequestOptions::default()
+    })?;
+# Ok::<(), bcode::BcodeError>(())
+```
+
+The feature is disabled by default, so lean custom-provider and agent users do not compile the OpenAI-compatible transport stack. `ProviderRequestContext::request` remains an explicitly advanced, untyped escape hatch for newly released provider fields that have no typed extension yet; providers reserve typed/core field names and fail conflicting overrides.
+
+Granular capability negotiation is separate from these provider-native options. `ProviderCapabilities::feature_support` reports the active provider surface, and each `ModelInfo::feature_support` reports only model-specific evidence. `ModelTurnRequest::requested_features()` inventories parameters, structured-output strictness, tool modes/parallelism, cache hints, and media input. `ModelFeatureSupport::negotiate(...)` returns `Guaranteed` only when both provider and model affirm support with provenance; missing legacy/catalog data remains `Unknown`, never an implicit guarantee. Provider adapters additionally reject unsupported requested controls before network work.
+
+Provider/model resolution is inspectable rather than implicit. `Bcode::default_selection_provenance()`, `ProviderRegistry::default_selection_report()`, and `Agent::selection_report()` expose the effective selector, winning provider/model sources (config, profile, alias, auth config, exact environment variable, explicit registration, or per-request override), provider registration source, and selected model metadata source. Per-request builder overrides replace only the provenance they actually supersede.
+
 Basic stateless text generation uses explicit imports and a provider invoker:
 
 ```rust,no_run
@@ -182,7 +240,7 @@ let response = bcode::generate_text_builder()
 # }
 ```
 
-Middleware can implement rate-limit/budget rejection, redaction and safety transforms, response auditing, and tracing without server or TUI dependencies. For buffered response caching, implement `ModelResponseCache` and attach it with `response_cache(...)`; the application owns key construction, expiration, capacity, and storage, while Bcode performs lookup after request middleware and stores successful non-streaming provider responses before response middleware. `RetryPolicy` retries only provider-originated failures through the runtime's cancellation-aware retry boundary; `FallbackPolicy` instead switches through an ordered list of provider/model selectors. Configure one planner directly when custom behavior must combine retry, fallback, compaction, or request rebuilding. Timeout, cancellation, permission, tool, middleware, cache, and validation failures remain terminal by default.
+Middleware can implement rate-limit/budget rejection, redaction and safety transforms, response auditing, and tracing without server or TUI dependencies. For buffered response caching, implement `ModelResponseCache` or use bounded `InMemoryModelResponseCache`, then attach it with `response_cache(...)`. Bcode derives secret-safe provider/model/config/request identities after request middleware, preserves complete structured/tool/usage responses, exposes hit/stored/bypassed provenance, runs response middleware and hooks on hits, bypasses unsafe tool/custom-routing/custom-stop requests unless explicitly identified, and supports expiration, invalidation, privacy, and bounded single-flight behavior. See `docs/model-response-cache.md`. `RetryPolicy` retries only provider-originated failures through the runtime's cancellation-aware retry boundary; `FallbackPolicy` instead switches through an ordered list of provider/model selectors. Configure one planner directly when custom behavior must combine retry, fallback, compaction, or request rebuilding. Timeout, cancellation, permission, tool, middleware, cache, and validation failures remain terminal by default.
 
 High-level `TextStream`, `ObjectStream<T>`, and `ScopedAgentStream` use the canonical provider/tool loop, so configured tools and provider round planners—including retry and fallback policies—remain active. They apply request middleware before provider startup and response middleware plus model hooks to the terminal response. `TextStreamItem::ScopedEvent` retains invocation lifecycle and contribution events that do not fit the normalized model-event family. Response transforms do not buffer, rewrite, or retract already emitted deltas; transformed terminal `response.text` is canonical and Bcode resynchronizes `response.runtime.text` plus ordered `response.steps` after the middleware stack. A response-middleware rejection becomes the single terminal typed SDK error after any visible events. Streaming intentionally bypasses `ModelResponseCache`: replaying a cached completed response would not reproduce trustworthy event timing or provider/tool lifecycle. Low-level `AgentStream` remains available as the raw runtime stream when SDK middleware, hooks, tools, and provider-round planning are not wanted.
 
@@ -192,9 +250,14 @@ High-level `TextStream`, `ObjectStream<T>`, and `ScopedAgentStream` use the cano
 
 ### Optional sessions and persistence
 
-Stateless calls do not require a session. For frontend-oriented conversations, call `Agent::chat()` and `AgentSession::send(...)`; `session()` and `generate_text_with_provider(...)` remain the explicit equivalents. The chat/session wrapper exposes the visible transcript, append, retry/regenerate, branch/fork, and import/export operations.
+Stateless calls do not require a session. For frontend-oriented conversations, call `Agent::chat()` and `AgentSession::send(...)`; `session()` and `generate_text_with_provider(...)` remain the explicit equivalents. Successful turns preserve the complete visible assistant/tool/result transcript used by later model context. The wrapper also exposes append, retry/regenerate, branch/fork, and import/export operations with commit-before-mutation persistence semantics. See `docs/stateful-chat.md`.
 
-Applications can attach memory, retrieval, summaries, or profile context through `SessionContextProvider`. Context providers return normal `ModelMessage` values for each request, but those injected messages are not appended to or persisted with the visible transcript. For extensible SDK-managed persistence, implement `SessionPersistenceAdapter` and call `Agent::session_with_persistence(...)`; adapters load/save complete `PersistedSession` values and can target databases, object stores, or application services without TUI/server dependencies. `LocalSessionStore` is the built-in explicit JSON adapter and remains available through `session_with_store(...)`. Missing stores start empty, while empty or corrupt stores return repair/replacement errors instead of silently rebuilding or replaying unbounded history.
+Applications can attach legacy request context through `SessionContextProvider`, or use the typed
+`MemoryProvider` contract for query-aware retrieval with relevance, provenance, privacy, size
+bounds, failure policy, and retrieval reports. Retrieved memory is request-only and never mutates the
+visible/persisted transcript. Persisted memory requires an explicit
+`AgentSession::remember(...)` call with `MemoryRetention::SessionTranscript`. See
+`docs/application-memory.md` for the complete contract. Context providers return normal `ModelMessage` values for each request, but those injected messages are not appended to or persisted with the visible transcript. For extensible SDK-managed persistence, implement `SessionPersistenceAdapter` and call `Agent::session_with_persistence(...)`; adapters load/save complete `PersistedSession` values and can target databases, object stores, or application services without TUI/server dependencies. `LocalSessionStore` is the built-in explicit JSON adapter and remains available through `session_with_store(...)`. Missing stores start empty, while empty or corrupt stores return repair/replacement errors instead of silently rebuilding or replaying unbounded history.
 
 Daemon-backed session catalogs, attach/history operations, model selection, input submission, and cancellation remain intentionally `bcode_client`-only. Enable `daemon-client` and use the re-exported `BcodeClient`; embedded `AgentSession` persistence adapters do not silently connect to or depend on a daemon.
 

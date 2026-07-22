@@ -1,0 +1,13 @@
+error[E0432]: unresolved import `bcode::testing`
+ --> tests/ui/default_fail/testing_feature_is_opt_in.rs:1:12
+  |
+1 | use bcode::testing::ScriptedProvider;
+  |            ^^^^^^^ could not find `testing` in `bcode`
+  |
+note: found an item that was configured out
+ --> src/lib.rs
+  |
+  | #[cfg(feature = "testing")]
+  |       ------------------- the item is gated behind the `testing` feature
+  | pub mod testing;
+  |         ^^^^^^^

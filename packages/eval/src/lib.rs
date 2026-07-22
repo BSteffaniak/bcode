@@ -11,6 +11,35 @@
 
 //! Leaf eval runner, judges, reports, comparisons, and baselines for Bcode.
 
+mod sdk;
+
+pub use sdk::{
+    AgentStepCount, LatencyAtMost, NoopSdkEvalObserver, OutputContains, SDK_EVAL_RUN_FILENAME,
+    SDK_EVAL_RUN_SCHEMA_VERSION, SdkCriterionScore, SdkEvalCase, SdkEvalCaseResult,
+    SdkEvalCriterion, SdkEvalError, SdkEvalObserver, SdkEvalProvenance, SdkEvalReport, SdkEvalRun,
+    SdkEvalRunConfig, SdkEvalRunEvent, SdkEvalSubject, SdkEvaluator, StructuredEquals,
+    ToolTraceCount, UsageAtMost, load_sdk_eval_run, write_sdk_eval_run,
+};
+
+/// Typed plugin service interface for SDK evaluation artifacts.
+pub const SDK_EVAL_ARTIFACT_INTERFACE_ID: &str = "bcode.eval.sdk-artifact/v1";
+/// Load one persisted SDK evaluation run.
+pub const OP_LOAD_SDK_EVAL_RUN: &str = "load_sdk_eval_run";
+
+/// Typed request for loading one SDK evaluation artifact through a plugin.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoadSdkEvalRunRequest {
+    /// Run directory or `sdk-eval.json` path.
+    pub path: PathBuf,
+}
+
+/// Typed response containing one loaded SDK evaluation run.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LoadSdkEvalRunResponse {
+    /// Loaded run.
+    pub run: SdkEvalRun,
+}
+
 use bcode_eval_models::{
     CURRENT_IMPROVEMENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION, EvalArtifactRef, EvalBaseline,
     EvalCase, EvalCaseRunResult, EvalComparisonReport, EvalComparisonVariant, EvalDiagnostic,
@@ -54,7 +83,12 @@ pub enum EvalError {
     Validation(String),
     /// Requested executor is not supported by the selected configuration.
     #[error("unsupported executor for variant {variant_id}: {reason}")]
-    UnsupportedExecutor { variant_id: String, reason: String },
+    UnsupportedExecutor {
+        /// Variant selecting the unsupported executor.
+        variant_id: String,
+        /// Actionable unsupported-executor reason.
+        reason: String,
+    },
     /// A command failed before producing an exit status.
     #[error("command failed: {0}")]
     Command(String),

@@ -791,6 +791,7 @@ mod tests {
             context_window,
             max_output_tokens: Some(16_000),
             capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: None,

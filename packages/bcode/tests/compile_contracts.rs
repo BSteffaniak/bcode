@@ -1,0 +1,8 @@
+#![cfg(feature = "testing")]
+
+#[test]
+fn public_sdk_compile_contracts() {
+    let tests = trybuild::TestCases::new();
+    tests.pass("tests/ui/pass/*.rs");
+    tests.compile_fail("tests/ui/fail/*.rs");
+}

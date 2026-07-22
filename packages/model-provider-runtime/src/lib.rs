@@ -4,6 +4,13 @@
 
 //! Shared turn lifecycle support for native model provider plugins.
 
+mod conformance;
+pub use conformance::{
+    ProviderConformanceCase, ProviderConformanceError, ProviderConformanceOptions,
+    ProviderConformanceOutcome, ProviderConformanceReport, ProviderEventSummary,
+    ProviderEventValidator, run_provider_conformance_suite,
+};
+
 use bcode_model::{ProviderError, ProviderErrorCategory, ProviderRetryHint, ProviderTurnEvent};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -108,6 +115,211 @@ impl TurnStore {
     }
 }
 
+const REDACTED_DIAGNOSTIC: &str = "[REDACTED]";
+const MAX_PROVIDER_DIAGNOSTIC_CHARS: usize = 4_096;
+const SENSITIVE_DIAGNOSTIC_KEYS: &[&str] = &[
+    "authorization",
+    "api_key",
+    "apikey",
+    "x-api-key",
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "password",
+    "passwd",
+    "secret",
+    "secret_access_key",
+    "aws_secret_access_key",
+    "session_token",
+    "aws_session_token",
+];
+
+/// Redact credential-shaped values from an upstream provider diagnostic and bound its size.
+///
+/// Adapters must apply this before copying an upstream message into `ProviderError::message`,
+/// `provider_message`, or a preserved source. The sanitizer recognizes common header, JSON, form,
+/// query-string, URL-userinfo, bearer/basic-token, and AWS access-key shapes. It deliberately does
+/// not promise reversible or lossless diagnostics.
+#[must_use]
+pub fn sanitize_provider_diagnostic(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    for key in SENSITIVE_DIAGNOSTIC_KEYS {
+        collect_assignment_spans(message, &lower, key, &mut spans);
+    }
+    for scheme in ["bearer ", "basic "] {
+        collect_scheme_spans(message, &lower, scheme, &mut spans);
+    }
+    collect_url_userinfo_spans(message, &mut spans);
+    collect_aws_access_key_spans(message, &mut spans);
+    let redacted = replace_spans(message, spans);
+    truncate_diagnostic(&redacted)
+}
+
+fn collect_assignment_spans(
+    message: &str,
+    lower: &str,
+    key: &str,
+    spans: &mut Vec<(usize, usize)>,
+) {
+    let bytes = message.as_bytes();
+    let mut search_from = 0;
+    while let Some(relative) = lower[search_from..].find(key) {
+        let start = search_from + relative;
+        let key_end = start + key.len();
+        search_from = key_end;
+        if start > 0 && is_identifier_byte(bytes[start - 1]) {
+            continue;
+        }
+        let mut cursor = key_end;
+        if cursor < bytes.len() && matches!(bytes[cursor], b'\'' | b'"') {
+            cursor += 1;
+        }
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || !matches!(bytes[cursor], b':' | b'=') {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            continue;
+        }
+        let (value_start, value_end) = assignment_value_span(bytes, cursor);
+        if value_start < value_end {
+            spans.push((value_start, value_end));
+        }
+    }
+}
+
+const fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn assignment_value_span(bytes: &[u8], cursor: usize) -> (usize, usize) {
+    if matches!(bytes[cursor], b'\'' | b'"') {
+        let quote = bytes[cursor];
+        let mut end = cursor + 1;
+        while end < bytes.len() {
+            if bytes[end] == quote && bytes[end.saturating_sub(1)] != b'\\' {
+                break;
+            }
+            end += 1;
+        }
+        return (cursor + 1, end);
+    }
+    let mut end = cursor;
+    while end < bytes.len()
+        && !bytes[end].is_ascii_whitespace()
+        && !matches!(bytes[end], b'&' | b',' | b';' | b'}' | b']')
+    {
+        end += 1;
+    }
+    (cursor, end)
+}
+
+fn collect_scheme_spans(message: &str, lower: &str, scheme: &str, spans: &mut Vec<(usize, usize)>) {
+    let bytes = message.as_bytes();
+    let mut search_from = 0;
+    while let Some(relative) = lower[search_from..].find(scheme) {
+        let start = search_from + relative + scheme.len();
+        let mut end = start;
+        while end < bytes.len()
+            && !bytes[end].is_ascii_whitespace()
+            && !matches!(bytes[end], b',' | b';' | b'"' | b'\'')
+        {
+            end += 1;
+        }
+        if start < end {
+            spans.push((start, end));
+        }
+        search_from = end.max(start + 1);
+    }
+}
+
+fn collect_url_userinfo_spans(message: &str, spans: &mut Vec<(usize, usize)>) {
+    let bytes = message.as_bytes();
+    let mut search_from = 0;
+    while let Some(relative) = message[search_from..].find("://") {
+        let authority_start = search_from + relative + 3;
+        let authority_end = bytes[authority_start..]
+            .iter()
+            .position(|byte| matches!(byte, b'/' | b'?' | b'#' | b' ' | b'\n' | b'\r'))
+            .map_or(bytes.len(), |offset| authority_start + offset);
+        if let Some(at_offset) = bytes[authority_start..authority_end]
+            .iter()
+            .rposition(|byte| *byte == b'@')
+        {
+            let at = authority_start + at_offset;
+            if let Some(colon_offset) = bytes[authority_start..at]
+                .iter()
+                .rposition(|byte| *byte == b':')
+            {
+                let password_start = authority_start + colon_offset + 1;
+                if password_start < at {
+                    spans.push((password_start, at));
+                }
+            }
+        }
+        search_from = authority_end.max(authority_start + 1);
+    }
+}
+
+fn collect_aws_access_key_spans(message: &str, spans: &mut Vec<(usize, usize)>) {
+    let bytes = message.as_bytes();
+    for start in 0..bytes.len().saturating_sub(19) {
+        if matches!(&bytes[start..start + 4], b"AKIA" | b"ASIA")
+            && bytes[start + 4..start + 20]
+                .iter()
+                .all(u8::is_ascii_alphanumeric)
+        {
+            spans.push((start, start + 20));
+        }
+    }
+}
+
+fn replace_spans(message: &str, mut spans: Vec<(usize, usize)>) -> String {
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in spans {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut output = String::with_capacity(message.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if !message.is_char_boundary(start) || !message.is_char_boundary(end) || start < cursor {
+            continue;
+        }
+        output.push_str(&message[cursor..start]);
+        output.push_str(REDACTED_DIAGNOSTIC);
+        cursor = end;
+    }
+    output.push_str(&message[cursor..]);
+    output
+}
+
+fn truncate_diagnostic(message: &str) -> String {
+    let mut chars = message.chars();
+    let prefix = chars
+        .by_ref()
+        .take(MAX_PROVIDER_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…[TRUNCATED]")
+    } else {
+        prefix
+    }
+}
+
 /// Build a normalized provider error.
 #[must_use]
 pub fn provider_error(
@@ -128,6 +340,10 @@ pub fn provider_error(
                 | ProviderErrorCategory::Overloaded
         ),
         provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
         retry: None,
     }
 }

@@ -14,7 +14,8 @@ use bcode_model::{
     OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
     PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities, ProviderCapability,
     ProviderContextFormat, ProviderError, ProviderErrorCategory, ProviderTurnEvent,
-    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolChoice, ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -99,10 +100,18 @@ impl FakeTurn {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        self.push(ProviderTurnEvent::Cancelled);
-        self.push(ProviderTurnEvent::TurnFinished {
-            stop_reason: StopReason::Cancelled,
-        });
+        if let Ok(mut events) = self.events.lock() {
+            if events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::TurnFinished { .. }))
+            {
+                return;
+            }
+            events.push_back(ProviderTurnEvent::Cancelled);
+            events.push_back(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Cancelled,
+            });
+        }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -134,11 +143,7 @@ impl FakeProviderPlugin {
         match context.request.operation.as_str() {
             OP_CAPABILITIES => json_response(&capabilities()),
             OP_MODELS => Self::models(&context.request),
-            OP_VALIDATE_CONFIG => json_response(&ValidateConfigResponse {
-                valid: true,
-                message: Some("fake provider is always valid".to_string()),
-                metadata: std::collections::BTreeMap::new(),
-            }),
+            OP_VALIDATE_CONFIG => Self::validate_config(&context.request),
             OP_CONTEXT_MANAGEMENT_CAPABILITIES => {
                 let request = match context
                     .request
@@ -171,6 +176,19 @@ impl FakeProviderPlugin {
                 "unsupported model provider operation",
             ),
         }
+    }
+
+    fn validate_config(request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<ValidateConfigRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        json_response(&ValidateConfigResponse {
+            valid: true,
+            message: Some("fake provider is always valid".to_string()),
+            failures: Vec::new(),
+            metadata: request.provider_context.settings,
+        })
     }
 
     fn models(request: &ServiceRequest) -> ServiceResponse {
@@ -229,6 +247,11 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
+        if let Some(error) = validate_fake_request(&request) {
+            return json_response(&StartTurnResponse {
+                provider_turn_id: insert_fake_error_turn(&self.state, error),
+            });
+        }
         if let Some(error) = validate_fake_parallel_tool_policy(&request) {
             return error;
         }
@@ -252,14 +275,17 @@ impl FakeProviderPlugin {
             .or_else(|| {
                 tool_result
                     .is_none()
-                    .then(|| fake_tool_call(&user_text, state.next_turn))
+                    .then(|| required_fake_tool_call(&request, state.next_turn))
                     .flatten()
+            })
+            .or_else(|| {
+                (tool_result.is_none()
+                    && !matches!(request.tool_call_policy.choice, ToolChoice::None))
+                .then(|| fake_tool_call(&user_text, state.next_turn))
+                .flatten()
             });
         let has_tool_result = tool_result.is_some();
-        let text = tool_result.map_or_else(
-            || format!("fake: {user_text}"),
-            |result| format!("fake tool result: {result}"),
-        );
+        let text = fake_response_text(&request, tool_result.as_deref(), &user_text);
         let turn = FakeTurn::default();
         turn.push(ProviderTurnEvent::TurnStarted);
         emit_fake_managed_compaction(&request, &turn);
@@ -272,12 +298,7 @@ impl FakeProviderPlugin {
         if emit_overflow {
             state.overflow_emitted = true;
         }
-        let configured_tool_call_count = request
-            .provider_context
-            .settings
-            .get("fake_parallel_tool_calls")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or_default();
+        let configured_tool_call_count = fake_tool_call_count(&request);
         let emit_malformed_tool_call = request
             .provider_context
             .settings
@@ -293,6 +314,10 @@ impl FakeProviderPlugin {
                     message: "fake context overflow".to_string(),
                     retryable: false,
                     provider_message: None,
+                    failure: None,
+                    request_id: None,
+                    diagnostic_context: Box::default(),
+                    sources: Box::default(),
                     retry: None,
                 },
             });
@@ -308,18 +333,13 @@ impl FakeProviderPlugin {
         ) {
         } else if let Some(tool_call) = tool_call {
             finish_fake_tool_turn(&turn, tool_call);
-        } else if let Some(delay) = fake_request_delay(&request) {
-            std::thread::spawn(move || {
-                FakeTurnWorker {
-                    turn,
-                    text,
-                    delay,
-                    request_input_tokens,
-                }
-                .run();
-            });
         } else {
-            finish_fake_turn(&turn, text, request_input_tokens);
+            finish_fake_text_response(
+                turn,
+                text,
+                fake_request_delay(&request),
+                request_input_tokens,
+            );
         }
         json_response(&StartTurnResponse { provider_turn_id })
     }
@@ -375,6 +395,37 @@ impl FakeProviderPlugin {
     }
 }
 
+fn finish_fake_text_response(
+    turn: FakeTurn,
+    text: Result<String, ProviderError>,
+    delay: Option<Duration>,
+    request_input_tokens: u64,
+) {
+    let text = match text {
+        Ok(text) => text,
+        Err(error) => {
+            turn.push(ProviderTurnEvent::Error { error });
+            turn.push(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Error,
+            });
+            return;
+        }
+    };
+    if let Some(delay) = delay {
+        std::thread::spawn(move || {
+            FakeTurnWorker {
+                turn,
+                text,
+                delay,
+                request_input_tokens,
+            }
+            .run();
+        });
+    } else {
+        finish_fake_turn(&turn, text, request_input_tokens);
+    }
+}
+
 struct FakeTurnWorker {
     turn: FakeTurn,
     text: String,
@@ -389,6 +440,304 @@ impl FakeTurnWorker {
             finish_fake_turn(&self.turn, self.text, self.request_input_tokens);
         }
     }
+}
+
+fn fake_response_text(
+    request: &ModelTurnRequest,
+    tool_result: Option<&str>,
+    user_text: &str,
+) -> Result<String, ProviderError> {
+    if let Some(result) = tool_result {
+        return Ok(format!("fake tool result: {result}"));
+    }
+    let Some(structured) = request.structured_output.as_ref() else {
+        return Ok(format!("fake: {user_text}"));
+    };
+    let validator =
+        jsonschema::validator_for(&structured.schema).map_err(|error| ProviderError {
+            code: "invalid_structured_output_schema".to_string(),
+            category: ProviderErrorCategory::InvalidRequest,
+            message: error.to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        })?;
+    let value = fake_value_for_schema(&structured.schema, 0).ok_or_else(|| ProviderError {
+        code: "unsupported_structured_output_schema".to_string(),
+        category: ProviderErrorCategory::UnsupportedFeature,
+        message: "fake provider cannot construct a value for the requested JSON schema".to_string(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    })?;
+    if !validator.is_valid(&value) {
+        return Err(ProviderError {
+            code: "unsupported_structured_output_schema".to_string(),
+            category: ProviderErrorCategory::UnsupportedFeature,
+            message: "fake provider cannot satisfy the requested JSON schema".to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        });
+    }
+    serde_json::to_string(&value).map_err(|error| ProviderError {
+        code: "structured_output_encode_failed".to_string(),
+        category: ProviderErrorCategory::ProviderInternal,
+        message: error.to_string(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    })
+}
+
+fn fake_value_for_schema(schema: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
+    if depth > 32 {
+        return None;
+    }
+    if let Some(value) = schema.get("const") {
+        return Some(value.clone());
+    }
+    if let Some(value) = schema
+        .get("enum")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|values| values.first())
+    {
+        return Some(value.clone());
+    }
+    for keyword in ["oneOf", "anyOf"] {
+        if let Some(value) = schema
+            .get(keyword)
+            .and_then(serde_json::Value::as_array)
+            .and_then(|variants| {
+                variants
+                    .iter()
+                    .find_map(|variant| fake_value_for_schema(variant, depth + 1))
+            })
+        {
+            return Some(value);
+        }
+    }
+    if let Some(value) = schema.get("default") {
+        return Some(value.clone());
+    }
+    let schema_type = schema
+        .get("type")
+        .and_then(|value| {
+            value.as_str().or_else(|| {
+                value
+                    .as_array()
+                    .and_then(|types| types.iter().find_map(serde_json::Value::as_str))
+            })
+        })
+        .unwrap_or("null");
+    match schema_type {
+        "object" => fake_object_for_schema(schema, depth + 1),
+        "array" => fake_array_for_schema(schema, depth + 1),
+        "string" if schema.get("pattern").is_some() => None,
+        "string" => {
+            let length = schema
+                .get("minLength")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            Some(serde_json::Value::String("x".repeat(length)))
+        }
+        "integer" => schema
+            .get("minimum")
+            .and_then(serde_json::Value::as_i64)
+            .map_or_else(
+                || Some(serde_json::json!(0)),
+                |minimum| Some(serde_json::json!(minimum)),
+            ),
+        "number" => schema
+            .get("minimum")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(serde_json::Number::from_f64)
+            .map_or_else(|| Some(serde_json::json!(0)), |number| Some(number.into())),
+        "boolean" => Some(serde_json::Value::Bool(true)),
+        "null" => Some(serde_json::Value::Null),
+        _ => None,
+    }
+}
+
+fn fake_object_for_schema(schema: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    let required = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    let mut object = serde_json::Map::new();
+    for name in required {
+        let property = properties?.get(name)?;
+        object.insert(name.to_string(), fake_value_for_schema(property, depth)?);
+    }
+    Some(serde_json::Value::Object(object))
+}
+
+fn fake_array_for_schema(schema: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
+    let length = schema
+        .get("minItems")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_default();
+    let item_schema = schema.get("items").unwrap_or(&serde_json::Value::Null);
+    let mut values = Vec::with_capacity(length);
+    for _ in 0..length {
+        values.push(fake_value_for_schema(item_schema, depth)?);
+    }
+    Some(serde_json::Value::Array(values))
+}
+
+fn insert_fake_error_turn(state: &Mutex<FakeProviderState>, error: ProviderError) -> String {
+    let mut state = state
+        .lock()
+        .expect("fake provider state lock should not be poisoned");
+    state.next_turn += 1;
+    let provider_turn_id = format!("fake-turn-{}", state.next_turn);
+    let turn = FakeTurn::default();
+    turn.push(ProviderTurnEvent::TurnStarted);
+    turn.push(ProviderTurnEvent::Error { error });
+    turn.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::Error,
+    });
+    state.turns.insert(provider_turn_id.clone(), turn);
+    provider_turn_id
+}
+
+fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
+    let unsupported = if request.parameters != bcode_model::ModelParameters::default() {
+        Some((
+            "fake_model_parameters_unsupported",
+            "fake provider does not implement model sampling or reasoning parameters",
+        ))
+    } else if matches!(
+        request.prompt_cache.mode,
+        bcode_model::PromptCacheMode::Aggressive
+    ) || request.prompt_cache.cache_system_prompt
+        || request.prompt_cache.cache_tools
+        || request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
+        })
+    {
+        Some((
+            "fake_prompt_cache_unsupported",
+            "fake provider does not implement prompt caching",
+        ))
+    } else if request.conversation_reuse.mode.is_enabled()
+        || request
+            .conversation_reuse
+            .previous_provider_response_id
+            .is_some()
+        || request
+            .conversation_reuse
+            .new_messages_start_index
+            .is_some()
+        || request.conversation_reuse.provider_state.is_some()
+    {
+        Some((
+            "fake_conversation_reuse_unsupported",
+            "fake provider does not implement provider-native conversation reuse",
+        ))
+    } else if !request.provider_context.request.is_empty() {
+        Some((
+            "fake_provider_options_unsupported",
+            "fake provider does not implement provider-native request options",
+        ))
+    } else if matches!(request.tool_call_policy.choice, ToolChoice::Required)
+        && request.tools.is_empty()
+    {
+        Some((
+            "fake_required_tool_without_tools",
+            "required tool choice needs at least one registered tool",
+        ))
+    } else if let ToolChoice::Tool { name } = &request.tool_call_policy.choice
+        && !request.tools.iter().any(|tool| tool.name == *name)
+    {
+        Some((
+            "fake_unknown_required_tool",
+            "named tool choice must reference a registered tool",
+        ))
+    } else if request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    }) {
+        Some((
+            "fake_image_input_unsupported",
+            "fake provider does not implement image input",
+        ))
+    } else {
+        None
+    };
+    if let Some((code, message)) = unsupported {
+        return Some(ProviderError {
+            code: code.to_string(),
+            category: ProviderErrorCategory::UnsupportedFeature,
+            message: message.to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        });
+    }
+    request
+        .explicitly_unsupported_features(&fake_feature_support())
+        .first()
+        .map(|feature| ProviderError {
+            code: "fake_feature_unsupported".to_string(),
+            category: ProviderErrorCategory::UnsupportedFeature,
+            message: format!("fake provider does not support {feature:?}"),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        })
+}
+
+fn fake_tool_call_count(request: &ModelTurnRequest) -> usize {
+    request
+        .provider_context
+        .settings
+        .get("fake_parallel_tool_calls")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            usize::from(
+                request.tool_call_policy.parallel
+                    && request.tools.len() > 1
+                    && matches!(request.tool_call_policy.choice, ToolChoice::Required),
+            ) * request.tools.len()
+        })
 }
 
 fn validate_fake_parallel_tool_policy(request: &ModelTurnRequest) -> Option<ServiceResponse> {
@@ -475,6 +824,10 @@ fn finish_configured_fake_tool_conformance(
                 message: "fake provider emitted a malformed tool call".to_owned(),
                 retryable: false,
                 provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
                 retry: None,
             },
         });
@@ -499,6 +852,9 @@ fn finish_configured_fake_tool_conformance(
             },
         );
     }
+    turn.push(ProviderTurnEvent::Usage {
+        usage: TokenUsage::default(),
+    });
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::ToolCall,
     });
@@ -515,6 +871,9 @@ fn finish_fake_tool_call(turn: &FakeTurn, call: ToolCall) {
 
 fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall) {
     finish_fake_tool_call(turn, call);
+    turn.push(ProviderTurnEvent::Usage {
+        usage: TokenUsage::default(),
+    });
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::ToolCall,
     });
@@ -542,6 +901,87 @@ fn fake_delay() -> Option<Duration> {
     }
 }
 
+fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
+    use bcode_model::{
+        CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
+        ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
+    };
+    let supported = || CapabilitySupport::Supported {
+        source: CapabilitySource::TestContract,
+    };
+    let unsupported = |reason: &str| CapabilitySupport::Unsupported {
+        source: CapabilitySource::TestContract,
+        reason: reason.to_string(),
+    };
+    ModelFeatureSupport {
+        parameters: [
+            ModelParameterKey::Temperature,
+            ModelParameterKey::MaxOutputTokens,
+            ModelParameterKey::TopP,
+            ModelParameterKey::StopSequences,
+            ModelParameterKey::ReasoningBudgetTokens,
+            ModelParameterKey::ReasoningEffort,
+            ModelParameterKey::ReasoningEffortValue,
+            ModelParameterKey::ReasoningSummary,
+        ]
+        .into_iter()
+        .map(|key| {
+            (
+                key,
+                unsupported("fake provider accepts no model parameters"),
+            )
+        })
+        .collect(),
+        structured_output: [
+            (StructuredOutputMode::JsonSchema, supported()),
+            (StructuredOutputMode::StrictJsonSchema, supported()),
+        ]
+        .into_iter()
+        .collect(),
+        tool_choice: [
+            ToolChoiceMode::Auto,
+            ToolChoiceMode::None,
+            ToolChoiceMode::Required,
+            ToolChoiceMode::Named,
+            ToolChoiceMode::Parallel,
+        ]
+        .into_iter()
+        .map(|mode| (mode, supported()))
+        .collect(),
+        prompt_cache: [
+            PromptCacheFeature::ConversationPrefix,
+            PromptCacheFeature::ExplicitSystem,
+            PromptCacheFeature::ExplicitTools,
+            PromptCacheFeature::ExplicitMessage,
+            PromptCacheFeature::Ttl,
+        ]
+        .into_iter()
+        .map(|feature| {
+            (
+                feature,
+                unsupported("fake provider does not implement prompt caching"),
+            )
+        })
+        .collect(),
+        media_input: [
+            MediaInputFeature::UserImage,
+            MediaInputFeature::SystemImage,
+            MediaInputFeature::AssistantImage,
+            MediaInputFeature::ToolMessageImage,
+            MediaInputFeature::ImageReference,
+            MediaInputFeature::ToolResultImage,
+        ]
+        .into_iter()
+        .map(|feature| {
+            (
+                feature,
+                unsupported("fake provider accepts text input only"),
+            )
+        })
+        .collect(),
+    }
+}
+
 fn capabilities() -> ProviderCapabilities {
     ProviderCapabilities {
         provider_id: "bcode.fake-provider".to_string(),
@@ -551,9 +991,11 @@ fn capabilities() -> ProviderCapabilities {
             ProviderCapability::Tools,
             ProviderCapability::ParallelToolCalls,
             ProviderCapability::Cancellation,
+            ProviderCapability::JsonMode,
         ]
         .into_iter()
         .collect(),
+        feature_support: fake_feature_support(),
         auth_schemes: BTreeSet::new(),
         retry_rules: Vec::new(),
         metadata: BTreeMap::new(),
@@ -572,9 +1014,11 @@ fn models(has_context_window: bool) -> ModelList {
                 ModelCapability::StreamingText,
                 ModelCapability::ToolCalls,
                 ModelCapability::ParallelToolCalls,
+                ModelCapability::JsonMode,
             ]
             .into_iter()
             .collect(),
+            feature_support: fake_feature_support(),
             reasoning: None,
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: Some(bcode_model::ModelMetadataSource::BundledCatalog),
@@ -607,6 +1051,29 @@ fn repeated_fake_tool_call(
         id: format!("fake-tool-{}", state.next_turn),
         name: "fake.missing-tool".to_string(),
         arguments: serde_json::json!({ "round": state.next_turn }),
+    })
+}
+
+fn required_fake_tool_call(request: &ModelTurnRequest, next_turn: u64) -> Option<ToolCall> {
+    let name = match &request.tool_call_policy.choice {
+        ToolChoice::Required => request.tools.first()?.name.clone(),
+        ToolChoice::Tool { name } => request
+            .tools
+            .iter()
+            .find(|tool| tool.name == *name)?
+            .name
+            .clone(),
+        ToolChoice::Auto | ToolChoice::None => return None,
+    };
+    let arguments = if name == "filesystem.read" {
+        serde_json::json!({"path": "/tmp/bcode-provider-conformance"})
+    } else {
+        serde_json::json!({})
+    };
+    Some(ToolCall {
+        id: format!("fake-required-tool-{next_turn}"),
+        name,
+        arguments,
     })
 }
 
@@ -719,6 +1186,7 @@ fn native_web_search(request: &ServiceRequest) -> ServiceResponse {
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
+
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
@@ -733,3 +1201,34 @@ bcode_plugin_sdk::export_concurrent_plugin!(
     FakeProviderPlugin,
     include_str!("../bcode-plugin.toml")
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_model::{
+        CapabilitySupport, ModelParameterKey, RequestedModelFeature, StructuredOutputMode,
+    };
+
+    #[test]
+    fn fake_capability_contract_matches_request_validation() {
+        let provider = capabilities();
+        let model = models(true).models.remove(0);
+        assert!(provider.feature_support.has_complete_inventory());
+        assert!(model.feature_support.has_complete_inventory());
+        assert!(
+            provider
+                .feature_support
+                .negotiate(
+                    &model.feature_support,
+                    RequestedModelFeature::StructuredOutput(StructuredOutputMode::StrictJsonSchema)
+                )
+                .is_guaranteed()
+        );
+        assert!(matches!(
+            provider
+                .feature_support
+                .parameter(ModelParameterKey::Temperature),
+            CapabilitySupport::Unsupported { .. }
+        ));
+    }
+}

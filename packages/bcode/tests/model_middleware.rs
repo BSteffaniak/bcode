@@ -1,7 +1,8 @@
 use bcode::{
-    Agent, AgentTurnRequest, BcodeError, GenerateTextResponse, ModelMiddleware,
-    ModelProviderInvoker, ProviderTurnEvent, RuntimeFuture, StopReason, TextStreamItem,
-    generate_text_builder, stream_object_builder, stream_text_builder,
+    Agent, AgentTurnRequest, ApplicationRateLimitDecision, ApplicationRateLimiter, BcodeError,
+    GenerateTextResponse, ModelMiddleware, ModelProviderInvoker, ProviderTurnEvent,
+    RateLimitMiddleware, RuntimeFuture, StopReason, TextStreamItem, generate_text_builder,
+    stream_object_builder, stream_text_builder,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -167,6 +168,111 @@ async fn streaming_request_middleware_rejection_never_starts_provider() {
         Some(TextStreamItem::Error(BcodeError::Hook(message))) if message == "request budget exhausted"
     ));
     assert!(stream.next().await.is_none());
+    assert!(prompt.lock().expect("prompt lock").is_none());
+}
+
+#[derive(Debug)]
+struct DenyingLimiter;
+
+impl ApplicationRateLimiter for DenyingLimiter {
+    fn check(
+        &self,
+        request: &AgentTurnRequest,
+    ) -> std::result::Result<ApplicationRateLimitDecision, String> {
+        assert_eq!(request.model_id, "limited-model");
+        assert_eq!(
+            request.metadata.get("tenant").map(String::as_str),
+            Some("acme")
+        );
+        Ok(ApplicationRateLimitDecision::Deny {
+            reason: "tenant window exhausted".to_string(),
+            retry_at_unix: Some(1_900_000_000),
+        })
+    }
+}
+
+#[tokio::test]
+async fn application_rate_limiter_denial_is_typed_and_never_starts_provider() {
+    let prompt = Arc::new(Mutex::new(None));
+    let mut provider = RecordingProvider {
+        prompt: Arc::clone(&prompt),
+    };
+    let error = generate_text_builder()
+        .model("limited-model")
+        .metadata("tenant", "acme")
+        .prompt("limited")
+        .middleware_layer(RateLimitMiddleware::new("tenant", Arc::new(DenyingLimiter)))
+        .run(&mut provider)
+        .await
+        .expect_err("limiter should deny");
+
+    assert!(matches!(
+        error,
+        BcodeError::RateLimited {
+            limiter_id,
+            reason,
+            retry_at_unix: Some(1_900_000_000),
+        } if limiter_id == "tenant" && reason == "tenant window exhausted"
+    ));
+    assert!(prompt.lock().expect("prompt lock").is_none());
+}
+
+#[tokio::test]
+async fn streaming_rate_limiter_uses_the_same_pre_provider_boundary() {
+    let prompt = Arc::new(Mutex::new(None));
+    let provider = RecordingProvider {
+        prompt: Arc::clone(&prompt),
+    };
+    let mut stream = stream_text_builder()
+        .model("limited-model")
+        .metadata("tenant", "acme")
+        .prompt("limited")
+        .middleware_layer(RateLimitMiddleware::new("tenant", Arc::new(DenyingLimiter)))
+        .run(provider);
+
+    assert!(matches!(
+        stream.next().await,
+        Some(TextStreamItem::Error(BcodeError::RateLimited {
+            retry_at_unix: Some(1_900_000_000),
+            ..
+        }))
+    ));
+    assert!(stream.next().await.is_none());
+    assert!(prompt.lock().expect("prompt lock").is_none());
+}
+
+#[derive(Debug)]
+struct FailedLimiter;
+
+impl ApplicationRateLimiter for FailedLimiter {
+    fn check(
+        &self,
+        _request: &AgentTurnRequest,
+    ) -> std::result::Result<ApplicationRateLimitDecision, String> {
+        Err("distributed limiter unavailable".to_string())
+    }
+}
+
+#[tokio::test]
+async fn application_limiter_storage_failure_is_typed_and_fail_closed() {
+    let prompt = Arc::new(Mutex::new(None));
+    let mut provider = RecordingProvider {
+        prompt: Arc::clone(&prompt),
+    };
+    let error = generate_text_builder()
+        .prompt("limited")
+        .middleware_layer(RateLimitMiddleware::new("global", Arc::new(FailedLimiter)))
+        .run(&mut provider)
+        .await
+        .expect_err("limiter storage failure should fail closed");
+
+    assert!(matches!(
+        error,
+        BcodeError::RateLimiter {
+            limiter_id,
+            message,
+        } if limiter_id == "global" && message == "distributed limiter unavailable"
+    ));
     assert!(prompt.lock().expect("prompt lock").is_none());
 }
 

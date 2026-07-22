@@ -11,44 +11,49 @@
 use bcode_agent_permissions::{PermissionAskCallback, ask_callback};
 use bcode_agent_policy::active_tools_for;
 use bcode_agent_runtime::{
-    AgentRuntime, PermissionPolicyAuthorization, ToolBatchExecutionOutput, TurnGeneration,
-    TurnScope,
+    PermissionPolicyAuthorization, ToolBatchExecutionOutput, TurnGeneration, TurnScope,
 };
 #[cfg(feature = "embedded-plugins")]
 use bcode_model::{
-    AckResponse, CancelTurnRequest, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
-    StartTurnResponse,
+    AckResponse, CancelTurnRequest, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, OP_CANCEL_TURN,
+    OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
+    PollTurnEventsRequest, PollTurnEventsResponse, StartTurnResponse,
 };
-use bcode_model::{ModelParameters, ProviderRequestContext};
 use bcode_plugin_sdk::path::display_from_current_dir;
 #[cfg(feature = "embedded-plugins")]
 use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
-use bcode_session_models::SessionId;
+pub use bcode_session_models::SessionId;
 use futures::Stream;
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use bcode_agent_permissions::{AgentPermissionPolicy, allow_all_agent_policy};
 pub use bcode_agent_policy::{Action, AgentConfig, AgentPermissionConfig, PermissionConfig};
 pub use bcode_agent_profile::{AgentDecision, EvaluateToolCallResponse};
+#[cfg(feature = "testing")]
+pub mod testing;
 pub use bcode_agent_runtime::{
-    AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
-    AgentRuntimeStreamItem as AgentStreamItem, AgentTurnRequest, AgentTurnResponse, AllowAllPolicy,
-    CancellationToken, DEFAULT_STREAM_BUFFER_CAPACITY, ModelProviderInvoker, PermissionDecision,
-    PermissionPolicy, ProviderRoundPlan, ProviderRoundPlanContext, ProviderRoundPlanner,
-    RegisteredTool, RuntimeError, RuntimeFuture, RuntimePermissionContext,
-    RuntimePermissionRequest, ToolCatalog, ToolExecutionOutput, ToolRoundObserver, ToolRoundState,
-    ToolSource, UnifiedToolCatalog,
+    AgentLoopStopCondition, AgentLoopStopContext, AgentLoopStopPredicate,
+    AgentLoopTerminationReason, AgentRuntime, AgentRuntimeEvent as AgentEvent,
+    AgentRuntimeStream as AgentStream, AgentRuntimeStreamItem as AgentStreamItem, AgentTurnRequest,
+    AgentTurnResponse, AllowAllPolicy, CancellationToken, DEFAULT_STREAM_BUFFER_CAPACITY,
+    InProcessModelProvider, InProcessModelProviderAdapter, InProcessProviderContext,
+    InProcessProviderEmitError, InProcessProviderEventSink, InProcessProviderFuture,
+    InProcessProviderOutcome, ModelProviderInvoker, PermissionDecision, PermissionPolicy,
+    ProviderRoundPlan, ProviderRoundPlanContext, ProviderRoundPlanner, RegisteredTool,
+    RuntimeError, RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
+    ToolExecutionOutput, ToolResultPolicy, ToolResultTransform, ToolRoundObserver, ToolRoundState,
+    ToolSource, UnifiedToolCatalog, in_process_provider_error,
 };
 pub use bcode_agent_runtime::{
     ArtifactCommitGuard, HostTurnEventSink, InvocationArtifactSink, InvocationCapabilities,
@@ -62,19 +67,35 @@ pub use bcode_client::{
     BcodeClient, ClientConnection, ClientError, DaemonAvailability, SessionList,
 };
 pub use bcode_model::{
-    ContentBlock as ModelContentBlock, MessageRole, ModelInfo, ModelList, ModelMessage,
-    ProviderCapabilities, ProviderTurnEvent, StopReason, TokenUsage, ToolCall, ToolChoice,
-    ToolResult,
+    CapabilityScope, CapabilitySource, CapabilitySupport, ContentBlock as ModelContentBlock,
+    MediaInputFeature, MessageRole, ModelFeatureSupport, ModelInfo, ModelList, ModelMessage,
+    ModelMetadataSource, ModelParameterKey, ModelParameters, ModelTurnRequest,
+    NegotiatedFeatureSupport, PromptCacheFeature, ProviderCapabilities, ProviderError,
+    ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext, ProviderRequestExtension,
+    ProviderRequestProjection, ProviderRetryHint, ProviderTurnEvent, RequestedModelFeature,
+    StopReason, StructuredOutputMode, TokenUsage, ToolCall, ToolChoice, ToolChoiceMode, ToolResult,
+    ToolResultContent,
 };
+#[cfg(feature = "evaluation")]
+pub mod evaluation;
+#[cfg(feature = "openai-compatible-provider")]
+pub mod openai {
+    //! Typed provider-specific options for the OpenAI-compatible provider.
+
+    pub use bcode_openai_compatible_provider_plugin::{
+        OpenAiPromptCacheRetention, OpenAiResponsesRequestOptions, OpenAiServiceTier,
+        OpenAiTruncation,
+    };
+}
 pub use bcode_tool::PreparedToolInvocation;
 pub use bcode_tool::{
     ListToolsRequest, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifactWriteRequest,
     ToolArtifactWriteResolution, ToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
     ToolExchangeResponsePolicy, ToolExecutionOptions, ToolInvocationDescriptor,
-    ToolInvocationInput, ToolInvocationInputResolution, ToolInvocationResponse,
-    ToolInvocationResult, ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolList,
-    ToolPolicyMetadata, ToolPreparationRequest, ToolPreparationResponse, ToolSideEffect,
-    ToolUiMetadata,
+    ToolInvocationInput, ToolInvocationInputResolution, ToolInvocationLifecycleEvent,
+    ToolInvocationLifecycleStage, ToolInvocationResponse, ToolInvocationResult,
+    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolList, ToolPolicyMetadata,
+    ToolPreparationRequest, ToolPreparationResponse, ToolSideEffect, ToolUiMetadata,
 };
 
 /// Result alias for Bcode SDK operations.
@@ -156,14 +177,37 @@ impl From<String> for ModelSelector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     max_retries: u32,
-    delay: Duration,
+    base_delay: Duration,
+    max_delay: Duration,
+    jitter_millis: u64,
 }
 
 impl RetryPolicy {
     /// Create a retry policy with a maximum retry count and fixed delay.
     #[must_use]
     pub const fn new(max_retries: u32, delay: Duration) -> Self {
-        Self { max_retries, delay }
+        Self {
+            max_retries,
+            base_delay: delay,
+            max_delay: delay,
+            jitter_millis: 0,
+        }
+    }
+
+    /// Configure exponential backoff capped at `max_delay`.
+    #[must_use]
+    pub const fn with_max_delay(mut self, max_delay: Duration) -> Self {
+        self.max_delay = max_delay;
+        self
+    }
+
+    /// Configure deterministic bounded jitter in milliseconds.
+    ///
+    /// Jitter is derived from request identity and attempt, requiring no RNG/global state.
+    #[must_use]
+    pub const fn with_jitter_millis(mut self, jitter_millis: u64) -> Self {
+        self.jitter_millis = jitter_millis;
+        self
     }
 
     /// Return the maximum number of retries after the initial attempt.
@@ -175,7 +219,84 @@ impl RetryPolicy {
     /// Return the fixed delay before each retry.
     #[must_use]
     pub const fn delay(self) -> Duration {
-        self.delay
+        self.base_delay
+    }
+
+    fn retry_delay(&self, context: &ProviderRoundPlanContext<'_>) -> Duration {
+        let exponent = context.attempt.saturating_sub(1).min(31);
+        let multiplier = 1_u32 << exponent;
+        let backoff = self
+            .base_delay
+            .checked_mul(multiplier)
+            .unwrap_or(self.max_delay)
+            .min(self.max_delay);
+        let hinted = provider_retry_delay(context.previous_failure).unwrap_or(Duration::ZERO);
+        let floor = backoff.max(hinted).min(self.max_delay);
+        let jitter_bound = self.jitter_millis.min(
+            u64::try_from(self.max_delay.saturating_sub(floor).as_millis()).unwrap_or(u64::MAX),
+        );
+        if jitter_bound == 0 {
+            return floor;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(context.proposed_request.model_id.as_bytes());
+        hasher.update(
+            context
+                .proposed_request
+                .provider_plugin_id
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        hasher.update(context.attempt.to_le_bytes());
+        let digest = hasher.finalize();
+        let jitter = u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"))
+            % jitter_bound.saturating_add(1);
+        floor + Duration::from_millis(jitter)
+    }
+}
+
+fn provider_retry_delay(failure: Option<&RuntimeError>) -> Option<Duration> {
+    let RuntimeError::Provider { error, .. } = failure? else {
+        return None;
+    };
+    let hint = error.retry.as_deref()?;
+    let relative = hint.retry_after_ms.map(Duration::from_millis);
+    let absolute = hint.retry_at_unix.map(|retry_at| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        Duration::from_secs(retry_at.saturating_sub(now))
+    });
+    match (relative, absolute) {
+        (Some(relative), Some(absolute)) => Some(relative.max(absolute)),
+        (Some(delay), None) | (None, Some(delay)) => Some(delay),
+        (None, None) => None,
+    }
+}
+
+fn retryable_provider_failure(failure: &RuntimeError) -> bool {
+    match failure {
+        RuntimeError::ProviderInvocation(_) => true,
+        RuntimeError::Provider { error, .. } => error.retryable,
+        _ => false,
+    }
+}
+
+fn fallbackable_provider_failure(failure: &RuntimeError) -> bool {
+    match failure {
+        RuntimeError::ProviderInvocation(_) => true,
+        RuntimeError::Provider { error, .. } => matches!(
+            error.category,
+            ProviderErrorCategory::RateLimit
+                | ProviderErrorCategory::Network
+                | ProviderErrorCategory::Timeout
+                | ProviderErrorCategory::ModelNotFound
+                | ProviderErrorCategory::UnsupportedFeature
+                | ProviderErrorCategory::ProviderInternal
+                | ProviderErrorCategory::Overloaded
+        ),
+        _ => false,
     }
 }
 
@@ -190,14 +311,11 @@ impl ProviderRoundPlanner for RetryPolicy {
                     request: context.proposed_request.clone(),
                 });
             };
-            let retryable = matches!(
-                failure,
-                RuntimeError::ProviderInvocation(_) | RuntimeError::Provider { .. }
-            );
+            let retryable = retryable_provider_failure(failure);
             Ok(if retryable && context.attempt <= self.max_retries {
                 ProviderRoundPlan::RetryAfter {
                     request: context.proposed_request.clone(),
-                    delay: self.delay,
+                    delay: self.retry_delay(&context),
                 }
             } else {
                 ProviderRoundPlan::Fail { error: None }
@@ -244,10 +362,7 @@ impl ProviderRoundPlanner for FallbackPolicy {
                     request: context.proposed_request.clone(),
                 });
             };
-            if !matches!(
-                failure,
-                RuntimeError::ProviderInvocation(_) | RuntimeError::Provider { .. }
-            ) {
+            if !fallbackable_provider_failure(failure) {
                 return Ok(ProviderRoundPlan::Fail { error: None });
             }
             let fallback_index = context.attempt.saturating_sub(1) as usize;
@@ -262,6 +377,118 @@ impl ProviderRoundPlanner for FallbackPolicy {
                 delay: Duration::ZERO,
             })
         })
+    }
+}
+
+/// Application-owned error returned by a typed tool handler.
+///
+/// `message` and `details` are application-visible through the structured invocation result.
+/// Only `model_message` is sent back to the model, so applications can avoid exposing internal or
+/// sensitive error details accidentally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolApplicationError<D = serde_json::Value> {
+    /// Stable application-defined error code.
+    pub code: String,
+    /// Detailed application-visible error message.
+    pub message: String,
+    /// Explicitly safe model-visible error message.
+    pub model_message: String,
+    /// Typed application-owned diagnostic details.
+    pub details: D,
+    /// Whether retrying the tool operation may succeed.
+    pub retryable: bool,
+}
+
+impl<D> ToolApplicationError<D> {
+    /// Create a non-retryable typed application error.
+    #[must_use]
+    pub fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        model_message: impl Into<String>,
+        details: D,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            model_message: model_message.into(),
+            details,
+            retryable: false,
+        }
+    }
+
+    /// Mark whether retrying may succeed.
+    #[must_use]
+    pub const fn retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
+    }
+}
+
+/// Per-call context supplied to asynchronous typed tools.
+///
+/// State is available only when the application explicitly supplies it during registration.
+#[derive(Debug, Clone)]
+pub struct TypedToolContext<S> {
+    scope: InvocationScope,
+    state: Arc<S>,
+    lifecycle_sequence: Arc<AtomicU64>,
+}
+
+impl<S> TypedToolContext<S> {
+    fn new(scope: InvocationScope, state: Arc<S>) -> Self {
+        Self {
+            scope,
+            state,
+            lifecycle_sequence: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Return the canonical invocation ID.
+    #[must_use]
+    pub fn invocation_id(&self) -> &str {
+        self.scope.invocation_id()
+    }
+
+    /// Return explicitly supplied application state.
+    #[must_use]
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
+    /// Return cancellation shared with the parent model/tool turn.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.scope.cancellation()
+    }
+
+    /// Return whether cancellation has been requested or normal output has closed.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        !self.scope.accepts_work()
+    }
+
+    /// Publish a typed, ordered progress event through the canonical invocation event stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `metadata` cannot be serialized.
+    pub fn report_progress<M>(
+        &self,
+        message: impl Into<String>,
+        metadata: M,
+    ) -> std::result::Result<bool, serde_json::Error>
+    where
+        M: Serialize,
+    {
+        let event = ToolInvocationLifecycleEvent {
+            invocation_id: self.invocation_id().to_string(),
+            sequence: self.lifecycle_sequence.fetch_add(1, Ordering::Relaxed),
+            stage: ToolInvocationLifecycleStage::Progress,
+            message: Some(message.into()),
+            metadata: serde_json::to_value(metadata)?,
+        };
+        Ok(self.scope.emit_lifecycle(event))
     }
 }
 
@@ -461,6 +688,20 @@ impl GenerateTextBuilder {
     #[must_use]
     pub fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
         self.agent = self.agent.max_tool_rounds(max_tool_rounds);
+        self
+    }
+
+    /// Configure maximum consecutive semantically identical tool-call batches.
+    #[must_use]
+    pub fn max_repeated_tool_batches(mut self, limit: u32) -> Self {
+        self.agent = self.agent.max_repeated_tool_batches(limit);
+        self
+    }
+
+    /// Configure an application-owned successful-loop stop condition.
+    #[must_use]
+    pub fn stop_when(mut self, condition: impl AgentLoopStopCondition + 'static) -> Self {
+        self.agent = self.agent.stop_when(condition);
         self
     }
 
@@ -680,6 +921,20 @@ impl StreamTextBuilder {
     #[must_use]
     pub fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
         self.agent = self.agent.max_tool_rounds(max_tool_rounds);
+        self
+    }
+
+    /// Configure maximum consecutive semantically identical tool-call batches.
+    #[must_use]
+    pub fn max_repeated_tool_batches(mut self, limit: u32) -> Self {
+        self.agent = self.agent.max_repeated_tool_batches(limit);
+        self
+    }
+
+    /// Configure an application-owned successful-loop stop condition.
+    #[must_use]
+    pub fn stop_when(mut self, condition: impl AgentLoopStopCondition + 'static) -> Self {
+        self.agent = self.agent.stop_when(condition);
         self
     }
 
@@ -1461,7 +1716,7 @@ pub async fn generate_text<P>(
 where
     P: ModelProviderInvoker,
 {
-    generate_text_builder().prompt(prompt).run(provider).await
+    Box::pin(generate_text_builder().prompt(prompt).run(provider)).await
 }
 
 /// Generate text with prior conversation messages and a caller-supplied provider.
@@ -1478,11 +1733,13 @@ pub async fn generate_text_with_messages<P>(
 where
     P: ModelProviderInvoker,
 {
-    generate_text_builder()
-        .messages(messages)
-        .prompt(prompt)
-        .run(provider)
-        .await
+    Box::pin(
+        generate_text_builder()
+            .messages(messages)
+            .prompt(prompt)
+            .run(provider),
+    )
+    .await
 }
 
 /// Generate text with a caller-supplied provider and cancellation token using default settings.
@@ -1499,11 +1756,13 @@ pub async fn generate_text_with_cancellation<P>(
 where
     P: ModelProviderInvoker,
 {
-    generate_text_builder()
-        .prompt(prompt)
-        .cancellation(cancellation)
-        .run(provider)
-        .await
+    Box::pin(
+        generate_text_builder()
+            .prompt(prompt)
+            .cancellation(cancellation)
+            .run(provider),
+    )
+    .await
 }
 
 /// Stream text with a caller-supplied provider using default agent settings.
@@ -1574,11 +1833,13 @@ pub async fn generate_text_with_model<P>(
 where
     P: ModelProviderInvoker,
 {
-    generate_text_builder()
-        .model(model)
-        .prompt(prompt)
-        .run(provider)
-        .await
+    Box::pin(
+        generate_text_builder()
+            .model(model)
+            .prompt(prompt)
+            .run(provider),
+    )
+    .await
 }
 
 /// Stream text with a caller-supplied provider and model selector using default agent settings.
@@ -1645,6 +1906,27 @@ pub enum BcodeError {
     /// Hook callback failed.
     #[error("hook error: {0}")]
     Hook(String),
+    /// Response cache lookup, storage, or coordination failed.
+    #[error("response cache error: {0}")]
+    Cache(String),
+    /// Application-owned rate limiter denied a model request.
+    #[error("application rate limiter {limiter_id} denied the request: {reason}")]
+    RateLimited {
+        /// Application-defined limiter identity.
+        limiter_id: String,
+        /// Actionable denial reason.
+        reason: String,
+        /// Absolute Unix retry timestamp when known.
+        retry_at_unix: Option<u64>,
+    },
+    /// Application-owned rate limiter failed to evaluate a request.
+    #[error("application rate limiter {limiter_id} failed: {message}")]
+    RateLimiter {
+        /// Application-defined limiter identity.
+        limiter_id: String,
+        /// Limiter/storage failure detail.
+        message: String,
+    },
     /// Structured output was invalid or could not be decoded.
     #[error("structured output error: {0}")]
     StructuredOutput(String),
@@ -1679,9 +1961,26 @@ pub enum BcodeError {
     /// Session state is missing, stale, corrupt, or requires repair.
     #[error("session state requires attention: {0}")]
     SessionState(String),
+    /// Memory retrieval or validation failed before provider invocation.
+    #[error("memory provider {provider_index} failed ({code})")]
+    Memory {
+        /// Zero-based configured memory provider.
+        provider_index: usize,
+        /// Stable failure code without provider payloads.
+        code: &'static str,
+    },
+    /// Explicit memory item failed validation.
+    #[error("memory item is invalid ({code})")]
+    MemoryValidation {
+        /// Stable validation code without memory payloads.
+        code: &'static str,
+    },
     /// Tool execution failed.
     #[error("tool execution error: {0}")]
     ToolExecution(String),
+    /// Provider-specific request extension could not be encoded.
+    #[error("provider request extension error: {0}")]
+    ProviderExtension(String),
     /// Provider setup or capability discovery failed.
     #[error(
         "provider configuration failed: {0}; verify the provider plugin is enabled and its credentials, endpoint, and model settings are configured"
@@ -1798,6 +2097,99 @@ type ModelAfterHook = Arc<dyn Fn(&ModelCallContext, &ModelCallOutcome) -> Result
 type ToolBeforeHook = Arc<dyn Fn(&ToolCallContext) -> Result<()> + Send + Sync>;
 type ToolAfterHook = Arc<dyn Fn(&ToolCallContext, &ToolCallOutcome) -> Result<()> + Send + Sync>;
 
+/// Secret-safe deterministic identity for one post-middleware model request.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ModelResponseCacheKey {
+    /// Cache-key schema version.
+    pub schema_version: u32,
+    /// SHA-256 digest of provider/model/config, messages, tools, structured output, and parameters.
+    pub digest_hex: String,
+}
+
+impl ModelResponseCacheKey {
+    /// Derive a key from the complete post-middleware request without retaining prompt contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request identity cannot be serialized.
+    pub fn from_request(request: &AgentTurnRequest) -> Result<Self> {
+        let mut provider_context = request.provider_context.clone();
+        provider_context.env.values_mut().for_each(String::clear);
+        if let Some(auth) = &mut provider_context.auth {
+            auth.credentials
+                .values_mut()
+                .for_each(|credential| credential.value.clear());
+        }
+        for candidate in &mut provider_context.auth_candidates {
+            candidate.env.values_mut().for_each(String::clear);
+            candidate
+                .auth
+                .credentials
+                .values_mut()
+                .for_each(|credential| credential.value.clear());
+        }
+        let identity = serde_json::json!({
+            "schema_version": 1,
+            "provider_plugin_id": request.provider_plugin_id,
+            "model_id": request.model_id,
+            "provider_context": provider_context,
+            "system_prompt": request.system_prompt,
+            "messages": request.messages,
+            "prompt": request.prompt,
+            "append_prompt": request.append_prompt,
+            "tools": request.tools,
+            "tool_call_policy": request.tool_call_policy,
+            "structured_output": request.structured_output,
+            "parameters": request.parameters,
+            "metadata": request.metadata,
+            "max_tool_rounds": request.max_tool_rounds,
+            "max_repeated_tool_batches": request.max_repeated_tool_batches,
+            "timeout_seconds": request.timeout.as_secs(),
+            "timeout_subsec_nanos": request.timeout.subsec_nanos(),
+            "cache_routing_identity": request.cache_routing_identity,
+        });
+        let encoded = serde_json::to_vec(&identity).map_err(|error| {
+            BcodeError::Cache(format!("failed to encode cache identity: {error}"))
+        })?;
+        let digest = Sha256::digest(encoded);
+        Ok(Self {
+            schema_version: 1,
+            digest_hex: format!("{digest:x}"),
+        })
+    }
+}
+
+/// Privacy class controlling whether a response may enter shared cache storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelResponseCachePrivacy {
+    /// Request is private to its fully derived identity and may use the configured cache.
+    #[default]
+    Private,
+    /// Application has explicitly approved shared storage under its cache adapter policy.
+    Shared,
+    /// Bypass lookup and storage entirely.
+    NoStore,
+}
+
+/// Cache provenance for one SDK response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ModelResponseCacheStatus {
+    /// No cache was configured or policy bypassed it.
+    #[default]
+    Bypassed,
+    /// Cache miss; this response was produced by provider/tool execution and stored successfully.
+    Stored {
+        /// Canonical identity stored by the configured cache.
+        key: ModelResponseCacheKey,
+    },
+    /// Completed response was loaded from cache.
+    Hit {
+        /// Canonical identity loaded from the configured cache.
+        key: ModelResponseCacheKey,
+    },
+}
+
 /// Application-owned cache adapter for completed non-streaming model responses.
 ///
 /// The adapter owns cache-key construction, expiration, capacity, and storage. It receives the
@@ -1811,13 +2203,322 @@ pub trait ModelResponseCache: Send + Sync {
     /// Returns an error when cache lookup fails and the application does not want to continue.
     fn get(&self, request: &AgentTurnRequest) -> Result<Option<GenerateTextResponse>>;
 
+    /// Return privacy behavior for this request.
+    #[must_use]
+    fn privacy(&self, _request: &AgentTurnRequest) -> ModelResponseCachePrivacy {
+        ModelResponseCachePrivacy::Private
+    }
+
+    /// Return whether requests advertising tools may be cached.
+    ///
+    /// Defaults to false because a cache hit skips tool execution and therefore must never suppress
+    /// side effects implicitly. Applications opting in must version tool implementations in request
+    /// metadata and ensure replay is safe.
+    #[must_use]
+    fn allow_tool_responses(&self) -> bool {
+        false
+    }
+
     /// Store a completed response for this request.
+    ///
+    /// Responses include complete ordered steps, tool results, provider metadata, and usage. Cache
+    /// hits preserve those values; provider usage remains historical and is not billed again.
     ///
     /// # Errors
     ///
     /// Returns an error when cache storage fails and the application treats that failure as
     /// terminal.
     fn put(&self, request: &AgentTurnRequest, response: &GenerateTextResponse) -> Result<()>;
+
+    /// Abort a miss reservation after provider/tool/cache processing fails.
+    ///
+    /// Adapters implementing single-flight stampede control must wake followers so one can become
+    /// the next leader. The compatibility default is a no-op.
+    fn abort(&self, _request: &AgentTurnRequest) {}
+
+    /// Invalidate this exact request identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when invalidation fails. The compatibility default is a no-op.
+    fn invalidate(&self, _request: &AgentTurnRequest) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Bounded application-owned in-memory response cache with expiration and single-flight misses.
+#[derive(Debug)]
+pub struct InMemoryModelResponseCache {
+    ttl: Duration,
+    capacity: std::num::NonZeroUsize,
+    single_flight_timeout: Duration,
+    allow_tool_responses: bool,
+    state: Mutex<InMemoryCacheState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct InMemoryCacheState {
+    entries: BTreeMap<ModelResponseCacheKey, InMemoryCacheEntry>,
+    in_flight: BTreeMap<ModelResponseCacheKey, Instant>,
+    next_sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InMemoryCacheEntry {
+    response: GenerateTextResponse,
+    expires_at: Instant,
+    sequence: u64,
+}
+
+impl InMemoryModelResponseCache {
+    /// Create a bounded cache. Both expiration and capacity are mandatory.
+    #[must_use]
+    pub fn new(ttl: Duration, capacity: std::num::NonZeroUsize) -> Self {
+        Self {
+            ttl,
+            capacity,
+            single_flight_timeout: Duration::from_secs(30),
+            allow_tool_responses: false,
+            state: Mutex::new(InMemoryCacheState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Configure how long followers wait before replacing an abandoned miss leader.
+    ///
+    /// Zero is accepted and disables coalescing rather than permitting an unbounded wait.
+    #[must_use]
+    pub const fn with_single_flight_timeout(mut self, timeout: Duration) -> Self {
+        self.single_flight_timeout = timeout;
+        self
+    }
+
+    /// Explicitly allow or reject caching requests that advertise tools.
+    #[must_use]
+    pub const fn with_tool_responses(mut self, allow: bool) -> Self {
+        self.allow_tool_responses = allow;
+        self
+    }
+
+    /// Remove every cached response and wake miss followers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if cache synchronization was poisoned.
+    pub fn invalidate_all(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| BcodeError::Cache(error.to_string()))?;
+        state.entries.clear();
+        state.in_flight.clear();
+        drop(state);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn key(request: &AgentTurnRequest) -> Result<ModelResponseCacheKey> {
+        ModelResponseCacheKey::from_request(request)
+    }
+}
+
+impl ModelResponseCache for InMemoryModelResponseCache {
+    fn allow_tool_responses(&self) -> bool {
+        self.allow_tool_responses
+    }
+
+    fn get(&self, request: &AgentTurnRequest) -> Result<Option<GenerateTextResponse>> {
+        let key = Self::key(request)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| BcodeError::Cache(error.to_string()))?;
+        loop {
+            let now = Instant::now();
+            if let Some(entry) = state.entries.get(&key) {
+                if entry.expires_at > now {
+                    return Ok(Some(entry.response.clone()));
+                }
+                state.entries.remove(&key);
+            }
+            let lease_expires = state.in_flight.get(&key).copied();
+            if lease_expires.is_none_or(|expires| expires <= now) {
+                state
+                    .in_flight
+                    .insert(key, now + self.single_flight_timeout);
+                return Ok(None);
+            }
+            let wait = lease_expires
+                .expect("checked in-flight lease")
+                .saturating_duration_since(now);
+            let (next_state, _) = self
+                .changed
+                .wait_timeout(state, wait)
+                .map_err(|error| BcodeError::Cache(error.to_string()))?;
+            state = next_state;
+        }
+    }
+
+    fn put(&self, request: &AgentTurnRequest, response: &GenerateTextResponse) -> Result<()> {
+        let key = Self::key(request)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| BcodeError::Cache(error.to_string()))?;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let sequence = state.next_sequence;
+        state.entries.insert(
+            key.clone(),
+            InMemoryCacheEntry {
+                response: response.clone(),
+                expires_at: Instant::now() + self.ttl,
+                sequence,
+            },
+        );
+        state.in_flight.remove(&key);
+        while state.entries.len() > self.capacity.get() {
+            let oldest = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.sequence)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                state.entries.remove(&oldest);
+            }
+        }
+        drop(state);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn abort(&self, request: &AgentTurnRequest) {
+        let Ok(key) = Self::key(request) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight.remove(&key);
+            drop(state);
+            self.changed.notify_all();
+        }
+    }
+
+    fn invalidate(&self, request: &AgentTurnRequest) -> Result<()> {
+        let key = Self::key(request)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| BcodeError::Cache(error.to_string()))?;
+        state.entries.remove(&key);
+        state.in_flight.remove(&key);
+        drop(state);
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+async fn response_cache_get(
+    cache: Arc<dyn ModelResponseCache>,
+    request: AgentTurnRequest,
+) -> Result<Option<GenerateTextResponse>> {
+    tokio::task::spawn_blocking(move || cache.get(&request))
+        .await
+        .map_err(|error| BcodeError::Cache(format!("cache lookup task failed: {error}")))?
+}
+
+async fn response_cache_put(
+    cache: Arc<dyn ModelResponseCache>,
+    request: AgentTurnRequest,
+    response: GenerateTextResponse,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || cache.put(&request, &response))
+        .await
+        .map_err(|error| BcodeError::Cache(format!("cache storage task failed: {error}")))?
+}
+
+async fn response_cache_abort(cache: Arc<dyn ModelResponseCache>, request: AgentTurnRequest) {
+    let _ = tokio::task::spawn_blocking(move || cache.abort(&request)).await;
+}
+
+/// Typed application-owned model rate-limit decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplicationRateLimitDecision {
+    /// Admit this request.
+    Allow,
+    /// Reject this request before provider execution.
+    Deny {
+        /// Actionable application-defined reason.
+        reason: String,
+        /// Absolute Unix retry timestamp when known.
+        retry_at_unix: Option<u64>,
+    },
+}
+
+/// Storage-agnostic application model rate limiter.
+///
+/// Implementations own synchronization, persistence, keying, windows, and distributed semantics.
+/// The complete request exposes provider/model/config identity and application metadata.
+pub trait ApplicationRateLimiter: Send + Sync {
+    /// Atomically admit or deny one complete model request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when limiter storage or evaluation fails. Bcode treats this as terminal and
+    /// never starts the provider.
+    fn check(
+        &self,
+        request: &AgentTurnRequest,
+    ) -> std::result::Result<ApplicationRateLimitDecision, String>;
+}
+
+/// Model middleware backed by an application-owned rate limiter.
+#[derive(Clone)]
+pub struct RateLimitMiddleware {
+    limiter_id: String,
+    limiter: Arc<dyn ApplicationRateLimiter>,
+}
+
+impl fmt::Debug for RateLimitMiddleware {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RateLimitMiddleware")
+            .field("limiter_id", &self.limiter_id)
+            .field("limiter", &"<application limiter>")
+            .finish()
+    }
+}
+
+impl RateLimitMiddleware {
+    /// Create middleware around an application-owned limiter.
+    #[must_use]
+    pub fn new(limiter_id: impl Into<String>, limiter: Arc<dyn ApplicationRateLimiter>) -> Self {
+        Self {
+            limiter_id: limiter_id.into(),
+            limiter,
+        }
+    }
+}
+
+impl ModelMiddleware for RateLimitMiddleware {
+    fn before_request(&self, request: AgentTurnRequest) -> Result<AgentTurnRequest> {
+        match self
+            .limiter
+            .check(&request)
+            .map_err(|message| BcodeError::RateLimiter {
+                limiter_id: self.limiter_id.clone(),
+                message,
+            })? {
+            ApplicationRateLimitDecision::Allow => Ok(request),
+            ApplicationRateLimitDecision::Deny {
+                reason,
+                retry_at_unix,
+            } => Err(BcodeError::RateLimited {
+                limiter_id: self.limiter_id.clone(),
+                reason,
+                retry_at_unix,
+            }),
+        }
+    }
 }
 
 /// Middleware for transport-independent model request and response processing.
@@ -1895,7 +2596,12 @@ impl ModelMiddlewareStack {
 
     fn before_request(&self, mut request: AgentTurnRequest) -> Result<AgentTurnRequest> {
         for middleware in &self.middleware {
-            request = middleware.before_request(request)?;
+            request = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                middleware.before_request(request)
+            }))
+            .map_err(|payload| {
+                extension_panic("model middleware before_request", payload.as_ref())
+            })??;
         }
         Ok(request)
     }
@@ -1906,7 +2612,12 @@ impl ModelMiddlewareStack {
         mut response: GenerateTextResponse,
     ) -> Result<GenerateTextResponse> {
         for middleware in self.middleware.iter().rev() {
-            response = middleware.after_response(request, response)?;
+            response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                middleware.after_response(request, response)
+            }))
+            .map_err(|payload| {
+                extension_panic("model middleware after_response", payload.as_ref())
+            })??;
         }
         response.runtime.text.clone_from(&response.text);
         response.steps = generation_steps(&response.runtime);
@@ -1984,7 +2695,8 @@ impl AgentHooks {
 
     fn run_before_model(&self, context: &ModelCallContext) -> Result<()> {
         for hook in &self.before_model {
-            hook(context)?;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(context)))
+                .map_err(|payload| extension_panic("before-model hook", payload.as_ref()))??;
         }
         Ok(())
     }
@@ -1995,24 +2707,38 @@ impl AgentHooks {
         outcome: &ModelCallOutcome,
     ) -> Result<()> {
         for hook in &self.after_model {
-            hook(context, outcome)?;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(context, outcome)))
+                .map_err(|payload| extension_panic("after-model hook", payload.as_ref()))??;
         }
         Ok(())
     }
 
     fn run_before_tool(&self, context: &ToolCallContext) -> Result<()> {
         for hook in &self.before_tool {
-            hook(context)?;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(context)))
+                .map_err(|payload| extension_panic("before-tool hook", payload.as_ref()))??;
         }
         Ok(())
     }
 
     fn run_after_tool(&self, context: &ToolCallContext, outcome: &ToolCallOutcome) -> Result<()> {
         for hook in &self.after_tool {
-            hook(context, outcome)?;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(context, outcome)))
+                .map_err(|payload| extension_panic("after-tool hook", payload.as_ref()))??;
         }
         Ok(())
     }
+}
+
+fn extension_panic(boundary: &'static str, payload: &(dyn std::any::Any + Send)) -> BcodeError {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map_or_else(
+            || payload.downcast_ref::<String>().map(String::as_str),
+            |message| Some(*message),
+        )
+        .unwrap_or("non-string panic payload");
+    BcodeError::Hook(format!("{boundary} panicked: {detail}"))
 }
 
 type InlineToolFuture = std::pin::Pin<
@@ -2375,6 +3101,69 @@ fn json_object_slice(text: &str) -> Option<&str> {
     (start <= end).then_some(&text[start..=end])
 }
 
+fn validate_typed_tool_input(
+    schema: &serde_json::Value,
+    input: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|error| format!("invalid generated typed tool schema: {error}"))?;
+    if validator.is_valid(input) {
+        return Ok(());
+    }
+    let errors = validator
+        .iter_errors(input)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "typed tool input failed schema validation: {errors}"
+    ))
+}
+
+fn typed_tool_success_response<O>(output: O) -> std::result::Result<ToolInvocationResponse, String>
+where
+    O: Serialize,
+{
+    let value = serde_json::to_value(output)
+        .map_err(|error| format!("failed to serialize typed tool result: {error}"))?;
+    let encoded = serde_json::to_string(&value)
+        .map_err(|error| format!("failed to encode typed tool result: {error}"))?;
+    Ok(ToolInvocationResponse {
+        output: encoded.clone(),
+        is_error: false,
+        content: Vec::new(),
+        full_output: None,
+        result: Some(ToolInvocationResult::Json { value: encoded }),
+    })
+}
+
+fn typed_tool_error_response<D>(
+    error: ToolApplicationError<D>,
+) -> std::result::Result<ToolInvocationResponse, String>
+where
+    D: Serialize,
+{
+    let model_message = error.model_message.clone();
+    let mut value = serde_json::to_value(error)
+        .map_err(|error| format!("failed to serialize typed tool application error: {error}"))?;
+    value
+        .as_object_mut()
+        .expect("ToolApplicationError must serialize as an object")
+        .insert(
+            "status".to_string(),
+            serde_json::Value::String("error".to_string()),
+        );
+    let encoded = serde_json::to_string(&value)
+        .map_err(|error| format!("failed to encode typed tool application error: {error}"))?;
+    Ok(ToolInvocationResponse {
+        output: model_message,
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+        result: Some(ToolInvocationResult::Json { value: encoded }),
+    })
+}
+
 fn json_value_from_text(text: &str) -> Option<serde_json::Value> {
     if let Some(slice) = json_object_slice(text) {
         return serde_json::from_str(slice).ok();
@@ -2417,6 +3206,48 @@ fn assistant_message(text: impl Into<String>) -> ModelMessage {
         role: MessageRole::Assistant,
         content: vec![ModelContentBlock::Text { text: text.into() }],
     }
+}
+
+fn transcript_messages_from_response(response: &GenerateTextResponse) -> Vec<ModelMessage> {
+    let mut messages = Vec::new();
+    let mut assistant_content = Vec::new();
+    for step in &response.steps {
+        match step {
+            GenerationStep::Model { text, .. } => {
+                if !text.is_empty() {
+                    assistant_content.push(ModelContentBlock::Text { text: text.clone() });
+                }
+            }
+            GenerationStep::ToolCall { call, .. } => {
+                assistant_content.push(ModelContentBlock::ToolCall { call: call.clone() });
+            }
+            GenerationStep::ToolResult { result, .. } => {
+                if !assistant_content.is_empty() {
+                    messages.push(ModelMessage {
+                        role: MessageRole::Assistant,
+                        content: std::mem::take(&mut assistant_content),
+                    });
+                }
+                messages.push(ModelMessage {
+                    role: MessageRole::Tool,
+                    content: vec![ModelContentBlock::ToolResult {
+                        result: result.clone(),
+                    }],
+                });
+            }
+            GenerationStep::FinalResponse { .. } => {}
+        }
+    }
+    if !assistant_content.is_empty() {
+        messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: assistant_content,
+        });
+    }
+    if messages.is_empty() && !response.text.is_empty() {
+        messages.push(assistant_message(response.text.clone()));
+    }
+    messages
 }
 
 fn text_from_message(message: &ModelMessage) -> Option<String> {
@@ -2838,15 +3669,93 @@ impl ModelProviderInvoker for PluginModelProviderInvoker {
     }
 }
 
+/// Source that registered a provider in the SDK registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderRegistrationSource {
+    /// Provider registration came from composed configuration.
+    Configuration,
+    /// Application code registered the provider explicitly.
+    Explicit,
+    /// Provider discovery registered the provider.
+    Discovery,
+}
+
 /// Provider registry entry used by the SDK facade.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRegistration {
     /// Provider plugin ID.
     pub provider_plugin_id: String,
+    /// Provider registration provenance.
+    pub source: ProviderRegistrationSource,
     /// Provider capability metadata, when discovered or supplied.
     pub capabilities: Option<ProviderCapabilities>,
     /// Provider model metadata, when discovered or supplied.
     pub models: Option<ModelList>,
+}
+
+/// Public provenance for one resolved provider/model choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelSelectionSource {
+    /// Base configuration selected the value.
+    Config,
+    /// A named model profile selected the value.
+    Profile {
+        /// Selected profile name.
+        name: String,
+    },
+    /// A model alias selected or rewrote the value.
+    Alias {
+        /// Alias that selected or rewrote the value.
+        name: String,
+    },
+    /// Provider authentication configuration implied the provider.
+    AuthConfig,
+    /// An exact environment variable selected the value.
+    Environment {
+        /// Environment variable that selected the value.
+        variable: String,
+    },
+    /// An SDK registry default explicitly selected the value.
+    ExplicitRegistration,
+    /// An agent/request builder overrode the inherited value.
+    PerRequest,
+}
+
+/// Winning source for provider and model components of a selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectionProvenance {
+    /// Winning provider source, or `None` for an unqualified model.
+    pub provider: Option<ModelSelectionSource>,
+    /// Winning model source.
+    pub model: Option<ModelSelectionSource>,
+}
+
+#[cfg(feature = "config")]
+impl From<bcode_config::ModelSelectionSource> for ModelSelectionSource {
+    fn from(source: bcode_config::ModelSelectionSource) -> Self {
+        match source {
+            bcode_config::ModelSelectionSource::Config => Self::Config,
+            bcode_config::ModelSelectionSource::Profile { name } => Self::Profile { name },
+            bcode_config::ModelSelectionSource::Alias { name } => Self::Alias { name },
+            bcode_config::ModelSelectionSource::AuthConfig => Self::AuthConfig,
+            bcode_config::ModelSelectionSource::Environment { variable } => {
+                Self::Environment { variable }
+            }
+        }
+    }
+}
+
+/// Final effective provider/model selection report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectionReport {
+    /// Final effective provider/model selector.
+    pub selector: ModelSelector,
+    /// Winning source of each selector component.
+    pub provenance: ModelSelectionProvenance,
+    /// How the selected provider entered the registry, when known.
+    pub registration_source: Option<ProviderRegistrationSource>,
+    /// Source of selected model metadata, when known.
+    pub model_metadata_source: Option<ModelMetadataSource>,
 }
 
 /// Explicit SDK provider registry/default facade.
@@ -2854,6 +3763,7 @@ pub struct ProviderRegistration {
 pub struct ProviderRegistry {
     providers: BTreeMap<String, ProviderRegistration>,
     default_model: Option<ModelSelector>,
+    default_provenance: Option<ModelSelectionProvenance>,
 }
 
 impl ProviderRegistry {
@@ -2902,14 +3812,58 @@ impl ProviderRegistry {
         let mut registry = Self::new();
         if let Some(provider_plugin_id) = selection.provider_plugin_id.as_deref() {
             registry = registry.provider(provider_plugin_id);
+            if let Some(registration) = registry.providers.get_mut(provider_plugin_id) {
+                registration.source = ProviderRegistrationSource::Configuration;
+            }
         }
         if let Some(model_id) = selection.model_id.as_deref() {
             registry.default_model = Some(selection.provider_plugin_id.as_deref().map_or_else(
                 || ModelSelector::new(model_id),
                 |provider_plugin_id| ModelSelector::with_provider(provider_plugin_id, model_id),
             ));
+            registry.default_provenance = Some(ModelSelectionProvenance {
+                provider: selection.provider_source.clone().map(Into::into),
+                model: selection.model_source.clone().map(Into::into),
+            });
         }
         registry
+    }
+
+    /// Negotiate one granular feature for a selected provider/model.
+    #[must_use]
+    pub fn feature_support(
+        &self,
+        selector: &ModelSelector,
+        feature: RequestedModelFeature,
+    ) -> NegotiatedFeatureSupport {
+        let Some(provider_id) = selector.provider_plugin_id.as_deref() else {
+            return NegotiatedFeatureSupport::Unknown {
+                scope: CapabilityScope::Provider,
+            };
+        };
+        let Some(registration) = self.providers.get(provider_id) else {
+            return NegotiatedFeatureSupport::Unknown {
+                scope: CapabilityScope::Provider,
+            };
+        };
+        let Some(provider) = registration.capabilities.as_ref() else {
+            return NegotiatedFeatureSupport::Unknown {
+                scope: CapabilityScope::Provider,
+            };
+        };
+        let Some(model) = registration.models.as_ref().and_then(|models| {
+            models
+                .models
+                .iter()
+                .find(|model| model.model_id == selector.model_id)
+        }) else {
+            return NegotiatedFeatureSupport::Unknown {
+                scope: CapabilityScope::Model,
+            };
+        };
+        provider
+            .feature_support
+            .negotiate(&model.feature_support, feature)
     }
 
     /// Return selected provider/model capability support for parallel tool calls.
@@ -2918,31 +3872,11 @@ impl ProviderRegistry {
         &self,
         selector: &ModelSelector,
     ) -> bcode_model::ParallelToolCallCapabilities {
-        let Some(provider_id) = selector.provider_plugin_id.as_deref() else {
-            return bcode_model::ParallelToolCallCapabilities::default();
-        };
-        let Some(registration) = self.providers.get(provider_id) else {
-            return bcode_model::ParallelToolCallCapabilities::default();
-        };
-        let provider = registration
-            .capabilities
-            .as_ref()
-            .is_some_and(|capabilities| {
-                capabilities
-                    .capabilities
-                    .contains(&bcode_model::ProviderCapability::ParallelToolCalls)
-            });
-        let model = registration.models.as_ref().is_some_and(|models| {
-            models.models.iter().any(|model| {
-                model.model_id == selector.model_id
-                    && model
-                        .capabilities
-                        .contains(&bcode_model::ModelCapability::ParallelToolCalls)
-            })
-        });
+        let feature = RequestedModelFeature::ToolChoice(ToolChoiceMode::Parallel);
+        let guaranteed = self.feature_support(selector, feature).is_guaranteed();
         bcode_model::ParallelToolCallCapabilities {
-            provider,
-            model,
+            provider: guaranteed,
+            model: guaranteed,
             runtime: true,
         }
     }
@@ -2955,10 +3889,74 @@ impl ProviderRegistry {
             .entry(provider_plugin_id.clone())
             .or_insert_with(|| ProviderRegistration {
                 provider_plugin_id,
+                source: ProviderRegistrationSource::Explicit,
                 capabilities: None,
                 models: None,
             });
         self
+    }
+
+    /// Mark one provider registration as discovered rather than explicitly supplied.
+    #[must_use]
+    pub fn discovered_provider(mut self, provider_plugin_id: impl Into<String>) -> Self {
+        let provider_plugin_id = provider_plugin_id.into();
+        self.providers
+            .entry(provider_plugin_id.clone())
+            .and_modify(|registration| registration.source = ProviderRegistrationSource::Discovery)
+            .or_insert_with(|| ProviderRegistration {
+                provider_plugin_id,
+                source: ProviderRegistrationSource::Discovery,
+                capabilities: None,
+                models: None,
+            });
+        self
+    }
+
+    /// Discover and register one embedded provider's capabilities and model metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either typed provider operation cannot be invoked or decoded.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn discover_provider(
+        mut self,
+        plugins: &bcode_plugin::PluginRuntimeHost,
+        provider_plugin_id: impl Into<String>,
+        provider_context: ProviderRequestContext,
+        selected_model_id: Option<String>,
+    ) -> Result<Self> {
+        let provider_plugin_id = provider_plugin_id.into();
+        let capabilities = plugins
+            .invoke_service_json_scoped::<(), ProviderCapabilities>(
+                &provider_plugin_id,
+                MODEL_PROVIDER_INTERFACE_ID,
+                OP_CAPABILITIES,
+                &(),
+                bcode_plugin::PluginInvocationScope::Global,
+            )
+            .await
+            .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))?;
+        let models = plugins
+            .invoke_service_json_scoped::<bcode_model::ModelListRequest, ModelList>(
+                &provider_plugin_id,
+                MODEL_PROVIDER_INTERFACE_ID,
+                OP_MODELS,
+                &bcode_model::ModelListRequest {
+                    provider_context,
+                    selected_model_id,
+                },
+                bcode_plugin::PluginInvocationScope::Global,
+            )
+            .await
+            .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))?;
+        self = self
+            .discovered_provider(&provider_plugin_id)
+            .provider_capabilities(capabilities)
+            .provider_models(&provider_plugin_id, models);
+        if let Some(registration) = self.providers.get_mut(&provider_plugin_id) {
+            registration.source = ProviderRegistrationSource::Discovery;
+        }
+        Ok(self)
     }
 
     /// Register provider capabilities.
@@ -2970,6 +3968,7 @@ impl ProviderRegistry {
             .entry(provider_plugin_id.clone())
             .or_insert_with(|| ProviderRegistration {
                 provider_plugin_id,
+                source: ProviderRegistrationSource::Explicit,
                 capabilities: None,
                 models: None,
             });
@@ -2990,6 +3989,7 @@ impl ProviderRegistry {
             .entry(provider_plugin_id.clone())
             .or_insert_with(|| ProviderRegistration {
                 provider_plugin_id,
+                source: ProviderRegistrationSource::Explicit,
                 capabilities: None,
                 models: None,
             });
@@ -3000,7 +4000,13 @@ impl ProviderRegistry {
     /// Configure the default provider/model selector used by agents built from [`Bcode`].
     #[must_use]
     pub fn default_model(mut self, model: impl Into<ModelSelector>) -> Self {
-        self.default_model = Some(model.into());
+        let model = model.into();
+        let has_provider = model.provider_plugin_id.is_some();
+        self.default_model = Some(model);
+        self.default_provenance = Some(ModelSelectionProvenance {
+            provider: has_provider.then_some(ModelSelectionSource::ExplicitRegistration),
+            model: Some(ModelSelectionSource::ExplicitRegistration),
+        });
         self
     }
 
@@ -3008,6 +4014,50 @@ impl ProviderRegistry {
     #[must_use]
     pub const fn default_model_selector(&self) -> Option<&ModelSelector> {
         self.default_model.as_ref()
+    }
+
+    /// Return the winning sources for the default provider/model selection.
+    #[must_use]
+    pub const fn default_selection_provenance(&self) -> Option<&ModelSelectionProvenance> {
+        self.default_provenance.as_ref()
+    }
+
+    /// Report the effective default provider/model and all available provenance.
+    #[must_use]
+    pub fn default_selection_report(&self) -> Option<ModelSelectionReport> {
+        let selector = self.default_model.clone()?;
+        Some(self.selection_report(
+            selector,
+            self.default_provenance.clone().unwrap_or_default(),
+        ))
+    }
+
+    /// Report an effective per-request selector and provenance.
+    #[must_use]
+    pub fn selection_report(
+        &self,
+        selector: ModelSelector,
+        provenance: ModelSelectionProvenance,
+    ) -> ModelSelectionReport {
+        let registration = selector
+            .provider_plugin_id
+            .as_deref()
+            .and_then(|provider_id| self.providers.get(provider_id));
+        let model_metadata_source = registration
+            .and_then(|registration| registration.models.as_ref())
+            .and_then(|models| {
+                models
+                    .models
+                    .iter()
+                    .find(|model| model.model_id == selector.model_id)
+            })
+            .and_then(|model| model.metadata_source);
+        ModelSelectionReport {
+            selector,
+            provenance,
+            registration_source: registration.map(|registration| registration.source),
+            model_metadata_source,
+        }
     }
 
     /// Return a registered provider by plugin ID.
@@ -3080,6 +4130,34 @@ impl Bcode {
         Ok(Self::builder().load_provider_defaults()?.build())
     }
 
+    /// Discover one embedded provider into this SDK's registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded runtime is configured or typed discovery fails.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn discover_provider(
+        mut self,
+        provider_plugin_id: impl Into<String>,
+        provider_context: ProviderRequestContext,
+        selected_model_id: Option<String>,
+    ) -> Result<Self> {
+        let plugins = self
+            .plugins
+            .as_ref()
+            .ok_or(BcodeError::MissingPluginRuntime)?;
+        self.provider_registry = self
+            .provider_registry
+            .discover_provider(
+                plugins,
+                provider_plugin_id,
+                provider_context,
+                selected_model_id,
+            )
+            .await?;
+        Ok(self)
+    }
+
     /// Start building an agent attached to this SDK handle.
     #[must_use]
     pub fn agent(&self) -> AgentBuilder {
@@ -3096,12 +4174,11 @@ impl Bcode {
         } else {
             builder
         };
-        if let Some(selector) = self.provider_registry.default_model_selector() {
-            builder
-                .model_selector(selector.clone())
-                .parallel_tool_capabilities(
-                    self.provider_registry.parallel_tool_capabilities(selector),
-                )
+        if let Some(report) = self.provider_registry.default_selection_report() {
+            let selector = report.selector.clone();
+            builder.selection_report(report).parallel_tool_capabilities(
+                self.provider_registry.parallel_tool_capabilities(&selector),
+            )
         } else {
             builder
         }
@@ -3117,6 +4194,12 @@ impl Bcode {
     #[must_use]
     pub const fn default_model_selector(&self) -> Option<&ModelSelector> {
         self.provider_registry.default_model_selector()
+    }
+
+    /// Return provenance for the configured default model selection.
+    #[must_use]
+    pub const fn default_selection_provenance(&self) -> Option<&ModelSelectionProvenance> {
+        self.provider_registry.default_selection_provenance()
     }
 
     /// Return the configured runtime mode.
@@ -3433,20 +4516,514 @@ impl BcodeBuilder {
     }
 }
 
+/// Current renderer-neutral frontend event/snapshot schema version.
+pub const FRONTEND_CONTRACT_SCHEMA_VERSION: u32 = 1;
+
+/// Provider/plugin-independent transcript content for frontend snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FrontendContentBlock {
+    /// Plain visible text.
+    Text {
+        /// Visible text content.
+        text: String,
+    },
+    /// Provider-neutral image content.
+    Image {
+        /// Provider-neutral image content.
+        image: bcode_model::ImageContent,
+    },
+    /// Complete model-requested tool call.
+    ToolCall {
+        /// Complete tool call.
+        call: ToolCall,
+    },
+    /// Complete model-visible tool result.
+    ToolResult {
+        /// Complete model-visible tool result.
+        result: ToolResult,
+    },
+}
+
+/// Provider/plugin-independent visible transcript message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendMessage {
+    /// Message role.
+    pub role: MessageRole,
+    /// Visible neutral content. Provider extensions and cache points are omitted.
+    pub content: Vec<FrontendContentBlock>,
+}
+
+impl From<&ModelMessage> for FrontendMessage {
+    fn from(message: &ModelMessage) -> Self {
+        Self {
+            role: message.role,
+            content: message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    ModelContentBlock::Text { text } => {
+                        Some(FrontendContentBlock::Text { text: text.clone() })
+                    }
+                    ModelContentBlock::Image { image } => Some(FrontendContentBlock::Image {
+                        image: image.clone(),
+                    }),
+                    ModelContentBlock::ToolCall { call } => {
+                        Some(FrontendContentBlock::ToolCall { call: call.clone() })
+                    }
+                    ModelContentBlock::ToolResult { result } => {
+                        Some(FrontendContentBlock::ToolResult {
+                            result: result.clone(),
+                        })
+                    }
+                    ModelContentBlock::CachePoint { .. }
+                    | ModelContentBlock::ProviderExtension { .. } => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Renderer-neutral event safe for terminal, desktop, web, and service frontends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum FrontendEvent {
+    /// Provider turn started.
+    TurnStarted,
+    /// Visible assistant text delta.
+    TextDelta(String),
+    /// Visible reasoning delta.
+    ReasoningDelta(String),
+    /// Tool call began.
+    ToolCallStarted {
+        /// Provider call ID.
+        call_id: String,
+        /// Requested tool name.
+        name: String,
+    },
+    /// Incremental tool-call argument data.
+    ToolCallDelta {
+        /// Provider call ID.
+        call_id: String,
+        /// Argument delta.
+        delta: String,
+    },
+    /// Complete tool call.
+    ToolCallFinished(ToolCall),
+    /// Complete model-visible tool result.
+    ToolResult(ToolResult),
+    /// Provider usage update.
+    Usage(TokenUsage),
+    /// Provider-confirmed complete request input tokens.
+    ExactRequestInputTokens {
+        /// Exact token count.
+        tokens: u64,
+    },
+    /// Provider context was compacted.
+    ContextCompacted,
+    /// Provider retry was scheduled.
+    RetryScheduled {
+        /// Human-readable retry reason.
+        message: String,
+        /// Scheduled Unix timestamp.
+        retry_at_unix: u64,
+    },
+    /// Visible warning.
+    Warning(String),
+    /// Visible provider error.
+    Error {
+        /// Safe error message.
+        message: String,
+    },
+    /// Turn completed successfully.
+    Finished {
+        /// Terminal stop reason.
+        stop_reason: StopReason,
+        /// Final provider usage when available.
+        usage: Option<TokenUsage>,
+        /// Turn latency in milliseconds.
+        latency_ms: u64,
+    },
+    /// Turn was cancelled.
+    Cancelled,
+}
+
+impl FrontendEvent {
+    /// Project one normalized runtime event, omitting provider metadata and request-projection
+    /// internals by construction.
+    #[must_use]
+    pub fn from_agent_event(event: &AgentEvent) -> Option<Self> {
+        match event {
+            AgentEvent::TurnStarted => Some(Self::TurnStarted),
+            AgentEvent::TextDelta(text) => Some(Self::TextDelta(text.clone())),
+            AgentEvent::ReasoningDelta(text) => Some(Self::ReasoningDelta(text.clone())),
+            AgentEvent::ToolCallStarted { call_id, name } => Some(Self::ToolCallStarted {
+                call_id: call_id.clone(),
+                name: name.clone(),
+            }),
+            AgentEvent::ToolCallDelta { call_id, delta } => Some(Self::ToolCallDelta {
+                call_id: call_id.clone(),
+                delta: delta.clone(),
+            }),
+            AgentEvent::ToolCallFinished(call) => Some(Self::ToolCallFinished(call.clone())),
+            AgentEvent::ToolResult(result) => Some(Self::ToolResult(result.clone())),
+            AgentEvent::Usage(usage) => Some(Self::Usage(usage.clone())),
+            AgentEvent::ExactRequestInputTokens(tokens) => Some(Self::ExactRequestInputTokens {
+                tokens: tokens.get(),
+            }),
+            AgentEvent::ContextCompacted => Some(Self::ContextCompacted),
+            AgentEvent::RetryScheduled {
+                message,
+                retry_at_unix,
+            } => Some(Self::RetryScheduled {
+                message: message.clone(),
+                retry_at_unix: *retry_at_unix,
+            }),
+            AgentEvent::Warning(message) => Some(Self::Warning(message.clone())),
+            AgentEvent::ProviderError { message, .. } => Some(Self::Error {
+                message: message.clone(),
+            }),
+            AgentEvent::Finished {
+                stop_reason,
+                usage,
+                latency_ms,
+            } => Some(Self::Finished {
+                stop_reason: *stop_reason,
+                usage: usage.clone(),
+                latency_ms: *latency_ms,
+            }),
+            AgentEvent::Cancelled => Some(Self::Cancelled),
+            AgentEvent::RequestProjection(_) | AgentEvent::ProviderMetadata { .. } => None,
+        }
+    }
+}
+
+/// Versioned, correlated frontend event envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendEventEnvelope {
+    /// Frontend contract schema version.
+    pub schema_version: u32,
+    /// Session correlated with this event.
+    pub session_id: SessionId,
+    /// Turn correlated with this event.
+    pub turn_id: String,
+    /// Monotonic sequence within the correlated turn cursor.
+    pub sequence: u64,
+    /// Renderer-neutral event payload.
+    pub event: FrontendEvent,
+}
+
+/// Sequence allocator and provider-safe projector for one frontend turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontendEventCursor {
+    session_id: SessionId,
+    turn_id: String,
+    next_sequence: u64,
+}
+
+impl FrontendEventCursor {
+    /// Create a cursor at an application-selected resume sequence.
+    #[must_use]
+    pub fn new(session_id: SessionId, turn_id: impl Into<String>, next_sequence: u64) -> Self {
+        Self {
+            session_id,
+            turn_id: turn_id.into(),
+            next_sequence,
+        }
+    }
+
+    /// Return the next sequence that will be assigned to a projected event.
+    #[must_use]
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    /// Project one runtime event. Provider-internal events return `None` and consume no sequence.
+    #[must_use]
+    pub fn project(&mut self, event: &AgentEvent) -> Option<FrontendEventEnvelope> {
+        let event = FrontendEvent::from_agent_event(event)?;
+        let envelope = FrontendEventEnvelope {
+            schema_version: FRONTEND_CONTRACT_SCHEMA_VERSION,
+            session_id: self.session_id,
+            turn_id: self.turn_id.clone(),
+            sequence: self.next_sequence,
+            event,
+        };
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        Some(envelope)
+    }
+}
+
+/// Frontend turn lifecycle status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendTurnStatus {
+    /// The turn may still produce events.
+    Active,
+    /// The turn completed successfully.
+    Completed,
+    /// The turn was cancelled.
+    Cancelled,
+    /// The turn ended with an error.
+    Failed,
+}
+
+/// Materialized renderer-neutral state for one turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendTurnSnapshot {
+    /// Correlated turn ID.
+    pub turn_id: String,
+    /// Current materialized lifecycle status.
+    pub status: FrontendTurnStatus,
+    /// Concatenated visible assistant text.
+    pub text: String,
+    /// Concatenated visible reasoning text.
+    pub reasoning: String,
+    /// Latest cumulative provider usage.
+    pub usage: Option<TokenUsage>,
+    /// Provider-confirmed exact input context for the request.
+    pub exact_request_input_tokens: Option<u64>,
+    /// Terminal stop reason when known.
+    pub stop_reason: Option<StopReason>,
+    /// Terminal latency in milliseconds when known.
+    pub latency_ms: Option<u64>,
+    /// Complete observed tool calls in event order.
+    pub tool_calls: Vec<ToolCall>,
+    /// Complete observed tool results in event order.
+    pub tool_results: Vec<ToolResult>,
+    /// Visible warnings in event order.
+    pub warnings: Vec<String>,
+    /// Last visible terminal error message.
+    pub last_error: Option<String>,
+}
+
+impl FrontendTurnSnapshot {
+    const fn new(turn_id: String) -> Self {
+        Self {
+            turn_id,
+            status: FrontendTurnStatus::Active,
+            text: String::new(),
+            reasoning: String::new(),
+            usage: None,
+            exact_request_input_tokens: None,
+            stop_reason: None,
+            latency_ms: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            warnings: Vec::new(),
+            last_error: None,
+        }
+    }
+
+    fn apply(&mut self, event: &FrontendEvent) {
+        match event {
+            FrontendEvent::TurnStarted
+            | FrontendEvent::ToolCallStarted { .. }
+            | FrontendEvent::ToolCallDelta { .. }
+            | FrontendEvent::RetryScheduled { .. }
+            | FrontendEvent::ContextCompacted => {}
+            FrontendEvent::TextDelta(text) => self.text.push_str(text),
+            FrontendEvent::ReasoningDelta(text) => self.reasoning.push_str(text),
+            FrontendEvent::ToolCallFinished(call) => self.tool_calls.push(call.clone()),
+            FrontendEvent::ToolResult(result) => self.tool_results.push(result.clone()),
+            FrontendEvent::Usage(usage) => self.usage = Some(usage.clone()),
+            FrontendEvent::ExactRequestInputTokens { tokens } => {
+                self.exact_request_input_tokens = Some(*tokens);
+            }
+            FrontendEvent::Warning(message) => self.warnings.push(message.clone()),
+            FrontendEvent::Error { message } => {
+                self.last_error = Some(message.clone());
+                self.status = FrontendTurnStatus::Failed;
+            }
+            FrontendEvent::Finished {
+                stop_reason,
+                usage,
+                latency_ms,
+            } => {
+                self.status = FrontendTurnStatus::Completed;
+                self.stop_reason = Some(*stop_reason);
+                self.usage.clone_from(usage);
+                self.latency_ms = Some(*latency_ms);
+            }
+            FrontendEvent::Cancelled => {
+                self.status = FrontendTurnStatus::Cancelled;
+                self.stop_reason = Some(StopReason::Cancelled);
+            }
+        }
+    }
+}
+
+/// Result of idempotently applying a frontend event envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontendSnapshotApplyOutcome {
+    /// The event was new and changed materialized state.
+    Applied,
+    /// The event exactly matched one already applied at the same sequence.
+    Duplicate,
+}
+
+/// Validation failure while materializing a frontend snapshot.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FrontendSnapshotError {
+    /// Envelope uses an unsupported schema version.
+    #[error("unsupported frontend schema version {0}")]
+    UnsupportedVersion(u32),
+    /// Envelope belongs to another session.
+    #[error("frontend event belongs to a different session")]
+    SessionMismatch,
+    /// Envelope skipped the next required sequence.
+    #[error("frontend event sequence gap: expected {expected}, received {actual}")]
+    SequenceGap {
+        /// Next required sequence.
+        expected: u64,
+        /// Received sequence.
+        actual: u64,
+    },
+    /// Duplicate sequence carried a different payload.
+    #[error("frontend duplicate sequence {sequence} has conflicting payload")]
+    ConflictingDuplicate {
+        /// Conflicting sequence.
+        sequence: u64,
+    },
+    /// Envelope belongs to another active turn.
+    #[error("frontend event belongs to turn {actual}, active turn is {expected}")]
+    TurnMismatch {
+        /// Active turn ID.
+        expected: String,
+        /// Received turn ID.
+        actual: String,
+    },
+}
+
+/// Serializable renderer-neutral session snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendSessionSnapshot {
+    /// Frontend contract schema version.
+    pub schema_version: u32,
+    /// Materialized session ID.
+    pub session_id: SessionId,
+    /// Provider-neutral visible transcript.
+    pub transcript: Vec<FrontendMessage>,
+    /// Active or most recently materialized turn.
+    pub active_turn: Option<FrontendTurnSnapshot>,
+    /// Next event sequence required by this snapshot.
+    pub next_sequence: u64,
+    #[serde(default)]
+    applied_event_digests: BTreeMap<u64, String>,
+}
+
+impl FrontendSessionSnapshot {
+    /// Create a snapshot from visible neutral transcript messages.
+    #[must_use]
+    pub fn new(session_id: SessionId, transcript: &[ModelMessage]) -> Self {
+        Self {
+            schema_version: FRONTEND_CONTRACT_SCHEMA_VERSION,
+            session_id,
+            transcript: transcript.iter().map(FrontendMessage::from).collect(),
+            active_turn: None,
+            next_sequence: 0,
+            applied_event_digests: BTreeMap::new(),
+        }
+    }
+
+    /// Replace the visible transcript using the same provider-safe projection.
+    pub fn replace_transcript(&mut self, transcript: &[ModelMessage]) {
+        self.transcript = transcript.iter().map(FrontendMessage::from).collect();
+    }
+
+    /// Idempotently apply one event, rejecting gaps, conflicting duplicates, and mixed turns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed contract error for unsupported versions or incoherent delivery.
+    pub fn apply_event(
+        &mut self,
+        envelope: &FrontendEventEnvelope,
+    ) -> std::result::Result<FrontendSnapshotApplyOutcome, FrontendSnapshotError> {
+        if envelope.schema_version != FRONTEND_CONTRACT_SCHEMA_VERSION {
+            return Err(FrontendSnapshotError::UnsupportedVersion(
+                envelope.schema_version,
+            ));
+        }
+        if envelope.session_id != self.session_id {
+            return Err(FrontendSnapshotError::SessionMismatch);
+        }
+        let digest = frontend_event_digest(envelope);
+        if envelope.sequence < self.next_sequence {
+            return if self.applied_event_digests.get(&envelope.sequence) == Some(&digest) {
+                Ok(FrontendSnapshotApplyOutcome::Duplicate)
+            } else {
+                Err(FrontendSnapshotError::ConflictingDuplicate {
+                    sequence: envelope.sequence,
+                })
+            };
+        }
+        if envelope.sequence > self.next_sequence {
+            return Err(FrontendSnapshotError::SequenceGap {
+                expected: self.next_sequence,
+                actual: envelope.sequence,
+            });
+        }
+        let start_new = self.active_turn.as_ref().is_none_or(|turn| {
+            turn.turn_id != envelope.turn_id
+                && !matches!(turn.status, FrontendTurnStatus::Active)
+                && matches!(envelope.event, FrontendEvent::TurnStarted)
+        });
+        if start_new {
+            self.active_turn = Some(FrontendTurnSnapshot::new(envelope.turn_id.clone()));
+        }
+        let turn = self
+            .active_turn
+            .get_or_insert_with(|| FrontendTurnSnapshot::new(envelope.turn_id.clone()));
+        if turn.turn_id != envelope.turn_id {
+            return Err(FrontendSnapshotError::TurnMismatch {
+                expected: turn.turn_id.clone(),
+                actual: envelope.turn_id.clone(),
+            });
+        }
+        turn.apply(&envelope.event);
+        self.applied_event_digests.insert(envelope.sequence, digest);
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        Ok(FrontendSnapshotApplyOutcome::Applied)
+    }
+}
+
+fn frontend_event_digest(envelope: &FrontendEventEnvelope) -> String {
+    let encoded =
+        serde_json::to_vec(envelope).expect("serializing a frontend event envelope cannot fail");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
+/// Current portable SDK session payload schema version.
+pub const PERSISTED_SESSION_SCHEMA_VERSION: u32 = 1;
+
+const fn persisted_session_schema_version() -> u32 {
+    PERSISTED_SESSION_SCHEMA_VERSION
+}
+
 /// On-disk payload used by [`LocalSessionStore`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSession {
+    /// Portable payload schema version. Older unversioned payloads decode as version 1.
+    #[serde(default = "persisted_session_schema_version")]
+    pub schema_version: u32,
     /// Session ID associated with the transcript.
     pub session_id: SessionId,
     /// Caller-managed conversation transcript.
     pub messages: Vec<ModelMessage>,
+    /// Explicit transcript-persisted memory records. Older payloads default to none.
+    #[serde(default)]
+    pub memories: Vec<MemoryItem>,
 }
 
 /// Persistence adapter for SDK-managed conversation sessions.
 ///
-/// Adapters own their storage behavior and should return `Ok(None)` when no persisted session
-/// exists. Corrupt, stale, or otherwise unusable state should return a descriptive [`BcodeError`]
-/// rather than silently discarding data.
+/// Adapters must serialize concurrent saves for one logical session, atomically replace a complete
+/// payload (never expose a partial one), and make successful `save` data visible to later `load`
+/// calls. Bcode does not impose a database, locking backend, or async runtime. Applications migrate
+/// older/newer schema versions inside their adapter before returning a validated payload.
+/// Corrupt, stale, conflicting, or otherwise unusable state should return a descriptive
+/// [`BcodeError`] rather than silently discarding data.
 pub trait SessionPersistenceAdapter: Send + Sync {
     /// Load a persisted session, or return `Ok(None)` when it does not exist.
     ///
@@ -3455,7 +5032,10 @@ pub trait SessionPersistenceAdapter: Send + Sync {
     /// Returns an error when persisted state exists but cannot be read or safely decoded.
     fn load(&self) -> Result<Option<PersistedSession>>;
 
-    /// Save the complete persisted session.
+    /// Save the complete persisted session as one atomic replacement.
+    ///
+    /// Implementations must serialize concurrent writes for this logical session and must not
+    /// return success until a subsequent `load` can observe the complete payload.
     ///
     /// # Errors
     ///
@@ -3463,7 +5043,29 @@ pub trait SessionPersistenceAdapter: Send + Sync {
     fn save(&self, session: &PersistedSession) -> Result<()>;
 }
 
+fn validate_persisted_session(session: &PersistedSession) -> Result<()> {
+    if session.schema_version != PERSISTED_SESSION_SCHEMA_VERSION {
+        return Err(BcodeError::SessionState(format!(
+            "unsupported SDK session schema version {}; current version is {}; migrate with the application adapter before opening",
+            session.schema_version, PERSISTED_SESSION_SCHEMA_VERSION
+        )));
+    }
+    if session.memories.iter().any(|memory| {
+        memory.retention != MemoryRetention::SessionTranscript
+            || !session.messages.contains(&memory.message)
+    }) {
+        return Err(BcodeError::SessionState(
+            "persisted memory metadata is inconsistent with the visible transcript".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Explicit local JSON session store for SDK-managed persistence.
+///
+/// This adapter uses same-directory temporary-file replacement. Callers must serialize concurrent
+/// writers to the same path; the last completed save wins. It is a portable convenience adapter,
+/// not a multi-process transactional database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSessionStore {
     path: PathBuf,
@@ -3505,12 +5107,14 @@ impl LocalSessionStore {
                 display_from_current_dir(&self.path)
             )));
         }
-        serde_json::from_str(&contents).map(Some).map_err(|error| {
+        let session: PersistedSession = serde_json::from_str(&contents).map_err(|error| {
             BcodeError::SessionState(format!(
                 "session store {} is corrupt and requires repair or replacement: {error}",
                 display_from_current_dir(&self.path)
             ))
-        })
+        })?;
+        validate_persisted_session(&session)?;
+        Ok(Some(session))
     }
 
     /// Save the complete session payload atomically enough for local SDK use.
@@ -3519,6 +5123,7 @@ impl LocalSessionStore {
     ///
     /// Returns an error when parent directories or files cannot be written.
     pub fn save(&self, session: &PersistedSession) -> Result<()> {
+        validate_persisted_session(session)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 BcodeError::SessionPersistence(format!(
@@ -3560,6 +5165,7 @@ impl SessionPersistenceAdapter for LocalSessionStore {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InMemorySession {
     messages: Vec<ModelMessage>,
+    persisted_memories: Vec<MemoryItem>,
 }
 
 impl InMemorySession {
@@ -3572,13 +5178,34 @@ impl InMemorySession {
     /// Create a session from caller-managed model messages.
     #[must_use]
     pub const fn from_messages(messages: Vec<ModelMessage>) -> Self {
-        Self { messages }
+        Self {
+            messages,
+            persisted_memories: Vec::new(),
+        }
+    }
+
+    /// Restore a transcript and its explicit persisted memory records.
+    #[must_use]
+    pub const fn from_persisted(
+        messages: Vec<ModelMessage>,
+        persisted_memories: Vec<MemoryItem>,
+    ) -> Self {
+        Self {
+            messages,
+            persisted_memories,
+        }
     }
 
     /// Return the current session transcript.
     #[must_use]
     pub fn messages(&self) -> &[ModelMessage] {
         &self.messages
+    }
+
+    /// Return explicit transcript-persisted memory records.
+    #[must_use]
+    pub fn persisted_memories(&self) -> &[MemoryItem] {
+        &self.persisted_memories
     }
 
     /// Export the session transcript for caller-managed persistence.
@@ -3592,17 +5219,159 @@ impl InMemorySession {
         self.messages.push(message);
     }
 
-    /// Clear the in-memory transcript.
+    /// Add one explicit transcript-persisted memory record and its visible message.
+    pub fn push_persisted_memory(&mut self, memory: MemoryItem) {
+        self.messages.push(memory.message.clone());
+        self.persisted_memories.push(memory);
+    }
+
+    /// Clear the in-memory transcript and explicit persisted-memory metadata.
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.persisted_memories.clear();
     }
 }
 
-/// Application-owned context/memory extension for SDK sessions.
+/// Privacy classification for application-owned memory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPrivacy {
+    /// Memory may be supplied under ordinary application policy.
+    #[default]
+    Public,
+    /// Memory contains private application/user context.
+    Private,
+    /// Memory contains sensitive context requiring explicit policy opt-in.
+    Sensitive,
+}
+
+/// Whether memory is ephemeral retrieval context or an explicit transcript entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRetention {
+    /// Use only for one model request; never mutate or persist the transcript.
+    #[default]
+    RequestOnly,
+    /// Persist explicitly through [`AgentSession::remember`]; retrieval providers cannot silently
+    /// request this retention.
+    SessionTranscript,
+}
+
+/// Stable application-owned source identity for retrieved memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProvenance {
+    /// Memory provider/index identity.
+    pub provider_id: String,
+    /// Stable source/document/record identity within that provider.
+    pub source_id: String,
+}
+
+/// One typed memory item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryItem {
+    /// Stable item identity used in reports and diagnostics.
+    pub id: String,
+    /// Model context contributed by this item.
+    pub message: ModelMessage,
+    /// Provider-owned relevance score from zero (least) through 1,000 (most).
+    pub relevance_millis: u16,
+    /// Source provenance.
+    pub provenance: MemoryProvenance,
+    /// Privacy classification evaluated by [`MemoryPolicy`].
+    #[serde(default)]
+    pub privacy: MemoryPrivacy,
+    /// Request-only retrieval or explicitly persisted transcript memory.
+    #[serde(default)]
+    pub retention: MemoryRetention,
+}
+
+/// Query passed to an application memory provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRetrievalRequest {
+    /// Current user query/prompt.
+    pub query: String,
+    /// Visible transcript before the current user query.
+    pub transcript: Vec<ModelMessage>,
+}
+
+/// Application-extensible memory retrieval contract.
+pub trait MemoryProvider: Send + Sync {
+    /// Retrieve candidate memories. Bcode validates, ranks, filters, and bounds the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when retrieval fails. [`MemoryFailurePolicy`] determines whether the model
+    /// request fails or continues without this provider's items.
+    fn retrieve(&self, request: &MemoryRetrievalRequest) -> Result<Vec<MemoryItem>>;
+}
+
+/// Behavior when one memory provider fails or returns invalid items.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemoryFailurePolicy {
+    /// Fail the model request before provider invocation.
+    #[default]
+    FailTurn,
+    /// Record the failure and continue without that memory provider.
+    ContinueWithoutMemory,
+}
+
+/// Bounds and privacy policy for retrieved memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPolicy {
+    /// Maximum accepted items across all providers.
+    pub max_items: usize,
+    /// Maximum serialized bytes for one item message.
+    pub max_item_bytes: usize,
+    /// Maximum serialized bytes across accepted item messages.
+    pub max_total_bytes: usize,
+    /// Most sensitive privacy class admitted to model context.
+    pub max_privacy: MemoryPrivacy,
+    /// Failure behavior for retrieval and validation.
+    pub failure_policy: MemoryFailurePolicy,
+}
+
+impl Default for MemoryPolicy {
+    fn default() -> Self {
+        Self {
+            max_items: 16,
+            max_item_bytes: 32 * 1024,
+            max_total_bytes: 128 * 1024,
+            max_privacy: MemoryPrivacy::Private,
+            failure_policy: MemoryFailurePolicy::FailTurn,
+        }
+    }
+}
+
+/// Accepted memory evidence for one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievedMemoryEvidence {
+    /// Stable memory item identity.
+    pub id: String,
+    /// Source provenance.
+    pub provenance: MemoryProvenance,
+    /// Relevance used for ranking.
+    pub relevance_millis: u16,
+    /// Serialized message size admitted to context.
+    pub byte_len: usize,
+}
+
+/// Report for the latest memory assembly attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryRetrievalReport {
+    /// Accepted items in final relevance order.
+    pub accepted: Vec<RetrievedMemoryEvidence>,
+    /// Stable non-secret failure/filter diagnostics.
+    pub diagnostics: Vec<String>,
+    /// Total serialized bytes accepted.
+    pub accepted_bytes: usize,
+}
+
+/// Application-owned request-context extension for SDK sessions.
 ///
-/// Providers can retrieve memory, summaries, user profile context, or application state and return
-/// normal model messages for the next turn. Returned messages are request context only: they are not
-/// appended to or persisted with the visible session transcript.
+/// Providers can return summaries, profile context, or application state as normal model messages
+/// for the next turn. Returned messages are request context only: they are not appended to or
+/// persisted with the visible session transcript. New memory integrations that need relevance,
+/// provenance, privacy, bounds, and diagnostics should implement [`MemoryProvider`].
 pub trait SessionContextProvider: Send + Sync {
     /// Return context messages for the next turn.
     ///
@@ -3619,6 +5388,9 @@ pub struct AgentSession {
     session: InMemorySession,
     persistence: Option<Arc<dyn SessionPersistenceAdapter>>,
     context_providers: Vec<Arc<dyn SessionContextProvider>>,
+    memory_providers: Vec<Arc<dyn MemoryProvider>>,
+    memory_policy: MemoryPolicy,
+    memory_report: MemoryRetrievalReport,
 }
 
 impl fmt::Debug for AgentSession {
@@ -3629,6 +5401,9 @@ impl fmt::Debug for AgentSession {
             .field("session", &self.session)
             .field("persistence", &self.persistence.is_some())
             .field("context_providers", &self.context_providers.len())
+            .field("memory_providers", &self.memory_providers.len())
+            .field("memory_policy", &self.memory_policy)
+            .field("memory_report", &self.memory_report)
             .finish()
     }
 }
@@ -3642,6 +5417,19 @@ impl AgentSession {
             session,
             persistence: None,
             context_providers: Vec::new(),
+            memory_providers: Vec::new(),
+            memory_policy: MemoryPolicy {
+                max_items: 16,
+                max_item_bytes: 32 * 1024,
+                max_total_bytes: 128 * 1024,
+                max_privacy: MemoryPrivacy::Private,
+                failure_policy: MemoryFailurePolicy::FailTurn,
+            },
+            memory_report: MemoryRetrievalReport {
+                accepted: Vec::new(),
+                diagnostics: Vec::new(),
+                accepted_bytes: 0,
+            },
         }
     }
 
@@ -3663,6 +5451,64 @@ impl AgentSession {
     ) -> Self {
         self.context_providers.push(provider);
         self
+    }
+
+    /// Attach an application-owned typed memory provider.
+    #[must_use]
+    pub fn with_memory_provider<P>(mut self, provider: P) -> Self
+    where
+        P: MemoryProvider + 'static,
+    {
+        self.memory_providers.push(Arc::new(provider));
+        self
+    }
+
+    /// Attach a shared typed memory provider.
+    #[must_use]
+    pub fn with_shared_memory_provider(mut self, provider: Arc<dyn MemoryProvider>) -> Self {
+        self.memory_providers.push(provider);
+        self
+    }
+
+    /// Configure retrieval bounds, privacy, and failure behavior.
+    #[must_use]
+    pub const fn with_memory_policy(mut self, policy: MemoryPolicy) -> Self {
+        self.memory_policy = policy;
+        self
+    }
+
+    /// Return the latest memory retrieval/filtering report.
+    #[must_use]
+    pub const fn memory_report(&self) -> &MemoryRetrievalReport {
+        &self.memory_report
+    }
+
+    /// Explicitly append transcript-persisted memory.
+    ///
+    /// Unlike retrieval, this mutates the visible transcript and immediately saves through a
+    /// configured persistence adapter. Request-only items are rejected to prevent accidental
+    /// retention.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for request-only retention, invalid metadata/relevance, oversized messages,
+    /// disallowed privacy, or persistence failure.
+    pub fn remember(&mut self, memory: MemoryItem) -> Result<()> {
+        validate_memory_item(&memory, &self.memory_policy, true)?;
+        if let Some(persistence) = &self.persistence {
+            let mut messages = self.session.messages.clone();
+            messages.push(memory.message.clone());
+            let mut memories = self.session.persisted_memories.clone();
+            memories.push(memory.clone());
+            persistence.save(&PersistedSession {
+                schema_version: PERSISTED_SESSION_SCHEMA_VERSION,
+                session_id: self.agent.session_id,
+                messages,
+                memories,
+            })?;
+        }
+        self.session.push_persisted_memory(memory);
+        Ok(())
     }
 
     /// Attach a persistence adapter and save after successful turns.
@@ -3690,6 +5536,12 @@ impl AgentSession {
         &self.session
     }
 
+    /// Build a renderer-neutral serializable snapshot of visible session state.
+    #[must_use]
+    pub fn frontend_snapshot(&self) -> FrontendSessionSnapshot {
+        FrontendSessionSnapshot::new(self.agent.session_id, self.session.messages())
+    }
+
     /// Return the configured persistence adapter, when persistence was explicitly enabled.
     #[must_use]
     pub fn persistence(&self) -> Option<&dyn SessionPersistenceAdapter> {
@@ -3700,8 +5552,10 @@ impl AgentSession {
     #[must_use]
     pub fn persisted_session(&self) -> PersistedSession {
         PersistedSession {
+            schema_version: PERSISTED_SESSION_SCHEMA_VERSION,
             session_id: self.agent.session_id,
             messages: self.session.messages.clone(),
+            memories: self.session.persisted_memories.clone(),
         }
     }
 
@@ -3742,11 +5596,38 @@ impl AgentSession {
         self.branch()
     }
 
-    fn request_messages(&self, transcript: &[ModelMessage]) -> Result<Vec<ModelMessage>> {
+    fn commit_messages(&mut self, messages: Vec<ModelMessage>) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            persistence.save(&PersistedSession {
+                schema_version: PERSISTED_SESSION_SCHEMA_VERSION,
+                session_id: self.agent.session_id,
+                messages: messages.clone(),
+                memories: self.session.persisted_memories.clone(),
+            })?;
+        }
+        self.session.messages = messages;
+        Ok(())
+    }
+
+    fn request_messages(
+        &mut self,
+        transcript: &[ModelMessage],
+        query: &str,
+    ) -> Result<Vec<ModelMessage>> {
         let mut messages = Vec::new();
         for provider in &self.context_providers {
             messages.extend(provider.context_messages(&self.session)?);
         }
+        let (memory, report) = retrieve_memory(
+            &self.memory_providers,
+            &self.memory_policy,
+            &MemoryRetrievalRequest {
+                query: query.to_string(),
+                transcript: transcript.to_vec(),
+            },
+        )?;
+        self.memory_report = report;
+        messages.extend(memory.into_iter().map(|item| item.message));
         messages.extend_from_slice(transcript);
         Ok(messages)
     }
@@ -3783,19 +5664,16 @@ impl AgentSession {
                 "cannot regenerate because the last user message has no text block".to_string(),
             )
         })?;
-        let prior_messages = self.request_messages(&self.session.messages[..user_index])?;
+        let transcript = self.session.messages[..user_index].to_vec();
+        let prior_messages = self.request_messages(&transcript, &prompt)?;
         let response = self
             .agent
             .generate_text_with_provider_and_history(provider, prompt, prior_messages)
             .await?;
-        self.session.messages.truncate(user_index);
-        self.session.messages.push(user_message);
-        self.session
-            .messages
-            .push(assistant_message(response.text.clone()));
-        if self.persistence.is_some() {
-            self.save()?;
-        }
+        let mut updated = self.session.messages[..user_index].to_vec();
+        updated.push(user_message);
+        updated.extend(transcript_messages_from_response(&response));
+        self.commit_messages(updated)?;
         Ok(response)
     }
 
@@ -3833,20 +5711,158 @@ impl AgentSession {
         P: ModelProviderInvoker,
     {
         let prompt = prompt.into();
-        let messages = self.request_messages(&self.session.messages)?;
+        let transcript = self.session.messages.clone();
+        let messages = self.request_messages(&transcript, &prompt)?;
         let response = self
             .agent
             .generate_text_with_provider_and_history(provider, prompt.clone(), messages)
             .await?;
-        self.session.messages.push(user_message(prompt));
-        self.session
-            .messages
-            .push(assistant_message(response.text.clone()));
-        if self.persistence.is_some() {
-            self.save()?;
-        }
+        let mut updated = self.session.messages.clone();
+        updated.push(user_message(prompt));
+        updated.extend(transcript_messages_from_response(&response));
+        self.commit_messages(updated)?;
         Ok(response)
     }
+}
+
+fn validate_memory_item(
+    item: &MemoryItem,
+    policy: &MemoryPolicy,
+    require_persisted: bool,
+) -> Result<usize> {
+    let code = memory_item_validation_code(item, policy, require_persisted);
+    if let Some(code) = code {
+        return Err(BcodeError::MemoryValidation { code });
+    }
+    let bytes = serde_json::to_vec(&item.message)
+        .map(|encoded| encoded.len())
+        .map_err(|_| BcodeError::MemoryValidation {
+            code: "message_serialization_failed",
+        })?;
+    if bytes > policy.max_item_bytes || bytes > policy.max_total_bytes {
+        return Err(BcodeError::MemoryValidation {
+            code: "item_too_large",
+        });
+    }
+    Ok(bytes)
+}
+
+fn memory_item_validation_code(
+    item: &MemoryItem,
+    policy: &MemoryPolicy,
+    require_persisted: bool,
+) -> Option<&'static str> {
+    if item.id.trim().is_empty() {
+        return Some("empty_item_id");
+    }
+    if item.provenance.provider_id.trim().is_empty() {
+        return Some("empty_provider_id");
+    }
+    if item.provenance.source_id.trim().is_empty() {
+        return Some("empty_source_id");
+    }
+    if item.relevance_millis > 1_000 {
+        return Some("relevance_out_of_range");
+    }
+    if item.message.content.is_empty() {
+        return Some("empty_message");
+    }
+    if require_persisted && item.retention != MemoryRetention::SessionTranscript {
+        return Some("request_only_cannot_be_persisted");
+    }
+    if !require_persisted && item.retention != MemoryRetention::RequestOnly {
+        return Some("provider_cannot_persist_memory");
+    }
+    if item.privacy > policy.max_privacy {
+        return Some("privacy_not_allowed");
+    }
+    None
+}
+
+fn retrieve_memory(
+    providers: &[Arc<dyn MemoryProvider>],
+    policy: &MemoryPolicy,
+    request: &MemoryRetrievalRequest,
+) -> Result<(Vec<MemoryItem>, MemoryRetrievalReport)> {
+    let mut report = MemoryRetrievalReport::default();
+    let mut candidates = Vec::new();
+    let mut identities = std::collections::BTreeSet::new();
+    for (provider_index, provider) in providers.iter().enumerate() {
+        let items = match provider.retrieve(request) {
+            Ok(items) => items,
+            Err(_) if policy.failure_policy == MemoryFailurePolicy::ContinueWithoutMemory => {
+                report
+                    .diagnostics
+                    .push(format!("provider:{provider_index}:retrieval_failed"));
+                continue;
+            }
+            Err(_) => {
+                return Err(BcodeError::Memory {
+                    provider_index,
+                    code: "retrieval_failed",
+                });
+            }
+        };
+        for (item_index, item) in items.into_iter().enumerate() {
+            let identity = (item.provenance.provider_id.clone(), item.id.clone());
+            let validation_code = memory_item_validation_code(&item, policy, false)
+                .or_else(|| (!identities.insert(identity)).then_some("duplicate_item_identity"));
+            let bytes = serde_json::to_vec(&item.message)
+                .map(|encoded| encoded.len())
+                .ok();
+            let validation_code = validation_code
+                .or_else(|| bytes.is_none().then_some("message_serialization_failed"))
+                .or_else(|| {
+                    bytes
+                        .is_some_and(|bytes| bytes > policy.max_item_bytes)
+                        .then_some("item_too_large")
+                });
+            if let Some(code) = validation_code {
+                if policy.failure_policy == MemoryFailurePolicy::FailTurn {
+                    return Err(BcodeError::Memory {
+                        provider_index,
+                        code,
+                    });
+                }
+                report.diagnostics.push(format!(
+                    "provider:{provider_index}:item:{item_index}:{code}"
+                ));
+                continue;
+            }
+            candidates.push((provider_index, item_index, item, bytes.unwrap_or_default()));
+        }
+    }
+    candidates.sort_by(
+        |(left_provider, left_item, left, _), (right_provider, right_item, right, _)| {
+            right
+                .relevance_millis
+                .cmp(&left.relevance_millis)
+                .then_with(|| left_provider.cmp(right_provider))
+                .then_with(|| left_item.cmp(right_item))
+        },
+    );
+    let mut accepted = Vec::new();
+    for (_, _, item, bytes) in candidates {
+        if accepted.len() >= policy.max_items {
+            report.diagnostics.push("limit:max_items".to_string());
+            break;
+        }
+        if report.accepted_bytes.saturating_add(bytes) > policy.max_total_bytes {
+            report
+                .diagnostics
+                .push(format!("item:{}:total_size_limit", item.id));
+            continue;
+        }
+        report.accepted_bytes = report.accepted_bytes.saturating_add(bytes);
+        report.accepted.push(RetrievedMemoryEvidence {
+            id: item.id.clone(),
+            provenance: item.provenance.clone(),
+            relevance_millis: item.relevance_millis,
+            byte_len: bytes,
+        });
+        accepted.push(item);
+    }
+    Ok((accepted, report))
 }
 
 /// Configured agent facade for text generation, tools, streaming, hooks, and sessions.
@@ -3859,12 +5875,17 @@ pub struct Agent {
     cwd: Option<PathBuf>,
     provider_plugin_id: Option<String>,
     model_id: String,
+    selection_provenance: Box<ModelSelectionProvenance>,
+    registration_source: Option<ProviderRegistrationSource>,
+    model_metadata_source: Option<ModelMetadataSource>,
     provider_context: ProviderRequestContext,
     system_prompt: Option<String>,
     parameters: ModelParameters,
     metadata: BTreeMap<String, String>,
     timeout: Duration,
     max_tool_rounds: u32,
+    max_repeated_tool_batches: u32,
+    stop_condition: Option<AgentLoopStopPredicate>,
     execution_options: ToolExecutionOptions,
     tool_choice: ToolChoice,
     parallel_tool_capabilities: bcode_model::ParallelToolCallCapabilities,
@@ -3875,6 +5896,7 @@ pub struct Agent {
     tool_invoker: Option<Arc<dyn ToolInvoker>>,
     provider_factory: Option<ProviderFactory>,
     provider_round_planner: Arc<dyn ProviderRoundPlanner>,
+    cache_routing_identity: Option<String>,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
@@ -3899,12 +5921,17 @@ impl fmt::Debug for Agent {
             .field("cwd", &self.cwd)
             .field("provider_plugin_id", &self.provider_plugin_id)
             .field("model_id", &self.model_id)
+            .field("selection_provenance", &self.selection_provenance)
+            .field("registration_source", &self.registration_source)
+            .field("model_metadata_source", &self.model_metadata_source)
             .field("provider_context", &self.provider_context)
             .field("system_prompt", &self.system_prompt)
             .field("parameters", &self.parameters)
             .field("metadata", &self.metadata)
             .field("timeout", &self.timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("max_repeated_tool_batches", &self.max_repeated_tool_batches)
+            .field("stop_condition", &self.stop_condition.is_some())
             .field("execution_options", &self.execution_options)
             .field("tool_choice", &self.tool_choice)
             .field(
@@ -3921,6 +5948,7 @@ impl fmt::Debug for Agent {
             .field("tool_invoker", &self.tool_invoker.is_some())
             .field("provider_factory", &self.provider_factory.is_some())
             .field("provider_round_planner", &"<planner>")
+            .field("cache_routing_identity", &self.cache_routing_identity)
             .field("tool_catalog", &self.tool_catalog)
             .field(
                 "inline_tool_handlers",
@@ -4279,25 +6307,56 @@ impl Agent {
                 cancellation,
             ),
         )?;
-        let response = if let Some(response) = self
-            .response_cache
+        let cache = self.response_cache.as_ref().and_then(|cache| {
+            let privacy_allows = cache.privacy(&request) != ModelResponseCachePrivacy::NoStore;
+            let tools_allow = request.tools.is_empty() || cache.allow_tool_responses();
+            let routing_identified = request.cache_routing_identity.is_some();
+            let stopping_identified = request.stop_condition.is_none();
+            (privacy_allows && tools_allow && routing_identified && stopping_identified)
+                .then(|| Arc::clone(cache))
+        });
+        let key = cache
             .as_ref()
-            .map(|cache| cache.get(&request))
-            .transpose()?
-            .flatten()
-        {
+            .map(|_| ModelResponseCacheKey::from_request(&request))
+            .transpose()?;
+        let cached = if let Some(cache) = &cache {
+            response_cache_get(Arc::clone(cache), request.clone()).await?
+        } else {
+            None
+        };
+        let response = if let Some(mut response) = cached {
+            response.cache_status = ModelResponseCacheStatus::Hit {
+                key: key.expect("cache key exists for cache hit"),
+            };
             response
         } else {
-            let response = self
+            let runtime_response = self
                 .run_provider_tool_loop(
                     provider,
                     request.clone(),
                     Arc::clone(&self.invocation_event_sink),
                 )
-                .await?;
-            let response = GenerateTextResponse::from(response);
-            if let Some(cache) = &self.response_cache {
-                cache.put(&request, &response)?;
+                .await;
+            let runtime_response = match runtime_response {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(cache) = cache {
+                        response_cache_abort(cache, request.clone()).await;
+                    }
+                    return Err(error);
+                }
+            };
+            let mut response = GenerateTextResponse::from(runtime_response);
+            if let Some(cache) = cache {
+                response.cache_status = ModelResponseCacheStatus::Stored {
+                    key: key.expect("cache key exists for cache storage"),
+                };
+                if let Err(error) =
+                    response_cache_put(cache.clone(), request.clone(), response.clone()).await
+                {
+                    response_cache_abort(cache, request.clone()).await;
+                    return Err(error);
+                }
             }
             response
         };
@@ -4685,7 +6744,7 @@ impl Agent {
         if let (Some(plugins), Some(provider_plugin_id)) =
             (self.plugins.as_ref(), self.provider_plugin_id.as_deref())
         {
-            let provider = plugins
+            let provider_capabilities = plugins
                 .invoke_service_json_scoped::<(), ProviderCapabilities>(
                     provider_plugin_id,
                     MODEL_PROVIDER_INTERFACE_ID,
@@ -4694,11 +6753,7 @@ impl Agent {
                     bcode_plugin::PluginInvocationScope::Global,
                 )
                 .await
-                .is_ok_and(|capabilities| {
-                    capabilities
-                        .capabilities
-                        .contains(&bcode_model::ProviderCapability::ParallelToolCalls)
-                });
+                .ok();
             let model = plugins
                 .invoke_service_json_scoped::<bcode_model::ModelListRequest, ModelList>(
                     provider_plugin_id,
@@ -4717,15 +6772,20 @@ impl Agent {
                         .models
                         .into_iter()
                         .find(|model| model.model_id == self.model_id)
-                })
-                .is_some_and(|model| {
-                    model
-                        .capabilities
-                        .contains(&bcode_model::ModelCapability::ParallelToolCalls)
+                });
+            let parallel_feature = RequestedModelFeature::ToolChoice(ToolChoiceMode::Parallel);
+            let parallel_guaranteed = provider_capabilities
+                .as_ref()
+                .zip(model.as_ref())
+                .is_some_and(|(provider, model)| {
+                    provider
+                        .feature_support
+                        .negotiate(&model.feature_support, parallel_feature)
+                        .is_guaranteed()
                 });
             request.tool_call_policy = bcode_model::ParallelToolCallCapabilities {
-                provider,
-                model,
+                provider: parallel_guaranteed,
+                model: parallel_guaranteed,
                 runtime: true,
             }
             .negotiate(
@@ -4832,6 +6892,9 @@ impl Agent {
             metadata: self.metadata.clone(),
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
+            max_repeated_tool_batches: self.max_repeated_tool_batches,
+            stop_condition: self.stop_condition.clone(),
+            cache_routing_identity: self.cache_routing_identity.clone(),
             cancellation,
         }
     }
@@ -4865,8 +6928,9 @@ impl Agent {
     ) -> Result<AgentSession> {
         let persisted = persistence.load()?;
         let session = if let Some(persisted) = persisted {
+            validate_persisted_session(&persisted)?;
             self.session_id = persisted.session_id;
-            InMemorySession::from_messages(persisted.messages)
+            InMemorySession::from_persisted(persisted.messages, persisted.memories)
         } else {
             InMemorySession::new()
         };
@@ -4893,6 +6957,46 @@ impl Agent {
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
+
+    /// Return provenance for the configured provider/model selection.
+    #[must_use]
+    pub const fn selection_provenance(&self) -> &ModelSelectionProvenance {
+        &self.selection_provenance
+    }
+
+    /// Report the final effective selection and all available provenance.
+    #[must_use]
+    pub fn selection_report(&self) -> ModelSelectionReport {
+        ModelSelectionReport {
+            selector: self.provider_plugin_id.as_deref().map_or_else(
+                || ModelSelector::new(&self.model_id),
+                |provider| ModelSelector::with_provider(provider, &self.model_id),
+            ),
+            provenance: (*self.selection_provenance).clone(),
+            registration_source: self.registration_source,
+            model_metadata_source: self.model_metadata_source,
+        }
+    }
+
+    /// Decode one configured typed provider request extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored extension payload does not match its Rust type.
+    pub fn provider_extension<E>(&self) -> Result<Option<E>>
+    where
+        E: ProviderRequestExtension,
+    {
+        self.provider_context
+            .extension::<E>()
+            .map_err(|error| BcodeError::ProviderExtension(error.to_string()))
+    }
+
+    /// Return the configured provider request context.
+    #[must_use]
+    pub const fn provider_context(&self) -> &ProviderRequestContext {
+        &self.provider_context
+    }
 }
 
 /// Builder for [`Agent`].
@@ -4905,12 +7009,17 @@ pub struct AgentBuilder {
     cwd: Option<PathBuf>,
     provider_plugin_id: Option<String>,
     model_id: Option<String>,
+    selection_provenance: Box<ModelSelectionProvenance>,
+    registration_source: Option<ProviderRegistrationSource>,
+    model_metadata_source: Option<ModelMetadataSource>,
     provider_context: ProviderRequestContext,
     system_prompt: Option<String>,
     parameters: ModelParameters,
     metadata: BTreeMap<String, String>,
     timeout: Duration,
     max_tool_rounds: u32,
+    max_repeated_tool_batches: u32,
+    stop_condition: Option<AgentLoopStopPredicate>,
     execution_options: ToolExecutionOptions,
     tool_choice: ToolChoice,
     parallel_tool_capabilities: bcode_model::ParallelToolCallCapabilities,
@@ -4923,6 +7032,7 @@ pub struct AgentBuilder {
     tool_invoker: Option<Arc<dyn ToolInvoker>>,
     provider_factory: Option<ProviderFactory>,
     provider_round_planner: Arc<dyn ProviderRoundPlanner>,
+    cache_routing_identity: Option<String>,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
@@ -4948,12 +7058,17 @@ impl fmt::Debug for AgentBuilder {
             .field("cwd", &self.cwd)
             .field("provider_plugin_id", &self.provider_plugin_id)
             .field("model_id", &self.model_id)
+            .field("selection_provenance", &self.selection_provenance)
+            .field("registration_source", &self.registration_source)
+            .field("model_metadata_source", &self.model_metadata_source)
             .field("provider_context", &self.provider_context)
             .field("system_prompt", &self.system_prompt)
             .field("parameters", &self.parameters)
             .field("metadata", &self.metadata)
             .field("timeout", &self.timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("max_repeated_tool_batches", &self.max_repeated_tool_batches)
+            .field("stop_condition", &self.stop_condition.is_some())
             .field("execution_options", &self.execution_options)
             .field("tool_choice", &self.tool_choice)
             .field(
@@ -4972,6 +7087,7 @@ impl fmt::Debug for AgentBuilder {
             .field("tool_invoker", &self.tool_invoker.is_some())
             .field("provider_factory", &self.provider_factory.is_some())
             .field("provider_round_planner", &"<planner>")
+            .field("cache_routing_identity", &self.cache_routing_identity)
             .field("tool_catalog", &self.tool_catalog)
             .field(
                 "inline_tool_handlers",
@@ -5007,12 +7123,17 @@ impl Default for AgentBuilder {
             cwd: std::env::current_dir().ok(),
             provider_plugin_id: None,
             model_id: None,
+            selection_provenance: Box::default(),
+            registration_source: None,
+            model_metadata_source: None,
             provider_context: ProviderRequestContext::default(),
             system_prompt: None,
             parameters: ModelParameters::default(),
             metadata: BTreeMap::new(),
             timeout: Duration::from_mins(2),
             max_tool_rounds: 8,
+            max_repeated_tool_batches: 2,
+            stop_condition: None,
             execution_options: ToolExecutionOptions::default(),
             tool_choice: ToolChoice::Auto,
             parallel_tool_capabilities: bcode_model::ParallelToolCallCapabilities {
@@ -5028,6 +7149,7 @@ impl Default for AgentBuilder {
             tool_invoker: None,
             provider_factory: None,
             provider_round_planner: Arc::new(bcode_agent_runtime::NoopProviderRoundPlanner),
+            cache_routing_identity: Some("direct".to_string()),
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
             hooks: AgentHooks::new(),
@@ -5093,6 +7215,8 @@ impl AgentBuilder {
     #[must_use]
     pub fn model(mut self, model_id: impl Into<String>) -> Self {
         self.model_id = Some(model_id.into());
+        self.selection_provenance.model = Some(ModelSelectionSource::PerRequest);
+        self.model_metadata_source = None;
         self.parallel_tool_capabilities.model = false;
         self
     }
@@ -5103,6 +7227,12 @@ impl AgentBuilder {
         let selector = selector.into();
         self.provider_plugin_id = selector.provider_plugin_id;
         self.model_id = Some(selector.model_id);
+        self.selection_provenance.model = Some(ModelSelectionSource::PerRequest);
+        self.model_metadata_source = None;
+        if self.provider_plugin_id.is_some() {
+            self.selection_provenance.provider = Some(ModelSelectionSource::PerRequest);
+        }
+        self.registration_source = None;
         self.parallel_tool_capabilities.provider = false;
         self.parallel_tool_capabilities.model = false;
         self
@@ -5112,8 +7242,29 @@ impl AgentBuilder {
     #[must_use]
     pub fn provider_plugin(mut self, provider_plugin_id: impl Into<String>) -> Self {
         self.provider_plugin_id = Some(provider_plugin_id.into());
+        self.selection_provenance.provider = Some(ModelSelectionSource::PerRequest);
+        self.registration_source = None;
+        self.model_metadata_source = None;
         self.parallel_tool_capabilities.provider = false;
         self.parallel_tool_capabilities.model = false;
+        self
+    }
+
+    /// Configure provenance for a provider/model selection supplied by an SDK registry.
+    #[must_use]
+    pub fn selection_provenance(mut self, provenance: ModelSelectionProvenance) -> Self {
+        self.selection_provenance = Box::new(provenance);
+        self
+    }
+
+    /// Configure a complete registry-derived selection report.
+    #[must_use]
+    pub fn selection_report(mut self, report: ModelSelectionReport) -> Self {
+        self.provider_plugin_id = report.selector.provider_plugin_id;
+        self.model_id = Some(report.selector.model_id);
+        self.selection_provenance = Box::new(report.provenance);
+        self.registration_source = report.registration_source;
+        self.model_metadata_source = report.model_metadata_source;
         self
     }
 
@@ -5122,6 +7273,24 @@ impl AgentBuilder {
     pub fn provider_context(mut self, provider_context: ProviderRequestContext) -> Self {
         self.provider_context = provider_context;
         self
+    }
+
+    /// Configure one typed provider-specific request extension.
+    ///
+    /// The extension is scoped to its owning provider and serialized through the canonical model
+    /// request. Providers reject extensions sent to the wrong provider or API surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the extension cannot be serialized.
+    pub fn provider_extension<E>(mut self, extension: &E) -> Result<Self>
+    where
+        E: ProviderRequestExtension,
+    {
+        self.provider_context
+            .set_extension(extension)
+            .map_err(|error| BcodeError::ProviderExtension(error.to_string()))?;
+        Ok(self)
     }
 
     /// Configure the system prompt.
@@ -5156,6 +7325,23 @@ impl AgentBuilder {
     #[must_use]
     pub const fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
         self.max_tool_rounds = max_tool_rounds;
+        self
+    }
+
+    /// Configure maximum consecutive semantically identical tool-call batches.
+    #[must_use]
+    pub const fn max_repeated_tool_batches(mut self, max_repeated_tool_batches: u32) -> Self {
+        self.max_repeated_tool_batches = max_repeated_tool_batches;
+        self
+    }
+
+    /// Stop a successful loop after a completed provider round when `condition` returns true.
+    ///
+    /// A stop on a tool-call round happens before tools execute. It is reported as
+    /// [`AgentLoopTerminationReason::StopCondition`].
+    #[must_use]
+    pub fn stop_when(mut self, condition: impl AgentLoopStopCondition + 'static) -> Self {
+        self.stop_condition = Some(AgentLoopStopPredicate::new(condition));
         self
     }
 
@@ -5266,9 +7452,20 @@ impl AgentBuilder {
     }
 
     /// Configure provider retry, recovery, compaction, and request rebuilding policy.
+    ///
+    /// Custom planners disable response caching until [`Self::cache_routing_identity`] supplies a
+    /// stable versioned identity for their effective routing behavior.
     #[must_use]
     pub fn provider_round_planner(mut self, planner: Arc<dyn ProviderRoundPlanner>) -> Self {
         self.provider_round_planner = planner;
+        self.cache_routing_identity = None;
+        self
+    }
+
+    /// Identify custom retry/fallback/routing behavior for safe response-cache keys.
+    #[must_use]
+    pub fn cache_routing_identity(mut self, identity: impl Into<String>) -> Self {
+        self.cache_routing_identity = Some(identity.into());
         self
     }
 
@@ -5276,12 +7473,14 @@ impl AgentBuilder {
     #[must_use]
     pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.provider_round_planner = Arc::new(policy);
+        self.cache_routing_identity = Some(format!("retry:{policy:?}"));
         self
     }
 
     /// Configure ordered provider/model fallbacks for provider-originated failures.
     #[must_use]
     pub fn fallback_policy(mut self, policy: FallbackPolicy) -> Self {
+        self.cache_routing_identity = Some(format!("fallback:{policy:?}"));
         self.provider_round_planner = Arc::new(policy);
         self
     }
@@ -5297,21 +7496,72 @@ impl AgentBuilder {
         O: Serialize + Send + 'static,
         F: Fn(I) -> std::result::Result<O, String> + Send + Sync + 'static,
     {
+        let schema = tool.definition.input_schema.clone();
         self.inline_tool(tool.definition, move |request| {
+            validate_typed_tool_input(&schema, &request.arguments)?;
             let input = serde_json::from_value(request.arguments)
                 .map_err(|error| format!("invalid typed tool arguments: {error}"))?;
             let output = handler(input)?;
-            let value = serde_json::to_value(output)
-                .map_err(|error| format!("failed to serialize typed tool result: {error}"))?;
-            let encoded = serde_json::to_string(&value)
-                .map_err(|error| format!("failed to encode typed tool result: {error}"))?;
-            Ok(ToolInvocationResponse {
-                output: encoded.clone(),
-                is_error: false,
-                content: Vec::new(),
-                full_output: None,
-                result: Some(ToolInvocationResult::Json { value: encoded }),
-            })
+            typed_tool_success_response(output)
+        })
+    }
+
+    /// Register an asynchronous typed tool with cancellation, progress, and per-call context.
+    ///
+    /// Application errors remain structured for consumers while only their explicit
+    /// `model_message` is returned to the model.
+    #[must_use]
+    pub fn typed_tool_async<I, O, D, F, Fut>(self, tool: TypedTool<I, O>, handler: F) -> Self
+    where
+        I: DeserializeOwned + schemars::JsonSchema + Send + 'static,
+        O: Serialize + Send + 'static,
+        D: Serialize + Send + 'static,
+        F: Fn(I, TypedToolContext<()>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<O, ToolApplicationError<D>>>
+            + Send
+            + 'static,
+    {
+        self.typed_tool_with_state(tool, Arc::new(()), handler)
+    }
+
+    /// Register an asynchronous typed tool with explicitly supplied application state.
+    ///
+    /// Input is validated against the generated schema before deserialization. The handler gets
+    /// canonical cancellation, ordered progress reporting, invocation identity, and read-only
+    /// shared access to `state`.
+    #[must_use]
+    pub fn typed_tool_with_state<I, O, D, S, F, Fut>(
+        self,
+        tool: TypedTool<I, O>,
+        state: Arc<S>,
+        handler: F,
+    ) -> Self
+    where
+        I: DeserializeOwned + schemars::JsonSchema + Send + 'static,
+        O: Serialize + Send + 'static,
+        D: Serialize + Send + 'static,
+        S: Send + Sync + 'static,
+        F: Fn(I, TypedToolContext<S>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<O, ToolApplicationError<D>>>
+            + Send
+            + 'static,
+    {
+        let schema = tool.definition.input_schema.clone();
+        let handler = Arc::new(handler);
+        self.scoped_inline_tool(tool.definition, move |request, scope| {
+            let state = Arc::clone(&state);
+            let handler = Arc::clone(&handler);
+            let schema = schema.clone();
+            async move {
+                validate_typed_tool_input(&schema, &request.arguments)?;
+                let input = serde_json::from_value(request.arguments)
+                    .map_err(|error| format!("invalid typed tool arguments: {error}"))?;
+                let context = TypedToolContext::new(scope, state);
+                match handler(input, context).await {
+                    Ok(output) => typed_tool_success_response(output),
+                    Err(error) => typed_tool_error_response(error),
+                }
+            }
         })
     }
 
@@ -5604,12 +7854,17 @@ impl AgentBuilder {
             cwd: self.cwd,
             provider_plugin_id: self.provider_plugin_id,
             model_id: self.model_id.unwrap_or_default(),
+            selection_provenance: self.selection_provenance,
+            registration_source: self.registration_source,
+            model_metadata_source: self.model_metadata_source,
             provider_context: self.provider_context,
             system_prompt: self.system_prompt,
             parameters: self.parameters,
             metadata: self.metadata,
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
+            max_repeated_tool_batches: self.max_repeated_tool_batches,
+            stop_condition: self.stop_condition,
             execution_options: self.execution_options,
             tool_choice: self.tool_choice,
             parallel_tool_capabilities: self.parallel_tool_capabilities,
@@ -5620,6 +7875,7 @@ impl AgentBuilder {
             tool_invoker: self.tool_invoker,
             provider_factory: self.provider_factory,
             provider_round_planner: self.provider_round_planner,
+            cache_routing_identity: self.cache_routing_identity,
             tool_catalog: self.tool_catalog,
             inline_tool_handlers: self.inline_tool_handlers,
             hooks: self.hooks,
@@ -5643,7 +7899,8 @@ pub struct GenerateTextRequest {
 }
 
 /// One normalized step in a completed multi-step generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum GenerationStep {
     /// One provider model round, including accumulated text/reasoning and its latest usage.
     Model {
@@ -5655,6 +7912,8 @@ pub enum GenerationStep {
         reasoning: String,
         /// Latest token usage emitted during this model round.
         usage: Option<TokenUsage>,
+        /// Ordered non-content runtime metadata emitted during this model round.
+        metadata: Vec<AgentEvent>,
     },
     /// A complete model-requested tool call.
     ToolCall {
@@ -5676,18 +7935,23 @@ pub enum GenerationStep {
         text: String,
         /// Provider-reported stop reason.
         stop_reason: Option<StopReason>,
+        /// Why the successful loop stopped.
+        termination_reason: AgentLoopTerminationReason,
         /// Total generation latency in milliseconds.
-        latency_ms: u128,
+        latency_ms: u64,
     },
 }
 
 /// Response from text generation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateTextResponse {
     /// Generated assistant text.
     pub text: String,
     /// Ordered normalized model/tool/final steps.
     pub steps: Vec<GenerationStep>,
+    /// Response-cache provenance. Cached usage remains historical provider usage.
+    #[serde(default)]
+    pub cache_status: ModelResponseCacheStatus,
     /// Runtime response containing metadata and events.
     pub runtime: AgentTurnResponse,
 }
@@ -5697,6 +7961,7 @@ impl From<AgentTurnResponse> for GenerateTextResponse {
         Self {
             text: runtime.text.clone(),
             steps: generation_steps(&runtime),
+            cache_status: ModelResponseCacheStatus::Bypassed,
             runtime,
         }
     }
@@ -5709,6 +7974,7 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
         text: String,
         reasoning: String,
         usage: Option<TokenUsage>,
+        metadata: Vec<AgentEvent>,
     }
 
     fn flush_model(steps: &mut Vec<GenerationStep>, model: &mut ModelRound) {
@@ -5718,6 +7984,7 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
                 text: std::mem::take(&mut model.text),
                 reasoning: std::mem::take(&mut model.reasoning),
                 usage: model.usage.take(),
+                metadata: std::mem::take(&mut model.metadata),
             });
             model.started = false;
         }
@@ -5730,6 +7997,7 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
         text: String::new(),
         reasoning: String::new(),
         usage: None,
+        metadata: Vec::new(),
     };
     for event in &runtime.events {
         match event {
@@ -5769,15 +8037,18 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
                 round: model.round,
                 result: result.clone(),
             }),
-            AgentEvent::ToolCallStarted { .. }
-            | AgentEvent::ToolCallDelta { .. }
-            | AgentEvent::ExactRequestInputTokens(_)
+            event @ (AgentEvent::ExactRequestInputTokens(_)
             | AgentEvent::RequestProjection(_)
             | AgentEvent::ContextCompacted
             | AgentEvent::ProviderMetadata { .. }
             | AgentEvent::RetryScheduled { .. }
             | AgentEvent::Warning(_)
-            | AgentEvent::ProviderError { .. }
+            | AgentEvent::ProviderError { .. }) => {
+                model.started = true;
+                model.metadata.push(event.clone());
+            }
+            AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::ToolCallDelta { .. }
             | AgentEvent::Finished { .. }
             | AgentEvent::Cancelled => {}
         }
@@ -5786,6 +8057,7 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
     steps.push(GenerationStep::FinalResponse {
         text: runtime.text.clone(),
         stop_reason: runtime.stop_reason,
+        termination_reason: runtime.termination_reason,
         latency_ms: runtime.latency_ms,
     });
     steps

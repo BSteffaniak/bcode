@@ -16,7 +16,11 @@ bcode_session_models = { workspace = true }
 httpdate             = { workspace = true }
 serde                = { workspace = true }
 serde_json           = { workspace = true }
-tokio                = { workspace = true, features = ["rt", "sync", "time"] }
+tokio                = { workspace = true, features = ["net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_plugin_sdk           = { workspace = true }
 
 [features]
 default          = []

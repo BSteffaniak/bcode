@@ -23,7 +23,16 @@
 //! * Turn cancellation closes queued starts, signals registered active handles, and gates normal
 //!   output before later provider rounds can begin.
 
+mod in_process_provider;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod turn;
+
+pub use in_process_provider::{
+    InProcessModelProvider, InProcessModelProviderAdapter, InProcessProviderContext,
+    InProcessProviderEmitError, InProcessProviderEventSink, InProcessProviderFuture,
+    InProcessProviderOutcome, in_process_provider_error,
+};
 
 pub use turn::{
     ArtifactCommitGuard, HostTurnEventSink, InvocationArtifactSink, InvocationCancellation,
@@ -86,6 +95,11 @@ pub enum RuntimeError {
         /// Full provider-reported error metadata.
         error: Box<ProviderError>,
     },
+    /// Provider failed after model-visible output had already been emitted.
+    ///
+    /// Retrying would duplicate visible output, so planners must treat this as terminal.
+    #[error("provider failed after visible output: {0}")]
+    ProviderAfterOutput(Box<Self>),
     /// The turn was cancelled before completion.
     #[error("agent turn cancelled")]
     Cancelled,
@@ -104,6 +118,22 @@ pub enum RuntimeError {
     /// Provider completed a tool-call round without supplying any completed calls.
     #[error("provider finished with tool_call but emitted no completed tool calls")]
     EmptyProviderToolRound,
+    /// Provider completed a tool-call round with malformed completed calls.
+    #[error("provider emitted malformed tool call at index {index}: {message}")]
+    MalformedProviderToolCall {
+        /// Zero-based position in the provider batch.
+        index: usize,
+        /// Contract violation detail.
+        message: String,
+    },
+    /// Provider repeated the same semantic tool-call batch beyond the configured limit.
+    #[error("provider repeated an identical tool-call batch {repeats} times; limit is {limit}")]
+    RepeatedToolCallBatch {
+        /// Consecutive number of identical batches observed.
+        repeats: u32,
+        /// Maximum consecutive identical batches permitted.
+        limit: u32,
+    },
     /// A host extension failed while observing canonical orchestration.
     #[error("host extension failed: {0}")]
     HostExtension(String),
@@ -235,6 +265,15 @@ pub struct AgentTurnRequest {
     pub timeout: Duration,
     /// Maximum number of tool rounds allowed by the caller.
     pub max_tool_rounds: u32,
+    /// Maximum number of consecutive semantically identical tool-call batches allowed.
+    pub max_repeated_tool_batches: u32,
+    /// Optional application-owned successful-loop stop predicate.
+    pub stop_condition: Option<AgentLoopStopPredicate>,
+    /// Stable cache identity for provider-round routing configuration.
+    ///
+    /// `None` disables response caching because a custom planner's effective provider/model cannot
+    /// be identified safely.
+    pub cache_routing_identity: Option<String>,
     /// Cancellation token for this turn.
     pub cancellation: CancellationToken,
 }
@@ -258,13 +297,78 @@ impl AgentTurnRequest {
             metadata: BTreeMap::new(),
             timeout: Duration::from_mins(2),
             max_tool_rounds: 8,
+            max_repeated_tool_batches: 2,
+            stop_condition: None,
+            cache_routing_identity: Some("direct".to_string()),
             cancellation: CancellationToken::new(),
         }
     }
 }
 
+/// Why a successful multi-step agent loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoopTerminationReason {
+    /// The provider ended without requesting another tool round.
+    ProviderStop,
+    /// An application-configured stop condition accepted the completed provider round.
+    StopCondition,
+}
+
+const fn provider_stop_termination() -> AgentLoopTerminationReason {
+    AgentLoopTerminationReason::ProviderStop
+}
+
+/// Read-only state offered to an application stop condition after each provider round.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentLoopStopContext<'a> {
+    /// Zero-based provider round that just completed.
+    pub provider_round: u32,
+    /// Complete response for that provider round.
+    pub response: &'a AgentTurnResponse,
+    /// Completed tool calls emitted by that round, in provider order.
+    pub tool_calls: &'a [ToolCall],
+}
+
+/// Application-owned predicate for terminating a successful agent loop.
+pub trait AgentLoopStopCondition: Send + Sync {
+    /// Return `true` to stop after the completed provider round and before invoking its tools.
+    fn should_stop(&self, context: AgentLoopStopContext<'_>) -> bool;
+}
+
+impl<F> AgentLoopStopCondition for F
+where
+    F: Fn(AgentLoopStopContext<'_>) -> bool + Send + Sync,
+{
+    fn should_stop(&self, context: AgentLoopStopContext<'_>) -> bool {
+        self(context)
+    }
+}
+
+/// Cloneable application stop condition with opaque debug output.
+#[derive(Clone)]
+pub struct AgentLoopStopPredicate(Arc<dyn AgentLoopStopCondition>);
+
+impl std::fmt::Debug for AgentLoopStopPredicate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AgentLoopStopPredicate(<predicate>)")
+    }
+}
+
+impl AgentLoopStopPredicate {
+    /// Wrap an application stop condition.
+    #[must_use]
+    pub fn new(condition: impl AgentLoopStopCondition + 'static) -> Self {
+        Self(Arc::new(condition))
+    }
+
+    fn should_stop(&self, context: AgentLoopStopContext<'_>) -> bool {
+        self.0.should_stop(context)
+    }
+}
+
 /// Completed text-generation turn response.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentTurnResponse {
     /// Accumulated assistant text.
     pub text: String,
@@ -273,13 +377,17 @@ pub struct AgentTurnResponse {
     /// Last provider-reported token usage snapshot, when available.
     pub usage: Option<TokenUsage>,
     /// Total turn latency in milliseconds.
-    pub latency_ms: u128,
+    pub latency_ms: u64,
+    /// Why this successful loop stopped.
+    #[serde(default = "provider_stop_termination")]
+    pub termination_reason: AgentLoopTerminationReason,
     /// Runtime events observed during the turn.
     pub events: Vec<AgentRuntimeEvent>,
 }
 
 /// Normalized runtime event exposed independently from provider-specific details.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentRuntimeEvent {
     /// The provider accepted the turn.
     TurnStarted,
@@ -343,7 +451,7 @@ pub enum AgentRuntimeEvent {
         /// Last provider-reported token usage snapshot, when available.
         usage: Option<TokenUsage>,
         /// Total turn latency in milliseconds when the finish event was emitted.
-        latency_ms: u128,
+        latency_ms: u64,
     },
     /// Turn was cancelled.
     Cancelled,
@@ -717,6 +825,98 @@ impl RegisteredTool {
     }
 }
 
+/// Policy separating application-owned tool responses from bounded model-visible results.
+///
+/// The full [`ToolInvocationResponse`] always remains application-visible. Only the derived
+/// [`ToolResult`] sent to the model is redacted and bounded by this policy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ToolResultPolicy {
+    max_text_bytes: NonZeroUsize,
+    max_binary_bytes: NonZeroUsize,
+    max_content_items: NonZeroUsize,
+    redacted_values: Vec<String>,
+}
+
+impl std::fmt::Debug for ToolResultPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolResultPolicy")
+            .field("max_text_bytes", &self.max_text_bytes)
+            .field("max_binary_bytes", &self.max_binary_bytes)
+            .field("max_content_items", &self.max_content_items)
+            .field("redacted_value_count", &self.redacted_values.len())
+            .finish()
+    }
+}
+
+impl Default for ToolResultPolicy {
+    fn default() -> Self {
+        Self {
+            max_text_bytes: NonZeroUsize::new(64 * 1024).expect("64 KiB is non-zero"),
+            max_binary_bytes: NonZeroUsize::new(5 * 1024 * 1024).expect("5 MiB is non-zero"),
+            max_content_items: NonZeroUsize::new(64).expect("64 is non-zero"),
+            redacted_values: Vec::new(),
+        }
+    }
+}
+
+impl ToolResultPolicy {
+    /// Create the default bounded policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configure the maximum UTF-8 bytes for each model-visible text field.
+    #[must_use]
+    pub const fn max_text_bytes(mut self, max_text_bytes: NonZeroUsize) -> Self {
+        self.max_text_bytes = max_text_bytes;
+        self
+    }
+
+    /// Configure maximum decoded bytes for inline binary content.
+    #[must_use]
+    pub const fn max_binary_bytes(mut self, max_binary_bytes: NonZeroUsize) -> Self {
+        self.max_binary_bytes = max_binary_bytes;
+        self
+    }
+
+    /// Configure the maximum number of structured model-visible content items.
+    #[must_use]
+    pub const fn max_content_items(mut self, max_content_items: NonZeroUsize) -> Self {
+        self.max_content_items = max_content_items;
+        self
+    }
+
+    /// Register an exact sensitive value to replace before any tool text reaches the model.
+    ///
+    /// Empty values are ignored. Values remain application-owned and are not written into the
+    /// model result or transformation report.
+    #[must_use]
+    pub fn redact_value(mut self, value: impl Into<String>) -> Self {
+        let value = value.into();
+        if !value.is_empty() && !self.redacted_values.contains(&value) {
+            self.redacted_values.push(value);
+        }
+        self
+    }
+}
+
+/// Auditable transformations applied only to a model-visible tool result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolResultTransform {
+    /// Number of sensitive-value occurrences replaced.
+    pub redaction_count: usize,
+    /// Number of text fields truncated at a UTF-8 boundary.
+    pub truncated_text_fields: usize,
+    /// Number of excess structured content items omitted.
+    pub omitted_content_items: usize,
+    /// Number of unsafe or oversized reference fields omitted from model context.
+    pub omitted_reference_fields: usize,
+    /// Number of oversized inline binary fields omitted from model context.
+    pub omitted_binary_fields: usize,
+}
+
 /// Tool execution output normalized for model feedback and host/UI consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionOutput {
@@ -724,6 +924,8 @@ pub struct ToolExecutionOutput {
     pub model_result: ToolResult,
     /// Full typed invocation response returned by the executor.
     pub invocation: ToolInvocationResponse,
+    /// Auditable model-boundary transformations; the invocation response remains unchanged.
+    pub model_transform: ToolResultTransform,
     /// Normalized runtime events emitted for this execution.
     pub events: Vec<AgentRuntimeEvent>,
 }
@@ -1184,6 +1386,7 @@ impl PermissionPolicy for AllowAllPolicy {
 pub struct AgentRuntime {
     poll_interval: Duration,
     stream_buffer_capacity: NonZeroUsize,
+    tool_result_policy: ToolResultPolicy,
     turns: TurnScopeOwner,
 }
 
@@ -1236,6 +1439,7 @@ impl Default for AgentRuntime {
             poll_interval: Duration::from_millis(50),
             stream_buffer_capacity: NonZeroUsize::new(DEFAULT_STREAM_BUFFER_CAPACITY)
                 .expect("default stream buffer capacity must be positive"),
+            tool_result_policy: ToolResultPolicy::default(),
             turns: TurnScopeOwner::new(),
         }
     }
@@ -1264,6 +1468,19 @@ impl AgentRuntime {
     pub const fn with_stream_buffer_capacity(mut self, capacity: NonZeroUsize) -> Self {
         self.stream_buffer_capacity = capacity;
         self
+    }
+
+    /// Configure the policy applied to every model-visible tool result.
+    #[must_use]
+    pub fn with_tool_result_policy(mut self, policy: ToolResultPolicy) -> Self {
+        self.tool_result_policy = policy;
+        self
+    }
+
+    /// Return the configured model-visible tool-result policy.
+    #[must_use]
+    pub const fn tool_result_policy(&self) -> &ToolResultPolicy {
+        &self.tool_result_policy
     }
 
     /// Return the configured maximum number of queued stream items.
@@ -1472,16 +1689,9 @@ impl AgentRuntime {
         let started = Instant::now();
         let timeout = request.timeout;
         let mut provider_round = 0_u32;
+        let mut repeated_batches = ToolBatchRepeatGuard::new(request.max_repeated_tool_batches);
         let mut all_events = Vec::new();
-        let mut messages = request.messages.clone();
-        if request.append_prompt {
-            messages.push(ModelMessage {
-                role: MessageRole::User,
-                content: vec![ContentBlock::Text {
-                    text: request.prompt.clone(),
-                }],
-            });
-        }
+        let mut messages = initial_loop_messages(&request);
 
         loop {
             let planned_round = run_planned_provider_round(
@@ -1509,18 +1719,23 @@ impl AgentRuntime {
                 })
                 .collect::<Vec<_>>();
 
+            if request.stop_condition.as_ref().is_some_and(|condition| {
+                condition.should_stop(AgentLoopStopContext {
+                    provider_round,
+                    response: &response,
+                    tool_calls: &calls,
+                })
+            }) {
+                return Ok(stopped_agent_response(response, started, all_events));
+            }
             if response.stop_reason != Some(StopReason::ToolCall) {
-                return Ok(AgentTurnResponse {
-                    text: response.text,
-                    stop_reason: response.stop_reason,
-                    usage: response.usage,
-                    latency_ms: started.elapsed().as_millis(),
-                    events: all_events,
-                });
+                return Ok(completed_agent_response(response, started, all_events));
             }
             if calls.is_empty() {
                 return Err(RuntimeError::EmptyProviderToolRound);
             }
+            validate_provider_tool_calls(&calls)?;
+            repeated_batches.observe(&calls)?;
 
             append_provider_tool_calls(&mut messages, &response, &calls);
             observer.before_tool_batch(&calls)?;
@@ -1558,6 +1773,7 @@ impl AgentRuntime {
                 batch,
                 scope,
                 observer,
+                &self.tool_result_policy,
             )?;
             request.messages.clone_from(&messages);
             request.prompt.clear();
@@ -1687,6 +1903,7 @@ impl AgentRuntime {
             return Ok(ordered_batch_output(calls.len(), terminal));
         }
 
+        let result_policy = &self.tool_result_policy;
         for group in provider_batch_execution_groups(approved, options.parallel) {
             if !scope.control().accepts_normal_output() {
                 record_scheduler_cancellations(scope, group.len(), 0);
@@ -1715,7 +1932,9 @@ impl AgentRuntime {
                 serialization_reason,
                 "canonical tool execution group scheduled"
             );
-            let execution = execute_runtime_tool_group(invoker, &group, concurrency, scope).await;
+            let execution =
+                execute_runtime_tool_group(invoker, &group, concurrency, scope, result_policy)
+                    .await;
             if execution.queued_cancellations != 0 || execution.running_cancellations != 0 {
                 record_scheduler_cancellations(
                     scope,
@@ -1862,7 +2081,8 @@ impl AgentRuntime {
                     start,
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| terminal_after_visible_output(error, &events))?;
             let should_sleep = poll.events.is_empty();
             for event in poll.events {
                 let disposition = normalize_provider_event_or_cleanup(
@@ -1874,7 +2094,8 @@ impl AgentRuntime {
                     &mut text,
                     &mut usage,
                 )
-                .await?;
+                .await
+                .map_err(|error| terminal_after_visible_output(error, &events))?;
                 if let Some(response) = apply_provider_event_disposition(
                     provider,
                     &ProviderEventContext {
@@ -2038,7 +2259,8 @@ where
                 text: std::mem::take(text),
                 stop_reason: Some(stop_reason),
                 usage: usage.take(),
-                latency_ms: context.start.elapsed().as_millis(),
+                latency_ms: duration_millis(context.start.elapsed()),
+                termination_reason: AgentLoopTerminationReason::ProviderStop,
                 events: std::mem::take(events),
             }))
         }
@@ -2052,6 +2274,33 @@ where
                 .await?;
             Err(RuntimeError::Cancelled)
         }
+    }
+}
+
+fn terminal_after_visible_output(
+    error: RuntimeError,
+    events: &[AgentRuntimeEvent],
+) -> RuntimeError {
+    let visible = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentRuntimeEvent::TextDelta(_)
+                | AgentRuntimeEvent::ReasoningDelta(_)
+                | AgentRuntimeEvent::ToolCallStarted { .. }
+                | AgentRuntimeEvent::ToolCallDelta { .. }
+                | AgentRuntimeEvent::ToolCallFinished(_)
+                | AgentRuntimeEvent::ToolResult(_)
+        )
+    });
+    if visible
+        && matches!(
+            error,
+            RuntimeError::ProviderInvocation(_) | RuntimeError::Provider { .. }
+        )
+    {
+        RuntimeError::ProviderAfterOutput(Box::new(error))
+    } else {
+        error
     }
 }
 
@@ -2115,13 +2364,18 @@ async fn poll_provider_events<P>(
 where
     P: ModelProviderInvoker + ?Sized,
 {
-    let remaining = context
-        .request
-        .timeout
-        .checked_sub(context.start.elapsed())
-        .ok_or(RuntimeError::Timeout {
+    let Some(remaining) = context.request.timeout.checked_sub(context.start.elapsed()) else {
+        cancel_and_finish(
+            provider,
+            context.provider_plugin_id,
+            context.cancel_request,
+            context.finish_request,
+        )
+        .await;
+        return Err(RuntimeError::Timeout {
             timeout: context.request.timeout,
-        })?;
+        });
+    };
     let request_cancellation = context.request.cancellation.clone();
     let scope_cancellation = context.scope.control().cancellation();
     tokio::select! {
@@ -2194,7 +2448,7 @@ fn finished_event(
     AgentRuntimeEvent::Finished {
         stop_reason,
         usage: usage.cloned(),
-        latency_ms: latency.as_millis(),
+        latency_ms: duration_millis(latency),
     }
 }
 
@@ -2219,7 +2473,7 @@ impl Drop for RuntimePhaseDuration {
         tracing::debug!(
             provider_round = ?self.provider_round,
             phase = self.phase,
-            duration_ms = self.started.elapsed().as_millis(),
+            duration_ms = duration_millis(self.started.elapsed()),
             "canonical runtime phase completed"
         );
     }
@@ -2488,10 +2742,119 @@ async fn wait_for_provider_retry_delay(
     }
 }
 
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn remaining_turn_duration(started: Instant, timeout: Duration) -> Result<Duration> {
     timeout
         .checked_sub(started.elapsed())
         .ok_or(RuntimeError::Timeout { timeout })
+}
+
+fn completed_agent_response(
+    response: AgentTurnResponse,
+    started: Instant,
+    events: Vec<AgentRuntimeEvent>,
+) -> AgentTurnResponse {
+    AgentTurnResponse {
+        text: response.text,
+        stop_reason: response.stop_reason,
+        usage: response.usage,
+        latency_ms: duration_millis(started.elapsed()),
+        termination_reason: AgentLoopTerminationReason::ProviderStop,
+        events,
+    }
+}
+
+fn stopped_agent_response(
+    response: AgentTurnResponse,
+    started: Instant,
+    events: Vec<AgentRuntimeEvent>,
+) -> AgentTurnResponse {
+    AgentTurnResponse {
+        text: response.text,
+        stop_reason: response.stop_reason,
+        usage: response.usage,
+        latency_ms: duration_millis(started.elapsed()),
+        termination_reason: AgentLoopTerminationReason::StopCondition,
+        events,
+    }
+}
+
+fn initial_loop_messages(request: &AgentTurnRequest) -> Vec<ModelMessage> {
+    let mut messages = request.messages.clone();
+    if request.append_prompt {
+        messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: request.prompt.clone(),
+            }],
+        });
+    }
+    messages
+}
+
+#[derive(Debug)]
+struct ToolBatchRepeatGuard {
+    limit: u32,
+    repeats: u32,
+    previous: Option<Vec<(String, serde_json::Value)>>,
+}
+
+impl ToolBatchRepeatGuard {
+    const fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            repeats: 0,
+            previous: None,
+        }
+    }
+
+    fn observe(&mut self, calls: &[ToolCall]) -> Result<()> {
+        let semantic_batch = calls
+            .iter()
+            .map(|call| (call.name.clone(), call.arguments.clone()))
+            .collect::<Vec<_>>();
+        if self.previous.as_ref() == Some(&semantic_batch) {
+            self.repeats = self.repeats.saturating_add(1);
+        } else {
+            self.repeats = 1;
+            self.previous = Some(semantic_batch);
+        }
+        if self.repeats > self.limit {
+            return Err(RuntimeError::RepeatedToolCallBatch {
+                repeats: self.repeats,
+                limit: self.limit,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_provider_tool_calls(calls: &[ToolCall]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for (index, call) in calls.iter().enumerate() {
+        if call.id.trim().is_empty() {
+            return Err(RuntimeError::MalformedProviderToolCall {
+                index,
+                message: "tool-call id is empty".to_string(),
+            });
+        }
+        if call.name.trim().is_empty() {
+            return Err(RuntimeError::MalformedProviderToolCall {
+                index,
+                message: "tool name is empty".to_string(),
+            });
+        }
+        if !ids.insert(call.id.as_str()) {
+            return Err(RuntimeError::MalformedProviderToolCall {
+                index,
+                message: format!("duplicate tool-call id {}", call.id),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn append_provider_tool_calls(
@@ -2524,6 +2887,7 @@ fn append_tool_batch_results<O>(
     batch: ToolBatchExecutionOutput,
     scope: &TurnScope,
     observer: &O,
+    result_policy: &ToolResultPolicy,
 ) -> Result<()>
 where
     O: ToolRoundObserver + ?Sized,
@@ -2543,12 +2907,14 @@ where
                 output.model_result
             }
             Err(error) => {
-                let result = ToolResult {
+                let mut result = ToolResult {
                     call_id: call.id.clone(),
                     output: error.to_string(),
                     is_error: true,
                     content: Vec::new(),
                 };
+                let mut transform = ToolResultTransform::default();
+                transform_model_text(&mut result.output, result_policy, &mut transform);
                 let event = AgentRuntimeEvent::ToolResult(result.clone());
                 if !scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
                     return Err(RuntimeError::Cancelled);
@@ -2647,6 +3013,7 @@ async fn execute_runtime_tool_group<I>(
     group: &[PreparedRuntimeToolCall],
     concurrency: usize,
     scope: &TurnScope,
+    result_policy: &ToolResultPolicy,
 ) -> RuntimeToolGroupExecution
 where
     I: ToolInvoker + ?Sized,
@@ -2660,7 +3027,7 @@ where
             async move {
                 let _active = observation.enter();
                 let index = prepared.index;
-                let result = invoke_prepared_tool(invoker, prepared, scope).await;
+                let result = invoke_prepared_tool(invoker, prepared, scope, result_policy).await;
                 (index, result)
             }
         }))
@@ -2821,6 +3188,7 @@ async fn invoke_prepared_tool<I>(
     invoker: &I,
     prepared: PreparedRuntimeToolCall,
     scope: &TurnScope,
+    result_policy: &ToolResultPolicy,
 ) -> Result<ToolExecutionOutput>
 where
     I: ToolInvoker + ?Sized,
@@ -2863,7 +3231,8 @@ where
         let _ = lifecycle.cancel();
         return Err(RuntimeError::Cancelled);
     }
-    let output = tool_execution_output(&prepared.call, invocation);
+    let mut output = tool_execution_output(&prepared.call, invocation);
+    apply_tool_result_policy(&mut output, result_policy);
     for event in &output.events {
         if matches!(event, AgentRuntimeEvent::ToolCallFinished(_)) {
             continue;
@@ -2886,6 +3255,155 @@ where
     Ok(output)
 }
 
+fn apply_tool_result_policy(output: &mut ToolExecutionOutput, policy: &ToolResultPolicy) {
+    let mut transform = ToolResultTransform::default();
+    transform_model_text(&mut output.model_result.output, policy, &mut transform);
+    if output.model_result.content.len() > policy.max_content_items.get() {
+        transform.omitted_content_items = output
+            .model_result
+            .content
+            .len()
+            .saturating_sub(policy.max_content_items.get());
+        output
+            .model_result
+            .content
+            .truncate(policy.max_content_items.get());
+    }
+    output
+        .model_result
+        .content
+        .retain_mut(|content| match content {
+            bcode_model::ToolResultContent::Text { text } => {
+                transform_model_text(text, policy, &mut transform);
+                true
+            }
+            bcode_model::ToolResultContent::Image { image } => {
+                let mime_redactions = redact_model_text(&mut image.mime_type, policy);
+                let binary_redactions = policy
+                    .redacted_values
+                    .iter()
+                    .map(|sensitive| image.data_base64.matches(sensitive).count())
+                    .sum::<usize>();
+                transform.redaction_count = transform
+                    .redaction_count
+                    .saturating_add(mime_redactions)
+                    .saturating_add(binary_redactions);
+                transform_optional_model_text(
+                    &mut image.metadata.source_path,
+                    policy,
+                    &mut transform,
+                );
+                let decoded_bytes = estimated_base64_decoded_bytes(&image.data_base64).max(
+                    image
+                        .metadata
+                        .byte_len
+                        .and_then(|bytes| usize::try_from(bytes).ok())
+                        .unwrap_or_default(),
+                );
+                if decoded_bytes > policy.max_binary_bytes.get()
+                    || binary_redactions != 0
+                    || mime_redactions != 0
+                    || image.mime_type.len() > policy.max_text_bytes.get()
+                {
+                    transform.omitted_binary_fields =
+                        transform.omitted_binary_fields.saturating_add(1);
+                    false
+                } else {
+                    true
+                }
+            }
+            bcode_model::ToolResultContent::ImageRef { image } => {
+                let path_redactions = redact_model_text(&mut image.path, policy);
+                let mime_redactions = redact_model_text(&mut image.mime_type, policy);
+                let source_redactions = image
+                    .metadata
+                    .source_path
+                    .as_mut()
+                    .map_or(0, |path| redact_model_text(path, policy));
+                transform.redaction_count = transform
+                    .redaction_count
+                    .saturating_add(path_redactions)
+                    .saturating_add(mime_redactions)
+                    .saturating_add(source_redactions);
+                let invalid_reference = path_redactions != 0
+                    || mime_redactions != 0
+                    || source_redactions != 0
+                    || image.path.len() > policy.max_text_bytes.get()
+                    || image.mime_type.len() > policy.max_text_bytes.get()
+                    || image
+                        .metadata
+                        .source_path
+                        .as_ref()
+                        .is_some_and(|path| path.len() > policy.max_text_bytes.get());
+                if invalid_reference {
+                    transform.omitted_reference_fields =
+                        transform.omitted_reference_fields.saturating_add(1);
+                    false
+                } else {
+                    true
+                }
+            }
+        });
+    output.model_transform = transform;
+    for event in &mut output.events {
+        if let AgentRuntimeEvent::ToolResult(result) = event {
+            result.clone_from(&output.model_result);
+        }
+    }
+}
+
+fn transform_optional_model_text(
+    text: &mut Option<String>,
+    policy: &ToolResultPolicy,
+    transform: &mut ToolResultTransform,
+) {
+    if let Some(text) = text {
+        transform_model_text(text, policy, transform);
+    }
+}
+
+fn redact_model_text(text: &mut String, policy: &ToolResultPolicy) -> usize {
+    let mut redaction_count = 0_usize;
+    for sensitive in &policy.redacted_values {
+        let count = text.matches(sensitive).count();
+        if count != 0 {
+            *text = text.replace(sensitive, "[REDACTED]");
+            redaction_count = redaction_count.saturating_add(count);
+        }
+    }
+    redaction_count
+}
+
+fn transform_model_text(
+    text: &mut String,
+    policy: &ToolResultPolicy,
+    transform: &mut ToolResultTransform,
+) {
+    transform.redaction_count = transform
+        .redaction_count
+        .saturating_add(redact_model_text(text, policy));
+    let max_bytes = policy.max_text_bytes.get();
+    if text.len() > max_bytes {
+        let mut boundary = max_bytes;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
+        transform.truncated_text_fields = transform.truncated_text_fields.saturating_add(1);
+    }
+}
+
+fn estimated_base64_decoded_bytes(encoded: &str) -> usize {
+    let padding = encoded
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count()
+        .min(2);
+    (encoded.len().saturating_mul(3) / 4).saturating_sub(padding)
+}
+
 fn tool_execution_output(
     call: &ToolCall,
     invocation: ToolInvocationResponse,
@@ -2904,6 +3422,7 @@ fn tool_execution_output(
     ToolExecutionOutput {
         model_result: model_result.clone(),
         invocation,
+        model_transform: ToolResultTransform::default(),
         events: vec![
             AgentRuntimeEvent::ToolCallFinished(call.clone()),
             AgentRuntimeEvent::ToolResult(model_result),
@@ -3561,6 +4080,10 @@ mod tests {
                 message: "synthetic failure".to_string(),
                 retryable: false,
                 provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
                 retry: None,
             },
         }]);
@@ -3917,6 +4440,10 @@ mod tests {
                         message: "temporary".to_string(),
                         retryable: true,
                         provider_message: None,
+                        failure: None,
+                        request_id: None,
+                        diagnostic_context: Box::default(),
+                        sources: Box::default(),
                         retry: None,
                     },
                 }],
@@ -6121,6 +6648,10 @@ mod tests {
                                 message: "provider failed".to_string(),
                                 retryable: false,
                                 provider_message: None,
+                                failure: None,
+                                request_id: None,
+                                diagnostic_context: Box::default(),
+                                sources: Box::default(),
                                 retry: None,
                             },
                         }],

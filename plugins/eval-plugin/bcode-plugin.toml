@@ -6,6 +6,12 @@ categories = ["eval"]
 
 [[services]]
 class        = "service"
+description  = "Versioned SDK evaluation artifact loader"
+interface_id = "bcode.eval.sdk-artifact/v1"
+name         = "SDK Eval Artifacts"
+
+[[services]]
+class        = "service"
 description  = "Eval viewer command contributions"
 interface_id = "bcode.command/v1"
 name         = "Eval Commands"

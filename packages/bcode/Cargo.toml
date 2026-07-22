@@ -23,30 +23,37 @@ required-features = ["embedded-plugins", "static-bundled-fake-provider-plugin"]
 name              = "daemon_client"
 required-features = ["daemon-client"]
 
+[[example]]
+name              = "scripted_provider"
+required-features = ["testing"]
+
 [dependencies]
-bcode_agent_permissions    = { workspace = true }
-bcode_agent_policy         = { workspace = true }
-bcode_agent_profile        = { workspace = true }
-bcode_agent_runtime        = { workspace = true }
-bcode_bundled_plugins      = { workspace = true, optional = true }
-bcode_cli                  = { workspace = true, optional = true }
-bcode_client               = { workspace = true, optional = true }
-bcode_config               = { workspace = true, optional = true }
-bcode_fake_provider_plugin = { workspace = true, optional = true }
-bcode_model                = { workspace = true }
-bcode_plugin               = { workspace = true, optional = true }
-bcode_plugin_sdk           = { workspace = true }
-bcode_session_models       = { workspace = true }
-bcode_tool                 = { workspace = true }
-futures                    = { workspace = true }
-jsonschema                 = { workspace = true }
-partial-json-fixer         = { workspace = true }
-pin-project-lite           = { workspace = true }
-schemars                   = { workspace = true }
-serde                      = { workspace = true, features = ["derive"] }
-serde_json                 = { workspace = true }
-thiserror                  = { workspace = true }
-tokio                      = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+bcode_agent_permissions                 = { workspace = true }
+bcode_agent_policy                      = { workspace = true }
+bcode_agent_profile                     = { workspace = true }
+bcode_agent_runtime                     = { workspace = true }
+bcode_bundled_plugins                   = { workspace = true, optional = true }
+bcode_cli                               = { workspace = true, optional = true }
+bcode_client                            = { workspace = true, optional = true }
+bcode_config                            = { workspace = true, optional = true }
+bcode_eval                              = { workspace = true, optional = true }
+bcode_fake_provider_plugin              = { workspace = true, optional = true }
+bcode_model                             = { workspace = true }
+bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
+bcode_plugin                            = { workspace = true, optional = true }
+bcode_plugin_sdk                        = { workspace = true }
+bcode_session_models                    = { workspace = true }
+bcode_tool                              = { workspace = true }
+futures                                 = { workspace = true }
+jsonschema                              = { workspace = true }
+partial-json-fixer                      = { workspace = true }
+pin-project-lite                        = { workspace = true }
+schemars                                = { workspace = true }
+serde                                   = { workspace = true, features = ["derive"] }
+serde_json                              = { workspace = true }
+sha2                                    = { workspace = true }
+thiserror                               = { workspace = true }
+tokio                                   = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [dev-dependencies]
 bcode_hello_plugin    = { workspace = true }
@@ -55,6 +62,7 @@ bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_shell_plugin    = { workspace = true, features = ["static-bundled"] }
 tempfile              = { workspace = true }
 tokio                 = { workspace = true, features = ["macros", "rt"] }
+trybuild              = { workspace = true }
 
 [features]
 app = ["config", "cli", "static-bundled-plugins", "bundled-ocr-tesseract"]
@@ -84,7 +92,9 @@ config = ["dep:bcode_config"]
 daemon-client = ["dep:bcode_client"]
 default = []
 embedded-plugins = ["dep:bcode_plugin"]
+evaluation = ["dep:bcode_eval"]
 fail-on-warnings = []
+openai-compatible-provider = ["dep:bcode_openai_compatible_provider_plugin"]
 static-bundled-bedrock-provider-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-bedrock-provider-plugin",
@@ -140,6 +150,7 @@ static-bundled-ocr-plugin = [
 ]
 static-bundled-openai-compatible-provider-plugin = [
     "bundled-plugins",
+    "openai-compatible-provider",
     "bcode_bundled_plugins/static-bundled-openai-compatible-provider-plugin",
 ]
 static-bundled-opencode-session-import-plugin = [
@@ -190,3 +201,4 @@ system-ocr-tesseract = [
     "static-bundled-ocr-plugin",
     "bcode_bundled_plugins/system-ocr-tesseract",
 ]
+testing = ["bcode_agent_runtime/testing"]

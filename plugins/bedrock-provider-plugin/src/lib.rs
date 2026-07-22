@@ -11,16 +11,18 @@ use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_bedrock as bedrock;
 use aws_sdk_bedrockruntime::Client;
-use aws_sdk_bedrockruntime::error::DisplayErrorContext;
+use aws_sdk_bedrockruntime::operation::RequestId;
 use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
 use aws_sdk_bedrockruntime::types::{
-    CachePointBlock, CachePointType, ContentBlock as BedrockContentBlock, ContentBlockDelta,
-    ContentBlockStart, ConversationRole, ConverseStreamOutput, ImageBlock, ImageFormat,
-    ImageSource, InferenceConfiguration, Message as BedrockMessage,
-    StopReason as BedrockStopReason, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
+    AnyToolChoice, AutoToolChoice, CachePointBlock, CachePointType,
+    ContentBlock as BedrockContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
+    ConverseStreamOutput, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
+    Message as BedrockMessage, SpecificToolChoice, StopReason as BedrockStopReason,
+    SystemContentBlock, Tool, ToolChoice as BedrockToolChoice, ToolConfiguration, ToolInputSchema,
     ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::Blob;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::{Document, Number};
 use base64::Engine as _;
 use bcode_model::{
@@ -29,11 +31,13 @@ use bcode_model::{
     ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
     OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderCapabilities, ProviderCapability, ProviderError,
-    ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
-    StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolDefinition, ValidateConfigResponse,
+    ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext, ProviderRequestProjection,
+    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolChoice,
+    ToolDefinition, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, StreamOutcome, TurnState, TurnStore, provider_error, retry_hint_from_body,
+    sanitize_provider_diagnostic,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -55,6 +59,7 @@ pub struct BedrockProviderPlugin {
     turns: Mutex<TurnStore>,
     discovery: Arc<Mutex<DiscoveryCache>>,
     runtime: Result<ProviderRuntime, String>,
+    turn_executor: Arc<dyn BedrockTurnExecutor>,
 }
 
 impl Default for BedrockProviderPlugin {
@@ -63,7 +68,35 @@ impl Default for BedrockProviderPlugin {
             turns: Mutex::default(),
             discovery: Arc::default(),
             runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
+            turn_executor: Arc::new(AwsBedrockTurnExecutor),
         }
+    }
+}
+
+#[derive(Debug)]
+struct AwsBedrockTurnExecutor;
+
+trait BedrockTurnExecutor: Send + Sync {
+    fn start(
+        &self,
+        runtime: &ProviderRuntime,
+        request: ModelTurnRequest,
+        turn: TurnState,
+        discovery: Arc<Mutex<DiscoveryCache>>,
+    );
+}
+
+impl BedrockTurnExecutor for AwsBedrockTurnExecutor {
+    fn start(
+        &self,
+        runtime: &ProviderRuntime,
+        request: ModelTurnRequest,
+        turn: TurnState,
+        discovery: Arc<Mutex<DiscoveryCache>>,
+    ) {
+        runtime.spawn(async move {
+            stream_bedrock_turn(&request, &turn, discovery).await;
+        });
     }
 }
 
@@ -120,7 +153,7 @@ impl BedrockProviderPlugin {
         match context.request.operation.as_str() {
             OP_CAPABILITIES => json_response(&capabilities()),
             OP_MODELS => self.models_response(&context.request),
-            OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
+            OP_VALIDATE_CONFIG => self.validate_config_response(&context.request),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
@@ -151,10 +184,8 @@ impl BedrockProviderPlugin {
         });
         match &self.runtime {
             Ok(runtime) => {
-                let discovery = self.discovery.clone();
-                runtime.spawn(async move {
-                    stream_bedrock_turn(&request, &turn, discovery).await;
-                });
+                self.turn_executor
+                    .start(runtime, request, turn, Arc::clone(&self.discovery));
             }
             Err(error) => push_runtime_error(&turn, error),
         }
@@ -239,11 +270,130 @@ async fn stream_bedrock_turn(
     }
 }
 
+fn validate_bedrock_request(request: &ModelTurnRequest) -> Result<(), ProviderError> {
+    if request.structured_output.is_some() {
+        return Err(provider_error(
+            "bedrock_structured_output_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "Bedrock Converse does not provide provider-native JSON Schema enforcement",
+        ));
+    }
+    if request.parameters.reasoning_budget_tokens.is_some()
+        || request.parameters.reasoning_effort.is_some()
+        || request.parameters.reasoning_effort_value.is_some()
+        || request.parameters.reasoning_summary.is_some()
+    {
+        return Err(provider_error(
+            "bedrock_reasoning_controls_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "Bedrock reasoning controls are not supported by this provider adapter",
+        ));
+    }
+    if request.tool_call_policy.parallel {
+        return Err(provider_error(
+            "bedrock_parallel_tool_policy_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "Bedrock model metadata does not guarantee parallel tool-call generation",
+        ));
+    }
+    if request.conversation_reuse.mode.is_enabled()
+        || request
+            .conversation_reuse
+            .previous_provider_response_id
+            .is_some()
+        || request.conversation_reuse.provider_state.is_some()
+    {
+        return Err(provider_error(
+            "bedrock_conversation_reuse_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "Bedrock provider-native conversation reuse is not supported by this adapter",
+        ));
+    }
+    if !request.provider_context.request.is_empty() {
+        return Err(provider_error(
+            "bedrock_provider_options_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "Bedrock provider-native request options are not supported by this adapter",
+        ));
+    }
+    if request
+        .parameters
+        .max_output_tokens
+        .is_some_and(|tokens| i32::try_from(tokens).is_err())
+    {
+        return Err(provider_error(
+            "bedrock_max_output_tokens_out_of_range",
+            ProviderErrorCategory::InvalidRequest,
+            "Bedrock max_output_tokens must fit in a signed 32-bit integer",
+        ));
+    }
+    validate_bedrock_cache_ttl(request)?;
+    validate_declared_bedrock_features(request)?;
+    validate_tool_choice_registration(request)
+}
+
+fn validate_declared_bedrock_features(request: &ModelTurnRequest) -> Result<(), ProviderError> {
+    let unsupported = request.explicitly_unsupported_features(&bedrock_feature_support());
+    unsupported.first().map_or(Ok(()), |feature| {
+        Err(provider_error(
+            "bedrock_feature_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            format!("Bedrock does not support requested feature {feature:?}"),
+        ))
+    })
+}
+
+fn validate_bedrock_cache_ttl(request: &ModelTurnRequest) -> Result<(), ProviderError> {
+    let has_ttl = request.messages.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::CachePoint {
+                    hint: bcode_model::PromptCachePoint {
+                        ttl_seconds: Some(_),
+                        ..
+                    }
+                }
+            )
+        })
+    });
+    if has_ttl {
+        Err(provider_error(
+            "bedrock_cache_ttl_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "Bedrock cache points do not accept a portable TTL",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_tool_choice_registration(request: &ModelTurnRequest) -> Result<(), ProviderError> {
+    match &request.tool_call_policy.choice {
+        ToolChoice::Required if request.tools.is_empty() => Err(provider_error(
+            "tool_choice_without_tools",
+            ProviderErrorCategory::InvalidRequest,
+            "required tool choice needs at least one registered tool",
+        )),
+        ToolChoice::Tool { name } if !request.tools.iter().any(|tool| tool.name == *name) => {
+            Err(provider_error(
+                "unknown_required_tool",
+                ProviderErrorCategory::InvalidRequest,
+                format!("required tool '{name}' is not registered"),
+            ))
+        }
+        ToolChoice::Auto | ToolChoice::None | ToolChoice::Required | ToolChoice::Tool { .. } => {
+            Ok(())
+        }
+    }
+}
+
 async fn stream_bedrock_turn_inner(
     request: &ModelTurnRequest,
     turn: &TurnState,
     discovery: Arc<Mutex<DiscoveryCache>>,
 ) -> Result<StreamOutcome, ProviderError> {
+    validate_bedrock_request(request)?;
     let settings = Settings::resolve(Some(request));
     let client = bedrock_client(&settings).await;
     let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
@@ -329,6 +479,12 @@ async fn stream_bedrock_turn_inner(
             ProviderErrorCategory::Config,
             "Bedrock model discovery returned no usable streaming tool-use models; set BCODE_BEDROCK_MODEL or configure a Bedrock model profile",
         )
+        .with_failure(bedrock_failure_context(
+            bcode_model::ProviderFailureSourceKind::ModelProfile,
+            "BCODE_BEDROCK_MODEL or model profile",
+            bcode_model::ProviderFailureCapability::ModelDiscovery,
+            "set BCODE_BEDROCK_MODEL or configure an accessible streaming Bedrock model",
+        ))
     }))
 }
 
@@ -866,9 +1022,20 @@ fn joined_text_content(message: &ModelMessage) -> String {
 fn model_tools_to_bedrock_tool_config(
     request: &ModelTurnRequest,
 ) -> Result<Option<ToolConfiguration>, ProviderError> {
-    if request.tools.is_empty() {
+    if matches!(request.tool_call_policy.choice, ToolChoice::None) {
         return Ok(None);
     }
+    if request.tools.is_empty() {
+        return match &request.tool_call_policy.choice {
+            ToolChoice::Auto | ToolChoice::None => Ok(None),
+            ToolChoice::Required | ToolChoice::Tool { .. } => Err(provider_error(
+                "tool_choice_without_tools",
+                ProviderErrorCategory::InvalidRequest,
+                "Bedrock tool choice requires at least one registered tool",
+            )),
+        };
+    }
+    let tool_choice = bedrock_tool_choice(request)?;
     let mut tools = request
         .tools
         .iter()
@@ -889,9 +1056,43 @@ fn model_tools_to_bedrock_tool_config(
     }
     ToolConfiguration::builder()
         .set_tools(Some(tools))
+        .set_tool_choice(tool_choice)
         .build()
         .map(Some)
         .map_err(|error| build_error(&error))
+}
+
+fn bedrock_tool_choice(
+    request: &ModelTurnRequest,
+) -> Result<Option<BedrockToolChoice>, ProviderError> {
+    match &request.tool_call_policy.choice {
+        ToolChoice::Auto => Ok(Some(BedrockToolChoice::Auto(
+            AutoToolChoice::builder().build(),
+        ))),
+        ToolChoice::None => Ok(None),
+        ToolChoice::Required => Ok(Some(BedrockToolChoice::Any(
+            AnyToolChoice::builder().build(),
+        ))),
+        ToolChoice::Tool { name } => {
+            let tool = request
+                .tools
+                .iter()
+                .find(|tool| tool.name == *name)
+                .ok_or_else(|| {
+                    provider_error(
+                        "unknown_required_tool",
+                        ProviderErrorCategory::InvalidRequest,
+                        format!("required Bedrock tool '{name}' is not registered"),
+                    )
+                })?;
+            SpecificToolChoice::builder()
+                .name(bedrock_tool_name(&tool.name))
+                .build()
+                .map(BedrockToolChoice::Tool)
+                .map(Some)
+                .map_err(|error| build_error(&error))
+        }
+    }
 }
 
 fn default_cache_point() -> CachePointBlock {
@@ -1116,6 +1317,105 @@ fn resolve_configured_region(
     (None, RegionSource::AwsSdkDefaultChain)
 }
 
+fn bedrock_feature_support() -> bcode_model::ModelFeatureSupport {
+    use bcode_model::{
+        CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
+        ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
+    };
+    let supported = || CapabilitySupport::Supported {
+        source: CapabilitySource::BundledCatalog,
+    };
+    let unsupported = |reason: &str| CapabilitySupport::Unsupported {
+        source: CapabilitySource::BundledCatalog,
+        reason: reason.to_string(),
+    };
+    ModelFeatureSupport {
+        parameters: [
+            ModelParameterKey::Temperature,
+            ModelParameterKey::MaxOutputTokens,
+            ModelParameterKey::TopP,
+            ModelParameterKey::StopSequences,
+        ]
+        .into_iter()
+        .map(|key| (key, supported()))
+        .chain(
+            [
+                ModelParameterKey::ReasoningBudgetTokens,
+                ModelParameterKey::ReasoningEffort,
+                ModelParameterKey::ReasoningEffortValue,
+                ModelParameterKey::ReasoningSummary,
+            ]
+            .into_iter()
+            .map(|key| {
+                (
+                    key,
+                    unsupported("Bedrock Converse reasoning controls are not mapped"),
+                )
+            }),
+        )
+        .collect(),
+        structured_output: [
+            StructuredOutputMode::JsonSchema,
+            StructuredOutputMode::StrictJsonSchema,
+        ]
+        .into_iter()
+        .map(|mode| {
+            (
+                mode,
+                unsupported("Bedrock Converse structured output is not implemented"),
+            )
+        })
+        .collect(),
+        tool_choice: [
+            (ToolChoiceMode::Auto, supported()),
+            (ToolChoiceMode::None, supported()),
+            (ToolChoiceMode::Required, supported()),
+            (ToolChoiceMode::Named, supported()),
+            (
+                ToolChoiceMode::Parallel,
+                unsupported("Bedrock model-specific parallel support is not guaranteed"),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        prompt_cache: [
+            PromptCacheFeature::ConversationPrefix,
+            PromptCacheFeature::ExplicitSystem,
+            PromptCacheFeature::ExplicitTools,
+            PromptCacheFeature::ExplicitMessage,
+        ]
+        .into_iter()
+        .map(|feature| (feature, supported()))
+        .chain(std::iter::once((
+            PromptCacheFeature::Ttl,
+            unsupported("Bedrock cache points do not accept a portable TTL"),
+        )))
+        .collect(),
+        media_input: [
+            (MediaInputFeature::UserImage, supported()),
+            (
+                MediaInputFeature::SystemImage,
+                unsupported("Bedrock Converse system content does not accept images"),
+            ),
+            (
+                MediaInputFeature::AssistantImage,
+                unsupported("Bedrock Converse assistant messages do not accept images"),
+            ),
+            (
+                MediaInputFeature::ToolMessageImage,
+                unsupported("use structured tool-result image content instead"),
+            ),
+            (MediaInputFeature::ToolResultImage, supported()),
+            (
+                MediaInputFeature::ImageReference,
+                unsupported("Bedrock requires inline image bytes"),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
 fn capabilities() -> ProviderCapabilities {
     let settings = Settings::resolve(None);
     ProviderCapabilities {
@@ -1130,6 +1430,7 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
+        feature_support: bedrock_feature_support(),
         auth_schemes: [
             "aws_default_chain".to_string(),
             "aws_credentials".to_string(),
@@ -1190,9 +1491,17 @@ impl BedrockProviderPlugin {
         }
     }
 
-    fn validate_config(&self) -> ValidateConfigResponse {
-        let settings = Settings::resolve(None);
-        let validation: Result<(), ProviderError> = Ok(());
+    fn validate_config_response(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::ValidateConfigRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        json_response(&self.validate_config(&request.provider_context))
+    }
+
+    fn validate_config(&self, provider_context: &ProviderRequestContext) -> ValidateConfigResponse {
+        let settings = Settings::resolve_from_context(provider_context);
+        let mut validation: Result<(), ProviderError> = Ok(());
         let mut metadata = diagnostics_metadata(&settings);
         let effective_region = validation.as_ref().ok().and_then(|()| {
             self.runtime
@@ -1234,13 +1543,26 @@ impl BedrockProviderPlugin {
                     }
                 }
                 Err(error) => {
-                    metadata.insert("model_discovery_error".to_string(), error.message);
+                    metadata.insert("model_discovery_error".to_string(), error.message.clone());
+                    if matches!(
+                        error.category,
+                        ProviderErrorCategory::Auth | ProviderErrorCategory::Config
+                    ) {
+                        validation = Err(error);
+                    }
                 }
             }
         }
+        let failures = validation
+            .as_ref()
+            .err()
+            .and_then(|error| error.failure.as_deref())
+            .cloned()
+            .into_iter()
+            .collect();
         ValidateConfigResponse {
             valid: validation.is_ok(),
-            message: Some(match validation {
+            message: Some(match &validation {
                 Ok(()) => effective_region.map_or_else(
                     || format!(
                         "Bedrock configuration is usable; region will fall back to '{DEFAULT_REGION}' if the AWS SDK chain is empty and credentials will be resolved at request time"
@@ -1252,6 +1574,7 @@ impl BedrockProviderPlugin {
                 ),
                 Err(error) => format!("Bedrock configuration is not usable: {}", error.message),
             }),
+            failures,
             metadata,
         }
     }
@@ -1263,6 +1586,16 @@ fn model_list_request(request: &ServiceRequest) -> ModelListRequest {
         .unwrap_or_default()
 }
 
+fn bedrock_model_capabilities() -> BTreeSet<ModelCapability> {
+    [
+        ModelCapability::StreamingText,
+        ModelCapability::ToolCalls,
+        ModelCapability::PromptCaching,
+    ]
+    .into_iter()
+    .collect()
+}
+
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
     model_ids
         .iter()
@@ -1272,13 +1605,8 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             is_default: default_model == Some(model_id.as_str()),
             context_window: None,
             max_output_tokens: None,
-            capabilities: [
-                ModelCapability::StreamingText,
-                ModelCapability::ToolCalls,
-                ModelCapability::PromptCaching,
-            ]
-            .into_iter()
-            .collect(),
+            capabilities: bedrock_model_capabilities(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
             cache: bedrock_model_cache_info(),
             metadata_source: None,
@@ -1347,7 +1675,13 @@ async fn resolve_turn_model_selection(
             "bedrock_model_discovery_empty",
             ProviderErrorCategory::Config,
             "Bedrock model discovery returned no usable text/streaming models; set BCODE_BEDROCK_MODEL or configure a Bedrock model profile",
-        ));
+        )
+        .with_failure(bedrock_failure_context(
+            bcode_model::ProviderFailureSourceKind::ModelProfile,
+            "BCODE_BEDROCK_MODEL or model profile",
+            bcode_model::ProviderFailureCapability::ModelDiscovery,
+            "set BCODE_BEDROCK_MODEL or configure an accessible streaming Bedrock model",
+        )));
     }
     Ok(ModelSelection {
         model_ids,
@@ -1480,19 +1814,48 @@ fn cached_discovery(
     key: &DiscoveryCacheKey,
 ) -> Option<ModelDiscovery> {
     let cached = cache.lock().ok()?.entries.get(key).cloned()?;
-    (cached.discovered_at.elapsed() < MODEL_DISCOVERY_TTL)
-        .then(|| filtered_discovery(&cached.discovery, &cached.unsupported_streaming_tool_models))
+    (cached.discovered_at.elapsed() < MODEL_DISCOVERY_TTL).then(|| {
+        filtered_discovery(
+            &cached.discovery,
+            &cached.unsupported_streaming_tool_models,
+            &cached.unsupported_prompt_cache_models,
+        )
+    })
 }
 
 fn filtered_discovery(
     discovery: &ModelDiscovery,
     unsupported_streaming_tool_models: &BTreeSet<String>,
+    unsupported_prompt_cache_models: &BTreeSet<String>,
 ) -> ModelDiscovery {
     let models = discovery
         .models
         .iter()
         .filter(|model| !unsupported_streaming_tool_models.contains(&model.model_id))
         .cloned()
+        .map(|mut model| {
+            if unsupported_prompt_cache_models.contains(&model.model_id) {
+                model.capabilities.remove(&ModelCapability::PromptCaching);
+                model.cache.capabilities.clear();
+                for feature in [
+                    bcode_model::PromptCacheFeature::ConversationPrefix,
+                    bcode_model::PromptCacheFeature::ExplicitSystem,
+                    bcode_model::PromptCacheFeature::ExplicitTools,
+                    bcode_model::PromptCacheFeature::ExplicitMessage,
+                    bcode_model::PromptCacheFeature::Ttl,
+                ] {
+                    model.feature_support.prompt_cache.insert(
+                        feature,
+                        bcode_model::CapabilitySupport::Unsupported {
+                            source: bcode_model::CapabilitySource::Probe,
+                            reason: "Bedrock previously rejected prompt caching for this model"
+                                .to_string(),
+                        },
+                    );
+                }
+            }
+            model
+        })
         .collect::<Vec<_>>();
     let default_model_id = models.first().map(|model| model.model_id.clone());
     ModelDiscovery {
@@ -1876,13 +2239,8 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             display_name: candidate.display_name,
             context_window: None,
             max_output_tokens: None,
-            capabilities: [
-                ModelCapability::StreamingText,
-                ModelCapability::ToolCalls,
-                ModelCapability::PromptCaching,
-            ]
-            .into_iter()
-            .collect(),
+            capabilities: bedrock_model_capabilities(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
             cache: bedrock_model_cache_info(),
             metadata_source: None,
@@ -2147,19 +2505,111 @@ fn build_error(error: &(impl ToString + ?Sized)) -> ProviderError {
 }
 
 fn bedrock_sdk_error(
-    error: &aws_sdk_bedrockruntime::error::SdkError<ConverseStreamError>,
+    error_source: &aws_sdk_bedrockruntime::error::SdkError<ConverseStreamError>,
 ) -> ProviderError {
-    let message = DisplayErrorContext(error).to_string();
-    let category = error.as_service_error().map_or_else(
-        || bedrock_error_category_from_message(&message),
-        bedrock_converse_stream_error_category,
+    let Some(service_error) = error_source.as_service_error() else {
+        let (kind, category) = match error_source {
+            aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => {
+                ("timeout", ProviderErrorCategory::Timeout)
+            }
+            aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_) => {
+                ("dispatch", ProviderErrorCategory::Network)
+            }
+            aws_sdk_bedrockruntime::error::SdkError::ResponseError(_) => {
+                ("response", ProviderErrorCategory::Network)
+            }
+            aws_sdk_bedrockruntime::error::SdkError::ConstructionFailure(_) => {
+                ("construction", ProviderErrorCategory::Config)
+            }
+            _ => ("unknown", ProviderErrorCategory::ProviderInternal),
+        };
+        return bedrock_runtime_transport_error(kind, category);
+    };
+    let category = bedrock_converse_stream_error_category(service_error);
+    let provider_message = service_error
+        .meta()
+        .message()
+        .map(sanitize_provider_diagnostic);
+    let mut normalized = provider_error(
+        "bedrock_request_failed",
+        category,
+        provider_message
+            .as_deref()
+            .unwrap_or("Bedrock runtime service request failed"),
     );
-    let mut error = provider_error("bedrock_request_failed", category, message.clone());
+    if matches!(category, ProviderErrorCategory::Auth) {
+        normalized.failure = Some(Box::new(bedrock_failure_context(
+            bcode_model::ProviderFailureSourceKind::ProviderResponse,
+            service_error
+                .meta()
+                .code()
+                .unwrap_or("aws_bedrock_runtime_auth"),
+            bcode_model::ProviderFailureCapability::ModelInvocation,
+            "verify the AWS credential/profile source, region, and Bedrock model access",
+        )));
+    }
+    normalized.request_id = service_error
+        .meta()
+        .request_id()
+        .map(str::to_string)
+        .map(String::into_boxed_str);
+    normalized.provider_message = provider_message.clone().map(String::into_boxed_str);
+    normalized.sources.push(ProviderErrorSource {
+        source: "aws_bedrock_runtime".to_string(),
+        code: service_error.meta().code().map(str::to_string),
+        message: provider_message.clone(),
+    });
     if category == ProviderErrorCategory::RateLimit || category == ProviderErrorCategory::Overloaded
     {
-        error.retry = retry_hint_from_body(&message).map(Box::new);
+        normalized.retry = provider_message
+            .as_deref()
+            .and_then(retry_hint_from_body)
+            .map(Box::new);
     }
-    error
+    normalized
+}
+
+fn bedrock_failure_context(
+    source_kind: bcode_model::ProviderFailureSourceKind,
+    source: impl Into<String>,
+    capability: bcode_model::ProviderFailureCapability,
+    remediation: impl Into<String>,
+) -> bcode_model::ProviderFailureContext {
+    bcode_model::ProviderFailureContext {
+        provider_id: PROVIDER_ID.to_string(),
+        source_kind,
+        source: source.into(),
+        capability,
+        remediation: remediation.into(),
+    }
+}
+
+fn bedrock_runtime_transport_error(kind: &str, category: ProviderErrorCategory) -> ProviderError {
+    let mut normalized = provider_error(
+        "bedrock_request_failed",
+        category,
+        format!("Bedrock runtime {kind} failure"),
+    );
+    normalized
+        .diagnostic_context
+        .insert("transport_kind".to_string(), kind.to_string());
+    normalized.sources.push(ProviderErrorSource {
+        source: "aws_sdk".to_string(),
+        code: Some(kind.to_string()),
+        message: None,
+    });
+    if matches!(
+        category,
+        ProviderErrorCategory::Auth | ProviderErrorCategory::Config
+    ) {
+        normalized.failure = Some(Box::new(bedrock_failure_context(
+            bcode_model::ProviderFailureSourceKind::Runtime,
+            "aws_sdk_credential_and_region_chain",
+            bcode_model::ProviderFailureCapability::ModelInvocation,
+            "verify the AWS credential/profile source, region, and Bedrock model access",
+        )));
+    }
+    normalized
 }
 
 fn bedrock_converse_stream_error_category(error: &ConverseStreamError) -> ProviderErrorCategory {
@@ -2208,25 +2658,162 @@ fn bedrock_error_category_from_message(message: &str) -> ProviderErrorCategory {
     }
 }
 
-fn bedrock_discovery_error(error: &(impl std::fmt::Debug + ToString + ?Sized)) -> ProviderError {
-    let message = format!("{} ({error:?})", error.to_string());
-    let category = bedrock_error_category_from_message(&message);
-    let mut error = provider_error("bedrock_model_discovery_failed", category, message.clone());
-    if category == ProviderErrorCategory::RateLimit || category == ProviderErrorCategory::Overloaded
-    {
-        error.retry = retry_hint_from_body(&message).map(Box::new);
+fn bedrock_discovery_error<E, R>(error: &bedrock::error::SdkError<E, R>) -> ProviderError
+where
+    E: ProvideErrorMetadata,
+{
+    match error {
+        bedrock::error::SdkError::ServiceError(service) => {
+            let metadata = service.err().meta();
+            let provider_message = metadata.message().map(sanitize_provider_diagnostic);
+            let category = metadata
+                .code()
+                .or_else(|| metadata.message())
+                .map_or(ProviderErrorCategory::ProviderInternal, |detail| {
+                    bedrock_error_category_from_message(detail)
+                });
+            let mut normalized = provider_error(
+                "bedrock_model_discovery_failed",
+                category,
+                provider_message
+                    .as_deref()
+                    .unwrap_or("Bedrock model discovery service request failed"),
+            );
+            normalized.request_id = metadata
+                .request_id()
+                .map(str::to_string)
+                .map(String::into_boxed_str);
+            normalized.provider_message = provider_message.clone().map(String::into_boxed_str);
+            normalized.sources.push(ProviderErrorSource {
+                source: "aws_bedrock_control".to_string(),
+                code: metadata.code().map(str::to_string),
+                message: provider_message,
+            });
+            if matches!(category, ProviderErrorCategory::Auth) {
+                normalized.failure = Some(Box::new(bedrock_failure_context(
+                    bcode_model::ProviderFailureSourceKind::ProviderResponse,
+                    metadata.code().unwrap_or("aws_bedrock_control_auth"),
+                    bcode_model::ProviderFailureCapability::ModelDiscovery,
+                    "verify the AWS credential/profile source, region, and Bedrock model access",
+                )));
+            }
+            normalized
+        }
+        bedrock::error::SdkError::TimeoutError(_) => {
+            bedrock_transport_error("timeout", ProviderErrorCategory::Timeout)
+        }
+        bedrock::error::SdkError::DispatchFailure(_) => {
+            bedrock_transport_error("dispatch", ProviderErrorCategory::Network)
+        }
+        bedrock::error::SdkError::ResponseError(_) => {
+            bedrock_transport_error("response", ProviderErrorCategory::Network)
+        }
+        bedrock::error::SdkError::ConstructionFailure(_) => {
+            bedrock_transport_error("construction", ProviderErrorCategory::Config)
+        }
+        _ => bedrock_transport_error("unknown", ProviderErrorCategory::ProviderInternal),
     }
-    error
 }
 
-fn bedrock_stream_error(error: &(impl ToString + ?Sized)) -> ProviderError {
-    let message = error.to_string();
-    let category = if is_context_length_error(&message) {
+fn bedrock_transport_error(kind: &str, category: ProviderErrorCategory) -> ProviderError {
+    let mut normalized = provider_error(
+        "bedrock_model_discovery_failed",
+        category,
+        format!("Bedrock model discovery {kind} failure"),
+    );
+    normalized
+        .diagnostic_context
+        .insert("transport_kind".to_string(), kind.to_string());
+    normalized.sources.push(ProviderErrorSource {
+        source: "aws_sdk".to_string(),
+        code: Some(kind.to_string()),
+        message: None,
+    });
+    if matches!(
+        category,
+        ProviderErrorCategory::Auth | ProviderErrorCategory::Config
+    ) {
+        normalized.failure = Some(Box::new(bedrock_failure_context(
+            bcode_model::ProviderFailureSourceKind::Runtime,
+            "aws_sdk_credential_and_region_chain",
+            bcode_model::ProviderFailureCapability::ModelDiscovery,
+            "verify the AWS credential/profile source, region, and Bedrock model access",
+        )));
+    }
+    normalized
+}
+
+fn bedrock_stream_error<R>(
+    error: &aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
+        R,
+    >,
+) -> ProviderError {
+    let Some(service_error) = error.as_service_error() else {
+        let (kind, category) = match error {
+            aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => {
+                ("timeout", ProviderErrorCategory::Timeout)
+            }
+            aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_) => {
+                ("dispatch", ProviderErrorCategory::Network)
+            }
+            aws_sdk_bedrockruntime::error::SdkError::ResponseError(_) => {
+                ("response", ProviderErrorCategory::Network)
+            }
+            aws_sdk_bedrockruntime::error::SdkError::ConstructionFailure(_) => {
+                ("construction", ProviderErrorCategory::ProviderInternal)
+            }
+            _ => ("unknown", ProviderErrorCategory::ProviderInternal),
+        };
+        let mut normalized = provider_error(
+            "bedrock_stream_failed",
+            category,
+            format!("Bedrock stream {kind} failure"),
+        );
+        normalized
+            .diagnostic_context
+            .insert("transport_kind".to_string(), kind.to_string());
+        normalized.sources.push(ProviderErrorSource {
+            source: "aws_sdk".to_string(),
+            code: Some(kind.to_string()),
+            message: None,
+        });
+        return normalized;
+    };
+    let metadata = service_error.meta();
+    let provider_message = metadata.message().map(sanitize_provider_diagnostic);
+    let category = if service_error.is_service_unavailable_exception() {
+        ProviderErrorCategory::Overloaded
+    } else if service_error.is_throttling_exception() {
+        ProviderErrorCategory::RateLimit
+    } else if service_error.is_validation_exception() {
+        ProviderErrorCategory::InvalidRequest
+    } else if provider_message
+        .as_deref()
+        .is_some_and(is_context_length_error)
+    {
         ProviderErrorCategory::ContextLength
     } else {
         ProviderErrorCategory::ProviderInternal
     };
-    provider_error("bedrock_stream_failed", category, message)
+    let mut normalized = provider_error(
+        "bedrock_stream_failed",
+        category,
+        provider_message
+            .as_deref()
+            .unwrap_or("Bedrock response stream failed"),
+    );
+    normalized.request_id = metadata
+        .request_id()
+        .map(str::to_string)
+        .map(String::into_boxed_str);
+    normalized.provider_message = provider_message.clone().map(String::into_boxed_str);
+    normalized.sources.push(ProviderErrorSource {
+        source: "aws_bedrock_stream".to_string(),
+        code: metadata.code().map(str::to_string),
+        message: provider_message,
+    });
+    normalized
 }
 
 fn is_context_length_error(message: &str) -> bool {
@@ -2257,6 +2844,154 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_model_provider_runtime::{
+        BlockingModelProviderInvoker, ProviderConformanceOptions, ProviderConformanceOutcome,
+        run_provider_conformance_suite,
+    };
+    use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
+
+    #[derive(Debug)]
+    struct DeterministicBedrockTurnExecutor;
+
+    impl BedrockTurnExecutor for DeterministicBedrockTurnExecutor {
+        fn start(
+            &self,
+            _runtime: &ProviderRuntime,
+            request: ModelTurnRequest,
+            turn: TurnState,
+            _discovery: Arc<Mutex<DiscoveryCache>>,
+        ) {
+            if turn.is_cancelled() {
+                turn.push(ProviderTurnEvent::Cancelled);
+                turn.push(ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::Cancelled,
+                });
+                return;
+            }
+            if matches!(request.tool_call_policy.choice, ToolChoice::Required) {
+                let tool_count = if request.tool_call_policy.parallel {
+                    request.tools.len()
+                } else {
+                    1
+                };
+                for (index, tool) in request.tools.iter().take(tool_count).enumerate() {
+                    let call = ToolCall {
+                        id: format!("bedrock-conformance-call-{index}"),
+                        name: tool.name.clone(),
+                        arguments: serde_json::json!({}),
+                    };
+                    turn.push(ProviderTurnEvent::ToolCallStarted {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                    });
+                    turn.push(ProviderTurnEvent::ToolCallFinished { call });
+                }
+                turn.push(ProviderTurnEvent::Usage {
+                    usage: TokenUsage::default(),
+                });
+                turn.push(ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::ToolCall,
+                });
+                return;
+            }
+            turn.push(ProviderTurnEvent::TextDelta {
+                text: "bedrock conformance".to_string(),
+            });
+            turn.push(ProviderTurnEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(2),
+                    total_tokens: Some(5),
+                    ..TokenUsage::default()
+                },
+            });
+            turn.push(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            });
+        }
+    }
+
+    struct BedrockPluginInvoker {
+        plugin: BedrockProviderPlugin,
+    }
+
+    impl Default for BedrockPluginInvoker {
+        fn default() -> Self {
+            Self {
+                plugin: BedrockProviderPlugin {
+                    turns: Mutex::default(),
+                    discovery: Arc::default(),
+                    runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
+                    turn_executor: Arc::new(DeterministicBedrockTurnExecutor),
+                },
+            }
+        }
+    }
+
+    impl BlockingModelProviderInvoker for BedrockPluginInvoker {
+        fn invoke_json<Q, R>(
+            &mut self,
+            _provider_plugin_id: Option<&str>,
+            operation: &'static str,
+            request: &Q,
+        ) -> Result<R, String>
+        where
+            Q: serde::Serialize,
+            R: serde::de::DeserializeOwned,
+        {
+            let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
+                plugin_id: PROVIDER_ID.to_string(),
+                request: ServiceRequest {
+                    interface_id: MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                    operation: operation.to_string(),
+                    payload: serde_json::to_vec(request).map_err(|error| error.to_string())?,
+                },
+                config: PluginConfigContext::default(),
+                events: ServiceEventEmitter::default(),
+                cancellation: ServiceCancellation::default(),
+                bridge: ServiceBridge::default(),
+            });
+            if let Some(error) = response.error {
+                return Err(format!("{}: {}", error.code, error.message));
+            }
+            serde_json::from_slice(&response.payload).map_err(|error| error.to_string())
+        }
+    }
+
+    #[test]
+    fn bedrock_adapter_passes_public_deterministic_conformance_suite() {
+        let options = ProviderConformanceOptions {
+            provider_context: ProviderRequestContext {
+                settings: BTreeMap::from([
+                    ("model".to_string(), "test-model".to_string()),
+                    ("models".to_string(), "test-model".to_string()),
+                ]),
+                ..ProviderRequestContext::default()
+            },
+            model_id: Some("test-model".to_string()),
+            turn_timeout: Duration::from_secs(2),
+            ..ProviderConformanceOptions::default()
+        };
+
+        let report = run_provider_conformance_suite(&mut BedrockPluginInvoker::default(), &options)
+            .expect("Bedrock adapter should satisfy deterministic conformance");
+
+        assert_eq!(report.provider.provider_id, PROVIDER_ID);
+        assert!(report.cases.iter().all(|case| {
+            case.outcome == ProviderConformanceOutcome::Passed
+                || matches!(case.outcome, ProviderConformanceOutcome::Skipped { .. })
+        }));
+        for required_case in [
+            "baseline turn",
+            "tool calling",
+            "prompt caching",
+            "cancellation",
+        ] {
+            assert!(report.cases.iter().any(|case| {
+                case.name == required_case && case.outcome == ProviderConformanceOutcome::Passed
+            }));
+        }
+    }
 
     #[test]
     fn bedrock_service_unavailable_is_overload_from_sdk_error() {
@@ -2513,6 +3248,181 @@ mod tests {
             tool_config.tools().last(),
             Some(Tool::CachePoint(_))
         ));
+        assert!(
+            tool_config
+                .tool_choice()
+                .is_some_and(BedrockToolChoice::is_auto)
+        );
+    }
+
+    #[test]
+    fn bedrock_rejects_unmapped_cache_ttl() {
+        let mut request = test_model_turn_request();
+        request.messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::CachePoint {
+                hint: bcode_model::PromptCachePoint {
+                    label: None,
+                    ttl_seconds: Some(300),
+                },
+            }],
+        });
+
+        let error = validate_bedrock_request(&request).expect_err("TTL must be rejected");
+        assert_eq!(error.code, "bedrock_cache_ttl_unsupported");
+    }
+
+    #[test]
+    fn bedrock_granular_capabilities_distinguish_transport_and_unknown_model() {
+        use bcode_model::{
+            CapabilitySupport, ModelFeatureSupport, ModelParameterKey, RequestedModelFeature,
+            StructuredOutputMode,
+        };
+        let provider = bedrock_feature_support();
+        assert!(provider.has_complete_inventory());
+        assert!(
+            provider
+                .parameter(ModelParameterKey::Temperature)
+                .is_guaranteed()
+        );
+        assert!(matches!(
+            provider.structured_output(StructuredOutputMode::StrictJsonSchema),
+            CapabilitySupport::Unsupported { .. }
+        ));
+        assert!(matches!(
+            provider.negotiate(
+                &ModelFeatureSupport::default(),
+                RequestedModelFeature::Parameter(ModelParameterKey::Temperature)
+            ),
+            bcode_model::NegotiatedFeatureSupport::Unknown {
+                scope: bcode_model::CapabilityScope::Model
+            }
+        ));
+    }
+
+    #[test]
+    fn bedrock_rejects_unsupported_correctness_sensitive_controls() {
+        let mut request = test_model_turn_request();
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "Output".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        let error = validate_bedrock_request(&request).expect_err("schema mode must fail");
+        assert_eq!(error.category, ProviderErrorCategory::UnsupportedFeature);
+
+        request.structured_output = None;
+        request.parameters.reasoning_effort = Some(bcode_model::ReasoningEffort::High);
+        let error = validate_bedrock_request(&request).expect_err("reasoning control must fail");
+        assert_eq!(error.code, "bedrock_reasoning_controls_unsupported");
+
+        request.parameters = bcode_model::ModelParameters::default();
+        request.tool_call_policy.parallel = true;
+        let error = validate_bedrock_request(&request).expect_err("parallel policy must fail");
+        assert_eq!(error.code, "bedrock_parallel_tool_policy_unsupported");
+    }
+
+    #[test]
+    fn bedrock_rejects_unmapped_provider_options_and_reuse() {
+        let mut request = test_model_turn_request();
+        request.provider_context.request.insert(
+            "unsupported".to_string(),
+            bcode_model::ProviderRequestValue::Bool(true),
+        );
+        let error = validate_bedrock_request(&request).expect_err("provider option must fail");
+        assert_eq!(error.code, "bedrock_provider_options_unsupported");
+
+        request.provider_context.request.clear();
+        request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Auto;
+        let error = validate_bedrock_request(&request).expect_err("reuse must fail");
+        assert_eq!(error.code, "bedrock_conversation_reuse_unsupported");
+    }
+
+    #[test]
+    fn bedrock_tool_choice_none_omits_tools() {
+        let mut request = test_model_turn_request();
+        request.tools.push(ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "read".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        request.tool_call_policy.choice = ToolChoice::None;
+
+        assert!(
+            model_tools_to_bedrock_tool_config(&request)
+                .expect("none choice should project")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bedrock_required_and_specific_tool_choices_are_typed() {
+        let mut request = test_model_turn_request();
+        request.tools.push(ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "read".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        request.tool_call_policy.choice = ToolChoice::Required;
+        let required = model_tools_to_bedrock_tool_config(&request)
+            .expect("required choice should project")
+            .expect("required choice needs tool config");
+        assert!(
+            required
+                .tool_choice()
+                .is_some_and(BedrockToolChoice::is_any)
+        );
+
+        request.tool_call_policy.choice = ToolChoice::Tool {
+            name: "filesystem.read".to_string(),
+        };
+        let specific = model_tools_to_bedrock_tool_config(&request)
+            .expect("specific choice should project")
+            .expect("specific choice needs tool config");
+        let selected = specific
+            .tool_choice()
+            .and_then(|choice| choice.as_tool().ok())
+            .expect("specific Bedrock choice");
+        assert_eq!(selected.name(), "filesystem_read");
+    }
+
+    #[test]
+    fn bedrock_rejects_unknown_specific_tool_choice() {
+        let mut request = test_model_turn_request();
+        request.tools.push(ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "read".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        request.tool_call_policy.choice = ToolChoice::Tool {
+            name: "missing".to_string(),
+        };
+
+        let error = model_tools_to_bedrock_tool_config(&request)
+            .expect_err("unknown required tool must fail");
+        assert_eq!(error.code, "unknown_required_tool");
+        assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+    }
+
+    fn test_model_turn_request() -> ModelTurnRequest {
+        ModelTurnRequest {
+            session_id: "00000000-0000-0000-0000-000000000000"
+                .parse()
+                .expect("static nil UUID should parse"),
+            turn_id: "turn".to_string(),
+            model_id: "model".to_string(),
+            provider_context: ProviderRequestContext::default(),
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            parameters: bcode_model::ModelParameters::default(),
+            structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -2558,9 +3468,63 @@ mod tests {
             ),
             default_model_id: Some("bad-model".to_string()),
         };
-        let filtered =
-            filtered_discovery(&discovery, &compatibility.unsupported_streaming_for(&key));
+        let filtered = filtered_discovery(
+            &discovery,
+            &compatibility.unsupported_streaming_for(&key),
+            &BTreeSet::new(),
+        );
         assert_eq!(filtered.default_model_id, Some("good-model".to_string()));
+    }
+
+    #[test]
+    fn persisted_prompt_cache_incompatibility_removes_cache_capabilities() {
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".to_string(),
+            aws_profile: None,
+            endpoint_url: None,
+        };
+        let mut compatibility = PersistedCompatibilityCache::default();
+        compatibility.mark_prompt_cache_unsupported(&key, "no-cache", "unsupported", 10);
+        let discovery = ModelDiscovery {
+            models: model_infos_from_ids(&["no-cache".to_string(), "cache-ok".to_string()], None),
+            default_model_id: Some("no-cache".to_string()),
+        };
+
+        let filtered = filtered_discovery(
+            &discovery,
+            &BTreeSet::new(),
+            &compatibility.unsupported_prompt_cache_for(&key),
+        );
+
+        assert!(
+            !filtered.models[0]
+                .capabilities
+                .contains(&ModelCapability::PromptCaching)
+        );
+        assert!(filtered.models[0].cache.capabilities.is_empty());
+        assert!(
+            filtered.models[1]
+                .capabilities
+                .contains(&ModelCapability::PromptCaching)
+        );
+    }
+
+    #[test]
+    fn config_transport_failure_is_actionable_and_secret_safe() {
+        let error = bedrock_transport_error("construction", ProviderErrorCategory::Config);
+        let failure = error.failure.expect("config failure context");
+
+        assert_eq!(failure.provider_id, PROVIDER_ID);
+        assert_eq!(
+            failure.capability,
+            bcode_model::ProviderFailureCapability::ModelDiscovery
+        );
+        assert!(failure.is_actionable());
+        assert!(
+            !serde_json::to_string(&failure)
+                .expect("failure should encode")
+                .contains("secret_access_key")
+        );
     }
 
     #[test]

@@ -25,6 +25,34 @@ fn fake_bcode() -> Bcode {
 }
 
 #[tokio::test]
+async fn embedded_provider_discovery_reports_registration_and_model_provenance() {
+    let bcode = fake_bcode()
+        .discover_provider(
+            "bcode.fake-provider",
+            bcode::ProviderRequestContext::default(),
+            Some("fake-echo".to_string()),
+        )
+        .await
+        .expect("discover fake provider");
+    let report = bcode.provider_registry().selection_report(
+        ModelSelector::with_provider("bcode.fake-provider", "fake-echo"),
+        bcode::ModelSelectionProvenance {
+            provider: Some(bcode::ModelSelectionSource::ExplicitRegistration),
+            model: Some(bcode::ModelSelectionSource::PerRequest),
+        },
+    );
+
+    assert_eq!(
+        report.registration_source,
+        Some(bcode::ProviderRegistrationSource::Discovery)
+    );
+    assert_eq!(
+        report.model_metadata_source,
+        Some(bcode::ModelMetadataSource::BundledCatalog)
+    );
+}
+
+#[tokio::test]
 async fn static_provider_adapter_conforms_for_multiple_calls_and_sequential_fallback() {
     let bcode = fake_bcode();
     let capabilities = bcode

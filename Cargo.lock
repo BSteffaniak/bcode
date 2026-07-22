@@ -1312,9 +1312,11 @@ dependencies = [
  "bcode_cli",
  "bcode_client",
  "bcode_config",
+ "bcode_eval",
  "bcode_fake_provider_plugin",
  "bcode_hello_plugin",
  "bcode_model",
+ "bcode_openai_compatible_provider_plugin",
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_question_plugin",
@@ -1328,9 +1330,11 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "trybuild",
 ]
 
 [[package]]
@@ -1384,6 +1388,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_tool",
  "futures 0.3.32",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -1698,6 +1703,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
@@ -1738,6 +1744,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model",
  "bcode_plugin_sdk",
+ "jsonschema",
  "serde",
  "serde_json",
 ]
@@ -1950,7 +1957,9 @@ dependencies = [
 name = "bcode_model_provider_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_fake_provider_plugin",
  "bcode_model",
+ "bcode_plugin_sdk",
  "bcode_session_models",
  "httpdate",
  "serde",
@@ -10266,6 +10275,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "target-triple"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3a6bfce3d99adfa72d24750a61f782f3036a81e7f86d8841ee1326deaebd171"
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10877,6 +10892,21 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "trybuild"
+version = "1.0.118"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06649c6f63d86604ba0c8950d5a1829fc9a17afd70fc6629f481d75b6a624c78"
+dependencies = [
+ "glob",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "target-triple",
+ "termcolor",
+ "toml 1.1.2+spec-1.1.0",
+]
 
 [[package]]
 name = "ttf-parser"

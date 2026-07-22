@@ -27,12 +27,13 @@ use bcode_model::{
     OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
     OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
     ProviderCapabilities, ProviderCapability, ProviderContextFormat, ProviderError,
-    ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderRetryRule,
-    ProviderRetryRuleMatch, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
-    ValidateConfigResponse,
+    ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext, ProviderRequestProjection,
+    ProviderRetryRule, ProviderRetryRuleMatch, ProviderTurnEvent, StartTurnResponse, StopReason,
+    TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
+    sanitize_provider_diagnostic,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
@@ -60,6 +61,68 @@ const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_DIALECT_SETTING: &str = "dialect";
 const OPENAI_NAMESPACED_DIALECT_SETTING: &str = "openai.dialect";
+
+/// Typed provider-native options for the `OpenAI` Responses API.
+///
+/// These fields are intentionally separate from provider-neutral model parameters. Unsupported
+/// options fail before network work instead of being silently ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiResponsesRequestOptions {
+    /// Provider service tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<OpenAiServiceTier>,
+    /// Provider truncation policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<OpenAiTruncation>,
+    /// Stable end-user identifier used by provider abuse monitoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    /// Provider-specific prompt cache retention policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<OpenAiPromptCacheRetention>,
+}
+
+/// `OpenAI` request service tier.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiServiceTier {
+    /// Let `OpenAI` select the tier from project configuration.
+    Auto,
+    /// Use standard default processing.
+    Default,
+    /// Use lower-cost flex processing.
+    Flex,
+    /// Use priority processing.
+    Priority,
+}
+
+/// `OpenAI` Responses input truncation policy.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiTruncation {
+    /// Let the provider truncate when necessary.
+    Auto,
+    /// Reject requests that exceed the model context.
+    Disabled,
+}
+
+/// `OpenAI` prompt-cache retention policy.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiPromptCacheRetention {
+    /// Use in-memory cache retention.
+    InMemory,
+    /// Retain eligible cache data for 24 hours.
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+}
+
+impl bcode_model::ProviderRequestExtension for OpenAiResponsesRequestOptions {
+    const PROVIDER_ID: &'static str = PROVIDER_ID;
+}
 
 /// OpenAI-compatible model provider plugin.
 pub struct OpenAiCompatibleProviderPlugin {
@@ -226,7 +289,7 @@ impl OpenAiCompatibleProviderPlugin {
             }
             OP_COMPACT_CONTEXT => self.compact_context(&context.request),
             OP_MODELS => self.models_response(&context.request),
-            OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
+            OP_VALIDATE_CONFIG => self.validate_config(&context.request),
             OP_VERIFY_MODEL => self.verify_model(&context.request),
             OP_AUTH_USAGE => self.auth_usage(&context.request),
             OP_AUTH_PRIME => self.auth_prime(&context.request),
@@ -489,7 +552,10 @@ impl OpenAiCompatibleDialect {
     }
 
     const fn supports_parallel_tool_policy(self) -> bool {
-        matches!(self, Self::ResponsesApi | Self::ChatGptCodex)
+        matches!(
+            self,
+            Self::ChatCompletions | Self::ResponsesApi | Self::ChatGptCodex
+        )
     }
 
     const fn uses_codex_request_shape(self) -> bool {
@@ -1072,21 +1138,16 @@ async fn native_web_search_inner(
         .json(&body)
         .send()
         .await
-        .map_err(|error| {
-            provider_error(
-                "request_failed",
-                if error.is_timeout() {
-                    ProviderErrorCategory::Timeout
-                } else {
-                    ProviderErrorCategory::Network
-                },
-                error.to_string(),
-            )
-        })?;
+        .map_err(|error| reqwest_provider_error("request_failed", &error))?;
     let status = response.status();
+    let headers = response.headers().clone();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(error_from_status(status.as_u16(), &text));
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &text,
+        ));
     }
     Ok(native_web_search_response(&request.query, &text))
 }
@@ -1345,15 +1406,17 @@ async fn auth_usage_inner(
     let account_id_present = chatgpt_account_id(&settings).is_some();
     let response = send_codex_usage_request(&client, &settings, &url, access_token).await?;
     let status = response.status();
-    let body = response.text().await.map_err(|error| {
-        provider_error(
-            "auth_usage_response_read_failed",
-            ProviderErrorCategory::Network,
-            error.to_string(),
-        )
-    })?;
+    let headers = response.headers().clone();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| reqwest_provider_error("auth_usage_response_read_failed", &error))?;
     if !status.is_success() {
-        return Err(error_from_status(status.as_u16(), &body));
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &body,
+        ));
     }
     let payload = serde_json::from_str::<CodexUsagePayload>(&body).map_err(|error| {
         provider_error(
@@ -1403,17 +1466,10 @@ async fn send_codex_usage_request(
     access_token: &str,
 ) -> Result<reqwest::Response, ProviderError> {
     let builder = codex_authenticated_request(client.get(url), settings, access_token);
-    builder.send().await.map_err(|error| {
-        provider_error(
-            "auth_usage_request_failed",
-            if error.is_timeout() {
-                ProviderErrorCategory::Timeout
-            } else {
-                ProviderErrorCategory::Network
-            },
-            error.to_string(),
-        )
-    })
+    builder
+        .send()
+        .await
+        .map_err(|error| reqwest_provider_error("auth_usage_request_failed", &error))
 }
 
 fn codex_authenticated_request(
@@ -1564,27 +1620,18 @@ async fn auth_reset_credits_inner(
     let response = codex_authenticated_request(client.get(&url), &settings, access_token)
         .send()
         .await
-        .map_err(|error| {
-            provider_error(
-                "auth_reset_credits_request_failed",
-                if error.is_timeout() {
-                    ProviderErrorCategory::Timeout
-                } else {
-                    ProviderErrorCategory::Network
-                },
-                error.to_string(),
-            )
-        })?;
+        .map_err(|error| reqwest_provider_error("auth_reset_credits_request_failed", &error))?;
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response.text().await.map_err(|error| {
-        provider_error(
-            "auth_reset_credits_response_read_failed",
-            ProviderErrorCategory::Network,
-            error.to_string(),
-        )
+        reqwest_provider_error("auth_reset_credits_response_read_failed", &error)
     })?;
     if !status.is_success() {
-        return Err(error_from_status(status.as_u16(), &body));
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &body,
+        ));
     }
     let payload =
         serde_json::from_str::<CodexRateLimitResetCreditsPayload>(&body).map_err(|error| {
@@ -1658,26 +1705,19 @@ async fn auth_reset_credit_consume_inner(
         .send()
         .await
         .map_err(|error| {
-            provider_error(
-                "auth_reset_credit_consume_request_failed",
-                if error.is_timeout() {
-                    ProviderErrorCategory::Timeout
-                } else {
-                    ProviderErrorCategory::Network
-                },
-                error.to_string(),
-            )
+            reqwest_provider_error("auth_reset_credit_consume_request_failed", &error)
         })?;
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response.text().await.map_err(|error| {
-        provider_error(
-            "auth_reset_credit_consume_response_read_failed",
-            ProviderErrorCategory::Network,
-            error.to_string(),
-        )
+        reqwest_provider_error("auth_reset_credit_consume_response_read_failed", &error)
     })?;
     if !status.is_success() {
-        return Err(error_from_status(status.as_u16(), &body));
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &body,
+        ));
     }
     let payload = serde_json::from_str::<CodexRateLimitResetCreditConsumePayload>(&body).map_err(
         |error| {
@@ -2661,7 +2701,7 @@ async fn verify_model_inner(
     }
     refresh_chatgpt_auth_if_needed(&mut settings).await?;
     if matches!(settings.auth, AuthSettings::Missing) {
-        return Err(provider_error(
+        let mut error = provider_error(
             "missing_openai_auth",
             ProviderErrorCategory::Auth,
             format!(
@@ -2670,7 +2710,13 @@ async fn verify_model_inner(
                 settings.auth_diagnostics.mode,
                 settings.auth_diagnostics.detail
             ),
-        ));
+        );
+        error.failure = Some(Box::new(openai_failure_context(
+            &settings,
+            bcode_model::ProviderFailureCapability::ModelVerification,
+            "run `bcode login openai`/`bcode login xai` or configure the documented API-key environment variable",
+        )));
+        return Err(error);
     }
     let client = model_stream_client(settings.request_timeout).map_err(|error| {
         provider_error(
@@ -2782,22 +2828,218 @@ fn verify_response_from_provider_error(error: &ProviderError) -> bcode_model::Ve
     }
 }
 
+fn validate_openai_request(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+) -> Result<(), ProviderError> {
+    validate_openai_tool_choice(request)?;
+    if request.parameters.reasoning_budget_tokens.is_some() {
+        return Err(provider_error(
+            "reasoning_budget_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "OpenAI-compatible APIs do not expose a portable reasoning token budget",
+        ));
+    }
+    if matches!(settings.dialect, OpenAiCompatibleDialect::ChatCompletions)
+        && (request.parameters.reasoning_effort_value.is_some()
+            || request.parameters.reasoning_summary.is_some())
+    {
+        return Err(provider_error(
+            "reasoning_controls_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "custom reasoning effort and reasoning summaries require the Responses API",
+        ));
+    }
+    if !matches!(settings.dialect, OpenAiCompatibleDialect::ChatCompletions)
+        && !request.parameters.stop_sequences.is_empty()
+    {
+        return Err(provider_error(
+            "stop_sequences_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "stop sequences are not supported by this Responses API adapter",
+        ));
+    }
+    if request.tool_call_policy.parallel && !settings.dialect.supports_parallel_tool_policy() {
+        return Err(provider_error(
+            "parallel_tool_policy_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "parallel tool-call policy is not supported by the selected OpenAI dialect",
+        ));
+    }
+    if request.conversation_reuse.mode.is_enabled()
+        && !settings.dialect.supports_native_conversation_reuse()
+    {
+        return Err(provider_error(
+            "conversation_reuse_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "provider-native conversation reuse requires the Responses API",
+        ));
+    }
+    let has_reuse_payload = request
+        .conversation_reuse
+        .previous_provider_response_id
+        .is_some()
+        || request
+            .conversation_reuse
+            .new_messages_start_index
+            .is_some()
+        || request.conversation_reuse.provider_state.is_some();
+    if has_reuse_payload && !request.conversation_reuse.mode.is_enabled() {
+        return Err(provider_error(
+            "conversation_reuse_disabled",
+            ProviderErrorCategory::InvalidRequest,
+            "provider-native conversation state requires conversation reuse mode Auto",
+        ));
+    }
+    if request
+        .conversation_reuse
+        .new_messages_start_index
+        .is_some()
+        && request
+            .conversation_reuse
+            .previous_provider_response_id
+            .is_none()
+    {
+        return Err(provider_error(
+            "conversation_reuse_index_without_response",
+            ProviderErrorCategory::InvalidRequest,
+            "new_messages_start_index requires previous_provider_response_id",
+        ));
+    }
+    validate_openai_request_extensions(settings, request)?;
+    if settings.dialect.uses_codex_request_shape()
+        && (request.parameters.temperature.is_some() || request.parameters.top_p.is_some())
+    {
+        return Err(provider_error(
+            "codex_sampling_parameters_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "ChatGPT Codex does not support temperature or top_p",
+        ));
+    }
+    validate_declared_openai_features(settings, request)
+}
+
+fn validate_declared_openai_features(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+) -> Result<(), ProviderError> {
+    let unsupported = request
+        .explicitly_unsupported_features(&openai_feature_support(settings.dialect))
+        .into_iter()
+        .filter(|feature| matches!(feature, bcode_model::RequestedModelFeature::MediaInput(_)))
+        .collect::<Vec<_>>();
+    unsupported.first().map_or(Ok(()), |feature| {
+        Err(provider_error(
+            "openai_feature_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            format!("active OpenAI-compatible surface does not support {feature:?}"),
+        ))
+    })
+}
+
+fn validate_openai_request_extensions(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+) -> Result<(), ProviderError> {
+    let mut extension_owners = request
+        .provider_context
+        .request
+        .keys()
+        .filter_map(|key| bcode_model::provider_extension_owner(key));
+    if matches!(settings.dialect, OpenAiCompatibleDialect::ChatCompletions) {
+        if extension_owners.next().is_some() {
+            return Err(provider_error(
+                "chat_provider_extensions_unsupported",
+                ProviderErrorCategory::UnsupportedFeature,
+                "typed OpenAI request extensions require the Responses API",
+            ));
+        }
+        if !request.provider_context.request.is_empty() {
+            return Err(provider_error(
+                "chat_provider_options_unsupported",
+                ProviderErrorCategory::UnsupportedFeature,
+                "provider-native request options require the Responses API",
+            ));
+        }
+        return Ok(());
+    }
+    let extension = request
+        .provider_context
+        .extension::<OpenAiResponsesRequestOptions>()
+        .map_err(|error| {
+            provider_error(
+                "invalid_openai_request_extension",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+    if extension
+        .and_then(|extension| extension.safety_identifier)
+        .as_deref()
+        .is_some_and(str::is_empty)
+    {
+        return Err(provider_error(
+            "invalid_safety_identifier",
+            ProviderErrorCategory::InvalidRequest,
+            "OpenAI safety_identifier must not be empty",
+        ));
+    }
+    if extension_owners.any(|provider_id| provider_id != PROVIDER_ID) {
+        return Err(provider_error(
+            "foreign_provider_extension",
+            ProviderErrorCategory::InvalidRequest,
+            "OpenAI request contains an extension owned by another provider",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_openai_tool_choice(request: &ModelTurnRequest) -> Result<(), ProviderError> {
+    match &request.tool_call_policy.choice {
+        bcode_model::ToolChoice::Required if request.tools.is_empty() => Err(provider_error(
+            "tool_choice_without_tools",
+            ProviderErrorCategory::InvalidRequest,
+            "required tool choice needs at least one registered tool",
+        )),
+        bcode_model::ToolChoice::Tool { name }
+            if !request.tools.iter().any(|tool| tool.name == *name) =>
+        {
+            Err(provider_error(
+                "unknown_required_tool",
+                ProviderErrorCategory::InvalidRequest,
+                format!("required tool '{name}' is not registered"),
+            ))
+        }
+        bcode_model::ToolChoice::Auto
+        | bcode_model::ToolChoice::None
+        | bcode_model::ToolChoice::Required
+        | bcode_model::ToolChoice::Tool { .. } => Ok(()),
+    }
+}
+
 async fn stream_chat_completion_inner(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut settings = settings_for_context(&request.provider_context);
+    validate_openai_request(&settings, request)?;
     refresh_chatgpt_auth_if_needed(&mut settings).await?;
     turn.push(ProviderTurnEvent::ProviderMetadata {
         key: "diagnostic.auth".to_string(),
         value: auth_trace_metadata(&settings, &request.provider_context),
     });
     if matches!(settings.auth, AuthSettings::Missing) {
-        return Err(provider_error(
+        let mut error = provider_error(
             "missing_openai_auth",
             ProviderErrorCategory::Auth,
             "run `bcode login openai` (or `bcode login xai`) for ChatGPT subscription auth or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY) for API-key auth",
-        ));
+        );
+        error.failure = Some(Box::new(openai_failure_context(
+            &settings,
+            bcode_model::ProviderFailureCapability::ModelInvocation,
+            "run `bcode login openai`/`bcode login xai` or configure the documented API-key environment variable",
+        )));
+        return Err(error);
     }
     let client = model_stream_client(settings.request_timeout).map_err(|error| {
         provider_error(
@@ -2928,17 +3170,7 @@ async fn send_chat_completion_request(
         .json(&request_body)
         .send()
         .await
-        .map_err(|error| {
-            provider_error(
-                "request_failed",
-                if error.is_timeout() {
-                    ProviderErrorCategory::Timeout
-                } else {
-                    ProviderErrorCategory::Network
-                },
-                error.to_string(),
-            )
-        })?;
+        .map_err(|error| reqwest_provider_error("request_failed", &error))?;
     let status = response.status();
     if !status.is_success() {
         let headers = response.headers().clone();
@@ -2979,17 +3211,10 @@ async fn send_responses_request(
     {
         builder = builder.header("ChatGPT-Account-Id", account_id);
     }
-    let response = builder.send().await.map_err(|error| {
-        provider_error(
-            "request_failed",
-            if error.is_timeout() {
-                ProviderErrorCategory::Timeout
-            } else {
-                ProviderErrorCategory::Network
-            },
-            error.to_string(),
-        )
-    })?;
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| reqwest_provider_error("request_failed", &error))?;
     let status = response.status();
     if !status.is_success() {
         let headers = response.headers().clone();
@@ -3803,8 +4028,50 @@ fn build_responses_request(
             error.to_string(),
         )
     })?;
+    apply_openai_typed_request_options(&mut body, &request.provider_context)?;
     merge_provider_request_options(&mut body, &request.provider_context.request)?;
     Ok(body)
+}
+
+fn apply_openai_typed_request_options(
+    body: &mut serde_json::Value,
+    context: &ProviderRequestContext,
+) -> Result<(), ProviderError> {
+    let Some(options) = context
+        .extension::<OpenAiResponsesRequestOptions>()
+        .map_err(|error| {
+            provider_error(
+                "invalid_openai_request_extension",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })?
+    else {
+        return Ok(());
+    };
+    let value = serde_json::to_value(options).map_err(|error| {
+        provider_error(
+            "openai_request_extension_encode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    let Some(options) = value.as_object() else {
+        return Err(provider_error(
+            "invalid_openai_request_extension",
+            ProviderErrorCategory::InvalidRequest,
+            "OpenAI request extension is not an object",
+        ));
+    };
+    let Some(body) = body.as_object_mut() else {
+        return Err(provider_error(
+            "invalid_provider_request",
+            ProviderErrorCategory::InvalidRequest,
+            "provider request body is not a JSON object",
+        ));
+    };
+    body.extend(options.clone());
+    Ok(())
 }
 
 fn openai_tool_choice(
@@ -3924,6 +4191,9 @@ fn merge_provider_request_options(
         ));
     };
     for (key, value) in request_options {
+        if bcode_model::is_provider_extension_key(key) {
+            continue;
+        }
         if is_reserved_responses_request_key(key) {
             return Err(provider_error(
                 "reserved_provider_request_option",
@@ -3947,6 +4217,10 @@ fn is_reserved_responses_request_key(key: &str) -> bool {
             | "tool_choice"
             | "instructions"
             | "previous_response_id"
+            | "service_tier"
+            | "truncation"
+            | "safety_identifier"
+            | "prompt_cache_retention"
     )
 }
 
@@ -4714,6 +4988,161 @@ fn openai_tool_name(name: &str) -> String {
         .collect()
 }
 
+fn openai_parameter_support(
+    dialect: OpenAiCompatibleDialect,
+) -> BTreeMap<bcode_model::ModelParameterKey, bcode_model::CapabilitySupport> {
+    use bcode_model::{CapabilitySource, CapabilitySupport, ModelParameterKey};
+    let supported = || CapabilitySupport::Supported {
+        source: CapabilitySource::BundledCatalog,
+    };
+    let unsupported = |reason: &str| CapabilitySupport::Unsupported {
+        source: CapabilitySource::BundledCatalog,
+        reason: reason.to_string(),
+    };
+    let chat = matches!(dialect, OpenAiCompatibleDialect::ChatCompletions);
+    let codex = dialect.uses_codex_request_shape();
+    [
+        (
+            ModelParameterKey::Temperature,
+            if codex {
+                unsupported("ChatGPT Codex rejects temperature")
+            } else {
+                supported()
+            },
+        ),
+        (ModelParameterKey::MaxOutputTokens, supported()),
+        (
+            ModelParameterKey::TopP,
+            if codex {
+                unsupported("ChatGPT Codex rejects top_p")
+            } else {
+                supported()
+            },
+        ),
+        (
+            ModelParameterKey::StopSequences,
+            if chat {
+                supported()
+            } else {
+                unsupported("Responses surfaces do not map stop sequences")
+            },
+        ),
+        (
+            ModelParameterKey::ReasoningBudgetTokens,
+            unsupported("OpenAI-compatible APIs expose no portable reasoning token budget"),
+        ),
+        (ModelParameterKey::ReasoningEffort, supported()),
+        (
+            ModelParameterKey::ReasoningEffortValue,
+            if chat {
+                unsupported("custom reasoning effort values require Responses")
+            } else {
+                supported()
+            },
+        ),
+        (
+            ModelParameterKey::ReasoningSummary,
+            if chat {
+                unsupported("reasoning summaries require Responses")
+            } else {
+                supported()
+            },
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn openai_feature_support(dialect: OpenAiCompatibleDialect) -> bcode_model::ModelFeatureSupport {
+    use bcode_model::{
+        CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
+        PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
+    };
+    let supported = || CapabilitySupport::Supported {
+        source: CapabilitySource::BundledCatalog,
+    };
+    let unsupported = |reason: &str| CapabilitySupport::Unsupported {
+        source: CapabilitySource::BundledCatalog,
+        reason: reason.to_string(),
+    };
+    ModelFeatureSupport {
+        parameters: openai_parameter_support(dialect),
+        structured_output: [
+            (StructuredOutputMode::JsonSchema, supported()),
+            (StructuredOutputMode::StrictJsonSchema, supported()),
+        ]
+        .into_iter()
+        .collect(),
+        tool_choice: [
+            ToolChoiceMode::Auto,
+            ToolChoiceMode::None,
+            ToolChoiceMode::Required,
+            ToolChoiceMode::Named,
+        ]
+        .into_iter()
+        .map(|mode| (mode, supported()))
+        .chain(std::iter::once((
+            ToolChoiceMode::Parallel,
+            if dialect.supports_parallel_tool_policy() {
+                supported()
+            } else {
+                unsupported("active API surface does not support parallel tool policy")
+            },
+        )))
+        .collect(),
+        prompt_cache: [
+            (PromptCacheFeature::ConversationPrefix, supported()),
+            (
+                PromptCacheFeature::ExplicitSystem,
+                unsupported("OpenAI surfaces do not map explicit system cache points"),
+            ),
+            (
+                PromptCacheFeature::ExplicitTools,
+                unsupported("OpenAI surfaces do not map explicit tool cache points"),
+            ),
+            (
+                PromptCacheFeature::ExplicitMessage,
+                unsupported("OpenAI surfaces drop explicit message cache points"),
+            ),
+            (
+                PromptCacheFeature::Ttl,
+                unsupported("no portable OpenAI prompt-cache TTL is implemented"),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        media_input: [
+            (MediaInputFeature::UserImage, supported()),
+            (
+                MediaInputFeature::SystemImage,
+                unsupported("system images are not mapped by OpenAI request projection"),
+            ),
+            (
+                MediaInputFeature::AssistantImage,
+                unsupported("assistant images are not mapped by OpenAI request projection"),
+            ),
+            (
+                MediaInputFeature::ToolMessageImage,
+                unsupported("use structured tool-result image content instead"),
+            ),
+            (
+                MediaInputFeature::ToolResultImage,
+                if matches!(dialect, OpenAiCompatibleDialect::ChatCompletions) {
+                    unsupported("Chat Completions tool messages cannot carry image result content")
+                } else {
+                    supported()
+                },
+            ),
+            (
+                MediaInputFeature::ImageReference,
+                unsupported("image references are projected as text, not provider image input"),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
 fn capabilities() -> ProviderCapabilities {
     let settings = settings();
     let capabilities = BTreeSet::from([
@@ -4721,6 +5150,7 @@ fn capabilities() -> ProviderCapabilities {
         ProviderCapability::Cancellation,
         ProviderCapability::Tools,
         ProviderCapability::ParallelToolCalls,
+        ProviderCapability::JsonMode,
         ProviderCapability::PromptCaching,
         ProviderCapability::NativeWebSearch,
     ]);
@@ -4728,6 +5158,7 @@ fn capabilities() -> ProviderCapabilities {
         provider_id: PROVIDER_ID.to_string(),
         display_name: "OpenAI-Compatible (xAI, Grok, OpenAI, Groq, ...)".to_string(),
         capabilities,
+        feature_support: openai_feature_support(settings.dialect),
         auth_schemes: ["api_key".to_string(), "chatgpt".to_string()]
             .into_iter()
             .collect(),
@@ -4839,6 +5270,7 @@ fn apply_provider_static_metadata(settings: &Settings, models: Vec<ModelInfo>) -
                 model.capabilities.extend([
                     ModelCapability::ToolCalls,
                     ModelCapability::ParallelToolCalls,
+                    ModelCapability::JsonMode,
                 ]);
             }
             if provider_id == Some("xai") {
@@ -4937,6 +5369,7 @@ fn model_infos_from_items_without_catalog(
             context_window: provider_api_context_window(&model.metadata),
             max_output_tokens: provider_api_max_output_tokens(&model.metadata),
             capabilities: model_capabilities_for(&model),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
             cache: openai_model_cache_info(),
             metadata_source: provider_api_context_window(&model.metadata)
@@ -5328,27 +5761,19 @@ async fn fetch_provider_model_items(
         .bearer_auth(api_key)
         .send()
         .await
-        .map_err(|error| {
-            provider_error(
-                "models_request_failed",
-                if error.is_timeout() {
-                    ProviderErrorCategory::Timeout
-                } else {
-                    ProviderErrorCategory::Network
-                },
-                error.to_string(),
-            )
-        })?;
+        .map_err(|error| reqwest_provider_error("models_request_failed", &error))?;
     let status = response.status();
-    let body = response.text().await.map_err(|error| {
-        provider_error(
-            "models_response_read_failed",
-            ProviderErrorCategory::Network,
-            error.to_string(),
-        )
-    })?;
+    let headers = response.headers().clone();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| reqwest_provider_error("models_response_read_failed", &error))?;
     if !status.is_success() {
-        return Err(error_from_status(status.as_u16(), &body));
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &body,
+        ));
     }
     let body = serde_json::from_str::<ModelsResponseBody>(&body).map_err(|error| {
         provider_error(
@@ -5361,8 +5786,19 @@ async fn fetch_provider_model_items(
 }
 
 impl OpenAiCompatibleProviderPlugin {
-    fn validate_config(&self) -> ValidateConfigResponse {
-        let mut settings = settings();
+    fn validate_config(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::ValidateConfigRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        json_response(&self.validate_provider_context(&request.provider_context))
+    }
+
+    fn validate_provider_context(
+        &self,
+        provider_context: &ProviderRequestContext,
+    ) -> ValidateConfigResponse {
+        let mut settings = settings_for_context(provider_context);
         let refresh_status = self.validate_chatgpt_refresh(&mut settings);
         let valid = settings.auth.is_configured() && refresh_status.is_ok();
         let refresh_metadata = match &refresh_status {
@@ -5376,6 +5812,7 @@ impl OpenAiCompatibleProviderPlugin {
                     "OpenAI-compatible provider authentication is configured ({}) (supports xAI/Grok, OpenAI, etc.)",
                     settings.auth_diagnostics.detail
                 )),
+                failures: Vec::new(),
                 metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
             }
         } else {
@@ -5385,9 +5822,73 @@ impl OpenAiCompatibleProviderPlugin {
                     &settings,
                     refresh_status.as_ref().err(),
                 )),
+                failures: validation_failures(&settings, refresh_status.as_ref().err()),
                 metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
             }
         }
+    }
+}
+
+fn validation_failures(
+    settings: &Settings,
+    refresh_error: Option<&ProviderError>,
+) -> Vec<bcode_model::ProviderFailureContext> {
+    if let Some(error) = refresh_error
+        && let Some(failure) = error.failure.as_deref()
+    {
+        return vec![failure.clone()];
+    }
+    vec![openai_failure_context(
+        settings,
+        bcode_model::ProviderFailureCapability::Authentication,
+        "configure usable provider authentication",
+    )]
+}
+
+fn openai_failure_context(
+    settings: &Settings,
+    capability: bcode_model::ProviderFailureCapability,
+    remediation: &str,
+) -> bcode_model::ProviderFailureContext {
+    let (source_kind, source) = if settings.auth_diagnostics.source.contains("env") {
+        (
+            bcode_model::ProviderFailureSourceKind::Environment,
+            settings.auth_diagnostics.source.clone(),
+        )
+    } else if settings.auth_diagnostics.source.contains("profile")
+        || settings.auth_diagnostics.source.contains("sshenv")
+    {
+        (
+            bcode_model::ProviderFailureSourceKind::AuthProfile,
+            settings.auth_diagnostics.source.clone(),
+        )
+    } else {
+        (
+            bcode_model::ProviderFailureSourceKind::Credential,
+            "api_key_or_chatgpt_token".to_string(),
+        )
+    };
+    bcode_model::ProviderFailureContext {
+        provider_id: PROVIDER_ID.to_string(),
+        source_kind,
+        source,
+        capability,
+        remediation: remediation.to_string(),
+    }
+}
+
+fn openai_failure_context_for_source(
+    capability: bcode_model::ProviderFailureCapability,
+    source_kind: bcode_model::ProviderFailureSourceKind,
+    source: impl Into<String>,
+    remediation: impl Into<String>,
+) -> bcode_model::ProviderFailureContext {
+    bcode_model::ProviderFailureContext {
+        provider_id: PROVIDER_ID.to_string(),
+        source_kind,
+        source: source.into(),
+        capability,
+        remediation: remediation.into(),
     }
 }
 
@@ -6106,11 +6607,17 @@ impl OpenAiCompatibleProviderPlugin {
                     return Ok(format!("not_needed_expires_in_{}s", expires_at - now));
                 }
                 if refresh_token.is_none() {
-                    return Err(provider_error(
+                    let mut error = provider_error(
                         "missing_refresh_token",
                         ProviderErrorCategory::Auth,
                         "saved ChatGPT/Codex access token is expired or expiring soon and no refresh token is saved; run `bcode login openai` again",
-                    ));
+                    );
+                    error.failure = Some(Box::new(openai_failure_context(
+                        settings,
+                        bcode_model::ProviderFailureCapability::TokenRefresh,
+                        "run `bcode login openai` again to replace the expired credential",
+                    )));
+                    return Err(error);
                 }
                 let runtime = self.runtime.as_ref().map_err(|error| {
                     provider_error(
@@ -6268,6 +6775,12 @@ fn set_codex_secret(
                 ProviderErrorCategory::Auth,
                 error.to_string(),
             )
+            .with_failure(openai_failure_context_for_source(
+                bcode_model::ProviderFailureCapability::CredentialStorage,
+                bcode_model::ProviderFailureSourceKind::CredentialStore,
+                format!("sshenv:{profile}:{key}"),
+                "unlock or repair the credential store, then run `bcode login openai` again",
+            ))
         })
 }
 
@@ -6284,23 +6797,19 @@ async fn refresh_openai_codex_token(
         .form(&params)
         .send()
         .await
-        .map_err(|error| {
-            provider_error(
-                "token_refresh_failed",
-                ProviderErrorCategory::Network,
-                error.to_string(),
-            )
-        })?;
+        .map_err(|error| reqwest_provider_error("token_refresh_failed", &error))?;
     let status = response.status();
-    let body = response.text().await.map_err(|error| {
-        provider_error(
-            "token_refresh_response_failed",
-            ProviderErrorCategory::Network,
-            error.to_string(),
-        )
-    })?;
+    let headers = response.headers().clone();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| reqwest_provider_error("token_refresh_response_failed", &error))?;
     if !status.is_success() {
-        return Err(error_from_status(status.as_u16(), &body));
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &body,
+        ));
     }
     serde_json::from_str(&body).map_err(|error| {
         provider_error(
@@ -6382,6 +6891,7 @@ fn append_missing_model_items_from_ids(models: &mut Vec<ModelInfo>, model_ids: &
                 context_window: None,
                 max_output_tokens: None,
                 capabilities: std::collections::BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: Some(ModelMetadataSource::ProviderLive),
@@ -6488,6 +6998,46 @@ fn responses_or_chat_endpoint(settings: &Settings) -> String {
     }
 }
 
+fn reqwest_provider_error(code: &'static str, error: &reqwest::Error) -> ProviderError {
+    let category = if error.is_timeout() {
+        ProviderErrorCategory::Timeout
+    } else {
+        ProviderErrorCategory::Network
+    };
+    let mut normalized = provider_error(
+        code,
+        category,
+        if error.is_timeout() {
+            "provider request timed out"
+        } else {
+            "provider network request failed"
+        },
+    );
+    let transport_code = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
+    };
+    normalized
+        .diagnostic_context
+        .insert("transport_kind".to_string(), transport_code.to_string());
+    normalized.sources.push(ProviderErrorSource {
+        source: "reqwest".to_string(),
+        code: Some(transport_code.to_string()),
+        message: None,
+    });
+    normalized
+}
+
+#[cfg(test)]
 fn error_from_status(status: u16, body: &str) -> ProviderError {
     error_from_status_and_headers(status, None, body)
 }
@@ -6498,10 +7048,13 @@ fn error_from_status_and_headers(
     body: &str,
 ) -> ProviderError {
     let parsed = serde_json::from_str::<ErrorResponseBody>(body).ok();
-    let message = parsed
+    let provider_detail = parsed
         .as_ref()
         .and_then(|body| body.error.as_ref())
-        .map_or_else(|| body.to_string(), |error| error.message.clone());
+        .map(|error| sanitize_provider_diagnostic(&error.message));
+    let message = provider_detail
+        .clone()
+        .unwrap_or_else(|| format!("provider request failed with HTTP status {status}"));
     let code = parsed
         .as_ref()
         .and_then(|body| body.error.as_ref())
@@ -6512,11 +7065,50 @@ fn error_from_status_and_headers(
         .and_then(|body| body.error.as_ref())
         .and_then(|error| error.r#type.as_deref());
     let category = category_from_openai_error(status, &code, error_type, &message);
-    let mut error = provider_error(code, category, message);
-    if category == ProviderErrorCategory::RateLimit {
+    let mut error = provider_error(code.clone(), category, message);
+    if matches!(category, ProviderErrorCategory::Auth) {
+        error.failure = Some(Box::new(openai_failure_context_for_source(
+            bcode_model::ProviderFailureCapability::Authentication,
+            bcode_model::ProviderFailureSourceKind::ProviderResponse,
+            format!("http_status:{status}"),
+            "verify the selected auth profile or API-key source, then authenticate again",
+        )));
+    }
+    error.provider_message = provider_detail.clone().map(String::into_boxed_str);
+    error.request_id = headers
+        .and_then(openai_request_id)
+        .map(String::into_boxed_str);
+    error.diagnostic_context = Box::new(BTreeMap::from([(
+        "http_status".to_string(),
+        status.to_string(),
+    )]));
+    if let Some(error_type) = error_type {
+        error
+            .diagnostic_context
+            .insert("error_type".to_string(), error_type.to_string());
+    }
+    error.sources.push(ProviderErrorSource {
+        source: "openai_api".to_string(),
+        code: Some(code),
+        message: provider_detail,
+    });
+    if category == ProviderErrorCategory::RateLimit || category == ProviderErrorCategory::Overloaded
+    {
         error.retry = retry_hint_from_response(headers, body).map(Box::new);
     }
     error
+}
+
+fn openai_request_id(headers: &HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "openai-request-id"]
+        .into_iter()
+        .find_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
 }
 
 fn retry_hint_from_response(
@@ -6628,21 +7220,12 @@ fn is_context_length_error(code: &str, message: &str) -> bool {
 }
 
 fn stream_read_error(error: &reqwest::Error) -> ProviderError {
-    if error.is_timeout() {
-        provider_error(
-            "stream_read_timeout",
-            ProviderErrorCategory::Timeout,
-            format!(
-                "provider stream timed out while reading response body. This usually means an explicit OpenAI-compatible request timeout was configured; by default Bcode does not set a total timeout for model streams. underlying error: {error}"
-            ),
-        )
+    let code = if error.is_timeout() {
+        "stream_read_timeout"
     } else {
-        provider_error(
-            "stream_read_failed",
-            ProviderErrorCategory::Network,
-            format!("provider stream failed while reading response body: {error}"),
-        )
-    }
+        "stream_read_failed"
+    };
+    reqwest_provider_error(code, error)
 }
 
 fn provider_error(
@@ -6663,6 +7246,10 @@ fn provider_error(
                 | ProviderErrorCategory::Overloaded
         ),
         provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
         retry: None,
     }
 }
@@ -6690,6 +7277,396 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_model_provider_runtime::{
+        BlockingModelProviderInvoker, ProviderConformanceOptions, ProviderConformanceOutcome,
+        run_provider_conformance_suite,
+    };
+    use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::thread;
+
+    #[derive(Default)]
+    struct OpenAiPluginInvoker {
+        plugin: OpenAiCompatibleProviderPlugin,
+    }
+
+    impl BlockingModelProviderInvoker for OpenAiPluginInvoker {
+        fn invoke_json<Q, R>(
+            &mut self,
+            _provider_plugin_id: Option<&str>,
+            operation: &'static str,
+            request: &Q,
+        ) -> Result<R, String>
+        where
+            Q: serde::Serialize,
+            R: serde::de::DeserializeOwned,
+        {
+            let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
+                plugin_id: PROVIDER_ID.to_string(),
+                request: ServiceRequest {
+                    interface_id: MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                    operation: operation.to_string(),
+                    payload: serde_json::to_vec(request).map_err(|error| error.to_string())?,
+                },
+                config: PluginConfigContext::default(),
+                events: ServiceEventEmitter::default(),
+                cancellation: ServiceCancellation::default(),
+                bridge: ServiceBridge::default(),
+            });
+            if let Some(error) = response.error {
+                return Err(format!("{}: {}", error.code, error.message));
+            }
+            serde_json::from_slice(&response.payload).map_err(|error| error.to_string())
+        }
+    }
+
+    struct OpenAiConformanceServer {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl OpenAiConformanceServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind conformance server");
+            listener
+                .set_nonblocking(true)
+                .expect("configure conformance server");
+            let address = listener.local_addr().expect("conformance server address");
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                while !worker_stop.load(AtomicOrdering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve_openai_conformance_request(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept conformance request: {error}"),
+                    }
+                }
+            });
+            Self {
+                base_url: format!("http://{address}/v1"),
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for OpenAiConformanceServer {
+        fn drop(&mut self) {
+            self.stop.store(true, AtomicOrdering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn serve_openai_conformance_request(mut stream: TcpStream) {
+        stream
+            .set_nonblocking(false)
+            .expect("configure conformance connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set conformance read timeout");
+        let body = read_http_request_body(&mut stream);
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("decode provider request");
+        if body
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.get("type").and_then(serde_json::Value::as_str)
+                        == Some("web_search_preview")
+                })
+            })
+        {
+            let response_body = serde_json::json!({
+                "output": [{
+                    "content": [{
+                        "text": "Bcode provider conformance result",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "title": "Bcode",
+                            "url": "https://github.com/BSteffaniak/bcode"
+                        }]
+                    }]
+                }]
+            })
+            .to_string();
+            write_http_response(&mut stream, "application/json", &response_body);
+            return;
+        }
+        let mut events = Vec::new();
+        if body
+            .get("text")
+            .and_then(|text| text.get("format"))
+            .is_some()
+            || body.get("response_format").is_some()
+        {
+            events.push(serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "{\"ok\":true}"
+            }));
+        } else if body.get("tool_choice") == Some(&serde_json::json!("required")) {
+            let parallel = body.get("parallel_tool_calls") == Some(&serde_json::Value::Bool(true));
+            let tools = if parallel {
+                vec![
+                    ("call-conformance-first", "conformance_first"),
+                    ("call-conformance-second", "conformance_second"),
+                ]
+            } else {
+                vec![("call-conformance", "filesystem_read")]
+            };
+            events.extend(
+                tools
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (call_id, name))| {
+                        serde_json::json!({
+                            "type": "response.output_item.added",
+                            "output_index": index,
+                            "item": {
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": "{}"
+                            }
+                        })
+                    }),
+            );
+        } else {
+            events.push(serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "openai conformance"
+            }));
+        }
+        events.push(serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-conformance",
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+            }
+        }));
+        let response_body = events.into_iter().fold(String::new(), |mut output, event| {
+            use std::fmt::Write as _;
+            write!(output, "data: {event}\n\n").expect("write SSE event");
+            output
+        });
+        write_http_response(&mut stream, "text/event-stream", &response_body);
+    }
+
+    fn write_http_response(stream: &mut TcpStream, content_type: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write conformance response");
+    }
+
+    fn read_http_request_body(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).expect("read conformance request");
+            assert!(read > 0, "conformance request ended before headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let body_start = header_end + 4;
+                let headers = std::str::from_utf8(&request[..header_end]).expect("HTTP headers");
+                if headers.lines().any(|line| {
+                    line.eq_ignore_ascii_case("expect: 100-continue")
+                        || line.eq_ignore_ascii_case("expect:100-continue")
+                }) {
+                    stream
+                        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                        .expect("send HTTP continue response");
+                }
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .expect("content length");
+                while request.len() < body_start + content_length {
+                    let read = stream.read(&mut buffer).expect("read conformance body");
+                    assert!(read > 0, "conformance request body ended early");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                return request[body_start..body_start + content_length].to_vec();
+            }
+        }
+    }
+
+    #[test]
+    fn openai_adapter_passes_public_deterministic_conformance_suite() {
+        let server = OpenAiConformanceServer::start();
+        let options = ProviderConformanceOptions {
+            provider_context: ProviderRequestContext {
+                settings: BTreeMap::from([
+                    ("base_url".to_string(), server.base_url.clone()),
+                    ("dialect".to_string(), "responses_api".to_string()),
+                    (
+                        bcode_model::CATALOG_PROVIDER_ID_SETTING.to_string(),
+                        "openai".to_string(),
+                    ),
+                    ("live_discovery".to_string(), "false".to_string()),
+                ]),
+                env: BTreeMap::from([
+                    ("BCODE_OPENAI_API_KEY".to_string(), "test-key".to_string()),
+                    ("BCODE_OPENAI_MODEL".to_string(), "test-model".to_string()),
+                    ("BCODE_OPENAI_MODELS".to_string(), "test-model".to_string()),
+                ]),
+                ..ProviderRequestContext::default()
+            },
+            model_id: Some("test-model".to_string()),
+            turn_timeout: Duration::from_secs(10),
+            ..ProviderConformanceOptions::default()
+        };
+
+        let report = run_provider_conformance_suite(&mut OpenAiPluginInvoker::default(), &options)
+            .expect("OpenAI-compatible adapter should satisfy deterministic conformance");
+
+        assert_eq!(report.provider.provider_id, PROVIDER_ID);
+        assert!(report.cases.iter().all(|case| {
+            case.outcome == ProviderConformanceOutcome::Passed
+                || matches!(case.outcome, ProviderConformanceOutcome::Skipped { .. })
+        }));
+        for required_case in [
+            "baseline turn",
+            "tool calling",
+            "parallel tool calling",
+            "prompt caching",
+            "native web search",
+            "structured output",
+            "cancellation",
+        ] {
+            assert!(report.cases.iter().any(|case| {
+                case.name == required_case && case.outcome == ProviderConformanceOutcome::Passed
+            }));
+        }
+    }
+
+    #[test]
+    fn responses_request_projects_typed_openai_extension() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request.tool_call_policy.parallel = false;
+        request
+            .provider_context
+            .set_extension(&OpenAiResponsesRequestOptions {
+                service_tier: Some(OpenAiServiceTier::Priority),
+                truncation: Some(OpenAiTruncation::Disabled),
+                safety_identifier: Some("user-123".to_string()),
+                prompt_cache_retention: Some(OpenAiPromptCacheRetention::TwentyFourHours),
+            })
+            .expect("typed extension should encode");
+
+        let body = build_responses_request(&settings, &request, "model")
+            .expect("typed extension should project");
+
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["truncation"], "disabled");
+        assert_eq!(body["safety_identifier"], "user-123");
+        assert_eq!(body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn typed_openai_extension_rejects_malformed_payload() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request.tool_call_policy.parallel = false;
+        request.provider_context.request.insert(
+            format!("bcode.extension/{PROVIDER_ID}"),
+            bcode_model::ProviderRequestValue::String("not-an-object".to_string()),
+        );
+
+        let error = validate_openai_request(&settings, &request)
+            .expect_err("malformed typed extension must fail");
+        assert_eq!(error.code, "invalid_openai_request_extension");
+    }
+
+    #[test]
+    fn typed_openai_extension_rejects_wrong_surface_and_foreign_owner() {
+        let chat = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+        let mut request = test_request(Vec::new());
+        request.tool_call_policy.parallel = false;
+        request
+            .provider_context
+            .set_extension(&OpenAiResponsesRequestOptions::default())
+            .expect("extension should encode");
+        let error =
+            validate_openai_request(&chat, &request).expect_err("chat must reject extension");
+        assert_eq!(error.code, "chat_provider_extensions_unsupported");
+
+        let responses = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        request.provider_context.request.insert(
+            "bcode.extension/other.provider".to_string(),
+            bcode_model::ProviderRequestValue::Object(BTreeMap::new()),
+        );
+        let error =
+            validate_openai_request(&responses, &request).expect_err("foreign owner must fail");
+        assert_eq!(error.code, "foreign_provider_extension");
+    }
+
+    #[test]
+    fn openai_preflight_rejects_unmapped_controls() {
+        let chat = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+        let mut request = test_request(Vec::new());
+        request.tool_call_policy.parallel = false;
+        request.parameters.reasoning_budget_tokens = Some(128);
+        let error = validate_openai_request(&chat, &request).expect_err("budget must fail");
+        assert_eq!(error.code, "reasoning_budget_unsupported");
+
+        request.parameters = bcode_model::ModelParameters::default();
+        request.parameters.reasoning_summary = Some("auto".to_string());
+        let error = validate_openai_request(&chat, &request).expect_err("summary must fail");
+        assert_eq!(error.code, "reasoning_controls_unsupported");
+
+        request.parameters = bcode_model::ModelParameters::default();
+        request.provider_context.request.insert(
+            "custom".to_string(),
+            bcode_model::ProviderRequestValue::Bool(true),
+        );
+        let error = validate_openai_request(&chat, &request).expect_err("options must fail");
+        assert_eq!(error.code, "chat_provider_options_unsupported");
+    }
+
+    #[test]
+    fn openai_preflight_validates_reuse_and_tool_choice() {
+        let responses = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request.tool_call_policy.parallel = false;
+        request.conversation_reuse.previous_provider_response_id = Some("response".to_string());
+        let error = validate_openai_request(&responses, &request).expect_err("disabled reuse");
+        assert_eq!(error.code, "conversation_reuse_disabled");
+
+        request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Auto;
+        request.conversation_reuse.previous_provider_response_id = None;
+        request.conversation_reuse.new_messages_start_index = Some(1);
+        let error = validate_openai_request(&responses, &request).expect_err("missing response id");
+        assert_eq!(error.code, "conversation_reuse_index_without_response");
+
+        request.conversation_reuse = bcode_model::ConversationReuseHints::default();
+        request.tool_call_policy.choice = bcode_model::ToolChoice::Required;
+        let error = validate_openai_request(&responses, &request).expect_err("missing tools");
+        assert_eq!(error.code, "tool_choice_without_tools");
+    }
 
     #[test]
     fn openai_provider_cancel_turn_signals_active_adapter_state() {
@@ -6711,6 +7688,47 @@ mod tests {
         });
         assert!(response.error.is_none());
         assert!(turn.is_cancelled());
+    }
+
+    #[test]
+    fn granular_capabilities_are_dialect_specific_and_do_not_assume_model_support() {
+        use bcode_model::{
+            CapabilitySupport, ModelFeatureSupport, ModelParameterKey, RequestedModelFeature,
+            StructuredOutputMode,
+        };
+        let chat = openai_feature_support(OpenAiCompatibleDialect::ChatCompletions);
+        let responses = openai_feature_support(OpenAiCompatibleDialect::ResponsesApi);
+        let codex = openai_feature_support(OpenAiCompatibleDialect::ChatGptCodex);
+
+        assert!(chat.has_complete_inventory());
+        assert!(responses.has_complete_inventory());
+        assert!(codex.has_complete_inventory());
+        assert!(
+            chat.parameter(ModelParameterKey::StopSequences)
+                .is_guaranteed()
+        );
+        assert!(matches!(
+            responses.parameter(ModelParameterKey::StopSequences),
+            CapabilitySupport::Unsupported { .. }
+        ));
+        assert!(matches!(
+            codex.parameter(ModelParameterKey::Temperature),
+            CapabilitySupport::Unsupported { .. }
+        ));
+        assert!(
+            responses
+                .structured_output(StructuredOutputMode::StrictJsonSchema)
+                .is_guaranteed()
+        );
+        assert!(matches!(
+            responses.negotiate(
+                &ModelFeatureSupport::default(),
+                RequestedModelFeature::StructuredOutput(StructuredOutputMode::StrictJsonSchema)
+            ),
+            bcode_model::NegotiatedFeatureSupport::Unknown {
+                scope: bcode_model::CapabilityScope::Model
+            }
+        ));
     }
 
     #[test]
@@ -7051,16 +8069,17 @@ mod tests {
     #[test]
     fn responses_request_merges_generic_provider_options() {
         let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
-        request.provider_context.request = BTreeMap::from([
-            (
-                "service_tier".to_string(),
-                bcode_model::ProviderRequestValue::from(serde_json::json!("priority")),
-            ),
-            (
-                "custom_boolean".to_string(),
-                bcode_model::ProviderRequestValue::from(serde_json::json!(true)),
-            ),
-        ]);
+        request
+            .provider_context
+            .set_extension(&OpenAiResponsesRequestOptions {
+                service_tier: Some(OpenAiServiceTier::Priority),
+                ..OpenAiResponsesRequestOptions::default()
+            })
+            .expect("typed extension should encode");
+        request.provider_context.request.insert(
+            "custom_boolean".to_string(),
+            bcode_model::ProviderRequestValue::from(serde_json::json!(true)),
+        );
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
 
         let body =
@@ -7137,17 +8156,17 @@ mod tests {
     #[test]
     fn responses_request_rejects_reserved_provider_options() {
         let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
-        request.provider_context.request = BTreeMap::from([(
-            "model".to_string(),
-            bcode_model::ProviderRequestValue::from(serde_json::json!("other-model")),
-        )]);
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
-
-        let error = build_responses_request(&settings, &request, "gpt-5.5")
-            .expect_err("reserved field should be rejected");
-
-        assert_eq!(error.code, "reserved_provider_request_option");
-        assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+        for key in ["model", "service_tier"] {
+            request.provider_context.request = BTreeMap::from([(
+                key.to_string(),
+                bcode_model::ProviderRequestValue::from(serde_json::json!("override")),
+            )]);
+            let error = build_responses_request(&settings, &request, "gpt-5.5")
+                .expect_err("reserved field should be rejected");
+            assert_eq!(error.code, "reserved_provider_request_option");
+            assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+        }
     }
 
     fn text_message(role: MessageRole, text: &str) -> ModelMessage {
@@ -8420,6 +9439,63 @@ mod tests {
     }
 
     #[test]
+    fn unstructured_http_error_body_is_not_exposed_as_diagnostic_text() {
+        let error = error_from_status_and_headers(
+            502,
+            None,
+            "proxy failure containing secret=do-not-expose",
+        );
+
+        assert_eq!(
+            error.message,
+            "provider request failed with HTTP status 502"
+        );
+        assert!(error.provider_message.is_none());
+        assert!(error.sources.iter().all(|source| source.message.is_none()));
+        assert!(!format!("{error:?}").contains("do-not-expose"));
+    }
+
+    #[test]
+    fn http_error_preserves_safe_correlation_retry_and_source_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "req_123".parse().expect("header"));
+        headers.insert("retry-after", "2".parse().expect("header"));
+        let error = error_from_status_and_headers(
+            429,
+            Some(&headers),
+            r#"{"error":{"message":"slow down","code":"rate_limit_exceeded","type":"rate_limit_error"}}"#,
+        );
+
+        assert_eq!(error.request_id.as_deref(), Some("req_123"));
+        assert_eq!(error.provider_message.as_deref(), Some("slow down"));
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("http_status")
+                .map(String::as_str),
+            Some("429")
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("error_type")
+                .map(String::as_str),
+            Some("rate_limit_error")
+        );
+        assert_eq!(
+            error.retry.as_ref().and_then(|hint| hint.retry_after_ms),
+            Some(2_000)
+        );
+        assert!(matches!(
+            error.sources.as_slice(),
+            [ProviderErrorSource { source, code: Some(code), message: Some(message) }]
+                if source == "openai_api"
+                    && code == "rate_limit_exceeded"
+                    && message == "slow down"
+        ));
+    }
+
+    #[test]
     fn http_context_length_error_is_classified_for_overflow_recovery() {
         let error = error_from_status(
             400,
@@ -8534,6 +9610,43 @@ mod tests {
         .expect_err("context error should fail");
 
         assert_eq!(error.category, ProviderErrorCategory::ContextLength);
+    }
+
+    #[test]
+    fn missing_auth_validation_is_actionable_and_secret_safe() {
+        let plugin = OpenAiCompatibleProviderPlugin::default();
+        let response = plugin.validate_provider_context(&ProviderRequestContext::default());
+
+        assert!(!response.valid);
+        assert_eq!(response.failures.len(), 1);
+        let failure = &response.failures[0];
+        assert_eq!(failure.provider_id, PROVIDER_ID);
+        assert!(failure.is_actionable());
+        assert_eq!(
+            failure.capability,
+            bcode_model::ProviderFailureCapability::Authentication
+        );
+        assert!(
+            !serde_json::to_string(failure)
+                .expect("failure should encode")
+                .contains("api_key\":\"")
+        );
+    }
+
+    #[test]
+    fn auth_http_error_preserves_actionable_failure_context() {
+        let error = error_from_status(
+            401,
+            r#"{"error":{"message":"invalid credential","code":"invalid_api_key"}}"#,
+        );
+        let failure = error.failure.expect("auth failure context");
+
+        assert_eq!(failure.provider_id, PROVIDER_ID);
+        assert_eq!(
+            failure.source_kind,
+            bcode_model::ProviderFailureSourceKind::ProviderResponse
+        );
+        assert!(failure.is_actionable());
     }
 
     #[test]

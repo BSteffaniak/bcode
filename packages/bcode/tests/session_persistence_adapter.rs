@@ -84,6 +84,75 @@ impl ModelProviderInvoker for TextProvider {
     }
 }
 
+#[derive(Debug)]
+struct UnsupportedVersionAdapter;
+
+impl SessionPersistenceAdapter for UnsupportedVersionAdapter {
+    fn load(&self) -> bcode::Result<Option<PersistedSession>> {
+        Ok(Some(PersistedSession {
+            schema_version: bcode::PERSISTED_SESSION_SCHEMA_VERSION + 1,
+            session_id: bcode::SessionId::new(),
+            messages: Vec::new(),
+            memories: Vec::new(),
+        }))
+    }
+
+    fn save(&self, _session: &PersistedSession) -> bcode::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn custom_adapter_payload_version_is_validated_before_use() {
+    let error = Agent::builder()
+        .build()
+        .session_with_persistence(Arc::new(UnsupportedVersionAdapter))
+        .expect_err("unsupported payload must require migration");
+    assert!(matches!(error, BcodeError::SessionState(message) if message.contains("migrate")));
+}
+
+#[derive(Debug)]
+struct InconsistentMemoryAdapter;
+
+impl SessionPersistenceAdapter for InconsistentMemoryAdapter {
+    fn load(&self) -> bcode::Result<Option<PersistedSession>> {
+        Ok(Some(PersistedSession {
+            schema_version: bcode::PERSISTED_SESSION_SCHEMA_VERSION,
+            session_id: bcode::SessionId::new(),
+            messages: Vec::new(),
+            memories: vec![bcode::MemoryItem {
+                id: "memory".to_string(),
+                message: bcode::ModelMessage {
+                    role: bcode::MessageRole::User,
+                    content: vec![bcode::ModelContentBlock::Text {
+                        text: "missing transcript message".to_string(),
+                    }],
+                },
+                relevance_millis: 500,
+                provenance: bcode::MemoryProvenance {
+                    provider_id: "test".to_string(),
+                    source_id: "source".to_string(),
+                },
+                privacy: bcode::MemoryPrivacy::Public,
+                retention: bcode::MemoryRetention::SessionTranscript,
+            }],
+        }))
+    }
+
+    fn save(&self, _session: &PersistedSession) -> bcode::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn inconsistent_adapter_payload_is_rejected_without_repair_or_mutation() {
+    let error = Agent::builder()
+        .build()
+        .session_with_persistence(Arc::new(InconsistentMemoryAdapter))
+        .expect_err("inconsistent payload must fail");
+    assert!(matches!(error, BcodeError::SessionState(message) if message.contains("inconsistent")));
+}
+
 #[tokio::test]
 async fn custom_adapter_loads_and_saves_successful_turns() {
     let adapter = Arc::new(MemoryAdapter::default());
@@ -102,6 +171,10 @@ async fn custom_adapter_loads_and_saves_successful_turns() {
         .load()
         .expect("adapter should remain readable")
         .expect("successful turn should save");
+    assert_eq!(
+        saved.schema_version,
+        bcode::PERSISTED_SESSION_SCHEMA_VERSION
+    );
     assert_eq!(saved.messages.len(), 2);
 
     let restored = Agent::builder()

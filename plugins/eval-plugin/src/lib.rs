@@ -15,6 +15,10 @@ use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
 };
+use bcode_eval::{
+    LoadSdkEvalRunRequest, LoadSdkEvalRunResponse, OP_LOAD_SDK_EVAL_RUN,
+    SDK_EVAL_ARTIFACT_INTERFACE_ID, load_sdk_eval_run,
+};
 use bcode_plugin_sdk::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -39,6 +43,9 @@ impl RustPlugin for EvalPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == SDK_EVAL_ARTIFACT_INTERFACE_ID {
+            return invoke_sdk_eval_artifact_service(&context.request);
+        }
         if context.request.interface_id != COMMAND_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -82,6 +89,22 @@ fn open_latest_command() -> CommandContribution {
             plugin_id: PLUGIN_ID.to_string(),
             command_id: COMMAND_OPEN_LATEST.to_string(),
         },
+    }
+}
+
+fn invoke_sdk_eval_artifact_service(request: &ServiceRequest) -> ServiceResponse {
+    if request.operation != OP_LOAD_SDK_EVAL_RUN {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported SDK eval artifact operation",
+        );
+    }
+    let Ok(request) = serde_json::from_slice::<LoadSdkEvalRunRequest>(&request.payload) else {
+        return ServiceResponse::error("invalid_request", "invalid SDK eval artifact request");
+    };
+    match load_sdk_eval_run(&request.path) {
+        Ok(run) => json_response(&LoadSdkEvalRunResponse { run }),
+        Err(error) => ServiceResponse::error("artifact_unavailable", error.to_string()),
     }
 }
 
@@ -203,6 +226,41 @@ mod tests {
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("unknown_command")
         );
+    }
+
+    #[test]
+    fn sdk_eval_artifact_service_loads_typed_run() {
+        let directory =
+            std::env::temp_dir().join(format!("bcode-sdk-eval-plugin-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let run = bcode_eval::SdkEvalRun {
+            schema_version: bcode_eval::SDK_EVAL_RUN_SCHEMA_VERSION,
+            run_id: "plugin-run".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            configuration: bcode_eval::SdkEvalRunConfig {
+                evaluator_id: "plugin-test".to_string(),
+                evaluator_version: "v1".to_string(),
+                metadata: std::collections::BTreeMap::new(),
+            },
+            cases: Vec::new(),
+            passed: true,
+            overall_score: 0.0,
+        };
+        bcode_eval::write_sdk_eval_run(&directory, &run).expect("write SDK eval artifact");
+        let request = ServiceRequest {
+            interface_id: SDK_EVAL_ARTIFACT_INTERFACE_ID.to_string(),
+            operation: OP_LOAD_SDK_EVAL_RUN.to_string(),
+            payload: serde_json::to_vec(&LoadSdkEvalRunRequest {
+                path: directory.clone(),
+            })
+            .expect("request JSON"),
+        };
+        let response = invoke_sdk_eval_artifact_service(&request);
+        assert_eq!(response.error, None);
+        let loaded = serde_json::from_slice::<LoadSdkEvalRunResponse>(&response.payload)
+            .expect("typed response");
+        assert_eq!(loaded.run, run);
+        std::fs::remove_dir_all(directory).expect("clean temporary artifact");
     }
 
     fn invoke_command(command_id: &str) -> InvokeCommandResponse {

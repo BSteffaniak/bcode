@@ -318,6 +318,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "fmt",
     "std",
 ] }
+trybuild = { version = "1.0.118", default-features = false }
 two-face = { version = "0.5.1", default-features = false, features = [
     "syntect-onig",
 ] }

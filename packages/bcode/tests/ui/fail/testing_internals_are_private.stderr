@@ -1,0 +1,5 @@
+error[E0616]: field `state` of struct `ScriptedProvider` is private
+ --> tests/ui/fail/testing_internals_are_private.rs:5:27
+  |
+5 |     let _state = provider.state;
+  |                           ^^^^^ private field

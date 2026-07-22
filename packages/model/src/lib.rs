@@ -12,10 +12,13 @@
 //! Opaque replacement context is replayable only on a provider surface whose
 //! [`ProviderContextFormat`] exactly matches the format that produced it. Providers must preserve
 //! opaque items losslessly; hosts must retain a portable summary for incompatible surfaces.
+//!
+//! The normative required/optional operation and lifecycle semantics are documented in
+//! [`docs/model-provider-contract.md`](https://github.com/BSteffaniak/bcode/blob/master/docs/model-provider-contract.md).
 
 use bcode_session_models::SessionId;
 use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod context_management;
@@ -75,6 +78,158 @@ pub const OP_AUTH_RESET_CREDITS: &str = "auth_reset_credits";
 /// Operation for consuming one provider auth rate-limit reset credit.
 pub const OP_AUTH_RESET_CREDIT_CONSUME: &str = "auth_reset_credit_consume";
 
+/// Whether an operation is part of the baseline provider contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOperationRequirement {
+    /// Every `bcode.model-provider/v1` implementation must implement the operation.
+    Required,
+    /// The operation is required only when the provider advertises the associated capability.
+    CapabilityGated(ProviderCapability),
+    /// The operation is an optional extension that callers must probe before use.
+    Optional,
+}
+
+/// Static description of one typed `bcode.model-provider/v1` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderOperationContract {
+    /// Stable operation name sent through the plugin service boundary.
+    pub operation: &'static str,
+    /// Rust request payload type. `()` means an empty JSON request.
+    pub request_type: &'static str,
+    /// Rust success response payload type.
+    pub response_type: &'static str,
+    /// Baseline, capability-gated, or optional requirement.
+    pub requirement: ProviderOperationRequirement,
+    /// Concise behavioral requirement beyond successful typed decoding.
+    pub behavior: &'static str,
+}
+
+/// Complete operation inventory for [`MODEL_PROVIDER_INTERFACE_ID`].
+///
+/// Baseline providers must implement every [`ProviderOperationRequirement::Required`] operation.
+/// Capability-gated operations must be implemented when the corresponding capability is
+/// advertised. Optional operations are extensions and callers must tolerate an
+/// `unsupported_operation` service error.
+pub const MODEL_PROVIDER_OPERATIONS: &[ProviderOperationContract] = &[
+    ProviderOperationContract {
+        operation: OP_CAPABILITIES,
+        request_type: "()",
+        response_type: "ProviderCapabilities",
+        requirement: ProviderOperationRequirement::Required,
+        behavior: "return stable provider identity and truthful capability declarations",
+    },
+    ProviderOperationContract {
+        operation: OP_MODELS,
+        request_type: "ModelListRequest",
+        response_type: "ModelList",
+        requirement: ProviderOperationRequirement::Required,
+        behavior: "return unique model ids and truthful per-model capabilities",
+    },
+    ProviderOperationContract {
+        operation: OP_VALIDATE_CONFIG,
+        request_type: "ValidateConfigRequest",
+        response_type: "ValidateConfigResponse",
+        requirement: ProviderOperationRequirement::Required,
+        behavior: "report invalid configuration as typed validation data without panicking",
+    },
+    ProviderOperationContract {
+        operation: OP_START_TURN,
+        request_type: "ModelTurnRequest",
+        response_type: "StartTurnResponse",
+        requirement: ProviderOperationRequirement::Required,
+        behavior: "allocate a unique active turn and enqueue TurnStarted before content",
+    },
+    ProviderOperationContract {
+        operation: OP_POLL_TURN_EVENTS,
+        request_type: "PollTurnEventsRequest",
+        response_type: "PollTurnEventsResponse",
+        requirement: ProviderOperationRequirement::Required,
+        behavior: "drain ordered normalized events without replaying previously drained events",
+    },
+    ProviderOperationContract {
+        operation: OP_CANCEL_TURN,
+        request_type: "CancelTurnRequest",
+        response_type: "AckResponse",
+        requirement: ProviderOperationRequirement::Required,
+        behavior: "idempotently request cancellation; completed-turn races remain valid",
+    },
+    ProviderOperationContract {
+        operation: OP_FINISH_TURN,
+        request_type: "FinishTurnRequest",
+        response_type: "AckResponse",
+        requirement: ProviderOperationRequirement::Required,
+        behavior: "idempotently release all host-visible state for the provider turn id",
+    },
+    ProviderOperationContract {
+        operation: OP_CONTEXT_MANAGEMENT_CAPABILITIES,
+        request_type: "ContextManagementCapabilitiesRequest",
+        response_type: "ContextManagementCapabilities",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "describe context behavior for the active provider surface",
+    },
+    ProviderOperationContract {
+        operation: OP_COMPACT_CONTEXT,
+        request_type: "CompactContextRequest",
+        response_type: "CompactContextResponse",
+        requirement: ProviderOperationRequirement::CapabilityGated(
+            ProviderCapability::NativeContextCompaction,
+        ),
+        behavior: "return lossless replayable replacement context in its declared format",
+    },
+    ProviderOperationContract {
+        operation: OP_VERIFY_MODEL,
+        request_type: "VerifyModelRequest",
+        response_type: "VerifyModelResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "perform a bounded model probe and normalize the outcome",
+    },
+    ProviderOperationContract {
+        operation: OP_NATIVE_WEB_SEARCH,
+        request_type: "NativeWebSearchRequest",
+        response_type: "NativeWebSearchResponse",
+        requirement: ProviderOperationRequirement::CapabilityGated(
+            ProviderCapability::NativeWebSearch,
+        ),
+        behavior: "return normalized search results or a typed partial result",
+    },
+    ProviderOperationContract {
+        operation: OP_AUTH_USAGE,
+        request_type: "AuthUsageRequest",
+        response_type: "AuthUsageResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "return normalized auth-backed usage snapshots",
+    },
+    ProviderOperationContract {
+        operation: OP_AUTH_PRIME,
+        request_type: "AuthPrimeRequest",
+        response_type: "AuthPrimeResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "prime provider auth state without starting a model turn",
+    },
+    ProviderOperationContract {
+        operation: OP_AUTH_RESET_CREDITS,
+        request_type: "AuthResetCreditsRequest",
+        response_type: "AuthResetCreditsResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "list normalized auth reset-credit state",
+    },
+    ProviderOperationContract {
+        operation: OP_AUTH_RESET_CREDIT_CONSUME,
+        request_type: "AuthResetCreditConsumeRequest",
+        response_type: "AuthResetCreditConsumeResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "consume one reset credit with typed outcome data",
+    },
+];
+
+/// Look up the contract for one model-provider operation.
+#[must_use]
+pub fn provider_operation_contract(operation: &str) -> Option<&'static ProviderOperationContract> {
+    MODEL_PROVIDER_OPERATIONS
+        .iter()
+        .find(|contract| contract.operation == operation)
+}
+
 /// Provider-level capability report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
@@ -82,6 +237,9 @@ pub struct ProviderCapabilities {
     pub display_name: String,
     #[serde(default)]
     pub capabilities: BTreeSet<ProviderCapability>,
+    /// Granular provider-surface claims. Missing claims are unknown and never guaranteed.
+    #[serde(default)]
+    pub feature_support: ModelFeatureSupport,
     /// Provider-supported auth scheme identifiers, for example `api_key` or `chatgpt`.
     #[serde(default)]
     pub auth_schemes: BTreeSet<String>,
@@ -223,6 +381,303 @@ impl ProviderRetryRuleMatch {
         if override_match.provider_message_contains.is_some() {
             self.provider_message_contains = override_match.provider_message_contains;
         }
+    }
+}
+
+/// Provenance for a granular provider/model capability claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySource {
+    /// Reported directly by the provider API for the selected model/surface.
+    ProviderApi,
+    /// Maintained in Bcode's bundled compatibility catalog.
+    BundledCatalog,
+    /// Explicit application or user configuration.
+    Configuration,
+    /// Learned from a bounded compatibility probe or persisted incompatibility observation.
+    Probe,
+    /// Deterministic local test provider contract.
+    TestContract,
+}
+
+/// One truthful support claim with its provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    /// No trustworthy claim is available. This must never be presented as guaranteed support.
+    #[default]
+    Unknown,
+    /// The feature is supported according to the stated source.
+    Supported { source: CapabilitySource },
+    /// The feature is unsupported according to the stated source.
+    Unsupported {
+        source: CapabilitySource,
+        reason: String,
+    },
+}
+
+impl CapabilitySupport {
+    /// Return whether this is an affirmative, provenance-bearing support claim.
+    #[must_use]
+    pub const fn is_guaranteed(&self) -> bool {
+        matches!(self, Self::Supported { .. })
+    }
+
+    /// Return this claim's provenance when known.
+    #[must_use]
+    pub const fn source(&self) -> Option<CapabilitySource> {
+        match self {
+            Self::Unknown => None,
+            Self::Supported { source } | Self::Unsupported { source, .. } => Some(*source),
+        }
+    }
+}
+
+/// Scope at which granular feature negotiation was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityScope {
+    Provider,
+    Model,
+}
+
+/// Result of intersecting provider-surface and selected-model claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NegotiatedFeatureSupport {
+    /// Both scopes affirm support and preserve their independent provenance.
+    Guaranteed {
+        provider_source: CapabilitySource,
+        model_source: CapabilitySource,
+    },
+    /// One scope explicitly rejects the feature.
+    Unsupported {
+        scope: CapabilityScope,
+        source: CapabilitySource,
+        reason: String,
+    },
+    /// One scope has no trustworthy claim, so support cannot be guaranteed.
+    Unknown { scope: CapabilityScope },
+}
+
+impl NegotiatedFeatureSupport {
+    /// Return whether both provider and model affirm support.
+    #[must_use]
+    pub const fn is_guaranteed(&self) -> bool {
+        matches!(self, Self::Guaranteed { .. })
+    }
+}
+
+/// Provider-neutral model parameter keys used in capability negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelParameterKey {
+    Temperature,
+    MaxOutputTokens,
+    TopP,
+    StopSequences,
+    ReasoningBudgetTokens,
+    ReasoningEffort,
+    ReasoningEffortValue,
+    ReasoningSummary,
+}
+
+/// Structured-output modes negotiated independently from broad JSON capability flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredOutputMode {
+    JsonSchema,
+    StrictJsonSchema,
+}
+
+/// Tool selection modes negotiated independently from basic tool transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+    Named,
+    Parallel,
+}
+
+/// Prompt-cache hint families negotiated independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheFeature {
+    ConversationPrefix,
+    ExplicitSystem,
+    ExplicitTools,
+    ExplicitMessage,
+    Ttl,
+}
+
+/// Media-input families negotiated independently from text input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaInputFeature {
+    UserImage,
+    SystemImage,
+    AssistantImage,
+    ToolMessageImage,
+    ImageReference,
+    ToolResultImage,
+}
+
+/// Granular provider/model feature claims.
+///
+/// Absent entries are [`CapabilitySupport::Unknown`]. Callers must require affirmative claims from
+/// both the provider surface and selected model before presenting behavior as guaranteed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFeatureSupport {
+    #[serde(default)]
+    pub parameters: BTreeMap<ModelParameterKey, CapabilitySupport>,
+    #[serde(default)]
+    pub structured_output: BTreeMap<StructuredOutputMode, CapabilitySupport>,
+    #[serde(default)]
+    pub tool_choice: BTreeMap<ToolChoiceMode, CapabilitySupport>,
+    #[serde(default)]
+    pub prompt_cache: BTreeMap<PromptCacheFeature, CapabilitySupport>,
+    #[serde(default)]
+    pub media_input: BTreeMap<MediaInputFeature, CapabilitySupport>,
+}
+
+impl ModelFeatureSupport {
+    /// Return the parameter claim, defaulting to unknown.
+    #[must_use]
+    pub fn parameter(&self, parameter: ModelParameterKey) -> &CapabilitySupport {
+        self.parameters
+            .get(&parameter)
+            .unwrap_or(&CapabilitySupport::Unknown)
+    }
+
+    /// Return the structured-output claim, defaulting to unknown.
+    #[must_use]
+    pub fn structured_output(&self, mode: StructuredOutputMode) -> &CapabilitySupport {
+        self.structured_output
+            .get(&mode)
+            .unwrap_or(&CapabilitySupport::Unknown)
+    }
+
+    /// Return the tool-choice claim, defaulting to unknown.
+    #[must_use]
+    pub fn tool_choice(&self, mode: ToolChoiceMode) -> &CapabilitySupport {
+        self.tool_choice
+            .get(&mode)
+            .unwrap_or(&CapabilitySupport::Unknown)
+    }
+
+    /// Return the prompt-cache claim, defaulting to unknown.
+    #[must_use]
+    pub fn prompt_cache(&self, feature: PromptCacheFeature) -> &CapabilitySupport {
+        self.prompt_cache
+            .get(&feature)
+            .unwrap_or(&CapabilitySupport::Unknown)
+    }
+
+    /// Return the media-input claim, defaulting to unknown.
+    #[must_use]
+    pub fn media_input(&self, feature: MediaInputFeature) -> &CapabilitySupport {
+        self.media_input
+            .get(&feature)
+            .unwrap_or(&CapabilitySupport::Unknown)
+    }
+    /// Return whether every currently defined granular feature has an explicit claim.
+    ///
+    /// This is useful for provider-surface reports. Model reports may intentionally remain sparse
+    /// when model-specific evidence is unavailable.
+    #[must_use]
+    pub fn has_complete_inventory(&self) -> bool {
+        [
+            ModelParameterKey::Temperature,
+            ModelParameterKey::MaxOutputTokens,
+            ModelParameterKey::TopP,
+            ModelParameterKey::StopSequences,
+            ModelParameterKey::ReasoningBudgetTokens,
+            ModelParameterKey::ReasoningEffort,
+            ModelParameterKey::ReasoningEffortValue,
+            ModelParameterKey::ReasoningSummary,
+        ]
+        .into_iter()
+        .all(|key| self.parameters.contains_key(&key))
+            && [
+                StructuredOutputMode::JsonSchema,
+                StructuredOutputMode::StrictJsonSchema,
+            ]
+            .into_iter()
+            .all(|mode| self.structured_output.contains_key(&mode))
+            && [
+                ToolChoiceMode::Auto,
+                ToolChoiceMode::None,
+                ToolChoiceMode::Required,
+                ToolChoiceMode::Named,
+                ToolChoiceMode::Parallel,
+            ]
+            .into_iter()
+            .all(|mode| self.tool_choice.contains_key(&mode))
+            && [
+                PromptCacheFeature::ConversationPrefix,
+                PromptCacheFeature::ExplicitSystem,
+                PromptCacheFeature::ExplicitTools,
+                PromptCacheFeature::ExplicitMessage,
+                PromptCacheFeature::Ttl,
+            ]
+            .into_iter()
+            .all(|feature| self.prompt_cache.contains_key(&feature))
+            && [
+                MediaInputFeature::UserImage,
+                MediaInputFeature::SystemImage,
+                MediaInputFeature::AssistantImage,
+                MediaInputFeature::ToolMessageImage,
+                MediaInputFeature::ImageReference,
+                MediaInputFeature::ToolResultImage,
+            ]
+            .into_iter()
+            .all(|feature| self.media_input.contains_key(&feature))
+    }
+
+    /// Intersect provider-surface and selected-model claims for one requested feature.
+    #[must_use]
+    pub fn negotiate(
+        &self,
+        model: &Self,
+        feature: RequestedModelFeature,
+    ) -> NegotiatedFeatureSupport {
+        negotiate_feature_claims(feature.support_in(self), feature.support_in(model))
+    }
+}
+
+fn negotiate_feature_claims(
+    provider: &CapabilitySupport,
+    model: &CapabilitySupport,
+) -> NegotiatedFeatureSupport {
+    if let CapabilitySupport::Unsupported { source, reason } = provider {
+        return NegotiatedFeatureSupport::Unsupported {
+            scope: CapabilityScope::Provider,
+            source: *source,
+            reason: reason.clone(),
+        };
+    }
+    if matches!(provider, CapabilitySupport::Unknown) {
+        return NegotiatedFeatureSupport::Unknown {
+            scope: CapabilityScope::Provider,
+        };
+    }
+    if let CapabilitySupport::Unsupported { source, reason } = model {
+        return NegotiatedFeatureSupport::Unsupported {
+            scope: CapabilityScope::Model,
+            source: *source,
+            reason: reason.clone(),
+        };
+    }
+    if matches!(model, CapabilitySupport::Unknown) {
+        return NegotiatedFeatureSupport::Unknown {
+            scope: CapabilityScope::Model,
+        };
+    }
+    NegotiatedFeatureSupport::Guaranteed {
+        provider_source: provider.source().expect("provider support source"),
+        model_source: model.source().expect("model support source"),
     }
 }
 
@@ -487,6 +942,9 @@ pub struct ModelInfo {
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub capabilities: BTreeSet<ModelCapability>,
+    /// Granular model claims. Missing claims are unknown and never guaranteed.
+    #[serde(default)]
+    pub feature_support: ModelFeatureSupport,
     #[serde(default)]
     pub reasoning: Option<ModelReasoningInfo>,
     #[serde(default)]
@@ -729,6 +1187,9 @@ pub struct ValidateConfigRequest {
     pub profile: Option<String>,
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// Provider context to validate, including transient auth and endpoint settings.
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
 }
 
 /// Binary-codec-safe provider-native request option value.
@@ -1156,6 +1617,15 @@ pub struct AuthUsageWindowRef {
     pub window_id: String,
 }
 
+/// Provider-owned typed request extension.
+///
+/// Extension payload types belong to the provider crate that interprets them. The provider ID
+/// scopes serialized data so unrelated providers never receive or interpret the payload.
+pub trait ProviderRequestExtension: Serialize + DeserializeOwned {
+    /// Provider/plugin ID that owns this extension payload.
+    const PROVIDER_ID: &'static str;
+}
+
 /// Provider-neutral request context resolved by the host from model/provider profiles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequestContext {
@@ -1181,6 +1651,9 @@ pub struct ProviderRequestContext {
     pub auth_candidates: Vec<ProviderAuthCandidate>,
     /// Provider-native request fields merged into the outbound provider request.
     ///
+    /// This is an advanced untyped escape hatch for provider fields that do not yet have a typed
+    /// extension. Prefer [`Self::set_extension`] for stable application code.
+    ///
     /// These values are non-secret provider-specific request options resolved from model profiles
     /// and aliases. Providers should validate/reserve core fields before merging.
     #[serde(default)]
@@ -1193,12 +1666,80 @@ pub struct ProviderRequestContext {
     pub env: BTreeMap<String, String>,
 }
 
+impl ProviderRequestContext {
+    /// Encode and store one provider-owned typed request extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the typed extension cannot be represented as JSON.
+    pub fn set_extension<E>(&mut self, extension: &E) -> Result<(), serde_json::Error>
+    where
+        E: ProviderRequestExtension,
+    {
+        let value = serde_json::to_value(extension)?;
+        self.request.insert(
+            provider_extension_key(E::PROVIDER_ID),
+            ProviderRequestValue::from(value),
+        );
+        Ok(())
+    }
+
+    /// Decode a provider-owned typed request extension when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored payload does not match the extension type.
+    pub fn extension<E>(&self) -> Result<Option<E>, serde_json::Error>
+    where
+        E: ProviderRequestExtension,
+    {
+        self.request
+            .get(&provider_extension_key(E::PROVIDER_ID))
+            .cloned()
+            .map(serde_json::Value::from)
+            .map(serde_json::from_value)
+            .transpose()
+    }
+
+    /// Add one typed extension and return the updated context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the typed extension cannot be represented as JSON.
+    pub fn with_extension<E>(mut self, extension: &E) -> Result<Self, serde_json::Error>
+    where
+        E: ProviderRequestExtension,
+    {
+        self.set_extension(extension)?;
+        Ok(self)
+    }
+}
+
+/// Return whether a provider request key contains a typed extension envelope.
+#[must_use]
+pub fn is_provider_extension_key(key: &str) -> bool {
+    key.starts_with("bcode.extension/")
+}
+
+/// Return the provider owner encoded in a typed extension key.
+#[must_use]
+pub fn provider_extension_owner(key: &str) -> Option<&str> {
+    key.strip_prefix("bcode.extension/")
+}
+
+fn provider_extension_key(provider_id: &str) -> String {
+    format!("bcode.extension/{provider_id}")
+}
+
 /// Provider configuration validation response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidateConfigResponse {
     pub valid: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// Structured auth/config failures. Empty when validation succeeded.
+    #[serde(default)]
+    pub failures: Vec<ProviderFailureContext>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
 }
@@ -1803,6 +2344,278 @@ pub enum StopReason {
     Error,
 }
 
+/// Granular feature requested by one model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "family", content = "feature", rename_all = "snake_case")]
+pub enum RequestedModelFeature {
+    Parameter(ModelParameterKey),
+    StructuredOutput(StructuredOutputMode),
+    ToolChoice(ToolChoiceMode),
+    PromptCache(PromptCacheFeature),
+    MediaInput(MediaInputFeature),
+}
+
+impl RequestedModelFeature {
+    /// Return the support claim for this feature.
+    #[must_use]
+    pub fn support_in(self, support: &ModelFeatureSupport) -> &CapabilitySupport {
+        match self {
+            Self::Parameter(parameter) => support.parameter(parameter),
+            Self::StructuredOutput(mode) => support.structured_output(mode),
+            Self::ToolChoice(mode) => support.tool_choice(mode),
+            Self::PromptCache(feature) => support.prompt_cache(feature),
+            Self::MediaInput(feature) => support.media_input(feature),
+        }
+    }
+}
+
+impl ModelTurnRequest {
+    /// Return every granular feature explicitly exercised by this request.
+    #[must_use]
+    pub fn requested_features(&self) -> BTreeSet<RequestedModelFeature> {
+        let mut features = BTreeSet::new();
+        collect_parameter_features(&self.parameters, &mut features);
+        collect_output_and_tool_features(self, &mut features);
+        collect_cache_features(&self.prompt_cache, &mut features);
+        collect_content_features(&self.messages, &mut features);
+        features
+    }
+
+    /// Negotiate every feature exercised by this request across provider and model scopes.
+    #[must_use]
+    pub fn negotiate_requested_features(
+        &self,
+        provider: &ModelFeatureSupport,
+        model: &ModelFeatureSupport,
+    ) -> BTreeMap<RequestedModelFeature, NegotiatedFeatureSupport> {
+        self.requested_features()
+            .into_iter()
+            .map(|feature| (feature, provider.negotiate(model, feature)))
+            .collect()
+    }
+
+    /// Return requested features that have an explicit unsupported claim.
+    #[must_use]
+    pub fn explicitly_unsupported_features(
+        &self,
+        support: &ModelFeatureSupport,
+    ) -> BTreeSet<RequestedModelFeature> {
+        self.requested_features()
+            .into_iter()
+            .filter(|feature| {
+                matches!(
+                    feature.support_in(support),
+                    CapabilitySupport::Unsupported { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// Return requested features that are affirmatively guaranteed by both provider and model.
+    #[must_use]
+    pub fn guaranteed_features(
+        &self,
+        provider: &ModelFeatureSupport,
+        model: &ModelFeatureSupport,
+    ) -> BTreeSet<RequestedModelFeature> {
+        self.requested_features()
+            .into_iter()
+            .filter(|feature| {
+                feature.support_in(provider).is_guaranteed()
+                    && feature.support_in(model).is_guaranteed()
+            })
+            .collect()
+    }
+}
+
+fn collect_parameter_features(
+    parameters: &ModelParameters,
+    features: &mut BTreeSet<RequestedModelFeature>,
+) {
+    for (requested, key) in [
+        (
+            parameters.temperature.is_some(),
+            ModelParameterKey::Temperature,
+        ),
+        (
+            parameters.max_output_tokens.is_some(),
+            ModelParameterKey::MaxOutputTokens,
+        ),
+        (parameters.top_p.is_some(), ModelParameterKey::TopP),
+        (
+            !parameters.stop_sequences.is_empty(),
+            ModelParameterKey::StopSequences,
+        ),
+        (
+            parameters.reasoning_budget_tokens.is_some(),
+            ModelParameterKey::ReasoningBudgetTokens,
+        ),
+        (
+            parameters.reasoning_effort.is_some(),
+            ModelParameterKey::ReasoningEffort,
+        ),
+        (
+            parameters.reasoning_effort_value.is_some(),
+            ModelParameterKey::ReasoningEffortValue,
+        ),
+        (
+            parameters.reasoning_summary.is_some(),
+            ModelParameterKey::ReasoningSummary,
+        ),
+    ] {
+        if requested {
+            features.insert(RequestedModelFeature::Parameter(key));
+        }
+    }
+}
+
+fn collect_output_and_tool_features(
+    request: &ModelTurnRequest,
+    features: &mut BTreeSet<RequestedModelFeature>,
+) {
+    if let Some(structured) = &request.structured_output {
+        features.insert(RequestedModelFeature::StructuredOutput(
+            if structured.strict {
+                StructuredOutputMode::StrictJsonSchema
+            } else {
+                StructuredOutputMode::JsonSchema
+            },
+        ));
+    }
+    if request.tools.is_empty()
+        && matches!(request.tool_call_policy.choice, ToolChoice::Auto)
+        && !request.tool_call_policy.parallel
+    {
+        return;
+    }
+    let mode = match request.tool_call_policy.choice {
+        ToolChoice::Auto => ToolChoiceMode::Auto,
+        ToolChoice::None => ToolChoiceMode::None,
+        ToolChoice::Required => ToolChoiceMode::Required,
+        ToolChoice::Tool { .. } => ToolChoiceMode::Named,
+    };
+    features.insert(RequestedModelFeature::ToolChoice(mode));
+    if request.tool_call_policy.parallel {
+        features.insert(RequestedModelFeature::ToolChoice(ToolChoiceMode::Parallel));
+    }
+}
+
+fn collect_cache_features(
+    cache: &PromptCacheHints,
+    features: &mut BTreeSet<RequestedModelFeature>,
+) {
+    if cache.mode.cache_conversation_prefix() {
+        features.insert(RequestedModelFeature::PromptCache(
+            PromptCacheFeature::ConversationPrefix,
+        ));
+    }
+    if cache.cache_system_prompt {
+        features.insert(RequestedModelFeature::PromptCache(
+            PromptCacheFeature::ExplicitSystem,
+        ));
+    }
+    if cache.cache_tools {
+        features.insert(RequestedModelFeature::PromptCache(
+            PromptCacheFeature::ExplicitTools,
+        ));
+    }
+}
+
+fn collect_content_features(
+    messages: &[ModelMessage],
+    features: &mut BTreeSet<RequestedModelFeature>,
+) {
+    for message in messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::Image { .. } => {
+                    let feature = match message.role {
+                        MessageRole::User => MediaInputFeature::UserImage,
+                        MessageRole::System => MediaInputFeature::SystemImage,
+                        MessageRole::Assistant => MediaInputFeature::AssistantImage,
+                        MessageRole::Tool => MediaInputFeature::ToolMessageImage,
+                    };
+                    features.insert(RequestedModelFeature::MediaInput(feature));
+                }
+                ContentBlock::CachePoint { hint } => {
+                    features.insert(RequestedModelFeature::PromptCache(
+                        PromptCacheFeature::ExplicitMessage,
+                    ));
+                    if hint.ttl_seconds.is_some() {
+                        features
+                            .insert(RequestedModelFeature::PromptCache(PromptCacheFeature::Ttl));
+                    }
+                }
+                ContentBlock::ToolResult { result } => {
+                    for content in &result.content {
+                        let feature = match content {
+                            ToolResultContent::Image { .. } => MediaInputFeature::ToolResultImage,
+                            ToolResultContent::ImageRef { .. } => MediaInputFeature::ImageReference,
+                            ToolResultContent::Text { .. } => continue,
+                        };
+                        features.insert(RequestedModelFeature::MediaInput(feature));
+                    }
+                }
+                ContentBlock::Text { .. }
+                | ContentBlock::ToolCall { .. }
+                | ContentBlock::ProviderExtension { .. } => {}
+            }
+        }
+    }
+}
+
+/// Provider capability or operation affected by an auth/config failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureCapability {
+    Authentication,
+    Configuration,
+    ModelDiscovery,
+    ModelInvocation,
+    ModelVerification,
+    TokenRefresh,
+    CredentialStorage,
+}
+
+/// Non-secret source kind for an auth/config failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureSourceKind {
+    Environment,
+    AuthProfile,
+    ModelProfile,
+    ConfigKey,
+    Credential,
+    CredentialStore,
+    ProviderResponse,
+    Runtime,
+}
+
+/// Structured, actionable, secret-safe provider auth/config failure context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderFailureContext {
+    /// Provider/plugin ID responsible for remediation.
+    pub provider_id: String,
+    /// Kind of source that is missing or invalid.
+    pub source_kind: ProviderFailureSourceKind,
+    /// Non-secret source identifier such as an environment variable, profile, or config key.
+    pub source: String,
+    /// Capability or operation blocked by the failure.
+    pub capability: ProviderFailureCapability,
+    /// Concrete remediation without secret values.
+    pub remediation: String,
+}
+
+impl ProviderFailureContext {
+    /// Validate required context fields.
+    #[must_use]
+    pub fn is_actionable(&self) -> bool {
+        !self.provider_id.trim().is_empty()
+            && !self.source.trim().is_empty()
+            && !self.remediation.trim().is_empty()
+    }
+}
+
 /// Structured provider error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderError {
@@ -1812,9 +2625,43 @@ pub struct ProviderError {
     #[serde(default)]
     pub retryable: bool,
     #[serde(default)]
-    pub provider_message: Option<String>,
+    pub provider_message: Option<Box<str>>,
+    /// Structured provider/auth/config failure context when applicable.
+    #[serde(default)]
+    pub failure: Option<Box<ProviderFailureContext>>,
+    /// Provider-assigned request/correlation ID when available.
+    #[serde(default)]
+    pub request_id: Option<Box<str>>,
+    /// Allowlisted non-secret diagnostic fields such as HTTP status or upstream error type.
+    #[serde(default)]
+    pub diagnostic_context: Box<BTreeMap<String, String>>,
+    /// Ordered original error sources, from the provider API toward inner transports.
+    #[serde(default)]
+    pub sources: Box<Vec<ProviderErrorSource>>,
     #[serde(default)]
     pub retry: Option<Box<ProviderRetryHint>>,
+}
+
+impl ProviderError {
+    /// Attach actionable auth/config context.
+    #[must_use]
+    pub fn with_failure(mut self, failure: ProviderFailureContext) -> Self {
+        self.failure = Some(Box::new(failure));
+        self
+    }
+}
+
+/// Safe preserved source information for a normalized provider error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderErrorSource {
+    /// Source subsystem, protocol, or upstream provider API.
+    pub source: String,
+    /// Source-native error code when available.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Source-native message only when the adapter has determined it is safe to expose.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Provider-reported retry timing metadata.
@@ -1849,11 +2696,282 @@ pub enum ProviderErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelCatalogPolicy, ModelCatalogSupportHint, ModelInfo, ModelList, ModelListAuthority,
-        ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelTurnRequest,
-        ModelVisibility, ModelVisibilitySource, ParallelToolCallCapabilities,
-        ProviderErrorCategory, TokenUsage, ToolCallRequestPolicy, ToolChoice,
+        ModelCatalogPolicy, ModelCatalogSupportHint, ModelFeatureSupport, ModelInfo, ModelList,
+        ModelListAuthority, ModelParameterKey, ModelPricingInfo, ModelPricingSource,
+        ModelPricingUnit, ModelTokenPrice, ModelTurnRequest, ModelVisibility,
+        ModelVisibilitySource, NegotiatedFeatureSupport, ParallelToolCallCapabilities,
+        ProviderError, ProviderErrorCategory, ProviderErrorSource, ProviderOperationRequirement,
+        ProviderRequestContext, ProviderRequestExtension, RequestedModelFeature,
+        StructuredOutputMode, TokenUsage, ToolCallRequestPolicy, ToolChoice, ToolChoiceMode,
     };
+
+    #[test]
+    fn provider_error_diagnostics_round_trip_and_default_for_older_payloads() {
+        let error = ProviderError {
+            code: "rate_limit".to_string(),
+            category: ProviderErrorCategory::RateLimit,
+            message: "limited".to_string(),
+            retryable: true,
+            provider_message: Some("upstream limited".into()),
+            failure: Some(Box::new(super::ProviderFailureContext {
+                provider_id: "provider".to_string(),
+                source_kind: super::ProviderFailureSourceKind::Environment,
+                source: "PROVIDER_API_KEY".to_string(),
+                capability: super::ProviderFailureCapability::Authentication,
+                remediation: "set PROVIDER_API_KEY".to_string(),
+            })),
+            request_id: Some("req_123".into()),
+            diagnostic_context: Box::new(
+                std::iter::once(("http_status".to_string(), "429".to_string())).collect(),
+            ),
+            sources: Box::new(vec![ProviderErrorSource {
+                source: "provider_api".to_string(),
+                code: Some("limit".to_string()),
+                message: Some("upstream limited".to_string()),
+            }]),
+            retry: None,
+        };
+        let value = serde_json::to_value(&error).expect("error should encode");
+        assert_eq!(
+            serde_json::from_value::<ProviderError>(value).expect("error should decode"),
+            error
+        );
+
+        let old = serde_json::json!({
+            "code": "old",
+            "category": "network",
+            "message": "old payload"
+        });
+        let decoded: ProviderError = serde_json::from_value(old).expect("old error should decode");
+        assert!(decoded.failure.is_none());
+        assert!(decoded.request_id.is_none());
+        assert!(decoded.diagnostic_context.is_empty());
+        assert!(decoded.sources.is_empty());
+    }
+
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct TestProviderExtension {
+        priority: bool,
+    }
+
+    impl ProviderRequestExtension for TestProviderExtension {
+        const PROVIDER_ID: &'static str = "test.provider";
+    }
+
+    #[test]
+    fn typed_provider_extensions_are_scoped_and_round_trip() {
+        let mut context = ProviderRequestContext::default();
+        context
+            .set_extension(&TestProviderExtension { priority: true })
+            .expect("extension should encode");
+
+        let encoded = serde_json::to_string(&context).expect("context should encode");
+        let decoded: ProviderRequestContext =
+            serde_json::from_str(&encoded).expect("context should decode");
+
+        assert_eq!(
+            decoded
+                .extension::<TestProviderExtension>()
+                .expect("extension should decode"),
+            Some(TestProviderExtension { priority: true })
+        );
+        assert_eq!(
+            decoded
+                .request
+                .keys()
+                .filter(|key| super::is_provider_extension_key(key))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_operation_inventory_is_unique_and_covers_all_published_operations() {
+        let expected = [
+            super::OP_CAPABILITIES,
+            super::OP_CONTEXT_MANAGEMENT_CAPABILITIES,
+            super::OP_COMPACT_CONTEXT,
+            super::OP_MODELS,
+            super::OP_VALIDATE_CONFIG,
+            super::OP_START_TURN,
+            super::OP_VERIFY_MODEL,
+            super::OP_POLL_TURN_EVENTS,
+            super::OP_CANCEL_TURN,
+            super::OP_NATIVE_WEB_SEARCH,
+            super::OP_FINISH_TURN,
+            super::OP_AUTH_USAGE,
+            super::OP_AUTH_PRIME,
+            super::OP_AUTH_RESET_CREDITS,
+            super::OP_AUTH_RESET_CREDIT_CONSUME,
+        ];
+        let actual = super::MODEL_PROVIDER_OPERATIONS
+            .iter()
+            .map(|contract| contract.operation)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(actual.len(), super::MODEL_PROVIDER_OPERATIONS.len());
+        assert_eq!(actual, expected.into_iter().collect());
+        assert!(super::MODEL_PROVIDER_OPERATIONS.iter().all(|contract| {
+            !contract.request_type.is_empty()
+                && !contract.response_type.is_empty()
+                && !contract.behavior.is_empty()
+        }));
+    }
+
+    #[test]
+    fn provider_baseline_lifecycle_operations_are_required() {
+        for operation in [
+            super::OP_CAPABILITIES,
+            super::OP_MODELS,
+            super::OP_VALIDATE_CONFIG,
+            super::OP_START_TURN,
+            super::OP_POLL_TURN_EVENTS,
+            super::OP_CANCEL_TURN,
+            super::OP_FINISH_TURN,
+        ] {
+            let contract = super::provider_operation_contract(operation)
+                .expect("published operation should have a contract");
+            assert_eq!(contract.requirement, ProviderOperationRequirement::Required);
+        }
+    }
+
+    #[test]
+    fn capability_negotiation_requires_provider_and_model_evidence() {
+        let feature = RequestedModelFeature::Parameter(ModelParameterKey::Temperature);
+        let mut provider = ModelFeatureSupport::default();
+        provider.parameters.insert(
+            ModelParameterKey::Temperature,
+            super::CapabilitySupport::Supported {
+                source: super::CapabilitySource::BundledCatalog,
+            },
+        );
+        let mut model = ModelFeatureSupport::default();
+
+        assert_eq!(
+            provider.negotiate(&model, feature),
+            NegotiatedFeatureSupport::Unknown {
+                scope: super::CapabilityScope::Model
+            }
+        );
+
+        model.parameters.insert(
+            ModelParameterKey::Temperature,
+            super::CapabilitySupport::Unsupported {
+                source: super::CapabilitySource::ProviderApi,
+                reason: "model rejects temperature".to_string(),
+            },
+        );
+        assert!(matches!(
+            provider.negotiate(&model, feature),
+            NegotiatedFeatureSupport::Unsupported {
+                scope: super::CapabilityScope::Model,
+                ..
+            }
+        ));
+
+        model.parameters.insert(
+            ModelParameterKey::Temperature,
+            super::CapabilitySupport::Supported {
+                source: super::CapabilitySource::ProviderApi,
+            },
+        );
+        assert!(provider.negotiate(&model, feature).is_guaranteed());
+    }
+
+    #[test]
+    fn granular_capability_metadata_defaults_to_unknown_for_older_payloads() {
+        let provider: super::ProviderCapabilities = serde_json::from_value(serde_json::json!({
+            "provider_id": "old",
+            "display_name": "Old",
+            "capabilities": []
+        }))
+        .expect("old provider capabilities should decode");
+        assert_eq!(provider.feature_support, ModelFeatureSupport::default());
+        assert!(
+            !provider
+                .feature_support
+                .parameter(ModelParameterKey::Temperature)
+                .is_guaranteed()
+        );
+
+        let model: ModelInfo = serde_json::from_value(serde_json::json!({
+            "model_id": "old-model",
+            "display_name": "Old model"
+        }))
+        .expect("old model info should decode");
+        assert_eq!(model.feature_support, ModelFeatureSupport::default());
+    }
+
+    #[test]
+    fn request_feature_inventory_distinguishes_parameters_outputs_and_tool_modes() {
+        let request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "turn_id": "turn",
+            "model_id": "model",
+            "messages": [],
+            "tools": [{"name":"lookup","description":"lookup","input_schema":{"type":"object"}}],
+            "tool_call_policy": {"parallel": true, "choice": {"mode":"required"}},
+            "parameters": {"temperature": 0.2},
+            "structured_output": {"name":"answer","schema":{"type":"object"},"strict":true}
+        }))
+        .expect("feature request should decode");
+        let requested = request.requested_features();
+
+        assert!(requested.contains(&RequestedModelFeature::Parameter(
+            ModelParameterKey::Temperature
+        )));
+        assert!(requested.contains(&RequestedModelFeature::StructuredOutput(
+            StructuredOutputMode::StrictJsonSchema
+        )));
+        assert!(requested.contains(&RequestedModelFeature::ToolChoice(ToolChoiceMode::Required)));
+        assert!(requested.contains(&RequestedModelFeature::ToolChoice(ToolChoiceMode::Parallel)));
+    }
+
+    #[test]
+    fn request_feature_inventory_tracks_cache_hints_and_media_roles() {
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "turn_id": "turn",
+            "model_id": "model",
+            "messages": [{
+                "role": "system",
+                "content": [{
+                    "type": "image",
+                    "image": {"mime_type":"image/png","data_base64":"AA=="}
+                }]
+            }],
+            "prompt_cache": {"mode":"aggressive"}
+        }))
+        .expect("media/cache request should decode");
+        request.messages.push(super::ModelMessage {
+            role: super::MessageRole::Tool,
+            content: vec![super::ContentBlock::ToolResult {
+                result: super::ToolResult {
+                    call_id: "call".to_string(),
+                    output: String::new(),
+                    is_error: false,
+                    content: vec![super::ToolResultContent::ImageRef {
+                        image: super::ImageRefContent {
+                            path: "artifact://image".to_string(),
+                            mime_type: "image/png".to_string(),
+                            metadata: super::ImageMetadata::default(),
+                        },
+                    }],
+                },
+            }],
+        });
+        let requested = request.requested_features();
+
+        assert!(requested.contains(&RequestedModelFeature::PromptCache(
+            super::PromptCacheFeature::ConversationPrefix
+        )));
+        assert!(requested.contains(&RequestedModelFeature::MediaInput(
+            super::MediaInputFeature::SystemImage
+        )));
+        assert!(requested.contains(&RequestedModelFeature::MediaInput(
+            super::MediaInputFeature::ImageReference
+        )));
+    }
 
     #[test]
     fn model_turn_request_defaults_typed_tool_call_policy_when_omitted() {
@@ -2013,6 +3131,7 @@ mod tests {
                 context_window: None,
                 max_output_tokens: None,
                 capabilities: std::collections::BTreeSet::new(),
+                feature_support: super::ModelFeatureSupport::default(),
                 reasoning: None,
                 cache: super::ModelCacheInfo::default(),
                 metadata_source: None,

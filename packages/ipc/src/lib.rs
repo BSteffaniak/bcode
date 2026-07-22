@@ -2286,6 +2286,7 @@ mod tests {
                     context_window: Some(128_000),
                     max_output_tokens: Some(16_000),
                     capabilities: BTreeSet::new(),
+                    feature_support: bcode_model::ModelFeatureSupport::default(),
                     reasoning: None,
                     cache: bcode_model::ModelCacheInfo::default(),
                     metadata_source: None,

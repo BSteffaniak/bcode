@@ -5,7 +5,8 @@ use bcode::{
 use bcode_model::{
     AckResponse, CancelTurnRequest, ExactRequestInputTokens, FinishTurnRequest, ModelTurnRequest,
     PollTurnEventsRequest, PollTurnEventsResponse, ProviderError, ProviderErrorCategory,
-    ProviderRequestProjection, ProviderTurnEvent, StartTurnResponse, TokenUsage,
+    ProviderErrorSource, ProviderRequestProjection, ProviderRetryHint, ProviderTurnEvent,
+    StartTurnResponse, TokenUsage,
 };
 use std::collections::VecDeque;
 
@@ -39,8 +40,23 @@ impl EventProvider {
                         category: ProviderErrorCategory::ProviderInternal,
                         message: "provider failed".to_string(),
                         retryable: false,
-                        provider_message: Some("raw safe detail".to_string()),
-                        retry: None,
+                        provider_message: Some("raw safe detail".into()),
+                        failure: None,
+                        request_id: Some("req_test".into()),
+                        diagnostic_context: Box::new(
+                            std::iter::once(("http_status".to_string(), "500".to_string()))
+                                .collect(),
+                        ),
+                        sources: Box::new(vec![ProviderErrorSource {
+                            source: "test_provider".to_string(),
+                            code: Some("upstream_failure".to_string()),
+                            message: Some("raw safe detail".to_string()),
+                        }]),
+                        retry: Some(Box::new(ProviderRetryHint {
+                            retry_after_ms: Some(100),
+                            retry_at_unix: None,
+                            source: Some("retry-after".to_string()),
+                        })),
                     },
                 },
             ]),
@@ -253,6 +269,12 @@ async fn provider_failure_has_the_same_typed_cause_in_streaming_and_non_streamin
                 if code == "provider_failed"
                     && message == "provider failed"
                     && error.provider_message.as_deref() == Some("raw safe detail")
+                    && error.request_id.as_deref() == Some("req_test")
+                    && error.diagnostic_context.get("http_status").map(String::as_str)
+                        == Some("500")
+                    && error.sources.first().map(|source| source.source.as_str())
+                        == Some("test_provider")
+                    && error.retry.as_ref().and_then(|hint| hint.retry_after_ms) == Some(100)
         ));
     }
 }

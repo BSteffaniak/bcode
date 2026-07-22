@@ -1,0 +1,13 @@
+error[E0432]: unresolved import `bcode::evaluation`
+ --> tests/ui/default_fail/evaluation_feature_is_opt_in.rs:1:12
+  |
+1 | use bcode::evaluation::SdkEvaluator;
+  |            ^^^^^^^^^^ could not find `evaluation` in `bcode`
+  |
+note: found an item that was configured out
+ --> src/lib.rs
+  |
+  | #[cfg(feature = "evaluation")]
+  |       ---------------------- the item is gated behind the `evaluation` feature
+  | pub mod evaluation;
+  |         ^^^^^^^^^^
