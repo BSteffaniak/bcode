@@ -317,6 +317,8 @@ pub struct UsageView {
 pub struct ChatMessageView {
     /// Plain text or markdown-compatible message content.
     pub text: String,
+    /// Optional renderer-neutral role/display label suffix.
+    pub display_label: Option<String>,
     /// Message format hint.
     pub format: TextFormat,
 }
@@ -327,6 +329,7 @@ impl ChatMessageView {
     pub fn markdown(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
+            display_label: None,
             format: TextFormat::Markdown,
         }
     }
@@ -336,6 +339,7 @@ impl ChatMessageView {
     pub fn plain(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
+            display_label: None,
             format: TextFormat::PlainText,
         }
     }
@@ -365,6 +369,8 @@ pub struct ToolInvocationView {
     pub tool_name: Option<String>,
     /// Raw JSON arguments requested by the model, when retained.
     pub arguments_json: Option<String>,
+    /// Working directory captured for this invocation, when known.
+    pub working_directory: Option<PathBuf>,
     /// Plugin-owned request visual.
     pub request_visual: Option<PluginVisualView>,
     /// Current lifecycle status.

@@ -1,11 +1,18 @@
 //! Transcript item projection for the TUI.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use bcode_plugin_sdk::path::display;
+#[cfg(test)]
+use bcode_session_models::{SessionEvent, SessionEventKind, ToolInvocationStreamEvent};
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolInvocationProjection,
-    ToolInvocationResult, ToolInvocationStreamEvent,
+    SessionTokenUsage, ToolArtifact, ToolInvocationProjection, ToolInvocationResult,
+};
+use bcode_session_view_models::{
+    InteractionViewSummary, RuntimeWorkView, ToolInvocationView, ToolInvocationViewStatus,
+    ToolResultView, TranscriptViewItem, TranscriptViewItemKind,
 };
 
 /// Generic timing metadata for a tool invocation.
@@ -113,6 +120,7 @@ pub enum TranscriptItemKind {
     Generic,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ToolCallContext {
     tool_name: String,
@@ -361,6 +369,7 @@ impl TranscriptItem {
 }
 
 /// Project session events into transcript items, optionally hiding reasoning items.
+#[cfg(test)]
 #[must_use]
 pub fn transcript_items_from_events_with_reasoning(
     events: &[SessionEvent],
@@ -373,6 +382,7 @@ pub fn transcript_items_from_events_with_reasoning(
     projector.finish()
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StreamedToolReplayContext {
     index: Option<usize>,
@@ -383,6 +393,7 @@ struct StreamedToolReplayContext {
     saw_output: bool,
 }
 
+#[cfg(test)]
 struct TranscriptProjector {
     items: Vec<TranscriptItem>,
     tool_calls: BTreeMap<String, ToolCallContext>,
@@ -390,6 +401,7 @@ struct TranscriptProjector {
     include_reasoning: bool,
 }
 
+#[cfg(test)]
 impl TranscriptProjector {
     const fn new(include_reasoning: bool) -> Self {
         Self {
@@ -416,6 +428,7 @@ impl TranscriptProjector {
 }
 
 /// Merge streaming transcript items across a prepended history boundary.
+#[cfg(test)]
 pub fn merge_transcript_boundary(
     older: &mut Vec<TranscriptItem>,
     current: &mut Vec<TranscriptItem>,
@@ -756,6 +769,229 @@ pub fn permission_result_item(permission_id: &str, approved: bool) -> Transcript
     )
 }
 
+/// Adapt one generic shared semantic item into terminal transcript presentation.
+#[must_use]
+pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
+    let mut terminal = match &item.kind {
+        TranscriptViewItemKind::UserMessage { message } => message_text_item(
+            "You",
+            message,
+            item.streaming,
+            TranscriptItemKind::UserMessage,
+        ),
+        TranscriptViewItemKind::AssistantMessage { message } => message_text_item(
+            "Assistant",
+            message,
+            item.streaming,
+            TranscriptItemKind::AssistantMessage,
+        ),
+        TranscriptViewItemKind::ReasoningMessage { message } => message_text_item(
+            "Reasoning summary",
+            message,
+            item.streaming,
+            TranscriptItemKind::ReasoningMessage,
+        ),
+        TranscriptViewItemKind::SystemMessage { message } => {
+            let role = message
+                .display_label
+                .as_ref()
+                .map_or("System", |_| "Plugin");
+            message_text_item(role, message, item.streaming, TranscriptItemKind::System)
+        }
+        TranscriptViewItemKind::Usage { usage } => model_usage_item(&usage.turn_id, &usage.usage),
+        TranscriptViewItemKind::ToolInvocation { tool } => terminal_tool_item_from_shared(tool),
+        TranscriptViewItemKind::Permission { permission } => {
+            terminal_permission_item_from_shared(permission)
+        }
+        TranscriptViewItemKind::RuntimeWork { work } => {
+            terminal_runtime_work_item_from_shared(work)
+        }
+        TranscriptViewItemKind::Interaction { interaction } => {
+            terminal_interaction_item_from_shared(interaction)
+        }
+        TranscriptViewItemKind::PluginVisual { visual } => {
+            let fallback = serde_json::to_string_pretty(&visual.generic_payload)
+                .unwrap_or_else(|_| visual.generic_payload.to_string());
+            TranscriptItem::with_kind(
+                "Plugin visual",
+                fallback,
+                item.streaming,
+                TranscriptItemKind::Generic,
+            )
+        }
+        TranscriptViewItemKind::ToolContribution { contribution } => {
+            let fallback = serde_json::to_string_pretty(contribution)
+                .unwrap_or_else(|_| contribution.payload.to_string());
+            TranscriptItem::new("Tool contribution", fallback)
+        }
+    };
+    if let (Some(sequence), Some(timestamp_ms)) = (item.sequence, item.timestamp_ms) {
+        terminal = terminal.with_event_metadata(sequence, timestamp_ms);
+    }
+    terminal
+}
+
+fn message_text_item(
+    role: &'static str,
+    message: &bcode_session_view_models::ChatMessageView,
+    streaming: bool,
+    kind: TranscriptItemKind,
+) -> TranscriptItem {
+    let item = TranscriptItem::with_kind(role, message.text.clone(), streaming, kind);
+    if let Some(label) = &message.display_label {
+        item.with_display_label(label.clone())
+    } else {
+        item
+    }
+}
+
+fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
+    if let Some(ToolResultView::Artifact { artifact }) = &tool.result {
+        return apply_shared_tool_timing(
+            artifact_tool_result_item(
+                &tool.tool_call_id,
+                tool.tool_name.as_deref(),
+                tool.arguments_json.as_deref(),
+                &artifact.artifact,
+                tool.is_error.unwrap_or(false),
+            ),
+            tool,
+        );
+    }
+    if let Some(result) = tool_result_text_from_shared(tool) {
+        return apply_shared_tool_timing(
+            tool_result_item(
+                &tool.tool_call_id,
+                tool.tool_name.as_deref(),
+                tool.arguments_json.as_deref(),
+                &result,
+                tool.is_error.unwrap_or(false),
+            ),
+            tool,
+        );
+    }
+    if let Some(output) = &tool.output
+        && !output.text.is_empty()
+    {
+        let mut item = if matches!(tool.status, ToolInvocationViewStatus::Running) {
+            streaming_tool_output_item(
+                &tool.tool_call_id,
+                tool.tool_name.as_deref(),
+                tool.arguments_json.as_deref(),
+                &output.text,
+            )
+        } else {
+            tool_result_item(
+                &tool.tool_call_id,
+                tool.tool_name.as_deref(),
+                tool.arguments_json.as_deref(),
+                &output.text,
+                tool.is_error.unwrap_or(false),
+            )
+        };
+        if matches!(tool.status, ToolInvocationViewStatus::Finished) {
+            item.finish_streaming();
+        }
+        return apply_shared_tool_timing(item, tool);
+    }
+    let mut item = tool_request_item(
+        &tool.tool_call_id,
+        tool.producer_plugin_id.as_deref(),
+        tool.tool_name.as_deref().unwrap_or("unknown tool"),
+        tool.arguments_json.as_deref().unwrap_or("{}"),
+        tool.working_directory.clone(),
+        tool.request_visual
+            .as_ref()
+            .map(|visual| visual.descriptor.clone()),
+    );
+    if matches!(tool.status, ToolInvocationViewStatus::Running) {
+        item.streaming = true;
+    }
+    item
+}
+
+fn tool_result_text_from_shared(tool: &ToolInvocationView) -> Option<String> {
+    match &tool.result {
+        Some(ToolResultView::Text { text }) => Some(text.clone()),
+        Some(ToolResultView::Json { value }) => Some(pretty_jsonish(value)),
+        Some(ToolResultView::Artifact { .. }) | None => tool.result_text.clone(),
+    }
+}
+
+const fn apply_shared_tool_timing(
+    mut item: TranscriptItem,
+    tool: &ToolInvocationView,
+) -> TranscriptItem {
+    item.set_tool_started_at_ms(tool.timing.started_at_ms);
+    item.set_tool_finished_at_ms(tool.timing.finished_at_ms);
+    item.set_tool_timeout_ms(tool.timing.timeout_ms);
+    item.set_tool_timed_out(tool.timing.timed_out);
+    item
+}
+
+fn terminal_permission_item_from_shared(
+    permission: &bcode_session_view_models::PermissionView,
+) -> TranscriptItem {
+    if let Some(approved) = permission.approved {
+        return permission_result_item(&permission.permission_id, approved);
+    }
+    permission_request_item(
+        &permission.permission_id,
+        &permission.tool_call_id,
+        &permission.tool_name,
+        &permission.arguments_json,
+        permission.policy_source.as_deref(),
+        permission.detail.as_deref(),
+    )
+}
+
+fn terminal_runtime_work_item_from_shared(work: &RuntimeWorkView) -> TranscriptItem {
+    let mut lines = vec![format!("{}: {:?}", work.work_id, work.status)];
+    if !work.label.is_empty() {
+        lines.push(format!("label: {}", work.label));
+    }
+    if let Some(message) = &work.message {
+        lines.push(format!("message: {message}"));
+    }
+    if let (Some(completed), Some(total)) = (work.completed_units, work.total_units) {
+        lines.push(format!("progress: {completed}/{total}"));
+    }
+    TranscriptItem::with_kind(
+        "Runtime work",
+        lines.join("\n"),
+        !work.is_terminal(),
+        TranscriptItemKind::Meta,
+    )
+}
+
+fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -> TranscriptItem {
+    let payload = if interaction.resolved {
+        interaction.resolution.as_ref()
+    } else {
+        interaction.snapshot.as_ref()
+    };
+    let payload = payload.map_or_else(
+        || "null".to_owned(),
+        |value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+    );
+    let state = if interaction.resolved {
+        "resolved"
+    } else if interaction.required {
+        "response required"
+    } else {
+        "optional"
+    };
+    TranscriptItem::with_kind(
+        "Interaction",
+        format!(
+            "{} ({state})\n{payload}",
+            interaction.title.as_deref().unwrap_or(&interaction.kind)
+        ),
+        false,
+        TranscriptItemKind::Generic,
+    )
+}
+
 /// Build a compact transcript item for model token usage.
 #[must_use]
 pub fn model_usage_item(turn_id: &str, usage: &SessionTokenUsage) -> TranscriptItem {
@@ -811,6 +1047,7 @@ pub fn truncate_block(value: &str, max_chars: usize) -> String {
     output
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_lines)]
 fn push_transcript_item_from_event(
     items: &mut Vec<TranscriptItem>,
@@ -1016,6 +1253,7 @@ fn role_requires_last_item_stream_boundary(role: &'static str) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn non_streaming_transcript_item_from_event(
     event: &SessionEvent,
     tool_calls: &mut BTreeMap<String, ToolCallContext>,
@@ -1180,6 +1418,7 @@ fn non_streaming_transcript_item_from_event(
     }
 }
 
+#[cfg(test)]
 fn working_directory_changed_message(
     old_working_directory: &std::path::Path,
     new_working_directory: &std::path::Path,
@@ -1191,8 +1430,7 @@ fn working_directory_changed_message(
     )
 }
 
-#[allow(clippy::single_match_else, clippy::needless_pass_by_ref_mut)]
-#[allow(dead_code)]
+#[cfg(test)]
 fn apply_semantic_tool_result(
     items: &mut Vec<TranscriptItem>,
     tool_call_id: &str,
@@ -1205,6 +1443,7 @@ fn apply_semantic_tool_result(
     items.push(item);
 }
 
+#[cfg(test)]
 fn semantic_tool_result_item(
     tool_call_id: &str,
     context: Option<&ToolCallContext>,
@@ -1282,11 +1521,13 @@ pub fn artifact_summary_text(artifact: &ToolArtifact) -> String {
     format!("{title}\n{text}")
 }
 
+#[cfg(test)]
 const fn apply_replay_timing(item: &mut TranscriptItem, replay: &StreamedToolReplayContext) {
     item.set_tool_started_at_ms(replay.started_at_ms);
     item.set_tool_finished_at_ms(replay.finished_at_ms);
 }
 
+#[cfg(test)]
 fn apply_tool_invocation_stream_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &BTreeMap<String, ToolCallContext>,
@@ -1353,6 +1594,7 @@ fn apply_tool_invocation_stream_event(
     }
 }
 
+#[cfg(test)]
 fn tool_visual_timeout_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
     visual
         .payload
@@ -1377,6 +1619,72 @@ fn kind_for_role(role: &str) -> TranscriptItemKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_generic_items_adapt_without_renderer_types_crossing_the_boundary() {
+        let usage = bcode_session_models::SessionTokenUsage {
+            input_tokens: Some(2),
+            output_tokens: Some(3),
+            ..bcode_session_models::SessionTokenUsage::default()
+        };
+        let cases = [
+            (
+                TranscriptViewItemKind::UserMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown("hello"),
+                },
+                "You",
+                TranscriptItemKind::UserMessage,
+            ),
+            (
+                TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown("answer"),
+                },
+                "Assistant",
+                TranscriptItemKind::AssistantMessage,
+            ),
+            (
+                TranscriptViewItemKind::ReasoningMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown("thought"),
+                },
+                "Reasoning summary",
+                TranscriptItemKind::ReasoningMessage,
+            ),
+            (
+                TranscriptViewItemKind::SystemMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown("status"),
+                },
+                "System",
+                TranscriptItemKind::System,
+            ),
+            (
+                TranscriptViewItemKind::Usage {
+                    usage: bcode_session_view_models::UsageView {
+                        turn_id: "turn-1".to_owned(),
+                        usage,
+                    },
+                },
+                "Usage",
+                TranscriptItemKind::Usage {
+                    turn_id: "turn-1".to_owned(),
+                },
+            ),
+        ];
+
+        for (kind, role, expected_kind) in cases {
+            let shared = TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("test:item"),
+                revision: 1,
+                sequence: Some(7),
+                timestamp_ms: Some(9),
+                streaming: false,
+                kind,
+            };
+            let terminal = terminal_item_from_shared(&shared);
+            assert_eq!(terminal.role, role);
+            assert_eq!(terminal.kind(), &expected_kind);
+            assert_eq!(terminal.event_sequence(), Some(7));
+        }
+    }
 
     #[test]
     fn generic_turn_origin_labels_only_the_matching_user_turn() {

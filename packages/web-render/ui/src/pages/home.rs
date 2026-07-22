@@ -1248,6 +1248,68 @@ mod tests {
     }
 
     #[test]
+    fn visual_adapters_are_schema_version_specific_and_keep_fallbacks() {
+        let supported = PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: Some("filesystem-version-1".to_owned()),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            schema: "bcode.filesystem.request".to_owned(),
+            schema_version: 1,
+            title: Some("Filesystem read".to_owned()),
+            subtitle: None,
+            payload: serde_json::json!({"operation": "read", "path": "/tmp/versioned"}),
+        });
+        let supported_rendered = format!("{:?}", render_plugin_visual("plugin visual", &supported));
+        assert!(supported_rendered.contains("Filesystem read"));
+        assert!(supported_rendered.contains("/tmp/versioned"));
+        assert!(supported_rendered.contains("bcode.filesystem.request"));
+
+        let unsupported_version = PluginVisualView::from(PluginVisualDescriptor {
+            schema_version: 2,
+            ..supported.descriptor
+        });
+        let unsupported_rendered = format!(
+            "{:?}",
+            render_plugin_visual("plugin visual", &unsupported_version)
+        );
+        assert!(
+            !VISUAL_ADAPTERS.contains_key(&("bcode.filesystem.request", 2)),
+            "unexpected rich adapter for unsupported schema version"
+        );
+        assert!(unsupported_rendered.contains("bcode.filesystem.request"));
+        assert!(unsupported_rendered.contains("/tmp/versioned"));
+    }
+
+    #[test]
+    fn every_registered_visual_adapter_has_a_fixture() {
+        for ((schema, schema_version), adapter) in VISUAL_ADAPTERS.iter() {
+            let visual = PluginVisualView::from(PluginVisualDescriptor {
+                visual_id: Some(format!("fixture:{schema}:{schema_version}")),
+                producer_plugin_id: Some("fixture-plugin".to_owned()),
+                schema: (*schema).to_owned(),
+                schema_version: *schema_version,
+                title: Some(format!("Fixture {schema}")),
+                subtitle: None,
+                payload: visual_adapter_fixture_payload(schema),
+            });
+            assert!(
+                adapter(&visual).is_some(),
+                "adapter fixture did not render {schema}@{schema_version}"
+            );
+            let rendered = format!("{:?}", render_plugin_visual("plugin visual", &visual));
+            assert!(rendered.contains(schema));
+            assert!(rendered.contains("fixture"));
+        }
+    }
+
+    fn visual_adapter_fixture_payload(schema: &str) -> serde_json::Value {
+        if schema == "bcode.tool.request.shell.run" {
+            serde_json::json!({"command": "echo fixture", "cwd": "/tmp"})
+        } else {
+            serde_json::json!({"operation": "fixture", "path": "/tmp/fixture"})
+        }
+    }
+
+    #[test]
     fn generic_tool_artifact_keeps_schema_metadata_in_render_tree() {
         let artifact = ToolArtifactView::from(ToolArtifact {
             artifact_id: "artifact-1".to_owned(),
@@ -1265,6 +1327,7 @@ mod tests {
                 producer_plugin_id: Some("fixture-plugin".to_owned()),
                 tool_name: Some("fixture".to_owned()),
                 arguments_json: None,
+                working_directory: None,
                 request_visual: None,
                 status: ToolInvocationViewStatus::Finished,
                 result_text: None,

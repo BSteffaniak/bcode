@@ -53,9 +53,8 @@ use super::transcript::{
     TranscriptItem, TranscriptItemKind, display_tool_result_text,
     generic_tool_result_item_from_projection, live_tool_preview_anchor_item, model_usage_item,
     permission_request_item, permission_result_item, semantic_tool_result_item_from_raw,
-    streaming_tool_output_item, streaming_tool_visual_item, tool_contribution_item,
-    tool_request_item_from_projection, tool_result_item,
-    transcript_items_from_events_with_reasoning,
+    streaming_tool_output_item, streaming_tool_visual_item, terminal_item_from_shared,
+    tool_contribution_item, tool_request_item_from_projection, tool_result_item,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2140,9 +2139,6 @@ impl BmuxApp {
         if self.latest_history_sequence.is_none() {
             self.latest_history_sequence = events.last().map(|event| event.sequence);
         }
-        let mut older =
-            transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
-        self.transcript.merge_prepend(&mut older);
         self.rebuild_transcript_from_history();
         self.reconcile_tool_state_with_resident_transcript();
         self.older_history.update_cursor(events, has_more);
@@ -2165,9 +2161,6 @@ impl BmuxApp {
 
         self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_window.append_history(events);
-        let mut newer =
-            transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
-        self.transcript.merge_append(&mut newer);
         self.rebuild_transcript_from_history();
         self.reconcile_tool_state_with_resident_transcript();
         self.older_history.update_newer_cursor(events, has_more);
@@ -2350,7 +2343,9 @@ impl BmuxApp {
                 self.finish_streaming_item("Assistant", text, application);
                 self.finish_assistant_stream_anchor();
             }
-            SessionEventKind::SystemMessage { text } => self.push_system_message(text),
+            SessionEventKind::SystemMessage { .. } => {
+                self.push_shared_terminal_item(event.sequence);
+            }
             SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 tool_name,
@@ -2448,7 +2443,7 @@ impl BmuxApp {
                 }
             }
             SessionEventKind::ModelUsage { turn_id, usage } => {
-                self.push_model_usage(turn_id, usage, application);
+                self.push_model_usage(event.sequence, turn_id, usage, application);
             }
             SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
             SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
@@ -2855,9 +2850,29 @@ impl BmuxApp {
 
     fn push_user_message(&mut self, sequence: u64, text: &str, timestamp_ms: u64) {
         self.remove_pending_submission(text);
-        self.transcript.push(
-            TranscriptItem::new("You", text.to_owned()).with_event_metadata(sequence, timestamp_ms),
-        );
+        if !self.push_shared_terminal_item(sequence) {
+            self.transcript.push(
+                TranscriptItem::new("You", text.to_owned())
+                    .with_event_metadata(sequence, timestamp_ms),
+            );
+        }
+    }
+
+    fn push_shared_terminal_item(&mut self, sequence: u64) -> bool {
+        let item = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.sequence == Some(sequence))
+            .map(terminal_item_from_shared);
+        let Some(item) = item else {
+            return false;
+        };
+        self.transcript.push(item);
+        true
     }
 
     fn push_system_message(&mut self, text: &str) {
@@ -2871,25 +2886,11 @@ impl BmuxApp {
         old_working_directory: &std::path::Path,
         new_working_directory: &std::path::Path,
     ) {
-        if let Some(message) = self
-            .session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find_map(|item| match &item.kind {
-                bcode_session_view_models::TranscriptViewItemKind::SystemMessage { message }
-                    if item.sequence == Some(event_sequence)
-                        && message.text.starts_with("Working directory changed from ") =>
-                {
-                    Some(message.text.clone())
-                }
-                _ => None,
-            })
-        {
-            self.transcript.push(TranscriptItem::new("System", message));
-        }
+        let projected = self.push_shared_terminal_item(event_sequence);
+        debug_assert!(
+            projected,
+            "working-directory event must have a shared terminal transcript item"
+        );
         self.status = format!(
             "working directory: {}",
             display(new_working_directory, old_working_directory)
@@ -3658,6 +3659,7 @@ impl BmuxApp {
 
     fn push_model_usage(
         &mut self,
+        event_sequence: u64,
         turn_id: &str,
         usage: &bcode_session_models::SessionTokenUsage,
         application: SessionEventApplication,
@@ -3673,19 +3675,21 @@ impl BmuxApp {
                 bcode_session_view_models::TranscriptViewItemKind::Usage { usage }
                     if usage.turn_id == turn_id =>
                 {
-                    Some(&usage.usage)
+                    Some(usage.usage.clone())
                 }
                 _ => None,
             })
-            .unwrap_or(usage);
-        self.token_usage.absorb(projected_usage);
+            .unwrap_or_else(|| usage.clone());
+        self.token_usage.absorb(&projected_usage);
         if application.live_activity()
             && let Some(tokens) = projected_usage.metered_total_tokens()
         {
             self.status = format!("tokens: {tokens}");
         }
-        self.transcript
-            .push(model_usage_item(turn_id, projected_usage));
+        if !self.push_shared_terminal_item(event_sequence) {
+            self.transcript
+                .push(model_usage_item(turn_id, &projected_usage));
+        }
     }
 
     fn finish_model_turn(
@@ -5181,6 +5185,63 @@ mod tests {
                 .context_occupancy
                 .is_none()
         );
+    }
+
+    #[test]
+    fn generic_terminal_items_are_adapted_from_shared_projection() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let session_id = SessionId::new();
+        let event = |sequence, kind| SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence.saturating_mul(10),
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let events = [
+            event(
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "shared user".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+            event(
+                2,
+                SessionEventKind::SystemMessage {
+                    text: "shared system".to_owned(),
+                },
+            ),
+            event(
+                3,
+                SessionEventKind::ModelUsage {
+                    turn_id: "turn-1".to_owned(),
+                    usage: bcode_session_models::SessionTokenUsage {
+                        input_tokens: Some(2),
+                        output_tokens: Some(3),
+                        ..bcode_session_models::SessionTokenUsage::default()
+                    },
+                },
+            ),
+        ];
+        for event in &events {
+            app.absorb_session_event(event);
+        }
+
+        let terminal = app.transcript().iter().collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 3);
+        for (terminal, shared) in terminal
+            .iter()
+            .zip(&app.session_view_snapshot().transcript.items)
+        {
+            let expected = terminal_item_from_shared(shared);
+            assert_eq!(terminal.role(), expected.role());
+            assert_eq!(terminal.text(), expected.text());
+            assert_eq!(terminal.kind(), expected.kind());
+            assert_eq!(terminal.event_sequence(), shared.sequence);
+        }
     }
 
     #[test]

@@ -385,18 +385,24 @@ impl SessionView {
                 self.snapshot.working_directory = Some(working_directory.clone());
                 self.bump_revision();
             }
-            SessionEventKind::UserMessage { text, .. } => {
+            SessionEventKind::UserMessage {
+                text, admission, ..
+            } => {
                 if self.snapshot.title.is_none() {
                     self.snapshot.title = Some(derive_session_title_from_prompt(text));
                 }
+                let display_label = admission
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.display_label.clone());
+                let mut message = ChatMessageView::markdown(text.clone());
+                message.display_label = display_label;
                 self.push_item(
                     TranscriptViewItemId::event(event.sequence),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
-                    TranscriptViewItemKind::UserMessage {
-                        message: ChatMessageView::markdown(text.clone()),
-                    },
+                    TranscriptViewItemKind::UserMessage { message },
                 );
             }
             SessionEventKind::AssistantDelta { text } => {
@@ -629,7 +635,7 @@ impl SessionView {
                     false,
                     TranscriptViewItemKind::SystemMessage {
                         message: ChatMessageView::plain(format!(
-                            "Provider context compacted for {} / {}",
+                            "Provider context compacted (provider compacted context) for {} / {}",
                             snapshot.provider_plugin_id, snapshot.model_id
                         )),
                     },
@@ -820,14 +826,14 @@ impl SessionView {
                         metadata: metadata.clone(),
                     },
                 );
+                let mut message = ChatMessageView::plain(text.clone());
+                message.display_label = Some(plugin_id.clone());
                 self.upsert_item(
                     TranscriptViewItemId::new(format!("plugin-status:{plugin_id}:{note_id}")),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
-                    TranscriptViewItemKind::SystemMessage {
-                        message: ChatMessageView::plain(text.clone()),
-                    },
+                    TranscriptViewItemKind::SystemMessage { message },
                 );
             }
             SessionEventKind::RalphLifecycle {
@@ -1572,6 +1578,7 @@ fn tool_invocation_view_from_projection(
         producer_plugin_id: projection.producer_plugin_id,
         tool_name: projection.tool_name,
         arguments_json: projection.arguments_json,
+        working_directory: projection.working_directory,
         request_visual: projection.request_visual.map(PluginVisualView::from),
         status: projection.status.into(),
         result_text: projection.result_text,
@@ -1602,6 +1609,7 @@ impl StreamingMessageKind {
     const fn item_kind(self, text: String) -> TranscriptViewItemKind {
         let message = ChatMessageView {
             text,
+            display_label: None,
             format: TextFormat::Markdown,
         };
         match self {
