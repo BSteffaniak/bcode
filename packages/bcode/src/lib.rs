@@ -23,6 +23,8 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 #[cfg(feature = "embedded-plugins")]
 use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
 pub use bcode_session_models::SessionId;
+/// Optional OpenTelemetry and in-process metrics adapters.
+pub mod telemetry;
 use futures::Stream;
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -36,6 +38,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::Instrument as _;
 
 pub use bcode_agent_permissions::{AgentPermissionPolicy, allow_all_agent_policy};
 pub use bcode_agent_policy::{Action, AgentConfig, AgentPermissionConfig, PermissionConfig};
@@ -68,8 +71,9 @@ pub use bcode_client::{
 };
 pub use bcode_model::{
     CapabilityScope, CapabilitySource, CapabilitySupport, ContentBlock as ModelContentBlock,
-    MediaInputFeature, MessageRole, ModelFeatureSupport, ModelInfo, ModelList, ModelMessage,
-    ModelMetadataSource, ModelParameterKey, ModelParameters, ModelTurnRequest,
+    MediaInputFeature, MessageRole, ModelCostEstimate, ModelFeatureSupport, ModelInfo, ModelList,
+    ModelMessage, ModelMetadataSource, ModelParameterKey, ModelParameters, ModelPricingInfo,
+    ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelTurnRequest,
     NegotiatedFeatureSupport, PromptCacheFeature, ProviderCapabilities, ProviderError,
     ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext, ProviderRequestExtension,
     ProviderRequestProjection, ProviderRetryHint, ProviderTurnEvent, RequestedModelFeature,
@@ -1038,6 +1042,7 @@ struct TextStreamFinalizer {
     context: ModelCallContext,
     middleware: ModelMiddlewareStack,
     hooks: AgentHooks,
+    model_pricing: Option<ModelPricingInfo>,
 }
 
 pin_project! {
@@ -2417,6 +2422,77 @@ impl ModelResponseCache for InMemoryModelResponseCache {
     }
 }
 
+fn record_cache_lookup(request: &AgentTurnRequest, cache_hit: bool) {
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.cache_lookup",
+        cache_hit,
+        provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+        model_id = %request.model_id,
+    );
+}
+
+fn record_cache_bypass(request: &AgentTurnRequest) {
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.cache_bypass",
+        provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+        model_id = %request.model_id,
+    );
+}
+
+fn record_cache_store(request: &AgentTurnRequest) {
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.cache_store",
+        provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+        model_id = %request.model_id,
+    );
+}
+
+fn record_cost_estimate(
+    request: &AgentTurnRequest,
+    pricing: Option<&ModelPricingInfo>,
+    usage: Option<&TokenUsage>,
+) {
+    let estimate = pricing
+        .zip(usage)
+        .and_then(|(pricing, usage)| pricing.estimate_cost(usage));
+    let (currency, total_micros, source, cost_available) =
+        estimate
+            .as_ref()
+            .map_or(("", 0, "unavailable", false), |estimate| {
+                (
+                    estimate.currency.as_str(),
+                    estimate.total_micros,
+                    pricing_source_label(estimate.source),
+                    true,
+                )
+            });
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.cost_estimate",
+        provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+        model_id = %request.model_id,
+        currency,
+        total_micros,
+        pricing_source = source,
+        cost_available,
+        estimated = true,
+    );
+}
+
+const fn pricing_source_label(source: ModelPricingSource) -> &'static str {
+    match source {
+        ModelPricingSource::UserOverride => "user_override",
+        ModelPricingSource::ProviderApi => "provider_api",
+        ModelPricingSource::RemoteCatalog => "remote_catalog",
+        ModelPricingSource::BundledCatalog => "bundled_catalog",
+        ModelPricingSource::PatternMatch => "pattern_match",
+        ModelPricingSource::Unknown => "unknown",
+    }
+}
+
 async fn response_cache_get(
     cache: Arc<dyn ModelResponseCache>,
     request: AgentTurnRequest,
@@ -2512,11 +2588,22 @@ impl ModelMiddleware for RateLimitMiddleware {
             ApplicationRateLimitDecision::Deny {
                 reason,
                 retry_at_unix,
-            } => Err(BcodeError::RateLimited {
-                limiter_id: self.limiter_id.clone(),
-                reason,
-                retry_at_unix,
-            }),
+            } => {
+                tracing::info!(
+                    target: "bcode::sdk",
+                    event = "bcode.rate_limit",
+                    limiter_id = %self.limiter_id,
+                    provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+                    model_id = %request.model_id,
+                    retry_at_unix = retry_at_unix.unwrap_or_default(),
+                    reset_available = retry_at_unix.is_some(),
+                );
+                Err(BcodeError::RateLimited {
+                    limiter_id: self.limiter_id.clone(),
+                    reason,
+                    retry_at_unix,
+                })
+            }
         }
     }
 }
@@ -2817,11 +2904,18 @@ fn finish_text_response(
     response: AgentTurnResponse,
 ) -> TextStreamItem {
     let Some(finalizer) = finalizer.take() else {
-        return TextStreamItem::Error(BcodeError::Hook(
+        let error = BcodeError::Hook(
             "text stream terminal response was finalized more than once".to_string(),
-        ));
+        );
+        record_sdk_error(&error);
+        return TextStreamItem::Error(error);
     };
     let response = GenerateTextResponse::from(response);
+    record_cost_estimate(
+        &finalizer.request,
+        finalizer.model_pricing.as_ref(),
+        response.runtime.usage.as_ref(),
+    );
     let response = finalizer
         .middleware
         .after_response(&finalizer.request, response)
@@ -2836,7 +2930,36 @@ fn finish_text_response(
         });
     match response {
         Ok(response) => TextStreamItem::Finished(response),
-        Err(error) => TextStreamItem::Error(error),
+        Err(error) => {
+            record_sdk_error(&error);
+            TextStreamItem::Error(error)
+        }
+    }
+}
+
+fn record_sdk_error(error: &BcodeError) {
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.error",
+        error_origin = bcode_error_origin(error),
+    );
+}
+
+const fn bcode_error_origin(error: &BcodeError) -> &'static str {
+    match error {
+        BcodeError::Runtime(_) => "runtime",
+        BcodeError::Hook(_) => "hook",
+        BcodeError::Cache(_) => "cache",
+        BcodeError::RateLimited { .. } | BcodeError::RateLimiter { .. } => "rate_limit",
+        BcodeError::ToolExecution(_) => "tool",
+        BcodeError::StructuredOutput(_)
+        | BcodeError::StructuredInvalidJson(_)
+        | BcodeError::StructuredInvalidSchema(_)
+        | BcodeError::StructuredSchemaValidation(_)
+        | BcodeError::StructuredDecode(_)
+        | BcodeError::StructuredRepairExhausted(_)
+        | BcodeError::StructuredStreamingRepairsUnsupported { .. } => "structured_output",
+        _ => "sdk",
     }
 }
 
@@ -3756,6 +3879,8 @@ pub struct ModelSelectionReport {
     pub registration_source: Option<ProviderRegistrationSource>,
     /// Source of selected model metadata, when known.
     pub model_metadata_source: Option<ModelMetadataSource>,
+    /// Selected model pricing metadata used for labeled SDK cost estimates, when known.
+    pub model_pricing: Option<ModelPricingInfo>,
 }
 
 /// Explicit SDK provider registry/default facade.
@@ -4052,11 +4177,21 @@ impl ProviderRegistry {
                     .find(|model| model.model_id == selector.model_id)
             })
             .and_then(|model| model.metadata_source);
+        let model_pricing = registration
+            .and_then(|registration| registration.models.as_ref())
+            .and_then(|models| {
+                models
+                    .models
+                    .iter()
+                    .find(|model| model.model_id == selector.model_id)
+            })
+            .and_then(|model| model.pricing.clone());
         ModelSelectionReport {
             selector,
             provenance,
             registration_source: registration.map(|registration| registration.source),
             model_metadata_source,
+            model_pricing,
         }
     }
 
@@ -5666,9 +5801,18 @@ impl AgentSession {
         })?;
         let transcript = self.session.messages[..user_index].to_vec();
         let prior_messages = self.request_messages(&transcript, &prompt)?;
+        let session_span = tracing::info_span!(
+            target: "bcode::sdk",
+            "bcode.session_turn",
+            session_id = %self.agent.session_id,
+            provider_id = self.agent.provider_plugin_id.as_deref().unwrap_or(""),
+            model_id = %self.agent.model_id,
+            operation = "regenerate",
+        );
         let response = self
             .agent
             .generate_text_with_provider_and_history(provider, prompt, prior_messages)
+            .instrument(session_span)
             .await?;
         let mut updated = self.session.messages[..user_index].to_vec();
         updated.push(user_message);
@@ -5713,9 +5857,18 @@ impl AgentSession {
         let prompt = prompt.into();
         let transcript = self.session.messages.clone();
         let messages = self.request_messages(&transcript, &prompt)?;
+        let session_span = tracing::info_span!(
+            target: "bcode::sdk",
+            "bcode.session_turn",
+            session_id = %self.agent.session_id,
+            provider_id = self.agent.provider_plugin_id.as_deref().unwrap_or(""),
+            model_id = %self.agent.model_id,
+            operation = "generate",
+        );
         let response = self
             .agent
             .generate_text_with_provider_and_history(provider, prompt.clone(), messages)
+            .instrument(session_span)
             .await?;
         let mut updated = self.session.messages.clone();
         updated.push(user_message(prompt));
@@ -5878,6 +6031,7 @@ pub struct Agent {
     selection_provenance: Box<ModelSelectionProvenance>,
     registration_source: Option<ProviderRegistrationSource>,
     model_metadata_source: Option<ModelMetadataSource>,
+    model_pricing: Option<ModelPricingInfo>,
     provider_context: ProviderRequestContext,
     system_prompt: Option<String>,
     parameters: ModelParameters,
@@ -5924,6 +6078,7 @@ impl fmt::Debug for Agent {
             .field("selection_provenance", &self.selection_provenance)
             .field("registration_source", &self.registration_source)
             .field("model_metadata_source", &self.model_metadata_source)
+            .field("model_pricing", &self.model_pricing)
             .field("provider_context", &self.provider_context)
             .field("system_prompt", &self.system_prompt)
             .field("parameters", &self.parameters)
@@ -6298,76 +6453,97 @@ impl Agent {
     {
         let prompt = prompt.into();
         let context = self.model_call_context(prompt.clone());
-        self.hooks.run_before_model(&context)?;
-        let request = self.middleware.before_request(
-            self.turn_request_with_structured_output_messages_and_cancellation(
-                prompt,
-                structured_output,
-                messages,
-                cancellation,
-            ),
-        )?;
-        let cache = self.response_cache.as_ref().and_then(|cache| {
-            let privacy_allows = cache.privacy(&request) != ModelResponseCachePrivacy::NoStore;
-            let tools_allow = request.tools.is_empty() || cache.allow_tool_responses();
-            let routing_identified = request.cache_routing_identity.is_some();
-            let stopping_identified = request.stop_condition.is_none();
-            (privacy_allows && tools_allow && routing_identified && stopping_identified)
-                .then(|| Arc::clone(cache))
-        });
-        let key = cache
-            .as_ref()
-            .map(|_| ModelResponseCacheKey::from_request(&request))
-            .transpose()?;
-        let cached = if let Some(cache) = &cache {
-            response_cache_get(Arc::clone(cache), request.clone()).await?
-        } else {
-            None
-        };
-        let response = if let Some(mut response) = cached {
-            response.cache_status = ModelResponseCacheStatus::Hit {
-                key: key.expect("cache key exists for cache hit"),
+        let request_span = tracing::info_span!(
+            target: "bcode::sdk",
+            "bcode.model_request",
+            session_id = %self.session_id,
+            provider_id = self.provider_plugin_id.as_deref().unwrap_or(""),
+            model_id = %self.model_id,
+            streaming = false,
+        );
+        async move {
+            self.hooks.run_before_model(&context)?;
+            let request = self.middleware.before_request(
+                self.turn_request_with_structured_output_messages_and_cancellation(
+                    prompt,
+                    structured_output,
+                    messages,
+                    cancellation,
+                ),
+            )?;
+            let cache = self.response_cache.as_ref().and_then(|cache| {
+                let privacy_allows = cache.privacy(&request) != ModelResponseCachePrivacy::NoStore;
+                let tools_allow = request.tools.is_empty() || cache.allow_tool_responses();
+                let routing_identified = request.cache_routing_identity.is_some();
+                let stopping_identified = request.stop_condition.is_none();
+                (privacy_allows && tools_allow && routing_identified && stopping_identified)
+                    .then(|| Arc::clone(cache))
+            });
+            let key = cache
+                .as_ref()
+                .map(|_| ModelResponseCacheKey::from_request(&request))
+                .transpose()?;
+            let cached = if let Some(cache) = &cache {
+                let response = response_cache_get(Arc::clone(cache), request.clone()).await?;
+                record_cache_lookup(&request, response.is_some());
+                response
+            } else {
+                record_cache_bypass(&request);
+                None
             };
-            response
-        } else {
-            let runtime_response = self
-                .run_provider_tool_loop(
-                    provider,
-                    request.clone(),
-                    Arc::clone(&self.invocation_event_sink),
-                )
-                .await;
-            let runtime_response = match runtime_response {
-                Ok(response) => response,
-                Err(error) => {
-                    if let Some(cache) = cache {
-                        response_cache_abort(cache, request.clone()).await;
-                    }
-                    return Err(error);
-                }
-            };
-            let mut response = GenerateTextResponse::from(runtime_response);
-            if let Some(cache) = cache {
-                response.cache_status = ModelResponseCacheStatus::Stored {
-                    key: key.expect("cache key exists for cache storage"),
+            let response = if let Some(mut response) = cached {
+                response.cache_status = ModelResponseCacheStatus::Hit {
+                    key: key.expect("cache key exists for cache hit"),
                 };
-                if let Err(error) =
-                    response_cache_put(cache.clone(), request.clone(), response.clone()).await
-                {
-                    response_cache_abort(cache, request.clone()).await;
-                    return Err(error);
+                response
+            } else {
+                let runtime_response = self
+                    .run_provider_tool_loop(
+                        provider,
+                        request.clone(),
+                        Arc::clone(&self.invocation_event_sink),
+                    )
+                    .await;
+                let runtime_response = match runtime_response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if let Some(cache) = cache {
+                            response_cache_abort(cache, request.clone()).await;
+                        }
+                        return Err(error);
+                    }
+                };
+                let mut response = GenerateTextResponse::from(runtime_response);
+                if let Some(cache) = cache {
+                    response.cache_status = ModelResponseCacheStatus::Stored {
+                        key: key.expect("cache key exists for cache storage"),
+                    };
+                    if let Err(error) =
+                        response_cache_put(cache.clone(), request.clone(), response.clone()).await
+                    {
+                        response_cache_abort(cache, request.clone()).await;
+                        return Err(error);
+                    }
+                    record_cache_store(&request);
                 }
-            }
-            response
-        };
-        let response = self.middleware.after_response(&request, response)?;
-        self.hooks.run_after_model(
-            &context,
-            &ModelCallOutcome {
-                response: response.clone(),
-            },
-        )?;
-        Ok(response)
+                response
+            };
+            record_cost_estimate(
+                &request,
+                self.model_pricing.as_ref(),
+                response.runtime.usage.as_ref(),
+            );
+            let response = self.middleware.after_response(&request, response)?;
+            self.hooks.run_after_model(
+                &context,
+                &ModelCallOutcome {
+                    response: response.clone(),
+                },
+            )?;
+            Ok(response)
+        }
+        .instrument(request_span)
+        .await
     }
 
     /// Stream text using the agent's configured embedded provider.
@@ -6544,6 +6720,15 @@ impl Agent {
         P: ModelProviderInvoker + 'static,
     {
         let context = self.model_call_context(request.prompt.clone());
+        let request_span = tracing::info_span!(
+            target: "bcode::sdk",
+            "bcode.model_request",
+            session_id = %self.session_id,
+            provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+            model_id = %request.model_id,
+            streaming = true,
+        );
+        let _request_enter = request_span.enter();
         let request = self
             .hooks
             .run_before_model(&context)
@@ -6600,6 +6785,7 @@ impl Agent {
                 context,
                 middleware: self.middleware.clone(),
                 hooks: self.hooks.clone(),
+                model_pricing: self.model_pricing.clone(),
             }),
             pending: None,
         }
@@ -6975,6 +7161,7 @@ impl Agent {
             provenance: (*self.selection_provenance).clone(),
             registration_source: self.registration_source,
             model_metadata_source: self.model_metadata_source,
+            model_pricing: self.model_pricing.clone(),
         }
     }
 
@@ -7012,6 +7199,7 @@ pub struct AgentBuilder {
     selection_provenance: Box<ModelSelectionProvenance>,
     registration_source: Option<ProviderRegistrationSource>,
     model_metadata_source: Option<ModelMetadataSource>,
+    model_pricing: Option<ModelPricingInfo>,
     provider_context: ProviderRequestContext,
     system_prompt: Option<String>,
     parameters: ModelParameters,
@@ -7061,6 +7249,7 @@ impl fmt::Debug for AgentBuilder {
             .field("selection_provenance", &self.selection_provenance)
             .field("registration_source", &self.registration_source)
             .field("model_metadata_source", &self.model_metadata_source)
+            .field("model_pricing", &self.model_pricing)
             .field("provider_context", &self.provider_context)
             .field("system_prompt", &self.system_prompt)
             .field("parameters", &self.parameters)
@@ -7126,6 +7315,7 @@ impl Default for AgentBuilder {
             selection_provenance: Box::default(),
             registration_source: None,
             model_metadata_source: None,
+            model_pricing: None,
             provider_context: ProviderRequestContext::default(),
             system_prompt: None,
             parameters: ModelParameters::default(),
@@ -7217,7 +7407,18 @@ impl AgentBuilder {
         self.model_id = Some(model_id.into());
         self.selection_provenance.model = Some(ModelSelectionSource::PerRequest);
         self.model_metadata_source = None;
+        self.model_pricing = None;
         self.parallel_tool_capabilities.model = false;
+        self
+    }
+
+    /// Configure pricing metadata for the selected model.
+    ///
+    /// Cost observations derived from this metadata are always labeled as estimates and retain
+    /// currency and pricing-source provenance.
+    #[must_use]
+    pub fn model_pricing(mut self, pricing: ModelPricingInfo) -> Self {
+        self.model_pricing = Some(pricing);
         self
     }
 
@@ -7229,6 +7430,7 @@ impl AgentBuilder {
         self.model_id = Some(selector.model_id);
         self.selection_provenance.model = Some(ModelSelectionSource::PerRequest);
         self.model_metadata_source = None;
+        self.model_pricing = None;
         if self.provider_plugin_id.is_some() {
             self.selection_provenance.provider = Some(ModelSelectionSource::PerRequest);
         }
@@ -7245,6 +7447,7 @@ impl AgentBuilder {
         self.selection_provenance.provider = Some(ModelSelectionSource::PerRequest);
         self.registration_source = None;
         self.model_metadata_source = None;
+        self.model_pricing = None;
         self.parallel_tool_capabilities.provider = false;
         self.parallel_tool_capabilities.model = false;
         self
@@ -7265,6 +7468,7 @@ impl AgentBuilder {
         self.selection_provenance = Box::new(report.provenance);
         self.registration_source = report.registration_source;
         self.model_metadata_source = report.model_metadata_source;
+        self.model_pricing = report.model_pricing;
         self
     }
 
@@ -7857,6 +8061,7 @@ impl AgentBuilder {
             selection_provenance: self.selection_provenance,
             registration_source: self.registration_source,
             model_metadata_source: self.model_metadata_source,
+            model_pricing: self.model_pricing,
             provider_context: self.provider_context,
             system_prompt: self.system_prompt,
             parameters: self.parameters,

@@ -68,6 +68,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
+use tracing::Instrument as _;
 
 /// Boxed future returned by runtime extension traits.
 pub type RuntimeFuture<'a, T> =
@@ -1555,31 +1556,35 @@ impl AgentRuntime {
             cancellation: request.cancellation.clone(),
             capacity,
         });
-        tokio::spawn(async move {
-            let catalog = SharedToolCatalog(catalog);
-            let result = runtime
-                .run_provider_tool_loop(
-                    &mut provider,
-                    request,
-                    &catalog,
-                    authorization.as_ref(),
-                    invoker.as_ref(),
-                    &context,
-                    &host_context,
-                    options,
-                    stream_events,
-                    capabilities,
-                    observer.as_ref(),
-                    planner.as_ref(),
-                )
-                .await;
-            let item = match result {
-                Ok(response) => AgentLoopStreamItem::Finished(response),
-                Err(error) => AgentLoopStreamItem::Error(error),
-            };
-            task_lifecycle.complete();
-            store_terminal(&task_terminal, item);
-        });
+        let parent_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let catalog = SharedToolCatalog(catalog);
+                let result = runtime
+                    .run_provider_tool_loop(
+                        &mut provider,
+                        request,
+                        &catalog,
+                        authorization.as_ref(),
+                        invoker.as_ref(),
+                        &context,
+                        &host_context,
+                        options,
+                        stream_events,
+                        capabilities,
+                        observer.as_ref(),
+                        planner.as_ref(),
+                    )
+                    .await;
+                let item = match result {
+                    Ok(response) => AgentLoopStreamItem::Finished(response),
+                    Err(error) => AgentLoopStreamItem::Error(error),
+                };
+                task_lifecycle.complete();
+                store_terminal(&task_terminal, item);
+            }
+            .instrument(parent_span),
+        );
         AgentLoopStream {
             receiver,
             terminal,
@@ -1625,6 +1630,15 @@ impl AgentRuntime {
             events,
             capabilities,
         );
+        let turn_span = tracing::info_span!(
+            target: "bcode::sdk",
+            "bcode.agent_turn",
+            session_id = %context.session_id,
+            turn_id = %scope.turn_id(),
+            provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+            model_id = %request.model_id,
+            streaming = false,
+        );
         let result = self
             .run_provider_tool_loop_in_scope(
                 provider,
@@ -1639,6 +1653,7 @@ impl AgentRuntime {
                 observer,
                 planner,
             )
+            .instrument(turn_span)
             .await;
         match result {
             Ok(response) if self.complete_turn_scope(&scope) => Ok(response),
@@ -1694,6 +1709,7 @@ impl AgentRuntime {
         let mut messages = initial_loop_messages(&request);
 
         loop {
+            let provider_round_span = provider_round_span(scope, &request, provider_round);
             let planned_round = run_planned_provider_round(
                 self,
                 provider,
@@ -1706,6 +1722,7 @@ impl AgentRuntime {
                 negotiated_parallel_policy,
                 scope,
             )
+            .instrument(provider_round_span)
             .await?;
             let response = planned_round.response;
             request = planned_round.request;
@@ -1856,14 +1873,9 @@ impl AgentRuntime {
         }
         rounds.begin_round()?;
         let provider_round = rounds.completed_rounds();
+        let batch_span = tool_batch_span(scope, provider_round, calls.len(), options.parallel);
+        let _batch_enter = batch_span.enter();
         let _batch_duration = RuntimePhaseDuration::start("batch", Some(provider_round));
-        tracing::debug!(
-            provider_round,
-            batch_size = calls.len(),
-            parallel = options.parallel,
-            configured_max_concurrency = ?options.max_concurrency.map(NonZeroUsize::get),
-            "canonical provider tool batch admitted"
-        );
         if !scope.control().accepts_normal_output() {
             record_scheduler_cancellations(scope, calls.len(), 0);
             return Ok(cancelled_batch_output(calls.len()));
@@ -1989,23 +2001,27 @@ impl AgentRuntime {
         let task_lifecycle = Arc::clone(&lifecycle);
         let task_terminal = Arc::clone(&terminal);
         let runtime = self.clone();
-        tokio::spawn(async move {
-            let stream = StreamOutput {
-                sender: sender.clone(),
-                terminal: Arc::clone(&task_terminal),
-                cancellation: request.cancellation.clone(),
-                capacity,
-            };
-            let result = runtime
-                .run_text_turn_internal(&mut provider, request, Some(stream))
-                .await;
-            let item = match result {
-                Ok(response) => AgentRuntimeStreamItem::Finished(response),
-                Err(error) => AgentRuntimeStreamItem::Error(error),
-            };
-            task_lifecycle.complete();
-            store_terminal(&task_terminal, item);
-        });
+        let parent_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let stream = StreamOutput {
+                    sender: sender.clone(),
+                    terminal: Arc::clone(&task_terminal),
+                    cancellation: request.cancellation.clone(),
+                    capacity,
+                };
+                let result = runtime
+                    .run_text_turn_internal(&mut provider, request, Some(stream))
+                    .await;
+                let item = match result {
+                    Ok(response) => AgentRuntimeStreamItem::Finished(response),
+                    Err(error) => AgentRuntimeStreamItem::Error(error),
+                };
+                task_lifecycle.complete();
+                store_terminal(&task_terminal, item);
+            }
+            .instrument(parent_span),
+        );
         AgentRuntimeStream {
             receiver,
             terminal,
@@ -2246,6 +2262,7 @@ where
             provider
                 .finish_turn(context.provider_plugin_id, context.finish_request)
                 .await?;
+            record_usage(context, usage.as_ref());
             let finished_event =
                 finished_event(usage.as_ref(), context.start.elapsed(), stop_reason);
             if !context
@@ -2275,6 +2292,25 @@ where
             Err(RuntimeError::Cancelled)
         }
     }
+}
+
+fn record_usage(context: &ProviderEventContext<'_>, usage: Option<&TokenUsage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.usage",
+        turn_id = %context.scope.turn_id(),
+        provider_id = context.provider_plugin_id.unwrap_or(""),
+        input_tokens = usage.input_tokens.map_or(0, u64::from),
+        output_tokens = usage.output_tokens.map_or(0, u64::from),
+        total_tokens = usage.metered_total_tokens().map_or(0, u64::from),
+        cached_input_tokens = usage.cached_input_tokens.map_or(0, u64::from),
+        cache_write_input_tokens = usage.cache_write_input_tokens.map_or(0, u64::from),
+        reasoning_tokens = usage.reasoning_tokens.map_or(0, u64::from),
+        usage_available = usage.metered_total_tokens().is_some(),
+    );
 }
 
 fn terminal_after_visible_output(
@@ -2316,9 +2352,30 @@ async fn normalize_provider_event_or_cleanup<P>(
 where
     P: ModelProviderInvoker + ?Sized,
 {
+    let provider_error = match &event {
+        ProviderTurnEvent::Error { error } => Some((
+            error.code.clone(),
+            error.category,
+            error.retryable,
+            error.request_id.as_deref().unwrap_or("").to_owned(),
+        )),
+        _ => None,
+    };
     match normalize_provider_event(event, text, usage) {
         Ok(disposition) => Ok(disposition),
         Err(error) => {
+            if let Some((code, category, retryable, request_id)) = provider_error {
+                tracing::info!(
+                    target: "bcode::sdk",
+                    event = "bcode.error",
+                    error_origin = "provider",
+                    provider_id = provider_plugin_id.unwrap_or(""),
+                    provider_error_code = code,
+                    provider_error_category = provider_error_category_label(category),
+                    retryable,
+                    request_id,
+                );
+            }
             cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
             Err(error)
         }
@@ -2336,15 +2393,27 @@ where
     P: ModelProviderInvoker + ?Sized,
 {
     let scope_cancellation = scope.control().cancellation();
-    tokio::select! {
-        biased;
-        () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
-        () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
-        () = tokio::time::sleep(request.timeout) => {
-            Err(RuntimeError::Timeout { timeout: request.timeout })
+    let provider_span = tracing::info_span!(
+        target: "bcode::sdk",
+        "bcode.provider_operation",
+        turn_id = %model_request.turn_id,
+        provider_id = provider_plugin_id.unwrap_or(""),
+        model_id = %model_request.model_id,
+        operation = "start",
+    );
+    async move {
+        tokio::select! {
+            biased;
+            () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
+            () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
+            () = tokio::time::sleep(request.timeout) => {
+                Err(RuntimeError::Timeout { timeout: request.timeout })
+            }
+            response = provider.start_turn(provider_plugin_id, model_request) => response,
         }
-        response = provider.start_turn(provider_plugin_id, model_request) => response,
     }
+    .instrument(provider_span)
+    .await
 }
 
 struct ProviderPollContext<'a> {
@@ -2378,7 +2447,16 @@ where
     };
     let request_cancellation = context.request.cancellation.clone();
     let scope_cancellation = context.scope.control().cancellation();
-    tokio::select! {
+    let provider_span = tracing::info_span!(
+        target: "bcode::sdk",
+        "bcode.provider_operation",
+        turn_id = %context.scope.turn_id(),
+        provider_id = context.provider_plugin_id.unwrap_or(""),
+        model_id = %context.request.model_id,
+        operation = "poll",
+    );
+    async move {
+        tokio::select! {
         biased;
         () = request_cancellation.cancelled() => {
             cancel_and_finish(
@@ -2421,7 +2499,10 @@ where
                 }
             }
         },
+        }
     }
+    .instrument(provider_span)
+    .await
 }
 
 async fn cancel_and_finish<P>(
@@ -2432,6 +2513,12 @@ async fn cancel_and_finish<P>(
 ) where
     P: ModelProviderInvoker + ?Sized,
 {
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.cancellation",
+        provider_id = provider_plugin_id.unwrap_or(""),
+        provider_turn_id = %cancel_request.provider_turn_id,
+    );
     let _ = provider
         .cancel_turn(provider_plugin_id, cancel_request)
         .await;
@@ -2450,6 +2537,37 @@ fn finished_event(
         usage: usage.cloned(),
         latency_ms: duration_millis(latency),
     }
+}
+
+fn provider_round_span(
+    scope: &TurnScope,
+    request: &AgentTurnRequest,
+    provider_round: u32,
+) -> tracing::Span {
+    tracing::info_span!(
+        target: "bcode::sdk",
+        "bcode.provider_round",
+        turn_id = %scope.turn_id(),
+        provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+        model_id = %request.model_id,
+        round = provider_round,
+    )
+}
+
+fn tool_batch_span(
+    scope: &TurnScope,
+    provider_round: u32,
+    batch_size: usize,
+    parallel: bool,
+) -> tracing::Span {
+    tracing::info_span!(
+        target: "bcode::sdk",
+        "bcode.tool_batch",
+        turn_id = %scope.turn_id(),
+        provider_round,
+        batch_size,
+        parallel,
+    )
 }
 
 struct RuntimePhaseDuration {
@@ -2482,8 +2600,15 @@ impl Drop for RuntimePhaseDuration {
 fn record_scheduler_cancellations(scope: &TurnScope, queued: usize, running: usize) {
     scope.control().record_queued_cancellations(queued);
     scope.control().record_running_cancellations(running);
-    tracing::debug!(
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.cancellation",
+        turn_id = %scope.turn_id(),
         queued_cancellations = queued,
+        running_cancellations = running,
+        discarded_late_events = scope.control().discarded_normal_event_count(),
+    );
+    tracing::debug!(
         running_cancellations = running,
         discarded_late_events = scope.control().discarded_normal_event_count(),
         "canonical tool scheduler observed cancellation"
@@ -2662,7 +2787,19 @@ where
         .await?;
         let (request, delay) = match plan {
             ProviderRoundPlan::Proceed { request } => (request, None),
-            ProviderRoundPlan::RetryAfter { request, delay } => (request, Some(delay)),
+            ProviderRoundPlan::RetryAfter { request, delay } => {
+                tracing::info!(
+                    target: "bcode::sdk",
+                    event = "bcode.retry_scheduled",
+                    turn_id = %scope.turn_id(),
+                    provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+                    model_id = %request.model_id,
+                    round,
+                    attempt,
+                    delay_ms = duration_millis(delay),
+                );
+                (request, Some(delay))
+            }
             ProviderRoundPlan::Fail { error } => {
                 return Err(error.or(previous_failure).unwrap_or_else(|| {
                     RuntimeError::HostExtension(
@@ -2695,10 +2832,66 @@ where
                 return Err(RuntimeError::Timeout { timeout });
             }
             Err(error) => {
+                record_runtime_error(&error, &proposed_request);
                 previous_failure = Some(error);
                 attempt = attempt.saturating_add(1);
             }
         }
+    }
+}
+
+fn record_runtime_error(error: &RuntimeError, request: &AgentTurnRequest) {
+    let (origin, code, category, retryable, request_id) = match error {
+        RuntimeError::Provider {
+            code,
+            error: provider_error,
+            ..
+        } => (
+            "provider",
+            code.as_str(),
+            provider_error_category_label(provider_error.category),
+            provider_error.retryable,
+            provider_error.request_id.as_deref().unwrap_or(""),
+        ),
+        RuntimeError::ProviderAfterOutput(error) => {
+            record_runtime_error(error, request);
+            return;
+        }
+        RuntimeError::ProviderInvocation(_) => ("provider", "invocation", "", false, ""),
+        RuntimeError::ToolExecution { .. } => ("tool", "tool_execution", "", false, ""),
+        RuntimeError::Cancelled => ("runtime", "cancelled", "", false, ""),
+        RuntimeError::Timeout { .. } => ("runtime", "timeout", "", false, ""),
+        _ => ("runtime", "runtime_error", "", false, ""),
+    };
+    tracing::info!(
+        target: "bcode::sdk",
+        event = "bcode.error",
+        error_origin = origin,
+        provider_id = request.provider_plugin_id.as_deref().unwrap_or(""),
+        model_id = %request.model_id,
+        provider_error_code = code,
+        provider_error_category = category,
+        retryable,
+        request_id,
+    );
+}
+
+const fn provider_error_category_label(
+    category: bcode_model::ProviderErrorCategory,
+) -> &'static str {
+    match category {
+        bcode_model::ProviderErrorCategory::Config => "config",
+        bcode_model::ProviderErrorCategory::Auth => "auth",
+        bcode_model::ProviderErrorCategory::RateLimit => "rate_limit",
+        bcode_model::ProviderErrorCategory::Network => "network",
+        bcode_model::ProviderErrorCategory::Timeout => "timeout",
+        bcode_model::ProviderErrorCategory::ModelNotFound => "model_not_found",
+        bcode_model::ProviderErrorCategory::ContextLength => "context_length",
+        bcode_model::ProviderErrorCategory::InvalidRequest => "invalid_request",
+        bcode_model::ProviderErrorCategory::UnsupportedFeature => "unsupported_feature",
+        bcode_model::ProviderErrorCategory::ProviderInternal => "provider_internal",
+        bcode_model::ProviderErrorCategory::Overloaded => "overloaded",
+        bcode_model::ProviderErrorCategory::Cancelled => "cancelled",
     }
 }
 
@@ -3025,10 +3218,22 @@ where
         stream::iter(group.iter().cloned().map(|prepared| {
             let observation = Arc::clone(&observation);
             async move {
-                let _active = observation.enter();
-                let index = prepared.index;
-                let result = invoke_prepared_tool(invoker, prepared, scope, result_policy).await;
-                (index, result)
+                let tool_span = tracing::info_span!(
+                    target: "bcode::sdk",
+                    "bcode.tool_call",
+                    turn_id = %scope.turn_id(),
+                    tool_call_id = %prepared.call.id,
+                    tool_name = %prepared.call.name,
+                );
+                async move {
+                    let _active = observation.enter();
+                    let index = prepared.index;
+                    let result =
+                        invoke_prepared_tool(invoker, prepared, scope, result_policy).await;
+                    (index, result)
+                }
+                .instrument(tool_span)
+                .await
             }
         }))
         .buffer_unordered(concurrency),
@@ -3219,6 +3424,13 @@ where
     let invocation = match invocation {
         Ok(invocation) => invocation,
         Err(error) => {
+            tracing::info!(
+                target: "bcode::sdk",
+                event = "bcode.error",
+                error_origin = "tool",
+                tool_name = %prepared.call.name,
+                tool_error = true,
+            );
             if invocation_scope.accepts_work() {
                 let _ = lifecycle.finish(bcode_tool::ToolInvocationLifecycleStage::Failed);
             } else {
@@ -3247,6 +3459,13 @@ where
         }
     }
     let stage = if output.invocation.is_error {
+        tracing::info!(
+            target: "bcode::sdk",
+            event = "bcode.error",
+            error_origin = "tool",
+            tool_name = %prepared.call.name,
+            tool_error = true,
+        );
         bcode_tool::ToolInvocationLifecycleStage::Failed
     } else {
         bcode_tool::ToolInvocationLifecycleStage::Completed

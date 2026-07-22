@@ -38,6 +38,7 @@ bcode_client                            = { workspace = true, optional = true }
 bcode_config                            = { workspace = true, optional = true }
 bcode_eval                              = { workspace = true, optional = true }
 bcode_fake_provider_plugin              = { workspace = true, optional = true }
+bcode_metrics                           = { workspace = true, optional = true }
 bcode_model                             = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true, optional = true }
@@ -54,6 +55,9 @@ serde_json                              = { workspace = true }
 sha2                                    = { workspace = true }
 thiserror                               = { workspace = true }
 tokio                                   = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tracing                                 = { workspace = true }
+tracing-opentelemetry                   = { workspace = true, optional = true }
+tracing-subscriber                      = { workspace = true, optional = true }
 
 [dev-dependencies]
 bcode_hello_plugin    = { workspace = true }
@@ -62,6 +66,7 @@ bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_shell_plugin    = { workspace = true, features = ["static-bundled"] }
 tempfile              = { workspace = true }
 tokio                 = { workspace = true, features = ["macros", "rt"] }
+tracing-subscriber    = { workspace = true }
 trybuild              = { workspace = true }
 
 [features]
@@ -94,7 +99,9 @@ default = []
 embedded-plugins = ["dep:bcode_plugin"]
 evaluation = ["dep:bcode_eval"]
 fail-on-warnings = []
+metrics = ["dep:bcode_metrics", "dep:tracing-subscriber"]
 openai-compatible-provider = ["dep:bcode_openai_compatible_provider_plugin"]
+opentelemetry = ["dep:tracing-opentelemetry"]
 static-bundled-bedrock-provider-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-bedrock-provider-plugin",

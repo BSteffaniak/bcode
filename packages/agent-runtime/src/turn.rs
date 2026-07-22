@@ -701,6 +701,12 @@ impl TurnControl {
             return false;
         };
         Self::signal_cancellation_handles(handles);
+        tracing::info!(
+            target: "bcode::sdk",
+            event = "bcode.cancellation",
+            queued_cancellations = self.queued_cancellation_count(),
+            running_cancellations = self.running_cancellation_count(),
+        );
         tracing::debug!(
             duration_ms = started.elapsed().as_millis(),
             queued_cancellations = self.queued_cancellation_count(),
