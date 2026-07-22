@@ -2934,7 +2934,17 @@ fn validate_declared_openai_features(
     let unsupported = request
         .explicitly_unsupported_features(&openai_feature_support(settings.dialect))
         .into_iter()
-        .filter(|feature| matches!(feature, bcode_model::RequestedModelFeature::MediaInput(_)))
+        .filter(|feature| {
+            matches!(
+                feature,
+                bcode_model::RequestedModelFeature::MediaInput(media)
+                    if *media != bcode_model::MediaInputFeature::ImageReference
+                        || matches!(
+                            settings.dialect,
+                            OpenAiCompatibleDialect::ChatCompletions
+                        )
+            )
+        })
         .collect::<Vec<_>>();
     unsupported.first().map_or(Ok(()), |feature| {
         Err(provider_error(
@@ -7658,6 +7668,60 @@ mod tests {
         );
         let error = validate_openai_request(&chat, &request).expect_err("options must fail");
         assert_eq!(error.code, "chat_provider_options_unsupported");
+    }
+
+    #[test]
+    fn responses_surfaces_accept_text_projected_tool_image_references() {
+        let message = ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "call-1".to_string(),
+                    output: "read image".to_string(),
+                    is_error: false,
+                    content: vec![bcode_model::ToolResultContent::ImageRef {
+                        image: bcode_model::ImageRefContent {
+                            path: "/tmp/image.png".to_string(),
+                            mime_type: "image/png".to_string(),
+                            metadata: bcode_model::ImageMetadata {
+                                width: Some(100),
+                                height: Some(50),
+                                byte_len: Some(1234),
+                                source_path: Some("/tmp/image.png".to_string()),
+                            },
+                        },
+                    }],
+                },
+            }],
+        };
+        let mut request = test_request(vec![message.clone()]);
+        request.tool_call_policy.parallel = false;
+
+        for settings in [
+            test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi),
+            test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex),
+        ] {
+            validate_openai_request(&settings, &request)
+                .expect("Responses surfaces project image references as text");
+        }
+        let chat = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+        let error = validate_openai_request(&chat, &request)
+            .expect_err("Chat Completions cannot project structured image references");
+        assert_eq!(error.code, "openai_feature_unsupported");
+
+        let items = responses_tool_items(&message);
+        assert!(items.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Message { content, .. }
+                if content.iter().any(|content| matches!(
+                    content,
+                    ResponsesContent::InputText { text }
+                        if text.contains("/tmp/image.png") && text.contains("100x50")
+                ))
+        )));
     }
 
     #[test]
