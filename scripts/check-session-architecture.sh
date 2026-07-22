@@ -204,14 +204,16 @@ if ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
 fi
 
 if ! rg -q 'storage_compatibility\(\)' packages/session/src/lib.rs \
-  || ! rg -q 'StorageMigrationRequired' packages/session/src/lib.rs \
-  || ! rg -q 'load_gates: BTreeMap<SessionId, Arc<Mutex<\(\)>>>' packages/session/src/lib.rs; then
-  echo "Session normal-load violation: manager first load must classify storage, serialize per session, and reject legacy storage as explicitly migration-required." >&2
+  || ! rg -q 'load_gates: BTreeMap<SessionId, Arc<Mutex<\(\)>>>' packages/session/src/lib.rs \
+  || ! rg -q 'migrate_legacy_session_for_load' packages/session/src/lib.rs \
+  || ! rg -q 'acquire_session_maintenance_guard\(root, session_id\)' packages/session/src/lib.rs \
+  || ! rg -q 'transition_session_maintenance_to_lease' packages/session/src/lib.rs; then
+  echo "Session normal-load violation: manager first load must classify storage, serialize per session, and safely migrate known legacy storage under exclusive maintenance ownership." >&2
   violations=1
 fi
 
-if rg -q 'migrate_legacy_session_for_load|attempting automatic legacy session migration' packages/session/src/lib.rs; then
-  echo "Session normal-load violation: ordinary session load must never migrate legacy storage." >&2
+if rg -q 'KnownLegacy \{ writer_epoch \} => Err\(SessionError::StorageMigrationRequired' packages/session/src/lib.rs; then
+  echo "Session normal-load violation: recognized legacy storage must attempt guarded migration rather than fail before ownership acquisition." >&2
   violations=1
 fi
 
