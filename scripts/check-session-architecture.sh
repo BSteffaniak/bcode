@@ -192,6 +192,17 @@ if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/
   violations=1
 fi
 
+if ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
+    | grep -q 'session_export_events_from_root' \
+  || ! sed -n '/async fn session_export_events_from_root(/,/^}/p' packages/cli/src/lib.rs \
+    | grep -q 'open_existing_turso_in_root' \
+  || ! sed -n '/async fn session_export_events_from_root(/,/^}/p' packages/cli/src/lib.rs \
+    | grep -q 'all_events_strict' \
+  || ! rg -q 'explicit_export_reads_legacy_stream_history_without_migration' packages/cli/src/lib.rs; then
+  echo "Session export violation: pre-cutover export must read legacy canonical history explicitly without normal runtime loading or migration." >&2
+  violations=1
+fi
+
 if ! rg -q 'storage_compatibility\(\)' packages/session/src/lib.rs \
   || ! rg -q 'StorageMigrationRequired' packages/session/src/lib.rs \
   || ! rg -q 'load_gates: BTreeMap<SessionId, Arc<Mutex<\(\)>>>' packages/session/src/lib.rs; then

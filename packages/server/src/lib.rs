@@ -26364,7 +26364,6 @@ library = "test"
             .output()
             .map_or(true, |output| !output.status.success())
         {
-            eprintln!("skipping Vim preview server test because `nvim` is unavailable");
             return;
         }
         let workspace = tempfile::tempdir().expect("Vim preview workspace");

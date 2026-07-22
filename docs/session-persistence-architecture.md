@@ -184,6 +184,9 @@ and known legacy migrations run only through explicit maintenance commands.
 
 Maintenance commands are explicit:
 
+* `bcode session export <session-id>` is the pre-cutover escape hatch. It performs a read-only
+  strict canonical-event JSONL export through the non-migrating existing-database open and does not
+  load the runtime session, acquire write ownership, migrate, repair, or reindex storage.
 * `bcode session diagnose <session-id>` reports writer, projection, canonical-tail, and ownership
   state without mutation.
 * `bcode session doctor` diagnoses database and WAL state without mutation.

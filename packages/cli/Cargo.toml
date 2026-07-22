@@ -66,6 +66,9 @@ sshenv_vault = { workspace = true, features = ["windows-dpapi"] }
 [target.'cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
 sshenv_vault = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 _static-bundled = []
 default = []

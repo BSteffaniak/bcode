@@ -854,6 +854,7 @@ enum SessionCommand {
     History {
         session_id: SessionId,
     },
+    /// Export canonical events, including migration-required pre-cutover stores.
     Export {
         session_id: SessionId,
         #[arg(long, value_enum, default_value_t = SessionExportFormat::Jsonl)]
@@ -6471,14 +6472,24 @@ async fn session_export(
     session_id: SessionId,
     format: SessionExportFormat,
 ) -> Result<(), CliError> {
+    let root = bcode_config::default_session_store_dir();
+    let events = session_export_events_from_root(session_id, &root).await?;
     match format {
         SessionExportFormat::Jsonl => {
-            for event in paged_session_history(session_id).await? {
+            for event in events {
                 println!("{}", serde_json::to_string(&event)?);
             }
         }
     }
     Ok(())
+}
+
+async fn session_export_events_from_root(
+    session_id: SessionId,
+    root: &Path,
+) -> Result<Vec<SessionEvent>, CliError> {
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
+    Ok(db.all_events_strict().await?)
 }
 
 async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
@@ -8196,6 +8207,75 @@ mod context_compaction_tests {
             assert!(!output.contains("opaque-secret"));
             assert!(!output.contains("portable-secret"));
         }
+    }
+}
+
+#[cfg(test)]
+mod session_export_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_export_reads_legacy_stream_history_without_migration() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = bcode_session::db::SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("initialize session db");
+        let event = |sequence, kind| SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        db.append_event(&event(
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("pre-cutover export".to_owned()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append session event");
+        db.append_event(&event(
+            1,
+            SessionEventKind::ToolInvocationStream {
+                event: bcode_session_models::ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-1".to_owned(),
+                    stream: bcode_session_models::ToolOutputStream::Stdout,
+                    sequence: 1,
+                    text: "legacy output".to_owned(),
+                    byte_len: 13,
+                },
+            },
+        ))
+        .await
+        .expect("append pre-cutover stream event");
+        db.database()
+            .exec_raw("UPDATE session_storage_contract SET writer_epoch = 2 WHERE contract_id = 1")
+            .await
+            .expect("mark store legacy");
+        drop(db);
+
+        let exported = session_export_events_from_root(session_id, temp_dir.path())
+            .await
+            .expect("explicit export should read legacy history");
+        assert_eq!(exported.len(), 2);
+        assert!(matches!(
+            &exported[1].kind,
+            SessionEventKind::ToolInvocationStream {
+                event: bcode_session_models::ToolInvocationStreamEvent::OutputDelta {
+                    text,
+                    ..
+                }
+            } if text == "legacy output"
+        ));
+        let unchanged =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("reopen legacy store");
+        assert_eq!(unchanged.storage_writer_epoch().await.expect("epoch"), 2);
     }
 }
 
