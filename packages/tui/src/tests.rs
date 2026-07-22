@@ -4788,7 +4788,7 @@ fn rendered_tool_body(rendered: &str) -> Vec<String> {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn live_shell_recording_chunk_renders_through_active_request_visual() {
+async fn live_shell_recording_chunk_renders_once_through_canonical_request_contribution() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
@@ -4811,21 +4811,31 @@ async fn live_shell_recording_chunk_renders_through_active_request_visual() {
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"printf red"}"#.to_owned(),
             working_directory: None,
-            request_visual: Some(bcode_session_models::PluginVisualDescriptor {
-                visual_id: None,
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                schema: "bcode.tool.request.shell.run".to_owned(),
-                schema_version: 1,
-                title: Some("Shell command".to_owned()),
-                subtitle: None,
-                payload: serde_json::json!({"command": "printf red"}),
-            }),
+            request_visual: None,
             legacy_request_presentation: None,
         },
     ));
     app.absorb_session_event(&event(
         session_id,
         2,
+        SessionEventKind::ToolContribution {
+            event: bcode_session_models::ToolContributionEvent {
+                invocation_id: "call-live-shell".to_owned(),
+                contribution_id: "shell-run-request".to_owned(),
+                sequence: 1,
+                producer_id: "bcode.shell".to_owned(),
+                schema: "bcode.tool.request.shell.run".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                artifact: None,
+                payload: serde_json::json!({"command": "printf red"}),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
         SessionEventKind::ToolInvocationLifecycle {
             event: bcode_session_models::ToolInvocationLifecycleEvent {
                 invocation_id: "call-live-shell".to_owned(),

@@ -2275,6 +2275,27 @@ impl BmuxApp {
             return;
         }
         let backs_active_visual = self.contribution_backs_active_visual(contribution);
+        let backs_existing_contribution = contribution.artifact.as_ref().is_some_and(|artifact| {
+            let Some(presentation) = self.plugin_presentation() else {
+                return false;
+            };
+            self.session_view
+                .snapshot()
+                .contributions
+                .values()
+                .any(|existing| {
+                    existing.invocation_id == contribution.invocation_id
+                        && existing.contribution_id != contribution.contribution_id
+                        && presentation.accepts_artifact_reference(
+                            &existing.producer_id,
+                            &existing.schema,
+                            existing.schema_version,
+                            &artifact.reference_key,
+                            artifact.content_type.as_deref(),
+                        )
+                })
+        });
+        let backs_canonical_visual = backs_active_visual || backs_existing_contribution;
         match contribution.operation {
             bcode_session_models::ToolContributionOperation::Remove => {
                 if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
@@ -2285,7 +2306,7 @@ impl BmuxApp {
             }
             bcode_session_models::ToolContributionOperation::Upsert
             | bcode_session_models::ToolContributionOperation::Append
-                if backs_active_visual =>
+                if backs_canonical_visual =>
             {
                 if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
                     self.transcript.retain(|item| item.id() != id);
