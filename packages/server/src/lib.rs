@@ -11089,6 +11089,7 @@ struct ProviderRetryPolicy {
 enum ProviderRetryPolicyKind {
     Overload,
     NoProgressTimeout,
+    Transient,
     Custom,
 }
 
@@ -11130,10 +11131,31 @@ fn matching_provider_retry_policy(
         remote_catalog_rules,
         &state.model_retry.rules,
     );
-    rules
+    if let Some(policy) = rules
         .iter()
         .find(|rule| custom_retry_rule_matches(rule, error, selection))
         .map(ProviderRetryPolicy::from_rule)
+    {
+        return Some(policy);
+    }
+    is_transient_provider_error(error).then(|| ProviderRetryPolicy {
+        id: "builtin.transient".to_string(),
+        display_name: "transient provider error".to_string(),
+        max_retries: default_provider_retry_max_retries(),
+        initial_delay_ms: default_provider_retry_initial_delay_ms(),
+        max_delay_ms: default_provider_retry_max_delay_ms(),
+        use_provider_retry_hint: default_provider_retry_use_provider_retry_hint(),
+        kind: ProviderRetryPolicyKind::Transient,
+    })
+}
+
+const fn is_transient_provider_error(error: &bcode_model::ProviderError) -> bool {
+    error.retryable
+        && matches!(
+            error.category,
+            bcode_model::ProviderErrorCategory::Network
+                | bcode_model::ProviderErrorCategory::ProviderInternal
+        )
 }
 
 fn effective_provider_retry_rules(
@@ -11447,6 +11469,7 @@ fn provider_retry_message(policy: &ProviderRetryPolicy, delay: Duration, attempt
         ProviderRetryPolicyKind::NoProgressTimeout => {
             Some("Model provider made no progress before timeout.")
         }
+        ProviderRetryPolicyKind::Transient => Some("Model provider reported a transient error."),
         ProviderRetryPolicyKind::Custom => None,
     };
     if let Some(reason) = reason {
@@ -24700,6 +24723,86 @@ library = "test"
             &unrelated_error,
             &selection
         ));
+    }
+
+    #[test]
+    fn retryable_provider_internal_and_network_errors_use_transient_policy() {
+        let state = test_server_state(SessionManager::default());
+        let selection = SessionModelSelection::default();
+
+        for code in ["http_500", "http_502", "http_520", "http_599"] {
+            let error = bcode_model::ProviderError {
+                code: code.to_string(),
+                category: bcode_model::ProviderErrorCategory::ProviderInternal,
+                message: format!("error code: {}", &code[5..]),
+                retryable: true,
+                provider_message: None,
+                retry: None,
+            };
+
+            let policy = matching_provider_retry_policy(&state, &error, &selection, &[], &[])
+                .expect("retryable server error should use transient policy");
+
+            assert_eq!(policy.id, "builtin.transient");
+            assert_eq!(policy.max_retries, 3);
+            assert_eq!(policy.initial_delay_ms, 1_000);
+            assert_eq!(policy.max_delay_ms, 8_000);
+        }
+
+        let network_error = bcode_model::ProviderError {
+            code: "connection_reset".to_string(),
+            category: bcode_model::ProviderErrorCategory::Network,
+            message: "connection reset".to_string(),
+            retryable: true,
+            provider_message: None,
+            retry: None,
+        };
+        assert_eq!(
+            matching_provider_retry_policy(&state, &network_error, &selection, &[], &[])
+                .expect("retryable network error should use transient policy")
+                .id,
+            "builtin.transient"
+        );
+    }
+
+    #[test]
+    fn transient_policy_rejects_non_retryable_and_non_transient_errors() {
+        let state = test_server_state(SessionManager::default());
+        let selection = SessionModelSelection::default();
+        let errors = [
+            bcode_model::ProviderError {
+                code: "http_520".to_string(),
+                category: bcode_model::ProviderErrorCategory::ProviderInternal,
+                message: "error code: 520".to_string(),
+                retryable: false,
+                provider_message: None,
+                retry: None,
+            },
+            bcode_model::ProviderError {
+                code: "http_400".to_string(),
+                category: bcode_model::ProviderErrorCategory::InvalidRequest,
+                message: "bad request".to_string(),
+                retryable: false,
+                provider_message: None,
+                retry: None,
+            },
+            bcode_model::ProviderError {
+                code: "invalid_api_key".to_string(),
+                category: bcode_model::ProviderErrorCategory::Auth,
+                message: "invalid API key".to_string(),
+                retryable: false,
+                provider_message: None,
+                retry: None,
+            },
+        ];
+
+        for error in errors {
+            assert!(
+                matching_provider_retry_policy(&state, &error, &selection, &[], &[]).is_none(),
+                "{} should not use transient policy",
+                error.code
+            );
+        }
     }
 
     #[test]

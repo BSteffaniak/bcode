@@ -6835,6 +6835,17 @@ mod tests {
     }
 
     #[test]
+    fn generic_server_errors_are_retryable_provider_internal_errors() {
+        for status in [500, 502, 520, 599] {
+            let error = error_from_status(status, &format!("error code: {status}"));
+
+            assert_eq!(error.code, format!("http_{status}"));
+            assert_eq!(error.category, ProviderErrorCategory::ProviderInternal);
+            assert!(error.retryable);
+        }
+    }
+
+    #[test]
     fn rate_limit_remains_separate_from_overload() {
         let error = error_from_status(
             429,
