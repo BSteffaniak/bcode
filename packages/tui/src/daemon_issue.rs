@@ -133,9 +133,8 @@ pub fn classify_client_error(error: &ClientError) -> TuiDaemonIssue {
     }
     match error {
         ClientError::RequestTimeout { .. } => TuiDaemonIssue::Timeout,
-        ClientError::Codec(CodecError::UnsupportedVersion { .. }) => {
-            TuiDaemonIssue::StaleOrIncompatible
-        }
+        ClientError::Codec(CodecError::UnsupportedVersion { .. })
+        | ClientError::IncompatibleDaemon { .. } => TuiDaemonIssue::StaleOrIncompatible,
         ClientError::Codec(
             error @ (CodecError::Deserialize(_) | CodecError::EventConversion(_)),
         ) => TuiDaemonIssue::InvalidDaemonResponse(error.to_string()),

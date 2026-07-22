@@ -97,4 +97,39 @@ fi
 wait "${server_pid}"
 server_pid=""
 
+"${root}/target/debug/bcode" server start >/dev/null
+status_output="$("${root}/target/debug/bcode" server status --verbose)"
+client_digest="$(printf '%s\n' "${status_output}" | awk '/^client executable identity:/ {print $4}')"
+daemon_digest="$(printf '%s\n' "${status_output}" | awk '/^executable identity:/ {print $3}')"
+daemon_executable="$(printf '%s\n' "${status_output}" | sed -n 's/^daemon executable: //p')"
+if [[ -z "${client_digest}" || "${client_digest}" != "${daemon_digest}" ]]; then
+    echo "detached daemon executable identity does not match client" >&2
+    printf '%s\n' "${status_output}" >&2
+    exit 1
+fi
+if [[ ! "${daemon_executable}" =~ /daemon-images/.*/${daemon_digest}/bcode(.exe)?$ ]]; then
+    echo "detached daemon did not start from a content-addressed image" >&2
+    printf '%s\n' "${status_output}" >&2
+    exit 1
+fi
+if [[ ! -x "${daemon_executable}" ]]; then
+    echo "content-addressed daemon image is not executable" >&2
+    exit 1
+fi
+cached_digest="$(shasum -a 256 "${daemon_executable}" | awk '{print $1}')"
+if [[ "${cached_digest}" != "${daemon_digest}" ]]; then
+    echo "content-addressed daemon image failed digest verification" >&2
+    exit 1
+fi
+"${root}/target/debug/bcode" server stop >/dev/null
+sleep 1
+
+"${root}/target/debug/bcode" server start >/dev/null
+restarted_executable="$("${root}/target/debug/bcode" server status --verbose | sed -n 's/^daemon executable: //p')"
+if [[ "${restarted_executable}" != "${daemon_executable}" ]]; then
+    echo "daemon restart did not reuse the immutable image" >&2
+    exit 1
+fi
+"${root}/target/debug/bcode" server stop >/dev/null
+
 echo "smoke-local-daemon: PASS"

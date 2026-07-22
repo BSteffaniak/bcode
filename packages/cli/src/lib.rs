@@ -5716,12 +5716,50 @@ fn daemon_log_path() -> PathBuf {
     )
 }
 
-async fn server_status(verbose: bool) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    let status = client.server_status().await?;
+fn print_server_identity(status: &ServerStatus, verbose: bool) -> Result<(), CliError> {
+    let (client_executable, client_digest) = bcode_daemon_lifecycle::current_executable_identity()?;
+    let record = bcode_daemon_lifecycle::read_records(&bcode_config::default_state_dir())
+        .into_iter()
+        .find_map(|(_path, record)| {
+            (record.namespace == status.daemon.namespace).then_some(record)
+        });
     println!("daemon: running");
     println!("namespace: {}", status.daemon.namespace);
+    println!(
+        "executable identity: {}",
+        status
+            .daemon
+            .executable_digest
+            .as_deref()
+            .unwrap_or("<unknown>")
+    );
     if verbose {
+        println!(
+            "client executable: {}",
+            display_from_current_dir(&client_executable)
+        );
+        println!("client executable identity: {client_digest}");
+        println!(
+            "daemon executable: {}",
+            record
+                .as_ref()
+                .and_then(|record| record.executable_path.as_deref())
+                .map_or_else(
+                    || "<unknown>".to_owned(),
+                    |path| display_from_current_dir(path).to_string()
+                )
+        );
+        println!(
+            "registry identity: {}",
+            if record
+                .as_ref()
+                .is_some_and(|record| daemon_status_matches(record, &status.daemon))
+            {
+                "consistent"
+            } else {
+                "missing or inconsistent"
+            }
+        );
         println!(
             "pid: {}",
             status
@@ -5732,6 +5770,13 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
         println!("instance: {}", status.daemon.instance_id);
         println!("build fingerprint: {}", status.daemon.build_fingerprint);
     }
+    Ok(())
+}
+
+async fn server_status(verbose: bool) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let status = client.verified_server_status().await?;
+    print_server_identity(&status, verbose)?;
     println!("connected clients: {}", status.connected_client_count);
     println!(
         "model provider: {}",
@@ -5810,8 +5855,8 @@ async fn server_metrics(json: bool, report: bool) -> Result<(), CliError> {
 
 async fn server_diagnose(json: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    let status = client.server_status().await?;
-    let diagnosis = ServerDiagnosis::from_status(status);
+    let status = client.verified_server_status().await?;
+    let diagnosis = ServerDiagnosis::from_status(status)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&diagnosis)?);
     } else {
@@ -5823,6 +5868,10 @@ async fn server_diagnose(json: bool) -> Result<(), CliError> {
 #[derive(Debug, Clone, Serialize)]
 struct ServerDiagnosis {
     daemon: bcode_ipc::DaemonStatus,
+    client_executable_path: PathBuf,
+    client_executable_digest: String,
+    daemon_executable_path: Option<PathBuf>,
+    registry_identity_consistent: bool,
     connected_client_count: usize,
     session_count: usize,
     sessions: Vec<SessionDiagnosisSummary>,
@@ -5857,10 +5906,27 @@ enum DiagnosticSeverity {
 }
 
 impl ServerDiagnosis {
-    fn from_status(status: ServerStatus) -> Self {
+    fn from_status(status: ServerStatus) -> Result<Self, CliError> {
         let observations = diagnostic_observations(&status);
-        Self {
+        let (client_executable_path, client_executable_digest) =
+            bcode_daemon_lifecycle::current_executable_identity()?;
+        let record = bcode_daemon_lifecycle::read_records(&bcode_config::default_state_dir())
+            .into_iter()
+            .find_map(|(_path, record)| {
+                (record.namespace == status.daemon.namespace).then_some(record)
+            });
+        let daemon_executable_path = record
+            .as_ref()
+            .and_then(|record| record.executable_path.clone());
+        let registry_identity_consistent = record
+            .as_ref()
+            .is_some_and(|record| daemon_status_matches(record, &status.daemon));
+        Ok(Self {
             daemon: status.daemon,
+            client_executable_path,
+            client_executable_digest,
+            daemon_executable_path,
+            registry_identity_consistent,
             connected_client_count: status.connected_client_count,
             session_count: status.sessions.len(),
             sessions: status
@@ -5879,7 +5945,7 @@ impl ServerDiagnosis {
             plugin_runtime: status.plugin_runtime,
             metrics: status.metrics,
             observations,
-        }
+        })
     }
 }
 
@@ -5968,6 +6034,37 @@ fn add_histogram_observation(
 fn print_server_diagnosis(diagnosis: &ServerDiagnosis) {
     println!("daemon: running");
     println!("namespace: {}", diagnosis.daemon.namespace);
+    println!(
+        "client executable: {}",
+        display_from_current_dir(&diagnosis.client_executable_path)
+    );
+    println!(
+        "client executable identity: {}",
+        diagnosis.client_executable_digest
+    );
+    println!(
+        "daemon executable: {}",
+        diagnosis.daemon_executable_path.as_ref().map_or_else(
+            || "<unknown>".to_owned(),
+            |path| display_from_current_dir(path).to_string()
+        )
+    );
+    println!(
+        "daemon executable identity: {}",
+        diagnosis
+            .daemon
+            .executable_digest
+            .as_deref()
+            .unwrap_or("<unknown>")
+    );
+    println!(
+        "registry identity: {}",
+        if diagnosis.registry_identity_consistent {
+            "consistent"
+        } else {
+            "missing or inconsistent"
+        }
+    );
     println!("connected clients: {}", diagnosis.connected_client_count);
     println!("sessions: {}", diagnosis.session_count);
     println!(
@@ -6163,6 +6260,14 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
             }
         }
     }
+    if let Ok(removed_images) = bcode_daemon_lifecycle::cleanup_stale_daemon_images(&state_dir)
+        && verbose
+        && removed_images > 0
+    {
+        summary
+            .messages
+            .push(format!("removed {removed_images} stale daemon image(s)"));
+    }
     summary
 }
 
@@ -6173,6 +6278,7 @@ fn daemon_status_matches(
     status.namespace == record.namespace
         && status.instance_id == record.instance_id
         && status.build_fingerprint == record.build_fingerprint
+        && status.executable_digest == record.executable_digest
         && status.storage_writer_epoch == record.storage_writer_epoch
 }
 
@@ -7963,6 +8069,7 @@ mod web_command_tests {
             },
             log_path: PathBuf::from("test.log"),
             executable_path: None,
+            executable_digest: Some("digest".to_string()),
             started_at_unix_ms: 0,
             last_seen_unix_ms: 0,
             instance_id: "instance".to_string(),
@@ -7971,6 +8078,7 @@ mod web_command_tests {
             namespace: "namespace".to_string(),
             protocol_version: 9,
             build_fingerprint: "build".to_string(),
+            executable_digest: Some("digest".to_string()),
             storage_writer_epoch: Some(2),
             pid: Some(1),
             instance_id: "instance".to_string(),

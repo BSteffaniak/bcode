@@ -4826,15 +4826,13 @@ async fn live_shell_recording_chunk_renders_through_active_request_visual() {
     app.absorb_session_event(&event(
         session_id,
         2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call-live-shell".to_owned(),
-                tool_name: "shell.run".to_owned(),
+        SessionEventKind::ToolInvocationLifecycle {
+            event: bcode_session_models::ToolInvocationLifecycleEvent {
+                invocation_id: "call-live-shell".to_owned(),
                 sequence: 1,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: Some(1),
+                stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                message: None,
+                metadata: serde_json::Value::Null,
             },
         },
     ));
@@ -4881,6 +4879,9 @@ async fn live_shell_recording_chunk_renders_through_active_request_visual() {
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("artifact.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
     let response_bytes = bytes.clone();
+    let executable_digest = bcode_daemon_lifecycle::current_executable_identity()
+        .ok()
+        .map(|(_path, digest)| digest);
     let responder = tokio::spawn(async move {
         let mut stream = listener.accept().await.expect("artifact client");
         loop {
@@ -4893,6 +4894,13 @@ async fn live_shell_recording_chunk_renders_through_active_request_visual() {
                     bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
                         protocol_version: bcode_ipc::ProtocolVersion::current(),
                         client_id: ClientId::new(),
+                        daemon: bcode_ipc::DaemonStatus {
+                            namespace: bcode_ipc::daemon_namespace(),
+                            protocol_version: u32::from(bcode_ipc::ProtocolVersion::current().0),
+                            build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+                            executable_digest: executable_digest.clone(),
+                            ..bcode_ipc::DaemonStatus::default()
+                        },
                     })
                 }
                 bcode_ipc::Request::ReadSessionArtifact { offset, .. } => {

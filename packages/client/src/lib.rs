@@ -185,6 +185,8 @@ pub enum ClientError {
     Server { code: String, message: String },
     #[error("client request timed out after {timeout:?}")]
     RequestTimeout { timeout: Duration },
+    #[error("daemon executable identity mismatch: {message}")]
+    IncompatibleDaemon { message: String },
     #[error("unexpected response payload")]
     UnexpectedResponse,
     #[error("unexpected IPC envelope kind")]
@@ -216,6 +218,7 @@ impl ClientError {
             Self::Transport(_)
             | Self::Codec(_)
             | Self::Server { .. }
+            | Self::IncompatibleDaemon { .. }
             | Self::UnexpectedResponse
             | Self::UnexpectedEnvelope => false,
         }
@@ -896,6 +899,38 @@ impl BcodeClient {
             ResponsePayload::ServerStatus { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    fn verify_daemon_identity(status: &bcode_ipc::DaemonStatus) -> Result<(), ClientError> {
+        let (_path, digest) = bcode_daemon_lifecycle::current_executable_identity()
+            .map_err(DaemonStartError::from)?;
+        if status.namespace == bcode_ipc::daemon_namespace()
+            && status.protocol_version == u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION)
+            && status.build_fingerprint == bcode_ipc::BUILD_FINGERPRINT
+            && status.executable_digest.as_deref() == Some(digest.as_str())
+        {
+            return Ok(());
+        }
+        Err(ClientError::IncompatibleDaemon {
+            message: format!(
+                "expected namespace {} and executable {digest}, received namespace {} and executable {}",
+                bcode_ipc::daemon_namespace(),
+                status.namespace,
+                status.executable_digest.as_deref().unwrap_or("<unknown>")
+            ),
+        })
+    }
+
+    /// Return server status after verifying daemon executable identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, rejects the request, or does not match
+    /// this client's executable identity.
+    pub async fn verified_server_status(&self) -> Result<bcode_ipc::ServerStatus, ClientError> {
+        let status = self.server_status().await?;
+        Self::verify_daemon_identity(&status.daemon)?;
+        Ok(status)
     }
 
     /// Request graceful local server shutdown.
@@ -2342,7 +2377,10 @@ impl BcodeClient {
             })
             .await?
         {
-            ResponsePayload::Hello { client_id, .. } => {
+            ResponsePayload::Hello {
+                client_id, daemon, ..
+            } => {
+                Self::verify_daemon_identity(&daemon)?;
                 connection.client_id = Some(client_id);
                 Ok(connection)
             }

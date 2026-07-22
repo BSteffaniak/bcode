@@ -540,6 +540,9 @@ pub struct DaemonStatus {
     /// Build fingerprint included in the namespace.
     #[serde(default)]
     pub build_fingerprint: String,
+    /// SHA-256 digest of the executable bytes running the daemon.
+    #[serde(default)]
+    pub executable_digest: Option<String>,
     /// Durable session-storage writer epoch supported by this daemon.
     #[serde(default)]
     pub storage_writer_epoch: Option<u32>,
@@ -1060,6 +1063,7 @@ pub enum ResponsePayload {
     Hello {
         protocol_version: ProtocolVersion,
         client_id: ClientId,
+        daemon: DaemonStatus,
     },
     Pong,
     ServerStatus {
@@ -2539,6 +2543,13 @@ mod tests {
             Response::Ok(ResponsePayload::Hello {
                 protocol_version: ProtocolVersion::current(),
                 client_id: ClientId::new(),
+                daemon: DaemonStatus {
+                    namespace: daemon_namespace(),
+                    protocol_version: u32::from(ProtocolVersion::current().0),
+                    build_fingerprint: BUILD_FINGERPRINT.to_string(),
+                    executable_digest: Some("digest".to_string()),
+                    ..DaemonStatus::default()
+                },
             }),
             Response::Ok(ResponsePayload::ServerStatus {
                 status: ServerStatus {
@@ -2555,6 +2566,7 @@ mod tests {
                         namespace: daemon_namespace(),
                         protocol_version: u32::from(ProtocolVersion::current().0),
                         build_fingerprint: "test-build".to_string(),
+                        executable_digest: Some("digest".to_string()),
                         storage_writer_epoch: Some(2),
                         pid: Some(123),
                         instance_id: "instance".to_string(),

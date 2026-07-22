@@ -7,16 +7,18 @@
 use bcode_ipc::{BUILD_FINGERPRINT, CURRENT_PROTOCOL_VERSION, IpcEndpoint, daemon_namespace};
 use bcode_plugin_sdk::path::display_from_current_dir;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Current daemon registry record schema version.
-pub const DAEMON_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const DAEMON_RECORD_SCHEMA_VERSION: u32 = 2;
 
 /// Errors returned by daemon lifecycle registry operations.
 #[derive(Debug, Error)]
@@ -112,6 +114,9 @@ pub struct DaemonRecord {
     pub log_path: PathBuf,
     /// Executable path used to start the daemon.
     pub executable_path: Option<PathBuf>,
+    /// SHA-256 digest of the executable bytes running this daemon.
+    #[serde(default)]
+    pub executable_digest: Option<String>,
     /// Daemon start time in Unix milliseconds.
     pub started_at_unix_ms: u64,
     /// Last registry write/update time in Unix milliseconds.
@@ -133,6 +138,10 @@ impl DaemonRecord {
         instance_id: String,
     ) -> Result<Self, DaemonLifecycleError> {
         let now = unix_time_millis()?;
+        let executable_digest = executable_path
+            .as_deref()
+            .map(executable_sha256)
+            .transpose()?;
         Ok(Self {
             schema_version: DAEMON_RECORD_SCHEMA_VERSION,
             namespace: daemon_namespace(),
@@ -143,6 +152,7 @@ impl DaemonRecord {
             endpoint: endpoint_record(endpoint),
             log_path,
             executable_path,
+            executable_digest,
             started_at_unix_ms: now,
             last_seen_unix_ms: now,
             instance_id,
@@ -292,6 +302,7 @@ async fn live_record_matches_instance(record: &DaemonRecord) -> bool {
     status.instance_id == record.instance_id
         && status.namespace == record.namespace
         && status.build_fingerprint == record.build_fingerprint
+        && status.executable_digest == record.executable_digest
         && status.storage_writer_epoch == record.storage_writer_epoch
 }
 
@@ -328,23 +339,103 @@ pub async fn incompatible_storage_writer_records(
         .collect()
 }
 
-/// Return the directory that stores cached exact-build daemon executables.
+/// Return the directory that stores cached daemon executables for this namespace.
 #[must_use]
 pub fn daemon_image_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("daemon-images").join(daemon_namespace())
 }
 
-/// Return the cached executable path for the current daemon namespace.
+/// Return the immutable cached executable path for one binary digest.
 #[must_use]
-pub fn cached_daemon_executable_path(state_dir: &Path) -> PathBuf {
-    daemon_image_dir(state_dir).join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
+pub fn cached_daemon_executable_path_for_digest(
+    state_dir: &Path,
+    executable_digest: &str,
+) -> PathBuf {
+    daemon_image_dir(state_dir)
+        .join(executable_digest)
+        .join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
+}
+
+/// Return the cached executable path for the current process image.
+///
+/// # Errors
+///
+/// Returns an error when the current executable cannot be located or read.
+pub fn current_cached_daemon_executable_path(
+    state_dir: &Path,
+) -> Result<PathBuf, DaemonLifecycleError> {
+    let source = std::env::current_exe().map_err(|source| DaemonLifecycleError::Io {
+        path: PathBuf::from("<current_exe>"),
+        source,
+    })?;
+    let digest = executable_sha256(&source)?;
+    Ok(cached_daemon_executable_path_for_digest(state_dir, &digest))
+}
+
+/// Return the lowercase SHA-256 digest of a file.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be opened or read.
+pub fn executable_sha256(path: &Path) -> Result<String, DaemonLifecycleError> {
+    let mut file = fs::File::open(path).map_err(|source| DaemonLifecycleError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| DaemonLifecycleError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Return the current process executable and its byte digest.
+///
+/// # Errors
+///
+/// Returns an error when the executable cannot be located or read.
+pub fn current_executable_identity() -> Result<(PathBuf, String), DaemonLifecycleError> {
+    static IDENTITY: OnceLock<(PathBuf, String)> = OnceLock::new();
+    if let Some(identity) = IDENTITY.get() {
+        return Ok(identity.clone());
+    }
+    let path = std::env::current_exe().map_err(|source| DaemonLifecycleError::Io {
+        path: PathBuf::from("<current_exe>"),
+        source,
+    })?;
+    let digest = executable_sha256(&path)?;
+    let identity = (path, digest);
+    let _ = IDENTITY.set(identity.clone());
+    Ok(identity)
+}
+
+/// Verify that an executable digest agrees with its content-addressed cache path.
+#[must_use]
+pub fn executable_path_matches_digest(path: &Path, executable_digest: &str) -> bool {
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|component| component.to_str())
+        == Some(executable_digest)
 }
 
 /// Ensure the currently running executable is cached for detached daemon starts.
 ///
+/// The returned path is content-addressed and never replaced after publication.
+///
 /// # Errors
 ///
-/// Returns an error when the current executable cannot be located, copied, or made executable.
+/// Returns an error when the current executable cannot be located, copied, verified, or made
+/// executable.
 pub fn ensure_current_executable_cached() -> Result<PathBuf, DaemonLifecycleError> {
     ensure_current_executable_cached_in_state(&bcode_config::default_state_dir())
 }
@@ -352,34 +443,62 @@ pub fn ensure_current_executable_cached() -> Result<PathBuf, DaemonLifecycleErro
 fn ensure_current_executable_cached_in_state(
     state_dir: &Path,
 ) -> Result<PathBuf, DaemonLifecycleError> {
-    let source = std::env::current_exe().map_err(|source| DaemonLifecycleError::Io {
-        path: PathBuf::from("<current_exe>"),
-        source,
-    })?;
-    let target = cached_daemon_executable_path(state_dir);
-    if target == source && target.exists() {
+    let (source, digest) = current_executable_identity()?;
+    let target = cached_daemon_executable_path_for_digest(state_dir, &digest);
+    if target == source {
         return Ok(target);
     }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|source| DaemonLifecycleError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+    if target.exists() {
+        let cached_digest = executable_sha256(&target)?;
+        if cached_digest == digest {
+            return Ok(target);
+        }
+        return Err(DaemonLifecycleError::Io {
+            path: target,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "content-addressed daemon image digest mismatch",
+            ),
+        });
     }
-    let temp = target.with_extension(format!("tmp-{}", std::process::id()));
+    let parent = target
+        .parent()
+        .expect("content-addressed daemon image has a parent");
+    fs::create_dir_all(parent).map_err(|source| DaemonLifecycleError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let temp = parent.join(format!(".bcode.tmp-{}", std::process::id()));
     fs::copy(&source, &temp).map_err(|source_error| DaemonLifecycleError::Io {
         path: temp.clone(),
         source: source_error,
     })?;
     preserve_executable_permissions(&source, &temp)?;
-    fs::rename(&temp, &target).map_err(|source_error| {
+    let copied_digest = executable_sha256(&temp)?;
+    if copied_digest != digest {
         let _ = fs::remove_file(&temp);
-        DaemonLifecycleError::Io {
-            path: target.clone(),
-            source: source_error,
+        return Err(DaemonLifecycleError::Io {
+            path: temp,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "copied daemon image failed digest verification",
+            ),
+        });
+    }
+    match fs::rename(&temp, &target) {
+        Ok(()) => Ok(target),
+        Err(_source_error) if target.exists() && executable_sha256(&target)? == digest => {
+            let _ = fs::remove_file(&temp);
+            Ok(target)
         }
-    })?;
-    Ok(target)
+        Err(source_error) => {
+            let _ = fs::remove_file(&temp);
+            Err(DaemonLifecycleError::Io {
+                path: target,
+                source: source_error,
+            })
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -415,35 +534,62 @@ fn preserve_executable_permissions(
     Ok(())
 }
 
-/// Remove cached daemon images that do not correspond to live daemon records.
+/// Remove cached daemon images that are not referenced by daemon records or the current build.
 ///
 /// # Errors
 ///
 /// Returns an error when reading or removing image directories fails.
 pub fn cleanup_stale_daemon_images(state_dir: &Path) -> Result<usize, DaemonLifecycleError> {
     let root = state_dir.join("daemon-images");
-    let Ok(entries) = fs::read_dir(&root) else {
+    let Ok(namespace_entries) = fs::read_dir(&root) else {
         return Ok(0);
     };
-    let live_namespaces = read_records(state_dir)
+    let mut retained = read_records(state_dir)
         .into_iter()
-        .map(|(_path, record)| record.namespace)
-        .chain(std::iter::once(daemon_namespace()))
+        .filter_map(|(_path, record)| record.executable_path)
         .collect::<std::collections::BTreeSet<_>>();
+    retained.insert(current_cached_daemon_executable_path(state_dir)?);
     let mut removed = 0;
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+    for namespace_entry in namespace_entries.flatten() {
+        if !namespace_entry
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_dir())
+        {
             continue;
         }
-        let namespace = entry.file_name().to_string_lossy().into_owned();
-        if live_namespaces.contains(&namespace) {
+        let Ok(image_entries) = fs::read_dir(namespace_entry.path()) else {
             continue;
+        };
+        for image_entry in image_entries.flatten() {
+            let path = image_entry.path();
+            let candidate = if image_entry
+                .file_type()
+                .is_ok_and(|file_type| file_type.is_dir())
+            {
+                path.join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
+            } else {
+                path.clone()
+            };
+            if retained.contains(&candidate) {
+                continue;
+            }
+            if image_entry
+                .file_type()
+                .is_ok_and(|file_type| file_type.is_dir())
+            {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            }
+            .map_err(|source| DaemonLifecycleError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            removed += 1;
         }
-        fs::remove_dir_all(entry.path()).map_err(|source| DaemonLifecycleError::Io {
-            path: entry.path(),
-            source,
-        })?;
-        removed += 1;
+        if fs::read_dir(namespace_entry.path()).is_ok_and(|mut entries| entries.next().is_none()) {
+            let _ = fs::remove_dir(namespace_entry.path());
+        }
     }
     Ok(removed)
 }
@@ -493,6 +639,7 @@ mod tests {
             },
             log_path: PathBuf::from("test.log"),
             executable_path: None,
+            executable_digest: None,
             started_at_unix_ms: 0,
             last_seen_unix_ms: 0,
             instance_id: "test-instance".to_string(),
@@ -516,18 +663,30 @@ mod tests {
     }
 
     #[test]
-    fn cached_daemon_executable_path_is_namespace_scoped() {
+    fn cached_daemon_executable_path_is_content_addressed() {
         assert_eq!(
-            cached_daemon_executable_path(Path::new("/state")),
+            cached_daemon_executable_path_for_digest(Path::new("/state"), "abc123"),
             Path::new("/state")
                 .join("daemon-images")
                 .join(daemon_namespace())
+                .join("abc123")
                 .join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
         );
     }
 
     #[test]
-    fn caches_current_executable_into_namespace_image_dir() {
+    fn content_addressed_paths_are_verified() {
+        let path = cached_daemon_executable_path_for_digest(Path::new("/state"), "abc123");
+        assert!(executable_path_matches_digest(&path, "abc123"));
+        assert!(!executable_path_matches_digest(&path, "other"));
+        assert!(!executable_path_matches_digest(
+            Path::new("/state/daemon-images/legacy/bcode"),
+            "abc123"
+        ));
+    }
+
+    #[test]
+    fn caches_current_executable_into_immutable_digest_directory() {
         let state_dir = std::env::temp_dir().join(format!(
             "bcode-daemon-image-test-{}-{}",
             std::process::id(),
@@ -535,9 +694,18 @@ mod tests {
         ));
 
         let cached = ensure_current_executable_cached_in_state(&state_dir).unwrap();
+        let (_source, digest) = current_executable_identity().unwrap();
 
         assert!(cached.exists());
-        assert_eq!(cached, cached_daemon_executable_path(&state_dir));
+        assert_eq!(
+            cached,
+            cached_daemon_executable_path_for_digest(&state_dir, &digest)
+        );
+        assert_eq!(executable_sha256(&cached).unwrap(), digest);
+        assert_eq!(
+            ensure_current_executable_cached_in_state(&state_dir).unwrap(),
+            cached
+        );
         let _ = fs::remove_dir_all(state_dir);
     }
 }
@@ -823,7 +991,7 @@ async fn wait_for_server_ready(
     child: &mut tokio::process::Child,
     log_path: &Path,
 ) -> Result<(), DaemonStartError> {
-    for _ in 0..50 {
+    for _ in 0..200 {
         if ping_ready(endpoint).await {
             if let Some(status) = child.try_wait()? {
                 return Err(DaemonStartError::Exited {
@@ -858,7 +1026,7 @@ async fn wait_for_daemon_ready(
     endpoint: &IpcEndpoint,
     log_path: &Path,
 ) -> Result<(), DaemonStartError> {
-    for _ in 0..50 {
+    for _ in 0..200 {
         if ping_ready(endpoint).await {
             return Ok(());
         }
@@ -873,9 +1041,26 @@ async fn wait_for_daemon_ready(
 
 async fn ping_ready(endpoint: &IpcEndpoint) -> bool {
     matches!(
-        tokio::time::timeout(Duration::from_millis(500), ping_once(endpoint)).await,
-        Ok(Ok(()))
+        tokio::time::timeout(Duration::from_millis(500), async {
+            let Some(status) = probe_daemon_status(endpoint).await else {
+                return false;
+            };
+            daemon_status_matches_current_executable(&status)
+        })
+        .await,
+        Ok(true)
     )
+}
+
+fn daemon_status_matches_current_executable(status: &bcode_ipc::DaemonStatus) -> bool {
+    if status.namespace != daemon_namespace()
+        || status.protocol_version != u32::from(CURRENT_PROTOCOL_VERSION)
+        || status.build_fingerprint != BUILD_FINGERPRINT
+    {
+        return false;
+    }
+    current_executable_identity()
+        .is_ok_and(|(_path, digest)| status.executable_digest.as_deref() == Some(digest.as_str()))
 }
 
 async fn probe_daemon_ready(endpoint: &IpcEndpoint) -> bool {
@@ -896,31 +1081,6 @@ async fn wait_for_existing_daemon(endpoint: &IpcEndpoint) -> bool {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     false
-}
-
-async fn ping_once(endpoint: &IpcEndpoint) -> Result<(), bcode_ipc::CodecError> {
-    let mut stream =
-        bcode_ipc::LocalIpcStream::connect(endpoint)
-            .await
-            .map_err(|error| match error {
-                bcode_ipc::IpcTransportError::Io(error) => bcode_ipc::CodecError::Io(error),
-                other => bcode_ipc::CodecError::Io(std::io::Error::other(other.to_string())),
-            })?;
-    let envelope = bcode_ipc::request_envelope(1, &bcode_ipc::Request::Ping)?;
-    bcode_ipc::send_envelope(&mut stream, &envelope).await?;
-    loop {
-        let envelope = bcode_ipc::recv_envelope(&mut stream).await?;
-        if envelope.kind != bcode_ipc::EnvelopeKind::Response || envelope.request_id != 1 {
-            continue;
-        }
-        let response = bcode_ipc::decode_response(&envelope.payload)?;
-        return match response {
-            bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Pong) => Ok(()),
-            _ => Err(bcode_ipc::CodecError::Io(std::io::Error::other(
-                "unexpected ping response",
-            ))),
-        };
-    }
 }
 
 async fn cleanup_stale_daemon_records() -> Result<(), DaemonLifecycleError> {

@@ -1637,12 +1637,31 @@ fn register_daemon(
     endpoint: &IpcEndpoint,
 ) -> Result<bcode_daemon_lifecycle::DaemonRecord, ServerError> {
     let instance_id = daemon_instance_id()?;
+    let executable_path = std::env::current_exe().ok();
+    let executable_digest = executable_path
+        .as_deref()
+        .and_then(|path| bcode_daemon_lifecycle::executable_sha256(path).ok());
     let mut record = bcode_daemon_lifecycle::DaemonRecord::current(
         endpoint,
         daemon_log_path(),
-        std::env::current_exe().ok(),
+        executable_path,
         instance_id,
     )?;
+    if let (Some(path), Some(digest)) = (
+        record.executable_path.as_deref(),
+        executable_digest.as_deref(),
+    ) && !bcode_daemon_lifecycle::executable_path_matches_digest(path, digest)
+    {
+        return Err(ServerError::DaemonLifecycle(
+            bcode_daemon_lifecycle::DaemonLifecycleError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "daemon executable is not running from its content-addressed image",
+                ),
+            },
+        ));
+    }
     record.storage_writer_epoch = Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
     bcode_daemon_lifecycle::write_record(&bcode_config::default_state_dir(), &record)?;
     Ok(record)
@@ -1658,6 +1677,7 @@ fn daemon_status_from_record(record: &bcode_daemon_lifecycle::DaemonRecord) -> D
         namespace: record.namespace.clone(),
         protocol_version: record.protocol_version,
         build_fingerprint: record.build_fingerprint.clone(),
+        executable_digest: record.executable_digest.clone(),
         storage_writer_epoch: record.storage_writer_epoch,
         pid: record.pid,
         instance_id: record.instance_id.clone(),
@@ -2898,6 +2918,7 @@ async fn handle_hello(
         Response::Ok(ResponsePayload::Hello {
             protocol_version: bcode_ipc::ProtocolVersion::current(),
             client_id,
+            daemon: state.daemon_status.clone(),
         }),
     )
     .await
@@ -27196,6 +27217,10 @@ library = "test"
         state.daemon_status.namespace = bcode_ipc::daemon_namespace();
         state.daemon_status.protocol_version = u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION);
         state.daemon_status.build_fingerprint = bcode_ipc::BUILD_FINGERPRINT.to_owned();
+        state.daemon_status.executable_digest =
+            bcode_daemon_lifecycle::current_executable_identity()
+                .ok()
+                .map(|(_path, digest)| digest);
         let state = Arc::new(state);
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
@@ -27806,7 +27831,15 @@ library = "test"
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
-                daemon_status: DaemonStatus::default(),
+                daemon_status: DaemonStatus {
+                    namespace: bcode_ipc::daemon_namespace(),
+                    protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                    build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+                    executable_digest: bcode_daemon_lifecycle::current_executable_identity()
+                        .ok()
+                        .map(|(_path, digest)| digest),
+                    ..DaemonStatus::default()
+                },
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
                 ralph_store,

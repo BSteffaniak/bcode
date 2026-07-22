@@ -2582,8 +2582,27 @@ impl BmuxApp {
                 self.transcript
                     .push(TranscriptItem::new("Tool contribution", fallback));
             }
-            SessionEventKind::ToolInvocationLifecycle { .. }
-            | SessionEventKind::RuntimeWorkStarted { .. }
+            SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
+                if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
+                    && let Some(context) = self
+                        .tool_call_contexts
+                        .get(&lifecycle.invocation_id)
+                        .cloned()
+                {
+                    self.apply_tool_started(
+                        &lifecycle.invocation_id,
+                        &context.tool_name,
+                        None,
+                        None,
+                        Some(event.timestamp_ms),
+                        application,
+                    );
+                }
+                if application.live_activity() {
+                    self.apply_shared_runtime_work_activity();
+                }
+            }
+            SessionEventKind::RuntimeWorkStarted { .. }
             | SessionEventKind::RuntimeWorkCancelRequested { .. }
             | SessionEventKind::RuntimeWorkProgress { .. }
                 if application.live_activity() =>
@@ -2999,8 +3018,8 @@ impl BmuxApp {
             enrich_tool_request_visual_runtime(
                 &mut visual,
                 tool_call_id,
-                context.columns,
-                context.rows,
+                Some(context.columns),
+                Some(context.rows),
             );
             item.set_tool_request_visual(visual, true);
             item.set_tool_started_at_ms(context.started_at_ms);
@@ -3530,12 +3549,7 @@ impl BmuxApp {
             .get(tool_call_id)
             .and_then(|context| context.request_visual.clone())
         {
-            enrich_tool_request_visual_runtime(
-                &mut visual,
-                tool_call_id,
-                columns.unwrap_or(0),
-                rows.unwrap_or(0),
-            );
+            enrich_tool_request_visual_runtime(&mut visual, tool_call_id, columns, rows);
             if let Some(context) = self.tool_call_contexts.get_mut(tool_call_id) {
                 context.request_visual = Some(visual.clone());
             }
@@ -4648,8 +4662,8 @@ fn submitted_interactive_payload_json(resolution_json: &str) -> Option<String> {
 fn enrich_tool_request_visual_runtime(
     visual: &mut bcode_session_models::PluginVisualDescriptor,
     tool_call_id: &str,
-    columns: u16,
-    rows: u16,
+    columns: Option<u16>,
+    rows: Option<u16>,
 ) {
     let runtime = visual
         .payload
@@ -4665,8 +4679,12 @@ fn enrich_tool_request_visual_runtime(
             "live_state_key".to_owned(),
             serde_json::Value::String(tool_call_id.to_owned()),
         );
-        runtime.insert("columns".to_owned(), serde_json::json!(columns));
-        runtime.insert("rows".to_owned(), serde_json::json!(rows));
+        if let Some(columns) = columns {
+            runtime.insert("columns".to_owned(), serde_json::json!(columns));
+        }
+        if let Some(rows) = rows {
+            runtime.insert("rows".to_owned(), serde_json::json!(rows));
+        }
         runtime.insert(
             "output".to_owned(),
             serde_json::Value::String(String::new()),
@@ -5500,6 +5518,66 @@ mod tests {
             "stale",
         ));
         assert!(app.transcript().is_empty());
+    }
+
+    #[test]
+    fn lifecycle_start_enriches_the_canonical_tool_request_visual() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        app.absorb_session_event(&event(
+            1,
+            bcode_session_models::SessionEventKind::ToolCallRequested {
+                tool_call_id: "call".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{\"command\":\"echo test\"}".to_owned(),
+                working_directory: None,
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                request_visual: Some(bcode_session_models::PluginVisualDescriptor {
+                    visual_id: None,
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    schema: "bcode.tool.request.shell.run".to_owned(),
+                    schema_version: 1,
+                    title: None,
+                    subtitle: None,
+                    payload: serde_json::json!({"command":"echo test"}),
+                }),
+                legacy_request_presentation: None,
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call".to_owned(),
+                    sequence: 0,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+
+        let context = app
+            .tool_call_contexts
+            .get("call")
+            .expect("tool call context");
+        assert_eq!(
+            context
+                .request_visual
+                .as_ref()
+                .and_then(|visual| visual.payload.get("_bcode_runtime"))
+                .and_then(|runtime| runtime.get("live_state_key"))
+                .and_then(serde_json::Value::as_str),
+            Some("call")
+        );
     }
 
     #[test]
