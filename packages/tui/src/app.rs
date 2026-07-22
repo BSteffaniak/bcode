@@ -55,8 +55,8 @@ use super::transcript::{
     interactive_tool_resolution_item, item_is_tool_surface_for_tool_call,
     live_tool_preview_anchor_item, model_usage_item, permission_request_item,
     permission_result_item, semantic_tool_result_item_from_raw, streaming_tool_output_item,
-    streaming_tool_visual_item, tool_request_item_from_projection, tool_result_item,
-    transcript_items_from_events_with_reasoning,
+    streaming_tool_visual_item, tool_contribution_item, tool_request_item_from_projection,
+    tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2308,17 +2308,15 @@ impl BmuxApp {
             }
             bcode_session_models::ToolContributionOperation::Upsert
             | bcode_session_models::ToolContributionOperation::Append => {
-                let fallback = serde_json::to_string_pretty(contribution)
-                    .unwrap_or_else(|_| contribution.payload.to_string());
                 if let Some((_, Some(id))) = self.transient_contribution_items.get(&key).copied() {
                     self.transcript.mutate_rev_find(
                         |item| item.id() == id,
-                        |item| item.replace_text(fallback.clone()),
+                        |item| item.replace_tool_contribution(contribution.clone()),
                     );
                     self.transient_contribution_items
                         .insert(key, (contribution.sequence, Some(id)));
                 } else {
-                    let item = TranscriptItem::new("Tool contribution", fallback);
+                    let item = tool_contribution_item(contribution, true);
                     let id = item.id();
                     self.transient_contribution_items
                         .insert(key, (contribution.sequence, Some(id)));
@@ -2577,10 +2575,8 @@ impl BmuxApp {
                 if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
                     self.transcript.retain(|item| item.id() != id);
                 }
-                let fallback = serde_json::to_string_pretty(contribution)
-                    .unwrap_or_else(|_| contribution.payload.to_string());
-                self.transcript
-                    .push(TranscriptItem::new("Tool contribution", fallback));
+                let item = tool_contribution_item(contribution, false);
+                self.transcript.push(item);
             }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
                 if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
@@ -4727,6 +4723,7 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
             | TranscriptItemKind::Meta
             | TranscriptItemKind::Skill
             | TranscriptItemKind::SkillError
+            | TranscriptItemKind::ToolContribution { .. }
             | TranscriptItemKind::Generic => {}
         }
     }
@@ -5462,6 +5459,7 @@ mod tests {
                     schema_version: 77,
                     operation: bcode_session_models::ToolContributionOperation::Append,
                     persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
                     payload: serde_json::json!({"sentinel": "opaque-tui"}),
                 },
             },
@@ -5488,6 +5486,7 @@ mod tests {
                     schema_version: 77,
                     operation,
                     persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
                     payload: serde_json::json!({"sentinel": sentinel}),
                 },
             },
@@ -5599,6 +5598,7 @@ mod tests {
                     schema_version: 1,
                     operation: bcode_session_models::ToolContributionOperation::Upsert,
                     persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
                     payload: serde_json::json!({"output": "shell-render-sentinel"}),
                 },
             },

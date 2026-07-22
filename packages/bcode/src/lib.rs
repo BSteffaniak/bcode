@@ -2524,7 +2524,6 @@ impl ToolInvoker for SdkToolInvoker {
                                 is_error: true,
                                 content: Vec::new(),
                                 full_output: None,
-                                host_action: None,
                                 result: None,
                             })
                         }
@@ -5307,7 +5306,6 @@ impl AgentBuilder {
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: Some(ToolInvocationResult::Json { value: encoded }),
             })
         })

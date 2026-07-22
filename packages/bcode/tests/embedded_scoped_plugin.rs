@@ -252,7 +252,6 @@ async fn assert_direct_batch_overlaps() {
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
-                        host_action: None,
                         result: None,
                     })
                 }

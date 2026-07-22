@@ -465,6 +465,22 @@ impl SessionView {
                         self.snapshot
                             .active_invocations
                             .remove(&lifecycle.invocation_id);
+                        self.snapshot.contributions.retain(|_, contribution| {
+                            contribution.invocation_id != lifecycle.invocation_id
+                        });
+                        self.contribution_sequences.retain(|key, _| {
+                            !key.starts_with(&format!("{}:", lifecycle.invocation_id))
+                        });
+                        let live_prefix = format!("live-contribution:{}:", lifecycle.invocation_id);
+                        let item_count = self.snapshot.transcript.items.len();
+                        self.snapshot
+                            .transcript
+                            .items
+                            .retain(|item| !item.id.get().starts_with(&live_prefix));
+                        if self.snapshot.transcript.items.len() != item_count {
+                            self.snapshot.transcript.revision =
+                                self.snapshot.transcript.revision.saturating_add(1);
+                        }
                         self.terminal_invocations
                             .insert(lifecycle.invocation_id.clone());
                     }
@@ -731,6 +747,12 @@ impl SessionView {
             SessionEventKind::ToolContribution {
                 event: contribution,
             } => {
+                if self
+                    .terminal_invocations
+                    .contains(&contribution.invocation_id)
+                {
+                    return;
+                }
                 let key = format!(
                     "{}:{}",
                     contribution.invocation_id, contribution.contribution_id
@@ -1202,6 +1224,12 @@ impl SessionView {
         &mut self,
         contribution: &bcode_session_models::ToolContributionEvent,
     ) {
+        if self
+            .terminal_invocations
+            .contains(&contribution.invocation_id)
+        {
+            return;
+        }
         let key = format!(
             "{}:{}",
             contribution.invocation_id, contribution.contribution_id
@@ -1816,6 +1844,7 @@ mod tests {
                         schema_version: 77,
                         operation,
                         persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        artifact: None,
                         payload,
                     },
                 },
@@ -1958,6 +1987,7 @@ mod tests {
                         schema_version: 77,
                         operation,
                         persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        artifact: None,
                         payload,
                     },
                 },
@@ -2017,6 +2047,7 @@ mod tests {
                     schema_version: 77,
                     operation,
                     persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
                     payload,
                 },
             },
@@ -2045,6 +2076,7 @@ mod tests {
                     schema_version: 77,
                     operation: bcode_session_models::ToolContributionOperation::Upsert,
                     persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
                     payload: serde_json::json!({"opaque": "durable"}),
                 },
             },
@@ -2102,6 +2134,25 @@ mod tests {
             view.snapshot().active_invocations["call-1"].stage,
             bcode_session_models::ToolInvocationLifecycleStage::Waiting
         );
+        let contribution = |sequence| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolContribution {
+                event: bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-1".to_owned(),
+                    contribution_id: "surface".to_owned(),
+                    sequence,
+                    producer_id: "future.producer".to_owned(),
+                    schema: "future.unknown/schema".to_owned(),
+                    schema_version: 77,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
+                    payload: serde_json::json!({"sequence": sequence}),
+                },
+            },
+        };
+        view.apply_live_event(&contribution(1));
+        assert_eq!(view.snapshot().contributions.len(), 1);
 
         view.apply_event(&lifecycle(
             3,
@@ -2111,7 +2162,10 @@ mod tests {
             4,
             bcode_session_models::ToolInvocationLifecycleStage::Progress,
         ));
+        view.apply_live_event(&contribution(2));
         assert!(view.snapshot().active_invocations.is_empty());
+        assert!(view.snapshot().contributions.is_empty());
+        assert!(view.snapshot().transcript.items.is_empty());
     }
 
     #[test]

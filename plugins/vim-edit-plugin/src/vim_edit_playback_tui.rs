@@ -1,18 +1,11 @@
 //! Native TUI rendering for Vim edit visuals and playback interaction.
 
-use bcode_plugin_sdk::tui::TerminalInteractionRenderer;
-use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue};
-use bmux_keyboard::KeyCode;
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use serde_json::Value;
 
-use super::vim_edit_interaction::VimEditPlaybackSnapshot;
 use super::{
-    VIM_EDIT_LIVE_SCHEMA, VIM_EDIT_PLAYBACK_SCHEMA, VIM_EDIT_PLAYBACK_SURFACE,
-    VIM_EDIT_REQUEST_APPLY_SCHEMA, VIM_EDIT_REQUEST_PREVIEW_SCHEMA,
+    VIM_EDIT_LIVE_SCHEMA, VIM_EDIT_PLAYBACK_SCHEMA, VIM_EDIT_REQUEST_APPLY_SCHEMA,
+    VIM_EDIT_REQUEST_PREVIEW_SCHEMA,
 };
 
 /// Vim edit TUI visual adapter.
@@ -57,208 +50,13 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for VimEditPlaybackTuiVisualA
     }
 }
 
-fn unknown_visual_context() -> bcode_plugin_sdk::tui::PluginTuiVisualRenderContext {
+#[cfg(test)]
+const fn unknown_visual_context() -> bcode_plugin_sdk::tui::PluginTuiVisualRenderContext {
     bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
         u16::MAX,
         bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
         None,
     )
-}
-
-/// Terminal renderer for interactive Vim edit playback.
-#[derive(Default)]
-pub struct VimEditPlaybackTerminalRenderer {
-    regions: Vec<PlaybackMouseRegion>,
-}
-
-#[derive(Clone)]
-struct PlaybackMouseRegion {
-    area: Rect,
-    input: InteractionInput,
-}
-
-impl VimEditPlaybackTerminalRenderer {
-    fn capture_regions(
-        &mut self,
-        snapshot: &VimEditPlaybackSnapshot,
-        area: Rect,
-        row_count: usize,
-    ) {
-        let controls_y = area
-            .y
-            .saturating_add(u16::try_from(row_count.saturating_sub(1)).unwrap_or(u16::MAX));
-        let controls = [
-            ("first", 1_u16, 7_u16),
-            ("previous", 9, 7),
-            ("play_pause", 17, 8),
-            ("next", 27, 7),
-            ("last", 35, 7),
-            ("previous_changed", 43, 9),
-            ("next_changed", 54, 9),
-            ("timeline", 65, 10),
-            ("diff", 77, 6),
-            ("apply_requested", 85, 7),
-            ("close", 94, 7),
-        ];
-        for (control_id, x, width) in controls {
-            if x < area.width {
-                self.regions.push(PlaybackMouseRegion {
-                    area: Rect::new(area.x.saturating_add(x), controls_y, width, 1),
-                    input: InteractionInput::Activate {
-                        control_id: InteractionControlId::new(control_id),
-                    },
-                });
-            }
-        }
-        if snapshot.show_timeline {
-            let timeline_start = Self::timeline_row_start(&snapshot.playback);
-            if let Some(events) = events(&snapshot.playback) {
-                for index in 0..events.len().min(16) {
-                    let y = area
-                        .y
-                        .saturating_add(u16::try_from(timeline_start + index).unwrap_or(u16::MAX));
-                    if y < area.y.saturating_add(area.height) {
-                        self.regions.push(PlaybackMouseRegion {
-                            area: Rect::new(area.x, y, area.width, 1),
-                            input: InteractionInput::Change {
-                                control_id: InteractionControlId::new("selected_frame"),
-                                value: InteractionValue::Number(
-                                    i64::try_from(index).unwrap_or(i64::MAX),
-                                ),
-                            },
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    fn timeline_row_start(playback: &Value) -> usize {
-        vim_screen_rows(
-            "nvim playback",
-            playback,
-            selected_context(playback),
-            u16::MAX,
-            &unknown_visual_context(),
-        )
-        .len()
-        .saturating_add(2)
-    }
-
-    fn mouse_input(&self, event: &MouseEvent) -> Option<InteractionInput> {
-        if !matches!(event.kind, MouseEventKind::Up(MouseButton::Left)) {
-            return None;
-        }
-        self.regions
-            .iter()
-            .find(|region| region.area.contains(event.position))
-            .map(|region| region.input.clone())
-    }
-}
-
-impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInteractionController>
-    for VimEditPlaybackTerminalRenderer
-{
-    const SURFACE_KIND: &'static str = VIM_EDIT_PLAYBACK_SURFACE;
-
-    fn id(&self) -> &'static str {
-        "vim-edit-playback"
-    }
-
-    fn title(&self) -> &'static str {
-        "Vim edit playback"
-    }
-
-    fn preferred_height(&mut self, snapshot: &VimEditPlaybackSnapshot, width: u16) -> u16 {
-        u16::try_from(
-            playback_rows(
-                &snapshot.playback,
-                Some(snapshot.selected_frame),
-                snapshot.show_timeline,
-                snapshot.show_diff,
-                width,
-                &unknown_visual_context(),
-            )
-            .len()
-            .saturating_add(1),
-        )
-        .unwrap_or(u16::MAX)
-    }
-
-    fn render(&mut self, snapshot: &VimEditPlaybackSnapshot, area: Rect, frame: &mut Frame<'_>) {
-        self.regions.clear();
-        let rows = playback_rows(
-            &snapshot.playback,
-            Some(snapshot.selected_frame),
-            snapshot.show_timeline,
-            snapshot.show_diff,
-            area.width,
-            &unknown_visual_context(),
-        );
-        for (offset, line) in rows.iter().enumerate() {
-            let Ok(offset) = u16::try_from(offset) else {
-                break;
-            };
-            if offset >= area.height {
-                break;
-            }
-            frame.write_line(Rect::new(area.x, area.y + offset, area.width, 1), line);
-        }
-        self.capture_regions(snapshot, area, rows.len());
-    }
-
-    fn input(
-        &mut self,
-        event: &Event,
-        _snapshot: &VimEditPlaybackSnapshot,
-    ) -> Option<InteractionInput> {
-        match event {
-            Event::Key(key) => match key.key {
-                KeyCode::Left | KeyCode::Char('h') => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("previous"),
-                }),
-                KeyCode::Right | KeyCode::Char('l') => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("next"),
-                }),
-                KeyCode::Char('g') | KeyCode::Home => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("first"),
-                }),
-                KeyCode::Char('G') | KeyCode::End => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("last"),
-                }),
-                KeyCode::Char('[') => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("previous_changed"),
-                }),
-                KeyCode::Char(']') => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("next_changed"),
-                }),
-                KeyCode::Char(' ') => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("play_pause"),
-                }),
-                KeyCode::Char('t') => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("timeline"),
-                }),
-                KeyCode::Char('d') => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("diff"),
-                }),
-                KeyCode::Char('a') => Some(InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("apply_requested"),
-                }),
-                KeyCode::Tab | KeyCode::Down => Some(InteractionInput::Navigate {
-                    direction: InteractionNavigation::Next,
-                }),
-                KeyCode::Up => Some(InteractionInput::Navigate {
-                    direction: InteractionNavigation::Previous,
-                }),
-                KeyCode::Enter => Some(InteractionInput::Submit),
-                KeyCode::Escape | KeyCode::Char('q') => Some(InteractionInput::Cancel),
-                _ => None,
-            },
-            Event::Tick => Some(InteractionInput::Tick),
-            Event::Mouse(mouse) => self.mouse_input(mouse),
-            _ => None,
-        }
-    }
 }
 
 fn request_rows(

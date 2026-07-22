@@ -174,6 +174,36 @@ impl ArtifactStreamCoordinator {
         }
     }
 
+    pub(crate) fn observe_contribution(
+        &mut self,
+        session_id: SessionId,
+        event: &bcode_session_models::ToolContributionEvent,
+    ) {
+        let Some(artifact) = event.artifact.as_ref() else {
+            return;
+        };
+        let key = (
+            session_id,
+            event.invocation_id.clone(),
+            artifact.artifact_id.clone(),
+            artifact.reference_key.clone(),
+        );
+        self.observe_artifact_target(
+            session_id,
+            &key,
+            ActiveArtifactTarget {
+                producer_plugin_id: event.producer_id.clone(),
+                schema: event.schema.clone(),
+                schema_version: event.schema_version,
+                content_type: artifact.content_type.clone(),
+                committed_bytes: artifact.committed_bytes,
+                revision: artifact.revision,
+                finalized: artifact.finalized,
+            },
+            false,
+        );
+    }
+
     pub(crate) fn observe_live_event(
         &mut self,
         session_id: SessionId,
@@ -202,8 +232,31 @@ impl ArtifactStreamCoordinator {
             artifact_id.clone(),
             reference_key.clone(),
         );
+        self.observe_artifact_target(
+            session_id,
+            &key,
+            ActiveArtifactTarget {
+                producer_plugin_id: producer_plugin_id.clone(),
+                schema: schema.clone(),
+                schema_version: *schema_version,
+                content_type: content_type.clone(),
+                committed_bytes: *committed_bytes,
+                revision: *revision,
+                finalized: *finalized,
+            },
+            availability.as_deref() == Some("incomplete"),
+        );
+    }
+
+    fn observe_artifact_target(
+        &mut self,
+        session_id: SessionId,
+        key: &ActiveArtifactKey,
+        target: ActiveArtifactTarget,
+        incomplete: bool,
+    ) {
         let state = self.artifact_fetches.entry(key.clone()).or_default();
-        if availability.as_deref() == Some("incomplete") {
+        if incomplete {
             state.fetching = false;
             state.retry_at = None;
             state.terminal_error = Some(
@@ -215,20 +268,12 @@ impl ArtifactStreamCoordinator {
         if state
             .target
             .as_ref()
-            .is_some_and(|target| *revision <= target.revision)
+            .is_some_and(|current| target.revision <= current.revision)
         {
             return;
         }
-        state.target = Some(ActiveArtifactTarget {
-            producer_plugin_id: producer_plugin_id.clone(),
-            schema: schema.clone(),
-            schema_version: *schema_version,
-            content_type: content_type.clone(),
-            committed_bytes: *committed_bytes,
-            revision: *revision,
-            finalized: *finalized,
-        });
-        self.schedule_active_artifact_fetch(session_id, &key);
+        state.target = Some(target);
+        self.schedule_active_artifact_fetch(session_id, key);
     }
 
     fn schedule_active_artifact_fetch(&mut self, session_id: SessionId, key: &ActiveArtifactKey) {

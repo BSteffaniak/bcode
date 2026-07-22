@@ -48,11 +48,6 @@ producer_default   = true
 render_mode        = "full_block"
 surfaces           = ["tui"]
 
-[[tui_surfaces]]
-description = "Interactive Vim edit playback UI"
-kind        = "tool.vim-edit.playback"
-title       = "Vim Edit Playback"
-
 [concurrency]
 max  = 2
 type = "limited"

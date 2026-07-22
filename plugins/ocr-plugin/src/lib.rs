@@ -10,9 +10,9 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
-    ToolPluginVisualMetadata, ToolResultContent, ToolSideEffect, ToolVisualPayloadSelector,
+    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence, ToolDefinition,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolResultContent, ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,12 @@ impl OcrPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
+        emit_request_contribution(
+            events,
+            &invocation.tool_call_id,
+            &invocation.name,
+            &invocation.arguments,
+        );
         let response = match invocation.name.as_str() {
             "ocr.extract" => self.invoke_extract(&invocation, events),
             "ocr.status" => invoke_status(&invocation.tool_call_id),
@@ -134,7 +140,6 @@ impl OcrPlugin {
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             },
         };
@@ -633,10 +638,7 @@ fn extract_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("extracting OCR text".to_string()),
-            request_visual: Some(ocr_request_visual(
-                "extracting OCR text",
-                &["path", "url", "language", "engine", "max_bytes"],
-            )),
+            request_visual: None
         },
     }
 }
@@ -651,38 +653,36 @@ fn status_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("checking OCR status".to_string()),
-            request_visual: Some(ocr_request_visual("checking OCR status", &[])),
+            request_visual: None,
         },
     }
 }
 
-fn ocr_request_visual(operation: &str, fields: &[&str]) -> ToolPluginVisualMetadata {
-    let mut payload = std::collections::BTreeMap::new();
+fn emit_request_contribution(
+    events: ServiceEventEmitter,
+    invocation_id: &str,
+    operation: &str,
+    arguments: &serde_json::Value,
+) {
+    let mut payload = arguments.as_object().cloned().unwrap_or_default();
     payload.insert(
-        "operation".to_string(),
-        ToolVisualPayloadSelector {
-            fields: Vec::new(),
-            literal: Some(serde_json::Value::String(operation.to_string())),
-            required: false,
-        },
+        "operation".to_owned(),
+        serde_json::Value::String(operation.to_owned()),
     );
-    for field in fields {
-        payload.insert(
-            (*field).to_string(),
-            ToolVisualPayloadSelector {
-                fields: vec![(*field).to_string()],
-                literal: None,
-                required: false,
-            },
-        );
-    }
-    ToolPluginVisualMetadata {
-        producer_plugin_id: Some(OCR_PLUGIN_ID.to_string()),
-        schema: OCR_REQUEST_SCHEMA.to_string(),
+    let event = ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "request".to_owned(),
+        sequence: 1,
+        producer_id: OCR_PLUGIN_ID.to_owned(),
+        schema: OCR_REQUEST_SCHEMA.to_owned(),
         schema_version: 1,
-        title: Some("OCR".to_string()),
-        subtitle: Some(format!("{operation} · {{bytes}}")),
-        payload,
+        operation: ToolContributionOperation::Upsert,
+        persistence: ToolContributionPersistence::Durable,
+        artifact: None,
+        payload: serde_json::Value::Object(payload),
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
     }
 }
 
@@ -788,7 +788,6 @@ fn ocr_tool_response(value: &ExtractResponse, tool_call_id: &str) -> ToolInvocat
             text: value.text.clone(),
         }],
         full_output: value.truncated.then_some(value.full_text.clone()),
-        host_action: None,
         result: Some(ocr_artifact_result(
             tool_call_id,
             "extract",
@@ -826,7 +825,6 @@ fn json_tool_response_with_artifact<T: Serialize>(
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: Some(ocr_artifact_result(
                 tool_call_id,
                 artifact_suffix,
@@ -866,7 +864,6 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }
@@ -891,6 +888,17 @@ bcode_plugin_sdk::export_plugin!(OcrPlugin, include_str!("../bcode-plugin.toml")
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_tools_remove_legacy_request_visuals() {
+        for definition in [extract_tool_definition(), status_tool_definition()] {
+            assert!(
+                definition.ui.request_visual.is_none(),
+                "{}",
+                definition.name
+            );
+        }
+    }
 
     #[test]
     fn progress_uses_neutral_invocation_lifecycle_contract() {

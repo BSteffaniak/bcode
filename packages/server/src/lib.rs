@@ -79,9 +79,9 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveToolArgumentPreview, ModelTurnOutcome,
     PluginVisualDescriptor, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkKind,
     RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
-    TraceRedaction, WorkId,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolContributionEvent,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
+    TraceBlobRef, TraceRedaction, WorkId,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -96,11 +96,11 @@ use bcode_skill_models::{
     SkillToolPolicyTarget,
 };
 use bcode_tool::{
-    InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_PREPARE_TOOL, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID,
-    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolDefinition as ServiceToolDefinition,
-    ToolExchangeRequest, ToolExchangeResolution, ToolInvocationDescriptor, ToolInvocationInput,
-    ToolInvocationInputResolution, ToolInvocationRequest, ToolInvocationResponse,
+    InteractiveToolResolution, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
+    ToolDefinition as ServiceToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
+    ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
+    ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
     ToolList, ToolOutputStream, ToolPreparationRequest, ToolPreparationResponse, ToolResultContent,
@@ -216,6 +216,7 @@ pub struct ServerState {
     pending_interactive_tools: Mutex<BTreeMap<String, PendingInteractiveToolRequest>>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
+    active_contributions: Arc<StdMutex<BTreeMap<ActiveContributionKey, ToolContributionEvent>>>,
     active_plugin_visuals: Arc<StdMutex<BTreeMap<(SessionId, String), ToolInvocationStreamEvent>>>,
     next_permission_id: Mutex<u64>,
     next_permission_batch_id: Mutex<u64>,
@@ -1116,6 +1117,7 @@ impl ServerState {
             pending_interactive_tools: Mutex::default(),
             active_plugin_invocations: Arc::default(),
             active_artifacts: Arc::default(),
+            active_contributions: Arc::default(),
             active_plugin_visuals: Arc::default(),
             next_permission_id: Mutex::new(1),
             next_permission_batch_id: Mutex::new(1),
@@ -5204,6 +5206,13 @@ async fn handle_rename_session(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ActiveContributionKey {
+    session: SessionId,
+    invocation: String,
+    contribution: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ActiveArtifactKey {
     session_id: SessionId,
     tool_call_id: String,
@@ -5222,6 +5231,7 @@ struct ActiveArtifactReference {
     revision: u64,
     finalized: bool,
     abandoned: bool,
+    contribution_snapshot: Option<ToolContributionEvent>,
 }
 
 impl ActiveArtifactReference {
@@ -6032,7 +6042,7 @@ async fn handle_attach_session(
             )
             .await?;
             let sink = ClientEventSink::new(client_id, writer.clone(), state.metrics.clone());
-            send_active_artifact_snapshots(state, session_id, &sink).await?;
+            send_active_runtime_snapshots(state, session_id, &sink).await?;
             let handle =
                 forward_session_events(sink, session_id, attachment.events, attachment.live_events);
             state.register_client_forwarder(client_id, handle).await;
@@ -6311,7 +6321,7 @@ async fn finish_attach_session_projection_window_success(
         context.writer.clone(),
         state.metrics.clone(),
     );
-    send_active_artifact_snapshots(state, session_id, &sink).await?;
+    send_active_runtime_snapshots(state, session_id, &sink).await?;
     let handle =
         forward_session_events(sink, session_id, attachment.events, attachment.live_events);
     state
@@ -6401,7 +6411,7 @@ async fn finish_attach_session_recent_success(
         context.writer.clone(),
         state.metrics.clone(),
     );
-    send_active_artifact_snapshots(state, session_id, &sink).await?;
+    send_active_runtime_snapshots(state, session_id, &sink).await?;
     let handle =
         forward_session_events(sink, session_id, attachment.events, attachment.live_events);
     state
@@ -14819,7 +14829,6 @@ fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }
@@ -15402,7 +15411,6 @@ async fn execute_model_tool(
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     });
     if cancel_state.is_cancelled() {
@@ -16097,7 +16105,6 @@ async fn invoke_model_tool(
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         });
     }
@@ -16256,6 +16263,7 @@ async fn invoke_model_tool(
                                     state,
                                     session_id,
                                     &call.id,
+                                    plugin_id,
                                     contribution,
                                 )
                                 .await;
@@ -16292,7 +16300,8 @@ async fn invoke_model_tool(
         } else if let Ok(contribution) =
             serde_json::from_slice::<bcode_session_models::ToolContributionEvent>(&payload)
         {
-            append_tool_contribution_event(state, session_id, &call.id, contribution).await;
+            append_tool_contribution_event(state, session_id, &call.id, plugin_id, contribution)
+                .await;
         } else if let Ok(event) =
             serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
         {
@@ -16305,19 +16314,6 @@ async fn invoke_model_tool(
     tool_output_publisher.finish(state, session_id).await;
     let response: ToolInvocationResponse =
         bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())?;
-    if let Some(bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(request)) =
-        response.host_action.clone()
-    {
-        return handle_interactive_tool_request(
-            state,
-            session_id,
-            call,
-            plugin_id,
-            request,
-            cancel_state,
-        )
-        .await;
-    }
     Ok(response)
 }
 
@@ -16371,25 +16367,180 @@ async fn append_plugin_tool_lifecycle_event(
     }
 }
 
-async fn append_tool_contribution_event(
+const MAX_ACTIVE_CONTRIBUTION_BYTES: usize = 256 * 1024;
+const MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION: usize = 256;
+
+fn update_active_contribution(
+    state: &ServerState,
+    session_id: SessionId,
+    event: &ToolContributionEvent,
+) -> Result<bool, String> {
+    if event.invocation_id.trim().is_empty()
+        || event.contribution_id.trim().is_empty()
+        || event.producer_id.trim().is_empty()
+        || event.schema.trim().is_empty()
+        || event.schema_version == 0
+        || event.sequence == 0
+        || event.sequence == u64::MAX
+    {
+        return Err("active contribution identity, schema, and sequence must be valid".to_owned());
+    }
+    let encoded_bytes = serde_json::to_vec(event)
+        .map_err(|error| format!("failed to encode active contribution: {error}"))?
+        .len();
+    if encoded_bytes > MAX_ACTIVE_CONTRIBUTION_BYTES {
+        return Err(format!(
+            "active contribution exceeds {MAX_ACTIVE_CONTRIBUTION_BYTES} bytes"
+        ));
+    }
+    let key = ActiveContributionKey {
+        session: session_id,
+        invocation: event.invocation_id.clone(),
+        contribution: event.contribution_id.clone(),
+    };
+    let mut contributions = state
+        .active_contributions
+        .lock()
+        .map_err(|_| "active contribution registry poisoned".to_owned())?;
+    if let Some(current) = contributions.get(&key) {
+        if event.sequence <= current.sequence {
+            return Ok(false);
+        }
+        if event.producer_id != current.producer_id
+            || event.schema != current.schema
+            || event.schema_version != current.schema_version
+            || event.persistence != current.persistence
+        {
+            return Err("active contribution immutable identity changed".to_owned());
+        }
+    }
+    if event.operation == bcode_session_models::ToolContributionOperation::Remove {
+        contributions.remove(&key);
+        return Ok(true);
+    }
+    let session_count = contributions
+        .keys()
+        .filter(|existing| existing.session == session_id)
+        .count();
+    if !contributions.contains_key(&key) && session_count >= MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION {
+        return Err(format!(
+            "session has reached {MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION} active contributions"
+        ));
+    }
+    contributions.insert(key, event.clone());
+    drop(contributions);
+    Ok(true)
+}
+
+fn active_contribution_snapshot_events(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<Vec<bcode_session_models::SessionLiveEvent>, String> {
+    let contributions = state
+        .active_contributions
+        .lock()
+        .map_err(|_| "active contribution registry poisoned".to_owned())?;
+    Ok(contributions
+        .iter()
+        .filter(|(key, _)| key.session == session_id)
+        .map(|(_, event)| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolContribution {
+                event: event.clone(),
+            },
+        })
+        .collect())
+}
+
+async fn clear_active_contributions(
     state: &ServerState,
     session_id: SessionId,
     invocation_id: &str,
-    event: bcode_session_models::ToolContributionEvent,
 ) {
-    if event.invocation_id != invocation_id {
-        tracing::warn!(
-            expected_invocation_id = invocation_id,
-            actual_invocation_id = event.invocation_id,
-            "discarded tool contribution with mismatched invocation identity"
-        );
-        return;
-    }
-    if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
+    let removed = state.active_contributions.lock().map_or_else(
+        |_| Vec::new(),
+        |mut contributions| {
+            let mut removed = Vec::new();
+            contributions.retain(|key, event| {
+                let keep = key.session != session_id || key.invocation != invocation_id;
+                if !keep {
+                    removed.push(event.clone());
+                }
+                keep
+            });
+            removed
+        },
+    );
+    for mut event in removed {
+        event.sequence = event.sequence.saturating_add(1);
+        event.operation = bcode_session_models::ToolContributionOperation::Remove;
+        event.payload = serde_json::Value::Null;
         state
             .sessions
             .publish_live_event(session_id, SessionLiveEventKind::ToolContribution { event })
             .await;
+    }
+}
+
+fn contribution_artifact_stream_event(
+    event: &ToolContributionEvent,
+) -> Option<ToolInvocationStreamEvent> {
+    let artifact = event.artifact.as_ref()?;
+    Some(ToolInvocationStreamEvent::ArtifactUpdate {
+        tool_call_id: event.invocation_id.clone(),
+        sequence: event.sequence,
+        artifact_id: artifact.artifact_id.clone(),
+        reference_key: artifact.reference_key.clone(),
+        producer_plugin_id: event.producer_id.clone(),
+        schema: event.schema.clone(),
+        schema_version: event.schema_version,
+        content_type: artifact.content_type.clone(),
+        storage_uri: artifact.storage_uri.clone(),
+        committed_bytes: artifact.committed_bytes,
+        revision: artifact.revision,
+        availability: None,
+        finalized: artifact.finalized,
+    })
+}
+
+async fn append_tool_contribution_event(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+    producer_id: &str,
+    event: bcode_session_models::ToolContributionEvent,
+) {
+    if event.invocation_id != invocation_id || event.producer_id != producer_id {
+        tracing::warn!(
+            expected_invocation_id = invocation_id,
+            actual_invocation_id = event.invocation_id,
+            expected_producer_id = producer_id,
+            actual_producer_id = event.producer_id,
+            "discarded tool contribution with mismatched invocation or producer identity"
+        );
+        return;
+    }
+    if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
+        if let Some(artifact_event) = contribution_artifact_stream_event(&event)
+            && let Err(error) =
+                update_active_artifact(state, session_id, &artifact_event, Some(event.clone()))
+        {
+            tracing::warn!(%error, "discarded tool contribution with invalid artifact revision");
+            return;
+        }
+        match update_active_contribution(state, session_id, &event) {
+            Ok(true) => {
+                state
+                    .sessions
+                    .publish_live_event(
+                        session_id,
+                        SessionLiveEventKind::ToolContribution { event },
+                    )
+                    .await;
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "discarded invalid active tool contribution"),
+        }
         return;
     }
     match state
@@ -16472,62 +16623,12 @@ async fn resolve_interactive_tool_request(
     .await)
 }
 
-async fn handle_interactive_tool_request(
-    state: &ServerState,
-    session_id: SessionId,
-    call: &bcode_model::ToolCall,
-    plugin_id: &str,
-    request: bcode_tool::InteractiveToolRequest,
-    cancel_state: &TurnCancelState,
-) -> Result<ToolInvocationResponse, String> {
-    if request.interaction_id.is_empty() {
-        return Ok(tool_error(
-            "interactive tool request missing interaction_id",
-        ));
-    }
-    if request.turn_behavior
-        == bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction
-    {
-        return Ok(tool_error(
-            "interactive turn behavior not supported yet: complete_turn_with_pending_interaction",
-        ));
-    }
-
-    let resolution = resolve_interactive_tool_request(
-        state,
-        session_id,
-        call,
-        plugin_id,
-        &request,
-        cancel_state,
-    )
-    .await?;
-    let resume = InteractiveToolResumeRequest {
-        tool_call_id: call.id.clone(),
-        tool_name: call.name.clone(),
-        interaction_id: request.interaction_id.clone(),
-        original_arguments: call.arguments.clone(),
-        interactive_request: request,
-        resolution,
-    };
-    state
-        .plugins
-        .invoke_service_json_scoped::<_, ToolInvocationResponse>(
-            plugin_id,
-            TOOL_SERVICE_INTERFACE_ID,
-            OP_RESUME_INTERACTIVE_TOOL,
-            &resume,
-            active_plugin_scope_for_tool_call(state, session_id, &call.id).await,
-        )
-        .await
-        .map_err(|error| error.to_string())
-}
-
 #[allow(clippy::too_many_lines)] // Validates and commits one complete active-artifact state transition.
 fn update_active_artifact(
     state: &ServerState,
     session_id: SessionId,
     event: &ToolInvocationStreamEvent,
+    contribution_snapshot: Option<ToolContributionEvent>,
 ) -> Result<(), String> {
     let ToolInvocationStreamEvent::ArtifactUpdate {
         tool_call_id,
@@ -16628,6 +16729,7 @@ fn update_active_artifact(
             revision: *revision,
             finalized: *finalized,
             abandoned: false,
+            contribution_snapshot,
         },
     );
     drop(artifacts);
@@ -16645,11 +16747,21 @@ fn active_artifact_snapshot_events(
     let mut events = artifacts
         .iter()
         .filter(|(key, _)| key.session_id == session_id)
-        .map(|(key, artifact)| bcode_session_models::SessionLiveEvent {
-            session_id,
-            kind: SessionLiveEventKind::ToolOutputDelta {
-                event: artifact.stream_event(key),
-            },
+        .map(|(key, artifact)| {
+            artifact.contribution_snapshot.as_ref().map_or_else(
+                || bcode_session_models::SessionLiveEvent {
+                    session_id,
+                    kind: SessionLiveEventKind::ToolOutputDelta {
+                        event: artifact.stream_event(key),
+                    },
+                },
+                |event| bcode_session_models::SessionLiveEvent {
+                    session_id,
+                    kind: SessionLiveEventKind::ToolContribution {
+                        event: event.clone(),
+                    },
+                },
+            )
         })
         .collect::<Vec<_>>();
     drop(artifacts);
@@ -16729,7 +16841,7 @@ async fn append_tool_stream_event(
         return;
     }
     if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
-        if let Err(error) = update_active_artifact(state, session_id, &event) {
+        if let Err(error) = update_active_artifact(state, session_id, &event, None) {
             tracing::warn!("failed to update active artifact: {error}");
             return;
         }
@@ -18063,6 +18175,7 @@ async fn append_tool_invocation_terminal_event(
         },
     )
     .await;
+    clear_active_contributions(state, session_id, invocation_id).await;
 }
 
 async fn append_tool_request_event(
@@ -19189,12 +19302,15 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
     )
 }
 
-async fn send_active_artifact_snapshots(
+async fn send_active_runtime_snapshots(
     state: &ServerState,
     session_id: SessionId,
     sink: &ClientEventSink,
 ) -> Result<(), CodecError> {
     for event in active_artifact_snapshot_events(state, session_id).unwrap_or_default() {
+        sink.send(Event::SessionLive(event)).await?;
+    }
+    for event in active_contribution_snapshot_events(state, session_id).unwrap_or_default() {
         sink.send(Event::SessionLive(event)).await?;
     }
     Ok(())
@@ -20799,7 +20915,7 @@ library = "test"
             availability: None,
             finalized: false,
         };
-        update_active_artifact(&state, session_id, &update).expect("register artifact");
+        update_active_artifact(&state, session_id, &update, None).expect("register artifact");
 
         let snapshots = active_artifact_snapshot_events(&state, session_id).expect("snapshots");
         assert_eq!(snapshots.len(), 1);
@@ -20833,7 +20949,7 @@ library = "test"
         assert!(!finalized);
         assert_eq!(bytes, b"committed");
 
-        assert!(update_active_artifact(&state, session_id, &update).is_err());
+        assert!(update_active_artifact(&state, session_id, &update, None).is_err());
         let mut wrong_owner = update.clone();
         if let ToolInvocationStreamEvent::ArtifactUpdate {
             producer_plugin_id,
@@ -20844,7 +20960,7 @@ library = "test"
             *producer_plugin_id = "other.plugin".to_owned();
             *revision = 2;
         }
-        assert!(update_active_artifact(&state, session_id, &wrong_owner).is_err());
+        assert!(update_active_artifact(&state, session_id, &wrong_owner, None).is_err());
 
         let mut finalized = update.clone();
         if let ToolInvocationStreamEvent::ArtifactUpdate {
@@ -20858,7 +20974,7 @@ library = "test"
             *committed_bytes = 20;
             *is_finalized = true;
         }
-        update_active_artifact(&state, session_id, &finalized).expect("finalize artifact");
+        update_active_artifact(&state, session_id, &finalized, None).expect("finalize artifact");
         drop(registration);
         assert_eq!(
             active_artifact_snapshot_events(&state, session_id)
@@ -20967,6 +21083,7 @@ library = "test"
                 availability: None,
                 finalized: true,
             },
+            None,
         )
         .expect("finalized live artifact");
         assert_eq!(
@@ -21091,6 +21208,7 @@ library = "test"
                 availability: None,
                 finalized: false,
             },
+            None,
         )
         .expect("active artifact");
         drop(registration);
@@ -22205,7 +22323,6 @@ library = "test"
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: Some(ServiceToolInvocationResult::Artifact {
                 artifact: Box::new(bcode_tool::ToolArtifact {
                     artifact_id: "call-test-shell-run".to_string(),
@@ -25222,6 +25339,7 @@ library = "test"
                         schema_version: 99,
                         operation: bcode_session_models::ToolContributionOperation::Upsert,
                         persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        artifact: None,
                         payload: serde_json::json!({"private": "CONTRIBUTION_PRIVATE"}),
                     },
                 },
@@ -25565,6 +25683,25 @@ library = "test"
             &[plugin],
         )
         .expect("load shell plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state
+    }
+
+    fn test_server_state_with_vim_edit_plugin(sessions: SessionManager) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),
+            bcode_vim_edit_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.vim-edit".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load Vim edit plugin");
         let mut state = test_server_state(sessions);
         state.plugins = plugins;
         state
@@ -25987,6 +26124,10 @@ library = "test"
             .await
             .expect("shell contribution session")
             .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("shell contribution session should attach");
         let mut state = test_server_state_with_shell_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
         let result = execute_model_tool(
@@ -26008,6 +26149,31 @@ library = "test"
         .await
         .expect("shell contribution result");
         assert!(!result.is_error, "{:?}", result.content);
+        let mut saw_recording_contribution = false;
+        while let Ok(live) = attachment.live_events.try_recv() {
+            match live.kind {
+                SessionLiveEventKind::ToolContribution { event }
+                    if event.contribution_id == "shell-recording" =>
+                {
+                    saw_recording_contribution |= event.artifact.is_some();
+                }
+                SessionLiveEventKind::ToolOutputDelta {
+                    event: ToolInvocationStreamEvent::ArtifactUpdate { .. },
+                } => panic!("shell emitted legacy artifact-update stream"),
+                _ => {}
+            }
+        }
+        assert!(saw_recording_contribution);
+        assert!(
+            active_artifact_snapshot_events(&state, session_id)
+                .expect("shell reattach artifact snapshot")
+                .iter()
+                .any(|snapshot| matches!(
+                    &snapshot.kind,
+                    SessionLiveEventKind::ToolContribution { event }
+                        if event.contribution_id == "shell-recording" && event.artifact.is_some()
+                ))
+        );
 
         let history = state
             .sessions
@@ -26017,7 +26183,11 @@ library = "test"
         let contribution = history
             .iter()
             .find_map(|event| match &event.kind {
-                SessionEventKind::ToolContribution { event } => Some(event),
+                SessionEventKind::ToolContribution { event }
+                    if event.schema == "bcode.shell.run.summary" =>
+                {
+                    Some(event)
+                }
                 _ => None,
             })
             .expect("durable shell contribution");
@@ -26040,6 +26210,91 @@ library = "test"
                         .message
                         .as_deref()
                         .is_some_and(|message| message.contains("starting command"))
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_completes_vim_preview_with_durable_playback_without_interaction() {
+        if std::process::Command::new("nvim")
+            .arg("--version")
+            .output()
+            .map_or(true, |output| !output.status.success())
+        {
+            eprintln!("skipping Vim preview server test because `nvim` is unavailable");
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("Vim preview workspace");
+        let file = workspace.path().join("preview.txt");
+        std::fs::write(&file, "foo").expect("write preview source");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent Vim preview sessions");
+        let session_id = sessions
+            .create_session(
+                Some("Vim preview contribution".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("Vim preview session")
+            .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("Vim preview session should attach");
+        let mut state = test_server_state_with_vim_edit_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+
+        let result = execute_model_tool(
+            &state,
+            session_id,
+            bcode_model::ToolCall {
+                id: "vim-preview".to_owned(),
+                name: "vim_edit.preview".to_owned(),
+                arguments: serde_json::json!({
+                    "path": file,
+                    "steps": [{"ex": "%s/foo/bar/"}]
+                }),
+            },
+            workspace.path().to_path_buf(),
+            "bcode.vim-edit".to_owned(),
+            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Read {
+                paths: vec![workspace.path().display().to_string()],
+            }),
+            Arc::new(TurnCancelState::default()),
+            None,
+        )
+        .await
+        .expect("Vim preview result");
+
+        assert!(!result.is_error, "{}", result.result);
+        assert_eq!(std::fs::read_to_string(&file).expect("read source"), "foo");
+        assert!(state.pending_interactive_tools.lock().await.is_empty());
+        let mut saw_live_contribution = false;
+        while let Ok(live) = attachment.live_events.try_recv() {
+            if matches!(
+                live.kind,
+                SessionLiveEventKind::ToolContribution { event }
+                    if event.invocation_id == "vim-preview"
+                        && event.schema == "bcode.vim-edit.live"
+                        && event.sequence >= 1
+            ) {
+                saw_live_contribution = true;
+            }
+        }
+        assert!(saw_live_contribution);
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("Vim preview history");
+        assert!(history.iter().any(|entry| matches!(
+            &entry.kind,
+            SessionEventKind::ToolContribution { event }
+                if event.invocation_id == "vim-preview"
+                    && event.contribution_id == "playback"
+                    && event.schema == "bcode.vim-edit.playback"
+                    && event.persistence
+                        == bcode_session_models::ToolContributionPersistence::Durable
         )));
     }
 
@@ -27747,7 +28002,6 @@ library = "test"
             .expect("question task joins")
             .expect("question invocation succeeds");
         assert!(!response.is_error);
-        assert!(response.host_action.is_none());
         assert!(response.output.contains("Answered"));
         assert!(state.pending_interactive_tools.lock().await.is_empty());
         let history = state
@@ -27994,6 +28248,7 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One active-envelope test covers validation, ordering, replay, and removal.
     async fn transient_contribution_is_published_live_only_with_verified_identity() {
         let sessions = SessionManager::default();
         let session_id = sessions
@@ -28015,10 +28270,18 @@ library = "test"
             schema_version: 1,
             operation: bcode_session_models::ToolContributionOperation::Upsert,
             persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
             payload: serde_json::json!({"live": true}),
         };
 
-        append_tool_contribution_event(&state, session_id, "call-1", contribution.clone()).await;
+        append_tool_contribution_event(
+            &state,
+            session_id,
+            "call-1",
+            "test.plugin",
+            contribution.clone(),
+        )
+        .await;
         assert_eq!(
             attachment
                 .live_events
@@ -28040,8 +28303,77 @@ library = "test"
                 .any(|event| matches!(event.kind, SessionEventKind::ToolContribution { .. }))
         );
 
-        append_tool_contribution_event(&state, session_id, "other-call", contribution).await;
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("active contribution snapshot"),
+            vec![bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolContribution {
+                    event: contribution.clone(),
+                },
+            }]
+        );
+        append_tool_contribution_event(
+            &state,
+            session_id,
+            "call-1",
+            "test.plugin",
+            contribution.clone(),
+        )
+        .await;
         assert!(attachment.live_events.try_recv().is_err());
+
+        let mut updated = contribution.clone();
+        updated.sequence = 2;
+        updated.payload = serde_json::json!({"live": "updated"});
+        append_tool_contribution_event(
+            &state,
+            session_id,
+            "call-1",
+            "wrong.plugin",
+            updated.clone(),
+        )
+        .await;
+        assert!(attachment.live_events.try_recv().is_err());
+        append_tool_contribution_event(
+            &state,
+            session_id,
+            "call-1",
+            "test.plugin",
+            updated.clone(),
+        )
+        .await;
+        assert_eq!(
+            attachment
+                .live_events
+                .recv()
+                .await
+                .expect("updated contribution")
+                .kind,
+            SessionLiveEventKind::ToolContribution { event: updated }
+        );
+
+        append_tool_contribution_event(
+            &state,
+            session_id,
+            "other-call",
+            "test.plugin",
+            contribution,
+        )
+        .await;
+        assert!(attachment.live_events.try_recv().is_err());
+        clear_active_contributions(&state, session_id, "call-1").await;
+        assert!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("cleared snapshots")
+                .is_empty()
+        );
+        assert!(matches!(
+            attachment.live_events.recv().await.expect("terminal removal").kind,
+            SessionLiveEventKind::ToolContribution { event }
+                if event.operation == bcode_session_models::ToolContributionOperation::Remove
+                    && event.sequence == 3
+        ));
     }
 
     #[tokio::test]

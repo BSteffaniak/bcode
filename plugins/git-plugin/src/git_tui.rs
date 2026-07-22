@@ -128,6 +128,32 @@ mod tests {
     }
 
     #[test]
+    fn renders_clone_request_from_generic_contribution_payload() {
+        let payload = serde_json::json!({
+            "url": "https://github.com/bmorphism/bcode",
+            "ref": "main",
+            "destination": "/tmp/bcode"
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &GitTuiVisualAdapter,
+            "bcode.git.clone_request",
+            &payload,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("Clone repository"), "{rendered}");
+        assert!(
+            rendered.contains("github.com/bmorphism/bcode"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("main"), "{rendered}");
+    }
+
+    #[test]
     fn renders_clone_result() {
         let payload = serde_json::json!({
             "host": "github.com",

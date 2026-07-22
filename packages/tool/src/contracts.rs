@@ -203,6 +203,7 @@ mod tests {
             schema_version: 7,
             operation: ToolContributionOperation::Upsert,
             persistence: ToolContributionPersistence::Durable,
+            artifact: None,
             payload: serde_json::json!({"opaque": [1, 2, 3]}),
         };
 

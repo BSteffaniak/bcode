@@ -117,6 +117,7 @@ pub fn tui_registry(plugin_id: &str) -> Option<PluginTuiRegistry> {
     #[cfg(test)]
     let registry = registry.or_else(|| match plugin_id {
         "bcode.filesystem" => Some(bcode_filesystem_plugin::filesystem_tui_registry()),
+        "bcode.git" => Some(bcode_git_plugin::git_tui_registry()),
         "bcode.question" => Some(bcode_question_plugin::question_tui_registry()),
         "bcode.shell" => Some(bcode_shell_plugin::shell_tui_registry()),
         _ => None,
@@ -268,6 +269,49 @@ mod tests {
         .expect("select test plugin");
         let host = PluginHost::load_static_plugins(&selected).expect("load test plugin");
         PluginTuiPresentation::new(host)
+    }
+
+    #[test]
+    fn git_contribution_schema_routes_through_platform_registry() {
+        let bundled = [StaticBundledPlugin::new(
+            include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
+            bcode_git_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("select Git plugin");
+        let presentation = PluginTuiPresentation::new(
+            PluginHost::load_static_plugins(&selected).expect("load Git plugin"),
+        );
+        let route = presentation
+            .host()
+            .visual_adapter("bcode.git.clone_request", 1, "tui", Some("bcode.git"))
+            .expect("Git contribution route");
+        assert_eq!(route.plugin_id, "bcode.git");
+        let registry = presentation.registry("bcode.git").expect("Git registry");
+        let rows = registry
+            .visual_rows(
+                "bcode.git.clone_request",
+                &serde_json::json!({
+                    "url": "https://github.com/bmorphism/bcode",
+                    "ref": "main"
+                }),
+                &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                    80,
+                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                    None,
+                ),
+            )
+            .expect("Git contribution rows");
+        let rendered = rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(rendered.contains("github.com/bmorphism/bcode"));
+        assert!(rendered.contains("main"));
     }
 
     #[test]

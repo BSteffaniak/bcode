@@ -128,6 +128,11 @@ pub enum TranscriptItemKind {
     Skill,
     /// Skill failure note.
     SkillError,
+    /// Generic schema-versioned tool contribution.
+    ToolContribution {
+        /// Opaque contribution envelope.
+        contribution: Box<bcode_session_models::ToolContributionEvent>,
+    },
     /// Generic fallback item.
     Generic,
 }
@@ -181,6 +186,7 @@ pub const fn tool_surface_for_item(item: &TranscriptItem) -> Option<(&str, ToolT
         | TranscriptItemKind::Meta
         | TranscriptItemKind::Skill
         | TranscriptItemKind::SkillError
+        | TranscriptItemKind::ToolContribution { .. }
         | TranscriptItemKind::Generic => None,
     }
 }
@@ -319,9 +325,16 @@ impl TranscriptItem {
         &self.text
     }
 
-    /// Replace display text.
-    pub fn replace_text(&mut self, text: String) {
-        self.text = text;
+    /// Replace an opaque contribution envelope and its generic fallback text.
+    pub fn replace_tool_contribution(
+        &mut self,
+        contribution: bcode_session_models::ToolContributionEvent,
+    ) {
+        self.text = serde_json::to_string_pretty(&contribution)
+            .unwrap_or_else(|_| contribution.payload.to_string());
+        self.kind = TranscriptItemKind::ToolContribution {
+            contribution: Box::new(contribution),
+        };
         self.bump_revision();
     }
 
@@ -757,6 +770,24 @@ fn tool_timing_from_artifact(artifact: &ToolArtifact) -> ToolTiming {
             .and_then(serde_json::Value::as_bool),
         ..ToolTiming::default()
     }
+}
+
+/// Build a renderer-neutral transcript item for an opaque tool contribution.
+#[must_use]
+pub fn tool_contribution_item(
+    contribution: &bcode_session_models::ToolContributionEvent,
+    streaming: bool,
+) -> TranscriptItem {
+    let text = serde_json::to_string_pretty(contribution)
+        .unwrap_or_else(|_| contribution.payload.to_string());
+    TranscriptItem::with_kind(
+        "Tool contribution",
+        text,
+        streaming,
+        TranscriptItemKind::ToolContribution {
+            contribution: Box::new(contribution.clone()),
+        },
+    )
 }
 
 /// Build an interactive tool request item.

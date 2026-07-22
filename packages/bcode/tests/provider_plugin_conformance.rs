@@ -64,7 +64,6 @@ async fn static_provider_adapter_conforms_for_multiple_calls_and_sequential_fall
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })
@@ -74,7 +73,6 @@ async fn static_provider_adapter_conforms_for_multiple_calls_and_sequential_fall
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })
@@ -114,7 +112,6 @@ async fn static_provider_adapter_conforms_for_multiple_calls_and_sequential_fall
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })
@@ -124,7 +121,6 @@ async fn static_provider_adapter_conforms_for_multiple_calls_and_sequential_fall
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })

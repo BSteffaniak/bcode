@@ -170,7 +170,6 @@ fn bridge_tool_response(context: &NativeServiceContext, invocation_id: &str) -> 
         is_error: false,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     })
     .unwrap_or_else(|error| {

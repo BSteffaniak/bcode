@@ -65,6 +65,7 @@ bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_vim_edit_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_web_render = { workspace = true, features = [
     "actix",
     "assets",

@@ -4939,24 +4939,33 @@ async fn live_shell_recording_chunk_renders_through_active_request_visual() {
     let mut coordinator = super::artifact_stream::ArtifactStreamCoordinator::new(
         bcode_client::BcodeClient::new(endpoint),
     );
-    coordinator.observe_live_event(
-        session_id,
-        &ToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id: "call-live-shell".to_owned(),
-            sequence: 2,
+    let contribution = bcode_session_models::ToolContributionEvent {
+        invocation_id: "call-live-shell".to_owned(),
+        contribution_id: "shell-recording".to_owned(),
+        sequence: 2,
+        producer_id: "bcode.shell".to_owned(),
+        schema: "bcode.shell.run".to_owned(),
+        schema_version: 1,
+        operation: bcode_session_models::ToolContributionOperation::Upsert,
+        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+        artifact: Some(bcode_session_models::ToolContributionArtifact {
             artifact_id: "call-live-shell-shell-run".to_owned(),
             reference_key: "shell_recording".to_owned(),
-            producer_plugin_id: "bcode.shell".to_owned(),
-            schema: "bcode.shell.run".to_owned(),
-            schema_version: 1,
             content_type: Some("application/x-bcode-shell-recording; version=3".to_owned()),
             storage_uri: String::new(),
             committed_bytes: u64::try_from(bytes.len()).expect("recording length"),
             revision: 2,
-            availability: None,
             finalized: false,
+        }),
+        payload: serde_json::json!({"mode": "terminal"}),
+    };
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolContribution {
+            event: contribution.clone(),
         },
-    );
+    });
+    coordinator.observe_contribution(session_id, &contribution);
     let completion = tokio::time::timeout(Duration::from_secs(1), coordinator.next_completion())
         .await
         .expect("artifact fetch timeout")

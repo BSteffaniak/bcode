@@ -58,6 +58,17 @@ static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
                 render_shell_request as VisualAdapter,
             ),
             (("bcode.filesystem.request", 1), structured),
+            (("bcode.filesystem.change", 1), structured),
+            (("bcode.filesystem.read", 1), structured),
+            (("bcode.filesystem.image", 1), structured),
+            (("bcode.filesystem.exists", 1), structured),
+            (("bcode.filesystem.list", 1), structured),
+            (("bcode.filesystem.find", 1), structured),
+            (("bcode.filesystem.grep", 1), structured),
+            (("bcode.filesystem.stat", 1), structured),
+            (("bcode.filesystem.artifact.metadata", 1), structured),
+            (("bcode.filesystem.artifact.read", 1), structured),
+            (("bcode.filesystem.artifact.grep", 1), structured),
             (("bcode.document.request", 1), structured),
             (("bcode.ocr.request", 1), structured),
             (("bcode.web-search.search_request", 1), structured),
@@ -65,7 +76,11 @@ static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
             (("bcode.web-search.status_request", 1), structured),
             (("bcode.web-search.inspect_request", 1), structured),
             (("bcode.git.clone_request", 1), structured),
+            (("bcode.git.clone_result", 1), structured),
             (("bcode.worktree.request", 1), structured),
+            (("bcode.worktree.list", 1), structured),
+            (("bcode.worktree.create_result", 1), structured),
+            (("bcode.worktree.remove_result", 1), structured),
             (("bcode.vim-edit.request.preview", 1), structured),
             (("bcode.vim-edit.request.apply", 1), structured),
             (("bcode.vim-edit.live", 1), structured),
@@ -676,7 +691,7 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
                     (render_plugin_visual("request visual", visual))
                 }
                 @if let Some(result) = &tool.result {
-                    (json_panel("semantic result", &serde_json::to_value(result).unwrap_or(serde_json::Value::Null)))
+                    (render_tool_result(result))
                 }
             }
         },
@@ -712,9 +727,40 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
             render_plugin_visual("plugin visual", visual)
         }
         TranscriptViewItemKind::ToolContribution { contribution } => {
-            let fallback = serde_json::to_value(contribution).unwrap_or(serde_json::Value::Null);
-            json_panel("tool contribution", &fallback)
+            let visual = PluginVisualView::from(bcode_session_models::PluginVisualDescriptor {
+                visual_id: Some(format!(
+                    "{}-{}",
+                    contribution.invocation_id, contribution.contribution_id
+                )),
+                producer_plugin_id: Some(contribution.producer_id.clone()),
+                schema: contribution.schema.clone(),
+                schema_version: contribution.schema_version,
+                title: Some("Tool contribution".to_owned()),
+                subtitle: None,
+                payload: contribution.payload.clone(),
+            });
+            render_plugin_visual("tool contribution", &visual)
         }
+    }
+}
+
+fn render_tool_result(result: &bcode_session_view_models::ToolResultView) -> Containers {
+    if let bcode_session_view_models::ToolResultView::Artifact { artifact } = result {
+        let visual = PluginVisualView::from(bcode_session_models::PluginVisualDescriptor {
+            visual_id: Some(artifact.artifact.artifact_id.clone()),
+            producer_plugin_id: Some(artifact.artifact.producer_plugin_id.clone()),
+            schema: artifact.artifact.schema.clone(),
+            schema_version: artifact.artifact.schema_version,
+            title: artifact.artifact.title.clone(),
+            subtitle: None,
+            payload: artifact.artifact.metadata.clone(),
+        });
+        render_plugin_visual("semantic result", &visual)
+    } else {
+        json_panel(
+            "semantic result",
+            &serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
+        )
     }
 }
 
@@ -1028,6 +1074,17 @@ mod tests {
     fn bundled_visual_registry_covers_actual_high_value_request_schemas() {
         for schema in [
             "bcode.filesystem.request",
+            "bcode.filesystem.change",
+            "bcode.filesystem.read",
+            "bcode.filesystem.image",
+            "bcode.filesystem.exists",
+            "bcode.filesystem.list",
+            "bcode.filesystem.find",
+            "bcode.filesystem.grep",
+            "bcode.filesystem.stat",
+            "bcode.filesystem.artifact.metadata",
+            "bcode.filesystem.artifact.read",
+            "bcode.filesystem.artifact.grep",
             "bcode.document.request",
             "bcode.ocr.request",
             "bcode.web-search.search_request",
@@ -1035,7 +1092,11 @@ mod tests {
             "bcode.web-search.status_request",
             "bcode.web-search.inspect_request",
             "bcode.git.clone_request",
+            "bcode.git.clone_result",
             "bcode.worktree.request",
+            "bcode.worktree.list",
+            "bcode.worktree.create_result",
+            "bcode.worktree.remove_result",
             "bcode.vim-edit.request.preview",
             "bcode.vim-edit.request.apply",
             "bcode.vim-edit.live",
@@ -1134,6 +1195,7 @@ mod tests {
                 schema_version: 77,
                 operation: bcode_session_models::ToolContributionOperation::Append,
                 persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                artifact: None,
                 payload: serde_json::json!({"sentinel": "opaque-web"}),
             },
         };
@@ -1141,6 +1203,32 @@ mod tests {
         assert!(rendered.contains("future.unknown/schema"));
         assert!(rendered.contains("opaque-web"));
         assert!(rendered.contains("append"));
+    }
+
+    #[test]
+    fn git_contribution_renders_through_schema_adapter_and_keeps_fallback() {
+        let kind = TranscriptViewItemKind::ToolContribution {
+            contribution: bcode_session_models::ToolContributionEvent {
+                invocation_id: "git-call".to_owned(),
+                contribution_id: "clone-request".to_owned(),
+                sequence: 1,
+                producer_id: "bcode.git".to_owned(),
+                schema: "bcode.git.clone_request".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                artifact: None,
+                payload: serde_json::json!({
+                    "url": "https://github.com/bmorphism/bcode",
+                    "ref": "main"
+                }),
+            },
+        };
+
+        let rendered = format!("{:?}", transcript_item_body(&kind));
+        assert!(rendered.contains("github.com/bmorphism/bcode"));
+        assert!(rendered.contains("main"));
+        assert!(rendered.contains("bcode.git.clone_request"));
     }
 
     #[test]
@@ -1155,6 +1243,7 @@ mod tests {
                 schema_version: 1,
                 operation: bcode_session_models::ToolContributionOperation::Upsert,
                 persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                artifact: None,
                 payload: serde_json::json!({"output": "shell-render-sentinel"}),
             },
         };

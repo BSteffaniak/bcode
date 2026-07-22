@@ -1425,6 +1425,7 @@ mod tests {
             schema_version: 9,
             operation: bcode_tool::ToolContributionOperation::Upsert,
             persistence,
+            artifact: None,
             payload: serde_json::json!({"unknown": [1, 2, 3]}),
         })
     }
@@ -1684,6 +1685,7 @@ mod tests {
             schema_version: 1,
             operation: bcode_tool::ToolContributionOperation::Upsert,
             persistence: bcode_tool::ToolContributionPersistence::Transient,
+            artifact: None,
             payload: serde_json::Value::Null,
         };
 
@@ -1918,6 +1920,7 @@ mod tests {
             schema_version: 1,
             operation: bcode_tool::ToolContributionOperation::Upsert,
             persistence: bcode_tool::ToolContributionPersistence::Transient,
+            artifact: None,
             payload: serde_json::Value::Null,
         }));
         assert!(

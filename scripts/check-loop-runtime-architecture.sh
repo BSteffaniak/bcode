@@ -644,6 +644,138 @@ if ! grep -F 'generic_live_contribution_description_preserves_opaque_identity_an
   violations=1
 fi
 
+if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*Some|ToolInvocationStreamEvent' \
+  plugins/git-plugin/src --glob '*.rs' >/tmp/bcode-git-legacy-visuals.txt; then
+  echo "Runtime architecture violation: Git reintroduced legacy visual/stream production." >&2
+  cat /tmp/bcode-git-legacy-visuals.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'clone_request_uses_durable_generic_contribution_without_legacy_visual' plugins/git-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'renders_clone_request_from_generic_contribution_payload' plugins/git-plugin/src/git_tui.rs >/dev/null ||
+   ! grep -F 'TranscriptItemKind::ToolContribution { contribution }' packages/tui/src/render.rs >/dev/null; then
+  echo "Runtime architecture violation: generic Git contribution adapter coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*Some|ToolInvocationStreamEvent' \
+  plugins/worktree-plugin/src --glob '*.rs' >/tmp/bcode-worktree-legacy-visuals.txt; then
+  echo "Runtime architecture violation: Worktree reintroduced legacy visual/stream production." >&2
+  cat /tmp/bcode-worktree-legacy-visuals.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'worktree_requests_use_durable_generic_contributions_without_legacy_visuals' plugins/worktree-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'worktree_request_adapter_renders_generic_contribution_payload' plugins/worktree-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic Worktree contribution adapter coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*Some|ToolInvocationStreamEvent' \
+  plugins/filesystem-plugin/src --glob '*.rs' >/tmp/bcode-filesystem-legacy-visuals.txt; then
+  echo "Runtime architecture violation: Filesystem reintroduced legacy visual/stream production." >&2
+  cat /tmp/bcode-filesystem-legacy-visuals.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'filesystem_requests_use_durable_generic_contributions_without_legacy_visuals' plugins/filesystem-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'adapter_supports_raw_filesystem_change_artifact_schema' plugins/filesystem-plugin/src/file_change_tui.rs >/dev/null; then
+  echo "Runtime architecture violation: generic Filesystem contribution adapter coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*Some|ToolInvocationStreamEvent' \
+  plugins/document-plugin/src plugins/ocr-plugin/src plugins/web-search-plugin/src --glob '*.rs' \
+  >/tmp/bcode-neutral-request-producer-legacy.txt; then
+  echo "Runtime architecture violation: migrated Document/OCR/Web request producers reintroduced legacy visuals/streams." >&2
+  cat /tmp/bcode-neutral-request-producer-legacy.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'document_tools_remove_legacy_request_visuals' plugins/document-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ocr_tools_remove_legacy_request_visuals' plugins/ocr-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'web_tools_remove_legacy_request_visuals_and_map_request_schemas' plugins/web-search-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic Document/OCR/Web request coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*Some' \
+  plugins/shell-plugin/src --glob '*.rs' >/tmp/bcode-shell-legacy-request-visuals.txt; then
+  echo "Runtime architecture violation: Shell reintroduced legacy request visual production." >&2
+  cat /tmp/bcode-shell-legacy-request-visuals.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'shell_request_visual_is_generic_contribution_only' plugins/shell-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'contribution_id: "shell-run-request"' plugins/shell-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic Shell request contribution coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*Some' \
+  plugins/vim-edit-plugin/src --glob '*.rs' >/tmp/bcode-vim-edit-legacy-request-visuals.txt; then
+  echo "Runtime architecture violation: Vim-edit reintroduced legacy request visual production." >&2
+  cat /tmp/bcode-vim-edit-legacy-request-visuals.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'vim_edit_requests_remove_legacy_visuals_and_map_contribution_schemas' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'contribution_id: "request"' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic Vim-edit request contribution coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ToolInvocationStreamEvent|ToolStreamVisualUpdate|VisualUpdate' \
+  plugins/vim-edit-plugin/src/lib.rs >/tmp/bcode-vim-edit-legacy-streams.txt; then
+  echo "Runtime architecture violation: Vim-edit reintroduced legacy visual stream events." >&2
+  cat /tmp/bcode-vim-edit-legacy-streams.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'emit_vim_live_contribution' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ToolContributionPersistence::Transient' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic transient Vim-edit visual contributions were removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'emit_playback_contribution' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'contribution_id: "playback"' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'persistence: ToolContributionPersistence::Durable' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: durable Vim-edit playback contributions were removed." >&2
+  violations=1
+fi
+
+if rg -n 'InteractiveTool|OP_RESUME_INTERACTIVE_TOOL|ToolInvocationHostAction|vim_edit_interaction|tool\.vim-edit\.playback' \
+  plugins/vim-edit-plugin packages/bundled-plugins/src/lib.rs >/tmp/bcode-vim-edit-legacy-interaction.txt; then
+  echo "Runtime architecture violation: Vim-edit reintroduced its legacy pending-interaction/resume path." >&2
+  cat /tmp/bcode-vim-edit-legacy-interaction.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'active_contribution_snapshot_events' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'clear_active_contributions' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: bounded active transient contribution snapshots were removed." >&2
+  violations=1
+fi
+
+if grep -R -E 'ToolInvocationStreamEvent|ToolOutputStream|ArtifactUpdate' plugins/shell-plugin/src --include='*.rs' >/dev/null; then
+  echo "Runtime architecture violation: Shell plugin still emits legacy tool stream/artifact updates." >&2
+  violations=1
+fi
+
+if grep -R -E 'emit_tool_stream_event|ToolInvocationStreamEvent::(Started|OutputDelta|VisualUpdate|ArtifactUpdate|Status|Finished)' plugins --include='*.rs' >/dev/null; then
+  echo "Runtime architecture violation: a bundled plugin still writes a legacy tool stream event." >&2
+  violations=1
+fi
+
+if rg -n 'ToolInvocationHostAction|InteractiveToolResumeRequest|OP_RESUME_INTERACTIVE_TOOL' \
+  packages plugins examples --glob='*.rs' >/tmp/bcode-removed-tool-host-contracts.txt; then
+  echo "Runtime architecture violation: removed tool host-action/resume contracts were reintroduced." >&2
+  cat /tmp/bcode-removed-tool-host-contracts.txt >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

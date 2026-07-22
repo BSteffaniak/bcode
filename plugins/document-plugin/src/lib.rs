@@ -10,9 +10,9 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
-    ToolPluginVisualMetadata, ToolSideEffect, ToolVisualPayloadSelector,
+    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence, ToolDefinition,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -134,6 +134,14 @@ impl DocumentPlugin {
         if context.cancellation.is_cancelled() {
             return json_response(&tool_error("document tool cancelled".to_string()));
         }
+        emit_request_contribution(
+            context.events,
+            DOCUMENT_PLUGIN_ID,
+            DOCUMENT_REQUEST_SCHEMA,
+            &invocation.tool_call_id,
+            &invocation.name,
+            &invocation.arguments,
+        );
         let response = match invocation.name.as_str() {
             "document.extract" => self.invoke_extract(&invocation, context.events),
             "document.status" => invoke_status(&invocation.tool_call_id),
@@ -142,7 +150,6 @@ impl DocumentPlugin {
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             },
         };
@@ -570,10 +577,7 @@ fn extract_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("extracting".to_string()),
-            request_visual: Some(document_request_visual(
-                "extracting document text",
-                &["path", "url", "max_bytes", "timeout_ms"],
-            )),
+            request_visual: None
         },
     }
 }
@@ -591,38 +595,38 @@ fn status_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("checking document extractors".to_string()),
-            request_visual: Some(document_request_visual("checking document extractors", &[])),
+            request_visual: None,
         },
     }
 }
 
-fn document_request_visual(operation: &str, fields: &[&str]) -> ToolPluginVisualMetadata {
-    let mut payload = std::collections::BTreeMap::new();
+fn emit_request_contribution(
+    events: ServiceEventEmitter,
+    producer_id: &str,
+    schema: &str,
+    invocation_id: &str,
+    operation: &str,
+    arguments: &serde_json::Value,
+) {
+    let mut payload = arguments.as_object().cloned().unwrap_or_default();
     payload.insert(
-        "operation".to_string(),
-        ToolVisualPayloadSelector {
-            fields: Vec::new(),
-            literal: Some(serde_json::Value::String(operation.to_string())),
-            required: false,
-        },
+        "operation".to_owned(),
+        serde_json::Value::String(operation.to_owned()),
     );
-    for field in fields {
-        payload.insert(
-            (*field).to_string(),
-            ToolVisualPayloadSelector {
-                fields: vec![(*field).to_string()],
-                literal: None,
-                required: false,
-            },
-        );
-    }
-    ToolPluginVisualMetadata {
-        producer_plugin_id: Some(DOCUMENT_PLUGIN_ID.to_string()),
-        schema: DOCUMENT_REQUEST_SCHEMA.to_string(),
+    let event = ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "request".to_owned(),
+        sequence: 1,
+        producer_id: producer_id.to_owned(),
+        schema: schema.to_owned(),
         schema_version: 1,
-        title: Some("Document".to_string()),
-        subtitle: Some(format!("{operation} · {{bytes}}")),
-        payload,
+        operation: ToolContributionOperation::Upsert,
+        persistence: ToolContributionPersistence::Durable,
+        artifact: None,
+        payload: serde_json::Value::Object(payload),
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
     }
 }
 
@@ -685,7 +689,6 @@ fn json_tool_response_with_artifact<T: Serialize>(
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: Some(ToolInvocationResult::Artifact {
                 artifact: Box::new(ToolArtifact {
                     artifact_id: format!("{tool_call_id}-document-{artifact_suffix}"),
@@ -709,7 +712,6 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }
@@ -734,6 +736,17 @@ bcode_plugin_sdk::export_plugin!(DocumentPlugin, include_str!("../bcode-plugin.t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_tools_remove_legacy_request_visuals() {
+        for definition in [extract_tool_definition(), status_tool_definition()] {
+            assert!(
+                definition.ui.request_visual.is_none(),
+                "{}",
+                definition.name
+            );
+        }
+    }
 
     #[test]
     fn progress_uses_neutral_invocation_lifecycle_contract() {

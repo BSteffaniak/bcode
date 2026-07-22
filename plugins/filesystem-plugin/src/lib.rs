@@ -13,10 +13,10 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
-    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationLifecycleEvent,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolDefinition, ToolInvocationLifecycleEvent,
     ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList, ToolPluginVisualMetadata, ToolResultContent, ToolSideEffect,
-    ToolVisualPayloadSelector,
+    ToolInvocationResult, ToolList, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -414,109 +414,16 @@ fn compatibility_aliases_for(aliases: &[&str]) -> Vec<bcode_tool::ToolCompatibil
 fn path_tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        request_visual: Some(filesystem_request_visual(activity_label, &["path"])),
+        request_visual: None,
     }
 }
 
-fn filesystem_request_visual(
-    operation: &str,
-    argument_fields: &[&str],
-) -> ToolPluginVisualMetadata {
-    let mut payload = std::collections::BTreeMap::new();
-    payload.insert(
-        "operation".to_string(),
-        payload_selector(
-            &[],
-            Some(serde_json::Value::String(operation.to_string())),
-            false,
-        ),
-    );
-    for field in argument_fields {
-        payload.insert(
-            (*field).to_string(),
-            payload_selector(&[*field], None, false),
-        );
-    }
-    ToolPluginVisualMetadata {
-        producer_plugin_id: Some(FILESYSTEM_PLUGIN_ID.to_string()),
-        schema: FILESYSTEM_REQUEST_SCHEMA.to_string(),
-        schema_version: 1,
-        title: Some(format!("Filesystem {operation}")),
-        subtitle: Some(format!("{operation} {{path}} · {{bytes}}")),
-        payload,
-    }
+fn write_tool_ui(activity_label: &str, _preview_title: &str) -> bcode_tool::ToolUiMetadata {
+    path_tool_ui(activity_label)
 }
 
-fn payload_selector(
-    fields: &[&str],
-    literal: Option<serde_json::Value>,
-    required: bool,
-) -> ToolVisualPayloadSelector {
-    ToolVisualPayloadSelector {
-        fields: fields.iter().map(|field| (*field).to_string()).collect(),
-        literal,
-        required,
-    }
-}
-
-fn file_change_metadata(
-    title: &str,
-    old_text_fields: &[&str],
-    old_text_literal: Option<&str>,
-    old_text_required: bool,
-    new_text_fields: &[&str],
-) -> ToolPluginVisualMetadata {
-    let mut payload = std::collections::BTreeMap::new();
-    payload.insert("path".to_string(), payload_selector(&["path"], None, false));
-    payload.insert(
-        "old_text".to_string(),
-        payload_selector(
-            old_text_fields,
-            old_text_literal.map(|value| serde_json::Value::String(value.to_string())),
-            old_text_required,
-        ),
-    );
-    payload.insert(
-        "new_text".to_string(),
-        payload_selector(new_text_fields, None, true),
-    );
-    ToolPluginVisualMetadata {
-        schema: "bcode.filesystem.change".to_string(),
-        schema_version: 1,
-        producer_plugin_id: Some("bcode.filesystem".to_string()),
-        title: Some(title.to_string()),
-        subtitle: None,
-        payload,
-    }
-}
-
-fn write_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolUiMetadata {
-    bcode_tool::ToolUiMetadata {
-        activity_label: Some(activity_label.to_string()),
-        request_visual: Some({
-            let mut metadata = file_change_metadata(
-                preview_title,
-                &[],
-                Some(""),
-                false,
-                &["contents", "new_text"],
-            );
-            metadata.subtitle = Some(format!("{activity_label} {{path}} · {{bytes}}"));
-            metadata
-        }),
-    }
-}
-
-fn edit_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolUiMetadata {
-    bcode_tool::ToolUiMetadata {
-        activity_label: Some(activity_label.to_string()),
-        request_visual: Some({
-            let mut metadata =
-                file_change_metadata(preview_title, &["old_text"], None, false, &["new_text"]);
-            metadata.subtitle = Some(format!("{activity_label} {{path}} · {{bytes}}"));
-            metadata
-        }),
-    }
+fn edit_tool_ui(activity_label: &str, _preview_title: &str) -> bcode_tool::ToolUiMetadata {
+    path_tool_ui(activity_label)
 }
 
 fn read_tool_definition() -> ToolDefinition {
@@ -657,10 +564,7 @@ fn find_tool_definition() -> ToolDefinition {
         ),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("finding".to_string()),
-            request_visual: Some(filesystem_request_visual(
-                "finding",
-                &["path", "pattern", "max_results", "timeout_ms"],
-            )),
+            request_visual: None,
         },
     }
 }
@@ -690,17 +594,7 @@ fn grep_tool_definition() -> ToolDefinition {
         ),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("searching".to_string()),
-            request_visual: Some(filesystem_request_visual(
-                "searching",
-                &[
-                    "path",
-                    "pattern",
-                    "glob",
-                    "ignore_case",
-                    "max_matches",
-                    "timeout_ms",
-                ],
-            )),
+            request_visual: None,
         },
     }
 }
@@ -739,10 +633,7 @@ fn artifact_metadata_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("reading artifact metadata".to_string()),
-            request_visual: Some(filesystem_request_visual(
-                "reading artifact metadata",
-                &["path"],
-            )),
+            request_visual: None,
         },
     }
 }
@@ -766,10 +657,7 @@ fn artifact_read_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("reading artifact".to_string()),
-            request_visual: Some(filesystem_request_visual(
-                "reading artifact",
-                &["path", "offset_bytes", "max_bytes", "from_end"],
-            )),
+            request_visual: None
         },
     }
 }
@@ -794,11 +682,61 @@ fn artifact_grep_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("searching artifact".to_string()),
-            request_visual: Some(filesystem_request_visual(
-                "searching artifact",
-                &["path", "pattern", "ignore_case", "max_matches"],
-            )),
+            request_visual: None,
         },
+    }
+}
+
+fn filesystem_request_contribution(
+    invocation_id: &str,
+    operation: &str,
+    arguments: &serde_json::Value,
+) -> ToolContributionEvent {
+    let payload = arguments.as_object().map_or_else(
+        || json!({"operation": operation, "arguments": arguments}),
+        |arguments| {
+            let mut payload = arguments.clone();
+            payload.insert(
+                "operation".to_owned(),
+                serde_json::Value::String(operation.to_owned()),
+            );
+            serde_json::Value::Object(payload)
+        },
+    );
+    let (schema, payload) = if operation == "filesystem.write" {
+        let mut payload = payload;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "old_text".to_owned(),
+                serde_json::Value::String(String::new()),
+            );
+            if let Some(contents) = object.get("contents").cloned() {
+                object.insert("new_text".to_owned(), contents);
+            }
+        }
+        ("bcode.filesystem.change", payload)
+    } else if operation == "filesystem.edit" {
+        ("bcode.filesystem.change", payload)
+    } else {
+        (FILESYSTEM_REQUEST_SCHEMA, payload)
+    };
+    ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "filesystem-request".to_owned(),
+        sequence: 1,
+        producer_id: FILESYSTEM_PLUGIN_ID.to_owned(),
+        schema: schema.to_owned(),
+        schema_version: 1,
+        operation: ToolContributionOperation::Upsert,
+        persistence: ToolContributionPersistence::Durable,
+        artifact: None,
+        payload,
+    }
+}
+
+fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
+    if let Ok(payload) = serde_json::to_vec(event) {
+        events.emit(&payload);
     }
 }
 
@@ -814,11 +752,14 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         });
     }
     let cwd = request.cwd.clone();
+    emit_tool_contribution(
+        context.events,
+        &filesystem_request_contribution(&request.tool_call_id, &request.name, &request.arguments),
+    );
     let response = match request.name.as_str() {
         "filesystem.read" => tool_read(request.arguments, cwd.as_deref(), &request.tool_call_id),
         "filesystem.write" => tool_write(request.arguments, cwd.as_deref(), &request.tool_call_id),
@@ -862,7 +803,6 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         },
     };
@@ -918,7 +858,6 @@ fn text_tool_response(
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         };
     };
@@ -957,7 +896,6 @@ fn text_tool_response(
         is_error: false,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: Some(filesystem_artifact_result(
             tool_call_id,
             "read",
@@ -1051,7 +989,6 @@ fn tool_artifact_read(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             },
         },
@@ -1108,7 +1045,6 @@ fn tool_artifact_grep(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             },
         },
@@ -1212,7 +1148,6 @@ fn image_tool_response(
             },
         }],
         full_output: None,
-        host_action: None,
         result: Some(filesystem_artifact_result(
             tool_call_id,
             "image",
@@ -1315,7 +1250,6 @@ fn tool_write(
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
-                        host_action: None,
                         result: Some(file_change_artifact(
                             tool_call_id,
                             "filesystem.write",
@@ -1347,7 +1281,6 @@ fn tool_edit(
                     is_error: true,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 },
                 |(replacements, start_line)| {
@@ -1357,7 +1290,6 @@ fn tool_edit(
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
-                        host_action: None,
                         result: Some(file_change_artifact(
                             tool_call_id,
                             "filesystem.edit",
@@ -1390,7 +1322,6 @@ fn tool_exists(
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: Some(filesystem_artifact_result(
                     tool_call_id,
                     "exists",
@@ -2404,7 +2335,6 @@ fn tool_io_error(error: &std::io::Error) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }
@@ -2415,7 +2345,6 @@ fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }
@@ -2440,7 +2369,6 @@ where
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: Some(filesystem_artifact_result(
                 tool_call_id,
                 artifact_suffix,
@@ -2454,7 +2382,6 @@ where
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         },
     }
@@ -2526,57 +2453,42 @@ mod tests {
     }
 
     #[test]
-    fn write_and_edit_live_previews_use_file_change_plugin_view() {
-        assert_file_change_plugin_live_preview(
-            write_tool_definition().ui.request_visual,
-            &["contents", "new_text"],
-            Some(""),
-            false,
-        );
-        assert_file_change_plugin_live_preview(
-            edit_tool_definition().ui.request_visual,
-            &["new_text"],
-            None,
-            false,
-        );
-    }
-
-    fn assert_file_change_plugin_live_preview(
-        preview: Option<ToolPluginVisualMetadata>,
-        expected_new_text_fields: &[&str],
-        expected_old_text_literal: Option<&str>,
-        expected_old_text_required: bool,
-    ) {
-        let Some(view) = preview else {
-            panic!("expected request visual");
-        };
-        assert_eq!(view.producer_plugin_id.as_deref(), Some("bcode.filesystem"));
-        assert_eq!(view.schema, "bcode.filesystem.change");
-        assert_eq!(view.schema_version, 1);
-        assert!(view.subtitle.is_some());
+    fn filesystem_requests_use_durable_generic_contributions_without_legacy_visuals() {
+        for definition in [
+            read_tool_definition(),
+            write_tool_definition(),
+            edit_tool_definition(),
+            exists_tool_definition(),
+            list_tool_definition(),
+            find_tool_definition(),
+            grep_tool_definition(),
+            stat_tool_definition(),
+            artifact_metadata_tool_definition(),
+            artifact_read_tool_definition(),
+            artifact_grep_tool_definition(),
+        ] {
+            assert!(
+                definition.ui.request_visual.is_none(),
+                "{}",
+                definition.name
+            );
+        }
+        let arguments = serde_json::json!({"path": "src/lib.rs", "offset": 2});
+        let contribution = filesystem_request_contribution("call-1", "filesystem.read", &arguments);
+        assert_eq!(contribution.invocation_id, "call-1");
+        assert_eq!(contribution.producer_id, FILESYSTEM_PLUGIN_ID);
+        assert_eq!(contribution.schema, FILESYSTEM_REQUEST_SCHEMA);
         assert_eq!(
-            view.payload.get("path").expect("path selector").fields,
-            vec!["path".to_string()]
+            contribution.persistence,
+            ToolContributionPersistence::Durable
         );
-        assert_eq!(
-            view.payload
-                .get("new_text")
-                .expect("new_text selector")
-                .fields,
-            expected_new_text_fields
-                .iter()
-                .map(|field| (*field).to_string())
-                .collect::<Vec<_>>()
-        );
-        let old_text = view.payload.get("old_text").expect("old_text selector");
-        assert_eq!(old_text.required, expected_old_text_required);
-        assert_eq!(
-            old_text
-                .literal
-                .as_ref()
-                .and_then(serde_json::Value::as_str),
-            expected_old_text_literal
-        );
+        assert_eq!(contribution.payload["operation"], "filesystem.read");
+        assert_eq!(contribution.payload["path"], "src/lib.rs");
+        let write_arguments = serde_json::json!({"path": "new.rs", "contents": "fn main() {}"});
+        let write = filesystem_request_contribution("call-2", "filesystem.write", &write_arguments);
+        assert_eq!(write.schema, "bcode.filesystem.change");
+        assert_eq!(write.payload["old_text"], "");
+        assert_eq!(write.payload["new_text"], "fn main() {}");
     }
 
     #[test]

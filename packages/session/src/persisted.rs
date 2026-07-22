@@ -1800,6 +1800,7 @@ mod tests {
                     schema_version: 7,
                     operation: bcode_session_models::ToolContributionOperation::Upsert,
                     persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
                     payload: serde_json::json!({"opaque": [1, 2, 3]}),
                 },
             },

@@ -46,6 +46,27 @@ pub enum ToolContributionPersistence {
     Durable,
 }
 
+/// Generic revision metadata for one artifact attached to a renderer contribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolContributionArtifact {
+    /// Producer-assigned artifact identifier unique within the invocation.
+    pub artifact_id: String,
+    /// Stable reference key within the artifact.
+    pub reference_key: String,
+    /// Optional media type for the referenced bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Opaque host-readable storage reference.
+    pub storage_uri: String,
+    /// Byte prefix committed and safe for bounded range reads.
+    pub committed_bytes: u64,
+    /// Monotonic artifact revision.
+    pub revision: u64,
+    /// Whether no later bytes will be appended.
+    #[serde(default)]
+    pub finalized: bool,
+}
+
 /// Schema-versioned renderer contribution emitted by a tool owner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolContributionEvent {
@@ -65,6 +86,9 @@ pub struct ToolContributionEvent {
     pub operation: ToolContributionOperation,
     /// Whether the opaque envelope is transient or durable.
     pub persistence: ToolContributionPersistence,
+    /// Optional generic artifact revision consumed through the host artifact capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ToolContributionArtifact>,
     /// Opaque renderer payload interpreted outside core orchestration.
     pub payload: serde_json::Value,
 }
@@ -175,4 +199,56 @@ pub struct ToolInvocationLifecycleEvent {
     /// Optional structured producer metadata.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub metadata: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contribution_without_artifact_remains_decode_compatible() {
+        let contribution: ToolContributionEvent = serde_json::from_value(serde_json::json!({
+            "invocation_id": "call-1",
+            "contribution_id": "surface",
+            "sequence": 1,
+            "producer_id": "example.plugin",
+            "schema": "example.surface",
+            "schema_version": 1,
+            "operation": "upsert",
+            "persistence": "transient",
+            "payload": {"opaque": true}
+        }))
+        .expect("legacy contribution envelope");
+
+        assert!(contribution.artifact.is_none());
+    }
+
+    #[test]
+    fn contribution_artifact_revision_round_trips() {
+        let contribution = ToolContributionEvent {
+            invocation_id: "call-1".to_owned(),
+            contribution_id: "recording".to_owned(),
+            sequence: 2,
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.recording".to_owned(),
+            schema_version: 1,
+            operation: ToolContributionOperation::Upsert,
+            persistence: ToolContributionPersistence::Transient,
+            artifact: Some(ToolContributionArtifact {
+                artifact_id: "recording-1".to_owned(),
+                reference_key: "bytes".to_owned(),
+                content_type: Some("application/octet-stream".to_owned()),
+                storage_uri: "file:///tmp/recording".to_owned(),
+                committed_bytes: 42,
+                revision: 2,
+                finalized: false,
+            }),
+            payload: serde_json::json!({"opaque": [1, 2]}),
+        };
+        let encoded = serde_json::to_vec(&contribution).expect("encode contribution");
+        let decoded: ToolContributionEvent =
+            serde_json::from_slice(&encoded).expect("decode contribution");
+
+        assert_eq!(decoded, contribution);
+    }
 }

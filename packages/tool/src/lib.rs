@@ -8,10 +8,10 @@ pub mod contracts;
 pub mod interaction;
 
 pub use bcode_tool_models::{
-    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
-    ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResolutionEvent,
-    ToolExchangeResponsePolicy, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolContributionArtifact, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolExchangeRequest, ToolExchangeResolution,
+    ToolExchangeResolutionEvent, ToolExchangeResponsePolicy, ToolInvocationInput,
+    ToolInvocationInputResolution, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
 };
 pub use contracts::{
     PreparedToolInvocation, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
@@ -39,9 +39,6 @@ pub const OP_PREPARE_TOOL: &str = "prepare_tool";
 
 /// Operation for invoking a tool.
 pub const OP_INVOKE_TOOL: &str = "invoke_tool";
-
-/// Operation for resuming a suspended interactive tool invocation.
-pub const OP_RESUME_INTERACTIVE_TOOL: &str = "resume_interactive_tool";
 
 /// List tools request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,8 +507,6 @@ pub struct ToolInvocationResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_action: Option<ToolInvocationHostAction>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ToolInvocationResult>,
 }
 
@@ -544,13 +539,6 @@ pub struct ToolArtifactRef {
     pub byte_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-}
-
-/// Host action requested by a tool invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolInvocationHostAction {
-    InteractiveToolRequest(InteractiveToolRequest),
 }
 
 /// Generic request for host-owned interactive tool UI.
@@ -603,17 +591,6 @@ pub enum InteractiveToolAbortReason {
     Timeout,
     UnsupportedSurface,
     HostError,
-}
-
-/// Request payload for resuming a suspended interactive tool invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InteractiveToolResumeRequest {
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub interaction_id: String,
-    pub original_arguments: serde_json::Value,
-    pub interactive_request: InteractiveToolRequest,
-    pub resolution: InteractiveToolResolution,
 }
 
 /// Host render target for an interactive tool request.

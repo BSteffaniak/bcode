@@ -14,6 +14,6 @@ bcode.question	bcode.question.outcome	bcode.question.inline
 bcode.ralph	-	ralph-home
 bcode.shell	bcode.tool.request.shell.run,bcode.shell.run	-
 bcode.skills	-	skills.list,skills.active
-bcode.vim-edit	bcode.vim-edit.request.preview,bcode.vim-edit.request.apply,bcode.vim-edit.live,bcode.vim-edit.playback	tool.vim-edit.playback
+bcode.vim-edit	bcode.vim-edit.request.preview,bcode.vim-edit.request.apply,bcode.vim-edit.live,bcode.vim-edit.playback	-
 bcode.web-search	bcode.web-search.search_request,bcode.web-search.fetch_request,bcode.web-search.status_request,bcode.web-search.inspect_request,bcode.web-search.search_results,bcode.web-search.fetch_result,bcode.web-search.status,bcode.web-search.inspect_result	-
 bcode.worktree	bcode.worktree.request,bcode.worktree.list,bcode.worktree.create_result,bcode.worktree.remove_result	command.work-tree.attach,command.work-tree.createSession,command.work-tree.remove

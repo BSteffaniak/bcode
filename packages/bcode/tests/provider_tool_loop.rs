@@ -179,6 +179,7 @@ impl ToolInvoker for ParallelInvoker {
                 schema_version: 1,
                 operation: ToolContributionOperation::Upsert,
                 persistence: ToolContributionPersistence::Transient,
+                artifact: None,
                 payload: serde_json::Value::Null,
             }));
             self.barrier.wait().await;
@@ -191,7 +192,6 @@ impl ToolInvoker for ParallelInvoker {
                 is_error: false,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             })
         })
@@ -757,7 +757,6 @@ async fn dependent_calls_in_later_provider_rounds_wait_for_prior_results() {
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             }
@@ -776,7 +775,6 @@ async fn dependent_calls_in_later_provider_rounds_wait_for_prior_results() {
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
-                        host_action: None,
                         result: None,
                     })
                 }

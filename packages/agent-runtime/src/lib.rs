@@ -3238,7 +3238,6 @@ mod tests {
                         text: "structured".to_string(),
                     }],
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             })
@@ -3368,7 +3367,6 @@ mod tests {
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             })
@@ -3413,7 +3411,6 @@ mod tests {
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             })
@@ -3526,7 +3523,6 @@ mod tests {
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             })
@@ -4298,6 +4294,7 @@ mod tests {
                     schema_version: 1,
                     operation: ToolContributionOperation::Upsert,
                     persistence: ToolContributionPersistence::Transient,
+                    artifact: None,
                     payload: serde_json::json!({"text": "working"}),
                 }));
                 assert!(matches!(
@@ -4354,7 +4351,6 @@ mod tests {
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             })
@@ -4463,7 +4459,6 @@ mod tests {
                         is_error: true,
                         content: Vec::new(),
                         full_output: None,
-                        host_action: None,
                         result: None,
                     }),
                     _ => Ok(ToolInvocationResponse {
@@ -4471,7 +4466,6 @@ mod tests {
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
-                        host_action: None,
                         result: None,
                     }),
                 }
@@ -4648,7 +4642,6 @@ mod tests {
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             })
@@ -4832,7 +4825,6 @@ mod tests {
                     is_error: false,
                     content: Vec::new(),
                     full_output: None,
-                    host_action: None,
                     result: None,
                 })
             })

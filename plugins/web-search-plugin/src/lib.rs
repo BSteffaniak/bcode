@@ -9,10 +9,10 @@ use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
-    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolList,
-    ToolPluginVisualMetadata, ToolSideEffect, ToolVisualPayloadSelector,
+    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence, ToolDefinition,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult, ToolInvocationServiceRequest,
+    ToolInvocationServiceResolution, ToolList, ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,12 @@ impl WebSearchPlugin {
         if context.cancellation.is_cancelled() {
             return json_response(&tool_error("web tool cancelled".to_string()));
         }
+        emit_request_contribution(
+            context.events,
+            &invocation.tool_call_id,
+            &invocation.name,
+            &invocation.arguments,
+        );
         let response = match invocation.name.as_str() {
             "web.search" => self.invoke_search(
                 &context.config,
@@ -150,7 +156,6 @@ impl WebSearchPlugin {
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             },
         };
@@ -1589,32 +1594,44 @@ fn list_tools(
     })
 }
 
-fn query_request_visual(
-    schema: &str,
-    title: &str,
-    subtitle: &str,
-    fields: &[&str],
-) -> ToolPluginVisualMetadata {
-    ToolPluginVisualMetadata {
-        producer_plugin_id: Some(WEB_SEARCH_PLUGIN_ID.to_string()),
-        schema: schema.to_string(),
+fn web_request_schema(operation: &str) -> Option<&'static str> {
+    match operation {
+        "web.search" => Some(WEB_SEARCH_REQUEST_SCHEMA),
+        "web.fetch" => Some(WEB_FETCH_REQUEST_SCHEMA),
+        "web.status" => Some(WEB_STATUS_REQUEST_SCHEMA),
+        "web.inspect" => Some(WEB_INSPECT_REQUEST_SCHEMA),
+        _ => None,
+    }
+}
+
+fn emit_request_contribution(
+    events: ServiceEventEmitter,
+    invocation_id: &str,
+    operation: &str,
+    arguments: &serde_json::Value,
+) {
+    let Some(schema) = web_request_schema(operation) else {
+        return;
+    };
+    let mut payload = arguments.as_object().cloned().unwrap_or_default();
+    payload.insert(
+        "operation".to_owned(),
+        serde_json::Value::String(operation.to_owned()),
+    );
+    let event = ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "request".to_owned(),
+        sequence: 1,
+        producer_id: WEB_SEARCH_PLUGIN_ID.to_owned(),
+        schema: schema.to_owned(),
         schema_version: 1,
-        title: Some(title.to_string()),
-        subtitle: Some(subtitle.to_string()),
-        payload: fields
-            .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                (
-                    (*field).to_string(),
-                    ToolVisualPayloadSelector {
-                        fields: vec![(*field).to_string()],
-                        literal: None,
-                        required: index == 0,
-                    },
-                )
-            })
-            .collect(),
+        operation: ToolContributionOperation::Upsert,
+        persistence: ToolContributionPersistence::Durable,
+        artifact: None,
+        payload: serde_json::Value::Object(payload),
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
     }
 }
 
@@ -1641,20 +1658,7 @@ fn search_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("searching".to_string()),
-            request_visual: Some(query_request_visual(
-                WEB_SEARCH_REQUEST_SCHEMA,
-                "Search web",
-                "searching {query} · {bytes}",
-                &[
-                    "query",
-                    "provider",
-                    "max_results",
-                    "site",
-                    "freshness",
-                    "region",
-                    "safe_search",
-                ],
-            )),
+            request_visual: None
         },
     }
 }
@@ -1691,12 +1695,7 @@ fn fetch_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("fetching".to_string()),
-            request_visual: Some(query_request_visual(
-                WEB_FETCH_REQUEST_SCHEMA,
-                "Fetch URL",
-                "fetching {url} · {bytes}",
-                &["url", "max_bytes", "render", "prompt", "provider"],
-            )),
+            request_visual: None,
         },
     }
 }
@@ -1714,12 +1713,7 @@ fn status_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("checking web capabilities".to_string()),
-            request_visual: Some(query_request_visual(
-                WEB_STATUS_REQUEST_SCHEMA,
-                "Web status",
-                "checking web capabilities · {bytes}",
-                &[],
-            )),
+            request_visual: None,
         },
     }
 }
@@ -1740,12 +1734,7 @@ fn inspect_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("inspecting URL".to_string()),
-            request_visual: Some(query_request_visual(
-                WEB_INSPECT_REQUEST_SCHEMA,
-                "Inspect URL",
-                "inspecting {url} · {bytes}",
-                &["url"],
-            )),
+            request_visual: None
         },
     }
 }
@@ -2447,7 +2436,6 @@ fn search_tool_response(value: &SearchResponse, tool_call_id: &str) -> ToolInvoc
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: Some(web_artifact_result(
                 tool_call_id,
                 "search",
@@ -2476,7 +2464,6 @@ fn json_tool_response_with_artifact<T: Serialize>(
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: Some(web_artifact_result(
                 tool_call_id,
                 artifact_suffix,
@@ -2516,7 +2503,6 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }
@@ -2540,6 +2526,39 @@ bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_tools_remove_legacy_request_visuals_and_map_request_schemas() {
+        for definition in [
+            search_tool_definition(),
+            fetch_tool_definition(),
+            status_tool_definition(),
+            inspect_tool_definition(),
+        ] {
+            assert!(
+                definition.ui.request_visual.is_none(),
+                "{}",
+                definition.name
+            );
+        }
+        assert_eq!(
+            web_request_schema("web.search"),
+            Some(WEB_SEARCH_REQUEST_SCHEMA)
+        );
+        assert_eq!(
+            web_request_schema("web.fetch"),
+            Some(WEB_FETCH_REQUEST_SCHEMA)
+        );
+        assert_eq!(
+            web_request_schema("web.status"),
+            Some(WEB_STATUS_REQUEST_SCHEMA)
+        );
+        assert_eq!(
+            web_request_schema("web.inspect"),
+            Some(WEB_INSPECT_REQUEST_SCHEMA)
+        );
+        assert_eq!(web_request_schema("unknown"), None);
+    }
 
     #[test]
     fn progress_uses_neutral_invocation_lifecycle_contract() {

@@ -54,8 +54,6 @@ pub fn interaction_registry(
     match plugin_id {
         #[cfg(feature = "static-bundled-question-plugin")]
         "bcode.question" => Some(bcode_question_plugin::question_interaction_registry()),
-        #[cfg(feature = "static-bundled-vim-edit-plugin")]
-        "bcode.vim-edit" => Some(bcode_vim_edit_plugin::vim_edit_interaction_registry()),
         _ => None,
     }
 }
@@ -476,10 +474,11 @@ mod tests {
 
     #[cfg(feature = "static-bundled-vim-edit-plugin")]
     #[test]
-    fn vim_edit_bundle_provides_platform_interaction_registry() {
-        let registry = super::interaction_registry("bcode.vim-edit")
-            .expect("Vim edit interaction registry is available");
-        assert!(registry.supports("bcode.vim-edit.playback"));
+    fn vim_edit_bundle_provides_playback_visual_without_interaction_registry() {
+        let registry =
+            super::tui_registry("bcode.vim-edit").expect("Vim edit TUI registry is available");
+        assert!(registry.supports_visual("bcode.vim-edit.playback"));
+        assert!(super::interaction_registry("bcode.vim-edit").is_none());
     }
 
     #[cfg(feature = "static-bundled-filesystem-plugin")]

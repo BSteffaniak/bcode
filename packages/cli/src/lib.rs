@@ -8185,6 +8185,7 @@ mod context_compaction_tests {
                     schema_version: 42,
                     operation: bcode_session_models::ToolContributionOperation::Append,
                     persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
                     payload: serde_json::json!({"opaque_cli": [1, 2, 3]}),
                 },
             },

@@ -8,19 +8,15 @@
 //! `bcode_vim_edit` Neovim RPC editing engine.
 
 #[cfg(feature = "static-bundled")]
-mod vim_edit_interaction;
-#[cfg(feature = "static-bundled")]
 mod vim_edit_playback_tui;
 
-use bcode_plugin_sdk::path::{display, display_from_current_dir};
+use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    InteractiveToolRequest, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolArgumentExtractor,
-    ToolArgumentKind, ToolArtifact, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolPluginVisualMetadata,
-    ToolPolicyMetadata, ToolSideEffect, ToolStreamVisualUpdate, ToolUiMetadata,
-    ToolVisualPayloadSelector,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
+    ToolArgumentExtractor, ToolArgumentKind, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolList, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
 };
 use bcode_vim_edit::{
     VimEditFrame, VimEditMode, VimEditMultiFileEntry, VimEditMultiFileRequest,
@@ -38,8 +34,6 @@ const VIM_EDIT_REQUEST_PREVIEW_SCHEMA: &str = "bcode.vim-edit.request.preview";
 const VIM_EDIT_REQUEST_APPLY_SCHEMA: &str = "bcode.vim-edit.request.apply";
 const VIM_EDIT_LIVE_SCHEMA: &str = "bcode.vim-edit.live";
 const VIM_EDIT_PLAYBACK_SCHEMA: &str = "bcode.vim-edit.playback";
-const VIM_EDIT_PLAYBACK_INTERACTION_KIND: &str = "bcode.vim-edit.playback";
-const VIM_EDIT_PLAYBACK_SURFACE: &str = "tool.vim-edit.playback";
 const MAX_PLAYBACK_FRAMES: usize = 500;
 const MAX_CONTEXT_LINES: usize = 15;
 const MAX_CONTEXT_LINE_CHARS: usize = 240;
@@ -152,49 +146,11 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
             [preview_tool_definition(), apply_tool_definition()],
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
-        OP_RESUME_INTERACTIVE_TOOL => resume_interactive_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported vim edit tool service operation",
         ),
     }
-}
-
-fn resume_interactive_tool(context: &NativeServiceContext) -> ServiceResponse {
-    let resume = match context
-        .request
-        .payload_json::<InteractiveToolResumeRequest>()
-    {
-        Ok(resume) => resume,
-        Err(error) => return invalid_request(&error),
-    };
-    if let bcode_tool::InteractiveToolResolution::Submitted { payload } = &resume.resolution
-        && payload.get("action").and_then(serde_json::Value::as_str) == Some("apply_requested")
-    {
-        let arguments = payload
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| resume.original_arguments.clone());
-        let response = tool_vim_edit_with_nvim_executable(
-            arguments,
-            None,
-            VimEditMode::Apply,
-            &resume.tool_call_id,
-            "vim_edit.apply",
-            None,
-            context.events,
-        );
-        return json_response(&response);
-    }
-    let output = format!("Vim edit playback closed: {}", resume.interaction_id);
-    json_response(&ToolInvocationResponse {
-        output,
-        is_error: false,
-        content: Vec::new(),
-        full_output: None,
-        host_action: None,
-        result: None,
-    })
 }
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
@@ -224,6 +180,12 @@ fn invoke_tool_request_with_events(
     request: ToolInvocationRequest,
     events: ServiceEventEmitter,
 ) -> ToolInvocationResponse {
+    emit_request_contribution(
+        events,
+        &request.tool_call_id,
+        &request.name,
+        &request.arguments,
+    );
     match request.name.as_str() {
         "vim_edit.preview" => tool_vim_edit_with_nvim_executable(
             request.arguments,
@@ -248,7 +210,6 @@ fn invoke_tool_request_with_events(
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         },
     }
@@ -358,7 +319,7 @@ fn run_single_vim_edit_tool(
         timeout: Duration::from_millis(run.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
         observation_granularity: VimEditObservationGranularity::Key,
     };
-    let mut sequence = 0u64;
+    let mut sequence = 1u64;
     emit_vim_live_phase(
         &events,
         run.tool_call_id,
@@ -400,6 +361,7 @@ fn run_single_vim_edit_tool(
                 run.tool_name,
                 run.mode,
                 &run.original_arguments,
+                &events,
             )
         }
         Err(error) => {
@@ -443,7 +405,7 @@ fn run_multi_file_vim_edit_tool(
             steps: file.steps.into_iter().map(Into::into).collect(),
         })
         .collect::<Vec<_>>();
-    let mut sequence = 0u64;
+    let mut sequence = 1u64;
     emit_vim_live_phase(
         &events,
         run.tool_call_id,
@@ -491,6 +453,7 @@ fn run_multi_file_vim_edit_tool(
                 run.tool_name,
                 run.mode,
                 &run.original_arguments,
+                &events,
             )
         }
         Err(error) => {
@@ -510,6 +473,38 @@ fn run_multi_file_vim_edit_tool(
     }
 }
 
+fn emit_vim_live_contribution(
+    events: &ServiceEventEmitter,
+    invocation_id: &str,
+    sequence: u64,
+    active: bool,
+    payload: serde_json::Value,
+) {
+    let event = ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "vim-live".to_owned(),
+        sequence,
+        producer_id: VIM_EDIT_PLUGIN_ID.to_owned(),
+        schema: VIM_EDIT_LIVE_SCHEMA.to_owned(),
+        schema_version: 1,
+        operation: if active {
+            ToolContributionOperation::Upsert
+        } else {
+            ToolContributionOperation::Remove
+        },
+        persistence: ToolContributionPersistence::Transient,
+        artifact: None,
+        payload: if active {
+            payload
+        } else {
+            serde_json::Value::Null
+        },
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
+    }
+}
+
 fn emit_vim_live_phase(
     events: &ServiceEventEmitter,
     tool_call_id: &str,
@@ -519,28 +514,19 @@ fn emit_vim_live_phase(
     path: Option<&str>,
     error: Option<&str>,
 ) {
-    let event = ToolInvocationStreamEvent::VisualUpdate {
-        tool_call_id: tool_call_id.to_string(),
+    let active = !matches!(phase, "finished" | "error");
+    emit_vim_live_contribution(
+        events,
+        tool_call_id,
         sequence,
-        streaming: !matches!(phase, "finished" | "error"),
-        visual: ToolStreamVisualUpdate {
-            visual_id: Some(format!("{tool_call_id}-vim-live")),
-            producer_plugin_id: Some(VIM_EDIT_PLUGIN_ID.to_string()),
-            schema: VIM_EDIT_LIVE_SCHEMA.to_string(),
-            schema_version: 1,
-            title: Some("Vim edit live".to_string()),
-            subtitle: path.map(ToOwned::to_owned),
-            payload: json!({
-                "tool_name": tool_name,
-                "phase": phase,
-                "path": path,
-                "error": error,
-            }),
-        },
-    };
-    if let Ok(payload) = serde_json::to_vec(&event) {
-        events.emit(&payload);
-    }
+        active,
+        json!({
+            "tool_name": tool_name,
+            "phase": phase,
+            "path": path,
+            "error": error,
+        }),
+    );
 }
 
 fn emit_vim_live_payload(
@@ -552,23 +538,8 @@ fn emit_vim_live_payload(
     payload: serde_json::Value,
     streaming: bool,
 ) {
-    let event = ToolInvocationStreamEvent::VisualUpdate {
-        tool_call_id: tool_call_id.to_string(),
-        sequence,
-        streaming,
-        visual: ToolStreamVisualUpdate {
-            visual_id: Some(format!("{tool_call_id}-vim-live")),
-            producer_plugin_id: Some(VIM_EDIT_PLUGIN_ID.to_string()),
-            schema: VIM_EDIT_LIVE_SCHEMA.to_string(),
-            schema_version: 1,
-            title: Some("Vim edit live".to_string()),
-            subtitle: Some(format!("{path} · {tool_name}")),
-            payload,
-        },
-    };
-    if let Ok(payload) = serde_json::to_vec(&event) {
-        events.emit(&payload);
-    }
+    let _ = (tool_name, path);
+    emit_vim_live_contribution(events, tool_call_id, sequence, streaming, payload);
 }
 
 fn emit_vim_live_finished_result(
@@ -685,47 +656,32 @@ fn emit_vim_live_frame(
     phase: &str,
     frame: &VimEditFrame,
 ) {
-    let event = ToolInvocationStreamEvent::VisualUpdate {
-        tool_call_id: tool_call_id.to_string(),
+    emit_vim_live_contribution(
+        events,
+        tool_call_id,
         sequence,
-        streaming: true,
-        visual: ToolStreamVisualUpdate {
-            visual_id: Some(format!("{tool_call_id}-vim-live")),
-            producer_plugin_id: Some(VIM_EDIT_PLUGIN_ID.to_string()),
-            schema: VIM_EDIT_LIVE_SCHEMA.to_string(),
-            schema_version: 1,
-            title: Some("Vim edit live".to_string()),
-            subtitle: Some(format!(
-                "{} · step {}/{}",
-                display_from_current_dir(&frame.path),
-                frame.step_index.saturating_add(1),
-                frame.step_total
-            )),
-            payload: json!({
-                "tool_name": tool_name,
-                "phase": phase,
-                "path": frame.path.display().to_string(),
-                "file_index": frame.file_index,
-                "file_total": frame.file_total,
-                "step_index": frame.step_index,
-                "step_total": frame.step_total,
-                "step": frame.step.clone(),
-                "substep_index": frame.substep_index,
-                "substep_total": frame.substep_total,
-                "input_token": frame.input_token.clone(),
-                "before_cursor": frame.before_cursor,
-                "after_cursor": frame.after_cursor,
-                "cursor": frame.after_cursor,
-                "nvim_mode": frame.nvim_mode.clone(),
-                "context": frame.context.clone(),
-                "changed": frame.changed,
-                "message": frame.message.clone(),
-            }),
-        },
-    };
-    if let Ok(payload) = serde_json::to_vec(&event) {
-        events.emit(&payload);
-    }
+        true,
+        json!({
+            "tool_name": tool_name,
+            "phase": phase,
+            "path": frame.path.display().to_string(),
+            "file_index": frame.file_index,
+            "file_total": frame.file_total,
+            "step_index": frame.step_index,
+            "step_total": frame.step_total,
+            "step": frame.step.clone(),
+            "substep_index": frame.substep_index,
+            "substep_total": frame.substep_total,
+            "input_token": frame.input_token.clone(),
+            "before_cursor": frame.before_cursor,
+            "after_cursor": frame.after_cursor,
+            "cursor": frame.after_cursor,
+            "nvim_mode": frame.nvim_mode.clone(),
+            "context": frame.context.clone(),
+            "changed": frame.changed,
+            "message": frame.message.clone(),
+        }),
+    );
 }
 
 fn vim_edit_success_response(
@@ -735,6 +691,7 @@ fn vim_edit_success_response(
     tool_name: &str,
     mode: VimEditMode,
     original_arguments: &serde_json::Value,
+    events: &ServiceEventEmitter,
 ) -> ToolInvocationResponse {
     let output = VimEditToolOutput {
         success: true,
@@ -746,49 +703,19 @@ fn vim_edit_success_response(
         final_context: &result.final_context,
         events: &result.events,
     };
-    let mut response = json_tool_response(&output, false);
-    let playback = vim_edit_change_artifact(
-        tool_call_id,
-        tool_name,
-        path,
-        result,
-        mode,
-        original_arguments,
-    );
-    let ToolInvocationResult::Artifact { artifact } = &playback else {
-        unreachable!("vim edit artifact is always an artifact")
-    };
-    response.host_action = Some(vim_edit_playback_host_action(
-        tool_call_id,
-        &artifact.metadata,
-    ));
-    response.result = Some(playback);
+    let response = json_tool_response(&output, false);
+    let playback = vim_edit_playback_payload(tool_name, path, result, mode, original_arguments);
+    emit_playback_contribution(events, tool_call_id, &playback);
     response
 }
 
-fn vim_edit_playback_host_action(
-    tool_call_id: &str,
-    playback: &serde_json::Value,
-) -> bcode_tool::ToolInvocationHostAction {
-    bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(InteractiveToolRequest {
-        interaction_id: format!("{tool_call_id}-vim-edit-playback"),
-        interaction_kind: Some(VIM_EDIT_PLAYBACK_INTERACTION_KIND.to_string()),
-        surface_kind: VIM_EDIT_PLAYBACK_SURFACE.to_string(),
-        request: json!({ "playback": playback }),
-        required: false,
-        turn_behavior: bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction,
-        render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
-    })
-}
-
-fn vim_edit_change_artifact(
-    tool_call_id: &str,
+fn vim_edit_playback_payload(
     tool_name: &str,
     path: &str,
     result: &VimEditResult,
     mode: VimEditMode,
     original_arguments: &serde_json::Value,
-) -> ToolInvocationResult {
+) -> serde_json::Value {
     let summary = if result.changed {
         "vim edit changed file"
     } else {
@@ -797,43 +724,31 @@ fn vim_edit_change_artifact(
     let diff = truncated_text(&result.diff, MAX_DIFF_BYTES);
     let frames = single_file_playback_frames(path, result);
     let frames_truncated = result.events.len() > frames.len();
-    ToolInvocationResult::Artifact {
-        artifact: Box::new(ToolArtifact {
-            artifact_id: format!("{tool_call_id}-vim-edit-playback"),
-            producer_plugin_id: VIM_EDIT_PLUGIN_ID.to_string(),
-            schema: VIM_EDIT_PLAYBACK_SCHEMA.to_string(),
-            schema_version: 1,
-            tool_call_id: Some(tool_call_id.to_string()),
-            title: Some("Vim edit playback".to_string()),
-            metadata: json!({
-                "success": true,
-                "error": null,
-                "tool_name": tool_name,
-                "tool_mode": mode,
-                "original_arguments": original_arguments,
-                "preview_actions": if mode == VimEditMode::Preview { json!(["apply_requested", "dismiss"]) } else { json!(["dismiss"]) },
-                "summary": summary,
-                "path": path,
-                "changed": result.changed,
-                "diff": diff.text,
-                "diff_truncated": diff.truncated,
-                "cursor": result.cursor,
-                "nvim_mode": result.nvim_mode,
-                "final_context": bounded_context(&result.final_context),
-                "events": result.events,
-                "frames": frames,
-                "frame_count": result.events.len(),
-                "frames_truncated": frames_truncated,
-                "changed_ranges": [],
-                "selected_ranges": [],
-                "playback_controls": {
-                    "available": ["first", "previous", "next", "last"],
-                    "default_index": result.events.len()
-                },
-            }),
-            refs: Vec::new(),
-        }),
-    }
+    json!({
+        "success": true,
+        "error": null,
+        "tool_name": tool_name,
+        "tool_mode": mode,
+        "original_arguments": original_arguments,
+        "summary": summary,
+        "path": path,
+        "changed": result.changed,
+        "diff": diff.text,
+        "diff_truncated": diff.truncated,
+        "cursor": result.cursor,
+        "nvim_mode": result.nvim_mode,
+        "final_context": bounded_context(&result.final_context),
+        "events": result.events,
+        "frames": frames,
+        "frame_count": result.events.len(),
+        "frames_truncated": frames_truncated,
+        "changed_ranges": [],
+        "selected_ranges": [],
+        "playback_controls": {
+            "available": ["first", "previous", "next", "last"],
+            "default_index": result.events.len()
+        },
+    })
 }
 
 fn vim_edit_multi_file_success_response(
@@ -842,6 +757,7 @@ fn vim_edit_multi_file_success_response(
     tool_name: &str,
     mode: VimEditMode,
     original_arguments: &serde_json::Value,
+    events: &ServiceEventEmitter,
 ) -> ToolInvocationResponse {
     let diff = truncated_text(&result.diff, MAX_DIFF_BYTES);
     let frames = multi_file_playback_frames(result);
@@ -857,7 +773,6 @@ fn vim_edit_multi_file_success_response(
         "tool_name": tool_name,
         "tool_mode": mode,
         "original_arguments": original_arguments,
-        "preview_actions": if mode == VimEditMode::Preview { json!(["apply_requested", "dismiss"]) } else { json!(["dismiss"]) },
         "changed": result.changed,
         "diff": diff.text,
         "diff_truncated": diff.truncated,
@@ -866,20 +781,8 @@ fn vim_edit_multi_file_success_response(
         "frame_count": frame_count,
         "frames_truncated": frames_truncated,
     });
-    let mut response = json_tool_response(&output, false);
-    response.host_action = Some(vim_edit_playback_host_action(tool_call_id, &output));
-    response.result = Some(ToolInvocationResult::Artifact {
-        artifact: Box::new(ToolArtifact {
-            artifact_id: format!("{tool_call_id}-vim-edit-playback"),
-            producer_plugin_id: VIM_EDIT_PLUGIN_ID.to_string(),
-            schema: VIM_EDIT_PLAYBACK_SCHEMA.to_string(),
-            schema_version: 1,
-            tool_call_id: Some(tool_call_id.to_string()),
-            title: Some("Vim edit playback".to_string()),
-            metadata: output,
-            refs: Vec::new(),
-        }),
-    });
+    let response = json_tool_response(&output, false);
+    emit_playback_contribution(events, tool_call_id, &output);
     response
 }
 
@@ -1016,10 +919,7 @@ fn preview_tool_definition() -> ToolDefinition {
         policy: path_policy("read", ToolArgumentKind::ReadPath),
         ui: ToolUiMetadata {
             activity_label: Some("previewing Vim edit".to_string()),
-            request_visual: Some(vim_edit_request_visual(
-                VIM_EDIT_REQUEST_PREVIEW_SCHEMA,
-                "Vim edit preview",
-            )),
+            request_visual: None,
         },
     }
 }
@@ -1034,33 +934,69 @@ fn apply_tool_definition() -> ToolDefinition {
         policy: path_policy("edit", ToolArgumentKind::WritePath),
         ui: ToolUiMetadata {
             activity_label: Some("applying Vim edit".to_string()),
-            request_visual: Some(vim_edit_request_visual(
-                VIM_EDIT_REQUEST_APPLY_SCHEMA,
-                "Vim edit apply",
-            )),
+            request_visual: None,
         },
     }
 }
 
-fn vim_edit_request_visual(schema: &str, title: &str) -> ToolPluginVisualMetadata {
-    let mut payload = std::collections::BTreeMap::new();
-    for field in ["path", "files", "steps", "sandbox", "timeout_ms"] {
-        payload.insert(
-            field.to_string(),
-            ToolVisualPayloadSelector {
-                fields: vec![field.to_string()],
-                literal: None,
-                required: matches!(field, "path" | "files"),
-            },
-        );
+fn vim_edit_request_schema(operation: &str) -> Option<&'static str> {
+    match operation {
+        "vim_edit.preview" => Some(VIM_EDIT_REQUEST_PREVIEW_SCHEMA),
+        "vim_edit.apply" => Some(VIM_EDIT_REQUEST_APPLY_SCHEMA),
+        _ => None,
     }
-    ToolPluginVisualMetadata {
-        producer_plugin_id: Some(VIM_EDIT_PLUGIN_ID.to_string()),
-        schema: schema.to_string(),
+}
+
+fn emit_request_contribution(
+    events: ServiceEventEmitter,
+    invocation_id: &str,
+    operation: &str,
+    arguments: &serde_json::Value,
+) {
+    let Some(schema) = vim_edit_request_schema(operation) else {
+        return;
+    };
+    let mut payload = arguments.as_object().cloned().unwrap_or_default();
+    payload.insert(
+        "operation".to_owned(),
+        serde_json::Value::String(operation.to_owned()),
+    );
+    let event = ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "request".to_owned(),
+        sequence: 1,
+        producer_id: VIM_EDIT_PLUGIN_ID.to_owned(),
+        schema: schema.to_owned(),
         schema_version: 1,
-        title: Some(title.to_string()),
-        subtitle: Some("vim edit · {bytes}".to_string()),
-        payload,
+        operation: ToolContributionOperation::Upsert,
+        persistence: ToolContributionPersistence::Durable,
+        artifact: None,
+        payload: serde_json::Value::Object(payload),
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
+    }
+}
+
+fn emit_playback_contribution(
+    events: &ServiceEventEmitter,
+    invocation_id: &str,
+    payload: &serde_json::Value,
+) {
+    let event = ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "playback".to_owned(),
+        sequence: 1,
+        producer_id: VIM_EDIT_PLUGIN_ID.to_owned(),
+        schema: VIM_EDIT_PLAYBACK_SCHEMA.to_owned(),
+        schema_version: 1,
+        operation: ToolContributionOperation::Upsert,
+        persistence: ToolContributionPersistence::Durable,
+        artifact: None,
+        payload: payload.clone(),
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
     }
 }
 
@@ -1195,7 +1131,6 @@ fn json_tool_response<T: serde::Serialize>(value: &T, is_error: bool) -> ToolInv
             is_error,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         },
         Err(error) => ToolInvocationResponse {
@@ -1203,7 +1138,6 @@ fn json_tool_response<T: serde::Serialize>(value: &T, is_error: bool) -> ToolInv
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         },
     }
@@ -1217,23 +1151,11 @@ pub fn static_plugin() -> StaticPluginVtable {
 
 #[cfg(feature = "static-bundled")]
 #[must_use]
-pub fn vim_edit_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
-    let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
-    registry.register_interaction::<vim_edit_interaction::VimEditPlaybackInteractionController>();
-    registry
-}
-
-#[cfg(feature = "static-bundled")]
-#[must_use]
 pub fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_visual_adapter(Box::new(
         vim_edit_playback_tui::VimEditPlaybackTuiVisualAdapter,
     ));
-    registry.register_interactive_surface::<
-        vim_edit_interaction::VimEditPlaybackInteractionController,
-        vim_edit_playback_tui::VimEditPlaybackTerminalRenderer,
-    >();
     registry
 }
 
@@ -1246,9 +1168,24 @@ mod tests {
     use std::ffi::c_void;
 
     extern "C" fn collect_event(payload: *const u8, len: usize, user_data: *mut c_void) {
-        let events = unsafe { &mut *(user_data.cast::<Vec<ToolInvocationStreamEvent>>()) };
+        let events = unsafe { &mut *(user_data.cast::<Vec<ToolContributionEvent>>()) };
         let payload = unsafe { std::slice::from_raw_parts(payload, len) };
-        events.push(serde_json::from_slice(payload).expect("stream event"));
+        events.push(serde_json::from_slice(payload).expect("contribution event"));
+    }
+
+    #[test]
+    fn vim_edit_requests_remove_legacy_visuals_and_map_contribution_schemas() {
+        assert!(preview_tool_definition().ui.request_visual.is_none());
+        assert!(apply_tool_definition().ui.request_visual.is_none());
+        assert_eq!(
+            vim_edit_request_schema("vim_edit.preview"),
+            Some(VIM_EDIT_REQUEST_PREVIEW_SCHEMA)
+        );
+        assert_eq!(
+            vim_edit_request_schema("vim_edit.apply"),
+            Some(VIM_EDIT_REQUEST_APPLY_SCHEMA)
+        );
+        assert_eq!(vim_edit_request_schema("unknown"), None);
     }
 
     #[test]
@@ -1358,60 +1295,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_apply_request_runs_apply_when_nvim_is_available() {
-        if !nvim_available() {
-            eprintln!("skipping Neovim integration test because `nvim` is not available");
-            return;
-        }
-        let file = tempfile::NamedTempFile::new().expect("temp file");
-        std::fs::write(file.path(), "foo").expect("write temp file");
-        let original_arguments = json!({
-            "path": file.path(),
-            "steps": [{ "ex": "%s/foo/bar/" }]
-        });
-        let resume = InteractiveToolResumeRequest {
-            tool_call_id: "call-apply".to_string(),
-            tool_name: "vim_edit.preview".to_string(),
-            interaction_id: "call-apply-vim-edit-playback".to_string(),
-            original_arguments: original_arguments.clone(),
-            interactive_request: InteractiveToolRequest {
-                interaction_id: "call-apply-vim-edit-playback".to_string(),
-                interaction_kind: Some(VIM_EDIT_PLAYBACK_INTERACTION_KIND.to_string()),
-                surface_kind: VIM_EDIT_PLAYBACK_SURFACE.to_string(),
-                request: json!({ "playback": { "original_arguments": original_arguments } }),
-                required: false,
-                turn_behavior:
-                    bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction,
-                render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
-            },
-            resolution: bcode_tool::InteractiveToolResolution::Submitted {
-                payload: json!({ "action": "apply_requested" }),
-            },
-        };
-        let context = NativeServiceContext {
-            plugin_id: VIM_EDIT_PLUGIN_ID.to_string(),
-            request: ServiceRequest {
-                interface_id: TOOL_SERVICE_INTERFACE_ID.to_string(),
-                operation: OP_RESUME_INTERACTIVE_TOOL.to_string(),
-                payload: serde_json::to_vec(&resume).expect("resume payload"),
-            },
-            config: bcode_plugin_sdk::PluginConfigContext::default(),
-            events: ServiceEventEmitter::default(),
-            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
-            bridge: bcode_plugin_sdk::ServiceBridge::default(),
-        };
-        let service_response = resume_interactive_tool(&context);
-        assert!(service_response.error.is_none(), "{service_response:?}");
-        let response: ToolInvocationResponse =
-            serde_json::from_slice(&service_response.payload).expect("tool response");
-        assert!(!response.is_error, "{}", response.output);
-        assert_eq!(
-            std::fs::read_to_string(file.path()).expect("read file"),
-            "bar"
-        );
-    }
-
-    #[test]
     fn live_event_stream_emits_started_running_finished_when_nvim_is_available() {
         if !nvim_available() {
             eprintln!("skipping Neovim integration test because `nvim` is not available");
@@ -1419,7 +1302,7 @@ mod tests {
         }
         let file = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(file.path(), "foo bar").expect("write temp file");
-        let mut events = Vec::<ToolInvocationStreamEvent>::new();
+        let mut events = Vec::<ToolContributionEvent>::new();
         let emitter = ServiceEventEmitter::new(
             Some(collect_event),
             std::ptr::addr_of_mut!(events).cast::<c_void>(),
@@ -1434,41 +1317,31 @@ mod tests {
             emitter,
         );
         assert!(!response.is_error, "{}", response.output);
-        let visual_events = events
+        let live_events = events
             .iter()
-            .filter_map(|event| match event {
-                ToolInvocationStreamEvent::VisualUpdate {
-                    visual, streaming, ..
-                } => Some((visual, streaming)),
-                _ => None,
-            })
+            .filter(|event| event.schema == VIM_EDIT_LIVE_SCHEMA)
             .collect::<Vec<_>>();
-        assert!(visual_events.len() >= 3, "{visual_events:#?}");
-        assert_eq!(visual_events[0].0.schema, VIM_EDIT_LIVE_SCHEMA);
-        assert_eq!(
-            visual_events[0].0.visual_id.as_deref(),
-            Some("call-live-vim-live")
-        );
-        assert_eq!(visual_events[0].0.payload["phase"], "started");
-        assert!(visual_events.iter().any(|(visual, _)| {
-            visual.payload["phase"] == "running" && visual.payload.get("context").is_some()
+        assert!(live_events.len() >= 3, "{events:#?}");
+        assert_eq!(live_events[0].contribution_id, "vim-live");
+        assert_eq!(live_events[0].payload["phase"], "started");
+        assert!(live_events.iter().any(|event| {
+            event.payload["phase"] == "running" && event.payload.get("context").is_some()
         }));
-        let Some((last, streaming)) = visual_events.last() else {
-            panic!("expected final event");
-        };
-        assert_eq!(last.payload["phase"], "finished");
-        assert!(last.payload.get("context").is_some(), "{last:#?}");
-        assert!(last.payload.get("cursor").is_some(), "{last:#?}");
-        assert!(last.payload.get("step").is_some(), "{last:#?}");
-        assert_eq!(last.payload["nvim_mode"], "n");
-        assert!(!**streaming);
+        assert_eq!(
+            live_events.last().map(|event| event.operation),
+            Some(ToolContributionOperation::Remove)
+        );
+        assert!(events.iter().any(|event| {
+            event.schema == VIM_EDIT_PLAYBACK_SCHEMA
+                && event.persistence == ToolContributionPersistence::Durable
+        }));
     }
 
     #[test]
     fn live_event_stream_emits_error_for_missing_nvim() {
         let file = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(file.path(), "foo").expect("write temp file");
-        let mut events = Vec::<ToolInvocationStreamEvent>::new();
+        let mut events = Vec::<ToolContributionEvent>::new();
         let emitter = ServiceEventEmitter::new(
             Some(collect_event),
             std::ptr::addr_of_mut!(events).cast::<c_void>(),
@@ -1483,24 +1356,18 @@ mod tests {
             emitter,
         );
         assert!(response.is_error);
-        let phases = events
-            .iter()
-            .filter_map(|event| match event {
-                ToolInvocationStreamEvent::VisualUpdate {
-                    visual, streaming, ..
-                } => Some((visual.payload["phase"].clone(), *streaming)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            phases.first().map(|(phase, _)| phase),
+            events.first().map(|event| &event.payload["phase"]),
             Some(&json!("started"))
         );
-        assert_eq!(phases.last(), Some(&(json!("error"), false)));
+        assert_eq!(
+            events.last().map(|event| event.operation),
+            Some(ToolContributionOperation::Remove)
+        );
     }
 
     #[test]
-    fn success_response_contains_vim_edit_playback_artifact() {
+    fn success_response_emits_only_durable_vim_edit_playback_contribution() {
         let result = VimEditResult {
             changed: true,
             diff: "+new".to_string(),
@@ -1512,6 +1379,11 @@ mod tests {
             },
             events: Vec::new(),
         };
+        let mut events = Vec::<ToolContributionEvent>::new();
+        let emitter = ServiceEventEmitter::new(
+            Some(collect_event),
+            std::ptr::addr_of_mut!(events).cast::<c_void>(),
+        );
         let response = vim_edit_success_response(
             "src/lib.rs",
             &result,
@@ -1519,22 +1391,26 @@ mod tests {
             "vim_edit.preview",
             VimEditMode::Preview,
             &json!({ "path": "src/lib.rs", "steps": [] }),
+            &emitter,
         );
-        let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
-            panic!("expected artifact result");
-        };
-        assert_eq!(artifact.schema, "bcode.vim-edit.playback");
-        assert_eq!(artifact.producer_plugin_id, "bcode.vim-edit");
-        assert_eq!(artifact.metadata["tool_name"], "vim_edit.preview");
-        assert_eq!(artifact.metadata["path"], "src/lib.rs");
-        assert_eq!(artifact.metadata["summary"], "vim edit changed file");
-        assert_eq!(artifact.metadata["success"], true);
-        assert!(artifact.metadata.get("events").is_some());
-        assert!(artifact.metadata.get("frames").is_some());
-        assert_eq!(artifact.metadata["frame_count"], 0);
-        assert_eq!(artifact.metadata["frames_truncated"], false);
-        assert_eq!(artifact.metadata["diff_truncated"], false);
-        assert!(artifact.metadata.get("final_context").is_some());
+        assert!(response.result.is_none());
+        let playback = events
+            .iter()
+            .find(|event| event.contribution_id == "playback")
+            .expect("durable playback contribution");
+        assert_eq!(playback.schema, VIM_EDIT_PLAYBACK_SCHEMA);
+        assert_eq!(playback.producer_id, VIM_EDIT_PLUGIN_ID);
+        assert_eq!(playback.persistence, ToolContributionPersistence::Durable);
+        assert_eq!(playback.payload["tool_name"], "vim_edit.preview");
+        assert_eq!(playback.payload["path"], "src/lib.rs");
+        assert_eq!(playback.payload["summary"], "vim edit changed file");
+        assert_eq!(playback.payload["success"], true);
+        assert!(playback.payload.get("events").is_some());
+        assert!(playback.payload.get("frames").is_some());
+        assert_eq!(playback.payload["frame_count"], 0);
+        assert_eq!(playback.payload["frames_truncated"], false);
+        assert_eq!(playback.payload["diff_truncated"], false);
+        assert!(playback.payload.get("final_context").is_some());
     }
 
     #[test]

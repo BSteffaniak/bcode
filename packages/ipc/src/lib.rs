@@ -2856,6 +2856,7 @@ mod tests {
                     schema_version: 77,
                     operation: bcode_session_models::ToolContributionOperation::Append,
                     persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
                     payload: serde_json::json!({"opaque": [1, {"future": true}]}),
                 },
             },

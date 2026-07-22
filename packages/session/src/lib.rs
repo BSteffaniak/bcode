@@ -7216,6 +7216,7 @@ mod tests {
                         schema_version: 1,
                         operation: bcode_session_models::ToolContributionOperation::Upsert,
                         persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
                         payload: serde_json::json!({"must_not_persist": true}),
                     },
                 },
@@ -7258,6 +7259,7 @@ mod tests {
             schema_version: 4_294_967_000,
             operation: bcode_session_models::ToolContributionOperation::Append,
             persistence: bcode_session_models::ToolContributionPersistence::Durable,
+            artifact: None,
             payload: serde_json::json!({"nested": [1, {"future": true}], "number": 1.25}),
         };
         manager
@@ -7837,6 +7839,7 @@ mod tests {
                         schema_version: 7,
                         operation: bcode_session_models::ToolContributionOperation::Upsert,
                         persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        artifact: None,
                         payload: serde_json::json!({"opaque": true}),
                     },
                 },

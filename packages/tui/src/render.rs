@@ -738,6 +738,34 @@ fn push_transcript_item_rows(
         TranscriptItemKind::SkillError => {
             push_detail_block(rows, "Skill error", item.text(), Color::Red, width);
         }
+        TranscriptItemKind::ToolContribution { contribution } => {
+            let artifact = bcode_session_models::ToolArtifact {
+                artifact_id: format!(
+                    "{}-{}",
+                    contribution.invocation_id, contribution.contribution_id
+                ),
+                producer_plugin_id: contribution.producer_id.clone(),
+                schema: contribution.schema.clone(),
+                schema_version: contribution.schema_version,
+                tool_call_id: Some(contribution.invocation_id.clone()),
+                title: Some("Tool contribution".to_owned()),
+                metadata: contribution.payload.clone(),
+                refs: Vec::new(),
+            };
+            let visual = CanonicalToolVisual::from_artifact(&artifact);
+            if canonical_plugin_visual_available(&visual, plugin_host) {
+                push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
+                rows.push(Line::default());
+            } else {
+                push_detail_block(
+                    rows,
+                    &item.display_role(),
+                    item.text(),
+                    Color::BrightBlack,
+                    width,
+                );
+            }
+        }
         TranscriptItemKind::Generic => {
             push_detail_block(
                 rows,

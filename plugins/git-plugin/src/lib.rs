@@ -8,8 +8,8 @@ mod git_tui;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
-    ToolPluginVisualMetadata, ToolSideEffect, ToolVisualPayloadSelector,
+    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence, ToolDefinition,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -79,7 +79,6 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         },
     };
@@ -88,12 +87,16 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
 
 fn invoke_clone(
     invocation: &ToolInvocationRequest,
-    _events: ServiceEventEmitter,
+    events: ServiceEventEmitter,
 ) -> ToolInvocationResponse {
     let request = match serde_json::from_value::<CloneRequest>(invocation.arguments.clone()) {
         Ok(request) => request,
         Err(error) => return tool_error(error.to_string()),
     };
+    emit_tool_contribution(
+        events,
+        &clone_request_contribution(&invocation.tool_call_id, &request),
+    );
     match clone_repository(&request, invocation.artifact_dir.as_deref()) {
         Ok(response) => json_tool_response_with_artifact(
             &response,
@@ -106,10 +109,10 @@ fn invoke_clone(
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CloneRequest {
     url: String,
-    #[serde(default, alias = "branch")]
+    #[serde(default, rename = "ref", alias = "branch")]
     git_ref: Option<String>,
     #[serde(default)]
     destination: Option<PathBuf>,
@@ -383,32 +386,7 @@ fn clone_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("cloning".to_string()),
-            request_visual: Some(ToolPluginVisualMetadata {
-                producer_plugin_id: Some("bcode.git".to_string()),
-                schema: GIT_CLONE_REQUEST_SCHEMA.to_string(),
-                schema_version: 1,
-                title: Some("Clone repository".to_string()),
-                subtitle: Some("cloning {url} · {bytes}".to_string()),
-                payload: [
-                    ("url", true),
-                    ("destination", false),
-                    ("ref", false),
-                    ("branch", false),
-                ]
-                .into_iter()
-                .map(|(field, required)| {
-                    (
-                        field.to_string(),
-                        ToolVisualPayloadSelector {
-                            fields: vec![field.to_string()],
-                            literal: None,
-                            required,
-                        },
-                    )
-                })
-                .collect(),
-            }),
-
+            request_visual: None,
         },
     }
 }
@@ -419,6 +397,30 @@ fn github_clone_alias_definition() -> ToolDefinition {
     definition.description =
         "Compatibility alias for git.clone; prefer git.clone for all Git hosts.".to_string();
     definition
+}
+
+fn clone_request_contribution(
+    invocation_id: &str,
+    request: &CloneRequest,
+) -> ToolContributionEvent {
+    ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "clone-request".to_owned(),
+        sequence: 1,
+        producer_id: GIT_PLUGIN_ID.to_owned(),
+        schema: GIT_CLONE_REQUEST_SCHEMA.to_owned(),
+        schema_version: 1,
+        operation: ToolContributionOperation::Upsert,
+        persistence: ToolContributionPersistence::Durable,
+        artifact: None,
+        payload: serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
+    if let Ok(payload) = serde_json::to_vec(event) {
+        events.emit(&payload);
+    }
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
@@ -448,7 +450,6 @@ fn json_tool_response_with_artifact<T: Serialize>(
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: Some(ToolInvocationResult::Artifact {
                 artifact: Box::new(ToolArtifact {
                     artifact_id: format!("{tool_call_id}-git-{artifact_suffix}"),
@@ -472,7 +473,6 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }
@@ -497,6 +497,33 @@ bcode_plugin_sdk::export_plugin!(GitPlugin, include_str!("../bcode-plugin.toml")
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_request_uses_durable_generic_contribution_without_legacy_visual() {
+        let definition = clone_tool_definition();
+        assert!(definition.ui.request_visual.is_none());
+        let contribution = clone_request_contribution(
+            "call-1",
+            &CloneRequest {
+                url: "https://github.com/bmorphism/bcode".to_owned(),
+                git_ref: Some("main".to_owned()),
+                destination: None,
+            },
+        );
+        assert_eq!(contribution.invocation_id, "call-1");
+        assert_eq!(contribution.producer_id, GIT_PLUGIN_ID);
+        assert_eq!(contribution.schema, GIT_CLONE_REQUEST_SCHEMA);
+        assert_eq!(contribution.schema_version, 1);
+        assert_eq!(
+            contribution.persistence,
+            ToolContributionPersistence::Durable
+        );
+        assert_eq!(
+            contribution.payload["url"],
+            "https://github.com/bmorphism/bcode"
+        );
+        assert_eq!(contribution.payload["ref"], "main");
+    }
 
     #[test]
     fn parses_github_web_urls() {

@@ -4608,6 +4608,16 @@ library = "libexample_plugin.dylib"
         assert_blocked_plugin_bridge_wakes_on_cancellation(load_static_hello_plugin());
     }
     fn question_dynamic_library_path() -> PathBuf {
+        let workspace_library = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(format!(
+                "{}bcode_question_plugin{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            ));
+        if workspace_library.exists() {
+            return workspace_library;
+        }
         let executable = std::env::current_exe().expect("current test executable path");
         let directory = executable.parent().expect("test executable parent");
         let prefix = format!("{}bcode_question_plugin", std::env::consts::DLL_PREFIX);
@@ -4693,7 +4703,6 @@ library = "libexample_plugin.dylib"
             decode_service_response(response).expect("question response decodes");
 
         assert!(!response.is_error);
-        assert!(response.host_action.is_none());
         assert_eq!(requests.len(), 1);
         assert!(matches!(
             &requests[0],

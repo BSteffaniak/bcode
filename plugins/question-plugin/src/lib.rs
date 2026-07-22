@@ -226,7 +226,6 @@ fn question_response(
         is_error: false,
         content: Vec::new(),
         full_output: Some(value.clone()),
-        host_action: None,
         result: Some(ToolInvocationResult::Artifact {
             artifact: Box::new(ToolArtifact {
                 artifact_id: format!("question-outcome-{interaction_id}"),
@@ -614,7 +613,6 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }

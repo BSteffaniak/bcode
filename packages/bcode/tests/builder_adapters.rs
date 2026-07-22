@@ -37,7 +37,6 @@ fn response(output: &str) -> ToolInvocationResponse {
         is_error: false,
         content: Vec::new(),
         full_output: None,
-        host_action: None,
         result: None,
     }
 }
@@ -111,6 +110,7 @@ impl ToolInvoker for ContributionInvoker {
             schema_version: 9,
             operation: ToolContributionOperation::Upsert,
             persistence: self.0,
+            artifact: None,
             payload: serde_json::json!({"opaque": [1, 2, 3]}),
         });
         Box::pin(async move {

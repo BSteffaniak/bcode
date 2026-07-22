@@ -1656,12 +1656,18 @@ async fn absorb_bcode_event(
             true
         }
         BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.session_id => {
-            if let bcode_session_models::SessionLiveEventKind::ToolOutputDelta { event: stream } =
-                &event.kind
-            {
-                loop_state
+            match &event.kind {
+                bcode_session_models::SessionLiveEventKind::ToolOutputDelta { event: stream } => {
+                    loop_state
+                        .artifact_stream
+                        .observe_live_event(event.session_id, stream);
+                }
+                bcode_session_models::SessionLiveEventKind::ToolContribution {
+                    event: contribution,
+                } => loop_state
                     .artifact_stream
-                    .observe_live_event(event.session_id, stream);
+                    .observe_contribution(event.session_id, contribution),
+                _ => {}
             }
             chat.app.absorb_session_live_event(&event);
             true

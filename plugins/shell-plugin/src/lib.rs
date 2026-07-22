@@ -25,14 +25,13 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolArtifactRef, ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
-    ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolList, ToolPluginVisualMetadata, ToolSideEffect,
+    ToolArtifactRef, ToolContributionArtifact, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolDefinition, ToolInvocationLifecycleEvent,
+    ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolList, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -189,39 +188,7 @@ fn shell_tool_definition() -> ToolDefinition {
                 },
                 ui: bcode_tool::ToolUiMetadata {
                     activity_label: Some("running".to_string()),
-                    request_visual: Some(ToolPluginVisualMetadata {
-                        producer_plugin_id: Some("bcode.shell".to_string()),
-                        schema: "bcode.tool.request.shell.run".to_string(),
-                        schema_version: 1,
-                        title: Some("Shell command".to_string()),
-                        subtitle: Some("shell command · {bytes}".to_string()),
-                        payload: BTreeMap::from([
-                            (
-                                "command".to_string(),
-                                bcode_tool::ToolVisualPayloadSelector {
-                                    fields: vec!["command".to_string()],
-                                    literal: None,
-                                    required: true,
-                                },
-                            ),
-                            (
-                                "cwd".to_string(),
-                                bcode_tool::ToolVisualPayloadSelector {
-                                    fields: vec!["cwd".to_string()],
-                                    literal: None,
-                                    required: false,
-                                },
-                            ),
-                            (
-                                "format_commands".to_string(),
-                                bcode_tool::ToolVisualPayloadSelector {
-                                    fields: vec!["format_commands".to_string()],
-                                    literal: None,
-                                    required: false,
-                                },
-                            ),
-                        ]),
-                    }),
+                    request_visual: None,
                 },
             }
 }
@@ -258,7 +225,6 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         },
     };
@@ -281,7 +247,6 @@ fn run_shell_tool(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                host_action: None,
                 result: None,
             };
         }
@@ -292,11 +257,25 @@ fn run_shell_tool(
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         };
     }
     let arguments_json = serde_json::to_value(&arguments).unwrap_or_else(|_| json!({}));
+    emit_tool_contribution(
+        events,
+        &ToolContributionEvent {
+            invocation_id: tool_call_id.to_owned(),
+            contribution_id: "shell-run-request".to_owned(),
+            sequence: 1,
+            producer_id: "bcode.shell".to_owned(),
+            schema: "bcode.tool.request.shell.run".to_owned(),
+            schema_version: 1,
+            operation: ToolContributionOperation::Upsert,
+            persistence: ToolContributionPersistence::Durable,
+            artifact: None,
+            payload: arguments_json.clone(),
+        },
+    );
     emit_tool_lifecycle(
         events,
         &ToolInvocationLifecycleEvent {
@@ -329,6 +308,7 @@ fn run_shell_tool(
             schema_version: 1,
             operation: ToolContributionOperation::Upsert,
             persistence: ToolContributionPersistence::Durable,
+            artifact: None,
             payload: serde_json::from_str(&response.output)
                 .unwrap_or_else(|_| json!({"output": response.output.clone()})),
         },
@@ -595,7 +575,6 @@ fn run_terminal_shell_command_with_environment(
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            host_action: None,
             result: None,
         },
     }
@@ -991,7 +970,6 @@ fn terminal_shell_response(
         is_error: input.status.timed_out || input.status.cancelled || !input.status.success,
         content: Vec::new(),
         full_output: Some(full_encoded),
-        host_action: None,
         result: Some(shell_run_artifact(
             tool_call_id,
             &ShellRunResult::Terminal {
@@ -1473,22 +1451,28 @@ fn shell_recording_commit_observer(
         let revision = revision
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .saturating_add(1);
-        emit_tool_stream_event(
+        emit_tool_contribution(
             events,
-            &ToolInvocationStreamEvent::ArtifactUpdate {
-                tool_call_id: tool_call_id.clone(),
+            &ToolContributionEvent {
+                invocation_id: tool_call_id.clone(),
+                contribution_id: "shell-recording".to_owned(),
                 sequence: revision,
-                artifact_id: format!("{tool_call_id}-shell-run"),
-                reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
-                producer_plugin_id: "bcode.shell".to_owned(),
+                producer_id: "bcode.shell".to_owned(),
                 schema: "bcode.shell.run".to_owned(),
                 schema_version: 1,
-                content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
-                storage_uri: file_storage_uri(&commit.path)
-                    .unwrap_or_else(|| commit.path.display().to_string()),
-                committed_bytes: commit.committed_bytes,
-                revision,
-                finalized: commit.finalized,
+                operation: ToolContributionOperation::Upsert,
+                persistence: ToolContributionPersistence::Transient,
+                artifact: Some(ToolContributionArtifact {
+                    artifact_id: format!("{tool_call_id}-shell-run"),
+                    reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
+                    content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
+                    storage_uri: file_storage_uri(&commit.path)
+                        .unwrap_or_else(|| commit.path.display().to_string()),
+                    committed_bytes: commit.committed_bytes,
+                    revision,
+                    finalized: commit.finalized,
+                }),
+                payload: serde_json::json!({"mode": "terminal"}),
             },
         );
     })
@@ -1501,12 +1485,6 @@ fn emit_tool_lifecycle(events: ServiceEventEmitter, event: &ToolInvocationLifecy
 }
 
 fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
-    if let Ok(payload) = serde_json::to_vec(event) {
-        events.emit(&payload);
-    }
-}
-
-fn emit_tool_stream_event(events: ServiceEventEmitter, event: &ToolInvocationStreamEvent) {
     if let Ok(payload) = serde_json::to_vec(event) {
         events.emit(&payload);
     }
@@ -1693,6 +1671,11 @@ mod tests {
     use super::*;
     use std::ffi::c_void;
     use std::sync::Mutex;
+
+    #[test]
+    fn shell_request_visual_is_generic_contribution_only() {
+        assert!(shell_tool_definition().ui.request_visual.is_none());
+    }
 
     extern "C" fn capture_service_event(
         payload: *const u8,
@@ -2184,16 +2167,15 @@ mod tests {
             .lock()
             .expect("events")
             .iter()
-            .filter_map(|payload| serde_json::from_slice::<ToolInvocationStreamEvent>(payload).ok())
-            .filter_map(|event| match event {
-                ToolInvocationStreamEvent::ArtifactUpdate {
-                    committed_bytes,
-                    revision,
-                    finalized,
-                    storage_uri,
-                    ..
-                } => Some((committed_bytes, revision, finalized, storage_uri)),
-                _ => None,
+            .filter_map(|payload| serde_json::from_slice::<ToolContributionEvent>(payload).ok())
+            .filter_map(|event| event.artifact)
+            .map(|artifact| {
+                (
+                    artifact.committed_bytes,
+                    artifact.revision,
+                    artifact.finalized,
+                    artifact.storage_uri,
+                )
             })
             .collect::<Vec<_>>();
         assert!(artifact_updates.len() >= 3);
@@ -2755,19 +2737,12 @@ mod tests {
         let mut ipc_bytes = 0_usize;
         for payload in events.iter() {
             ipc_bytes = ipc_bytes.saturating_add(payload.len());
-            let event: ToolInvocationStreamEvent =
-                serde_json::from_slice(payload).expect("artifact notification");
-            let ToolInvocationStreamEvent::ArtifactUpdate {
-                committed_bytes,
-                revision,
-                ..
-            } = event
-            else {
-                panic!("shell live path emitted a non-artifact event");
-            };
-            assert!(committed_bytes >= committed);
-            committed = committed_bytes;
-            revisions = revisions.max(usize::try_from(revision).unwrap_or(usize::MAX));
+            let event: ToolContributionEvent =
+                serde_json::from_slice(payload).expect("artifact contribution");
+            let artifact = event.artifact.expect("artifact revision");
+            assert!(artifact.committed_bytes >= committed);
+            committed = artifact.committed_bytes;
+            revisions = revisions.max(usize::try_from(artifact.revision).unwrap_or(usize::MAX));
         }
         let notification_count = events.len();
         drop(events);
@@ -2883,10 +2858,10 @@ mod tests {
         assert!(baseline_events.lock().expect("baseline lock").is_empty());
         let recorded_events = recorded_events.lock().expect("recorded lock");
         assert!(!recorded_events.is_empty());
-        assert!(recorded_events.iter().all(|payload| matches!(
-            serde_json::from_slice::<ToolInvocationStreamEvent>(payload),
-            Ok(ToolInvocationStreamEvent::ArtifactUpdate { .. })
-        )));
+        assert!(recorded_events.iter().all(|payload| {
+            serde_json::from_slice::<ToolContributionEvent>(payload)
+                .is_ok_and(|event| event.artifact.is_some())
+        }));
         drop(recorded_events);
     }
 

@@ -12,9 +12,10 @@
 
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 pub use bcode_tool_models::{
-    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
-    ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResolutionEvent,
-    ToolExchangeResponsePolicy, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolContributionArtifact, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolExchangeRequest, ToolExchangeResolution,
+    ToolExchangeResolutionEvent, ToolExchangeResponsePolicy, ToolInvocationLifecycleEvent,
+    ToolInvocationLifecycleStage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
