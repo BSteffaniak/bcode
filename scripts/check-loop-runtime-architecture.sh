@@ -477,6 +477,13 @@ if rg -n 'ToolInvocationStreamEvent::(Started|Status|Finished)|emit_tool_status'
   violations=1
 fi
 
+if ! grep -F 'direct_static_dynamic_and_future_remote_adapters_share_scheduler_semantics' packages/bcode/tests/embedded_scoped_plugin.rs >/dev/null ||
+   ! grep -F 'FutureRemoteInvoker::concurrent()' packages/bcode/tests/embedded_scoped_plugin.rs >/dev/null ||
+   ! grep -F 'FutureRemoteInvoker::non_reentrant()' packages/bcode/tests/embedded_scoped_plugin.rs >/dev/null; then
+  echo "Runtime architecture violation: direct/static/dynamic/future-remote scheduler conformance coverage was removed." >&2
+  violations=1
+fi
+
 if ! grep -F 'static_and_dynamic_shell_contributions_are_observable_headlessly' packages/bcode/tests/embedded_scoped_plugin.rs >/dev/null ||
    ! grep -F 'server_persists_shell_owned_contribution_opaquely' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: shell generic lifecycle/contribution conformance coverage was removed." >&2

@@ -2,15 +2,21 @@
 
 use bcode::{
     Agent, ArtifactCommitGuard, InvocationArtifactSink, InvocationCapabilityFuture,
-    InvocationExchangeBroker, InvocationInputRouter, InvocationServiceRouter,
-    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolAuthorizationCoordinator,
-    ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCall, ToolDefinition,
-    ToolExchangeRequest, ToolExchangeResolution, ToolInvocationInput,
+    InvocationExchangeBroker, InvocationInputRouter, InvocationServiceRouter, PreparationScope,
+    PreparedToolInvocation, RegisteredTool, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
+    ToolAuthorizationCoordinator, ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCall,
+    ToolDefinition, ToolExchangeRequest, ToolExchangeResolution, ToolInvocationInput,
     ToolInvocationInputResolution, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
-    TurnEventObservability,
+    ToolInvoker, TurnEventObservability,
 };
-use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
-use std::sync::{Arc, Mutex};
+use bcode_tool::{
+    ToolInvocationResponse, ToolPolicyMetadata, ToolPreparationRequest, ToolPreparationResponse,
+    ToolSideEffect, ToolUiMetadata,
+};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[derive(Debug, Default)]
 struct Capabilities(Mutex<Vec<String>>);
@@ -200,19 +206,32 @@ fn static_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
 fn dynamic_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
     let executable = std::env::current_exe().expect("current test executable path");
     let directory = executable.parent().expect("test executable parent");
-    let prefix = format!("{}bcode_shell_plugin", std::env::consts::DLL_PREFIX);
-    let library = std::fs::read_dir(directory)
-        .expect("test dependency directory should be readable")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(&prefix) && name.ends_with(std::env::consts::DLL_SUFFIX)
-                })
-        })
-        .expect("shell plugin dynamic library should be built as a dev dependency");
+    let target_profile = directory
+        .parent()
+        .expect("test executable profile directory");
+    let exact_library_name = format!(
+        "{}bcode_shell_plugin{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
+    let profile_library = target_profile.join(&exact_library_name);
+    let library = if profile_library.is_file() {
+        profile_library
+    } else {
+        let prefix = format!("{}bcode_shell_plugin", std::env::consts::DLL_PREFIX);
+        std::fs::read_dir(directory)
+            .expect("test dependency directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&prefix) && name.ends_with(std::env::consts::DLL_SUFFIX)
+                    })
+            })
+            .expect("shell plugin dynamic library should be built before adapter conformance")
+    };
     let root =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/shell-plugin");
     let mut registered = bcode_plugin::discover_plugins_in_roots(&[root])
@@ -274,6 +293,120 @@ async fn assert_direct_batch_overlaps() {
     .expect("direct same-batch calls must overlap")
     .expect("direct batch should execute");
     assert!(output.results.iter().all(Result::is_ok));
+}
+
+#[derive(Debug)]
+struct FutureRemoteInvoker {
+    admission: Option<Arc<tokio::sync::Semaphore>>,
+    active: AtomicUsize,
+    maximum: AtomicUsize,
+}
+
+impl FutureRemoteInvoker {
+    fn concurrent() -> Arc<Self> {
+        Arc::new(Self {
+            admission: None,
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        })
+    }
+
+    fn non_reentrant() -> Arc<Self> {
+        Arc::new(Self {
+            admission: Some(Arc::new(tokio::sync::Semaphore::new(1))),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        })
+    }
+
+    fn maximum(&self) -> usize {
+        self.maximum.load(Ordering::SeqCst)
+    }
+}
+
+impl ToolInvoker for FutureRemoteInvoker {
+    fn prepare_tool<'a>(
+        &'a self,
+        _tool: &'a RegisteredTool,
+        _request: &'a ToolPreparationRequest,
+        _scope: &'a PreparationScope,
+    ) -> bcode::RuntimeFuture<'a, ToolPreparationResponse> {
+        Box::pin(async { Ok(ToolPreparationResponse::default()) })
+    }
+
+    fn invoke_tool<'a>(
+        &'a self,
+        _tool: &'a RegisteredTool,
+        invocation: &'a PreparedToolInvocation,
+        _scope: &'a bcode::InvocationScope,
+    ) -> bcode::RuntimeFuture<'a, ToolInvocationResponse> {
+        Box::pin(async move {
+            let _permit = match &self.admission {
+                Some(admission) => Some(
+                    admission
+                        .acquire()
+                        .await
+                        .expect("remote admission semaphore remains open"),
+                ),
+                None => None,
+            };
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolInvocationResponse {
+                output: invocation.invocation.invocation_id.clone(),
+                is_error: false,
+                content: Vec::new(),
+                full_output: None,
+                result: None,
+            })
+        })
+    }
+}
+
+async fn assert_future_remote_batch_semantics(invoker: Arc<FutureRemoteInvoker>, maximum: usize) {
+    let calls = [
+        ToolCall {
+            id: "remote-first".to_owned(),
+            name: "future.remote".to_owned(),
+            arguments: serde_json::Value::Null,
+        },
+        ToolCall {
+            id: "remote-second".to_owned(),
+            name: "future.remote".to_owned(),
+            arguments: serde_json::Value::Null,
+        },
+    ];
+    let agent = Agent::builder()
+        .inline_tool(
+            ToolDefinition {
+                name: "future.remote".to_owned(),
+                description: "future remote adapter conformance tool".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+                side_effect: ToolSideEffect::ReadOnly,
+                requires_permission: false,
+                policy: ToolPolicyMetadata::default(),
+                ui: ToolUiMetadata::default(),
+            },
+            |_| unreachable!("future remote invoker owns execution"),
+        )
+        .tool_invoker(invoker.clone())
+        .authorization_coordinator(Arc::new(AllowAuthorization))
+        .build();
+    let output = agent
+        .execute_tool_batch(&calls)
+        .await
+        .expect("future remote batch should execute");
+    assert_eq!(invoker.maximum(), maximum);
+    assert_eq!(
+        output
+            .results
+            .into_iter()
+            .map(|result| result.expect("remote result").invocation.output)
+            .collect::<Vec<_>>(),
+        ["remote-first", "remote-second"]
+    );
 }
 
 async fn assert_reentrant_shell_batch_overlaps(plugins: bcode_plugin::PluginRuntimeHost) {
@@ -360,8 +493,21 @@ async fn static_and_dynamic_shell_contributions_are_observable_headlessly() {
             .contributions
             .lock()
             .expect("contribution observations");
-        assert_eq!(contributions.len(), 1);
-        let contribution = &contributions[0];
+        assert_eq!(contributions.len(), 2);
+        let request = contributions
+            .iter()
+            .find(|event| event.schema == "bcode.tool.request.shell.run")
+            .expect("shell request contribution");
+        assert_eq!(request.invocation_id, "shell-contribution");
+        assert_eq!(request.producer_id, "bcode.shell");
+        assert_eq!(
+            request.persistence,
+            bcode_tool::ToolContributionPersistence::Durable
+        );
+        let contribution = contributions
+            .iter()
+            .find(|event| event.schema == "bcode.shell.run.summary")
+            .expect("shell summary contribution");
         assert_eq!(contribution.invocation_id, "shell-contribution");
         assert_eq!(contribution.producer_id, "bcode.shell");
         assert_eq!(contribution.schema, "bcode.shell.run.summary");
@@ -390,8 +536,10 @@ async fn static_and_dynamic_shell_contributions_are_observable_headlessly() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn direct_and_reentrant_static_dynamic_adapters_share_overlap_semantics() {
+async fn direct_static_dynamic_and_future_remote_adapters_share_scheduler_semantics() {
     assert_direct_batch_overlaps().await;
     assert_reentrant_shell_batch_overlaps(static_shell_runtime()).await;
     assert_reentrant_shell_batch_overlaps(dynamic_shell_runtime()).await;
+    assert_future_remote_batch_semantics(FutureRemoteInvoker::concurrent(), 2).await;
+    assert_future_remote_batch_semantics(FutureRemoteInvoker::non_reentrant(), 1).await;
 }
