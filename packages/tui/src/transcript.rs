@@ -134,6 +134,8 @@ impl TranscriptItemId {
 pub struct TranscriptItem {
     id: TranscriptItemId,
     revision: u64,
+    source_view_item_id: Option<bcode_session_view_models::TranscriptViewItemId>,
+    source_view_revision: Option<bcode_session_view_models::ViewRevision>,
     pub role: &'static str,
     pub text: String,
     pub streaming: bool,
@@ -171,6 +173,8 @@ impl TranscriptItem {
         Self {
             id: TranscriptItemId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             revision: 0,
+            source_view_item_id: None,
+            source_view_revision: None,
             role,
             text,
             streaming,
@@ -215,6 +219,41 @@ impl TranscriptItem {
     #[must_use]
     pub const fn id(&self) -> TranscriptItemId {
         self.id
+    }
+
+    /// Return the renderer-neutral source identity, when this item adapts shared session state.
+    #[must_use]
+    pub const fn source_view_item_id(
+        &self,
+    ) -> Option<&bcode_session_view_models::TranscriptViewItemId> {
+        self.source_view_item_id.as_ref()
+    }
+
+    fn with_source_view_item(
+        mut self,
+        id: bcode_session_view_models::TranscriptViewItemId,
+        revision: bcode_session_view_models::ViewRevision,
+    ) -> Self {
+        self.source_view_item_id = Some(id);
+        self.source_view_revision = Some(revision);
+        self
+    }
+
+    pub(crate) fn replace_from_shared(&mut self, replacement: Self) -> bool {
+        debug_assert_eq!(self.source_view_item_id, replacement.source_view_item_id);
+        if self.source_view_revision == replacement.source_view_revision {
+            return false;
+        }
+        self.source_view_revision = replacement.source_view_revision;
+        self.role = replacement.role;
+        self.text = replacement.text;
+        self.streaming = replacement.streaming;
+        self.display_label = replacement.display_label;
+        self.event_sequence = replacement.event_sequence;
+        self.timestamp_ms = replacement.timestamp_ms;
+        self.kind = replacement.kind;
+        self.bump_revision();
+        true
     }
 
     /// Return revision incremented whenever rendered state mutates.
@@ -840,7 +879,7 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
     if let (Some(sequence), Some(timestamp_ms)) = (item.sequence, item.timestamp_ms) {
         terminal = terminal.with_event_metadata(sequence, timestamp_ms);
     }
-    terminal
+    terminal.with_source_view_item(item.id.clone(), item.revision)
 }
 
 fn message_text_item(

@@ -2046,17 +2046,18 @@ impl BmuxApp {
     /// Absorb replayed history events.
     pub fn absorb_history(&mut self, events: &[SessionEvent]) {
         self.latest_history_sequence = events.last().map(|event| event.sequence);
-        self.session_view.apply_history(events);
         self.transcript_window.append_history(events);
         for event in events {
+            self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
+        self.sync_shared_message_items();
         self.trim_resident_transcript_window_if_needed();
     }
 
     fn rebuild_transcript_from_history(&mut self) {
         let events = self.transcript_window.events().to_vec();
-        self.session_view.rebuild_history_window(&events);
+        self.session_view.clear_history_window();
         self.transcript.replace(Vec::new());
         self.tool_call_contexts.clear();
         self.tool_invocation_projections.clear();
@@ -2066,8 +2067,10 @@ impl BmuxApp {
         self.active_tool_calls.clear();
         self.active_plugin_visuals.clear();
         for event in &events {
+            self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
+        self.sync_shared_message_items();
     }
 
     fn trim_resident_transcript_window_if_needed(&mut self) {
@@ -2404,10 +2407,13 @@ impl BmuxApp {
                 self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionEventKind::AssistantMessage { text } => {
-                let text = self
-                    .latest_shared_terminal_text("Assistant")
-                    .unwrap_or_else(|| text.clone());
-                self.finish_streaming_item("Assistant", &text, application);
+                if !self.upsert_latest_shared_message_item("Assistant", false) {
+                    self.finish_streaming_item("Assistant", text, application);
+                } else if application.live_activity()
+                    && matches!(self.activity, ActivityState::Streaming { .. })
+                {
+                    self.set_activity(ActivityState::FinalizingModelTurn);
+                }
                 self.finish_assistant_stream_anchor();
             }
             SessionEventKind::SystemMessage { .. } | SessionEventKind::PluginStatusNote { .. } => {
@@ -2594,10 +2600,13 @@ impl BmuxApp {
                 self.push_live_reasoning_delta(text, application);
             }
             SessionEventKind::AssistantReasoningMessage { text } if self.reasoning_visible() => {
-                let text = self
-                    .latest_shared_terminal_text("Reasoning summary")
-                    .unwrap_or_else(|| text.clone());
-                self.finish_streaming_item("Reasoning summary", &text, application);
+                if !self.upsert_shared_reasoning_items(false) {
+                    self.finish_streaming_item("Reasoning summary", text, application);
+                } else if application.live_activity()
+                    && matches!(self.activity, ActivityState::Streaming { .. })
+                {
+                    self.set_activity(ActivityState::FinalizingModelTurn);
+                }
             }
             SessionEventKind::AgentChanged { .. } => {
                 self.apply_shared_agent_changed();
@@ -2995,16 +3004,14 @@ impl BmuxApp {
 
     fn push_live_assistant_delta(&mut self, text: &str, application: SessionEventApplication) {
         self.add_streaming_delta(text, application);
-        if !self.push_shared_streaming_terminal_item("Assistant") {
+        if !self.upsert_latest_shared_message_item("Assistant", true) {
             self.push_streaming_item("Assistant", text);
         }
     }
 
     fn push_live_reasoning_delta(&mut self, text: &str, application: SessionEventApplication) {
         self.add_streaming_delta(text, application);
-        if self.reasoning_visible()
-            && !self.push_shared_streaming_terminal_item("Reasoning summary")
-        {
+        if self.reasoning_visible() && !self.upsert_shared_reasoning_items(true) {
             self.push_streaming_item("Reasoning summary", text);
         }
     }
@@ -3027,18 +3034,65 @@ impl BmuxApp {
         true
     }
 
-    fn push_shared_streaming_terminal_item(&mut self, role: &'static str) -> bool {
-        let Some(item) = self.latest_shared_streaming_terminal_item(role) else {
+    fn upsert_latest_shared_message_item(&mut self, role: &'static str, streaming: bool) -> bool {
+        let Some(shared_item) = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                let terminal = terminal_item_from_shared(item);
+                terminal.role == role && terminal.streaming == streaming
+            })
+        else {
             return false;
         };
-        if let Some(last) = self.transcript.last_mut()
-            && last.role == role
-            && last.streaming
-        {
-            last.replace_text(item.text);
-            return true;
+        let item = terminal_item_from_shared(shared_item);
+        self.transcript.upsert_shared_item(item);
+        true
+    }
+
+    fn sync_shared_message_items(&mut self) {
+        let source_ids = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { .. }
+                        | bcode_session_view_models::TranscriptViewItemKind::ReasoningMessage { .. }
+                )
+            })
+            .map(|item| item.id.clone())
+            .collect::<BTreeSet<_>>();
+        self.transcript.retain(|item| {
+            item.source_view_item_id().is_none_or(|id| {
+                source_ids.contains(id) || !matches!(item.role(), "Assistant" | "Reasoning summary")
+            })
+        });
+    }
+
+    fn upsert_shared_reasoning_items(&mut self, streaming: bool) -> bool {
+        let items = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .map(terminal_item_from_shared)
+            .filter(|item| item.role == "Reasoning summary" && item.streaming == streaming)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return false;
         }
-        self.transcript.push(item);
+        for item in items {
+            self.transcript.upsert_shared_item(item);
+        }
         true
     }
 
@@ -3063,6 +3117,7 @@ impl BmuxApp {
             .map(|item| item.text)
     }
 
+    #[cfg(test)]
     fn latest_shared_terminal_text(&self, role: &'static str) -> Option<String> {
         self.session_view
             .snapshot()
@@ -3075,6 +3130,7 @@ impl BmuxApp {
             .map(|item| item.text)
     }
 
+    #[cfg(test)]
     fn latest_shared_streaming_terminal_item(&self, role: &'static str) -> Option<TranscriptItem> {
         self.session_view
             .snapshot()
@@ -6261,6 +6317,64 @@ mod tests {
         assert_eq!(actual.role(), "Assistant");
         assert_eq!(actual.text(), "final shared");
         assert!(!actual.streaming());
+    }
+
+    #[test]
+    fn assistant_stream_identity_survives_interleaved_usage_and_finalization() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let live = |text: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                text: text.to_owned(),
+            },
+        };
+
+        app.absorb_session_live_event(&live("cargo check passed "));
+        let initial = app
+            .transcript()
+            .iter()
+            .find(|item| item.role() == "Assistant")
+            .expect("streaming assistant item");
+        let render_id = initial.id();
+        let source_id = initial
+            .source_view_item_id()
+            .expect("shared source identity")
+            .clone();
+
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_owned(),
+                usage: bcode_session_models::SessionTokenUsage {
+                    input_tokens: Some(6_154),
+                    output_tokens: Some(22),
+                    ..bcode_session_models::SessionTokenUsage::default()
+                },
+            },
+        ));
+        app.absorb_session_live_event(&live("successfully"));
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "cargo check passed successfully".to_owned(),
+            },
+        ));
+
+        let assistants = app
+            .transcript()
+            .iter()
+            .filter(|item| item.role() == "Assistant")
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].text(), "cargo check passed successfully");
+        assert!(!assistants[0].streaming());
+        assert_eq!(assistants[0].id(), render_id);
+        assert_eq!(assistants[0].source_view_item_id(), Some(&source_id));
+        assert!(app.transcript().iter().any(|item| item.role() == "Usage"));
     }
 
     #[test]

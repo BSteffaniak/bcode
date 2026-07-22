@@ -333,6 +333,12 @@ impl SessionView {
     /// pending checkpoints, runtime work, plugin status, skills, and composer state remain
     /// available until newer authoritative data replaces them.
     pub fn rebuild_history_window(&mut self, events: &[SessionEvent]) {
+        self.clear_history_window();
+        self.apply_history(events);
+    }
+
+    /// Clear bounded history projection while retaining authoritative hydrated session state.
+    pub fn clear_history_window(&mut self) {
         let previous = self.snapshot.clone();
         let terminal_runtime_work = self.terminal_runtime_work.clone();
         let mut replacement = Self::new();
@@ -349,7 +355,6 @@ impl SessionView {
         replacement.snapshot.interactions = previous.interactions;
         replacement.snapshot.session_summary = previous.session_summary;
         replacement.terminal_runtime_work = terminal_runtime_work;
-        replacement.apply_history(events);
         replacement.snapshot.revision = self.snapshot.revision.saturating_add(1);
         *self = replacement;
     }
@@ -1576,7 +1581,8 @@ impl SessionView {
             return;
         }
         if let Some(item) = streaming_finish_target_mut(&mut self.snapshot.transcript.items, kind) {
-            item.id = id;
+            item.sequence = (sequence != 0).then_some(sequence).or(item.sequence);
+            item.timestamp_ms = timestamp_ms.or(item.timestamp_ms);
             replace_text_in_item(item, text);
             item.streaming = false;
             item.revision = item.revision.saturating_add(1);
@@ -3194,6 +3200,47 @@ mod tests {
             &view.snapshot().transcript.items[0].kind,
             TranscriptViewItemKind::SystemMessage { message }
                 if message.text.contains("Treat prior file/path assumptions as possibly stale")
+        ));
+    }
+
+    #[test]
+    fn assistant_stream_keeps_live_identity_when_durable_message_finishes_it() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                text: "live answer".to_owned(),
+            },
+        });
+        let live_id = view.snapshot().transcript.items[0].id.clone();
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_owned(),
+                usage: bcode_session_models::SessionTokenUsage::default(),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "durable answer".to_owned(),
+            },
+        ));
+
+        assert_eq!(view.snapshot().transcript.items.len(), 2);
+        let assistant = &view.snapshot().transcript.items[0];
+        assert_eq!(assistant.id, live_id);
+        assert_eq!(assistant.sequence, Some(2));
+        assert!(!assistant.streaming);
+        assert!(matches!(
+            &assistant.kind,
+            TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "durable answer"
         ));
     }
 

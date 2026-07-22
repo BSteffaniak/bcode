@@ -57,6 +57,27 @@ impl TranscriptDocument {
         self.bump_revision();
     }
 
+    /// Upsert one item adapted from the renderer-neutral session transcript by stable source id.
+    pub fn upsert_shared_item(&mut self, item: TranscriptItem) -> usize {
+        let source_id = item
+            .source_view_item_id()
+            .expect("shared transcript item must carry source identity")
+            .clone();
+        if let Some(index) = self
+            .items
+            .iter()
+            .position(|existing| existing.source_view_item_id() == Some(&source_id))
+        {
+            if self.items[index].replace_from_shared(item) {
+                self.bump_revision();
+            }
+            return index;
+        }
+        self.items.push(item);
+        self.bump_revision();
+        self.items.len().saturating_sub(1)
+    }
+
     /// Finish streaming text for a role and bump the collection revision.
     pub fn finish_streaming_item(&mut self, role: &'static str, text: &str) {
         super::transcript::finish_streaming_transcript_item(&mut self.items, role, text);
