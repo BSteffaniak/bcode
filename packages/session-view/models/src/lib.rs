@@ -10,8 +10,8 @@
 
 use bcode_session_models::{
     ClientId, ModelTurnOutcome, PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkKind,
-    RuntimeWorkStatus, SessionId, SessionSummary, SessionTokenUsage, ToolArtifact,
-    ToolInvocationResult, WorkId,
+    RuntimeWorkStatus, SessionForkResult, SessionId, SessionSummary, SessionTokenUsage,
+    ToolArtifact, ToolInvocationResult, WorkId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +45,12 @@ impl TranscriptViewItemId {
     #[must_use]
     pub fn tool(tool_call_id: &str) -> Self {
         Self(format!("tool:{tool_call_id}"))
+    }
+
+    /// Create an identifier for historical tool request context retained after completion.
+    #[must_use]
+    pub fn tool_request(tool_call_id: &str) -> Self {
+        Self(format!("tool-request:{tool_call_id}"))
     }
 
     /// Create an identifier for a permission request.
@@ -153,6 +159,63 @@ impl SessionViewSnapshot {
             session_summary: None,
         }
     }
+
+    /// Apply a renderer-neutral patch to this snapshot.
+    ///
+    /// Full snapshot resets remain the correctness fallback: when `patch.reset` is present, the
+    /// entire snapshot is replaced after base-revision validation. Otherwise, transcript operations
+    /// are applied and collection fields in the patch are upserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot or transcript revision does not match the patch base, or
+    /// when a transcript operation references a missing or duplicate item.
+    pub fn apply_patch(
+        &mut self,
+        patch: &SessionViewPatch,
+    ) -> Result<(), TranscriptViewPatchError> {
+        if self.revision != patch.base_revision {
+            return Err(TranscriptViewPatchError::RevisionMismatch {
+                expected: patch.base_revision,
+                actual: self.revision,
+            });
+        }
+        if let Some(reset) = &patch.reset {
+            if reset.revision != patch.revision {
+                return Err(TranscriptViewPatchError::ResetRevisionMismatch {
+                    expected: patch.revision,
+                    actual: reset.revision,
+                });
+            }
+            *self = reset.as_ref().clone();
+            return Ok(());
+        }
+
+        self.transcript.apply_patch(patch)?;
+        self.contributions.extend(patch.contributions.clone());
+        self.active_exchanges.extend(patch.active_exchanges.clone());
+        self.active_invocations
+            .extend(patch.active_invocations.clone());
+        self.tools.extend(patch.tools.clone());
+        upsert_permissions(&mut self.permissions, &patch.permissions);
+        upsert_runtime_work(&mut self.runtime_work, &patch.runtime_work);
+        if let Some(active_skills) = &patch.active_skills {
+            self.active_skills.clone_from(active_skills);
+        }
+        self.plugin_status.extend(patch.plugin_status.clone());
+        if let Some(composer) = &patch.composer {
+            self.composer = composer.clone();
+        }
+        if let Some(thinking) = &patch.thinking {
+            self.thinking = thinking.clone();
+        }
+        if let Some(runtime) = &patch.runtime {
+            self.runtime = runtime.clone();
+        }
+        upsert_interactions(&mut self.interactions, &patch.interactions);
+        self.revision = patch.revision;
+        Ok(())
+    }
 }
 
 /// Incremental renderer-neutral session view update prepared for future patch streaming.
@@ -166,6 +229,9 @@ pub struct SessionViewPatch {
     pub revision: ViewRevision,
     /// Target session identifier, when known.
     pub session_id: Option<SessionId>,
+    /// Full snapshot reset used when an incremental patch would not be correctness-preserving.
+    #[serde(default)]
+    pub reset: Option<Box<SessionViewSnapshot>>,
     /// Transcript item operations.
     pub transcript: Vec<TranscriptViewPatchOp>,
     /// Opaque contribution updates keyed by invocation and contribution identity.
@@ -206,6 +272,7 @@ impl SessionViewPatch {
             base_revision,
             revision,
             session_id: None,
+            reset: None,
             transcript: Vec::new(),
             contributions: BTreeMap::new(),
             active_exchanges: BTreeMap::new(),
@@ -221,6 +288,77 @@ impl SessionViewPatch {
             interactions: Vec::new(),
         }
     }
+
+    /// Build a transcript-only patch between two bounded transcript documents.
+    ///
+    /// This helper keeps full-snapshot correctness as the baseline: it emits item-level append,
+    /// replace, and remove operations only when the next document preserves the same bounded-window
+    /// metadata and item ordering remains source-prefix compatible. Otherwise it falls back to a
+    /// transcript reset carrying the complete next document.
+    #[must_use]
+    pub fn transcript_between(
+        base_revision: ViewRevision,
+        revision: ViewRevision,
+        session_id: Option<SessionId>,
+        base: &TranscriptViewDocument,
+        next: &TranscriptViewDocument,
+    ) -> Self {
+        let mut patch = Self::empty(base_revision, revision);
+        patch.session_id = session_id;
+        patch.transcript = transcript_patch_ops(base, next);
+        patch
+    }
+
+    /// Build a correctness-preserving patch between two snapshots.
+    ///
+    /// The current implementation emits item-level transcript operations only when all
+    /// non-transcript snapshot fields are unchanged. Any broader state change falls back to a full
+    /// snapshot reset so patch consumers never have to infer missing field-clears from absent patch
+    /// data.
+    #[must_use]
+    pub fn between_snapshots(base: &SessionViewSnapshot, next: &SessionViewSnapshot) -> Self {
+        let mut patch = Self::transcript_between(
+            base.revision,
+            next.revision,
+            next.session_id,
+            &base.transcript,
+            &next.transcript,
+        );
+        if !snapshots_match_outside_transcript(base, next) {
+            patch.transcript.clear();
+            patch.reset = Some(Box::new(next.clone()));
+        }
+        patch
+    }
+}
+
+/// Error applying transcript patch operations to a bounded transcript document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptViewPatchError {
+    /// The document revision did not match the patch base revision.
+    RevisionMismatch {
+        /// Revision required by the patch.
+        expected: ViewRevision,
+        /// Current document revision.
+        actual: ViewRevision,
+    },
+    /// A reset operation carried a document or snapshot whose revision did not match the patch.
+    ResetRevisionMismatch {
+        /// Revision required by the patch.
+        expected: ViewRevision,
+        /// Revision carried by the reset payload.
+        actual: ViewRevision,
+    },
+    /// A replace or remove operation referenced an item that is not present.
+    MissingItem {
+        /// Missing item identifier.
+        id: TranscriptViewItemId,
+    },
+    /// An append operation attempted to add an item that is already present.
+    DuplicateItem {
+        /// Duplicate item identifier.
+        id: TranscriptViewItemId,
+    },
 }
 
 /// Transcript patch operation.
@@ -256,6 +394,217 @@ pub struct TranscriptViewDocument {
     pub has_newer_history: bool,
 }
 
+impl TranscriptViewDocument {
+    /// Apply transcript operations from a `SessionViewPatch`.
+    ///
+    /// This updates only transcript document state. Renderers must still treat full snapshots as the
+    /// correctness baseline and reset from a snapshot whenever patch ordering, revision continuity,
+    /// or transport reliability is uncertain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// * the document revision does not match `patch.base_revision`
+    /// * a replace or remove operation targets a missing item
+    /// * an append operation would duplicate an existing item id
+    pub fn apply_patch(
+        &mut self,
+        patch: &SessionViewPatch,
+    ) -> Result<(), TranscriptViewPatchError> {
+        if self.revision != patch.base_revision {
+            return Err(TranscriptViewPatchError::RevisionMismatch {
+                expected: patch.base_revision,
+                actual: self.revision,
+            });
+        }
+        for operation in &patch.transcript {
+            self.apply_patch_operation(operation, patch.revision)?;
+        }
+        self.revision = patch.revision;
+        self.refresh_source_bounds();
+        Ok(())
+    }
+
+    fn apply_patch_operation(
+        &mut self,
+        operation: &TranscriptViewPatchOp,
+        target_revision: ViewRevision,
+    ) -> Result<(), TranscriptViewPatchError> {
+        match operation {
+            TranscriptViewPatchOp::Append { item } => self.append_patch_item(item.clone()),
+            TranscriptViewPatchOp::Replace { item } => self.replace_patch_item(item.clone()),
+            TranscriptViewPatchOp::Remove { id } => self.remove_patch_item(id),
+            TranscriptViewPatchOp::Reset { document } => {
+                if document.revision != target_revision {
+                    return Err(TranscriptViewPatchError::ResetRevisionMismatch {
+                        expected: target_revision,
+                        actual: document.revision,
+                    });
+                }
+                *self = document.clone();
+                Ok(())
+            }
+        }
+    }
+
+    fn append_patch_item(
+        &mut self,
+        item: TranscriptViewItem,
+    ) -> Result<(), TranscriptViewPatchError> {
+        if self.items.iter().any(|existing| existing.id == item.id) {
+            return Err(TranscriptViewPatchError::DuplicateItem { id: item.id });
+        }
+        self.items.push(item);
+        Ok(())
+    }
+
+    fn replace_patch_item(
+        &mut self,
+        item: TranscriptViewItem,
+    ) -> Result<(), TranscriptViewPatchError> {
+        let Some(existing) = self
+            .items
+            .iter_mut()
+            .find(|existing| existing.id == item.id)
+        else {
+            return Err(TranscriptViewPatchError::MissingItem { id: item.id });
+        };
+        *existing = item;
+        Ok(())
+    }
+
+    fn remove_patch_item(
+        &mut self,
+        id: &TranscriptViewItemId,
+    ) -> Result<(), TranscriptViewPatchError> {
+        let Some(index) = self.items.iter().position(|item| item.id == *id) else {
+            return Err(TranscriptViewPatchError::MissingItem { id: id.clone() });
+        };
+        self.items.remove(index);
+        Ok(())
+    }
+
+    fn refresh_source_bounds(&mut self) {
+        self.source_start_sequence = self.items.iter().find_map(|item| item.sequence);
+        self.source_end_sequence = self.items.iter().rev().find_map(|item| item.sequence);
+    }
+}
+
+fn snapshots_match_outside_transcript(
+    base: &SessionViewSnapshot,
+    next: &SessionViewSnapshot,
+) -> bool {
+    base.schema_version == next.schema_version
+        && base.session_id == next.session_id
+        && base.title == next.title
+        && base.working_directory == next.working_directory
+        && base.latest_sequence == next.latest_sequence
+        && base.contributions == next.contributions
+        && base.active_exchanges == next.active_exchanges
+        && base.active_invocations == next.active_invocations
+        && base.tools == next.tools
+        && base.permissions == next.permissions
+        && base.runtime_work == next.runtime_work
+        && base.active_skills == next.active_skills
+        && base.plugin_status == next.plugin_status
+        && base.composer == next.composer
+        && base.thinking == next.thinking
+        && base.runtime == next.runtime
+        && base.interactions == next.interactions
+        && base.session_summary == next.session_summary
+}
+
+fn upsert_permissions(target: &mut Vec<PermissionView>, updates: &[PermissionView]) {
+    for update in updates {
+        upsert_by(target, update.clone(), |permission| {
+            permission.permission_id.as_str()
+        });
+    }
+}
+
+fn upsert_runtime_work(target: &mut Vec<RuntimeWorkView>, updates: &[RuntimeWorkView]) {
+    for update in updates {
+        upsert_by(target, update.clone(), |work| work.work_id.0.as_str());
+    }
+}
+
+fn upsert_interactions(
+    target: &mut Vec<InteractionViewSummary>,
+    updates: &[InteractionViewSummary],
+) {
+    for update in updates {
+        upsert_by(target, update.clone(), |interaction| {
+            interaction.interaction_id.as_str()
+        });
+    }
+}
+
+fn upsert_by<T, F>(target: &mut Vec<T>, update: T, key: F)
+where
+    F: Fn(&T) -> &str,
+{
+    if let Some(existing) = target
+        .iter_mut()
+        .find(|existing| key(existing) == key(&update))
+    {
+        *existing = update;
+    } else {
+        target.push(update);
+    }
+}
+
+fn transcript_patch_ops(
+    base: &TranscriptViewDocument,
+    next: &TranscriptViewDocument,
+) -> Vec<TranscriptViewPatchOp> {
+    if !transcript_window_metadata_matches(base, next)
+        || !transcript_items_are_prefix_compatible(base, next)
+    {
+        return vec![TranscriptViewPatchOp::Reset {
+            document: next.clone(),
+        }];
+    }
+
+    let mut operations = Vec::new();
+    let common_len = base.items.len().min(next.items.len());
+    for index in 0..common_len {
+        if base.items[index] != next.items[index] {
+            operations.push(TranscriptViewPatchOp::Replace {
+                item: next.items[index].clone(),
+            });
+        }
+    }
+    for item in next.items.iter().skip(common_len) {
+        operations.push(TranscriptViewPatchOp::Append { item: item.clone() });
+    }
+    for item in base.items.iter().skip(common_len).rev() {
+        operations.push(TranscriptViewPatchOp::Remove {
+            id: item.id.clone(),
+        });
+    }
+    operations
+}
+
+fn transcript_window_metadata_matches(
+    base: &TranscriptViewDocument,
+    next: &TranscriptViewDocument,
+) -> bool {
+    base.source_start_sequence == next.source_start_sequence
+        && base.has_older_history == next.has_older_history
+        && base.has_newer_history == next.has_newer_history
+}
+
+fn transcript_items_are_prefix_compatible(
+    base: &TranscriptViewDocument,
+    next: &TranscriptViewDocument,
+) -> bool {
+    base.items
+        .iter()
+        .zip(&next.items)
+        .all(|(base, next)| base.id == next.id)
+}
+
 /// Renderer-neutral transcript item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptViewItem {
@@ -285,14 +634,20 @@ pub enum TranscriptViewItemKind {
     ReasoningMessage { message: ChatMessageView },
     /// Tool request/result/stream block.
     ToolInvocation { tool: Box<ToolInvocationView> },
+    /// Historical request context retained after a tool result supersedes the active invocation row.
+    ToolRequest { tool: Box<ToolInvocationView> },
     /// Permission request block.
     Permission { permission: PermissionView },
     /// Runtime work status block.
     RuntimeWork { work: RuntimeWorkView },
     /// Provider-neutral model usage accounting.
     Usage { usage: UsageView },
+    /// Context compaction transcript note.
+    Compaction { compaction: CompactionView },
     /// Interactive request block.
     Interaction { interaction: InteractionViewSummary },
+    /// Skill-related transcript note.
+    Skill { skill: SkillView },
     /// System/status message.
     SystemMessage { message: ChatMessageView },
     /// Generic plugin visual payload.
@@ -310,6 +665,54 @@ pub struct UsageView {
     pub turn_id: String,
     /// Provider-neutral usage accounting.
     pub usage: SessionTokenUsage,
+}
+
+/// Renderer-neutral context compaction transcript note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionView {
+    /// Semantic compaction status.
+    pub status: CompactionViewStatus,
+    /// Renderer-ready compaction note text.
+    pub text: String,
+    /// Provider plugin identifier for provider-owned compaction, when known.
+    pub provider_plugin_id: Option<String>,
+    /// Model identifier for provider-owned compaction, when known.
+    pub model_id: Option<String>,
+}
+
+/// Semantic status for a compaction transcript note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionViewStatus {
+    /// Local context was compacted by Bcode.
+    Local,
+    /// Provider-owned context was compacted.
+    Provider,
+}
+
+/// Renderer-neutral skill transcript note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillView {
+    /// Skill identifier.
+    pub skill_id: String,
+    /// Semantic skill note status.
+    pub status: SkillViewStatus,
+    /// Renderer-ready skill note text.
+    pub text: String,
+}
+
+/// Semantic status for a skill transcript note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillViewStatus {
+    /// Skill was invoked.
+    Invoked,
+    /// Skill was suggested.
+    Suggested,
+    /// Skill context was loaded.
+    ContextLoaded,
+    /// Skill invocation failed.
+    Failed,
 }
 
 /// Chat text plus renderer-neutral annotations.
@@ -806,6 +1209,18 @@ pub enum SessionViewActionOutcome {
     PermissionBatchResolved { resolved_count: usize },
     /// Interaction resolution result.
     InteractionResolved { resolved: bool },
+    /// Session rename result.
+    SessionRenamed { session: Box<SessionSummary> },
+    /// Session deletion result.
+    SessionDeleted { session: Box<SessionSummary> },
+    /// Session fork result.
+    SessionForked { fork: Box<SessionForkResult> },
+    /// Session clone result.
+    SessionCloned { fork: Box<SessionForkResult> },
+    /// Runtime-work cancellation request result.
+    RuntimeWorkCancellationRequested { cancelled: bool },
+    /// Context compaction request result.
+    ContextCompacted { message: String },
 }
 
 /// Semantic renderer action shared by terminal, web, and future renderers.
@@ -882,6 +1297,46 @@ pub enum SessionViewAction {
         effort: Option<String>,
         /// Reasoning summary selection.
         summary: Option<String>,
+    },
+    /// Rename a session.
+    RenameSession {
+        /// Target session.
+        session_id: SessionId,
+        /// New title, or `None` to clear/reset the title according to daemon policy.
+        name: Option<String>,
+    },
+    /// Delete a session.
+    DeleteSession {
+        /// Target session.
+        session_id: SessionId,
+    },
+    /// Fork a session at an optional prompt boundary.
+    ForkSession {
+        /// Source session.
+        session_id: SessionId,
+        /// Prompt sequence to fork from.
+        prompt_sequence: u64,
+        /// New session name override.
+        name: Option<String>,
+    },
+    /// Clone a session.
+    CloneSession {
+        /// Source session.
+        session_id: SessionId,
+        /// New session name override.
+        name: Option<String>,
+    },
+    /// Request cancellation of a runtime-work item.
+    CancelRuntimeWork {
+        /// Target session.
+        session_id: SessionId,
+        /// Runtime work id.
+        work_id: WorkId,
+    },
+    /// Request context compaction for a session.
+    CompactContext {
+        /// Target session.
+        session_id: SessionId,
     },
     /// Set the selected agent for a session.
     SetAgent {

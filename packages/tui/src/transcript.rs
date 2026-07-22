@@ -1,15 +1,12 @@
 //! Transcript item projection for the TUI.
 
 #[cfg(test)]
-use std::collections::BTreeMap;
-
-#[cfg(test)]
-use bcode_plugin_sdk::path::display;
-#[cfg(test)]
-use bcode_session_models::{SessionEvent, SessionEventKind, ToolInvocationStreamEvent};
+use bcode_session_models::{SessionEvent, SessionEventKind};
 use bcode_session_models::{
     SessionTokenUsage, ToolArtifact, ToolInvocationProjection, ToolInvocationResult,
 };
+#[cfg(test)]
+use bcode_session_view::SessionView;
 use bcode_session_view_models::{
     InteractionViewSummary, RuntimeWorkView, ToolInvocationView, ToolInvocationViewStatus,
     ToolResultView, TranscriptViewItem, TranscriptViewItemKind,
@@ -118,15 +115,6 @@ pub enum TranscriptItemKind {
     },
     /// Generic fallback item.
     Generic,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct ToolCallContext {
-    tool_name: String,
-    arguments_json: String,
-    working_directory: Option<std::path::PathBuf>,
-    request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 }
 
 /// Stable identity for a rendered transcript item.
@@ -251,16 +239,12 @@ impl TranscriptItem {
         &self.text
     }
 
-    /// Replace an opaque contribution envelope and its generic fallback text.
-    pub fn replace_tool_contribution(
-        &mut self,
-        contribution: bcode_session_models::ToolContributionEvent,
-    ) {
-        self.text = serde_json::to_string_pretty(&contribution)
-            .unwrap_or_else(|_| contribution.payload.to_string());
-        self.kind = TranscriptItemKind::ToolContribution {
-            contribution: Box::new(contribution),
-        };
+    /// Replace display text.
+    pub fn replace_text(&mut self, text: String) {
+        if let TranscriptItemKind::ToolResult { result, .. } = &mut self.kind {
+            result.clone_from(&text);
+        }
+        self.text = text;
         self.bump_revision();
     }
 
@@ -368,169 +352,28 @@ impl TranscriptItem {
     }
 }
 
-/// Project session events into transcript items, optionally hiding reasoning items.
+/// Project session events through the shared semantic view into terminal transcript items,
+/// optionally hiding reasoning items.
 #[cfg(test)]
 #[must_use]
 pub fn transcript_items_from_events_with_reasoning(
     events: &[SessionEvent],
     include_reasoning: bool,
 ) -> Vec<TranscriptItem> {
-    let mut projector = TranscriptProjector::new(include_reasoning);
+    let mut view = SessionView::new();
     for event in events {
-        projector.push_event(event);
+        view.apply_event(event);
     }
-    projector.finish()
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct StreamedToolReplayContext {
-    index: Option<usize>,
-    columns: u16,
-    rows: u16,
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-    saw_output: bool,
-}
-
-#[cfg(test)]
-struct TranscriptProjector {
-    items: Vec<TranscriptItem>,
-    tool_calls: BTreeMap<String, ToolCallContext>,
-    streamed_tool_results: BTreeMap<String, StreamedToolReplayContext>,
-    include_reasoning: bool,
-}
-
-#[cfg(test)]
-impl TranscriptProjector {
-    const fn new(include_reasoning: bool) -> Self {
-        Self {
-            items: Vec::new(),
-            tool_calls: BTreeMap::new(),
-            streamed_tool_results: BTreeMap::new(),
-            include_reasoning,
-        }
-    }
-
-    fn push_event(&mut self, event: &SessionEvent) {
-        push_transcript_item_from_event(
-            &mut self.items,
-            &mut self.tool_calls,
-            &mut self.streamed_tool_results,
-            self.include_reasoning,
-            event,
-        );
-    }
-
-    fn finish(self) -> Vec<TranscriptItem> {
-        self.items
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_lines)]
-fn push_transcript_item_from_event(
-    items: &mut Vec<TranscriptItem>,
-    tool_calls: &mut BTreeMap<String, ToolCallContext>,
-    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
-    include_reasoning: bool,
-    event: &SessionEvent,
-) {
-    match &event.kind {
-        SessionEventKind::AssistantDelta { text } => {
-            push_streaming_transcript_item(items, "Assistant", text);
-        }
-        SessionEventKind::AssistantMessage { text } => {
-            finish_streaming_transcript_item(items, "Assistant", text);
-        }
-        SessionEventKind::AssistantReasoningDelta { text } if include_reasoning => {
-            push_streaming_transcript_item(items, "Reasoning summary", text);
-        }
-        SessionEventKind::AssistantReasoningMessage { text } if include_reasoning => {
-            finish_streaming_transcript_item(items, "Reasoning summary", text);
-        }
-        SessionEventKind::AssistantReasoningDelta { .. }
-        | SessionEventKind::AssistantReasoningMessage { .. } => {}
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result: _,
-            is_error,
-            semantic_result,
-            ..
-        } => {
-            if let Some(semantic_result) = semantic_result {
-                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
-                    && let Some(index) = replay.index
-                {
-                    let mut item = semantic_tool_result_item(
-                        tool_call_id,
-                        tool_calls.get(tool_call_id),
-                        semantic_result,
-                        *is_error,
-                    );
-                    apply_replay_timing(&mut item, replay);
-                    if replay.saw_output {
-                        if let Some(existing) = items.get_mut(index) {
-                            existing.set_tool_started_at_ms(replay.started_at_ms);
-                            existing.set_tool_finished_at_ms(replay.finished_at_ms);
-                            existing.finish_streaming();
-                        }
-                    } else if let Some(existing) = items.get_mut(index) {
-                        *existing = item;
-                    } else {
-                        items.push(item);
-                    }
-                    return;
-                }
-                let mut item = semantic_tool_result_item(
-                    tool_call_id,
-                    tool_calls.get(tool_call_id),
-                    semantic_result,
-                    *is_error,
-                );
-                if let Some(replay) = streamed_tool_results.get(tool_call_id) {
-                    apply_replay_timing(&mut item, replay);
-                }
-                items.push(item);
-                return;
-            }
-            let should_render_final =
-                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id) {
-                    if let Some(index) = replay.index
-                        && let Some(item) = items.get_mut(index)
-                    {
-                        item.set_tool_started_at_ms(replay.started_at_ms);
-                        item.set_tool_finished_at_ms(replay.finished_at_ms);
-                        item.finish_streaming();
-                    }
-                    !replay.saw_output
-                } else {
-                    true
-                };
-            if should_render_final
-                && let Some(mut item) = non_streaming_transcript_item_from_event(
-                    event,
-                    tool_calls,
-                    streamed_tool_results,
-                )
-            {
-                if let Some(replay) = streamed_tool_results.get(tool_call_id) {
-                    apply_replay_timing(&mut item, replay);
-                }
-                items.push(item);
-            }
-        }
-        SessionEventKind::ToolInvocationStream { event } => {
-            apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
-        }
-        _ => {
-            if let Some(item) =
-                non_streaming_transcript_item_from_event(event, tool_calls, streamed_tool_results)
-            {
-                items.push(item);
-            }
-        }
-    }
+    view.snapshot()
+        .transcript
+        .items
+        .iter()
+        .filter(|item| {
+            include_reasoning
+                || !matches!(item.kind, TranscriptViewItemKind::ReasoningMessage { .. })
+        })
+        .map(terminal_item_from_shared)
+        .collect()
 }
 
 /// Append streamed text to the currently open transcript stream for `role`.
@@ -732,6 +575,24 @@ pub fn tool_result_item(
     result: &str,
     is_error: bool,
 ) -> TranscriptItem {
+    tool_result_item_with_working_directory(
+        tool_call_id,
+        tool_name,
+        arguments_json,
+        None,
+        result,
+        is_error,
+    )
+}
+
+fn tool_result_item_with_working_directory(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    working_directory: Option<&std::path::Path>,
+    result: &str,
+    is_error: bool,
+) -> TranscriptItem {
     TranscriptItem::with_kind(
         if is_error { "Tool error" } else { "Tool" },
         result.to_owned(),
@@ -740,7 +601,7 @@ pub fn tool_result_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: arguments_json.map(ToOwned::to_owned),
-            working_directory: None,
+            working_directory: working_directory.map(std::path::Path::to_path_buf),
             result: result.to_owned(),
             artifact: None,
             is_error,
@@ -784,6 +645,67 @@ pub fn artifact_tool_result_item(
     )
 }
 
+/// Build a transcript item from a raw semantic tool result.
+#[must_use]
+pub fn semantic_tool_result_item_from_raw(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    working_directory: Option<&std::path::Path>,
+    result: &ToolInvocationResult,
+    is_error: bool,
+) -> TranscriptItem {
+    match result {
+        ToolInvocationResult::Text { text } | ToolInvocationResult::Json { value: text } => {
+            tool_result_item_with_working_directory(
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                working_directory,
+                text,
+                is_error,
+            )
+        }
+        ToolInvocationResult::Artifact { artifact } => {
+            artifact_tool_result_item(tool_call_id, tool_name, arguments_json, artifact, is_error)
+        }
+    }
+}
+
+/// Render a tool result string, parsing structured result payloads when possible.
+#[must_use]
+pub fn display_tool_result_text(result: &str) -> String {
+    if let Ok(result) = serde_json::from_str::<ToolInvocationResult>(result) {
+        return match result {
+            ToolInvocationResult::Text { text } | ToolInvocationResult::Json { value: text } => {
+                text
+            }
+            ToolInvocationResult::Artifact { artifact } => artifact_summary_text(&artifact),
+        };
+    }
+    serde_json::from_str::<ToolArtifact>(result).map_or_else(
+        |_| result.to_owned(),
+        |artifact| artifact_summary_text(&artifact),
+    )
+}
+
+/// Summarize a plugin-owned artifact for generic terminal rendering.
+#[must_use]
+pub fn artifact_summary_text(artifact: &ToolArtifact) -> String {
+    let title = artifact.title.as_deref().unwrap_or("Tool artifact");
+    let summary = artifact
+        .metadata
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&artifact.schema);
+    let path = artifact
+        .metadata
+        .get("path")
+        .and_then(serde_json::Value::as_str);
+    let text = path.map_or_else(|| summary.to_owned(), |path| format!("{summary}\n{path}"));
+    format!("{title}\n{text}")
+}
+
 fn tool_timing_from_artifact(artifact: &ToolArtifact) -> ToolTiming {
     ToolTiming {
         timed_out: artifact
@@ -792,24 +714,6 @@ fn tool_timing_from_artifact(artifact: &ToolArtifact) -> ToolTiming {
             .and_then(serde_json::Value::as_bool),
         ..ToolTiming::default()
     }
-}
-
-/// Build a renderer-neutral transcript item for an opaque tool contribution.
-#[must_use]
-pub fn tool_contribution_item(
-    contribution: &bcode_session_models::ToolContributionEvent,
-    streaming: bool,
-) -> TranscriptItem {
-    let text = serde_json::to_string_pretty(contribution)
-        .unwrap_or_else(|_| contribution.payload.to_string());
-    TranscriptItem::with_kind(
-        "Tool contribution",
-        text,
-        streaming,
-        TranscriptItemKind::ToolContribution {
-            contribution: Box::new(contribution.clone()),
-        },
-    )
 }
 
 /// Build a transcript item for a permission request.
@@ -890,7 +794,17 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
             message_text_item(role, message, item.streaming, TranscriptItemKind::System)
         }
         TranscriptViewItemKind::Usage { usage } => model_usage_item(&usage.turn_id, &usage.usage),
+        TranscriptViewItemKind::Compaction { compaction } => TranscriptItem::with_kind(
+            "Compaction",
+            compaction.text.clone(),
+            item.streaming,
+            TranscriptItemKind::Meta,
+        ),
+        TranscriptViewItemKind::Skill { skill } => terminal_skill_item_from_shared(skill),
         TranscriptViewItemKind::ToolInvocation { tool } => terminal_tool_item_from_shared(tool),
+        TranscriptViewItemKind::ToolRequest { tool } => {
+            terminal_tool_request_item_from_shared(tool)
+        }
         TranscriptViewItemKind::Permission { permission } => {
             terminal_permission_item_from_shared(permission)
         }
@@ -913,7 +827,14 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
         TranscriptViewItemKind::ToolContribution { contribution } => {
             let fallback = serde_json::to_string_pretty(contribution)
                 .unwrap_or_else(|_| contribution.payload.to_string());
-            TranscriptItem::new("Tool contribution", fallback)
+            TranscriptItem::with_kind(
+                "Tool contribution",
+                fallback,
+                item.streaming,
+                TranscriptItemKind::ToolContribution {
+                    contribution: Box::new(contribution.clone()),
+                },
+            )
         }
     };
     if let (Some(sequence), Some(timestamp_ms)) = (item.sequence, item.timestamp_ms) {
@@ -934,6 +855,38 @@ fn message_text_item(
     } else {
         item
     }
+}
+
+fn terminal_skill_item_from_shared(skill: &bcode_session_view_models::SkillView) -> TranscriptItem {
+    let (role, kind) = match skill.status {
+        bcode_session_view_models::SkillViewStatus::Invoked
+        | bcode_session_view_models::SkillViewStatus::Suggested => {
+            ("Skill", TranscriptItemKind::Skill)
+        }
+        bcode_session_view_models::SkillViewStatus::ContextLoaded => {
+            ("Skill context", TranscriptItemKind::Generic)
+        }
+        bcode_session_view_models::SkillViewStatus::Failed => {
+            ("Skill error", TranscriptItemKind::SkillError)
+        }
+    };
+    TranscriptItem::with_kind(role, skill.text.clone(), false, kind)
+}
+
+fn terminal_tool_request_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
+    apply_shared_tool_timing(
+        tool_request_item(
+            &tool.tool_call_id,
+            tool.producer_plugin_id.as_deref(),
+            tool.tool_name.as_deref().unwrap_or("unknown tool"),
+            tool.arguments_json.as_deref().unwrap_or("{}"),
+            tool.working_directory.clone(),
+            tool.request_visual
+                .as_ref()
+                .map(|visual| visual.descriptor.clone()),
+        ),
+        tool,
+    )
 }
 
 fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
@@ -1005,7 +958,9 @@ fn tool_result_text_from_shared(tool: &ToolInvocationView) -> Option<String> {
     match &tool.result {
         Some(ToolResultView::Text { text }) => Some(text.clone()),
         Some(ToolResultView::Json { value }) => Some(pretty_jsonish(value)),
-        Some(ToolResultView::Artifact { .. }) | None => tool.result_text.clone(),
+        Some(ToolResultView::Artifact { .. }) | None => {
+            tool.result_text.as_deref().map(display_tool_result_text)
+        }
     }
 }
 
@@ -1232,344 +1187,6 @@ fn role_requires_last_item_stream_boundary(role: &'static str) -> bool {
     role == "Reasoning summary"
 }
 
-#[allow(clippy::too_many_lines)]
-#[cfg(test)]
-fn non_streaming_transcript_item_from_event(
-    event: &SessionEvent,
-    tool_calls: &mut BTreeMap<String, ToolCallContext>,
-    streamed_tool_results: &BTreeMap<String, StreamedToolReplayContext>,
-) -> Option<TranscriptItem> {
-    match &event.kind {
-        SessionEventKind::UserMessage {
-            text, admission, ..
-        } => Some(
-            admission
-                .origin
-                .as_ref()
-                .and_then(|origin| origin.display_label.clone())
-                .map_or_else(
-                    || TranscriptItem::new("You", text.clone()),
-                    |label| TranscriptItem::new("You", text.clone()).with_display_label(label),
-                )
-                .with_event_metadata(event.sequence, event.timestamp_ms),
-        ),
-        SessionEventKind::SystemMessage { text } => Some(
-            TranscriptItem::new("System", text.clone())
-                .with_event_metadata(event.sequence, event.timestamp_ms),
-        ),
-        SessionEventKind::PluginStatusNote {
-            plugin_id, text, ..
-        } => Some(
-            TranscriptItem::new("Plugin", text.clone())
-                .with_display_label(plugin_id.clone())
-                .with_event_metadata(event.sequence, event.timestamp_ms),
-        ),
-        SessionEventKind::WorkingDirectoryChanged {
-            old_working_directory,
-            new_working_directory,
-        } => Some(TranscriptItem::new(
-            "System",
-            working_directory_changed_message(old_working_directory, new_working_directory),
-        )),
-        SessionEventKind::ToolCallRequested {
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            working_directory,
-            request_visual,
-            legacy_request_presentation: _legacy_request_presentation,
-            ..
-        } => {
-            tool_calls.insert(
-                tool_call_id.clone(),
-                ToolCallContext {
-                    tool_name: tool_name.clone(),
-                    arguments_json: arguments_json.clone(),
-                    working_directory: working_directory.clone(),
-                    request_visual: request_visual.clone(),
-                },
-            );
-            let projection = ToolInvocationProjection {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: Some(tool_name.clone()),
-                arguments_json: Some(arguments_json.clone()),
-                request_visual: request_visual.clone(),
-                ..ToolInvocationProjection::default()
-            };
-            Some(tool_request_item_from_projection(&projection))
-        }
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result,
-            is_error,
-            semantic_result,
-            ..
-        } => {
-            if let Some(semantic_result) = semantic_result {
-                return Some(semantic_tool_result_item(
-                    tool_call_id,
-                    tool_calls.get(tool_call_id),
-                    semantic_result,
-                    *is_error,
-                ));
-            }
-            if streamed_tool_results
-                .get(tool_call_id)
-                .is_some_and(|replay| replay.saw_output)
-            {
-                return None;
-            }
-            let context = tool_calls.get(tool_call_id);
-            let projection = ToolInvocationProjection {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: context.map(|context| context.tool_name.clone()),
-                arguments_json: context.map(|context| context.arguments_json.clone()),
-                result_text: Some(result.clone()),
-                is_error: Some(*is_error),
-                ..ToolInvocationProjection::default()
-            };
-            generic_tool_result_item_from_projection(&projection)
-        }
-        SessionEventKind::PermissionRequested {
-            permission_id,
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            legacy_request_presentation: _legacy_request_presentation,
-            policy_source,
-            policy_reason,
-            ..
-        } => Some(permission_request_item(
-            permission_id,
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            policy_source.as_deref(),
-            policy_reason.as_deref(),
-        )),
-        SessionEventKind::PermissionResolved {
-            permission_id,
-            approved,
-            ..
-        } => Some(permission_result_item(permission_id, *approved)),
-        SessionEventKind::ModelUsage { turn_id, usage } => Some(model_usage_item(turn_id, usage)),
-        SessionEventKind::ContextCompacted { summary, .. } => Some(TranscriptItem::with_kind(
-            "Compaction",
-            format!("context compacted: {summary}"),
-            false,
-            TranscriptItemKind::Meta,
-        )),
-        SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
-            Some(TranscriptItem::with_kind(
-                "Compaction",
-                format!(
-                    "provider compacted context ({})",
-                    snapshot.provider_plugin_id
-                ),
-                false,
-                TranscriptItemKind::Meta,
-            ))
-        }
-        SessionEventKind::SkillInvoked {
-            skill_id,
-            arguments,
-            source,
-            ..
-        } => Some(TranscriptItem::with_kind(
-            "Skill",
-            format!(
-                "invoked {skill_id}{}\nArguments: {arguments}",
-                source
-                    .as_ref()
-                    .map_or_else(String::new, |source| format!("\nSource: {}", source.label))
-            ),
-            false,
-            TranscriptItemKind::Skill,
-        )),
-        SessionEventKind::SkillInvocationFailed {
-            skill_id, error, ..
-        } => Some(TranscriptItem::with_kind(
-            "Skill error",
-            format!("{skill_id}: {error}"),
-            false,
-            TranscriptItemKind::SkillError,
-        )),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-fn working_directory_changed_message(
-    old_working_directory: &std::path::Path,
-    new_working_directory: &std::path::Path,
-) -> String {
-    format!(
-        "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
-        display(old_working_directory, old_working_directory),
-        display(new_working_directory, old_working_directory)
-    )
-}
-
-#[cfg(test)]
-fn semantic_tool_result_item(
-    tool_call_id: &str,
-    context: Option<&ToolCallContext>,
-    result: &ToolInvocationResult,
-    is_error: bool,
-) -> TranscriptItem {
-    semantic_tool_result_item_from_raw(
-        tool_call_id,
-        context.map(|context| context.tool_name.as_str()),
-        context.map(|context| context.arguments_json.as_str()),
-        context.and_then(|context| context.working_directory.as_deref()),
-        result,
-        is_error,
-    )
-}
-
-/// Build a transcript item from a raw semantic tool result.
-#[must_use]
-pub fn semantic_tool_result_item_from_raw(
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    arguments_json: Option<&str>,
-    working_directory: Option<&std::path::Path>,
-    result: &ToolInvocationResult,
-    is_error: bool,
-) -> TranscriptItem {
-    let mut item = match result {
-        ToolInvocationResult::Text { text } => {
-            tool_result_item(tool_call_id, tool_name, arguments_json, text, is_error)
-        }
-        ToolInvocationResult::Json { value } => {
-            tool_result_item(tool_call_id, tool_name, arguments_json, value, is_error)
-        }
-        ToolInvocationResult::Artifact { artifact } => {
-            artifact_tool_result_item(tool_call_id, tool_name, arguments_json, artifact, is_error)
-        }
-    };
-    if let TranscriptItemKind::ToolResult {
-        working_directory: item_cwd,
-        ..
-    } = &mut item.kind
-    {
-        *item_cwd = working_directory.map(std::path::Path::to_path_buf);
-    }
-    item
-}
-
-pub fn display_tool_result_text(result: &str) -> String {
-    if let Ok(result) = serde_json::from_str::<ToolInvocationResult>(result) {
-        return match result {
-            ToolInvocationResult::Text { text } | ToolInvocationResult::Json { value: text } => {
-                text
-            }
-            ToolInvocationResult::Artifact { artifact } => artifact_summary_text(&artifact),
-        };
-    }
-    serde_json::from_str::<ToolArtifact>(result).map_or_else(
-        |_| result.to_owned(),
-        |artifact| artifact_summary_text(&artifact),
-    )
-}
-
-pub fn artifact_summary_text(artifact: &ToolArtifact) -> String {
-    let title = artifact.title.as_deref().unwrap_or("Tool artifact");
-    let summary = artifact
-        .metadata
-        .get("summary")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(&artifact.schema);
-    let path = artifact
-        .metadata
-        .get("path")
-        .and_then(serde_json::Value::as_str);
-    let text = path.map_or_else(|| summary.to_owned(), |path| format!("{summary}\n{path}"));
-    format!("{title}\n{text}")
-}
-
-#[cfg(test)]
-const fn apply_replay_timing(item: &mut TranscriptItem, replay: &StreamedToolReplayContext) {
-    item.set_tool_started_at_ms(replay.started_at_ms);
-    item.set_tool_finished_at_ms(replay.finished_at_ms);
-}
-
-#[cfg(test)]
-fn apply_tool_invocation_stream_event(
-    items: &mut Vec<TranscriptItem>,
-    tool_calls: &BTreeMap<String, ToolCallContext>,
-    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
-    event: &ToolInvocationStreamEvent,
-) {
-    match event {
-        ToolInvocationStreamEvent::Started {
-            tool_call_id,
-            started_at_ms,
-            ..
-        } => {
-            let replay = streamed_tool_results
-                .entry(tool_call_id.clone())
-                .or_default();
-            replay.started_at_ms = *started_at_ms;
-        }
-        ToolInvocationStreamEvent::VisualUpdate {
-            tool_call_id,
-            visual,
-            streaming,
-            ..
-        } => {
-            let context = tool_calls.get(tool_call_id);
-            let mut item = streaming_tool_visual_item(
-                tool_call_id,
-                context.map(|context| context.tool_name.as_str()),
-                context.and_then(|context| context.working_directory.as_deref()),
-                visual,
-                *streaming,
-            );
-            let replay = streamed_tool_results
-                .entry(tool_call_id.clone())
-                .or_default();
-            item.set_tool_started_at_ms(replay.started_at_ms);
-            item.set_tool_finished_at_ms(replay.finished_at_ms);
-            item.set_tool_timeout_ms(tool_visual_timeout_ms(visual));
-            let index = upsert_tool_visual_item(items, item);
-            replay.index = Some(index);
-            replay.saw_output = true;
-        }
-        ToolInvocationStreamEvent::Finished {
-            tool_call_id,
-            finished_at_ms,
-            ..
-        } => {
-            let replay = streamed_tool_results
-                .entry(tool_call_id.clone())
-                .or_default();
-            replay.finished_at_ms = *finished_at_ms;
-            if let Some(index) = replay.index
-                && let Some(item) = items.get_mut(index)
-            {
-                item.set_tool_started_at_ms(replay.started_at_ms);
-                item.set_tool_finished_at_ms(replay.finished_at_ms);
-                item.finish_streaming();
-            }
-        }
-        ToolInvocationStreamEvent::OutputDelta { .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { .. }
-        | ToolInvocationStreamEvent::Status { .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { .. }
-        | ToolInvocationStreamEvent::LegacyTransientPruned { .. } => {}
-    }
-}
-
-#[cfg(test)]
-fn tool_visual_timeout_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
-    visual
-        .payload
-        .get("_bcode_runtime")
-        .and_then(|runtime| runtime.get("timeout_ms"))
-        .and_then(serde_json::Value::as_u64)
-}
-
 fn kind_for_role(role: &str) -> TranscriptItemKind {
     match role {
         "You" => TranscriptItemKind::UserMessage,
@@ -1725,7 +1342,7 @@ mod tests {
 
         let items = transcript_items_from_events_with_reasoning(&[event], false);
         assert_eq!(items.len(), 1);
-        assert!(items[0].text().contains("provider compacted context"));
+        assert!(items[0].text().contains("context compaction"));
         assert!(!items[0].text().contains(secret));
         assert!(!items[0].text().contains("portable summary"));
     }

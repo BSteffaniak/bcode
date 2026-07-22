@@ -90,3 +90,255 @@ fn permission_view_deserializes_legacy_shape() {
     assert_eq!(permission.batch, None);
     assert_eq!(permission.policy_source, None);
 }
+
+#[test]
+fn transcript_patch_appends_and_replaces_prefix_compatible_items() {
+    let mut base = transcript_document(3, [transcript_item("one", 1, "old")]);
+    let next = transcript_document(
+        4,
+        [
+            transcript_item("one", 1, "new"),
+            transcript_item("two", 2, "append"),
+        ],
+    );
+
+    let patch = SessionViewPatch::transcript_between(3, 4, None, &base, &next);
+    assert_eq!(
+        patch.transcript,
+        vec![
+            TranscriptViewPatchOp::Replace {
+                item: transcript_item("one", 1, "new")
+            },
+            TranscriptViewPatchOp::Append {
+                item: transcript_item("two", 2, "append")
+            },
+        ]
+    );
+
+    base.apply_patch(&patch).expect("patch applies");
+    assert_eq!(base, next);
+}
+
+#[test]
+fn transcript_patch_removes_tail_items() {
+    let mut base = transcript_document(
+        3,
+        [
+            transcript_item("one", 1, "one"),
+            transcript_item("two", 2, "remove"),
+        ],
+    );
+    let next = transcript_document(4, [transcript_item("one", 1, "one")]);
+
+    let patch = SessionViewPatch::transcript_between(3, 4, None, &base, &next);
+    assert_eq!(
+        patch.transcript,
+        vec![TranscriptViewPatchOp::Remove {
+            id: TranscriptViewItemId::new("two")
+        }]
+    );
+
+    base.apply_patch(&patch).expect("patch applies");
+    assert_eq!(base, next);
+}
+
+#[test]
+fn transcript_patch_resets_when_window_metadata_changes() {
+    let base = transcript_document(3, [transcript_item("one", 1, "old")]);
+    let mut next = transcript_document(4, [transcript_item("two", 2, "new")]);
+    next.has_older_history = true;
+
+    let patch = SessionViewPatch::transcript_between(3, 4, None, &base, &next);
+    assert_eq!(
+        patch.transcript,
+        vec![TranscriptViewPatchOp::Reset {
+            document: next.clone()
+        }]
+    );
+
+    let mut applied = base;
+    applied.apply_patch(&patch).expect("reset patch applies");
+    assert_eq!(applied, next);
+}
+
+#[test]
+fn transcript_patch_rejects_wrong_base_revision() {
+    let mut base = transcript_document(3, [transcript_item("one", 1, "old")]);
+    let next = transcript_document(5, [transcript_item("one", 1, "new")]);
+    let patch = SessionViewPatch::transcript_between(4, 5, None, &base, &next);
+
+    assert_eq!(
+        base.apply_patch(&patch),
+        Err(TranscriptViewPatchError::RevisionMismatch {
+            expected: 4,
+            actual: 3,
+        })
+    );
+}
+
+#[test]
+fn transcript_patch_rejects_reset_revision_mismatch() {
+    let mut base = transcript_document(3, [transcript_item("one", 1, "old")]);
+    let patch = SessionViewPatch {
+        transcript: vec![TranscriptViewPatchOp::Reset {
+            document: transcript_document(99, [transcript_item("one", 1, "new")]),
+        }],
+        ..SessionViewPatch::empty(3, 4)
+    };
+
+    assert_eq!(
+        base.apply_patch(&patch),
+        Err(TranscriptViewPatchError::ResetRevisionMismatch {
+            expected: 4,
+            actual: 99,
+        })
+    );
+}
+
+#[test]
+fn snapshot_patch_rejects_reset_revision_mismatch() {
+    let mut base = SessionViewSnapshot::empty();
+    base.revision = 3;
+    let mut reset = base.clone();
+    reset.revision = 99;
+    let patch = SessionViewPatch {
+        reset: Some(Box::new(reset)),
+        ..SessionViewPatch::empty(3, 4)
+    };
+
+    assert_eq!(
+        base.apply_patch(&patch),
+        Err(TranscriptViewPatchError::ResetRevisionMismatch {
+            expected: 4,
+            actual: 99,
+        })
+    );
+}
+
+#[test]
+fn session_view_patch_deserializes_without_reset_field() {
+    let patch: SessionViewPatch = serde_json::from_value(serde_json::json!({
+        "schema_version": SessionViewPatch::SCHEMA_VERSION,
+        "base_revision": 1,
+        "revision": 2,
+        "session_id": null,
+        "transcript": [],
+        "contributions": {},
+        "active_exchanges": {},
+        "active_invocations": {},
+        "tools": {},
+        "permissions": [],
+        "runtime_work": [],
+        "active_skills": null,
+        "plugin_status": {},
+        "composer": null,
+        "thinking": null,
+        "runtime": null,
+        "interactions": []
+    }))
+    .expect("legacy patch without reset");
+
+    assert!(patch.reset.is_none());
+}
+
+#[test]
+fn transcript_patch_rejects_missing_and_duplicate_items() {
+    let mut base = transcript_document(1, [transcript_item("one", 1, "one")]);
+    let duplicate = SessionViewPatch {
+        transcript: vec![TranscriptViewPatchOp::Append {
+            item: transcript_item("one", 1, "again"),
+        }],
+        ..SessionViewPatch::empty(1, 2)
+    };
+    assert_eq!(
+        base.apply_patch(&duplicate),
+        Err(TranscriptViewPatchError::DuplicateItem {
+            id: TranscriptViewItemId::new("one")
+        })
+    );
+
+    let missing = SessionViewPatch {
+        transcript: vec![TranscriptViewPatchOp::Remove {
+            id: TranscriptViewItemId::new("missing"),
+        }],
+        ..SessionViewPatch::empty(1, 2)
+    };
+    assert_eq!(
+        base.apply_patch(&missing),
+        Err(TranscriptViewPatchError::MissingItem {
+            id: TranscriptViewItemId::new("missing")
+        })
+    );
+}
+
+#[test]
+fn snapshot_patch_applies_transcript_only_incrementally() {
+    let mut base = SessionViewSnapshot::empty();
+    base.revision = 1;
+    base.transcript = transcript_document(1, [transcript_item("one", 1, "old")]);
+
+    let mut next = base.clone();
+    next.revision = 2;
+    next.transcript = transcript_document(
+        2,
+        [
+            transcript_item("one", 1, "new"),
+            transcript_item("two", 2, "append"),
+        ],
+    );
+
+    let patch = SessionViewPatch::between_snapshots(&base, &next);
+    assert!(patch.reset.is_none());
+    assert_eq!(patch.transcript.len(), 2);
+
+    base.apply_patch(&patch).expect("snapshot patch applies");
+    assert_eq!(base, next);
+}
+
+#[test]
+fn snapshot_patch_resets_when_non_transcript_state_changes() {
+    let mut base = SessionViewSnapshot::empty();
+    base.revision = 1;
+    base.transcript = transcript_document(1, [transcript_item("one", 1, "old")]);
+
+    let mut next = base.clone();
+    next.revision = 2;
+    next.title = Some("renamed".to_owned());
+    next.transcript = transcript_document(2, [transcript_item("one", 1, "new")]);
+
+    let patch = SessionViewPatch::between_snapshots(&base, &next);
+    assert_eq!(patch.reset.as_deref(), Some(&next));
+    assert!(patch.transcript.is_empty());
+
+    base.apply_patch(&patch).expect("reset patch applies");
+    assert_eq!(base, next);
+}
+
+fn transcript_document<const N: usize>(
+    revision: ViewRevision,
+    items: [TranscriptViewItem; N],
+) -> TranscriptViewDocument {
+    let mut document = TranscriptViewDocument {
+        revision,
+        items: items.into(),
+        source_start_sequence: None,
+        source_end_sequence: None,
+        has_older_history: false,
+        has_newer_history: false,
+    };
+    document.refresh_source_bounds();
+    document
+}
+
+fn transcript_item(id: &str, sequence: u64, text: &str) -> TranscriptViewItem {
+    TranscriptViewItem {
+        id: TranscriptViewItemId::new(id),
+        sequence: Some(sequence),
+        timestamp_ms: Some(sequence.saturating_mul(10)),
+        revision: sequence,
+        streaming: false,
+        kind: TranscriptViewItemKind::SystemMessage {
+            message: ChatMessageView::plain(text.to_owned()),
+        },
+    }
+}

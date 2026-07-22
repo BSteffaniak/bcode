@@ -1178,11 +1178,29 @@ impl TuiEffect {
                 TuiEffectResult::SlashPaletteLoaded { query, palette }
             }
             Self::RenameSession { session_id, name } => TuiEffectResult::RenameSession {
-                result: client.rename_session(session_id, name).await,
+                result: match execute_session_view_action(
+                    &client,
+                    SessionViewAction::RenameSession { session_id, name },
+                )
+                .await
+                {
+                    Ok(SessionViewActionOutcome::SessionRenamed { session }) => Ok(*session),
+                    Ok(_) => Err(ClientError::UnexpectedResponse),
+                    Err(error) => Err(error),
+                },
             },
             Self::DeleteSession { session_id } => TuiEffectResult::DeleteSession {
                 session_id,
-                result: client.delete_session(session_id).await,
+                result: match execute_session_view_action(
+                    &client,
+                    SessionViewAction::DeleteSession { session_id },
+                )
+                .await
+                {
+                    Ok(SessionViewActionOutcome::SessionDeleted { session }) => Ok(*session),
+                    Ok(_) => Err(ClientError::UnexpectedResponse),
+                    Err(error) => Err(error),
+                },
             },
             Self::ForkSession {
                 session_id,
@@ -1197,7 +1215,20 @@ impl TuiEffect {
                 install_draft,
                 draft,
                 initial_window_request,
-                result: client.fork_session(session_id, prompt_sequence, name).await,
+                result: match execute_session_view_action(
+                    &client,
+                    SessionViewAction::ForkSession {
+                        session_id,
+                        prompt_sequence,
+                        name,
+                    },
+                )
+                .await
+                {
+                    Ok(SessionViewActionOutcome::SessionForked { fork }) => Ok(*fork),
+                    Ok(_) => Err(ClientError::UnexpectedResponse),
+                    Err(error) => Err(error),
+                },
             },
             Self::CloneSession {
                 session_id,
@@ -1209,7 +1240,16 @@ impl TuiEffect {
                 switch_after_create,
                 install_draft,
                 initial_window_request,
-                result: client.clone_session(session_id, name).await,
+                result: match execute_session_view_action(
+                    &client,
+                    SessionViewAction::CloneSession { session_id, name },
+                )
+                .await
+                {
+                    Ok(SessionViewActionOutcome::SessionCloned { fork }) => Ok(*fork),
+                    Ok(_) => Err(ClientError::UnexpectedResponse),
+                    Err(error) => Err(error),
+                },
             },
             Self::SubmitMessage { request } => run_submit_message(&client, *request).await,
             Self::SkillAction { request } => run_skill_action(&client, *request).await,
@@ -1255,11 +1295,34 @@ impl TuiEffect {
                 work_id,
             } => TuiEffectResult::CancelRuntimeWork {
                 work_id: work_id.clone(),
-                result: client.cancel_runtime_work(session_id, work_id).await,
+                result: match execute_session_view_action(
+                    &client,
+                    SessionViewAction::CancelRuntimeWork {
+                        session_id,
+                        work_id,
+                    },
+                )
+                .await
+                {
+                    Ok(SessionViewActionOutcome::RuntimeWorkCancellationRequested {
+                        cancelled,
+                    }) => Ok(cancelled),
+                    Ok(_) => Err(ClientError::UnexpectedResponse),
+                    Err(error) => Err(error),
+                },
             },
             Self::CompactContext { session_id } => TuiEffectResult::CompactContext {
                 session_id,
-                result: client.compact_session(session_id).await,
+                result: match execute_session_view_action(
+                    &client,
+                    SessionViewAction::CompactContext { session_id },
+                )
+                .await
+                {
+                    Ok(SessionViewActionOutcome::ContextCompacted { message }) => Ok(message),
+                    Ok(_) => Err(ClientError::UnexpectedResponse),
+                    Err(error) => Err(error),
+                },
             },
             Self::AttachWorktree { session_id, path } => TuiEffectResult::AttachWorktree {
                 path: path.clone(),
@@ -1375,11 +1438,25 @@ async fn skill_action(
     .await?;
     let acceptance = match action {
         SkillActionKind::Activate => {
-            client.activate_skill(session_id, skill_id).await?;
+            execute_session_view_action(
+                client,
+                SessionViewAction::ActivateSkill {
+                    session_id,
+                    skill_id: skill_id.to_string(),
+                },
+            )
+            .await?;
             None
         }
         SkillActionKind::Deactivate => {
-            client.deactivate_skill(session_id, skill_id).await?;
+            execute_session_view_action(
+                client,
+                SessionViewAction::DeactivateSkill {
+                    session_id,
+                    skill_id: skill_id.to_string(),
+                },
+            )
+            .await?;
             None
         }
         SkillActionKind::Invoke => {

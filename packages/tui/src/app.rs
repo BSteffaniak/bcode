@@ -53,8 +53,8 @@ use super::transcript::{
     TranscriptItem, TranscriptItemKind, display_tool_result_text,
     generic_tool_result_item_from_projection, live_tool_preview_anchor_item, model_usage_item,
     permission_result_item, semantic_tool_result_item_from_raw, streaming_tool_output_item,
-    streaming_tool_visual_item, terminal_item_from_shared, tool_contribution_item,
-    tool_request_item_from_projection, tool_result_item,
+    streaming_tool_visual_item, terminal_item_from_shared, tool_request_item_from_projection,
+    tool_result_item,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2219,10 +2219,7 @@ impl BmuxApp {
                         .bottom_row(self.transcript_layout.total_rows()),
                 );
                 self.viewport.preserve_for_append();
-                self.add_streaming_delta(text, SessionEventApplication::Live);
-                if self.reasoning_visible() {
-                    self.push_streaming_item("Reasoning summary", text);
-                }
+                self.push_live_reasoning_delta(text, SessionEventApplication::Live);
             }
             SessionLiveEventKind::ToolOutputDelta { event } => {
                 self.pending_visual_overflow_bottom = Some(
@@ -2254,9 +2251,7 @@ impl BmuxApp {
                     preview,
                 );
             }
-            SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
-                self.apply_context_occupancy((**occupancy).clone());
-            }
+            SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
             SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
                 self.apply_shared_provider_stream_progress(event);
             }
@@ -2288,15 +2283,24 @@ impl BmuxApp {
             }
             bcode_session_models::ToolContributionOperation::Upsert
             | bcode_session_models::ToolContributionOperation::Append => {
+                let shared_item = self.shared_tool_contribution_item(contribution);
+                let text = shared_item.as_ref().map_or_else(
+                    || {
+                        serde_json::to_string_pretty(contribution)
+                            .unwrap_or_else(|_| contribution.payload.to_string())
+                    },
+                    |item| item.text().to_owned(),
+                );
                 if let Some((_, Some(id))) = self.transient_contribution_items.get(&key).copied() {
                     self.transcript.mutate_rev_find(
                         |item| item.id() == id,
-                        |item| item.replace_tool_contribution(contribution.clone()),
+                        |item| item.replace_text(text.clone()),
                     );
                     self.transient_contribution_items
                         .insert(key, (contribution.sequence, Some(id)));
                 } else {
-                    let item = tool_contribution_item(contribution, true);
+                    let item = shared_item
+                        .unwrap_or_else(|| TranscriptItem::new("Tool contribution", text));
                     let id = item.id();
                     self.transient_contribution_items
                         .insert(key, (contribution.sequence, Some(id)));
@@ -2341,10 +2345,13 @@ impl BmuxApp {
                 self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionEventKind::AssistantMessage { text } => {
-                self.finish_streaming_item("Assistant", text, application);
+                let text = self
+                    .latest_shared_terminal_text("Assistant")
+                    .unwrap_or_else(|| text.clone());
+                self.finish_streaming_item("Assistant", &text, application);
                 self.finish_assistant_stream_anchor();
             }
-            SessionEventKind::SystemMessage { .. } => {
+            SessionEventKind::SystemMessage { .. } | SessionEventKind::PluginStatusNote { .. } => {
                 self.push_shared_terminal_item(event.sequence);
             }
             SessionEventKind::ToolCallRequested {
@@ -2356,9 +2363,10 @@ impl BmuxApp {
                 legacy_request_presentation: _legacy_legacy_request_presentation,
                 ..
             } => {
-                self.active_tool_calls.insert(tool_call_id.clone());
+                self.record_shared_active_tool_requested(tool_call_id);
                 self.tool_activity_seen = true;
                 self.push_tool_request(
+                    (event.sequence, event.timestamp_ms),
                     tool_call_id,
                     tool_name,
                     arguments_json,
@@ -2376,7 +2384,7 @@ impl BmuxApp {
                 if application.live_activity() {
                     self.set_activity(ActivityState::PreparingFollowUpRequest);
                 }
-                self.active_tool_calls.remove(tool_call_id);
+                self.finish_shared_active_tool_call(tool_call_id);
                 self.push_tool_result(
                     tool_call_id,
                     result,
@@ -2419,61 +2427,79 @@ impl BmuxApp {
                 self.set_permission_status(permission_id);
             }
             SessionEventKind::ModelChanged { provider, model } => {
-                self.apply_model_changed(provider, model);
+                self.apply_shared_model_changed(provider, model);
             }
-            SessionEventKind::ReasoningChanged { effort, summary } => {
-                self.session_view
-                    .set_reasoning_selection(effort.clone(), summary.clone());
+            SessionEventKind::ReasoningChanged { .. } => {
                 self.refresh_thinking_label();
             }
             SessionEventKind::ModelTurnStarted { .. } if application.live_activity() => {
-                self.set_activity(ActivityState::PreparingModelRequest);
+                self.apply_shared_model_turn_started();
             }
             SessionEventKind::ModelTurnCancelRequested { .. } if application.live_activity() => {
-                self.set_cancelling();
-                "cancellation requested".clone_into(&mut self.status);
+                self.apply_shared_model_turn_cancel_requested();
             }
-            SessionEventKind::ModelTurnFinished {
-                outcome, message, ..
-            } => {
-                self.finish_model_turn(*outcome, message.as_deref(), application);
-                if *outcome == ModelTurnOutcome::Error {
-                    self.push_system_message(&format!(
-                        "Model turn failed: {}",
-                        message.as_deref().unwrap_or("no details recorded")
-                    ));
+            SessionEventKind::ModelTurnFinished { .. } => {
+                self.finish_shared_model_turn(application);
+                if matches!(
+                    self.session_view.snapshot().runtime.last_turn_outcome,
+                    Some(ModelTurnOutcome::Error)
+                ) && !self.push_shared_terminal_item(event.sequence)
+                {
+                    let message = self
+                        .session_view
+                        .snapshot()
+                        .runtime
+                        .last_turn_message
+                        .as_deref()
+                        .unwrap_or("no details recorded")
+                        .to_owned();
+                    self.push_system_message(&format!("Model turn failed: {message}"));
                 }
             }
             SessionEventKind::ModelUsage { turn_id, usage } => {
                 self.push_model_usage(event.sequence, turn_id, usage, application);
             }
-            SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
+            SessionEventKind::ContextCompacted { summary, .. } => {
+                let projected = self.push_shared_terminal_item(event.sequence);
+                if !projected {
+                    self.push_compaction(summary);
+                }
+            }
             SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
-                self.push_provider_compaction(snapshot);
+                let projected = self.push_shared_terminal_item(event.sequence);
+                if !projected {
+                    self.push_provider_compaction(snapshot);
+                }
             }
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
-                new_working_directory,
-            } => self.apply_working_directory_changed(
-                event.sequence,
-                old_working_directory,
-                new_working_directory,
-            ),
-            SessionEventKind::SessionRenamed { name } => self.rename_session(name.as_deref()),
+                new_working_directory: _,
+            } => self.apply_working_directory_changed(event.sequence, old_working_directory),
+            SessionEventKind::SessionRenamed { .. } => self.apply_shared_session_renamed(),
             SessionEventKind::SkillInvoked {
                 skill_id,
                 arguments,
                 source,
                 ..
-            } => self.push_skill_invoked(skill_id, arguments, source.as_ref()),
+            } => {
+                let projected = self.push_shared_terminal_item(event.sequence);
+                if !projected {
+                    self.push_skill_invoked(skill_id, arguments, source.as_ref());
+                }
+            }
             SessionEventKind::SkillSuggested {
                 skill_id, reason, ..
-            } => self.push_skill_suggested(skill_id, reason.as_deref()),
+            } => {
+                self.status = format!("suggested skill: {skill_id}");
+                if reason.is_some() && !self.push_shared_terminal_item(event.sequence) {
+                    self.push_skill_suggested(skill_id, reason.as_deref());
+                }
+            }
             SessionEventKind::SkillActivated { skill_id, .. } => {
-                self.status = format!("activated skill: {skill_id}");
+                self.apply_shared_skill_activated(skill_id);
             }
             SessionEventKind::SkillDeactivated { skill_id, .. } => {
-                self.status = format!("deactivated skill: {skill_id}");
+                self.apply_shared_skill_deactivated(skill_id);
             }
             SessionEventKind::SkillContextLoaded {
                 skill_id,
@@ -2482,27 +2508,40 @@ impl BmuxApp {
                 source,
                 preview,
                 ..
-            } => self.set_skill_context_status(
-                skill_id,
-                *bytes_loaded,
-                *truncated,
-                source.as_ref(),
-                preview.as_deref(),
-            ),
-            SessionEventKind::SkillInvocationFailed {
-                skill_id, error, ..
-            } => self.push_skill_error(skill_id, error),
-            SessionEventKind::AssistantReasoningDelta { text } => {
-                self.add_streaming_delta(text, application);
-                if self.reasoning_visible() {
-                    self.push_streaming_item("Reasoning summary", text);
+            } => {
+                let suffix = if *truncated { " truncated" } else { "" };
+                self.status =
+                    format!("loaded skill context: {skill_id} ({bytes_loaded} bytes{suffix})");
+                let projected = self.push_shared_terminal_item(event.sequence);
+                if !projected {
+                    self.set_skill_context_status(
+                        skill_id,
+                        *bytes_loaded,
+                        *truncated,
+                        source.as_ref(),
+                        preview.as_deref(),
+                    );
                 }
             }
-            SessionEventKind::AssistantReasoningMessage { text } if self.reasoning_visible() => {
-                self.finish_streaming_item("Reasoning summary", text, application);
+            SessionEventKind::SkillInvocationFailed {
+                skill_id, error, ..
+            } => {
+                let projected = self.push_shared_terminal_item(event.sequence);
+                if !projected {
+                    self.push_skill_error(skill_id, error);
+                }
             }
-            SessionEventKind::AgentChanged { agent_id } => {
-                self.set_current_agent_id(agent_id.clone());
+            SessionEventKind::AssistantReasoningDelta { text } => {
+                self.push_live_reasoning_delta(text, application);
+            }
+            SessionEventKind::AssistantReasoningMessage { text } if self.reasoning_visible() => {
+                let text = self
+                    .latest_shared_terminal_text("Reasoning summary")
+                    .unwrap_or_else(|| text.clone());
+                self.finish_streaming_item("Reasoning summary", &text, application);
+            }
+            SessionEventKind::AgentChanged { .. } => {
+                self.apply_shared_agent_changed();
             }
             SessionEventKind::TraceEvent { trace } if application.live_activity() => {
                 self.apply_trace_event(trace);
@@ -2517,8 +2556,12 @@ impl BmuxApp {
                 if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
                     self.transcript.retain(|item| item.id() != id);
                 }
-                let item = tool_contribution_item(contribution, false);
-                self.transcript.push(item);
+                if !self.push_shared_terminal_item(event.sequence) {
+                    let fallback = serde_json::to_string_pretty(contribution)
+                        .unwrap_or_else(|_| contribution.payload.to_string());
+                    self.transcript
+                        .push(TranscriptItem::new("Tool contribution", fallback));
+                }
             }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
                 if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
@@ -2556,6 +2599,8 @@ impl BmuxApp {
                 if application.live_activity() {
                     self.apply_shared_runtime_work_activity();
                 }
+                let shared_work = self.shared_runtime_work_item(&work_id.0);
+                let status = shared_work.as_ref().map_or(*status, |work| work.status);
                 if work_id.0.starts_with("ralph:")
                     && matches!(
                         status,
@@ -2564,10 +2609,12 @@ impl BmuxApp {
                             | RuntimeWorkStatus::Cancelled
                     )
                 {
-                    self.push_system_message(&format!(
-                        "Ralph work {status:?}: {}",
-                        message.as_deref().unwrap_or("no details recorded")
-                    ));
+                    let message = shared_work
+                        .as_ref()
+                        .and_then(|work| work.message.as_deref())
+                        .or(message.as_deref())
+                        .unwrap_or("no details recorded");
+                    self.push_system_message(&format!("Ralph work {status:?}: {message}"));
                 }
             }
             SessionEventKind::RalphLifecycle {
@@ -2577,13 +2624,16 @@ impl BmuxApp {
                 state_dir,
                 ..
             } => {
-                self.push_system_message(&format!(
-                    "Ralph {kind}\n* Loop: {loop_name}\n* {message}\n* State: {}",
-                    self.working_directory().map_or_else(
-                        || display_from_current_dir(state_dir),
-                        |working_directory| display(state_dir, working_directory),
-                    )
-                ));
+                let projected = self.push_shared_terminal_item(event.sequence);
+                if !projected {
+                    self.push_system_message(&format!(
+                        "Ralph {kind}\n* Loop: {loop_name}\n* {message}\n* State: {}",
+                        self.working_directory().map_or_else(
+                            || display_from_current_dir(state_dir),
+                            |working_directory| display(state_dir, working_directory),
+                        )
+                    ));
+                }
             }
             _ => {}
         }
@@ -2758,15 +2808,24 @@ impl BmuxApp {
         self.status = format!("model selected for next session: {provider_label}/{model}");
     }
 
-    fn apply_model_changed(&mut self, provider: &str, model: &str) {
-        let selected_model = model_to_display_selection(model);
-        self.session_view.set_model_selection(
-            provider_to_display_selection(provider),
-            selected_model.clone(),
-            selected_model,
+    fn apply_shared_model_changed(&mut self, provider: &str, model: &str) {
+        debug_assert_eq!(
+            self.selected_provider_plugin_id(),
+            provider_to_display_selection(provider).as_deref()
+        );
+        debug_assert_eq!(
+            self.selected_model_id(),
+            model_to_display_selection(model).as_deref()
         );
         self.token_usage.clear_model_info();
         self.status = format!("model: {provider}/{model}");
+    }
+
+    fn apply_shared_agent_changed(&mut self) {
+        debug_assert!(self.session_view.snapshot().runtime.agent_id.is_some());
+        self.current_agent_accent = None;
+        self.clear_pending_agent_fields();
+        self.sync_theme_target(Instant::now());
     }
 
     fn tool_elapsed_invalidation_requests(
@@ -2816,8 +2875,35 @@ impl BmuxApp {
             .select_to_wrapped_position(width, target_row, layout.cursor.col);
     }
 
-    fn rename_session(&mut self, name: Option<&str>) {
-        self.set_session_name_status(name);
+    fn apply_shared_session_renamed(&mut self) {
+        self.status = self.session_title().map_or_else(
+            || "session renamed".to_owned(),
+            |name| format!("session: {name}"),
+        );
+    }
+
+    fn apply_shared_skill_activated(&mut self, skill_id: &impl std::fmt::Display) {
+        let skill_id = skill_id.to_string();
+        if self
+            .session_view
+            .snapshot()
+            .active_skills
+            .contains(&skill_id)
+        {
+            self.status = format!("activated skill: {skill_id}");
+        }
+    }
+
+    fn apply_shared_skill_deactivated(&mut self, skill_id: &impl std::fmt::Display) {
+        let skill_id = skill_id.to_string();
+        if !self
+            .session_view
+            .snapshot()
+            .active_skills
+            .contains(&skill_id)
+        {
+            self.status = format!("deactivated skill: {skill_id}");
+        }
     }
 
     fn remove_pending_submission(&mut self, text: &str) {
@@ -2831,12 +2917,15 @@ impl BmuxApp {
         timestamp_ms: u64,
         application: SessionEventApplication,
     ) {
+        let text = self
+            .shared_terminal_text_for_sequence(sequence, "You")
+            .unwrap_or_else(|| text.to_owned());
         self.input_history
-            .push_committed(sequence, timestamp_ms, text);
+            .push_committed(sequence, timestamp_ms, &text);
         if application.live_activity() {
-            self.push_live_user_message(sequence, text, timestamp_ms);
+            self.push_live_user_message(sequence, &text, timestamp_ms);
         } else {
-            self.push_user_message(sequence, text, timestamp_ms);
+            self.push_user_message(sequence, &text, timestamp_ms);
         }
     }
 
@@ -2847,7 +2936,18 @@ impl BmuxApp {
 
     fn push_live_assistant_delta(&mut self, text: &str, application: SessionEventApplication) {
         self.add_streaming_delta(text, application);
-        self.push_streaming_item("Assistant", text);
+        if !self.push_shared_streaming_terminal_item("Assistant") {
+            self.push_streaming_item("Assistant", text);
+        }
+    }
+
+    fn push_live_reasoning_delta(&mut self, text: &str, application: SessionEventApplication) {
+        self.add_streaming_delta(text, application);
+        if self.reasoning_visible()
+            && !self.push_shared_streaming_terminal_item("Reasoning summary")
+        {
+            self.push_streaming_item("Reasoning summary", text);
+        }
     }
 
     fn push_user_message(&mut self, sequence: u64, text: &str, timestamp_ms: u64) {
@@ -2861,20 +2961,199 @@ impl BmuxApp {
     }
 
     fn push_shared_terminal_item(&mut self, sequence: u64) -> bool {
-        let item = self
-            .session_view
+        let Some(item) = self.shared_terminal_item(sequence) else {
+            return false;
+        };
+        self.transcript.push(item);
+        true
+    }
+
+    fn push_shared_streaming_terminal_item(&mut self, role: &'static str) -> bool {
+        let Some(item) = self.latest_shared_streaming_terminal_item(role) else {
+            return false;
+        };
+        if let Some(last) = self.transcript.last_mut()
+            && last.role == role
+            && last.streaming
+        {
+            last.replace_text(item.text);
+            return true;
+        }
+        self.transcript.push(item);
+        true
+    }
+
+    fn shared_terminal_item(&self, sequence: u64) -> Option<TranscriptItem> {
+        self.session_view
             .snapshot()
             .transcript
             .items
             .iter()
             .rev()
             .find(|item| item.sequence == Some(sequence))
-            .map(terminal_item_from_shared);
-        let Some(item) = item else {
-            return false;
-        };
-        self.transcript.push(item);
-        true
+            .map(terminal_item_from_shared)
+    }
+
+    fn shared_terminal_text_for_sequence(
+        &self,
+        sequence: u64,
+        role: &'static str,
+    ) -> Option<String> {
+        self.shared_terminal_item(sequence)
+            .filter(|item| item.role == role)
+            .map(|item| item.text)
+    }
+
+    fn latest_shared_terminal_text(&self, role: &'static str) -> Option<String> {
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .map(terminal_item_from_shared)
+            .find(|item| item.role == role)
+            .map(|item| item.text)
+    }
+
+    fn latest_shared_streaming_terminal_item(&self, role: &'static str) -> Option<TranscriptItem> {
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .map(terminal_item_from_shared)
+            .find(|item| item.role == role && item.streaming)
+    }
+
+    fn shared_tool_request_item(
+        &self,
+        sequence: u64,
+        tool_call_id: &str,
+    ) -> Option<TranscriptItem> {
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                item.sequence == Some(sequence)
+                    && matches!(
+                        &item.kind,
+                        bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
+                            if tool.tool_call_id == tool_call_id
+                                && matches!(
+                                    tool.status,
+                                    bcode_session_view_models::ToolInvocationViewStatus::Requested
+                                        | bcode_session_view_models::ToolInvocationViewStatus::Running
+                                )
+                    )
+            })
+            .map(terminal_item_from_shared)
+            .filter(|item| {
+                matches!(
+                    item.kind(),
+                    TranscriptItemKind::ToolRequest {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } if item_tool_call_id == tool_call_id
+                )
+            })
+    }
+
+    fn shared_tool_output_item(&self, tool_call_id: &str) -> Option<TranscriptItem> {
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
+                    | bcode_session_view_models::TranscriptViewItemKind::ToolRequest { tool }
+                        if tool.tool_call_id == tool_call_id
+                            && tool.result.is_none()
+                            && tool.output.as_ref().is_some_and(|output| !output.text.is_empty())
+                )
+            })
+            .map(terminal_item_from_shared)
+            .filter(|item| {
+                matches!(
+                    item.kind(),
+                    TranscriptItemKind::ToolResult {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } if item_tool_call_id == tool_call_id
+                )
+            })
+    }
+
+    fn shared_tool_result_item(&self, tool_call_id: &str) -> Option<TranscriptItem> {
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
+                        if tool.tool_call_id == tool_call_id
+                            && matches!(
+                                tool.status,
+                                bcode_session_view_models::ToolInvocationViewStatus::Finished
+                            )
+                )
+            })
+            .map(terminal_item_from_shared)
+    }
+
+    fn shared_tool_contribution_item(
+        &self,
+        contribution: &bcode_session_models::ToolContributionEvent,
+    ) -> Option<TranscriptItem> {
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::ToolContribution {
+                        contribution: item_contribution,
+                    } if item_contribution.invocation_id == contribution.invocation_id
+                        && item_contribution.contribution_id == contribution.contribution_id
+                        && item_contribution.sequence == contribution.sequence
+                )
+            })
+            .map(terminal_item_from_shared)
+    }
+
+    fn shared_runtime_work_item(
+        &self,
+        work_id: &str,
+    ) -> Option<bcode_session_view_models::RuntimeWorkView> {
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.kind {
+                bcode_session_view_models::TranscriptViewItemKind::RuntimeWork { work }
+                    if work.work_id.0 == work_id =>
+                {
+                    Some(work.clone())
+                }
+                _ => None,
+            })
     }
 
     fn push_system_message(&mut self, text: &str) {
@@ -2886,17 +3165,18 @@ impl BmuxApp {
         &mut self,
         event_sequence: u64,
         old_working_directory: &std::path::Path,
-        new_working_directory: &std::path::Path,
     ) {
         let projected = self.push_shared_terminal_item(event_sequence);
         debug_assert!(
             projected,
             "working-directory event must have a shared terminal transcript item"
         );
-        self.status = format!(
-            "working directory: {}",
-            display(new_working_directory, old_working_directory)
-        );
+        if let Some(new_working_directory) = self.working_directory() {
+            self.status = format!(
+                "working directory: {}",
+                display(new_working_directory, old_working_directory)
+            );
+        }
     }
 
     fn push_streaming_item(&mut self, role: &'static str, text: &str) {
@@ -2915,44 +3195,110 @@ impl BmuxApp {
         }
     }
 
+    fn projected_tool_request_context(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+        working_directory: Option<std::path::PathBuf>,
+        request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
+    ) -> ToolCallContext {
+        let shared_tool = self.session_view.snapshot().tools.get(tool_call_id);
+        let request_visual = request_visual
+            .cloned()
+            .or_else(|| {
+                shared_tool
+                    .and_then(|tool| tool.request_visual.as_ref())
+                    .map(|visual| visual.descriptor.clone())
+            })
+            .or_else(|| {
+                self.live_tool_previews
+                    .get(tool_call_id)
+                    .map(|state| state.preview.visual.clone())
+            });
+        ToolCallContext {
+            tool_name: shared_tool
+                .and_then(|tool| tool.tool_name.clone())
+                .unwrap_or_else(|| tool_name.to_owned()),
+            arguments_json: shared_tool
+                .and_then(|tool| tool.arguments_json.clone())
+                .unwrap_or_else(|| arguments_json.to_owned()),
+            working_directory: shared_tool
+                .and_then(|tool| tool.working_directory.clone())
+                .or(working_directory),
+            request_visual,
+        }
+    }
+
+    fn record_shared_active_tool_requested(&mut self, tool_call_id: &str) {
+        let Some(tool) = self.session_view.snapshot().tools.get(tool_call_id) else {
+            self.active_tool_calls.insert(tool_call_id.to_owned());
+            return;
+        };
+        if !matches!(
+            tool.status,
+            bcode_session_view_models::ToolInvocationViewStatus::Finished
+        ) {
+            self.active_tool_calls.insert(tool_call_id.to_owned());
+        }
+    }
+
+    fn finish_shared_active_tool_call(&mut self, tool_call_id: &str) {
+        let finished = self
+            .session_view
+            .snapshot()
+            .tools
+            .get(tool_call_id)
+            .is_none_or(|tool| {
+                matches!(
+                    tool.status,
+                    bcode_session_view_models::ToolInvocationViewStatus::Finished
+                )
+            });
+        if finished {
+            self.active_tool_calls.remove(tool_call_id);
+        }
+    }
+
     fn push_tool_request(
         &mut self,
+        event_metadata: (u64, u64),
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
         working_directory: Option<std::path::PathBuf>,
         request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
     ) {
-        let effective_request_visual = request_visual.cloned().or_else(|| {
-            self.live_tool_previews
-                .get(tool_call_id)
-                .map(|state| state.preview.visual.clone())
-        });
-        self.tool_call_contexts.insert(
-            tool_call_id.to_owned(),
-            ToolCallContext {
-                tool_name: tool_name.to_owned(),
-                arguments_json: arguments_json.to_owned(),
-                working_directory: working_directory.clone(),
-                request_visual: effective_request_visual.clone(),
-            },
+        let projected_context = self.projected_tool_request_context(
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            working_directory,
+            request_visual,
         );
+        let effective_request_visual = projected_context.request_visual.clone();
+        self.tool_call_contexts
+            .insert(tool_call_id.to_owned(), projected_context.clone());
         let mut item = self
-            .tool_invocation_projections
-            .get(tool_call_id)
-            .map_or_else(
-                || {
-                    tool_request_item_from_projection(&ToolInvocationProjection {
-                        tool_call_id: tool_call_id.to_owned(),
-                        tool_name: Some(tool_name.to_owned()),
-                        arguments_json: Some(arguments_json.to_owned()),
-                        working_directory,
-                        request_visual: effective_request_visual.clone(),
-                        ..ToolInvocationProjection::default()
-                    })
-                },
-                tool_request_item_from_projection,
-            );
+            .shared_tool_request_item(event_metadata.0, tool_call_id)
+            .unwrap_or_else(|| {
+                self.tool_invocation_projections
+                    .get(tool_call_id)
+                    .map_or_else(
+                        || {
+                            tool_request_item_from_projection(&ToolInvocationProjection {
+                                tool_call_id: tool_call_id.to_owned(),
+                                tool_name: Some(projected_context.tool_name.clone()),
+                                arguments_json: Some(projected_context.arguments_json.clone()),
+                                working_directory: projected_context.working_directory.clone(),
+                                request_visual: effective_request_visual.clone(),
+                                ..ToolInvocationProjection::default()
+                            })
+                        },
+                        tool_request_item_from_projection,
+                    )
+                    .with_event_metadata(event_metadata.0, event_metadata.1)
+            });
         if let Some(visual) = effective_request_visual.clone() {
             item.set_tool_request_visual(visual, false);
         }
@@ -2975,10 +3321,10 @@ impl BmuxApp {
         if has_live_preview_anchor && request_visual.is_none() {
             self.finish_tool_request_preview(tool_call_id);
             self.set_activity(ActivityState::RunningTool {
-                name: tool_name.to_owned(),
+                name: projected_context.tool_name.clone(),
             });
-            self.status =
-                tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
+            self.status = tool_request_status(&projected_context.arguments_json)
+                .unwrap_or_else(|| "started".to_owned());
             return;
         }
         if has_live_preview_anchor {
@@ -2989,10 +3335,10 @@ impl BmuxApp {
             self.live_tool_previews.remove(tool_call_id);
             self.mark_live_preview_dirty();
             self.set_activity(ActivityState::RunningTool {
-                name: tool_name.to_owned(),
+                name: projected_context.tool_name.clone(),
             });
-            self.status =
-                tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
+            self.status = tool_request_status(&projected_context.arguments_json)
+                .unwrap_or_else(|| "started".to_owned());
             return;
         }
         let replaced = self.transcript.mutate_rev_find(
@@ -3011,12 +3357,14 @@ impl BmuxApp {
             self.transcript.push(item);
         }
         self.set_activity(ActivityState::RunningTool {
-            name: tool_name.to_owned(),
+            name: projected_context.tool_name,
         });
-        self.status = tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
+        self.status = tool_request_status(&projected_context.arguments_json)
+            .unwrap_or_else(|| "started".to_owned());
     }
 
     fn push_permission_request(&mut self, input: PermissionRequestInput<'_>) {
+        let shared_permission = self.shared_permission_view(input.permission_id).cloned();
         if !self.push_shared_terminal_item(input.event_sequence) {
             self.transcript
                 .push(super::transcript::permission_request_item(
@@ -3029,19 +3377,43 @@ impl BmuxApp {
                 ));
         }
         if input.application.live_activity() {
+            let tool_name = shared_permission
+                .as_ref()
+                .map_or(input.tool_name, |permission| permission.tool_name.as_str());
             self.set_activity(ActivityState::WaitingPermission {
-                name: input.tool_name.to_owned(),
+                name: tool_name.to_owned(),
             });
         }
         if input.application.live_activity() {
-            self.status = Self::tool_call_file_status(input.tool_call_id).map_or_else(
-                || {
-                    tool_request_status(input.arguments_json)
-                        .unwrap_or_else(|| input.tool_name.to_owned())
-                },
+            let tool_call_id = shared_permission
+                .as_ref()
+                .map_or(input.tool_call_id, |permission| {
+                    permission.tool_call_id.as_str()
+                });
+            let arguments_json = shared_permission
+                .as_ref()
+                .map_or(input.arguments_json, |permission| {
+                    permission.arguments_json.as_str()
+                });
+            let tool_name = shared_permission
+                .as_ref()
+                .map_or(input.tool_name, |permission| permission.tool_name.as_str());
+            self.status = Self::tool_call_file_status(tool_call_id).map_or_else(
+                || tool_request_status(arguments_json).unwrap_or_else(|| tool_name.to_owned()),
                 |status| format!("waiting permission · {status}"),
             );
         }
+    }
+
+    fn shared_permission_view(
+        &self,
+        permission_id: &str,
+    ) -> Option<&bcode_session_view_models::PermissionView> {
+        self.session_view
+            .snapshot()
+            .permissions
+            .iter()
+            .find(|permission| permission.permission_id == permission_id)
     }
 
     fn set_permission_status(&mut self, permission_id: &str) {
@@ -3070,8 +3442,27 @@ impl BmuxApp {
             self.finish_tool_request_preview(&tool_call_id);
         }
         status.clone_into(&mut self.status);
-        self.transcript
-            .push(permission_result_item(permission_id, approved));
+        self.transcript.push(
+            self.shared_permission_result_item(permission_id)
+                .unwrap_or_else(|| permission_result_item(permission_id, approved)),
+        );
+    }
+
+    fn shared_permission_result_item(&self, permission_id: &str) -> Option<TranscriptItem> {
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                        if permission.permission_id == permission_id && permission.resolved
+                )
+            })
+            .map(terminal_item_from_shared)
     }
 
     fn set_file_activity(&mut self, tool_name: &str) {
@@ -3189,6 +3580,13 @@ impl BmuxApp {
         if !application.live_activity() {
             return;
         }
+        let is_error = self
+            .session_view
+            .snapshot()
+            .tools
+            .get(tool_call_id)
+            .and_then(|tool| tool.is_error)
+            .unwrap_or(is_error);
         if is_error {
             "failed".clone_into(&mut self.status);
         } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
@@ -3245,31 +3643,35 @@ impl BmuxApp {
             }
         }
         self.supersede_matching_live_preview(tool_call_id, semantic_result);
-        let mut item = if let Some(semantic_result) = semantic_result {
-            semantic_tool_result_item_from_raw(
-                tool_call_id,
-                tool_name.as_deref(),
-                arguments_json.as_deref(),
-                self.tool_call_contexts
-                    .get(tool_call_id)
-                    .and_then(|context| context.working_directory.as_deref()),
-                semantic_result,
-                is_error,
-            )
-        } else {
-            self.tool_invocation_projections
-                .get(tool_call_id)
-                .and_then(generic_tool_result_item_from_projection)
-                .unwrap_or_else(|| {
-                    tool_result_item(
+        let mut item = self
+            .shared_tool_result_item(tool_call_id)
+            .unwrap_or_else(|| {
+                if let Some(semantic_result) = semantic_result {
+                    semantic_tool_result_item_from_raw(
                         tool_call_id,
                         tool_name.as_deref(),
                         arguments_json.as_deref(),
-                        &display_tool_result_text(result),
+                        self.tool_call_contexts
+                            .get(tool_call_id)
+                            .and_then(|context| context.working_directory.as_deref()),
+                        semantic_result,
                         is_error,
                     )
-                })
-        };
+                } else {
+                    self.tool_invocation_projections
+                        .get(tool_call_id)
+                        .and_then(generic_tool_result_item_from_projection)
+                        .unwrap_or_else(|| {
+                            tool_result_item(
+                                tool_call_id,
+                                tool_name.as_deref(),
+                                arguments_json.as_deref(),
+                                &display_tool_result_text(result),
+                                is_error,
+                            )
+                        })
+                }
+            });
         if let Some(projection) = self.tool_invocation_projections.get(tool_call_id) {
             item.set_tool_started_at_ms(projection.started_at_ms);
             item.set_tool_finished_at_ms(projection.finished_at_ms);
@@ -3523,22 +3925,31 @@ impl BmuxApp {
         if text.is_empty() {
             return;
         }
+        let shared_item = self.shared_tool_output_item(tool_call_id);
         if let Some(context) = self.streamed_tool_results.get(tool_call_id)
             && let Some(index) = context.index
             && let Some(item) = self.transcript.get_mut(index)
         {
             self.tool_activity_seen = true;
-            item.append_text(text);
+            if let Some(shared_item) = shared_item {
+                item.copy_tool_timing_from(&shared_item);
+                item.replace_text(shared_item.text);
+            } else {
+                item.append_text(text);
+            }
             return;
         }
         let context = self.tool_call_contexts.get(tool_call_id);
         self.tool_activity_seen = true;
-        self.transcript.push(streaming_tool_output_item(
-            tool_call_id,
-            context.map(|context| context.tool_name.as_str()),
-            context.map(|context| context.arguments_json.as_str()),
-            text,
-        ));
+        let item = shared_item.unwrap_or_else(|| {
+            streaming_tool_output_item(
+                tool_call_id,
+                context.map(|context| context.tool_name.as_str()),
+                context.map(|context| context.arguments_json.as_str()),
+                text,
+            )
+        });
+        self.transcript.push(item);
         self.streamed_tool_results.insert(
             tool_call_id.to_owned(),
             StreamedToolResultContext {
@@ -3697,14 +4108,31 @@ impl BmuxApp {
         }
     }
 
-    fn finish_model_turn(
-        &mut self,
-        outcome: ModelTurnOutcome,
-        message: Option<&str>,
-        application: SessionEventApplication,
-    ) {
-        if application.live_activity() {
-            self.status = message.map_or_else(
+    fn apply_shared_model_turn_started(&mut self) {
+        let runtime = &self.session_view.snapshot().runtime;
+        debug_assert!(runtime.active_turn_id.is_some());
+        debug_assert!(!runtime.cancelling);
+        if runtime.active_turn_id.is_some() && !runtime.cancelling {
+            self.set_activity(ActivityState::PreparingModelRequest);
+        }
+    }
+
+    fn apply_shared_model_turn_cancel_requested(&mut self) {
+        let runtime = &self.session_view.snapshot().runtime;
+        debug_assert!(runtime.active_turn_id.is_some());
+        debug_assert!(runtime.cancelling);
+        if runtime.cancelling {
+            self.set_cancelling();
+            "cancellation requested".clone_into(&mut self.status);
+        }
+    }
+
+    fn finish_shared_model_turn(&mut self, application: SessionEventApplication) {
+        let runtime = &self.session_view.snapshot().runtime;
+        if application.live_activity()
+            && let Some(outcome) = runtime.last_turn_outcome
+        {
+            self.status = runtime.last_turn_message.as_deref().map_or_else(
                 || model_turn_outcome_label(outcome).to_owned(),
                 ToOwned::to_owned,
             );
@@ -3751,12 +4179,7 @@ impl BmuxApp {
         self.session_view.set_context_occupancy(occupancy);
     }
 
-    fn clear_context_occupancy(&mut self) {
-        self.session_view.set_context_occupancy(None);
-    }
-
     fn push_compaction(&mut self, summary: &str) {
-        self.clear_context_occupancy();
         self.transcript.push(TranscriptItem::new(
             "Compaction",
             format!("local context compaction: {summary}"),
@@ -3767,7 +4190,6 @@ impl BmuxApp {
         &mut self,
         snapshot: &bcode_session_models::ProviderContextSnapshot,
     ) {
-        self.clear_context_occupancy();
         let origin = provider_compaction_origin_label(snapshot.origin);
         self.transcript.push(TranscriptItem::new(
             "Compaction",
@@ -4020,13 +4442,6 @@ impl BmuxApp {
             | SessionTracePhase::SkillContextLoaded
             | SessionTracePhase::SkillInvocationFailed => {}
         }
-    }
-
-    fn set_session_name_status(&mut self, name: Option<&str>) {
-        self.status = name.map_or_else(
-            || "session renamed".to_owned(),
-            |name| format!("session: {name}"),
-        );
     }
 
     fn set_skill_context_status(
@@ -4956,6 +5371,79 @@ mod tests {
     }
 
     #[test]
+    fn skill_activation_status_consumes_shared_projection() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let skill_id = bcode_skill_models::SkillId::new("event-skill");
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+
+        app.absorb_session_event(&event(
+            1,
+            bcode_session_models::SessionEventKind::SkillActivated {
+                skill_id: skill_id.clone(),
+                source: None,
+                mode: bcode_skill_models::SkillActivationMode::Explicit,
+                activated_at_ms: 1,
+            },
+        ));
+        assert!(
+            app.session_view_snapshot()
+                .active_skills
+                .contains("event-skill")
+        );
+        assert_eq!(app.status(), "activated skill: event-skill");
+
+        app.absorb_session_event(&event(
+            2,
+            bcode_session_models::SessionEventKind::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms: 2,
+            },
+        ));
+        assert!(
+            !app.session_view_snapshot()
+                .active_skills
+                .contains("event-skill")
+        );
+        assert_eq!(app.status(), "deactivated skill: event-skill");
+    }
+
+    #[test]
+    fn ralph_runtime_failure_notice_consumes_shared_projection() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.absorb_session_event(&bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::RuntimeWorkFinished {
+                work_id: bcode_session_models::WorkId::new("ralph:loop"),
+                status: RuntimeWorkStatus::Failed,
+                finished_at_ms: Some(1),
+                message: Some("boom".to_owned()),
+            },
+        });
+
+        let shared = app
+            .shared_runtime_work_item("ralph:loop")
+            .expect("shared runtime work item");
+        assert_eq!(shared.status, RuntimeWorkStatus::Failed);
+        assert_eq!(shared.message.as_deref(), Some("boom"));
+        let terminal = app.transcript().iter().last().expect("ralph notice");
+        assert_eq!(terminal.role(), "System");
+        assert_eq!(terminal.text(), "Ralph work Failed: boom");
+    }
+
+    #[test]
     fn generic_lifecycle_drives_tui_activity_until_terminal_event() {
         let session_id = bcode_session_models::SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -5084,6 +5572,191 @@ mod tests {
     }
 
     #[test]
+    fn ralph_lifecycle_consumes_shared_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(
+            1,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: std::path::PathBuf::from("/tmp/project"),
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::RalphLifecycle {
+                loop_name: "loop".to_owned(),
+                state_dir: std::path::PathBuf::from("/tmp/project/.bcode/ralph/loop"),
+                kind: "started".to_owned(),
+                message: "running".to_owned(),
+                occurred_at_ms: 2,
+            },
+        ));
+
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.sequence == Some(2))
+            .expect("shared ralph lifecycle item");
+        let expected = terminal_item_from_shared(shared);
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("ralph lifecycle item");
+        assert_eq!(actual.role(), expected.role());
+        assert_eq!(actual.text(), expected.text());
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(
+            actual.text(),
+            "Ralph started\n* Loop: loop\n* running\n* State: .bcode/ralph/loop"
+        );
+    }
+
+    #[test]
+    fn skill_transcript_rows_consume_shared_projection() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+
+        app.absorb_session_event(&event(
+            1,
+            bcode_session_models::SessionEventKind::SkillInvoked {
+                skill_id: bcode_skill_models::SkillId::new("review"),
+                arguments: "{}".to_owned(),
+                source: None,
+                invoked_at_ms: 1,
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            bcode_session_models::SessionEventKind::SkillContextLoaded {
+                skill_id: bcode_skill_models::SkillId::new("review"),
+                bytes_loaded: 42,
+                truncated: true,
+                source: Some(bcode_skill_models::SkillSource {
+                    kind: bcode_skill_models::SkillSourceKind::User,
+                    label: "user skills".to_owned(),
+                    path: Some("/skills/review/SKILL.md".to_owned()),
+                    precedence: 10,
+                }),
+                preview: Some("preview".to_owned()),
+                loaded_at_ms: 2,
+            },
+        ));
+        app.absorb_session_event(&event(
+            3,
+            bcode_session_models::SessionEventKind::SkillInvocationFailed {
+                skill_id: bcode_skill_models::SkillId::new("review"),
+                error: "boom".to_owned(),
+                failed_at_ms: 3,
+            },
+        ));
+
+        let terminal = app.transcript().iter().collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 3);
+        assert_eq!(terminal[0].role(), "Skill");
+        assert_eq!(terminal[0].text(), "invoked review\nArguments: {}");
+        assert_eq!(terminal[0].kind(), &TranscriptItemKind::Skill);
+        assert_eq!(terminal[1].role(), "Skill context");
+        assert_eq!(
+            terminal[1].text(),
+            "loaded review\nSource: user skills\nFile: /skills/review/SKILL.md\nBytes: 42 truncated\n\nPreview:\npreview"
+        );
+        assert_eq!(terminal[1].kind(), &TranscriptItemKind::Generic);
+        assert_eq!(
+            app.status(),
+            "loaded skill context: review (42 bytes truncated)"
+        );
+        assert_eq!(terminal[2].role(), "Skill error");
+        assert_eq!(terminal[2].text(), "review: boom");
+        assert_eq!(terminal[2].kind(), &TranscriptItemKind::SkillError);
+        assert_eq!(
+            app.session_view_snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(terminal_item_from_shared)
+                .map(|item| (item.role(), item.text().to_owned(), item.kind().clone()))
+                .collect::<Vec<_>>(),
+            terminal
+                .iter()
+                .map(|item| (item.role(), item.text().to_owned(), item.kind().clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn model_reasoning_and_agent_events_consume_shared_runtime_projection() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+
+        app.absorb_session_event(&event(
+            1,
+            bcode_session_models::SessionEventKind::ModelChanged {
+                provider: "<auto>".to_owned(),
+                model: "<default>".to_owned(),
+            },
+        ));
+        assert_eq!(app.selected_provider_plugin_id(), None);
+        assert_eq!(app.selected_model_id(), None);
+        assert_eq!(app.status(), "model: <auto>/<default>");
+
+        app.set_pending_agent("review", Some("#ff00ff".to_owned()));
+        app.absorb_session_event(&event(
+            2,
+            bcode_session_models::SessionEventKind::AgentChanged {
+                agent_id: "build".to_owned(),
+            },
+        ));
+        assert_eq!(app.current_agent_id(), "build");
+        assert_eq!(app.display_agent_accent(), None);
+
+        app.absorb_session_event(&event(
+            3,
+            bcode_session_models::SessionEventKind::ReasoningChanged {
+                effort: Some("high".to_owned()),
+                summary: Some("detailed".to_owned()),
+            },
+        ));
+        assert_eq!(app.reasoning_effort(), Some("high"));
+        assert_eq!(app.reasoning_summary(), Some("detailed"));
+        assert_eq!(
+            app.session_view_snapshot()
+                .runtime
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            app.session_view_snapshot()
+                .runtime
+                .reasoning_summary
+                .as_deref(),
+            Some("detailed")
+        );
+    }
+
+    #[test]
     fn context_summary_marks_estimated_overflow_without_exceeding_one_hundred_percent() {
         let meter = TokenUsageMeter {
             context_window: Some(372_000),
@@ -5193,19 +5866,766 @@ mod tests {
     }
 
     #[test]
-    fn generic_terminal_items_are_adapted_from_shared_projection() {
-        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    fn model_turn_start_and_cancel_consume_shared_runtime_projection() {
         let session_id = SessionId::new();
-        let event = |sequence, kind| SessionEvent {
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            1,
+            SessionEventKind::ModelTurnStarted {
+                turn_id: "turn-shared".to_owned(),
+            },
+        ));
+
+        let runtime = &app.session_view_snapshot().runtime;
+        assert_eq!(runtime.active_turn_id.as_deref(), Some("turn-shared"));
+        assert!(!runtime.cancelling);
+        assert!(matches!(
+            app.activity(),
+            ActivityState::PreparingModelRequest
+        ));
+
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            2,
+            SessionEventKind::ModelTurnCancelRequested {
+                turn_id: "turn-shared".to_owned(),
+                requested_at_ms: Some(2),
+                client_id: Some(bcode_session_models::ClientId::new()),
+            },
+        ));
+
+        let runtime = &app.session_view_snapshot().runtime;
+        assert_eq!(runtime.active_turn_id.as_deref(), Some("turn-shared"));
+        assert!(runtime.cancelling);
+        assert!(matches!(app.activity(), ActivityState::Cancelling));
+        assert_eq!(app.status(), "cancellation requested");
+    }
+
+    #[test]
+    fn model_turn_finish_consumes_shared_runtime_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            1,
+            SessionEventKind::ModelTurnStarted {
+                turn_id: "turn-shared".to_owned(),
+            },
+        ));
+        assert!(matches!(
+            app.activity(),
+            ActivityState::PreparingModelRequest
+        ));
+
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            2,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-shared".to_owned(),
+                outcome: ModelTurnOutcome::Error,
+                message: Some("provider failed".to_owned()),
+            },
+        ));
+
+        let runtime = &app.session_view_snapshot().runtime;
+        assert_eq!(runtime.active_turn_id, None);
+        assert_eq!(runtime.last_turn_outcome, Some(ModelTurnOutcome::Error));
+        assert_eq!(
+            runtime.last_turn_message.as_deref(),
+            Some("provider failed")
+        );
+        assert_eq!(app.status(), "provider failed");
+        assert!(matches!(app.activity(), ActivityState::Idle));
+
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.sequence == Some(2))
+            .expect("shared model-turn error item");
+        let expected = terminal_item_from_shared(shared);
+        let actual = app.transcript().iter().last().expect("terminal error item");
+        assert_eq!(actual.role(), expected.role());
+        assert_eq!(actual.text(), expected.text());
+        assert_eq!(actual.kind(), expected.kind());
+    }
+
+    #[test]
+    fn session_rename_status_consumes_shared_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            1,
+            SessionEventKind::SessionRenamed {
+                name: Some("renamed session".to_owned()),
+            },
+        ));
+
+        assert_eq!(app.session_title(), Some("renamed session"));
+        assert_eq!(app.status(), "session: renamed session");
+    }
+
+    #[test]
+    fn working_directory_status_consumes_shared_projection() {
+        let session_id = SessionId::new();
+        let old_working_directory = std::path::PathBuf::from("/tmp/bcode-old");
+        let new_working_directory = std::path::PathBuf::from("/tmp/bcode-old/subdir");
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            1,
+            SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory: old_working_directory.clone(),
+                new_working_directory: new_working_directory.clone(),
+            },
+        ));
+
+        assert_eq!(
+            app.working_directory(),
+            Some(new_working_directory.as_path())
+        );
+        assert_eq!(
+            app.status(),
+            format!(
+                "working directory: {}",
+                display(&new_working_directory, &old_working_directory)
+            )
+        );
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.sequence == Some(1))
+            .expect("shared working-directory item");
+        let expected = terminal_item_from_shared(shared);
+        let actual = app.transcript().iter().last().expect("terminal item");
+        assert_eq!(actual.role(), expected.role());
+        assert_eq!(actual.text(), expected.text());
+        assert_eq!(actual.kind(), expected.kind());
+    }
+
+    #[test]
+    fn context_compaction_clears_occupancy_through_shared_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let occupancy = bcode_session_models::RequestContextOccupancy {
+            context_epoch: 3,
+            observation_sequence: 7,
+            observation: snapshot(true, 2_500),
+        };
+        app.apply_context_occupancy(Some(occupancy));
+
+        app.absorb_session_event(&bcode_session_models::SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence.saturating_mul(10),
+            sequence: 8,
+            timestamp_ms: 8,
             session_id,
             provenance: None,
-            kind,
-        };
-        let events = [
-            event(
+            kind: bcode_session_models::SessionEventKind::ContextCompacted {
+                compacted_through_sequence: 7,
+                summary: "summary".to_owned(),
+            },
+        });
+
+        assert!(
+            app.session_view_snapshot()
+                .runtime
+                .context_occupancy
+                .is_none()
+        );
+        let terminal = app.transcript().iter().last().expect("compaction item");
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.sequence == Some(8))
+            .expect("shared compaction item");
+        let expected = terminal_item_from_shared(shared);
+        assert_eq!(terminal.role(), "Compaction");
+        assert_eq!(terminal.text(), "local context compaction: summary");
+        assert_eq!(terminal.role(), expected.role());
+        assert_eq!(terminal.text(), expected.text());
+        assert_eq!(terminal.kind(), expected.kind());
+    }
+
+    #[test]
+    fn provider_context_compaction_consumes_shared_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+        app.absorb_session_event(&bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 9,
+            timestamp_ms: 9,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence: 8,
+                snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
+                    provider_plugin_id: "provider".to_owned(),
+                    model_id: "model".to_owned(),
+                    compatibility_key: "compat".to_owned(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: "[]".to_owned(),
+                    portable_summary: "summary".to_owned(),
+                },
+            },
+        });
+
+        let terminal = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("provider compaction item");
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.sequence == Some(9))
+            .expect("shared provider compaction item");
+        let expected = terminal_item_from_shared(shared);
+        assert_eq!(terminal.role(), "Compaction");
+        assert_eq!(
+            terminal.text(),
+            "explicit provider-native context compaction (provider)"
+        );
+        assert_eq!(terminal.role(), expected.role());
+        assert_eq!(terminal.text(), expected.text());
+        assert_eq!(terminal.kind(), expected.kind());
+    }
+
+    #[test]
+    fn user_message_commit_consumes_shared_projection_text() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+        app.replace_composer_with("shared user");
+        app.stage_submission();
+        assert_eq!(app.pending_submissions().len(), 1);
+
+        app.absorb_session_event(&event(
+            1,
+            SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "shared user".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ));
+
+        assert!(app.pending_submissions().is_empty());
+        assert_eq!(
+            app.shared_terminal_text_for_sequence(1, "You").as_deref(),
+            Some("shared user")
+        );
+        let entry = app
+            .timeline_entries()
+            .into_iter()
+            .next()
+            .expect("timeline entry");
+        assert_eq!(entry.text(), "shared user");
+        let actual = app.transcript().iter().last().expect("user item");
+        assert_eq!(actual.role(), "You");
+        assert_eq!(actual.text(), "shared user");
+        assert_eq!(actual.event_sequence(), Some(1));
+    }
+
+    #[test]
+    fn assistant_streaming_delta_consumes_shared_projection_text() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(
+            1,
+            SessionEventKind::AssistantDelta {
+                text: "shared ".to_owned(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::AssistantDelta {
+                text: "stream".to_owned(),
+            },
+        ));
+
+        assert_eq!(
+            app.latest_shared_streaming_terminal_item("Assistant")
+                .as_ref()
+                .map(TranscriptItem::text),
+            Some("shared stream")
+        );
+        let actual = app.transcript().iter().last().expect("assistant item");
+        assert_eq!(actual.role(), "Assistant");
+        assert_eq!(actual.text(), "shared stream");
+        assert!(actual.streaming());
+        assert_eq!(app.transcript().len(), 1);
+    }
+
+    #[test]
+    fn assistant_final_message_consumes_shared_projection_text() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(
+            1,
+            SessionEventKind::AssistantDelta {
+                text: "draft".to_owned(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "final shared".to_owned(),
+            },
+        ));
+
+        assert_eq!(
+            app.latest_shared_terminal_text("Assistant").as_deref(),
+            Some("final shared")
+        );
+        let actual = app.transcript().iter().last().expect("assistant item");
+        assert_eq!(actual.role(), "Assistant");
+        assert_eq!(actual.text(), "final shared");
+        assert!(!actual.streaming());
+    }
+
+    #[test]
+    fn reasoning_final_message_consumes_shared_projection_text() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(
+            1,
+            SessionEventKind::AssistantReasoningDelta {
+                text: "draft reasoning".to_owned(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::AssistantReasoningMessage {
+                text: "final reasoning".to_owned(),
+            },
+        ));
+
+        assert_eq!(
+            app.latest_shared_terminal_text("Reasoning summary")
+                .as_deref(),
+            Some("final reasoning")
+        );
+        let actual = app.transcript().iter().last().expect("reasoning item");
+        assert_eq!(actual.role(), "Reasoning summary");
+        assert_eq!(actual.text(), "final reasoning");
+        assert!(!actual.streaming());
+    }
+
+    #[test]
+    fn split_reasoning_stream_consumes_shared_projection_without_aggregate_overwrite() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(
+            1,
+            SessionEventKind::AssistantReasoningDelta {
+                text: "first thought".to_owned(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::SystemMessage {
+                text: "tool output".to_owned(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            3,
+            SessionEventKind::AssistantReasoningDelta {
+                text: "second thought".to_owned(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            4,
+            SessionEventKind::AssistantReasoningMessage {
+                text: "first thought second thought final aggregate".to_owned(),
+            },
+        ));
+
+        let terminal = app.transcript().iter().collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 3);
+        assert_eq!(terminal[0].role(), "Reasoning summary");
+        assert_eq!(terminal[0].text(), "first thought");
+        assert!(!terminal[0].streaming());
+        assert_eq!(terminal[1].role(), "System");
+        assert_eq!(terminal[1].text(), "tool output");
+        assert_eq!(terminal[2].role(), "Reasoning summary");
+        assert_eq!(terminal[2].text(), "second thought");
+        assert!(!terminal[2].streaming());
+        assert_eq!(
+            app.session_view_snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(terminal_item_from_shared)
+                .map(|item| (item.role(), item.text().to_owned(), item.streaming()))
+                .collect::<Vec<_>>(),
+            terminal
+                .iter()
+                .map(|item| (item.role(), item.text().to_owned(), item.streaming()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn generic_terminal_items_are_adapted_from_shared_projection() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let events = shared_projection_terminal_adapter_events(SessionId::new());
+        for event in &events {
+            app.absorb_session_event(event);
+        }
+
+        let terminal = app.transcript().iter().collect::<Vec<_>>();
+        assert_eq!(terminal.len(), events.len());
+        for (terminal, shared) in terminal
+            .iter()
+            .zip(&app.session_view_snapshot().transcript.items)
+        {
+            let expected = terminal_item_from_shared(shared);
+            assert_eq!(terminal.role(), expected.role());
+            assert_eq!(terminal.text(), expected.text());
+            assert_eq!(terminal.kind(), expected.kind());
+            assert_eq!(terminal.event_sequence(), shared.sequence);
+        }
+    }
+
+    #[test]
+    fn active_tool_calls_follow_shared_tool_status() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
+        assert!(app.active_tool_calls.contains("tool-shared"));
+        assert!(matches!(
+            app.session_view_snapshot()
+                .tools
+                .get("tool-shared")
+                .expect("shared requested tool")
+                .status,
+            bcode_session_view_models::ToolInvocationViewStatus::Requested
+        ));
+
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "tool-shared".to_owned(),
+                result: "shared result".to_owned(),
+                is_error: false,
+                semantic_result: Some(ToolInvocationResult::Text {
+                    text: "shared result".to_owned(),
+                }),
+                output: None,
+            },
+        ));
+
+        assert!(!app.active_tool_calls.contains("tool-shared"));
+        assert!(matches!(
+            app.session_view_snapshot()
+                .tools
+                .get("tool-shared")
+                .expect("shared finished tool")
+                .status,
+            bcode_session_view_models::ToolInvocationViewStatus::Finished
+        ));
+    }
+
+    #[test]
+    fn tool_request_state_consumes_shared_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
+
+        let tool = app
+            .session_view_snapshot()
+            .tools
+            .get("tool-shared")
+            .expect("shared tool view");
+        assert_eq!(tool.tool_name.as_deref(), Some("shell.run"));
+        assert_eq!(
+            app.activity(),
+            &ActivityState::RunningTool {
+                name: tool.tool_name.clone().expect("tool name")
+            }
+        );
+        assert_eq!(
+            app.status(),
+            tool_request_status(tool.arguments_json.as_deref().expect("arguments"))
+                .unwrap_or_else(|| "started".to_owned())
+        );
+        let context = app
+            .tool_call_contexts
+            .get("tool-shared")
+            .expect("terminal tool context");
+        assert_eq!(
+            context.tool_name,
+            tool.tool_name.as_deref().unwrap_or_default()
+        );
+        assert_eq!(
+            context.arguments_json,
+            tool.arguments_json.as_deref().unwrap_or_default()
+        );
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.sequence == Some(1))
+            .expect("shared tool item");
+        let expected = terminal_item_from_shared(shared);
+        let actual = app.transcript().iter().last().expect("terminal tool item");
+        assert_eq!(actual.role(), expected.role());
+        assert_eq!(actual.text(), expected.text());
+        assert_eq!(actual.kind(), expected.kind());
+    }
+
+    #[test]
+    fn tool_output_delta_consumes_shared_projection_text() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "tool-shared".to_owned(),
+                    sequence: 1,
+                    stream: ToolOutputStream::Stdout,
+                    text: "hello ".to_owned(),
+                    byte_len: 6,
+                },
+            },
+        ));
+        app.absorb_session_event(&event(
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "tool-shared".to_owned(),
+                    sequence: 2,
+                    stream: ToolOutputStream::Stdout,
+                    text: "world".to_owned(),
+                    byte_len: 5,
+                },
+            },
+        ));
+
+        let shared = app
+            .shared_tool_output_item("tool-shared")
+            .expect("shared tool output item");
+        assert_eq!(shared.text(), "hello world");
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("terminal output item");
+        assert_eq!(actual.role(), shared.role());
+        assert_eq!(actual.text(), shared.text());
+        assert_eq!(actual.kind(), shared.kind());
+        assert!(actual.streaming());
+    }
+
+    #[test]
+    fn tool_result_status_consumes_shared_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "tool-shared".to_owned(),
+                result: "shared failure".to_owned(),
+                is_error: true,
+                semantic_result: Some(ToolInvocationResult::Text {
+                    text: "shared failure".to_owned(),
+                }),
+                output: None,
+            },
+        ));
+
+        let tool = app
+            .session_view_snapshot()
+            .tools
+            .get("tool-shared")
+            .expect("shared tool view");
+        assert_eq!(tool.is_error, Some(true));
+        assert_eq!(app.status(), "failed");
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
+                        if tool.tool_call_id == "tool-shared"
+                )
+            })
+            .expect("shared tool item");
+        let expected = terminal_item_from_shared(shared);
+        let actual = app.transcript().iter().last().expect("terminal tool item");
+        assert_eq!(actual.role(), expected.role());
+        assert_eq!(actual.text(), expected.text());
+        assert_eq!(actual.kind(), expected.kind());
+    }
+
+    #[test]
+    fn finished_tool_result_uses_shared_terminal_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+        app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "tool-shared".to_owned(),
+                result: "shared result".to_owned(),
+                is_error: false,
+                semantic_result: Some(ToolInvocationResult::Text {
+                    text: "shared result".to_owned(),
+                }),
+                output: None,
+            },
+        ));
+
+        let terminal = app.transcript().iter().collect::<Vec<_>>();
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
+                        if tool.tool_call_id == "tool-shared"
+                            && matches!(
+                                tool.status,
+                                bcode_session_view_models::ToolInvocationViewStatus::Finished
+                            )
+                )
+            })
+            .expect("shared finished tool item");
+        let expected = terminal_item_from_shared(shared);
+        let actual = terminal.last().expect("terminal result item");
+        assert_eq!(actual.role(), expected.role());
+        assert_eq!(actual.text(), expected.text());
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.event_sequence(), shared.sequence);
+    }
+
+    #[test]
+    fn permission_request_activity_consumes_shared_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(1, shared_permission_request_kind()));
+
+        let permission = app
+            .shared_permission_view("permission-shared")
+            .expect("shared permission view");
+        assert_eq!(permission.tool_name, "shell.run");
+        assert_eq!(
+            app.activity(),
+            &ActivityState::WaitingPermission {
+                name: permission.tool_name.clone()
+            }
+        );
+        assert_eq!(
+            app.status(),
+            tool_request_status(&permission.arguments_json)
+                .unwrap_or_else(|| permission.tool_name.clone())
+        );
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.sequence == Some(1))
+            .expect("shared permission item");
+        let expected = terminal_item_from_shared(shared);
+        let actual = app.transcript().iter().last().expect("terminal item");
+        assert_eq!(actual.role(), expected.role());
+        assert_eq!(actual.text(), expected.text());
+        assert_eq!(actual.kind(), expected.kind());
+    }
+
+    #[test]
+    fn resolved_permission_result_uses_shared_terminal_projection() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+        app.absorb_session_event(&event(1, shared_permission_request_kind()));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::PermissionResolved {
+                permission_id: "permission-shared".to_owned(),
+                approved: true,
+            },
+        ));
+
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                        if permission.permission_id == "permission-shared" && permission.resolved
+                )
+            })
+            .expect("shared resolved permission item");
+        let expected = terminal_item_from_shared(shared);
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("terminal permission item");
+        assert_eq!(actual.role(), expected.role());
+        assert_eq!(actual.text(), expected.text());
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.event_sequence(), shared.sequence);
+    }
+
+    fn shared_projection_terminal_adapter_events(session_id: SessionId) -> Vec<SessionEvent> {
+        [
+            shared_projection_adapter_event(
+                session_id,
                 1,
                 SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
@@ -5213,13 +6633,15 @@ mod tests {
                     admission: bcode_session_models::TurnAdmissionMetadata::default(),
                 },
             ),
-            event(
+            shared_projection_adapter_event(
+                session_id,
                 2,
                 SessionEventKind::SystemMessage {
                     text: "shared system".to_owned(),
                 },
             ),
-            event(
+            shared_projection_adapter_event(
+                session_id,
                 3,
                 SessionEventKind::ModelUsage {
                     turn_id: "turn-1".to_owned(),
@@ -5230,36 +6652,87 @@ mod tests {
                     },
                 },
             ),
-            event(
-                4,
-                SessionEventKind::PermissionRequested {
-                    permission_id: "permission-shared".to_owned(),
-                    tool_call_id: "tool-shared".to_owned(),
-                    producer_plugin_id: Some("bcode.shell".to_owned()),
-                    tool_name: "shell.run".to_owned(),
-                    arguments_json: r#"{"command":"printf shared"}"#.to_owned(),
-                    legacy_request_presentation: None,
-                    batch: None,
-                    policy_source: Some("ask".to_owned()),
-                    policy_reason: Some("needs confirmation".to_owned()),
+            shared_projection_adapter_event(session_id, 4, shared_tool_call_request_kind()),
+            shared_projection_adapter_event(session_id, 5, shared_permission_request_kind()),
+            shared_projection_adapter_event(
+                session_id,
+                7,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: "turn-shared".to_owned(),
+                    outcome: ModelTurnOutcome::Error,
+                    message: Some("provider failed".to_owned()),
                 },
             ),
-        ];
-        for event in &events {
-            app.absorb_session_event(event);
-        }
+            shared_projection_adapter_event(session_id, 8, shared_tool_contribution_kind()),
+            shared_projection_adapter_event(session_id, 9, shared_plugin_status_note_kind()),
+        ]
+        .into()
+    }
 
-        let terminal = app.transcript().iter().collect::<Vec<_>>();
-        assert_eq!(terminal.len(), 4);
-        for (terminal, shared) in terminal
-            .iter()
-            .zip(&app.session_view_snapshot().transcript.items)
-        {
-            let expected = terminal_item_from_shared(shared);
-            assert_eq!(terminal.role(), expected.role());
-            assert_eq!(terminal.text(), expected.text());
-            assert_eq!(terminal.kind(), expected.kind());
-            assert_eq!(terminal.event_sequence(), shared.sequence);
+    fn shared_projection_adapter_event(
+        session_id: SessionId,
+        sequence: u64,
+        kind: SessionEventKind,
+    ) -> SessionEvent {
+        SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence.saturating_mul(10),
+            session_id,
+            provenance: None,
+            kind,
+        }
+    }
+
+    fn shared_tool_call_request_kind() -> SessionEventKind {
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "tool-shared".to_owned(),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"printf shared"}"#.to_owned(),
+            working_directory: None,
+            request_visual: None,
+            legacy_request_presentation: None,
+        }
+    }
+
+    fn shared_permission_request_kind() -> SessionEventKind {
+        SessionEventKind::PermissionRequested {
+            permission_id: "permission-shared".to_owned(),
+            tool_call_id: "tool-shared".to_owned(),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"printf shared"}"#.to_owned(),
+            legacy_request_presentation: None,
+            batch: None,
+            policy_source: Some("ask".to_owned()),
+            policy_reason: Some("needs confirmation".to_owned()),
+        }
+    }
+
+    fn shared_tool_contribution_kind() -> SessionEventKind {
+        SessionEventKind::ToolContribution {
+            event: bcode_session_models::ToolContributionEvent {
+                invocation_id: "tool-shared".to_owned(),
+                contribution_id: "status".to_owned(),
+                sequence: 1,
+                producer_id: "bcode.test".to_owned(),
+                schema: "bcode.test.status".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                artifact: None,
+                payload: serde_json::json!({"status": "ok"}),
+            },
+        }
+    }
+
+    fn shared_plugin_status_note_kind() -> SessionEventKind {
+        SessionEventKind::PluginStatusNote {
+            plugin_id: "bcode.test".to_owned(),
+            note_id: "note-1".to_owned(),
+            text: "plugin status".to_owned(),
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -5424,6 +6897,23 @@ mod tests {
         assert_eq!(app.transcript().len(), 1);
         assert!(app.transcript()[0].text().contains("second"));
         assert!(!app.transcript()[0].text().contains("first"));
+        let shared = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::ToolContribution {
+                        contribution,
+                    } if contribution.sequence == 2
+                )
+            })
+            .expect("shared live contribution transcript item");
+        let expected = terminal_item_from_shared(shared);
+        assert_eq!(app.transcript()[0].role(), expected.role());
+        assert_eq!(app.transcript()[0].text(), expected.text());
 
         app.absorb_session_live_event(&live(
             3,

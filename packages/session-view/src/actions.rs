@@ -54,56 +54,51 @@ pub async fn execute_session_view_action(
             resolution,
         } => execute_resolve_interaction(client, interaction_id, resolution).await,
         SessionViewAction::UpdateDraft { scope, text } => {
-            client
-                .set_composer_draft(composer_draft_scope(scope), text)
-                .await?;
-            Ok(SessionViewActionOutcome::None)
+            execute_update_draft(client, scope, text).await
         }
         SessionViewAction::SetModel {
             session_id,
             provider_plugin_id,
             model_id,
-        } => {
-            client
-                .set_session_model(session_id, provider_plugin_id, model_id)
-                .await?;
-            Ok(SessionViewActionOutcome::None)
-        }
+        } => execute_set_model(client, session_id, provider_plugin_id, model_id).await,
         SessionViewAction::SetReasoning {
             session_id,
             effort,
             summary,
-        } => {
-            client
-                .set_session_reasoning(session_id, effort, summary)
-                .await?;
-            Ok(SessionViewActionOutcome::None)
+        } => execute_set_reasoning(client, session_id, effort, summary).await,
+        SessionViewAction::RenameSession { session_id, name } => {
+            execute_rename_session(client, session_id, name).await
+        }
+        SessionViewAction::DeleteSession { session_id } => {
+            execute_delete_session(client, session_id).await
+        }
+        SessionViewAction::ForkSession {
+            session_id,
+            prompt_sequence,
+            name,
+        } => execute_fork_session(client, session_id, prompt_sequence, name).await,
+        SessionViewAction::CloneSession { session_id, name } => {
+            execute_clone_session(client, session_id, name).await
+        }
+        SessionViewAction::CancelRuntimeWork {
+            session_id,
+            work_id,
+        } => execute_cancel_runtime_work(client, session_id, work_id).await,
+        SessionViewAction::CompactContext { session_id } => {
+            execute_compact_context(client, session_id).await
         }
         SessionViewAction::SetAgent {
             session_id,
             agent_id,
-        } => {
-            client.set_session_agent(session_id, agent_id).await?;
-            Ok(SessionViewActionOutcome::None)
-        }
+        } => execute_set_agent(client, session_id, agent_id).await,
         SessionViewAction::ActivateSkill {
             session_id,
             skill_id,
-        } => {
-            client
-                .activate_skill(session_id, SkillId::new(skill_id))
-                .await?;
-            Ok(SessionViewActionOutcome::None)
-        }
+        } => execute_activate_skill(client, session_id, skill_id).await,
         SessionViewAction::DeactivateSkill {
             session_id,
             skill_id,
-        } => {
-            client
-                .deactivate_skill(session_id, SkillId::new(skill_id))
-                .await?;
-            Ok(SessionViewActionOutcome::None)
-        }
+        } => execute_deactivate_skill(client, session_id, skill_id).await,
         SessionViewAction::SwitchSession { .. }
         | SessionViewAction::LoadOlderHistory { .. }
         | SessionViewAction::LoadNewerHistory { .. } => Err(ClientError::Server {
@@ -112,6 +107,135 @@ pub async fn execute_session_view_action(
                 .to_owned(),
         }),
     }
+}
+
+async fn execute_set_agent(
+    client: &BcodeClient,
+    session_id: SessionId,
+    agent_id: String,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    client.set_session_agent(session_id, agent_id).await?;
+    Ok(SessionViewActionOutcome::None)
+}
+
+async fn execute_activate_skill(
+    client: &BcodeClient,
+    session_id: SessionId,
+    skill_id: String,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    client
+        .activate_skill(session_id, SkillId::new(skill_id))
+        .await?;
+    Ok(SessionViewActionOutcome::None)
+}
+
+async fn execute_deactivate_skill(
+    client: &BcodeClient,
+    session_id: SessionId,
+    skill_id: String,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    client
+        .deactivate_skill(session_id, SkillId::new(skill_id))
+        .await?;
+    Ok(SessionViewActionOutcome::None)
+}
+
+async fn execute_update_draft(
+    client: &BcodeClient,
+    scope: ComposerDraftViewScope,
+    text: String,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    client
+        .set_composer_draft(composer_draft_scope(scope), text)
+        .await?;
+    Ok(SessionViewActionOutcome::None)
+}
+
+async fn execute_set_model(
+    client: &BcodeClient,
+    session_id: SessionId,
+    provider_plugin_id: Option<String>,
+    model_id: String,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    client
+        .set_session_model(session_id, provider_plugin_id, model_id)
+        .await?;
+    Ok(SessionViewActionOutcome::None)
+}
+
+async fn execute_set_reasoning(
+    client: &BcodeClient,
+    session_id: SessionId,
+    effort: Option<String>,
+    summary: Option<String>,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    client
+        .set_session_reasoning(session_id, effort, summary)
+        .await?;
+    Ok(SessionViewActionOutcome::None)
+}
+
+async fn execute_rename_session(
+    client: &BcodeClient,
+    session_id: SessionId,
+    name: Option<String>,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    Ok(SessionViewActionOutcome::SessionRenamed {
+        session: Box::new(client.rename_session(session_id, name).await?),
+    })
+}
+
+async fn execute_delete_session(
+    client: &BcodeClient,
+    session_id: SessionId,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    Ok(SessionViewActionOutcome::SessionDeleted {
+        session: Box::new(client.delete_session(session_id).await?),
+    })
+}
+
+async fn execute_fork_session(
+    client: &BcodeClient,
+    session_id: SessionId,
+    prompt_sequence: u64,
+    name: Option<String>,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    Ok(SessionViewActionOutcome::SessionForked {
+        fork: Box::new(
+            client
+                .fork_session(session_id, prompt_sequence, name)
+                .await?,
+        ),
+    })
+}
+
+async fn execute_clone_session(
+    client: &BcodeClient,
+    session_id: SessionId,
+    name: Option<String>,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    Ok(SessionViewActionOutcome::SessionCloned {
+        fork: Box::new(client.clone_session(session_id, name).await?),
+    })
+}
+
+async fn execute_cancel_runtime_work(
+    client: &BcodeClient,
+    session_id: SessionId,
+    work_id: bcode_session_models::WorkId,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    Ok(SessionViewActionOutcome::RuntimeWorkCancellationRequested {
+        cancelled: client.cancel_runtime_work(session_id, work_id).await?,
+    })
+}
+
+async fn execute_compact_context(
+    client: &BcodeClient,
+    session_id: SessionId,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    Ok(SessionViewActionOutcome::ContextCompacted {
+        message: client.compact_session(session_id).await?,
+    })
 }
 
 async fn execute_resolve_interaction(

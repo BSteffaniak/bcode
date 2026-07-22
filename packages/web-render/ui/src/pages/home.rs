@@ -7,7 +7,8 @@ use std::sync::LazyLock;
 use bcode_session_models::SessionSummary;
 use bcode_session_view_models::{
     InteractionViewSummary, PermissionView, PluginVisualView, SessionViewSnapshot,
-    ToolInvocationViewStatus, TranscriptViewItemKind,
+    ToolArtifactView, ToolInvocationView, ToolInvocationViewStatus, ToolResultView,
+    TranscriptViewItemKind,
 };
 use hyperchad::template::{Containers, container};
 use serde::Deserialize;
@@ -48,6 +49,97 @@ struct QuestionAnswer {
 }
 
 type VisualAdapter = fn(&PluginVisualView) -> Option<Containers>;
+type ArtifactAdapter = fn(&ToolArtifactView) -> Option<Containers>;
+
+static ARTIFACT_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), ArtifactAdapter>> =
+    LazyLock::new(|| {
+        BTreeMap::from([
+            (
+                ("bcode.document.extract_result", 1),
+                render_document_extract_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.document.status", 1),
+                render_document_status as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.read", 1),
+                render_filesystem_read_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.image", 1),
+                render_filesystem_image_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.change", 1),
+                render_filesystem_change_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.exists", 1),
+                render_filesystem_exists_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.list", 1),
+                render_filesystem_list_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.find", 1),
+                render_filesystem_find_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.grep", 1),
+                render_filesystem_grep_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.stat", 1),
+                render_filesystem_stat_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.artifact.metadata", 1),
+                render_filesystem_artifact_metadata as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.artifact.read", 1),
+                render_filesystem_artifact_read as ArtifactAdapter,
+            ),
+            (
+                ("bcode.filesystem.artifact.grep", 1),
+                render_filesystem_artifact_grep as ArtifactAdapter,
+            ),
+            (
+                ("bcode.git.clone_result", 1),
+                render_git_clone_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.ocr.extract_result", 1),
+                render_ocr_extract_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.ocr.status", 1),
+                render_ocr_status as ArtifactAdapter,
+            ),
+            (
+                ("bcode.web-search.search_results", 1),
+                render_web_search_results as ArtifactAdapter,
+            ),
+            (
+                ("bcode.web-search.fetch_result", 1),
+                render_web_fetch_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.worktree.list", 1),
+                render_worktree_list_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.worktree.create_result", 1),
+                render_worktree_create_result as ArtifactAdapter,
+            ),
+            (
+                ("bcode.worktree.remove_result", 1),
+                render_worktree_remove_result as ArtifactAdapter,
+            ),
+        ])
+    });
 
 static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
     LazyLock::new(|| {
@@ -77,18 +169,32 @@ static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
             (("bcode.filesystem.artifact.grep", 1), structured),
             (("bcode.document.request", 1), structured),
             (("bcode.ocr.request", 1), structured),
-            (("bcode.web-search.search_request", 1), structured),
-            (("bcode.web-search.fetch_request", 1), structured),
+            (
+                ("bcode.web-search.search_request", 1),
+                render_web_search_request as VisualAdapter,
+            ),
+            (
+                ("bcode.web-search.fetch_request", 1),
+                render_web_fetch_request as VisualAdapter,
+            ),
             (("bcode.web-search.status_request", 1), structured),
             (("bcode.web-search.inspect_request", 1), structured),
-            (("bcode.git.clone_request", 1), structured),
-            (("bcode.git.clone_result", 1), structured),
-            (("bcode.worktree.request", 1), structured),
-            (("bcode.worktree.list", 1), structured),
-            (("bcode.worktree.create_result", 1), structured),
-            (("bcode.worktree.remove_result", 1), structured),
-            (("bcode.vim-edit.request.preview", 1), structured),
-            (("bcode.vim-edit.request.apply", 1), structured),
+            (
+                ("bcode.git.clone_request", 1),
+                render_git_clone_request as VisualAdapter,
+            ),
+            (
+                ("bcode.worktree.request", 1),
+                render_worktree_request as VisualAdapter,
+            ),
+            (
+                ("bcode.vim-edit.request.preview", 1),
+                render_vim_edit_request as VisualAdapter,
+            ),
+            (
+                ("bcode.vim-edit.request.apply", 1),
+                render_vim_edit_request as VisualAdapter,
+            ),
             (("bcode.vim-edit.live", 1), structured),
             (("bcode.vim-edit.playback", 1), structured),
         ])
@@ -674,6 +780,13 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
         | TranscriptViewItemKind::SystemMessage { message } => container! {
             div white-space="preserve-wrap" margin=0 color="#c9d1d9" { (message.text) }
         },
+        TranscriptViewItemKind::Compaction { compaction } => container! {
+            div white-space="preserve-wrap" margin=0 color="#c9d1d9" { (compaction.text) }
+        },
+        TranscriptViewItemKind::Skill { skill } => container! {
+            div white-space="preserve-wrap" margin=0 color="#c9d1d9" { (skill.text) }
+        },
+        TranscriptViewItemKind::ToolRequest { tool } => render_tool_request(tool),
         TranscriptViewItemKind::ToolInvocation { tool } => container! {
             div {
                 div color="#f0f6fc" margin-bottom=6 { (tool.tool_name.as_deref().unwrap_or("unknown tool")) }
@@ -750,24 +863,599 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
     }
 }
 
-fn render_tool_result(result: &bcode_session_view_models::ToolResultView) -> Containers {
-    if let bcode_session_view_models::ToolResultView::Artifact { artifact } = result {
-        let visual = PluginVisualView::from(bcode_session_models::PluginVisualDescriptor {
-            visual_id: Some(artifact.artifact.artifact_id.clone()),
-            producer_plugin_id: Some(artifact.artifact.producer_plugin_id.clone()),
-            schema: artifact.artifact.schema.clone(),
-            schema_version: artifact.artifact.schema_version,
-            title: artifact.artifact.title.clone(),
-            subtitle: None,
-            payload: artifact.artifact.metadata.clone(),
-        });
-        render_plugin_visual("semantic result", &visual)
-    } else {
-        json_panel(
-            "semantic result",
-            &serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
-        )
+fn render_tool_request(tool: &ToolInvocationView) -> Containers {
+    container! {
+        div {
+            div color="#f0f6fc" margin-bottom=6 { (tool.tool_name.as_deref().unwrap_or("unknown tool")) }
+            @if let Some(arguments_json) = &tool.arguments_json {
+                details margin-bottom=8 {
+                    summary color="#8b949e" { "arguments" }
+                    div white-space="preserve-wrap" color="#c9d1d9" { (arguments_json) }
+                }
+            }
+            @if let Some(visual) = &tool.request_visual {
+                (render_plugin_visual("request visual", visual))
+            }
+        }
     }
+}
+
+fn render_tool_result(result: &ToolResultView) -> Containers {
+    let rich = match result {
+        ToolResultView::Artifact { artifact } => ARTIFACT_ADAPTERS
+            .get(&(
+                artifact.artifact.schema.as_str(),
+                artifact.artifact.schema_version,
+            ))
+            .and_then(|adapter| adapter(artifact)),
+        ToolResultView::Text { .. } | ToolResultView::Json { .. } => None,
+    };
+    let fallback = serde_json::to_value(result).unwrap_or(serde_json::Value::Null);
+    container! {
+        @if let Some(rich) = rich {
+            (rich)
+        }
+        (json_panel("semantic result", &fallback))
+    }
+}
+
+fn render_document_extract_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let source = metadata.get("source").and_then(serde_json::Value::as_str)?;
+    let content_type = metadata
+        .get("content_type")
+        .and_then(serde_json::Value::as_str);
+    let extractor = metadata
+        .get("extractor")
+        .and_then(serde_json::Value::as_str);
+    let truncated = metadata
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool);
+    let document_path = metadata
+        .get("document_path")
+        .and_then(serde_json::Value::as_str);
+    let text_path = metadata
+        .get("text_path")
+        .and_then(serde_json::Value::as_str);
+    let text = metadata.get("text").and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Document extraction")) }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (source) }
+            @if let Some(content_type) = content_type { div color="#8b949e" font-size=12 margin-top=4 { "type: " (content_type) } }
+            @if let Some(extractor) = extractor { div color="#8b949e" font-size=12 margin-top=4 { "extractor: " (extractor) } }
+            @if let Some(document_path) = document_path { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "document: " (document_path) } }
+            @if let Some(text_path) = text_path { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "text: " (text_path) } }
+            @if let Some(truncated) = truncated { div color="#8b949e" font-size=12 margin-top=4 { "truncated: " (truncated.to_string()) } }
+            @if let Some(text) = text { div color="#c9d1d9" font-size=12 white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { (text) } }
+        }
+    })
+}
+
+fn render_document_status(artifact: &ToolArtifactView) -> Option<Containers> {
+    render_extract_capabilities(artifact, "Document extractors", "extractors")
+}
+
+fn render_filesystem_read_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let contents = artifact
+        .artifact
+        .metadata
+        .get("contents")
+        .and_then(serde_json::Value::as_str)?;
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("File contents")) }
+            div color="#c9d1d9" font-size=12 font-family="monospace" white-space="preserve-wrap" { (contents) }
+        }
+    })
+}
+
+fn render_filesystem_image_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let path = metadata.get("path").and_then(serde_json::Value::as_str)?;
+    let mime_type = metadata
+        .get("mime_type")
+        .and_then(serde_json::Value::as_str);
+    let width = metadata.get("width").and_then(serde_json::Value::as_u64);
+    let height = metadata.get("height").and_then(serde_json::Value::as_u64);
+    let byte_len = metadata.get("byte_len").and_then(serde_json::Value::as_u64);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Image file")) }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(mime_type) = mime_type { div color="#8b949e" font-size=12 margin-top=4 { "type: " (mime_type) } }
+            @if let (Some(width), Some(height)) = (width, height) { div color="#8b949e" font-size=12 margin-top=4 { "dimensions: " (width.to_string()) "x" (height.to_string()) } }
+            @if let Some(byte_len) = byte_len { div color="#8b949e" font-size=12 margin-top=4 { "bytes: " (byte_len.to_string()) } }
+        }
+    })
+}
+
+fn render_filesystem_change_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let path = metadata.get("path").and_then(serde_json::Value::as_str)?;
+    let summary = metadata.get("summary").and_then(serde_json::Value::as_str);
+    let old_text = metadata.get("old_text").and_then(serde_json::Value::as_str);
+    let new_text = metadata.get("new_text").and_then(serde_json::Value::as_str);
+    let start_line = metadata
+        .get("start_line")
+        .and_then(serde_json::Value::as_u64);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("File change")) }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(summary) = summary { div color="#8b949e" font-size=12 margin-top=4 white-space="preserve-wrap" { (summary) } }
+            @if let Some(start_line) = start_line { div color="#8b949e" font-size=12 margin-top=4 { "start line: " (start_line.to_string()) } }
+            @if let Some(old_text) = old_text { div color="#f85149" font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { "- " (old_text) } }
+            @if let Some(new_text) = new_text { div color="#7ee787" font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { "+ " (new_text) } }
+        }
+    })
+}
+
+fn render_filesystem_exists_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let exists = artifact
+        .artifact
+        .metadata
+        .get("exists")
+        .and_then(serde_json::Value::as_bool)?;
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Path exists")) }
+            div color="#f0f6fc" { "exists: " (exists.to_string()) }
+        }
+    })
+}
+
+fn render_filesystem_list_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let entries = artifact
+        .artifact
+        .metadata
+        .get("entries")
+        .and_then(serde_json::Value::as_array)?;
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Directory entries"), entries.len())) }
+            @for entry in entries.iter().take(25) {
+                @if let Some(entry) = entry.as_object() {
+                    div border-top="1, #30363d" padding-top=6 margin-top=6 {
+                        @if let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) {
+                            span color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+                        }
+                        @if let Some(kind) = entry.get("kind").and_then(serde_json::Value::as_str) {
+                            span color="#8b949e" { " · " (kind) }
+                        }
+                    }
+                }
+            }
+            @if entries.len() > 25 {
+                div color="#8b949e" font-size=12 margin-top=8 { "… " ((entries.len() - 25).to_string()) " more entries" }
+            }
+            (filesystem_result_metadata(&artifact.artifact.metadata))
+        }
+    })
+}
+
+fn render_filesystem_find_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let paths = artifact
+        .artifact
+        .metadata
+        .get("paths")
+        .and_then(serde_json::Value::as_array)?;
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Path matches"), paths.len())) }
+            @for path in paths.iter().filter_map(serde_json::Value::as_str).take(30) {
+                div color="#f0f6fc" font-size=12 font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" padding-top=4 margin-top=4 { (path) }
+            }
+            @if paths.len() > 30 {
+                div color="#8b949e" font-size=12 margin-top=8 { "… " ((paths.len() - 30).to_string()) " more paths" }
+            }
+            (filesystem_result_metadata(&artifact.artifact.metadata))
+        }
+    })
+}
+
+fn render_filesystem_grep_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    render_grep_matches(artifact, "Search matches")
+}
+
+fn render_filesystem_stat_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let exists = metadata
+        .get("exists")
+        .and_then(serde_json::Value::as_bool)?;
+    let kind = metadata.get("kind").and_then(serde_json::Value::as_str);
+    let len = metadata.get("len").and_then(serde_json::Value::as_u64);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Path metadata")) }
+            div color="#f0f6fc" { "exists: " (exists.to_string()) }
+            @if let Some(kind) = kind { div color="#8b949e" font-size=12 margin-top=4 { "kind: " (kind) } }
+            @if let Some(len) = len { div color="#8b949e" font-size=12 margin-top=4 { "len: " (len.to_string()) } }
+        }
+    })
+}
+
+fn render_filesystem_artifact_metadata(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let path = metadata.get("path").and_then(serde_json::Value::as_str)?;
+    let exists = metadata.get("exists").and_then(serde_json::Value::as_bool);
+    let kind = metadata.get("kind").and_then(serde_json::Value::as_str);
+    let byte_len = metadata.get("byte_len").and_then(serde_json::Value::as_u64);
+    let content_type = metadata
+        .get("content_type")
+        .and_then(serde_json::Value::as_str);
+    let complete = metadata
+        .get("complete")
+        .and_then(serde_json::Value::as_bool);
+    let message = metadata.get("message").and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Artifact metadata")) }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(exists) = exists { div color="#8b949e" font-size=12 margin-top=4 { "exists: " (exists.to_string()) } }
+            @if let Some(kind) = kind { div color="#8b949e" font-size=12 margin-top=4 { "kind: " (kind) } }
+            @if let Some(byte_len) = byte_len { div color="#8b949e" font-size=12 margin-top=4 { "bytes: " (byte_len.to_string()) } }
+            @if let Some(content_type) = content_type { div color="#8b949e" font-size=12 margin-top=4 { "type: " (content_type) } }
+            @if let Some(complete) = complete { div color="#8b949e" font-size=12 margin-top=4 { "complete: " (complete.to_string()) } }
+            @if let Some(message) = message { div color="#8b949e" font-size=12 margin-top=4 white-space="preserve-wrap" { (message) } }
+        }
+    })
+}
+
+fn render_filesystem_artifact_read(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let path = metadata.get("path").and_then(serde_json::Value::as_str)?;
+    let contents = metadata.get("contents").and_then(serde_json::Value::as_str);
+    let returned_bytes = metadata
+        .get("returned_bytes")
+        .and_then(serde_json::Value::as_u64);
+    let total_bytes = metadata
+        .get("total_bytes")
+        .and_then(serde_json::Value::as_u64);
+    let truncated = metadata
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Artifact contents")) }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(returned_bytes) = returned_bytes { div color="#8b949e" font-size=12 margin-top=4 { "returned bytes: " (returned_bytes.to_string()) } }
+            @if let Some(total_bytes) = total_bytes { div color="#8b949e" font-size=12 margin-top=4 { "total bytes: " (total_bytes.to_string()) } }
+            @if let Some(truncated) = truncated { div color="#8b949e" font-size=12 margin-top=4 { "truncated: " (truncated.to_string()) } }
+            @if let Some(contents) = contents { div color="#c9d1d9" font-size=12 font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { (contents) } }
+        }
+    })
+}
+
+fn render_filesystem_artifact_grep(artifact: &ToolArtifactView) -> Option<Containers> {
+    render_grep_matches(artifact, "Artifact matches")
+}
+
+fn render_grep_matches(
+    artifact: &ToolArtifactView,
+    fallback_title: &'static str,
+) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let matches = metadata
+        .get("matches")
+        .and_then(serde_json::Value::as_array)?;
+    let path = metadata.get("path").and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or(fallback_title), matches.len())) }
+            @if let Some(path) = path { div color="#8b949e" font-size=12 font-family="monospace" white-space="preserve-wrap" margin-bottom=6 { (path) } }
+            @for hit in matches.iter().take(30) {
+                @if let Some(hit) = hit.as_object() {
+                    div border-top="1, #30363d" padding-top=6 margin-top=6 {
+                        @if let Some(path) = hit.get("path").and_then(serde_json::Value::as_str) { div color="#f0f6fc" font-size=12 font-family="monospace" white-space="preserve-wrap" { (path) } }
+                        @if let Some(line_number) = hit.get("line_number").and_then(serde_json::Value::as_u64) { span color="#8b949e" font-size=12 { (line_number.to_string()) ": " } }
+                        @if let Some(line) = hit.get("line").and_then(serde_json::Value::as_str) { span color="#c9d1d9" font-size=12 white-space="preserve-wrap" { (line) } }
+                    }
+                }
+            }
+            @if matches.len() > 30 {
+                div color="#8b949e" font-size=12 margin-top=8 { "… " ((matches.len() - 30).to_string()) " more matches" }
+            }
+            (filesystem_result_metadata(metadata))
+        }
+    })
+}
+
+fn filesystem_result_metadata(metadata: &serde_json::Value) -> Containers {
+    let backend = metadata.get("backend").and_then(serde_json::Value::as_str);
+    let visited_entries = metadata
+        .get("visited_entries")
+        .and_then(serde_json::Value::as_u64);
+    let partial = metadata.get("partial").and_then(serde_json::Value::as_bool);
+    let timed_out = metadata
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool);
+    let message = metadata.get("message").and_then(serde_json::Value::as_str);
+    container! {
+        @if backend.is_some() || visited_entries.is_some() || partial.is_some() || timed_out.is_some() || message.is_some() {
+            div color="#8b949e" font-size=12 margin-top=8 {
+                @if let Some(backend) = backend { div { "backend: " (backend) } }
+                @if let Some(visited_entries) = visited_entries { div { "visited entries: " (visited_entries.to_string()) } }
+                @if let Some(partial) = partial { div { "partial: " (partial.to_string()) } }
+                @if let Some(timed_out) = timed_out { div { "timed out: " (timed_out.to_string()) } }
+                @if let Some(message) = message { div white-space="preserve-wrap" { (message) } }
+            }
+        }
+    }
+}
+
+fn render_git_clone_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let repo = metadata.get("repo").and_then(serde_json::Value::as_str)?;
+    let owner = metadata.get("owner").and_then(serde_json::Value::as_str);
+    let host = metadata.get("host").and_then(serde_json::Value::as_str);
+    let clone_url = metadata
+        .get("clone_url")
+        .and_then(serde_json::Value::as_str);
+    let path = metadata.get("path").and_then(serde_json::Value::as_str);
+    let already_exists = metadata
+        .get("already_exists")
+        .and_then(serde_json::Value::as_bool);
+    let repo_label = owner.map_or_else(|| repo.to_owned(), |owner| format!("{owner}/{repo}"));
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div direction=row gap=8 align-items=center margin-bottom=6 {
+                span color="#58a6ff" { (artifact.artifact.title.as_deref().unwrap_or("Repository clone")) }
+                @if let Some(host) = host { span color="#8b949e" { (host) } }
+            }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (repo_label) }
+            @if let Some(path) = path { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "path: " (path) } }
+            @if let Some(clone_url) = clone_url { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "remote: " (clone_url) } }
+            @if let Some(already_exists) = already_exists { div color="#8b949e" font-size=12 margin-top=4 { "already exists: " (already_exists.to_string()) } }
+        }
+    })
+}
+
+fn render_ocr_extract_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let text = metadata.get("text").and_then(serde_json::Value::as_str)?;
+    let source = metadata
+        .get("source")
+        .and_then(serde_json::Value::as_object);
+    let path = source
+        .and_then(|source| source.get("path"))
+        .and_then(serde_json::Value::as_str);
+    let url = source
+        .and_then(|source| source.get("url"))
+        .and_then(serde_json::Value::as_str);
+    let engine = metadata.get("engine").and_then(serde_json::Value::as_str);
+    let language = metadata.get("language").and_then(serde_json::Value::as_str);
+    let truncated = metadata
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool);
+    let text_bytes = metadata
+        .get("text_bytes")
+        .and_then(serde_json::Value::as_u64);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("OCR extraction")) }
+            @if let Some(path) = path { div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) } }
+            @if let Some(url) = url { div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (url) } }
+            @if let Some(engine) = engine { div color="#8b949e" font-size=12 margin-top=4 { "engine: " (engine) } }
+            @if let Some(language) = language { div color="#8b949e" font-size=12 margin-top=4 { "language: " (language) } }
+            @if let Some(text_bytes) = text_bytes { div color="#8b949e" font-size=12 margin-top=4 { "text bytes: " (text_bytes.to_string()) } }
+            @if let Some(truncated) = truncated { div color="#8b949e" font-size=12 margin-top=4 { "truncated: " (truncated.to_string()) } }
+            div color="#c9d1d9" font-size=12 white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { (text) }
+        }
+    })
+}
+
+fn render_ocr_status(artifact: &ToolArtifactView) -> Option<Containers> {
+    render_extract_capabilities(artifact, "OCR engines", "engines")
+}
+
+fn render_extract_capabilities(
+    artifact: &ToolArtifactView,
+    title: &'static str,
+    entries_key: &'static str,
+) -> Option<Containers> {
+    let extract = artifact
+        .artifact
+        .metadata
+        .get("extract")
+        .and_then(serde_json::Value::as_object)?;
+    let available = extract
+        .get("available")
+        .and_then(serde_json::Value::as_bool);
+    let entries = extract
+        .get(entries_key)
+        .and_then(serde_json::Value::as_array);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or(title)) }
+            @if let Some(available) = available { div color="#8b949e" font-size=12 margin-bottom=4 { "available: " (available.to_string()) } }
+            @if let Some(entries) = entries {
+                @for entry in entries {
+                    @if let Some(entry) = entry.as_object() {
+                        div border-top="1, #30363d" padding-top=6 margin-top=6 {
+                            @if let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) { span color="#f0f6fc" { (name) } }
+                            @if let Some(quality) = entry.get("quality").and_then(serde_json::Value::as_str) { span color="#8b949e" { " · " (quality) } }
+                            @if let Some(available) = entry.get("available").and_then(serde_json::Value::as_bool) { span color="#8b949e" { " · available: " (available.to_string()) } }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn render_web_search_results(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let query = metadata.get("query").and_then(serde_json::Value::as_str);
+    let provider = metadata.get("provider").and_then(serde_json::Value::as_str);
+    let partial = metadata.get("partial").and_then(serde_json::Value::as_bool);
+    let message = metadata.get("message").and_then(serde_json::Value::as_str);
+    let results = metadata.get("results")?.as_array()?;
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div direction=row gap=8 align-items=center margin-bottom=6 {
+                span color="#58a6ff" { (artifact.artifact.title.as_deref().unwrap_or("Search results")) }
+                @if let Some(provider) = provider {
+                    span color="#8b949e" { (provider) }
+                }
+            }
+            @if let Some(query) = query {
+                div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" margin-bottom=8 { (query) }
+            }
+            @for (index, result) in results.iter().take(10).enumerate() {
+                @if let Some(result) = result.as_object() {
+                    div border-top="1, #30363d" padding-top=8 margin-top=8 {
+                        div color="#58a6ff" font-size=12 margin-bottom=2 { (format!("{}.", index + 1)) }
+                        @if let Some(title) = result.get("title").and_then(serde_json::Value::as_str) {
+                            div color="#f0f6fc" white-space="preserve-wrap" { (title) }
+                        }
+                        @if let Some(url) = result.get("url").and_then(serde_json::Value::as_str) {
+                            div color="#8b949e" font-size=12 font-family="monospace" white-space="preserve-wrap" margin-top=2 { (url) }
+                        }
+                        @if let Some(snippet) = result.get("snippet").and_then(serde_json::Value::as_str) {
+                            div color="#c9d1d9" font-size=12 white-space="preserve-wrap" margin-top=4 { (snippet) }
+                        }
+                    }
+                }
+            }
+            @if results.len() > 10 {
+                div color="#8b949e" font-size=12 margin-top=8 { "… " ((results.len() - 10).to_string()) " more results" }
+            }
+            @if partial == Some(true) {
+                div color="#f2cc60" font-size=12 margin-top=8 { "partial results" }
+            }
+            @if let Some(message) = message {
+                div color="#8b949e" font-size=12 margin-top=4 white-space="preserve-wrap" { (message) }
+            }
+        }
+    })
+}
+
+fn render_web_fetch_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let url = metadata
+        .get("final_url")
+        .or_else(|| metadata.get("url"))
+        .and_then(serde_json::Value::as_str)?;
+    let title = metadata.get("title").and_then(serde_json::Value::as_str);
+    let status = metadata.get("status").and_then(serde_json::Value::as_u64);
+    let content_type = metadata
+        .get("content_type")
+        .and_then(serde_json::Value::as_str);
+    let content_format = metadata
+        .get("content_format")
+        .and_then(serde_json::Value::as_str);
+    let rendered = metadata
+        .get("rendered")
+        .and_then(serde_json::Value::as_bool);
+    let truncated = metadata
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool);
+    let preview = metadata
+        .get("markdown")
+        .or_else(|| metadata.get("text"))
+        .and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Fetched page")) }
+            @if let Some(title) = title {
+                div color="#f0f6fc" white-space="preserve-wrap" margin-bottom=4 { (title) }
+            }
+            div color="#8b949e" font-size=12 font-family="monospace" white-space="preserve-wrap" margin-bottom=8 { (url) }
+            @if let Some(status) = status {
+                div color="#8b949e" font-size=12 margin-top=4 { "status: " (status.to_string()) }
+            }
+            @if let Some(content_type) = content_type {
+                div color="#8b949e" font-size=12 margin-top=4 { "type: " (content_type) }
+            }
+            @if let Some(content_format) = content_format {
+                div color="#8b949e" font-size=12 margin-top=4 { "format: " (content_format) }
+            }
+            @if let Some(rendered) = rendered {
+                div color="#8b949e" font-size=12 margin-top=4 { "rendered: " (rendered.to_string()) }
+            }
+            @if let Some(truncated) = truncated {
+                div color="#8b949e" font-size=12 margin-top=4 { "truncated: " (truncated.to_string()) }
+            }
+            @if let Some(preview) = preview {
+                div color="#c9d1d9" font-size=12 white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { (preview) }
+            }
+        }
+    })
+}
+
+fn render_worktree_list_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let worktrees = artifact
+        .artifact
+        .metadata
+        .get("worktrees")
+        .or_else(|| artifact.artifact.metadata.get("entries"))
+        .and_then(serde_json::Value::as_array)?;
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Worktrees"), worktrees.len())) }
+            @for worktree in worktrees.iter().take(20) {
+                @if let Some(worktree) = worktree.as_object() {
+                    div border-top="1, #30363d" padding-top=6 margin-top=6 {
+                        @if let Some(path) = worktree.get("path").and_then(serde_json::Value::as_str) {
+                            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+                        }
+                        @if let Some(branch) = worktree.get("branch").and_then(serde_json::Value::as_str) {
+                            div color="#8b949e" font-size=12 margin-top=2 { "branch: " (branch) }
+                        }
+                        @if let Some(commit) = worktree.get("commit").and_then(serde_json::Value::as_str) {
+                            div color="#8b949e" font-size=12 margin-top=2 { "commit: " (commit) }
+                        }
+                        @if let Some(is_main) = worktree.get("is_main").and_then(serde_json::Value::as_bool) {
+                            div color="#8b949e" font-size=12 margin-top=2 { "main: " (is_main.to_string()) }
+                        }
+                    }
+                }
+            }
+            @if worktrees.len() > 20 {
+                div color="#8b949e" font-size=12 margin-top=8 { "… " ((worktrees.len() - 20).to_string()) " more worktrees" }
+            }
+        }
+    })
+}
+
+fn render_worktree_create_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let metadata = &artifact.artifact.metadata;
+    let path = metadata.get("path").and_then(serde_json::Value::as_str)?;
+    let repo_root = metadata
+        .get("repo_root")
+        .and_then(serde_json::Value::as_str);
+    let branch = metadata.get("branch").and_then(serde_json::Value::as_str);
+    let created_branch = metadata
+        .get("created_branch")
+        .and_then(serde_json::Value::as_bool);
+    let setup_applied = metadata
+        .get("setup_applied")
+        .and_then(serde_json::Value::as_bool);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Worktree created")) }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(repo_root) = repo_root { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "repo: " (repo_root) } }
+            @if let Some(branch) = branch { div color="#8b949e" font-size=12 margin-top=4 { "branch: " (branch) } }
+            @if let Some(created_branch) = created_branch { div color="#8b949e" font-size=12 margin-top=4 { "created branch: " (created_branch.to_string()) } }
+            @if let Some(setup_applied) = setup_applied { div color="#8b949e" font-size=12 margin-top=4 { "setup applied: " (setup_applied.to_string()) } }
+        }
+    })
+}
+
+fn render_worktree_remove_result(artifact: &ToolArtifactView) -> Option<Containers> {
+    let path = artifact
+        .artifact
+        .metadata
+        .get("path")
+        .and_then(serde_json::Value::as_str)?;
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Worktree removed")) }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+        }
+    })
 }
 
 fn render_plugin_visual(title: &str, visual: &PluginVisualView) -> Containers {
@@ -872,6 +1560,211 @@ fn render_filesystem_change(visual: &PluginVisualView) -> Option<Containers> {
     })
 }
 
+fn render_vim_edit_request(visual: &PluginVisualView) -> Option<Containers> {
+    let arguments = visual
+        .descriptor
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let single_path = arguments.get("path").and_then(serde_json::Value::as_str);
+    let files = arguments.get("files").and_then(serde_json::Value::as_array);
+    let steps = arguments.get("steps").and_then(serde_json::Value::as_array);
+    let sandbox = arguments.get("sandbox").and_then(serde_json::Value::as_str);
+    let timeout_ms = arguments
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64);
+    if single_path.is_none() && files.is_none() {
+        return None;
+    }
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { (visual.descriptor.title.as_deref().unwrap_or("Vim edit")) }
+            @if let Some(path) = single_path {
+                div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+                @if let Some(steps) = steps {
+                    div color="#8b949e" font-size=12 margin-top=4 { "steps: " (steps.len().to_string()) }
+                }
+            }
+            @if let Some(files) = files {
+                @for file in files.iter().take(10) {
+                    @if let Some(file) = file.as_object() {
+                        div border-top="1, #30363d" padding-top=6 margin-top=6 {
+                            @if let Some(path) = file.get("path").and_then(serde_json::Value::as_str) {
+                                span color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+                            }
+                            @if let Some(steps) = file.get("steps").and_then(serde_json::Value::as_array) {
+                                span color="#8b949e" { " · steps: " (steps.len().to_string()) }
+                            }
+                        }
+                    }
+                }
+                @if files.len() > 10 {
+                    div color="#8b949e" font-size=12 margin-top=8 { "… " ((files.len() - 10).to_string()) " more files" }
+                }
+            }
+            @if let Some(sandbox) = sandbox { div color="#8b949e" font-size=12 margin-top=4 { "sandbox: " (sandbox) } }
+            @if let Some(timeout_ms) = timeout_ms { div color="#8b949e" font-size=12 margin-top=4 { "timeout: " (timeout_ms.to_string()) " ms" } }
+        }
+    })
+}
+
+fn render_git_clone_request(visual: &PluginVisualView) -> Option<Containers> {
+    let arguments = visual
+        .descriptor
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let url = arguments.get("url")?.as_str()?;
+    let reference = arguments
+        .get("ref")
+        .or_else(|| arguments.get("branch"))
+        .and_then(serde_json::Value::as_str);
+    let destination = arguments
+        .get("destination")
+        .and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 { "Clone repository" }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (url) }
+            @if let Some(reference) = reference { div color="#8b949e" font-size=12 margin-top=4 { "ref: " (reference) } }
+            @if let Some(destination) = destination { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "destination: " (destination) } }
+        }
+    })
+}
+
+fn render_worktree_request(visual: &PluginVisualView) -> Option<Containers> {
+    let arguments = visual
+        .descriptor
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let operation = arguments
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("worktree");
+    let primary_path = arguments
+        .get("path")
+        .or_else(|| arguments.get("name"))
+        .and_then(serde_json::Value::as_str)?;
+    let cwd = arguments.get("cwd").and_then(serde_json::Value::as_str);
+    let branch = arguments
+        .get("branch")
+        .or_else(|| arguments.get("new_branch"))
+        .and_then(serde_json::Value::as_str);
+    let base_ref = arguments
+        .get("base_ref")
+        .and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div direction=row gap=8 align-items=center margin-bottom=6 {
+                span color="#58a6ff" { (operation) }
+                span color="#8b949e" { "worktree" }
+            }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (primary_path) }
+            @if let Some(cwd) = cwd { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "cwd: " (cwd) } }
+            @if let Some(branch) = branch { div color="#8b949e" font-size=12 margin-top=4 { "branch: " (branch) } }
+            @if let Some(base_ref) = base_ref { div color="#8b949e" font-size=12 margin-top=4 { "base ref: " (base_ref) } }
+            @for key in ["detach", "force", "no_setup"] {
+                @if let Some(value) = arguments.get(key).and_then(serde_json::Value::as_bool) {
+                    div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value.to_string()) }
+                }
+            }
+        }
+    })
+}
+
+fn render_web_search_request(visual: &PluginVisualView) -> Option<Containers> {
+    let arguments = visual
+        .descriptor
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let query = arguments.get("query")?.as_str()?;
+    let provider = arguments
+        .get("provider")
+        .and_then(serde_json::Value::as_str);
+    let site = arguments.get("site").and_then(serde_json::Value::as_str);
+    let freshness = arguments
+        .get("freshness")
+        .and_then(serde_json::Value::as_str);
+    let region = arguments.get("region").and_then(serde_json::Value::as_str);
+    let safe_search = arguments
+        .get("safe_search")
+        .and_then(serde_json::Value::as_str);
+    let max_results = arguments
+        .get("max_results")
+        .and_then(serde_json::Value::as_u64);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div direction=row gap=8 align-items=center margin-bottom=6 {
+                span color="#58a6ff" { "Web search" }
+                @if let Some(provider) = provider {
+                    span color="#8b949e" { (provider) }
+                }
+            }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (query) }
+            @if let Some(site) = site {
+                div color="#8b949e" font-size=12 margin-top=4 { "site: " (site) }
+            }
+            @if let Some(freshness) = freshness {
+                div color="#8b949e" font-size=12 margin-top=4 { "freshness: " (freshness) }
+            }
+            @if let Some(region) = region {
+                div color="#8b949e" font-size=12 margin-top=4 { "region: " (region) }
+            }
+            @if let Some(safe_search) = safe_search {
+                div color="#8b949e" font-size=12 margin-top=4 { "safe search: " (safe_search) }
+            }
+            @if let Some(max_results) = max_results {
+                div color="#8b949e" font-size=12 margin-top=4 { "max results: " (max_results.to_string()) }
+            }
+        }
+    })
+}
+
+fn render_web_fetch_request(visual: &PluginVisualView) -> Option<Containers> {
+    let arguments = visual
+        .descriptor
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let url = arguments.get("url")?.as_str()?;
+    let provider = arguments
+        .get("provider")
+        .and_then(serde_json::Value::as_str);
+    let render = arguments.get("render").and_then(serde_json::Value::as_bool);
+    let max_bytes = arguments
+        .get("max_bytes")
+        .and_then(serde_json::Value::as_u64);
+    let timeout_ms = arguments
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64);
+    let prompt = arguments.get("prompt").and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div direction=row gap=8 align-items=center margin-bottom=6 {
+                span color="#58a6ff" { "Fetch page" }
+                @if let Some(provider) = provider {
+                    span color="#8b949e" { (provider) }
+                }
+            }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (url) }
+            @if let Some(render) = render {
+                div color="#8b949e" font-size=12 margin-top=4 { "rendered browser fetch: " (render.to_string()) }
+            }
+            @if let Some(max_bytes) = max_bytes {
+                div color="#8b949e" font-size=12 margin-top=4 { "max bytes: " (max_bytes.to_string()) }
+            }
+            @if let Some(timeout_ms) = timeout_ms {
+                div color="#8b949e" font-size=12 margin-top=4 { "timeout: " (timeout_ms.to_string()) " ms" }
+            }
+            @if let Some(prompt) = prompt {
+                div color="#8b949e" font-size=12 margin-top=4 white-space="preserve-wrap" { "prompt: " (prompt) }
+            }
+        }
+    })
+}
+
 fn render_shell_request(visual: &PluginVisualView) -> Option<Containers> {
     let payload = &visual.descriptor.payload;
     let arguments = payload.get("arguments").unwrap_or(payload);
@@ -909,10 +1802,18 @@ const fn item_label(kind: &TranscriptViewItemKind) -> &'static str {
         TranscriptViewItemKind::AssistantMessage { .. } => "assistant",
         TranscriptViewItemKind::ReasoningMessage { .. } => "reasoning",
         TranscriptViewItemKind::ToolInvocation { .. } => "tool",
+        TranscriptViewItemKind::ToolRequest { .. } => "tool request",
         TranscriptViewItemKind::Permission { .. } => "permission",
         TranscriptViewItemKind::RuntimeWork { .. } => "runtime work",
         TranscriptViewItemKind::Usage { .. } => "usage",
+        TranscriptViewItemKind::Compaction { .. } => "compaction",
         TranscriptViewItemKind::Interaction { .. } => "interaction",
+        TranscriptViewItemKind::Skill { skill } => match skill.status {
+            bcode_session_view_models::SkillViewStatus::ContextLoaded => "skill context",
+            bcode_session_view_models::SkillViewStatus::Failed => "skill error",
+            bcode_session_view_models::SkillViewStatus::Invoked
+            | bcode_session_view_models::SkillViewStatus::Suggested => "skill",
+        },
         TranscriptViewItemKind::SystemMessage { .. } => "system",
         TranscriptViewItemKind::PluginVisual { .. } => "plugin visual",
         TranscriptViewItemKind::ToolContribution { .. } => "tool contribution",
@@ -932,9 +1833,9 @@ mod tests {
     use super::*;
     use bcode_session_models::{PluginVisualDescriptor, RuntimeWorkStatus, ToolArtifact, WorkId};
     use bcode_session_view_models::{
-        ChatMessageView, PermissionBatchView, PermissionView, RuntimeWorkView, ToolArtifactView,
-        ToolInvocationView, ToolResultView, ToolTimingView, TranscriptViewItem,
-        TranscriptViewItemId,
+        ChatMessageView, CompactionView, CompactionViewStatus, PermissionBatchView, PermissionView,
+        RuntimeWorkView, SkillView, SkillViewStatus, ToolArtifactView, ToolInvocationView,
+        ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
     };
 
     #[test]
@@ -952,6 +1853,65 @@ mod tests {
 
         assert!(!should_render_transcript_item(&item, false));
         assert!(should_render_transcript_item(&item, true));
+    }
+
+    #[test]
+    fn skill_transcript_item_renders_semantic_label_and_text() {
+        let item = TranscriptViewItem {
+            id: TranscriptViewItemId::new("skill:test"),
+            sequence: Some(1),
+            timestamp_ms: None,
+            revision: 1,
+            streaming: false,
+            kind: TranscriptViewItemKind::Skill {
+                skill: SkillView {
+                    skill_id: "review".to_owned(),
+                    status: SkillViewStatus::Failed,
+                    text: "review: boom".to_owned(),
+                },
+            },
+        };
+
+        assert_eq!(item_label(&item.kind), "skill error");
+        let rendered = format!("{:?}", transcript_item(&item));
+        assert!(rendered.contains("review: boom"));
+
+        let context_item = TranscriptViewItem {
+            id: TranscriptViewItemId::new("skill:context"),
+            sequence: Some(2),
+            timestamp_ms: None,
+            revision: 1,
+            streaming: false,
+            kind: TranscriptViewItemKind::Skill {
+                skill: SkillView {
+                    skill_id: "review".to_owned(),
+                    status: SkillViewStatus::ContextLoaded,
+                    text: "loaded review".to_owned(),
+                },
+            },
+        };
+        assert_eq!(item_label(&context_item.kind), "skill context");
+        let rendered = format!("{:?}", transcript_item(&context_item));
+        assert!(rendered.contains("loaded review"));
+
+        let compaction_item = TranscriptViewItem {
+            id: TranscriptViewItemId::new("compaction:test"),
+            sequence: Some(3),
+            timestamp_ms: None,
+            revision: 1,
+            streaming: false,
+            kind: TranscriptViewItemKind::Compaction {
+                compaction: CompactionView {
+                    status: CompactionViewStatus::Local,
+                    text: "local context compaction: summary".to_owned(),
+                    provider_plugin_id: None,
+                    model_id: None,
+                },
+            },
+        };
+        assert_eq!(item_label(&compaction_item.kind), "compaction");
+        let rendered = format!("{:?}", transcript_item(&compaction_item));
+        assert!(rendered.contains("local context compaction: summary"));
     }
 
     #[test]
@@ -1357,12 +2317,415 @@ mod tests {
         }
     }
 
-    fn visual_adapter_fixture_payload(schema: &str) -> serde_json::Value {
-        if schema == "bcode.tool.request.shell.run" {
-            serde_json::json!({"command": "echo fixture", "cwd": "/tmp"})
-        } else {
-            serde_json::json!({"operation": "fixture", "path": "/tmp/fixture"})
+    #[test]
+    fn every_registered_artifact_adapter_has_a_fixture() {
+        for ((schema, schema_version), adapter) in ARTIFACT_ADAPTERS.iter() {
+            let artifact = ToolArtifactView::from(ToolArtifact {
+                artifact_id: format!("fixture:{schema}:{schema_version}"),
+                producer_plugin_id: "fixture-plugin".to_owned(),
+                schema: (*schema).to_owned(),
+                schema_version: *schema_version,
+                tool_call_id: Some("fixture-call".to_owned()),
+                title: Some(format!("Fixture {schema}")),
+                metadata: artifact_adapter_fixture_metadata(schema),
+                refs: Vec::new(),
+            });
+            assert!(
+                adapter(&artifact).is_some(),
+                "artifact adapter fixture did not render {schema}@{schema_version}"
+            );
+            let rendered = format!(
+                "{:?}",
+                render_tool_result(&ToolResultView::Artifact { artifact })
+            );
+            assert!(rendered.contains(schema));
+            assert!(rendered.contains("fixture"));
         }
+    }
+
+    fn artifact_adapter_fixture_metadata(schema: &str) -> serde_json::Value {
+        document_artifact_fixture(schema)
+            .or_else(|| filesystem_artifact_fixture(schema))
+            .or_else(|| ocr_artifact_fixture(schema))
+            .or_else(|| web_and_worktree_artifact_fixture(schema))
+            .unwrap_or_else(|| serde_json::json!({"fixture": true}))
+    }
+
+    fn document_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
+        match schema {
+            "bcode.document.extract_result" => Some(serde_json::json!({
+                "source": "file:///tmp/fixture.pdf",
+                "content_type": "application/pdf",
+                "artifact_kind": "document",
+                "artifact_scope": "session",
+                "document_path": "/tmp/fixture.pdf",
+                "text_path": "/tmp/fixture.txt",
+                "text": "fixture document text",
+                "truncated": false,
+                "extractor": "native"
+            })),
+            "bcode.document.status" => Some(serde_json::json!({
+                "extract": {
+                    "available": true,
+                    "extractors": [{
+                        "name": "fixture-extractor",
+                        "available": true,
+                        "quality": "fixture-quality"
+                    }],
+                    "configured_order": ["fixture-extractor"]
+                }
+            })),
+            _ => None,
+        }
+    }
+
+    fn filesystem_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
+        match schema {
+            "bcode.filesystem.read" => Some(serde_json::json!({
+                "contents": "fixture file contents"
+            })),
+            "bcode.filesystem.image" => Some(serde_json::json!({
+                "path": "/tmp/fixture.png",
+                "mime_type": "image/png",
+                "width": 640,
+                "height": 480,
+                "byte_len": 1024
+            })),
+            "bcode.filesystem.change" => Some(serde_json::json!({
+                "tool_name": "filesystem.edit",
+                "summary": "fixture change",
+                "path": "/tmp/fixture.txt",
+                "old_text": "old fixture",
+                "new_text": "new fixture",
+                "start_line": 1
+            })),
+            "bcode.filesystem.exists" => Some(serde_json::json!({
+                "exists": true
+            })),
+            "bcode.filesystem.list" => Some(serde_json::json!({
+                "entries": [{"path": "/tmp/fixture.txt", "kind": "file"}],
+                "backend": "fixture-backend",
+                "timed_out": false,
+                "partial": false,
+                "visited_entries": 1,
+                "message": "fixture message"
+            })),
+            "bcode.filesystem.find" => Some(serde_json::json!({
+                "paths": ["/tmp/fixture.txt"],
+                "backend": "fixture-backend",
+                "timed_out": false,
+                "partial": false,
+                "visited_entries": 1,
+                "message": "fixture message"
+            })),
+            "bcode.filesystem.grep" => Some(serde_json::json!({
+                "matches": [{"path": "/tmp/fixture.txt", "line_number": 1, "line": "fixture match"}],
+                "backend": "fixture-backend",
+                "timed_out": false,
+                "partial": false,
+                "visited_entries": 1,
+                "message": "fixture message"
+            })),
+            "bcode.filesystem.stat" => Some(serde_json::json!({
+                "exists": true,
+                "kind": "file",
+                "len": 128
+            })),
+            _ => filesystem_artifact_file_fixture(schema),
+        }
+    }
+
+    fn filesystem_artifact_file_fixture(schema: &str) -> Option<serde_json::Value> {
+        match schema {
+            "bcode.filesystem.artifact.metadata" => Some(serde_json::json!({
+                "path": "/tmp/fixture-artifact.json",
+                "exists": true,
+                "kind": "file",
+                "byte_len": 128,
+                "content_type": "application/json",
+                "complete": true,
+                "message": "fixture message"
+            })),
+            "bcode.filesystem.artifact.read" => Some(serde_json::json!({
+                "path": "/tmp/fixture-artifact.json",
+                "offset_bytes": 0,
+                "returned_bytes": 16,
+                "total_bytes": 16,
+                "from_end": false,
+                "truncated": false,
+                "contents": "fixture artifact"
+            })),
+            "bcode.filesystem.artifact.grep" => Some(serde_json::json!({
+                "path": "/tmp/fixture-artifact.json",
+                "matches": [{"path": "/tmp/fixture-artifact.json", "line_number": 1, "line": "fixture artifact match"}],
+                "total_bytes": 128,
+                "partial": false,
+                "message": "fixture message"
+            })),
+            _ => None,
+        }
+    }
+
+    fn ocr_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
+        match schema {
+            "bcode.ocr.extract_result" => Some(serde_json::json!({
+                "text": "fixture OCR text",
+                "source": {
+                    "path": "/tmp/fixture.png",
+                    "url": null
+                },
+                "engine": "tesseract",
+                "language": "eng",
+                "truncated": false,
+                "text_bytes": 16,
+                "full_text_bytes": 16
+            })),
+            "bcode.ocr.status" => Some(serde_json::json!({
+                "extract": {
+                    "available": true,
+                    "default_engine": "tesseract",
+                    "engines": [{
+                        "name": "tesseract",
+                        "available": true,
+                        "version": "fixture-version",
+                        "quality": "fixture-quality"
+                    }]
+                }
+            })),
+            _ => None,
+        }
+    }
+
+    fn web_and_worktree_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
+        match schema {
+            "bcode.git.clone_result" => Some(serde_json::json!({
+                "host": "github.com",
+                "owner": "fixture-owner",
+                "repo": "fixture-repo",
+                "clone_url": "https://github.com/fixture-owner/fixture-repo.git",
+                "path": "/tmp/fixture-repo",
+                "already_exists": false
+            })),
+            "bcode.web-search.search_results" => Some(serde_json::json!({
+                "query": "fixture search",
+                "provider": "fixture-provider",
+                "results": [{
+                    "title": "fixture result",
+                    "url": "https://example.com/fixture",
+                    "snippet": "fixture snippet"
+                }],
+                "partial": false,
+                "message": "fixture message"
+            })),
+            "bcode.web-search.fetch_result" => Some(serde_json::json!({
+                "url": "https://example.com/fixture",
+                "final_url": "https://example.com/fixture-final",
+                "status": 200,
+                "title": "fixture page",
+                "content_type": "text/html",
+                "content_format": "markdown",
+                "rendered": true,
+                "truncated": false,
+                "markdown": "fixture body"
+            })),
+            _ => worktree_artifact_fixture(schema),
+        }
+    }
+
+    fn worktree_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
+        match schema {
+            "bcode.worktree.list" => Some(serde_json::json!({
+                "main_root": "/tmp/fixture-repo",
+                "worktrees": [{
+                    "path": "/tmp/fixture-worktree",
+                    "is_main": false,
+                    "branch": "fixture-branch",
+                    "commit": "abc1234"
+                }]
+            })),
+            "bcode.worktree.create_result" => Some(serde_json::json!({
+                "repo_root": "/tmp/fixture-repo",
+                "path": "/tmp/fixture-worktree",
+                "branch": "fixture-branch",
+                "created_branch": true,
+                "setup_applied": false
+            })),
+            "bcode.worktree.remove_result" => Some(serde_json::json!({
+                "path": "/tmp/fixture-worktree"
+            })),
+            _ => None,
+        }
+    }
+
+    fn visual_adapter_fixture_payload(schema: &str) -> serde_json::Value {
+        match schema {
+            "bcode.tool.request.shell.run" => {
+                serde_json::json!({"command": "echo fixture", "cwd": "/tmp"})
+            }
+            "bcode.web-search.search_request" => serde_json::json!({
+                "arguments": {
+                    "query": "fixture query",
+                    "provider": "fixture-provider",
+                    "site": "example.com"
+                }
+            }),
+            "bcode.web-search.fetch_request" => serde_json::json!({
+                "arguments": {
+                    "url": "https://example.com/fixture",
+                    "provider": "fixture-provider",
+                    "render": true
+                }
+            }),
+            "bcode.git.clone_request" => serde_json::json!({
+                "arguments": {
+                    "url": "https://github.com/fixture-owner/fixture-repo.git",
+                    "ref": "main",
+                    "destination": "/tmp/fixture-repo"
+                }
+            }),
+            "bcode.worktree.request" => serde_json::json!({
+                "arguments": {
+                    "operation": "create",
+                    "path": "/tmp/fixture-worktree",
+                    "branch": "fixture-branch",
+                    "base_ref": "head"
+                }
+            }),
+            "bcode.vim-edit.request.preview" | "bcode.vim-edit.request.apply" => {
+                serde_json::json!({
+                    "arguments": {
+                        "path": "/tmp/fixture.txt",
+                        "steps": [{"keys": "ifixture<Esc>"}],
+                        "sandbox": "default",
+                        "timeout_ms": 1000
+                    }
+                })
+            }
+            _ => serde_json::json!({"operation": "fixture", "path": "/tmp/fixture"}),
+        }
+    }
+
+    #[test]
+    fn web_search_request_adapter_renders_query_options_and_fallback() {
+        let visual = PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: Some("web-search-1".to_owned()),
+            producer_plugin_id: Some("bcode.web-search".to_owned()),
+            schema: "bcode.web-search.search_request".to_owned(),
+            schema_version: 1,
+            title: Some("Web search".to_owned()),
+            subtitle: None,
+            payload: serde_json::json!({
+                "arguments": {
+                    "query": "renderer neutral app",
+                    "provider": "brave",
+                    "site": "example.com",
+                    "freshness": "week",
+                    "region": "us",
+                    "safe_search": "moderate",
+                    "max_results": 5
+                }
+            }),
+        });
+
+        let rendered = format!("{:?}", render_plugin_visual("plugin visual", &visual));
+        assert!(rendered.contains("renderer neutral app"));
+        assert!(rendered.contains("brave"));
+        assert!(rendered.contains("example.com"));
+        assert!(rendered.contains("max results"));
+        assert!(rendered.contains("bcode.web-search.search_request"));
+    }
+
+    #[test]
+    fn web_fetch_request_adapter_renders_url_options_and_fallback() {
+        let visual = PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: Some("web-fetch-1".to_owned()),
+            producer_plugin_id: Some("bcode.web-search".to_owned()),
+            schema: "bcode.web-search.fetch_request".to_owned(),
+            schema_version: 1,
+            title: Some("Fetch page".to_owned()),
+            subtitle: None,
+            payload: serde_json::json!({
+                "arguments": {
+                    "url": "https://example.com/page",
+                    "provider": "rendered",
+                    "render": true,
+                    "max_bytes": 4096,
+                    "timeout_ms": 1000,
+                    "prompt": "extract summary"
+                }
+            }),
+        });
+
+        let rendered = format!("{:?}", render_plugin_visual("plugin visual", &visual));
+        assert!(rendered.contains("https://example.com/page"));
+        assert!(rendered.contains("rendered"));
+        assert!(rendered.contains("max bytes"));
+        assert!(rendered.contains("extract summary"));
+        assert!(rendered.contains("bcode.web-search.fetch_request"));
+    }
+
+    #[test]
+    fn web_search_result_adapter_renders_results_and_semantic_fallback() {
+        let artifact = ToolArtifactView::from(ToolArtifact {
+            artifact_id: "web-search-result".to_owned(),
+            producer_plugin_id: "bcode.web-search".to_owned(),
+            schema: "bcode.web-search.search_results".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some("call-web-search".to_owned()),
+            title: Some("Search results".to_owned()),
+            metadata: serde_json::json!({
+                "query": "rust tui web renderer",
+                "provider": "brave",
+                "results": [{
+                    "title": "Renderer Neutral",
+                    "url": "https://example.com/renderer",
+                    "snippet": "A renderer-neutral search result"
+                }],
+                "partial": false,
+                "message": "ok"
+            }),
+            refs: Vec::new(),
+        });
+        let result = ToolResultView::Artifact { artifact };
+
+        let rendered = format!("{:?}", render_tool_result(&result));
+        assert!(rendered.contains("rust tui web renderer"));
+        assert!(rendered.contains("Renderer Neutral"));
+        assert!(rendered.contains("https://example.com/renderer"));
+        assert!(rendered.contains("semantic result"));
+        assert!(rendered.contains("bcode.web-search.search_results"));
+    }
+
+    #[test]
+    fn web_fetch_result_adapter_renders_metadata_preview_and_semantic_fallback() {
+        let artifact = ToolArtifactView::from(ToolArtifact {
+            artifact_id: "web-fetch-result".to_owned(),
+            producer_plugin_id: "bcode.web-search".to_owned(),
+            schema: "bcode.web-search.fetch_result".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some("call-web-fetch".to_owned()),
+            title: Some("Fetched page".to_owned()),
+            metadata: serde_json::json!({
+                "url": "https://example.com/original",
+                "final_url": "https://example.com/final",
+                "status": 200,
+                "title": "Example page",
+                "content_type": "text/html",
+                "content_format": "markdown",
+                "rendered": true,
+                "truncated": false,
+                "markdown": "# Sentinel preview"
+            }),
+            refs: Vec::new(),
+        });
+        let result = ToolResultView::Artifact { artifact };
+
+        let rendered = format!("{:?}", render_tool_result(&result));
+        assert!(rendered.contains("Example page"));
+        assert!(rendered.contains("https://example.com/final"));
+        assert!(rendered.contains("Sentinel preview"));
+        assert!(rendered.contains("semantic result"));
+        assert!(rendered.contains("bcode.web-search.fetch_result"));
     }
 
     #[test]
