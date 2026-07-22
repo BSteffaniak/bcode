@@ -58,9 +58,16 @@ if [[ "$native_search_implementations" != "$expected_native_search_implementatio
   exit 1
 fi
 
-count="$(grep -c 'OP_NATIVE_WEB_SEARCH,' packages/server/src/lib.rs)"
-if [[ "$count" != "2" ]]; then
-  echo "expected one server provider-interface native search route plus its import, found $count references" >&2
+if sed -n '1,19720p' packages/server/src/lib.rs | rg -n 'OP_NATIVE_WEB_SEARCH|NativeWebSearch(Request|Response)|model.native|model_native' \
+  >/tmp/bcode-server-native-search-production.txt; then
+  echo "server production routing must remain opaque to provider-native web search" >&2
+  cat /tmp/bcode-server-native-search-production.txt >&2
+  exit 1
+fi
+
+if ! grep -F 'invocation_operations = ["native_web_search"]' plugins/fake-provider-plugin/bcode-plugin.toml >/dev/null ||
+   ! grep -F 'invocation_operations = ["native_web_search"]' plugins/openai-compatible-provider-plugin/bcode-plugin.toml >/dev/null; then
+  echo "provider-native invocation service exports must remain manifest-declared" >&2
   exit 1
 fi
 

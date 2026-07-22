@@ -4,6 +4,13 @@
 //! that may interpret shell artifact schemas and terminal recording references; generic TUI and
 //! transcript code routes opaque plugin visuals without understanding those values.
 
+#[cfg(test)]
+use crate::contracts::SHELL_RECORDING_CONTENT_TYPE;
+use crate::contracts::{
+    SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_MEDIA_TYPE, SHELL_RECORDING_REF_KEY,
+    SHELL_RUN_SCHEMA, SHELL_SCHEMA_VERSION, ShellInvocationAction,
+    TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
+};
 use bcode_tui_components::terminal_viewer::{
     MAX_INLINE_TERMINAL_ROWS, TerminalViewerInput, TerminalViewerLiveState, TerminalViewerSizing,
     terminal_viewer_rows,
@@ -21,10 +28,6 @@ use std::sync::Mutex;
 
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
-const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
-const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str = "application/x-bcode-terminal-pty-stream";
-const SHELL_RECORDING_REF_KEY: &str = "shell_recording";
-const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording";
 
 #[derive(Default)]
 struct LiveTerminalReplay {
@@ -60,7 +63,7 @@ pub struct ShellRunTuiVisualAdapter {
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
     fn supports(&self, kind: &str) -> bool {
-        matches!(kind, "bcode.shell.run" | "bcode.tool.request.shell.run")
+        matches!(kind, SHELL_RUN_SCHEMA | "bcode.tool.request.shell.run")
     }
 
     fn render_mode(
@@ -68,7 +71,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         kind: &str,
         _payload: &serde_json::Value,
     ) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderMode {
-        if matches!(kind, "bcode.shell.run" | "bcode.tool.request.shell.run") {
+        if matches!(kind, SHELL_RUN_SCHEMA | "bcode.tool.request.shell.run") {
             bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
         } else {
             bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::Inline
@@ -112,13 +115,13 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             input_id: format!("{invocation_id}-input-{input_sequence}"),
             invocation_id: invocation_id.to_owned(),
             producer_id: "bcode.shell".to_owned(),
-            schema: "bcode.shell.invocation-input".to_owned(),
-            schema_version: 1,
-            payload: serde_json::json!({
-                "type": "resize",
-                "columns": size.width,
-                "rows": size.height,
-            }),
+            schema: SHELL_INVOCATION_INPUT_SCHEMA.to_owned(),
+            schema_version: SHELL_SCHEMA_VERSION,
+            payload: serde_json::to_value(ShellInvocationAction::Resize {
+                columns: size.width,
+                rows: size.height,
+            })
+            .unwrap_or(serde_json::Value::Null),
         })
     }
 
@@ -131,7 +134,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         self.supports(kind)
             && reference_key == SHELL_RECORDING_REF_KEY
             && content_type
-                .is_some_and(|content_type| content_type.starts_with(SHELL_RECORDING_CONTENT_TYPE))
+                .is_some_and(|content_type| content_type.starts_with(SHELL_RECORDING_MEDIA_TYPE))
     }
 
     fn artifact_chunk(
@@ -220,7 +223,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         if kind == "bcode.tool.request.shell.run" {
             return self.shell_request_rows(payload, width, context);
         }
-        if kind == "bcode.shell.run"
+        if kind == SHELL_RUN_SCHEMA
             && let Some(key) = payload
                 .get("_bcode_runtime")
                 .and_then(|runtime| runtime.get("live_state_key"))
@@ -1076,7 +1079,7 @@ fn terminal_replay_ref(payload: &serde_json::Value) -> Option<&serde_json::Value
                     .get("content_type")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|content_type| {
-                        content_type.starts_with(SHELL_RECORDING_CONTENT_TYPE)
+                        content_type.starts_with(SHELL_RECORDING_MEDIA_TYPE)
                     })
         })
         .or_else(|| {
@@ -1133,7 +1136,7 @@ mod tests {
                 reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
                 producer_plugin_id: "bcode.shell".to_owned(),
                 schema: "bcode.tool.request.shell.run".to_owned(),
-                schema_version: 1,
+                schema_version: SHELL_SCHEMA_VERSION,
                 content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
                 offset: u64::try_from(offset).expect("offset"),
                 total_bytes: u64::try_from(all_bytes.len()).expect("length"),
@@ -1158,7 +1161,7 @@ mod tests {
         });
         bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
             adapter,
-            "bcode.shell.run",
+            SHELL_RUN_SCHEMA,
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
                 80,
@@ -1238,7 +1241,7 @@ mod tests {
                     reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
                     producer_plugin_id: "bcode.shell".to_owned(),
                     schema: "bcode.tool.request.shell.run".to_owned(),
-                    schema_version: 1,
+                    schema_version: SHELL_SCHEMA_VERSION,
                     content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
                     offset: u64::try_from(offset).expect("offset"),
                     total_bytes: u64::try_from(bytes.len()).expect("length"),
@@ -1278,7 +1281,7 @@ mod tests {
                 reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
                 producer_plugin_id: "bcode.shell".to_owned(),
                 schema: "bcode.tool.request.shell.run".to_owned(),
-                schema_version: 1,
+                schema_version: SHELL_SCHEMA_VERSION,
                 content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
                 offset: 0,
                 total_bytes: u64::try_from(bytes.len()).expect("length"),
@@ -1334,7 +1337,7 @@ mod tests {
         });
         let final_rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
             &adapter,
-            "bcode.shell.run",
+            SHELL_RUN_SCHEMA,
             &final_payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
                 80,
@@ -1494,8 +1497,8 @@ mod tests {
                 invocation_id: "shell-call".to_owned(),
                 input_id: "shell-call-input-0".to_owned(),
                 producer_id: "bcode.shell".to_owned(),
-                schema: "bcode.shell.invocation-input".to_owned(),
-                schema_version: 1,
+                schema: SHELL_INVOCATION_INPUT_SCHEMA.to_owned(),
+                schema_version: SHELL_SCHEMA_VERSION,
                 payload: serde_json::json!({
                     "type": "resize",
                     "columns": 132,
@@ -1594,7 +1597,7 @@ mod tests {
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
             &ShellRunTuiVisualAdapter::default(),
-            "bcode.shell.run",
+            SHELL_RUN_SCHEMA,
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
                 100,
@@ -1709,7 +1712,7 @@ mod tests {
         });
         let rendered = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
             &ShellRunTuiVisualAdapter::default(),
-            "bcode.shell.run",
+            SHELL_RUN_SCHEMA,
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
                 100,

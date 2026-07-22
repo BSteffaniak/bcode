@@ -193,9 +193,21 @@ if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/
 fi
 
 if ! rg -q 'storage_compatibility\(\)' packages/session/src/lib.rs \
-  || ! rg -q 'acquire_session_maintenance_guard\(root, session_id\)' packages/session/src/lib.rs \
+  || ! rg -q 'StorageMigrationRequired' packages/session/src/lib.rs \
   || ! rg -q 'load_gates: BTreeMap<SessionId, Arc<Mutex<\(\)>>>' packages/session/src/lib.rs; then
-  echo "Session automatic migration violation: manager first load must classify storage, serialize per session, and require maintenance ownership." >&2
+  echo "Session normal-load violation: manager first load must classify storage, serialize per session, and reject legacy storage as explicitly migration-required." >&2
+  violations=1
+fi
+
+if rg -q 'migrate_legacy_session_for_load|attempting automatic legacy session migration' packages/session/src/lib.rs; then
+  echo "Session normal-load violation: ordinary session load must never migrate legacy storage." >&2
+  violations=1
+fi
+
+model_context_body="$(sed -n '/pub async fn model_context_events(/,/^    }/p' packages/session/src/db.rs)"
+if grep -Eq 'select\("events"\)|decode_session_event_degraded|reindex_model_context|migrate' <<<"$model_context_body" \
+  || rg -q 'compatibility_model_context_events|model_context_events_query' packages/session/src/db.rs; then
+  echo "Session model-context violation: normal reads must use the bounded projection and never replay, repair, or migrate canonical events." >&2
   violations=1
 fi
 

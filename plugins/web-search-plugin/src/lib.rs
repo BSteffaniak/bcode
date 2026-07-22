@@ -21,8 +21,8 @@ use std::env;
 use std::time::Duration;
 use thiserror::Error;
 
-const MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE: &str = "bcode.web-search.model-native/v1";
-const MODEL_NATIVE_WEB_SEARCH_OPERATION: &str = "search";
+const MODEL_PROVIDER_SERVICE_INTERFACE: &str = "bcode.model-provider/v1";
+const MODEL_NATIVE_WEB_SEARCH_OPERATION: &str = "native_web_search";
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_MAX_RESULTS: usize = 8;
 const DEFAULT_FETCH_MAX_BYTES: usize = 256 * 1024;
@@ -109,10 +109,9 @@ impl WebSearchPlugin {
     fn invoke_tool_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         match context.request.operation.as_str() {
             OP_LIST_TOOLS => list_tools(&context.request, &context.config),
-            bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
-                &context.request,
-                web_tool_definitions(&context.config),
-            ),
+            bcode_tool::OP_PREPARE_TOOL => {
+                prepare_web_tool_service_response(&context.request, &context.config)
+            }
             OP_INVOKE_TOOL => self.invoke_tool(context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
@@ -191,6 +190,7 @@ impl WebSearchPlugin {
                 Some(progress),
                 bridge,
                 invocation.tool_call_id.clone(),
+                invocation.preparation_descriptor.clone(),
             ),
             cancellation.clone(),
         )) {
@@ -677,6 +677,7 @@ async fn search_async(
     progress: Option<ProgressReporter>,
     bridge: ServiceBridge,
     invocation_id: String,
+    preparation_descriptor: serde_json::Value,
 ) -> Result<SearchResponse, WebError> {
     validate_non_empty("query", &request.query)?;
     let provider = search_provider(request.provider.as_deref(), &config)?;
@@ -691,7 +692,9 @@ async fn search_async(
         "gemini" | "google_gemini" => search_gemini(request, &config).await,
         "serper" => search_serper(request, &config).await,
         "serpapi" | "serp_api" => search_serpapi(request, &config).await,
-        "model_native" => search_model_native(&request, &bridge, &invocation_id),
+        "model_native" => {
+            search_model_native(&request, &bridge, &invocation_id, &preparation_descriptor)
+        }
         "duckduckgo_html" | "duckduckgo" | "ddg" => search_duckduckgo_html(request, &config).await,
         _ => Err(WebError::InvalidRequest(format!(
             "unsupported web search provider: {provider}"
@@ -706,18 +709,78 @@ async fn search_async(
     Ok(response)
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct WebToolPreparationDescriptor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_provider_route_id: Option<String>,
+}
+
+fn prepare_web_tool_service_response(
+    request: &ServiceRequest,
+    config: &bcode_plugin_sdk::PluginConfigContext,
+) -> ServiceResponse {
+    let preparation_request = match request.payload_json::<bcode_tool::ToolPreparationRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    let mut response = match prepare_tool_from_definitions(request, web_tool_definitions(config)) {
+        Ok(response) => response,
+        Err(message) => return ServiceResponse::error("invalid_preparation", message),
+    };
+    if preparation_request.invocation.tool_name == "web.search" {
+        let route_id = preparation_request
+            .host_context
+            .iter()
+            .filter(|entry| {
+                entry.schema == bcode_tool::TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA
+                    && entry.schema_version == 1
+            })
+            .find_map(|entry| {
+                serde_json::from_value::<Vec<bcode_tool::ToolInvocationServiceRoute>>(
+                    entry.payload.clone(),
+                )
+                .ok()
+            })
+            .and_then(|routes| {
+                routes.into_iter().find(|route| {
+                    route.interface_id == MODEL_PROVIDER_SERVICE_INTERFACE
+                        && route
+                            .operations
+                            .iter()
+                            .any(|operation| operation == MODEL_NATIVE_WEB_SEARCH_OPERATION)
+                })
+            })
+            .map(|route| route.route_id);
+        response.descriptor = serde_json::to_value(WebToolPreparationDescriptor {
+            model_provider_route_id: route_id,
+        })
+        .unwrap_or(serde_json::Value::Null);
+    }
+    json_response(&response)
+}
+
 fn search_model_native(
     request: &SearchRequest,
     bridge: &ServiceBridge,
     invocation_id: &str,
+    preparation_descriptor: &serde_json::Value,
 ) -> Result<SearchResponse, WebError> {
+    let route_id =
+        serde_json::from_value::<WebToolPreparationDescriptor>(preparation_descriptor.clone())?
+            .model_provider_route_id
+            .ok_or_else(|| {
+                WebError::InvalidRequest(
+                    "model-native search is not supported by this host".to_owned(),
+                )
+            })?;
     let query = request.query.clone();
     let response = bridge
         .request(&ServiceBridgeRequest::InvokeService(
             ToolInvocationServiceRequest {
                 invocation_id: invocation_id.to_string(),
                 request_id: format!("{invocation_id}-model-native-search"),
-                interface_id: MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE.to_string(),
+                route_id: Some(route_id),
+                interface_id: MODEL_PROVIDER_SERVICE_INTERFACE.to_string(),
                 operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
                 payload: serde_json::json!({
                     "query": request.query,
@@ -2782,6 +2845,9 @@ mod tests {
             },
             &bridge,
             "call-native",
+            &serde_json::json!({
+                "model_provider_route_id": "test-provider-route"
+            }),
         )
         .expect("model-native nested service succeeds");
 
@@ -2805,10 +2871,8 @@ mod tests {
             panic!("expected nested service request");
         };
         assert_eq!(request.invocation_id, "call-native");
-        assert_eq!(
-            request.interface_id,
-            MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE
-        );
+        assert_eq!(request.route_id.as_deref(), Some("test-provider-route"));
+        assert_eq!(request.interface_id, MODEL_PROVIDER_SERVICE_INTERFACE);
         assert_eq!(request.operation, MODEL_NATIVE_WEB_SEARCH_OPERATION);
         let response = ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
             payload: serde_json::json!({

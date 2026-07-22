@@ -257,6 +257,9 @@ pub struct PluginService {
     pub concurrency: Option<PluginConcurrencyConfig>,
     #[serde(default)]
     pub class: Option<PluginInvocationClass>,
+    /// Operations this service explicitly exposes to active tool invocations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invocation_operations: Vec<String>,
 }
 
 /// Plugin config declaration from a plugin manifest.
@@ -4671,6 +4674,7 @@ library = "libexample_plugin.dylib"
                     "required": true
                 }]
             }),
+            preparation_descriptor: serde_json::Value::Null,
             cwd: None,
             artifact_dir: None,
         };
@@ -5102,6 +5106,7 @@ library = "libexample_plugin.dylib"
                     description: None,
                     concurrency: None,
                     class: None,
+                    invocation_operations: Vec::new(),
                 }],
                 tui_surfaces: Vec::new(),
                 visual_adapters: Vec::new(),
@@ -5320,6 +5325,7 @@ library = "libexample_plugin.dylib"
                 name: Some("shell".to_string()),
                 description: None,
                 class: Some(PluginInvocationClass::ToolExecution),
+                invocation_operations: Vec::new(),
                 concurrency: None,
             }];
             manifest
@@ -5451,6 +5457,7 @@ library = "libexample_plugin.dylib"
                 name: Some("model".to_string()),
                 description: None,
                 class: Some(PluginInvocationClass::ModelProvider),
+                invocation_operations: Vec::new(),
                 concurrency: None,
             }];
             manifest
@@ -5759,6 +5766,7 @@ library = "libexample_plugin.dylib"
                 description: None,
                 concurrency: None,
                 class: None,
+                invocation_operations: Vec::new(),
             }],
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),

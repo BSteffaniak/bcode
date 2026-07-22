@@ -7051,12 +7051,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
-        SessionEventKind::InteractiveToolRequestCreated { .. } => {
-            "interactive_tool_request_created"
-        }
-        SessionEventKind::InteractiveToolRequestResolved { .. } => {
-            "interactive_tool_request_resolved"
-        }
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
@@ -7085,6 +7079,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
         SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
         SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
+        SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::ToolContribution { .. } => "tool_contribution",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
@@ -7483,25 +7478,13 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence
             );
         }
-        SessionEventKind::InteractiveToolRequestCreated {
-            interaction_id,
-            tool_call_id,
-            interaction_kind,
-            surface_kind,
-            ..
-        } => println!(
-            "#{} interactive tool request: {interaction_id} {} via {surface_kind} ({tool_call_id})",
-            event.sequence,
-            interaction_kind.as_deref().unwrap_or("<unknown>")
-        ),
-        SessionEventKind::InteractiveToolRequestResolved {
-            interaction_id,
-            tool_call_id,
-            ..
-        } => println!(
-            "#{} interactive tool resolved: {interaction_id} ({tool_call_id})",
-            event.sequence
-        ),
+        SessionEventKind::ToolInvocationResultRecorded { record } => {
+            let status = if record.is_error { "error" } else { "ok" };
+            println!(
+                "#{} invocation result ({status}): {}: {}",
+                event.sequence, record.invocation_id, record.model_output
+            );
+        }
         SessionEventKind::ToolExchangeRequested { request } => println!(
             "#{} exchange requested {}:{} schema={}@{} policy={:?} payload={}",
             event.sequence,

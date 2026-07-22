@@ -1683,31 +1683,38 @@ async fn load_pending_interactions(
 ) -> Result<Vec<bcode_session_view_models::InteractionViewSummary>, ClientError> {
     let mut interactions = Vec::new();
     for request in client
-        .list_interactive_tool_requests()
+        .list_pending_tool_exchanges()
         .await?
         .into_iter()
         .filter(|request| request.session_id == session_id)
     {
-        let interaction_id = request.interaction_id.clone();
-        let snapshot = client
-            .interaction_snapshot(interaction_id.clone())
-            .await?
-            .map_or(request.request, |snapshot| snapshot.snapshot);
-        let surface_kind = request.surface_kind.clone();
+        let exchange = request.request;
+        let interaction_id = exchange.exchange_id.clone();
+        let snapshot = exchange.payload;
+        let adapter = bcode_bundled_plugins::interaction_adapter(
+            &exchange.producer_id,
+            &exchange.schema,
+            exchange.schema_version,
+            "tui",
+        );
+        let kind = adapter.as_ref().map_or_else(
+            || exchange.schema.clone(),
+            |adapter| adapter.interaction_kind.clone(),
+        );
+        let surface_kind = adapter
+            .and_then(|adapter| adapter.tui_surface_kind)
+            .unwrap_or_else(|| exchange.schema.clone());
         interactions.push(bcode_session_view_models::InteractionViewSummary {
             interaction_id,
-            kind: request
-                .interaction_kind
-                .unwrap_or_else(|| surface_kind.clone()),
+            kind,
             surface_kind,
-            tool_call_id: Some(request.tool_call_id),
-            title: Some(request.tool_name),
-            required: request.required,
+            tool_call_id: Some(exchange.invocation_id),
+            title: Some(exchange.producer_id),
+            required: exchange.response_policy
+                == bcode_session_models::ToolExchangeResponsePolicy::Required,
             snapshot: Some(snapshot),
             resolved: false,
             resolution: None,
-            render_target: request.render_target,
-            turn_behavior: request.turn_behavior,
         });
     }
     Ok(interactions)

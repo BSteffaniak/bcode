@@ -82,31 +82,27 @@ Per-session access is split by capability:
 * Compatibility `open_turso*` entry points initialize only missing databases. Existing databases
   use the non-migrating open.
 
-Health, doctor, diagnosis, catalog, and audit paths remain non-migrating. The session manager is the
-single controlled automatic-migration entry point during first real load.
+Health, doctor, diagnosis, catalog, audit, and normal session-manager load paths remain
+non-migrating. Legacy migration is available only through an explicit maintenance command.
 
-## Automatic legacy migration
+## Explicit legacy migration
 
-First load is serialized per session. The manager inspects the migration ledger and durable storage
-contract without mutation, then follows one of these paths:
+Normal first load is serialized per session. The manager inspects the migration ledger and durable
+storage contract without mutation, then follows one of these paths:
 
 * Current storage: acquire a compatible runtime lease and recheck compatibility while ownership is
   held.
-* Known legacy storage: acquire exclusive maintenance ownership, then the maintenance write lock,
-  reopen and reclassify, migrate atomically, validate write readiness, and transition maintenance
-  ownership directly into the runtime lease.
+* Known legacy storage: return migration-required without acquiring maintenance ownership or
+  changing the database.
 * Unknown migration ids, dirty or failed migration records, future writer epochs, unsupported
   contract schemas, malformed canonical history, or ledger/contract inconsistencies: fail closed
   without mutation.
 
-Any live session owner blocks legacy migration. If two current daemons race, one may complete the
-migration while the other retries against the now-current database. No current runtime lease is
-installed after migration failure.
-
-Migration strictly validates contiguous canonical sequences and session identity, preserves
-canonical events and drafts, rebuilds all required derived projections through the same projector
-functions used by normal append, verifies checkpoints at the canonical tail, and updates the writer
-contract only when validation succeeds.
+Explicit migration acquires exclusive maintenance ownership and the maintenance write lock before
+calling `migrate_turso_in_root`. Migration strictly validates contiguous canonical sequences and
+session identity, preserves canonical events and drafts, rebuilds all required derived projections
+through the same projector functions used by normal append, verifies checkpoints at the canonical
+tail, and updates the writer contract only when validation succeeds.
 
 ## Durable writer contract
 
@@ -181,8 +177,8 @@ replay canonical events or invoke repair. Full history remains available for exp
 diagnosis, and maintenance.
 
 Model context begins at the latest valid local or provider compaction boundary and reads the current
-projection. Same-version stale or corrupt projections remain repair-required; only a controlled
-versioned migration may rebuild known legacy projection state automatically.
+projection. Missing, stale, incompatible, or corrupt projections remain repair-required. Rebuilds
+and known legacy migrations run only through explicit maintenance commands.
 
 ## Repair and maintenance
 
@@ -217,6 +213,6 @@ only after canonical path confinement beneath the session artifact root.
 * Catalogs, manifests, projections, and in-memory state are derived.
 * Catalog damage cannot hide canonical session directories.
 * Normal reads do not migrate, repair, or full replay.
-* Automatic migration applies only to known legacy state under exclusive ownership.
+* Known legacy migration requires explicit maintenance ownership and never runs on normal paths.
 * Unknown, future, dirty, ambiguous, or corrupt storage fails closed.
 * Historical duplicate roots are never merged automatically.

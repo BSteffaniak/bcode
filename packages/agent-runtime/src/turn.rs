@@ -1595,6 +1595,7 @@ mod tests {
             .invoke_service(ToolInvocationServiceRequest {
                 invocation_id: "invoke".to_string(),
                 request_id: "request".to_string(),
+                route_id: None,
                 interface_id: "example.service/v1".to_string(),
                 operation: "run".to_string(),
                 payload: serde_json::Value::Null,
@@ -2109,6 +2110,7 @@ mod tests {
                 .invoke_service(ToolInvocationServiceRequest {
                     invocation_id: "invoke".to_string(),
                     request_id: "service".to_string(),
+                    route_id: None,
                     interface_id: "example.service/v1".to_string(),
                     operation: "run".to_string(),
                     payload: serde_json::Value::Null,
@@ -2253,6 +2255,7 @@ mod tests {
                 .invoke_service(ToolInvocationServiceRequest {
                     invocation_id: "invoke".to_string(),
                     request_id: "service".to_string(),
+                    route_id: None,
                     interface_id: "example.service/v1".to_string(),
                     operation: "run".to_string(),
                     payload: serde_json::Value::Null,

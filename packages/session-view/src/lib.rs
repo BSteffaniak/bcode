@@ -12,9 +12,8 @@ mod actions;
 pub use actions::execute_session_view_action;
 
 use bcode_session_models::{
-    InteractiveToolRenderTarget, InteractiveToolTurnBehavior, SessionEvent, SessionEventKind,
-    SessionId, SessionLiveEvent, SessionLiveEventKind, ToolInvocationProjection,
-    ToolInvocationStreamEvent, apply_tool_invocation_projection_event,
+    SessionEvent, SessionEventKind, SessionId, SessionLiveEvent, SessionLiveEventKind,
+    ToolInvocationProjection, ToolInvocationStreamEvent, apply_tool_invocation_projection_event,
 };
 use bcode_session_view_models::{
     ChatMessageView, ComposerViewState, InteractionViewSummary, PluginStatusView, PluginVisualView,
@@ -491,6 +490,13 @@ impl SessionView {
             | SessionEventKind::ToolCallFinished { tool_call_id, .. } => {
                 self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
             }
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                self.upsert_tool_item(
+                    &record.invocation_id,
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                );
+            }
             SessionEventKind::ToolInvocationStream { event: stream } => {
                 let tool_call_id = stream_tool_call_id(stream);
                 self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
@@ -843,72 +849,6 @@ impl SessionView {
                         )),
                     },
                 );
-            }
-            SessionEventKind::InteractiveToolRequestCreated {
-                interaction_id,
-                tool_call_id,
-                tool_name,
-                interaction_kind,
-                surface_kind,
-                request_json,
-                required,
-                turn_behavior,
-                render_target,
-                ..
-            } => {
-                self.upsert_interaction_item(
-                    InteractionViewSummary {
-                        interaction_id: interaction_id.clone(),
-                        kind: interaction_kind
-                            .clone()
-                            .unwrap_or_else(|| surface_kind.clone()),
-                        surface_kind: surface_kind.clone(),
-                        tool_call_id: Some(tool_call_id.clone()),
-                        title: Some(tool_name.clone()),
-                        required: *required,
-                        snapshot: parse_json_value(request_json),
-                        resolved: false,
-                        resolution: None,
-                        render_target: *render_target,
-                        turn_behavior: *turn_behavior,
-                    },
-                    event.sequence,
-                    Some(event.timestamp_ms),
-                );
-            }
-            SessionEventKind::InteractiveToolRequestResolved {
-                interaction_id,
-                tool_call_id,
-                resolution_json,
-            } => {
-                let resolution = parse_json_value(resolution_json)
-                    .unwrap_or_else(|| serde_json::Value::String(resolution_json.clone()));
-                let existing = self
-                    .snapshot
-                    .interactions
-                    .iter()
-                    .find(|interaction| interaction.interaction_id == *interaction_id)
-                    .cloned();
-                let interaction = if let Some(mut interaction) = existing {
-                    interaction.resolved = true;
-                    interaction.resolution = Some(resolution);
-                    interaction
-                } else {
-                    InteractionViewSummary {
-                        interaction_id: interaction_id.clone(),
-                        kind: "unknown".to_owned(),
-                        surface_kind: String::new(),
-                        tool_call_id: Some(tool_call_id.clone()),
-                        title: None,
-                        required: false,
-                        snapshot: None,
-                        resolved: true,
-                        resolution: Some(resolution),
-                        render_target: InteractiveToolRenderTarget::default(),
-                        turn_behavior: InteractiveToolTurnBehavior::default(),
-                    }
-                };
-                self.upsert_interaction_item(interaction, event.sequence, Some(event.timestamp_ms));
             }
             SessionEventKind::PermissionRequested {
                 permission_id,
@@ -1624,10 +1564,6 @@ fn format_provider_bytes(bytes: usize) -> String {
     }
 }
 
-fn parse_json_value(value: &str) -> Option<serde_json::Value> {
-    serde_json::from_str(value).ok()
-}
-
 fn tool_invocation_view_from_projection(
     projection: ToolInvocationProjection,
 ) -> ToolInvocationView {
@@ -1795,8 +1731,7 @@ pub fn build_session_view_snapshot_for(
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, InteractiveToolRenderTarget,
-        InteractiveToolTurnBehavior, LocalContextEstimate, ModelRequestIdentity,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, LocalContextEstimate, ModelRequestIdentity,
         RequestContextObservation, RequestContextTokenCount, SessionEvent, SessionEventKind,
         SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTokenUsage, ToolInvocationResult,
         ToolOutputStream,
@@ -1814,6 +1749,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn durable_generic_history(session_id: SessionId) -> Vec<SessionEvent> {
         let lifecycle = |sequence, stage, message| {
             event(
@@ -1859,42 +1795,97 @@ mod tests {
                     working_directory: PathBuf::from("/tmp/deterministic"),
                 },
             ),
-            lifecycle(
+            event(
+                session_id,
                 2,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call".to_owned(),
+                    producer_plugin_id: Some("future.producer".to_owned()),
+                    tool_name: "future.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            lifecycle(
+                3,
                 bcode_session_models::ToolInvocationLifecycleStage::Started,
                 None,
             ),
             contribution(
-                3,
+                4,
                 1,
                 bcode_session_models::ToolContributionOperation::Upsert,
                 serde_json::json!({"opaque": [1, 2]}),
             ),
+            event(
+                session_id,
+                5,
+                SessionEventKind::ToolExchangeRequested {
+                    request: bcode_session_models::ToolExchangeRequest {
+                        invocation_id: "call".to_owned(),
+                        exchange_id: "exchange".to_owned(),
+                        producer_id: "future.producer".to_owned(),
+                        schema: "future.exchange".to_owned(),
+                        schema_version: 9,
+                        payload: serde_json::json!({"opaque_request": true}),
+                        response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                    },
+                },
+            ),
             lifecycle(
-                4,
-                bcode_session_models::ToolInvocationLifecycleStage::Progress,
-                Some("working".to_owned()),
+                6,
+                bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+                Some("waiting".to_owned()),
+            ),
+            event(
+                session_id,
+                7,
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: "call".to_owned(),
+                        exchange_id: "exchange".to_owned(),
+                        resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"opaque_response": 42}),
+                        },
+                    },
+                },
             ),
             contribution(
-                5,
+                8,
                 2,
                 bcode_session_models::ToolContributionOperation::Append,
                 serde_json::json!({"future_append": true}),
             ),
             contribution(
-                6,
+                9,
                 3,
                 bcode_session_models::ToolContributionOperation::Remove,
                 serde_json::Value::Null,
             ),
+            event(
+                session_id,
+                10,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call".to_owned(),
+                        model_output: "done".to_owned(),
+                        is_error: false,
+                        result: Some(ToolInvocationResult::Json {
+                            value: r#"{"opaque_result":true}"#.to_owned(),
+                        }),
+                    },
+                },
+            ),
             lifecycle(
-                7,
+                11,
                 bcode_session_models::ToolInvocationLifecycleStage::Completed,
                 None,
             ),
             event(
                 session_id,
-                8,
+                12,
                 SessionEventKind::SystemMessage {
                     text: "finished".to_owned(),
                 },
@@ -1925,7 +1916,7 @@ mod tests {
         );
         assert!(first.active_invocations.is_empty());
         assert!(first.contributions.is_empty());
-        assert_eq!(first.latest_sequence, Some(8));
+        assert_eq!(first.latest_sequence, Some(12));
     }
 
     #[test]
@@ -2101,6 +2092,59 @@ mod tests {
         ));
         assert!(view.snapshot().contributions.is_empty());
         assert_eq!(view.snapshot().transcript.items.len(), 1);
+    }
+
+    #[test]
+    fn session_view_projects_generic_final_result_without_legacy_finish_event() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("example.plugin".to_owned()),
+                tool_name: "example.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+                request_visual: None,
+                legacy_request_presentation: None,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "semantic".to_owned(),
+                    }),
+                },
+            },
+        ));
+
+        let snapshot = view.snapshot();
+        let tool = snapshot.tools.get("call-1").expect("projected tool");
+        assert_eq!(tool.status, ToolInvocationViewStatus::Finished);
+        assert_eq!(tool.result_text.as_deref(), Some("done"));
+        assert_eq!(
+            tool.result,
+            Some(ToolResultView::Text {
+                text: "semantic".to_owned(),
+            })
+        );
+        assert_eq!(
+            snapshot
+                .transcript
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, TranscriptViewItemKind::ToolInvocation { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2476,59 +2520,6 @@ mod tests {
     }
 
     #[test]
-    fn projects_interaction_lifecycle_and_keeps_transcript_in_sync() {
-        let session_id = SessionId::new();
-        let mut view = SessionView::new();
-        view.apply_event(&event(
-            session_id,
-            1,
-            SessionEventKind::InteractiveToolRequestCreated {
-                interaction_id: "interaction-1".to_owned(),
-                tool_call_id: "tool-1".to_owned(),
-                tool_name: "question".to_owned(),
-                interaction_kind: Some("bcode.question".to_owned()),
-                surface_kind: "bcode.question.inline".to_owned(),
-                request_json: r#"{"questions":[]}"#.to_owned(),
-                required: true,
-                turn_behavior: InteractiveToolTurnBehavior::AwaitBeforeContinuing,
-                render_target: InteractiveToolRenderTarget::TranscriptToolCall,
-            },
-        ));
-
-        assert_eq!(view.snapshot().interactions.len(), 1);
-        assert_eq!(view.snapshot().interactions[0].kind, "bcode.question");
-        assert_eq!(
-            view.snapshot().interactions[0].snapshot,
-            Some(serde_json::json!({"questions": []}))
-        );
-        assert!(matches!(
-            &view.snapshot().transcript.items[0].kind,
-            TranscriptViewItemKind::Interaction { interaction } if !interaction.resolved
-        ));
-
-        view.apply_event(&event(
-            session_id,
-            2,
-            SessionEventKind::InteractiveToolRequestResolved {
-                interaction_id: "interaction-1".to_owned(),
-                tool_call_id: "tool-1".to_owned(),
-                resolution_json: r#"{"type":"submitted"}"#.to_owned(),
-            },
-        ));
-
-        assert!(view.snapshot().interactions[0].resolved);
-        assert_eq!(
-            view.snapshot().interactions[0].resolution,
-            Some(serde_json::json!({"type": "submitted"}))
-        );
-        assert_eq!(view.snapshot().transcript.items.len(), 1);
-        assert!(matches!(
-            &view.snapshot().transcript.items[0].kind,
-            TranscriptViewItemKind::Interaction { interaction } if interaction.resolved
-        ));
-    }
-
-    #[test]
     fn history_window_rebuild_retains_authoritative_runtime_state() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
@@ -2761,8 +2752,6 @@ mod tests {
             snapshot: Some(serde_json::json!({"questions": []})),
             resolved: false,
             resolution: None,
-            render_target: InteractiveToolRenderTarget::TranscriptToolCall,
-            turn_behavior: InteractiveToolTurnBehavior::AwaitBeforeContinuing,
         };
         let mut view = SessionView::new();
         view.set_pending_interactions(vec![interaction("interaction-1")]);

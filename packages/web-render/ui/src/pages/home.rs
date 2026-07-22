@@ -874,10 +874,7 @@ const fn tool_status_color(status: ToolInvocationViewStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_models::{
-        InteractiveToolRenderTarget, InteractiveToolTurnBehavior, PluginVisualDescriptor,
-        RuntimeWorkStatus, ToolArtifact, WorkId,
-    };
+    use bcode_session_models::{PluginVisualDescriptor, RuntimeWorkStatus, ToolArtifact, WorkId};
     use bcode_session_view_models::{
         ChatMessageView, PermissionBatchView, PermissionView, RuntimeWorkView, ToolArtifactView,
         ToolInvocationView, ToolResultView, ToolTimingView, TranscriptViewItem,
@@ -1051,8 +1048,6 @@ mod tests {
             })),
             resolved: false,
             resolution: None,
-            render_target: InteractiveToolRenderTarget::TranscriptToolCall,
-            turn_behavior: InteractiveToolTurnBehavior::AwaitBeforeContinuing,
         };
 
         let rendered = format!(

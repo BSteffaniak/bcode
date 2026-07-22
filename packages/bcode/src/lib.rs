@@ -2536,10 +2536,12 @@ impl ToolInvoker for SdkToolInvoker {
                 ToolSource::Plugin { plugin_id } => {
                     #[cfg(feature = "embedded-plugins")]
                     {
+                        let preparation_descriptor = invocation.preparation.descriptor.clone();
                         execute_plugin_tool(
                             self.plugins.as_ref(),
                             plugin_id,
                             &descriptor,
+                            preparation_descriptor,
                             scope,
                             self.session_id,
                         )
@@ -2592,6 +2594,7 @@ async fn execute_plugin_tool(
     plugins: Option<&bcode_plugin::PluginRuntimeHost>,
     plugin_id: &str,
     descriptor: &ToolInvocationDescriptor,
+    preparation_descriptor: serde_json::Value,
     scope: &InvocationScope,
     session_id: SessionId,
 ) -> std::result::Result<ToolInvocationResponse, RuntimeError> {
@@ -2603,6 +2606,7 @@ async fn execute_plugin_tool(
         tool_call_id: descriptor.invocation_id.clone(),
         name: descriptor.tool_name.clone(),
         arguments: descriptor.arguments.clone(),
+        preparation_descriptor,
         cwd: None,
         artifact_dir: None,
     };

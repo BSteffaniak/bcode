@@ -253,6 +253,19 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
                             control_id: custom_control_id(question_index),
                             value: InteractionValue::String(text),
                         })
+                    } else if let QuestionFocusTarget::Question { question_index } = snapshot.focus
+                        && let Some(option_index) = character
+                            .to_digit(10)
+                            .and_then(|digit| usize::try_from(digit).ok())
+                            .and_then(|digit| digit.checked_sub(1))
+                            .filter(|option_index| {
+                                *option_index
+                                    < snapshot.request.questions[question_index].options.len()
+                            })
+                    {
+                        Some(InteractionInput::Activate {
+                            control_id: option_control_id(question_index, option_index),
+                        })
                     } else if character == ' ' {
                         Some(InteractionInput::Activate {
                             control_id: snapshot.focused_control_id.clone(),

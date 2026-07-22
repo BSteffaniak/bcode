@@ -9,12 +9,10 @@
 //! browser DOM primitives, daemon clients, or application orchestration.
 
 use bcode_session_models::{
-    ClientId, InteractiveToolRenderTarget, InteractiveToolResolution, InteractiveToolTurnBehavior,
-    ModelTurnOutcome, PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkKind,
+    ClientId, ModelTurnOutcome, PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkKind,
     RuntimeWorkStatus, SessionId, SessionSummary, SessionTokenUsage, ToolArtifact,
     ToolInvocationResult, WorkId,
 };
-use bcode_tool::InteractionInput;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -740,10 +738,6 @@ pub struct InteractionViewSummary {
     /// Durable resolution payload, when resolved.
     #[serde(default)]
     pub resolution: Option<serde_json::Value>,
-    /// Target renderer placement.
-    pub render_target: InteractiveToolRenderTarget,
-    /// Model turn behavior for the request.
-    pub turn_behavior: InteractiveToolTurnBehavior,
 }
 
 /// Prompt placement semantics for renderer-neutral prompt submission.
@@ -806,8 +800,6 @@ pub enum SessionViewActionOutcome {
     PermissionBatchResolved { resolved_count: usize },
     /// Interaction resolution result.
     InteractionResolved { resolved: bool },
-    /// Interaction input response as generic JSON.
-    InteractionInput { response: serde_json::Value },
 }
 
 /// Semantic renderer action shared by terminal, web, and future renderers.
@@ -848,19 +840,12 @@ pub enum SessionViewAction {
         /// Whether the batch is approved.
         approved: bool,
     },
-    /// Submit semantic input to an interactive tool/controller.
-    SubmitInteractionInput {
+    /// Resolve an invocation exchange with a terminal resolution.
+    ResolveExchange {
         /// Interaction id.
         interaction_id: String,
-        /// Semantic interaction input.
-        input: InteractionInput,
-    },
-    /// Resolve an interactive request with a final semantic resolution.
-    ResolveInteraction {
-        /// Interaction id.
-        interaction_id: String,
-        /// Final interaction resolution.
-        resolution: InteractiveToolResolution,
+        /// Final exchange resolution.
+        resolution: bcode_session_models::ToolExchangeResolution,
     },
     /// Request a switch to another session.
     SwitchSession {

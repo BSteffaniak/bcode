@@ -1493,8 +1493,24 @@ pub fn conversational_units(
 ) -> Vec<ConversationalUnit> {
     let mut units = Vec::<ConversationalUnit>::new();
     let mut pending_tool_calls = BTreeSet::new();
+    let generic_result_invocations = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                Some(record.invocation_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
 
     for event in events {
+        if matches!(
+            &event.kind,
+            SessionEventKind::ToolCallFinished { tool_call_id, .. }
+                if generic_result_invocations.contains(tool_call_id.as_str())
+        ) {
+            continue;
+        }
         let starts_turn_boundary = matches!(event.kind, SessionEventKind::ModelTurnStarted { .. })
             && !pending_tool_calls.is_empty();
         if matches!(event.kind, SessionEventKind::ModelTurnStarted { .. }) {
@@ -1541,6 +1557,9 @@ pub fn conversational_units(
             }
             SessionEventKind::ToolCallFinished { tool_call_id, .. } => {
                 pending_tool_calls.remove(tool_call_id);
+            }
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                pending_tool_calls.remove(&record.invocation_id);
             }
             SessionEventKind::ModelTurnFinished { .. } => {
                 // A terminal model turn abandons any tool calls for which no result was
@@ -1738,6 +1757,17 @@ pub fn session_event_compaction_line(
                 tool_output_context_chars.min(COMPACTION_TOOL_RESULT_CHARS),
             )
         )),
+        SessionEventKind::ToolInvocationResultRecorded { record } => Some(format!(
+            "#{} tool result {} (error={}):\n{}",
+            event.sequence,
+            record.invocation_id,
+            record.is_error,
+            project_tool_result_for_model_context(
+                &record.model_output,
+                None,
+                tool_output_context_chars.min(COMPACTION_TOOL_RESULT_CHARS),
+            )
+        )),
         SessionEventKind::SystemMessage { text } => Some(format!(
             "#{} system:\n{}",
             event.sequence,
@@ -1753,6 +1783,144 @@ pub fn session_event_compaction_line(
             display(new_working_directory, old_working_directory)
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod generic_result_tests {
+    use super::*;
+
+    fn event(sequence: u64, kind: SessionEventKind) -> bcode_session_models::SessionEvent {
+        bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn generic_results_keep_parallel_tool_batch_in_one_compaction_unit() {
+        let events = vec![
+            event(
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "older".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+            event(
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "older reply".to_owned(),
+                },
+            ),
+            event(
+                3,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "run both".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+            event(
+                4,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("example.plugin".to_owned()),
+                    tool_name: "example.one".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            event(
+                5,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-2".to_owned(),
+                    producer_plugin_id: Some("example.plugin".to_owned()),
+                    tool_name: "example.two".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            event(
+                6,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "one".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
+                },
+            ),
+            event(
+                7,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-2".to_owned(),
+                        model_output: "two".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
+                },
+            ),
+            event(
+                8,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_owned(),
+                    result: "legacy one".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ),
+            event(
+                9,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-2".to_owned(),
+                    result: "legacy two".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ),
+        ];
+
+        let units = conversational_units(&events, 1_000);
+        assert_eq!(units.len(), 2);
+        assert_eq!(
+            units[1]
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5, 6, 7]
+        );
+        let plan = structural_compaction_plan_with_policy(
+            &events,
+            1_000,
+            CompactionPlanningPolicy::Proactive {
+                keep_recent_tokens: 1,
+            },
+        )
+        .expect("older unit can compact while complete tool batch stays retained");
+        assert_eq!(plan.compacted_through_sequence, 2);
+        assert_eq!(
+            plan.retained_tail
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5, 6, 7]
+        );
     }
 }
 

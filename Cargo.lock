@@ -1520,6 +1520,7 @@ dependencies = [
  "bcode_daemon_lifecycle",
  "bcode_ipc",
  "bcode_model",
+ "bcode_plugin_sdk",
  "bcode_provider_auth",
  "bcode_session_models",
  "bcode_skill_models",
@@ -2173,6 +2174,7 @@ dependencies = [
  "bcode_tool",
  "bcode_vim_edit_plugin",
  "bcode_web_render",
+ "bcode_web_search_plugin",
  "bcode_worktree",
  "bcode_worktree_models",
  "futures 0.3.32",
@@ -2487,8 +2489,10 @@ dependencies = [
 name = "bcode_web_render"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_bundled_plugins",
  "bcode_client",
  "bcode_ipc",
+ "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_session_view",
  "bcode_session_view_models",

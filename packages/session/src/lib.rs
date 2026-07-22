@@ -39,7 +39,7 @@ use bcode_session_models::{
     SessionForkKind, SessionForkResult, SessionForkSummary, SessionHistoryDirection,
     SessionHistoryPage, SessionHistoryQuery, SessionId, SessionImportSummary,
     SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind, SessionSummary,
-    SessionTitleSource, SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
+    SessionTitleSource, SessionTokenUsage, SessionTraceEvent,
 };
 use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,11 @@ pub enum SessionError {
     /// Turn admission metadata is invalid.
     #[error(transparent)]
     TurnAdmission(#[from] bcode_session_models::TurnAdmissionMetadataError),
+    /// Session storage is a known legacy generation that requires an explicit maintenance migration.
+    #[error(
+        "session storage migration required: writer epoch {actual}, expected {expected}; run an explicit session migration/reindex command"
+    )]
+    StorageMigrationRequired { actual: u64, expected: u64 },
     /// Session database error: {0}
     #[error("session database error: {0}")]
     Db(#[from] db::SessionDbError),
@@ -699,11 +704,6 @@ enum SessionLoadStatusKind {
     SummaryOnly,
 }
 
-enum SessionLeaseLoadOutcome {
-    Acquired(Box<SessionLeaseGuard>),
-    Retry,
-}
-
 /// Current asynchronous catalog discovery status.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum CatalogLoadStatus {
@@ -1123,34 +1123,19 @@ impl SessionManager {
         use db::SessionStorageCompatibility::{Current, KnownLegacy};
 
         let root = store.root_path();
-        for attempt in 0..3_u8 {
-            let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
-            let compatibility = db.storage_compatibility().await?;
-            drop(db);
-            let outcome = match compatibility {
-                Current { .. } => {
-                    self.acquire_current_session_lease(session_id, store, &root)
-                        .await?
-                }
-                KnownLegacy { writer_epoch } => {
-                    self.migrate_legacy_session_for_load(
-                        session_id,
-                        store,
-                        &root,
-                        writer_epoch,
-                        attempt,
-                    )
-                    .await?
-                }
-            };
-            if let SessionLeaseLoadOutcome::Acquired(lease) = outcome {
-                return Ok(*lease);
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+        let compatibility = db.storage_compatibility().await?;
+        drop(db);
+        match compatibility {
+            Current { .. } => {
+                self.acquire_current_session_lease(session_id, store, &root)
+                    .await
             }
+            KnownLegacy { writer_epoch } => Err(SessionError::StorageMigrationRequired {
+                actual: writer_epoch,
+                expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            }),
         }
-        Err(db::SessionDbError::MigrationHistoryIncompatible {
-            reason: "session storage changed repeatedly while acquiring ownership".to_owned(),
-        }
-        .into())
     }
 
     async fn acquire_current_session_lease(
@@ -1158,7 +1143,7 @@ impl SessionManager {
         session_id: SessionId,
         store: &SessionStoreExecutor,
         root: &Path,
-    ) -> Result<SessionLeaseLoadOutcome, SessionError> {
+    ) -> Result<SessionLeaseGuard, SessionError> {
         use db::SessionStorageCompatibility::{Current, KnownLegacy};
 
         let lease = lease::acquire_session_lease(root, session_id, store.lease_owner())?;
@@ -1167,103 +1152,15 @@ impl SessionManager {
             .storage_compatibility()
             .await?;
         match rechecked {
-            Current { .. } => Ok(SessionLeaseLoadOutcome::Acquired(Box::new(lease))),
-            KnownLegacy { .. } => {
+            Current { .. } => Ok(lease),
+            KnownLegacy { writer_epoch } => {
                 drop(lease);
-                self.metrics
-                    .increment_counter("session.manager.storage_migration.race_retry_total");
-                Ok(SessionLeaseLoadOutcome::Retry)
+                Err(SessionError::StorageMigrationRequired {
+                    actual: writer_epoch,
+                    expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+                })
             }
         }
-    }
-
-    async fn migrate_legacy_session_for_load(
-        &self,
-        session_id: SessionId,
-        store: &SessionStoreExecutor,
-        root: &Path,
-        writer_epoch: u64,
-        attempt: u8,
-    ) -> Result<SessionLeaseLoadOutcome, SessionError> {
-        use db::SessionStorageCompatibility::{Current, KnownLegacy};
-
-        let started = self.metrics.timer();
-        self.metrics
-            .increment_counter("session.manager.storage_migration.attempted_total");
-        tracing::info!(
-            target: "bcode_session::migration",
-            %session_id,
-            writer_epoch,
-            target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-            "attempting automatic legacy session migration"
-        );
-        let maintenance = match lease::acquire_session_maintenance_guard(root, session_id) {
-            Ok(maintenance) => maintenance,
-            Err(error @ lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
-                self.metrics
-                    .increment_counter("session.manager.storage_migration.blocked_owner_total");
-                let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
-                    .await?
-                    .storage_compatibility()
-                    .await?;
-                if matches!(rechecked, Current { .. }) && attempt < 2 {
-                    self.metrics
-                        .increment_counter("session.manager.storage_migration.race_retry_total");
-                    return Ok(SessionLeaseLoadOutcome::Retry);
-                }
-                return Err(error.into());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let write = lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)?;
-        let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
-            .await?
-            .storage_compatibility()
-            .await?;
-        if matches!(rechecked, KnownLegacy { .. }) {
-            let migrated =
-                match db::SessionDb::migrate_turso_in_root(session_id, root, &maintenance, &write)
-                    .await
-                {
-                    Ok(migrated) => migrated,
-                    Err(error) => {
-                        self.metrics
-                            .increment_counter("session.manager.storage_migration.failed_total");
-                        tracing::warn!(
-                            target: "bcode_session::migration",
-                            %session_id,
-                            %error,
-                            "automatic legacy session migration failed"
-                        );
-                        return Err(error.into());
-                    }
-                };
-            migrated.validate_write_readiness().await?;
-            drop(migrated);
-            self.metrics
-                .increment_counter("session.manager.storage_migration.completed_total");
-            self.metrics.record_histogram(
-                "session.manager.storage_migration.duration_ms",
-                started.elapsed_ms(),
-            );
-            tracing::info!(
-                target: "bcode_session::migration",
-                %session_id,
-                writer_epoch,
-                target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-                duration_ms = started.elapsed_ms(),
-                "automatic legacy session migration completed"
-            );
-        }
-        drop(write);
-        Ok(SessionLeaseLoadOutcome::Acquired(Box::new(
-            lease::transition_session_maintenance_to_lease(
-                maintenance,
-                root,
-                session_id,
-                store.lease_owner(),
-            )?,
-        )))
     }
 
     async fn acquire_missing_session_lease(
@@ -2802,29 +2699,19 @@ impl SessionManager {
         .await
     }
 
-    /// Append a tool-call finished event to a session.
+    /// Append a generic terminal invocation result record to a session.
     ///
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the event cannot be persisted.
-    pub async fn append_tool_call_finished(
+    pub async fn append_tool_invocation_result(
         &self,
         session_id: SessionId,
-        tool_call_id: String,
-        result: String,
-        is_error: bool,
-        output: Option<TraceBlobRef>,
-        semantic_result: Option<bcode_session_models::ToolInvocationResult>,
+        record: bcode_session_models::ToolInvocationResultRecord,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id,
-                result,
-                is_error,
-                output,
-                semantic_result,
-            },
+            SessionEventKind::ToolInvocationResultRecorded { record },
         )
         .await
     }
@@ -4195,30 +4082,32 @@ mod tests {
                 .expect("transient output should publish");
         }
         manager
-            .append_tool_call_finished(
+            .append_event(
                 session.id,
-                "call-1".to_owned(),
-                "bounded result".to_owned(),
-                false,
-                None,
-                Some(ToolInvocationResult::Artifact {
-                    artifact: Box::new(bcode_session_models::ToolArtifact {
-                        artifact_id: "artifact-1".to_owned(),
-                        producer_plugin_id: "fixture.plugin".to_owned(),
-                        schema: "fixture.artifact".to_owned(),
-                        schema_version: 1,
-                        tool_call_id: Some("call-1".to_owned()),
-                        title: None,
-                        metadata: serde_json::Value::Null,
-                        refs: vec![bcode_session_models::ToolArtifactRef {
-                            key: "complete_output".to_owned(),
-                            content_type: Some("application/octet-stream".to_owned()),
-                            storage_uri: Some("file:///external/artifact".to_owned()),
-                            byte_len: Some(artifact_bytes),
-                            metadata: None,
-                        }],
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_owned(),
+                    result: "bounded result".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "artifact-1".to_owned(),
+                            producer_plugin_id: "fixture.plugin".to_owned(),
+                            schema: "fixture.artifact".to_owned(),
+                            schema_version: 1,
+                            tool_call_id: Some("call-1".to_owned()),
+                            title: None,
+                            metadata: serde_json::Value::Null,
+                            refs: vec![bcode_session_models::ToolArtifactRef {
+                                key: "complete_output".to_owned(),
+                                content_type: Some("application/octet-stream".to_owned()),
+                                storage_uri: Some("file:///external/artifact".to_owned()),
+                                byte_len: Some(artifact_bytes),
+                                metadata: None,
+                            }],
+                        }),
                     }),
-                }),
+                },
             )
             .await
             .expect("completion should append");
@@ -4331,9 +4220,10 @@ mod tests {
         ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
         ProjectionWindowTarget, ProviderContextSnapshot, ProviderContextSnapshotOrigin,
         ProviderStreamEvent, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-        SessionEventProvenance, SessionForkKind, SessionId, SessionLiveEvent, SessionLiveEventKind,
-        SessionProjectionKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-        ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef, WorkId,
+        SessionEventProvenance, SessionForkKind, SessionHistoryQuery, SessionId, SessionLiveEvent,
+        SessionLiveEventKind, SessionProjectionKind, SessionTraceEvent, SessionTracePayload,
+        SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+        TraceBlobRef, WorkId,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -4697,36 +4587,38 @@ mod tests {
                 .await
                 .expect("request should append");
             manager
-                .append_tool_call_finished(
+                .append_event(
                     session.id,
-                    "call-1".to_string(),
-                    "legacy fallback".to_string(),
-                    false,
-                    None,
-                    Some(ToolInvocationResult::Artifact {
-                        artifact: Box::new(bcode_session_models::ToolArtifact {
-                            artifact_id: "call-1-shell-run".to_string(),
-                            producer_plugin_id: "test.shell".to_string(),
-                            schema: "test.shell-artifact".to_string(),
-                            schema_version: 1,
-                            tool_call_id: Some("call-1".to_string()),
-                            title: Some("Shell run".to_string()),
-                            metadata: serde_json::json!({
-                                "mode": "terminal",
-                                "exit_code": 0,
-                                "timed_out": false,
-                                "cancelled": false,
-                                "duration_ms": null,
-                                "output_tail": "hello\n",
-                                "output_truncated": false,
-                                "output_bytes": 6,
-                                "retained_output_bytes": 6,
-                                "columns": 120,
-                                "rows": 30,
+                    SessionEventKind::ToolCallFinished {
+                        tool_call_id: "call-1".to_string(),
+                        result: "legacy fallback".to_string(),
+                        is_error: false,
+                        output: None,
+                        semantic_result: Some(ToolInvocationResult::Artifact {
+                            artifact: Box::new(bcode_session_models::ToolArtifact {
+                                artifact_id: "call-1-shell-run".to_string(),
+                                producer_plugin_id: "test.shell".to_string(),
+                                schema: "test.shell-artifact".to_string(),
+                                schema_version: 1,
+                                tool_call_id: Some("call-1".to_string()),
+                                title: Some("Shell run".to_string()),
+                                metadata: serde_json::json!({
+                                    "mode": "terminal",
+                                    "exit_code": 0,
+                                    "timed_out": false,
+                                    "cancelled": false,
+                                    "duration_ms": null,
+                                    "output_tail": "hello\n",
+                                    "output_truncated": false,
+                                    "output_bytes": 6,
+                                    "retained_output_bytes": 6,
+                                    "columns": 120,
+                                    "rows": 30,
+                                }),
+                                refs: Vec::new(),
                             }),
-                            refs: Vec::new(),
                         }),
-                    }),
+                    },
                 )
                 .await
                 .expect("finish should append");
@@ -4761,13 +4653,15 @@ mod tests {
                 .await
                 .expect("session should create");
             manager
-                .append_tool_call_finished(
+                .append_event(
                     session.id,
-                    "call-legacy".to_string(),
-                    "legacy result".to_string(),
-                    false,
-                    None,
-                    None,
+                    SessionEventKind::ToolCallFinished {
+                        tool_call_id: "call-legacy".to_string(),
+                        result: "legacy result".to_string(),
+                        is_error: false,
+                        output: None,
+                        semantic_result: None,
+                    },
                 )
                 .await
                 .expect("legacy finish should append");
@@ -5126,13 +5020,15 @@ mod tests {
             .await
             .expect("tool request should append");
         manager
-            .append_tool_call_finished(
+            .append_event(
                 session.id,
-                "tool-1".to_string(),
-                "ok".to_string(),
-                false,
-                None,
-                None,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "tool-1".to_string(),
+                    result: "ok".to_string(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
             )
             .await
             .expect("tool result should append");
@@ -5253,207 +5149,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exclusive_load_automatically_migrates_legacy_session_storage() {
+    async fn normal_load_rejects_legacy_storage_without_migration() {
         let root = unique_temp_dir();
         let session_id = {
             let manager = SessionManager::persistent(&root).expect("manager should initialize");
             let session = manager
-                .create_session(Some("legacy".to_string()), test_working_directory())
+                .create_session(Some("legacy".to_owned()), test_working_directory())
                 .await
                 .expect("session should create");
+            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+                .await
+                .expect("fixture database should open");
+            db.database()
+                .update("session_storage_contract")
+                .value(
+                    "writer_epoch",
+                    switchy::database::DatabaseValue::Int64(i64::from(
+                        db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
+                    )),
+                )
+                .execute(db.database())
+                .await
+                .expect("writer epoch should become legacy");
+            session.id
+        };
+
+        let manager = SessionManager::persistent(&root).expect("manager should reopen");
+        for result in [
+            manager.require_write_readiness(session_id).await,
             manager
-                .append_user_message(session.id, ClientId::new(), "legacy prompt".to_string())
+                .attach_session_recent(session_id, ClientId::new(), 16)
                 .await
-                .expect("message should append");
-            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
-                .await
-                .expect("legacy fixture database should open");
-            db.database()
-                .update("session_storage_contract")
-                .value(
-                    "writer_epoch",
-                    switchy::database::DatabaseValue::Int64(i64::from(
-                        db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
-                    )),
-                )
-                .execute(db.database())
-                .await
-                .expect("writer epoch should become legacy");
-            db.database()
-                .update("model_context_projection_state")
-                .value("schema_version", switchy::database::DatabaseValue::Int64(1))
-                .execute(db.database())
-                .await
-                .expect("projection should become legacy");
-            session.id
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let restored = SessionManager::persistent(&root).expect("manager should restore");
-        restored
-            .require_write_readiness(session_id)
-            .await
-            .expect("exclusive legacy session should migrate automatically");
-        let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
-            .await
-            .expect("migrated database should open");
-        assert_eq!(
-            migrated.storage_writer_epoch().await.expect("writer epoch"),
-            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
-        );
-        assert!(matches!(
-            migrated
-                .model_context_projection_status()
-                .await
-                .expect("projection status"),
-            db::ModelContextProjectionStatus::Fresh { .. }
-        ));
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn exclusive_load_automatically_migrates_missing_legacy_contract_table() {
-        let root = unique_temp_dir();
-        let session_id = {
-            let manager = SessionManager::persistent(&root).expect("manager should initialize");
-            let session = manager
-                .create_session(
-                    Some("tableless legacy".to_string()),
-                    test_working_directory(),
+                .map(|_| ()),
+            manager
+                .session_history_page(
+                    session_id,
+                    SessionHistoryQuery {
+                        cursor: None,
+                        limit: 16,
+                        direction: bcode_session_models::SessionHistoryDirection::Backward,
+                    },
                 )
                 .await
-                .expect("session should create");
-            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
-                .await
-                .expect("legacy fixture database should open");
-            db.database()
-                .delete("__bcode_session_migrations")
-                .where_in(
-                    "id",
-                    vec![
-                        switchy::database::DatabaseValue::String(
-                            "026_session_storage_contract_table".to_string(),
-                        ),
-                        switchy::database::DatabaseValue::String(
-                            "027_initialize_session_storage_contract".to_string(),
-                        ),
-                    ],
-                )
-                .execute(db.database())
-                .await
-                .expect("contract migrations should become pending");
-            db.database()
-                .exec_raw("DROP TABLE session_storage_contract")
-                .await
-                .expect("legacy contract table should be absent");
-            assert_eq!(
-                db.storage_writer_epoch()
-                    .await
-                    .expect("legacy writer epoch"),
-                u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH)
-            );
-            session.id
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let restored = SessionManager::persistent(&root).expect("manager should restore");
-        restored
-            .require_write_readiness(session_id)
+                .map(|_| ()),
+            manager.model_context_events(session_id).await.map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(SessionError::StorageMigrationRequired { actual, expected })
+                    if actual == u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+                        && expected == u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+            ));
+        }
+        let unchanged = db::SessionDb::open_existing_turso_in_root(session_id, &root)
             .await
-            .expect("missing legacy table should migrate automatically");
-        let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
-            .await
-            .expect("migrated database should open");
-        assert_eq!(
-            migrated.storage_writer_epoch().await.expect("writer epoch"),
-            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
-        );
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn concurrent_first_loads_share_one_automatic_legacy_migration() {
-        let root = unique_temp_dir();
-        let session_id = {
-            let manager = SessionManager::persistent(&root).expect("manager should initialize");
-            let session = manager
-                .create_session(
-                    Some("concurrent legacy".to_owned()),
-                    test_working_directory(),
-                )
-                .await
-                .expect("session should create");
-            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
-                .await
-                .expect("database should open");
-            db.database()
-                .update("session_storage_contract")
-                .value(
-                    "writer_epoch",
-                    switchy::database::DatabaseValue::Int64(i64::from(
-                        db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
-                    )),
-                )
-                .execute(db.database())
-                .await
-                .expect("writer epoch should become legacy");
-            session.id
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let metrics = MetricsRegistry::default();
-        let restored = SessionManager::persistent_with_metrics(&root, metrics.clone())
-            .expect("manager should restore");
-        let (first, second) = tokio::join!(
-            restored.require_write_readiness(session_id),
-            restored.require_write_readiness(session_id)
-        );
-        first.expect("first load should succeed");
-        second.expect("second load should share the successful load");
-        assert_eq!(
-            metrics
-                .snapshot()
-                .counters
-                .get("session.manager.storage_migration.completed_total"),
-            Some(&1)
-        );
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn active_owner_blocks_automatic_legacy_session_migration() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
-        let session = manager
-            .create_session(Some("owned legacy".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
-            .await
-            .expect("legacy fixture database should open");
-        db.database()
-            .update("session_storage_contract")
-            .value(
-                "writer_epoch",
-                switchy::database::DatabaseValue::Int64(i64::from(
-                    db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
-                )),
-            )
-            .execute(db.database())
-            .await
-            .expect("writer epoch should become legacy");
-        drop(db);
-
-        let contender = SessionManager::persistent(&root).expect("contender should initialize");
-        assert!(matches!(
-            contender.require_write_readiness(session.id).await,
-            Err(SessionError::Lease(
-                crate::lease::SessionLeaseError::OwnedByOtherDaemon { .. }
-            ))
-        ));
-        let unchanged = db::SessionDb::open_existing_turso_in_root(session.id, &root)
-            .await
-            .expect("legacy database should remain readable");
+            .expect("legacy database should remain readable for diagnostics");
         assert_eq!(
             unchanged
                 .storage_writer_epoch()
@@ -5461,9 +5211,64 @@ mod tests {
                 .expect("writer epoch"),
             u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH)
         );
-        drop(unchanged);
-        drop(contender);
-        drop(manager);
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn normal_load_rejects_missing_legacy_contract_without_migration() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should initialize");
+            let session = manager
+                .create_session(
+                    Some("tableless legacy".to_owned()),
+                    test_working_directory(),
+                )
+                .await
+                .expect("session should create");
+            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+                .await
+                .expect("fixture database should open");
+            db.database()
+                .delete("__bcode_session_migrations")
+                .where_in(
+                    "id",
+                    vec![
+                        switchy::database::DatabaseValue::String(
+                            "026_session_storage_contract_table".to_owned(),
+                        ),
+                        switchy::database::DatabaseValue::String(
+                            "027_initialize_session_storage_contract".to_owned(),
+                        ),
+                    ],
+                )
+                .execute(db.database())
+                .await
+                .expect("contract migrations should be removed");
+            db.database()
+                .exec_raw("DROP TABLE session_storage_contract")
+                .await
+                .expect("contract table should be removed");
+            session.id
+        };
+
+        let manager = SessionManager::persistent(&root).expect("manager should reopen");
+        assert!(matches!(
+            manager.require_write_readiness(session_id).await,
+            Err(SessionError::StorageMigrationRequired { actual, expected })
+                if actual == u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+                    && expected == u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        ));
+        let unchanged = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("legacy database should remain inspectable");
+        assert!(matches!(
+            unchanged
+                .storage_compatibility()
+                .await
+                .expect("compatibility"),
+            db::SessionStorageCompatibility::KnownLegacy { .. }
+        ));
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
@@ -7721,32 +7526,6 @@ mod tests {
                 },
             ),
             (
-                38,
-                "InteractiveToolRequestCreated",
-                SessionEventKind::InteractiveToolRequestCreated {
-                    interaction_id: "interaction".to_string(),
-                    tool_call_id: "call".to_string(),
-                    tool_name: "tool".to_string(),
-                    interaction_kind: Some("tool.interaction".to_string()),
-                    surface_kind: "form".to_string(),
-                    request_json: "{}".to_string(),
-                    required: true,
-                    turn_behavior:
-                        bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
-                    render_target:
-                        bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall,
-                },
-            ),
-            (
-                39,
-                "InteractiveToolRequestResolved",
-                SessionEventKind::InteractiveToolRequestResolved {
-                    interaction_id: "interaction".to_string(),
-                    tool_call_id: "call".to_string(),
-                    resolution_json: "{}".to_string(),
-                },
-            ),
-            (
                 40,
                 "ProviderContextCompacted",
                 SessionEventKind::ProviderContextCompacted {
@@ -7845,7 +7624,7 @@ mod tests {
                 },
             ),
             (
-                46,
+                38,
                 "ToolExchangeRequested",
                 SessionEventKind::ToolExchangeRequested {
                     request: bcode_session_models::ToolExchangeRequest {
@@ -7860,7 +7639,7 @@ mod tests {
                 },
             ),
             (
-                47,
+                39,
                 "ToolExchangeResolved",
                 SessionEventKind::ToolExchangeResolved {
                     event: bcode_session_models::ToolExchangeResolutionEvent {

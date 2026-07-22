@@ -401,6 +401,14 @@ impl TranscriptProjectionBuilder {
                 self.flush_streams();
                 self.finish_tool_invocation(tool_call_id, event.sequence, result.len());
             }
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                self.flush_streams();
+                self.finish_tool_invocation(
+                    &record.invocation_id,
+                    event.sequence,
+                    record.model_output.len(),
+                );
+            }
             _ => {
                 self.flush_streams();
                 if let Some((kind, bytes)) = non_streaming_item(event) {
@@ -1194,6 +1202,46 @@ mod tests {
         assert_eq!(items[0].source_range.start_sequence, 1);
         assert_eq!(items[0].source_range.end_sequence, 2);
         assert_eq!(items[0].content_bytes, 8);
+    }
+
+    #[test]
+    fn generic_result_record_closes_bounded_tool_projection() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("example.plugin".to_owned()),
+                    tool_name: "example.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "done".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
+                },
+            ),
+        ];
+
+        let items = build_transcript_projection(&events, Some(80));
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, TranscriptProjectionItemKind::ToolInvocation);
+        assert_eq!(items[0].source_range.start_sequence, 1);
+        assert_eq!(items[0].source_range.end_sequence, 2);
+        assert_eq!(items[0].content_bytes, 6);
     }
 
     #[test]

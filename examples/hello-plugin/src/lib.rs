@@ -118,6 +118,7 @@ fn bridge_requests(invocation_id: &str) -> [ServiceBridgeRequest; 4] {
         ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
             invocation_id: invocation_id.to_string(),
             request_id: "hello-service".to_string(),
+            route_id: None,
             interface_id: "example.nested/v1".to_string(),
             operation: "run".to_string(),
             payload: serde_json::Value::Null,

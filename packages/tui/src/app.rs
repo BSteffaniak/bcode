@@ -50,13 +50,12 @@ use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::tool_render_projection::semantic_result_supersedes_live_preview;
 use super::transcript::{
-    ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, display_tool_result_text,
-    generic_tool_result_item_from_projection, interactive_tool_request_item,
-    interactive_tool_resolution_item, item_is_tool_surface_for_tool_call,
-    live_tool_preview_anchor_item, model_usage_item, permission_request_item,
-    permission_result_item, semantic_tool_result_item_from_raw, streaming_tool_output_item,
-    streaming_tool_visual_item, tool_contribution_item, tool_request_item_from_projection,
-    tool_result_item, transcript_items_from_events_with_reasoning,
+    TranscriptItem, TranscriptItemKind, display_tool_result_text,
+    generic_tool_result_item_from_projection, live_tool_preview_anchor_item, model_usage_item,
+    permission_request_item, permission_result_item, semantic_tool_result_item_from_raw,
+    streaming_tool_output_item, streaming_tool_visual_item, tool_contribution_item,
+    tool_request_item_from_projection, tool_result_item,
+    transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -1394,19 +1393,6 @@ impl BmuxApp {
         self.session_view.set_pending_interactions(interactions);
     }
 
-    /// Return renderer-neutral interaction state by id.
-    #[must_use]
-    pub fn interaction_view(
-        &self,
-        interaction_id: &str,
-    ) -> Option<&bcode_session_view_models::InteractionViewSummary> {
-        self.session_view
-            .snapshot()
-            .interactions
-            .iter()
-            .find(|interaction| interaction.interaction_id == interaction_id)
-    }
-
     /// Return active plugin-owned session status contributions.
     pub fn plugin_status(
         &self,
@@ -2406,47 +2392,6 @@ impl BmuxApp {
             SessionEventKind::ToolInvocationStream { event } => {
                 self.apply_tool_stream_event(event, application);
             }
-            SessionEventKind::InteractiveToolRequestCreated {
-                interaction_id,
-                tool_call_id,
-                tool_name,
-                surface_kind,
-                request_json,
-                required,
-                ..
-            } => {
-                self.transcript.push(interactive_tool_request_item(
-                    interaction_id,
-                    tool_call_id,
-                    tool_name,
-                    surface_kind,
-                    request_json,
-                    *required,
-                ));
-                if application.live_activity() {
-                    self.set_activity(ActivityState::WaitingInteraction {
-                        name: tool_name.to_owned(),
-                    });
-                }
-            }
-            SessionEventKind::InteractiveToolRequestResolved {
-                interaction_id,
-                tool_call_id,
-                resolution_json,
-            } => {
-                if self.resolve_interactive_surface_tool_result(
-                    interaction_id,
-                    tool_call_id,
-                    resolution_json,
-                ) {
-                    return;
-                }
-                self.transcript.push(interactive_tool_resolution_item(
-                    interaction_id,
-                    tool_call_id,
-                    resolution_json,
-                ));
-            }
             SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
@@ -3066,52 +3011,6 @@ impl BmuxApp {
             name: tool_name.to_owned(),
         });
         self.status = tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
-    }
-
-    fn resolve_interactive_surface_tool_result(
-        &mut self,
-        interaction_id: &str,
-        tool_call_id: &str,
-        resolution_json: &str,
-    ) -> bool {
-        let Some((tool_name, _request_json, state_json)) =
-            self.transcript
-                .items()
-                .iter()
-                .find_map(|item| match item.kind() {
-                    TranscriptItemKind::InteractiveToolRequest {
-                        interaction_id: item_interaction_id,
-                        tool_call_id: item_tool_call_id,
-                        tool_name,
-                        surface_kind: _,
-                        request_json,
-                        ..
-                    } if item_interaction_id == interaction_id
-                        && item_tool_call_id == tool_call_id =>
-                    {
-                        Some((
-                            tool_name.clone(),
-                            request_json.clone(),
-                            submitted_interactive_payload_json(resolution_json)?,
-                        ))
-                    }
-                    _ => None,
-                })
-        else {
-            return false;
-        };
-        self.transcript.retain(|item| {
-            !item_is_interactive_submission_surface_for_tool_call(item, tool_call_id)
-        });
-        self.transcript.push(tool_result_item(
-            tool_call_id,
-            Some(&tool_name),
-            None,
-            &format!("interactive submission\n{state_json}"),
-            false,
-        ));
-        self.finish_tool_request_preview(tool_call_id);
-        true
     }
 
     fn push_permission_request(&mut self, input: PermissionRequestInput<'_>) {
@@ -4632,29 +4531,6 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
 }
 
-fn item_is_interactive_submission_surface_for_tool_call(
-    item: &TranscriptItem,
-    tool_call_id: &str,
-) -> bool {
-    item_is_tool_surface_for_tool_call(
-        item,
-        tool_call_id,
-        &[
-            ToolTranscriptSurface::Result,
-            ToolTranscriptSurface::Interaction,
-        ],
-    )
-}
-
-fn submitted_interactive_payload_json(resolution_json: &str) -> Option<String> {
-    let resolution = serde_json::from_str::<serde_json::Value>(resolution_json).ok()?;
-    let payload = resolution
-        .get("payload")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    serde_json::to_string_pretty(&payload).ok()
-}
-
 fn enrich_tool_request_visual_runtime(
     visual: &mut bcode_session_models::PluginVisualDescriptor,
     tool_call_id: &str,
@@ -4709,8 +4585,6 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
             TranscriptItemKind::ToolRequest { tool_call_id, .. }
             | TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. }
             | TranscriptItemKind::ToolResult { tool_call_id, .. }
-            | TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
-            | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
             | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
                 ids.insert(tool_call_id.clone());
             }
@@ -4738,8 +4612,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::ToolCallRequested { .. }
         | SessionEventKind::ToolCallFinished { .. }
-        | SessionEventKind::InteractiveToolRequestCreated { .. }
-        | SessionEventKind::InteractiveToolRequestResolved { .. }
+        | SessionEventKind::ToolInvocationResultRecorded { .. }
         | SessionEventKind::PermissionRequested { .. }
         | SessionEventKind::PermissionResolved { .. }
         | SessionEventKind::ModelUsage { .. }
@@ -4886,7 +4759,7 @@ mod tests {
             provenance: None,
             kind,
         };
-        let events = vec![
+        let events = [
             event(
                 1,
                 SessionEventKind::AssistantReasoningMessage {
@@ -4963,30 +4836,6 @@ mod tests {
                     progress_at_ms: Some(7),
                 },
             ),
-            event(
-                8,
-                SessionEventKind::InteractiveToolRequestCreated {
-                    interaction_id: "interaction-1".to_owned(),
-                    tool_call_id: "tool-1".to_owned(),
-                    tool_name: "question".to_owned(),
-                    interaction_kind: Some("bcode.question".to_owned()),
-                    surface_kind: "bcode.question.inline".to_owned(),
-                    request_json: r#"{"questions":[]}"#.to_owned(),
-                    required: true,
-                    turn_behavior:
-                        bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
-                    render_target:
-                        bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall,
-                },
-            ),
-            event(
-                9,
-                SessionEventKind::InteractiveToolRequestResolved {
-                    interaction_id: "interaction-1".to_owned(),
-                    tool_call_id: "tool-1".to_owned(),
-                    resolution_json: r#"{"type":"submitted"}"#.to_owned(),
-                },
-            ),
         ];
         let mut app = BmuxApp::new_with_history(Some(session_id), &events[..5], &[], false);
         for event in &events[5..] {
@@ -5038,16 +4887,6 @@ mod tests {
                 && work.message.as_deref() == Some("halfway")
                 && work.completed_units == Some(1)
                 && work.total_units == Some(2)
-        }));
-        assert!(legacy.iter().any(|item| matches!(
-            item.kind(),
-            super::super::transcript::TranscriptItemKind::ToolResult {
-                tool_call_id,
-                ..
-            } if tool_call_id == "tool-1" && item.text.contains("interactive submission")
-        )));
-        assert!(shared.interactions.iter().any(|interaction| {
-            interaction.interaction_id == "interaction-1" && interaction.resolved
         }));
     }
 

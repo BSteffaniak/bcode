@@ -750,6 +750,7 @@ fn execute_direct_tool_variant(
             tool_call_id: format!("eval-{}-{}-{}", suite.id, case.id, variant.id),
             name: config.tool_name.clone(),
             arguments: config.arguments.clone(),
+            preparation_descriptor: serde_json::Value::Null,
             cwd: Some(workspace.to_path_buf()),
             artifact_dir: Some(rep_dir.to_path_buf()),
         };

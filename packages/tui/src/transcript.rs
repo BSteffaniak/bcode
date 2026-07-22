@@ -76,30 +76,6 @@ pub enum TranscriptItemKind {
         /// Model turn identifier.
         turn_id: String,
     },
-    /// Host-owned interactive tool request.
-    InteractiveToolRequest {
-        /// Interaction identifier.
-        interaction_id: String,
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// Tool name.
-        tool_name: String,
-        /// Surface renderer key.
-        surface_kind: String,
-        /// Raw plugin-owned request JSON.
-        request_json: String,
-        /// Whether the interaction is required by the tool surface.
-        required: bool,
-    },
-    /// Host-owned interactive tool request resolution.
-    InteractiveToolResolution {
-        /// Interaction identifier.
-        interaction_id: String,
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// Generic core resolution JSON.
-        resolution_json: String,
-    },
     /// Permission request for a tool call.
     PermissionRequest {
         /// Permission identifier.
@@ -143,64 +119,6 @@ struct ToolCallContext {
     arguments_json: String,
     working_directory: Option<std::path::PathBuf>,
     request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
-}
-
-/// Lifecycle surface for a tool-related transcript item.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToolTranscriptSurface {
-    /// Durable request context for what tool/arguments were requested.
-    Request,
-    /// Live-only argument preview used as richer request context.
-    LiveArgumentPreview,
-    /// Generic or semantic tool result.
-    Result,
-    /// Permission or interactive tool request/resolution flow.
-    Interaction,
-}
-
-/// Return the tool call id and lifecycle surface for a tool transcript item.
-#[must_use]
-pub const fn tool_surface_for_item(item: &TranscriptItem) -> Option<(&str, ToolTranscriptSurface)> {
-    match item.kind() {
-        TranscriptItemKind::ToolRequest { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::Request))
-        }
-        TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. } => Some((
-            tool_call_id.as_str(),
-            ToolTranscriptSurface::LiveArgumentPreview,
-        )),
-        TranscriptItemKind::ToolResult { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::Result))
-        }
-        TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
-        | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
-        | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::Interaction))
-        }
-        TranscriptItemKind::UserMessage
-        | TranscriptItemKind::AssistantMessage
-        | TranscriptItemKind::ReasoningMessage
-        | TranscriptItemKind::Usage { .. }
-        | TranscriptItemKind::PermissionResult { .. }
-        | TranscriptItemKind::System
-        | TranscriptItemKind::Meta
-        | TranscriptItemKind::Skill
-        | TranscriptItemKind::SkillError
-        | TranscriptItemKind::ToolContribution { .. }
-        | TranscriptItemKind::Generic => None,
-    }
-}
-
-/// Return whether `item` belongs to one of `surfaces` for `tool_call_id`.
-#[must_use]
-pub fn item_is_tool_surface_for_tool_call(
-    item: &TranscriptItem,
-    tool_call_id: &str,
-    surfaces: &[ToolTranscriptSurface],
-) -> bool {
-    tool_surface_for_item(item).is_some_and(|(item_tool_call_id, surface)| {
-        item_tool_call_id == tool_call_id && surfaces.contains(&surface)
-    })
 }
 
 /// Stable identity for a rendered transcript item.
@@ -790,55 +708,6 @@ pub fn tool_contribution_item(
     )
 }
 
-/// Build an interactive tool request item.
-#[must_use]
-pub fn interactive_tool_request_item(
-    interaction_id: &str,
-    tool_call_id: &str,
-    tool_name: &str,
-    surface_kind: &str,
-    request_json: &str,
-    required: bool,
-) -> TranscriptItem {
-    let label = if required { "required" } else { "optional" };
-    let text = format!(
-        "interactive request ({label}) via {surface_kind}:\n{}",
-        pretty_jsonish(request_json)
-    );
-    TranscriptItem::with_kind(
-        "Interactive tool",
-        text,
-        false,
-        TranscriptItemKind::InteractiveToolRequest {
-            interaction_id: interaction_id.to_owned(),
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: tool_name.to_owned(),
-            surface_kind: surface_kind.to_owned(),
-            request_json: request_json.to_owned(),
-            required,
-        },
-    )
-}
-
-/// Build an interactive tool resolution item.
-#[must_use]
-pub fn interactive_tool_resolution_item(
-    interaction_id: &str,
-    tool_call_id: &str,
-    resolution_json: &str,
-) -> TranscriptItem {
-    TranscriptItem::with_kind(
-        "Interactive tool",
-        format!("interactive request resolved: {interaction_id}"),
-        false,
-        TranscriptItemKind::InteractiveToolResolution {
-            interaction_id: interaction_id.to_owned(),
-            tool_call_id: tool_call_id.to_owned(),
-            resolution_json: resolution_json.to_owned(),
-        },
-    )
-}
-
 /// Build a transcript item for a permission request.
 #[must_use]
 pub fn permission_request_item(
@@ -1243,31 +1112,6 @@ fn non_streaming_transcript_item_from_event(
             };
             generic_tool_result_item_from_projection(&projection)
         }
-        SessionEventKind::InteractiveToolRequestCreated {
-            interaction_id,
-            tool_call_id,
-            tool_name,
-            surface_kind,
-            request_json,
-            required,
-            ..
-        } => Some(interactive_tool_request_item(
-            interaction_id,
-            tool_call_id,
-            tool_name,
-            surface_kind,
-            request_json,
-            *required,
-        )),
-        SessionEventKind::InteractiveToolRequestResolved {
-            interaction_id,
-            tool_call_id,
-            resolution_json,
-        } => Some(interactive_tool_resolution_item(
-            interaction_id,
-            tool_call_id,
-            resolution_json,
-        )),
         SessionEventKind::PermissionRequested {
             permission_id,
             tool_call_id,

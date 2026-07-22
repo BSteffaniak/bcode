@@ -7,18 +7,18 @@
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
-    ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, InteractionInputResponse,
-    InteractionSnapshotResponse, InteractiveToolRequestSummary, IpcEndpoint, LocalIpcStream,
-    PermissionSummary, PluginContributions, PluginServiceResponse, PluginServiceSummary,
-    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest,
-    RalphListIterationsRequest, RalphListIterationsResponse, RalphListRunsRequest,
-    RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse, RalphRunRequest,
-    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
-    RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
-    SessionCatalogSourceStatus, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
-    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
-    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
-    default_endpoint, recv_envelope, request_envelope, send_envelope,
+    ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
+    LocalIpcStream, PendingToolExchangeSummary, PermissionSummary, PluginContributions,
+    PluginServiceResponse, PluginServiceSummary, RalphApproveRequest, RalphCancelRequest,
+    RalphCancelResponse, RalphLifecycleRequest, RalphListIterationsRequest,
+    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
+    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
+    RalphRunStatusResponse, RalphStatusRequest, RalphStatusResponse, Request, Response,
+    ResponsePayload, ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus,
+    SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
+    WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
+    decode_event, decode_response, default_endpoint, recv_envelope, request_envelope,
+    send_envelope,
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionEvent, SessionEventKind,
@@ -332,6 +332,7 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
             request: resolved.request,
             env,
         },
+        interaction_adapters: Vec::new(),
         env_keys,
     })
 }
@@ -756,6 +757,19 @@ impl BcodeClient {
     #[must_use]
     pub fn with_runtime_context(mut self, runtime_context: Option<ClientRuntimeContext>) -> Self {
         self.runtime_context = runtime_context;
+        self
+    }
+
+    /// Attach renderer interaction adapters to future connections.
+    #[must_use]
+    pub fn with_interaction_adapters(
+        mut self,
+        interaction_adapters: Vec<
+            bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability,
+        >,
+    ) -> Self {
+        let context = self.runtime_context.get_or_insert_default();
+        context.interaction_adapters = interaction_adapters;
         self
     }
 
@@ -2099,87 +2113,44 @@ impl BcodeClient {
         }
     }
 
-    /// List pending interactive tool requests.
+    /// List pending renderer-neutral tool exchanges.
     ///
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn list_interactive_tool_requests(
+    pub async fn list_pending_tool_exchanges(
         &self,
-    ) -> Result<Vec<InteractiveToolRequestSummary>, ClientError> {
-        match self
-            .send_request(Request::ListInteractiveToolRequests)
-            .await?
-        {
-            ResponsePayload::InteractiveToolRequestList { requests } => Ok(requests),
+    ) -> Result<Vec<PendingToolExchangeSummary>, ClientError> {
+        match self.send_request(Request::ListPendingToolExchanges).await? {
+            ResponsePayload::PendingToolExchangeList { exchanges } => Ok(exchanges),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
 
-    /// Return a renderer-neutral snapshot for a pending interaction.
+    /// Resolve a pending renderer-neutral tool exchange.
     ///
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn interaction_snapshot(
+    pub async fn resolve_tool_exchange(
         &self,
-        interaction_id: String,
-    ) -> Result<Option<InteractionSnapshotResponse>, ClientError> {
-        match self
-            .send_request(Request::GetInteractionSnapshot { interaction_id })
-            .await?
-        {
-            ResponsePayload::InteractionSnapshot { snapshot } => Ok(snapshot),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Submit renderer-neutral input to a pending interaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn submit_interaction_input(
-        &self,
-        interaction_id: String,
-        input: bcode_tool::InteractionInput,
-    ) -> Result<InteractionInputResponse, ClientError> {
-        match self
-            .send_request(Request::SubmitInteractionInput {
-                interaction_id,
-                input,
-            })
-            .await?
-        {
-            ResponsePayload::InteractionInputSubmitted { response } => Ok(response),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Resolve a pending interactive tool request.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn resolve_interactive_tool_request(
-        &self,
-        interaction_id: String,
-        resolution: bcode_session_models::InteractiveToolResolution,
+        exchange_id: String,
+        resolution: bcode_session_models::ToolExchangeResolution,
     ) -> Result<bool, ClientError> {
         match self
-            .send_request(Request::ResolveInteractiveToolRequest {
-                interaction_id,
+            .send_request(Request::ResolveToolExchange {
+                exchange_id,
                 resolution_json: serde_json::to_value(resolution).unwrap_or_else(|error| {
                     serde_json::json!({
-                        "type": "aborted",
-                        "reason": "host_error",
+                        "status": "failed",
+                        "code": "resolution_encode_failed",
                         "message": error.to_string(),
                     })
                 }),
             })
             .await?
         {
-            ResponsePayload::InteractiveToolRequestResolved { resolved } => Ok(resolved),
+            ResponsePayload::ToolExchangeResolved { resolved } => Ok(resolved),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

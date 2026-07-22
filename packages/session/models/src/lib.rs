@@ -156,6 +156,13 @@ pub fn apply_tool_invocation_projection_event(
             projection.is_error = Some(*is_error);
             projection.raw_result.clone_from(semantic_result);
         }
+        SessionEventKind::ToolInvocationResultRecorded { record } => {
+            let projection = tool_invocation_projection_mut(projections, &record.invocation_id);
+            projection.status = ToolInvocationProjectionStatus::Finished;
+            projection.result_text = Some(record.model_output.clone());
+            projection.is_error = Some(record.is_error);
+            projection.raw_result.clone_from(&record.result);
+        }
         _ => {}
     }
 }
@@ -249,7 +256,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 35;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 37;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -1022,58 +1029,6 @@ pub struct ProjectionWindow {
     pub scanned_events: usize,
 }
 
-/// Core-understood resolution for an interactive tool request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum InteractiveToolResolution {
-    /// Host submitted a surface/plugin-owned payload.
-    Submitted { payload: serde_json::Value },
-    /// Host/runtime could not complete the interaction.
-    Aborted {
-        reason: InteractiveToolAbortReason,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-    },
-}
-
-/// Infrastructure-level reason an interactive tool request could not be submitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InteractiveToolAbortReason {
-    /// User dismissed the host-owned interaction UI.
-    UserDismissed,
-    /// The model turn was cancelled before submission.
-    TurnCancelled,
-    /// The client that owned the interaction detached before submission.
-    ClientDetached,
-    /// The interaction timed out before submission.
-    Timeout,
-    /// No host surface could render this interaction kind.
-    UnsupportedSurface,
-    /// Host-side error prevented submission.
-    HostError,
-}
-
-/// How an interactive tool request affects the active model turn.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InteractiveToolTurnBehavior {
-    /// Suspend the tool call and model turn until the interaction is resolved.
-    #[default]
-    AwaitBeforeContinuing,
-    /// Finish the tool call while leaving the interaction answerable in the transcript.
-    CompleteTurnWithPendingInteraction,
-}
-
-/// Host render target for an interactive tool request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InteractiveToolRenderTarget {
-    /// Render inside the transcript tool-call block.
-    #[default]
-    TranscriptToolCall,
-}
-
 /// Typed semantic data returned by a tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1084,6 +1039,20 @@ pub enum ToolInvocationResult {
     Json { value: String },
     /// Opaque plugin artifact rendered by visual adapters.
     Artifact { artifact: Box<ToolArtifact> },
+}
+
+/// Durable renderer-neutral terminal result of one tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInvocationResultRecord {
+    /// Invocation that produced this result.
+    pub invocation_id: String,
+    /// Model-visible text returned by the invocation.
+    pub model_output: String,
+    /// Whether the invocation reported an error.
+    pub is_error: bool,
+    /// Optional typed semantic result supplied by the tool owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ToolInvocationResult>,
 }
 
 /// Opaque artifact produced by a tool plugin and rendered by visual adapters.
@@ -2055,25 +2024,13 @@ pub enum SessionEventKind {
         #[serde(default)]
         summary: Option<String>,
     },
-    InteractiveToolRequestCreated {
-        interaction_id: String,
-        tool_call_id: String,
-        tool_name: String,
-        #[serde(default)]
-        interaction_kind: Option<String>,
-        surface_kind: String,
-        request_json: String,
-        #[serde(default)]
-        required: bool,
-        #[serde(default)]
-        turn_behavior: InteractiveToolTurnBehavior,
-        #[serde(default)]
-        render_target: InteractiveToolRenderTarget,
+    /// Renderer-neutral exchange request emitted while an invocation remains active.
+    ToolExchangeRequested {
+        request: ToolExchangeRequest,
     },
-    InteractiveToolRequestResolved {
-        interaction_id: String,
-        tool_call_id: String,
-        resolution_json: String,
+    /// Terminal renderer-neutral exchange resolution.
+    ToolExchangeResolved {
+        event: ToolExchangeResolutionEvent,
     },
     /// Provider-native context installed at a durable compaction boundary.
     ProviderContextCompacted {
@@ -2105,19 +2062,71 @@ pub enum SessionEventKind {
     ToolContribution {
         event: ToolContributionEvent,
     },
-    /// Renderer-neutral exchange request emitted while an invocation remains active.
-    ToolExchangeRequested {
-        request: ToolExchangeRequest,
-    },
-    /// Terminal renderer-neutral exchange resolution.
-    ToolExchangeResolved {
-        event: ToolExchangeResolutionEvent,
+    /// Durable renderer-neutral terminal result for one tool invocation.
+    ToolInvocationResultRecorded {
+        record: ToolInvocationResultRecord,
     },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_result_record_finishes_projection_and_late_stream_cannot_revive_it() {
+        let session_id = SessionId::new();
+        let mut projections = BTreeMap::new();
+        let session_event = |sequence, kind| SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        apply_tool_invocation_projection_event(
+            &mut projections,
+            &session_event(
+                1,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "done".to_owned(),
+                        is_error: false,
+                        result: Some(ToolInvocationResult::Text {
+                            text: "semantic".to_owned(),
+                        }),
+                    },
+                },
+            ),
+        );
+        apply_tool_invocation_projection_event(
+            &mut projections,
+            &session_event(
+                2,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "call-1".to_owned(),
+                        stream: ToolOutputStream::Stdout,
+                        sequence: 2,
+                        text: "late".to_owned(),
+                        byte_len: 4,
+                    },
+                },
+            ),
+        );
+
+        let projection = projections.get("call-1").expect("generic projection");
+        assert_eq!(projection.status, ToolInvocationProjectionStatus::Finished);
+        assert_eq!(projection.result_text.as_deref(), Some("done"));
+        assert_eq!(
+            projection.raw_result,
+            Some(ToolInvocationResult::Text {
+                text: "semantic".to_owned(),
+            })
+        );
+        assert!(projection.stream_output.is_none());
+    }
 
     #[test]
     fn turn_receipt_derives_the_existing_model_work_identity() {
@@ -2196,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_admission_metadata_defaults_to_interactive_tools_enabled() {
+    fn turn_admission_metadata_defaults_to_tools_enabled() {
         let metadata = TurnAdmissionMetadata::default();
 
         assert_eq!(metadata.origin, None);

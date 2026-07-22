@@ -625,6 +625,23 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 
 #[cfg(feature = "static-bundled")]
 #[must_use]
+pub fn question_interaction_adapter(
+    platform_id: &str,
+) -> bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+    bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+        producer_id: "bcode.question".to_owned(),
+        exchange_schema: QUESTION_EXCHANGE_SCHEMA.to_owned(),
+        min_schema_version: 1,
+        max_schema_version: 1,
+        platform_id: platform_id.to_owned(),
+        priority: 100,
+        interaction_kind: QUESTION_INTERACTION_KIND.to_owned(),
+        tui_surface_kind: (platform_id == "tui").then(|| QUESTION_INLINE_SURFACE.to_owned()),
+    }
+}
+
+#[cfg(feature = "static-bundled")]
+#[must_use]
 pub fn question_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
     let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
     registry.register_interaction::<question_interaction::QuestionInteractionController>();

@@ -4320,6 +4320,7 @@ mod tests {
                         .invoke_service(ToolInvocationServiceRequest {
                             invocation_id: invocation_id.clone(),
                             request_id: "service".to_string(),
+                            route_id: None,
                             interface_id: "test.service/v1".to_string(),
                             operation: "execute".to_string(),
                             payload: serde_json::Value::Null,

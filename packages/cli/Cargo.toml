@@ -109,7 +109,10 @@ static-bundled-plugins = [
     "static-bundled-worktree-plugin",
     "bcode_tui/static-bundled-plugins",
 ]
-static-bundled-question-plugin = ["_static-bundled"]
+static-bundled-question-plugin = [
+    "_static-bundled",
+    "bcode_web_render/static-bundled-question-plugin",
+]
 static-bundled-ralph-plugin = [
     "_static-bundled",
     "bcode_tui/static-bundled-ralph-plugin",

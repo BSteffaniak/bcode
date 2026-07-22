@@ -3,9 +3,10 @@ name    = "Bcode OpenAI-Compatible Provider"
 version = "0.0.1"
 
 [[services]]
-description  = "OpenAI-compatible chat completions model provider"
-interface_id = "bcode.model-provider/v1"
-name         = "OpenAI-Compatible Model Provider"
+description           = "OpenAI-compatible chat completions model provider"
+interface_id          = "bcode.model-provider/v1"
+invocation_operations = ["native_web_search"]
+name                  = "OpenAI-Compatible Model Provider"
 
 [concurrency]
 type = "concurrent"

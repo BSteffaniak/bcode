@@ -61,8 +61,7 @@ use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, Metrics
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
     ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
-    ModelParameters, ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse,
-    OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH,
+    ModelParameters, ModelTurnRequest, OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
     OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
@@ -96,11 +95,10 @@ use bcode_skill_models::{
     SkillToolPolicyTarget,
 };
 use bcode_tool::{
-    InteractiveToolResolution, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL,
-    TOOL_SERVICE_INTERFACE_ID, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
-    ToolDefinition as ServiceToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
-    ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationRequest, ToolInvocationResponse,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL, TOOL_SERVICE_INTERFACE_ID,
+    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolDefinition as ServiceToolDefinition,
+    ToolExchangeRequest, ToolExchangeResolution, ToolInvocationDescriptor, ToolInvocationInput,
+    ToolInvocationInputResolution, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
     ToolList, ToolOutputStream, ToolPreparationRequest, ToolPreparationResponse, ToolResultContent,
@@ -213,7 +211,7 @@ pub struct ServerState {
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
-    pending_interactive_tools: Mutex<BTreeMap<String, PendingInteractiveToolRequest>>,
+    pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     active_contributions: Arc<StdMutex<BTreeMap<ActiveContributionKey, ToolContributionEvent>>>,
@@ -1020,19 +1018,17 @@ impl Drop for PendingPermissionBatchRegistration {
 }
 
 #[derive(Clone)]
-struct PendingInteractiveToolRequest {
-    summary: bcode_ipc::InteractiveToolRequestSummary,
-    controller: Option<Arc<Mutex<bcode_plugin_sdk::interaction::BoxedPluginInteractionController>>>,
-    resolution: Arc<Mutex<Option<InteractiveToolResolution>>>,
+struct PendingToolExchange {
+    summary: bcode_ipc::PendingToolExchangeSummary,
+    resolution: Arc<Mutex<Option<ToolExchangeResolution>>>,
     notify: Arc<Notify>,
 }
 
-impl std::fmt::Debug for PendingInteractiveToolRequest {
+impl std::fmt::Debug for PendingToolExchange {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("PendingInteractiveToolRequest")
+            .debug_struct("PendingToolExchange")
             .field("summary", &self.summary)
-            .field("has_controller", &self.controller.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1114,7 +1110,7 @@ impl ServerState {
             session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
             pending_permission_batches: Arc::new(StdMutex::default()),
-            pending_interactive_tools: Mutex::default(),
+            pending_tool_exchanges: Mutex::default(),
             active_plugin_invocations: Arc::default(),
             active_artifacts: Arc::default(),
             active_contributions: Arc::default(),
@@ -1145,6 +1141,7 @@ impl ServerState {
     async fn unregister_client(&self, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
         self.client_runtime_contexts.lock().await.remove(&client_id);
+        self.resolve_exchanges_without_consumers().await;
         self.client_session_namespaces
             .lock()
             .await
@@ -1154,6 +1151,31 @@ impl ServerState {
             .await
             .remove(&client_id);
         self.unregister_catalog_event_client(client_id).await;
+    }
+
+    async fn resolve_exchanges_without_consumers(&self) {
+        let contexts = self.client_runtime_contexts.lock().await;
+        let mut pending = self.pending_tool_exchanges.lock().await;
+        let entries = std::mem::take(&mut *pending);
+        let (retained, detached): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            entries.into_iter().partition(|(_, exchange)| {
+                contexts.values().any(|context| {
+                    context.interaction_adapters.iter().any(|adapter| {
+                        adapter.producer_id == exchange.summary.request.producer_id
+                            && adapter.supports(
+                                &exchange.summary.request.schema,
+                                exchange.summary.request.schema_version,
+                            )
+                    })
+                })
+            });
+        *pending = retained;
+        drop(contexts);
+        drop(pending);
+        for exchange in detached.into_values() {
+            *exchange.resolution.lock().await = Some(ToolExchangeResolution::ConsumerDetached);
+            exchange.notify.notify_waiters();
+        }
     }
 
     async fn attach_client_session(&self, client_id: ClientId, session_id: SessionId) {
@@ -1291,11 +1313,20 @@ impl ServerState {
         context: Option<ClientRuntimeContext>,
     ) {
         let mut contexts = self.client_runtime_contexts.lock().await;
-        if let Some(context) = context {
+        if let Some(mut context) = context {
+            if context.interaction_adapters.is_empty()
+                && let Some(existing) = contexts.get(&client_id)
+            {
+                context
+                    .interaction_adapters
+                    .clone_from(&existing.interaction_adapters);
+            }
             contexts.insert(client_id, context);
         } else {
             contexts.remove(&client_id);
         }
+        drop(contexts);
+        self.resolve_exchanges_without_consumers().await;
     }
 
     async fn client_runtime_context(&self, client_id: ClientId) -> Option<ClientRuntimeContext> {
@@ -1304,6 +1335,36 @@ impl ServerState {
             .await
             .get(&client_id)
             .cloned()
+    }
+
+    async fn client_supports_exchange(
+        &self,
+        client_id: ClientId,
+        request: &ToolExchangeRequest,
+    ) -> bool {
+        self.client_runtime_contexts
+            .lock()
+            .await
+            .get(&client_id)
+            .is_some_and(|context| {
+                context.interaction_adapters.iter().any(|adapter| {
+                    adapter.supports(&request.schema, request.schema_version)
+                        && request.producer_id == adapter.producer_id
+                })
+            })
+    }
+
+    async fn has_exchange_consumer(&self, request: &ToolExchangeRequest) -> bool {
+        self.client_runtime_contexts
+            .lock()
+            .await
+            .values()
+            .any(|context| {
+                context.interaction_adapters.iter().any(|adapter| {
+                    adapter.supports(&request.schema, request.schema_version)
+                        && request.producer_id == adapter.producer_id
+                })
+            })
     }
 
     async fn set_client_session_namespace(&self, client_id: ClientId, namespace: String) {
@@ -2282,10 +2343,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CloneSession { .. } => "clone_session",
         Request::RefreshSessionCatalog { .. } => "refresh_session_catalog",
         Request::AttachSessionProjectionWindow { .. } => "attach_session_projection_window",
-        Request::ListInteractiveToolRequests => "list_interactive_tool_requests",
-        Request::GetInteractionSnapshot { .. } => "get_interaction_snapshot",
-        Request::SubmitInteractionInput { .. } => "submit_interaction_input",
-        Request::ResolveInteractiveToolRequest { .. } => "resolve_interactive_tool_request",
+        Request::ListPendingToolExchanges => "list_pending_tool_exchanges",
+        Request::ResolveToolExchange { .. } => "resolve_tool_exchange",
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
@@ -2701,22 +2760,24 @@ async fn handle_request_inner(
             handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
                 .await
         }
-        request => handle_remaining_request(request, request_id, state, writer).await,
+        request => handle_remaining_request(request, request_id, client_id, state, writer).await,
     }
 }
 
 async fn handle_remaining_request(
     request: Request,
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    handle_agent_permission_plugin_request(request, request_id, state, writer).await
+    handle_agent_permission_plugin_request(request, request_id, client_id, state, writer).await
 }
 
 async fn handle_agent_permission_plugin_request(
     request: Request,
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
@@ -2745,11 +2806,10 @@ async fn handle_agent_permission_plugin_request(
         Request::ListPermissions
         | Request::ResolvePermission { .. }
         | Request::ResolvePermissionBatch { .. }
-        | Request::ListInteractiveToolRequests
-        | Request::GetInteractionSnapshot { .. }
-        | Request::SubmitInteractionInput { .. }
-        | Request::ResolveInteractiveToolRequest { .. } => {
-            handle_permission_interaction_request(request, request_id, state, writer).await
+        | Request::ListPendingToolExchanges
+        | Request::ResolveToolExchange { .. } => {
+            handle_permission_interaction_request(request, request_id, client_id, state, writer)
+                .await
         }
         Request::AddPermissionRule {
             agent_id,
@@ -2815,6 +2875,7 @@ async fn handle_agent_permission_plugin_request(
 async fn handle_permission_interaction_request(
     request: Request,
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
@@ -2838,34 +2899,74 @@ async fn handle_permission_interaction_request(
         Request::ResolvePermissionBatch { batch_id, approved } => {
             handle_resolve_permission_batch(request_id, state, writer, &batch_id, approved).await
         }
-        Request::ListInteractiveToolRequests => {
-            handle_list_interactive_tool_requests(request_id, state, writer).await
+        Request::ListPendingToolExchanges => {
+            handle_list_pending_tool_exchanges(request_id, state, writer).await
         }
-        Request::GetInteractionSnapshot { interaction_id } => {
-            handle_get_interaction_snapshot(request_id, state, writer, &interaction_id).await
-        }
-        Request::SubmitInteractionInput {
-            interaction_id,
-            input,
-        } => {
-            handle_submit_interaction_input(request_id, state, writer, &interaction_id, input).await
-        }
-        Request::ResolveInteractiveToolRequest {
-            interaction_id,
+        Request::ResolveToolExchange {
+            exchange_id,
             resolution_json,
         } => {
             let resolution = serde_json::from_value(resolution_json)?;
-            handle_resolve_interactive_tool_request(
+            handle_resolve_tool_exchange(
                 request_id,
+                client_id,
                 state,
                 writer,
-                &interaction_id,
+                &exchange_id,
                 resolution,
             )
             .await
         }
         _ => unreachable!("request routed to permission/interaction handler"),
     }
+}
+
+const MAX_CLIENT_INTERACTION_ADAPTERS: usize = 64;
+const MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES: usize = 128;
+
+fn validate_client_interaction_adapters(
+    context: Option<&ClientRuntimeContext>,
+) -> Result<(), &'static str> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    if context.interaction_adapters.len() > MAX_CLIENT_INTERACTION_ADAPTERS {
+        return Err("too many interaction adapters");
+    }
+    let mut routes = BTreeSet::new();
+    for adapter in &context.interaction_adapters {
+        let identifiers = [
+            adapter.producer_id.as_str(),
+            adapter.exchange_schema.as_str(),
+            adapter.platform_id.as_str(),
+            adapter.interaction_kind.as_str(),
+        ];
+        if identifiers
+            .iter()
+            .any(|value| value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES)
+            || adapter.tui_surface_kind.as_deref().is_some_and(|value| {
+                value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES
+            })
+        {
+            return Err("interaction adapter identifiers must be non-empty and at most 128 bytes");
+        }
+        if adapter.min_schema_version == 0
+            || adapter.max_schema_version < adapter.min_schema_version
+        {
+            return Err("interaction adapter schema version range must be positive and ordered");
+        }
+        if !routes.insert((
+            adapter.producer_id.as_str(),
+            adapter.exchange_schema.as_str(),
+            adapter.min_schema_version,
+            adapter.max_schema_version,
+            adapter.platform_id.as_str(),
+            adapter.priority,
+        )) {
+            return Err("duplicate interaction adapter route");
+        }
+    }
+    Ok(())
 }
 
 async fn handle_update_client_runtime_context(
@@ -2875,6 +2976,14 @@ async fn handle_update_client_runtime_context(
     writer: &SharedWriter,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<(), ServerError> {
+    if let Err(message) = validate_client_interaction_adapters(runtime_context.as_ref()) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("invalid_interaction_adapters", message)),
+        )
+        .await;
+    }
     state
         .set_client_runtime_context(client_id, runtime_context)
         .await;
@@ -2905,6 +3014,14 @@ async fn handle_hello(
     runtime_context: Option<ClientRuntimeContext>,
     daemon_namespace: String,
 ) -> Result<(), ServerError> {
+    if let Err(message) = validate_client_interaction_adapters(runtime_context.as_ref()) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("invalid_interaction_adapters", message)),
+        )
+        .await;
+    }
     if client_name_supports_message_accepted(client_name) {
         state.register_message_accepted_client(client_id).await;
     }
@@ -9260,13 +9377,13 @@ async fn handle_list_permissions(
     .await
 }
 
-async fn handle_list_interactive_tool_requests(
+async fn handle_list_pending_tool_exchanges(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let requests = state
-        .pending_interactive_tools
+    let exchanges = state
+        .pending_tool_exchanges
         .lock()
         .await
         .values()
@@ -9275,143 +9392,63 @@ async fn handle_list_interactive_tool_requests(
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::InteractiveToolRequestList { requests }),
+        Response::Ok(ResponsePayload::PendingToolExchangeList { exchanges }),
     )
     .await
 }
 
-async fn handle_get_interaction_snapshot(
+async fn complete_pending_tool_exchange(
+    state: &ServerState,
+    request: &PendingToolExchange,
+    resolution: ToolExchangeResolution,
+) {
+    state
+        .pending_tool_exchanges
+        .lock()
+        .await
+        .remove(&request.summary.request.exchange_id);
+    *request.resolution.lock().await = Some(resolution);
+    request.notify.notify_waiters();
+}
+
+async fn handle_resolve_tool_exchange(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     interaction_id: &str,
+    resolution: ToolExchangeResolution,
 ) -> Result<(), ServerError> {
     let pending = state
-        .pending_interactive_tools
+        .pending_tool_exchanges
         .lock()
         .await
         .get(interaction_id)
         .cloned();
-    let snapshot = match pending {
-        Some(pending) => interaction_snapshot(&pending).await,
-        None => None,
-    };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::InteractionSnapshot { snapshot }),
-    )
-    .await
-}
-
-async fn handle_submit_interaction_input(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    interaction_id: &str,
-    input: bcode_tool::InteractionInput,
-) -> Result<(), ServerError> {
-    let Some(pending) = state
-        .pending_interactive_tools
-        .lock()
-        .await
-        .get(interaction_id)
-        .cloned()
-    else {
+    let Some(pending) = pending else {
         return send_response(
             writer,
             request_id,
-            Response::Ok(ResponsePayload::InteractionInputSubmitted {
-                response: bcode_ipc::InteractionInputResponse::None,
-            }),
+            Response::Ok(ResponsePayload::ToolExchangeResolved { resolved: false }),
         )
         .await;
     };
-    let Some(controller) = &pending.controller else {
+    if !state
+        .client_supports_exchange(client_id, &pending.summary.request)
+        .await
+    {
         return send_response(
             writer,
             request_id,
-            Response::Ok(ResponsePayload::InteractionInputSubmitted {
-                response: bcode_ipc::InteractionInputResponse::None,
-            }),
+            Response::Err(ErrorResponse::new(
+                "incompatible_exchange_consumer",
+                "client did not advertise a compatible exchange adapter",
+            )),
         )
         .await;
-    };
-    let output = controller.lock().await.handle_input(input);
-    let response = match output {
-        bcode_tool::InteractionOutput::None => bcode_ipc::InteractionInputResponse::None,
-        bcode_tool::InteractionOutput::Redraw => interaction_snapshot(&pending)
-            .await
-            .map_or(bcode_ipc::InteractionInputResponse::None, |snapshot| {
-                bcode_ipc::InteractionInputResponse::Redraw { snapshot }
-            }),
-        bcode_tool::InteractionOutput::Submitted { payload } => {
-            let resolution = InteractiveToolResolution::Submitted {
-                payload: payload.clone(),
-            };
-            complete_pending_interactive_tool_request(state, &pending, resolution).await;
-            bcode_ipc::InteractionInputResponse::Submitted { payload }
-        }
-        bcode_tool::InteractionOutput::Cancelled => {
-            let resolution = InteractiveToolResolution::Aborted {
-                reason: bcode_tool::InteractiveToolAbortReason::UserDismissed,
-                message: None,
-            };
-            complete_pending_interactive_tool_request(state, &pending, resolution).await;
-            bcode_ipc::InteractionInputResponse::Cancelled
-        }
-    };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::InteractionInputSubmitted { response }),
-    )
-    .await
-}
-
-async fn interaction_snapshot(
-    pending: &PendingInteractiveToolRequest,
-) -> Option<bcode_ipc::InteractionSnapshotResponse> {
-    let controller = pending.controller.as_ref()?;
-    let interaction_kind = pending.summary.interaction_kind.clone()?;
-    Some(bcode_ipc::InteractionSnapshotResponse {
-        interaction_id: pending.summary.interaction_id.clone(),
-        interaction_kind,
-        snapshot: controller.lock().await.snapshot_json(),
-    })
-}
-
-async fn complete_pending_interactive_tool_request(
-    state: &ServerState,
-    request: &PendingInteractiveToolRequest,
-    resolution: InteractiveToolResolution,
-) {
-    state
-        .pending_interactive_tools
-        .lock()
-        .await
-        .remove(&request.summary.interaction_id);
-    *request.resolution.lock().await = Some(resolution.clone());
-    request.notify.notify_waiters();
-    append_interactive_tool_request_resolved_event(
-        state,
-        request.summary.session_id,
-        request.summary.interaction_id.clone(),
-        request.summary.tool_call_id.clone(),
-        resolution,
-    )
-    .await;
-}
-
-async fn handle_resolve_interactive_tool_request(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    interaction_id: &str,
-    resolution: bcode_session_models::InteractiveToolResolution,
-) -> Result<(), ServerError> {
+    }
     let Some(request) = state
-        .pending_interactive_tools
+        .pending_tool_exchanges
         .lock()
         .await
         .remove(interaction_id)
@@ -9419,16 +9456,15 @@ async fn handle_resolve_interactive_tool_request(
         return send_response(
             writer,
             request_id,
-            Response::Ok(ResponsePayload::InteractiveToolRequestResolved { resolved: false }),
+            Response::Ok(ResponsePayload::ToolExchangeResolved { resolved: false }),
         )
         .await;
     };
-    let resolution = interactive_resolution_from_session(resolution);
-    complete_pending_interactive_tool_request(state, &request, resolution).await;
+    complete_pending_tool_exchange(state, &request, resolution).await;
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::InteractiveToolRequestResolved { resolved: true }),
+        Response::Ok(ResponsePayload::ToolExchangeResolved { resolved: true }),
     )
     .await
 }
@@ -14820,32 +14856,6 @@ async fn collect_tool_definitions(state: &ServerState) -> Vec<ServiceToolDefinit
     tools
 }
 
-async fn invoke_host_provider_native_search_response(
-    state: &ServerState,
-    session_id: SessionId,
-    tool_call_id: &str,
-    bridge_request: ModelNativeWebSearchServiceRequest,
-) -> Result<NativeWebSearchResponse, String> {
-    let selection = session_model_selection(state, session_id).await;
-    let request = NativeWebSearchRequest {
-        query: bridge_request.query,
-        max_results: bridge_request.max_results,
-        site: bridge_request.site,
-        freshness: bridge_request.freshness,
-        region: bridge_request.region,
-        safe_search: bridge_request.safe_search,
-        provider_context: selection.provider_context,
-        metadata: BTreeMap::from([("tool_call_id".to_string(), tool_call_id.to_string())]),
-    };
-    invoke_model_provider_json_blocking::<_, NativeWebSearchResponse>(
-        state,
-        selection.provider_plugin_id,
-        OP_NATIVE_WEB_SEARCH,
-        request,
-    )
-    .await
-}
-
 fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
     ToolInvocationResponse {
         output: output.into(),
@@ -14854,6 +14864,84 @@ fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
         full_output: None,
         result: None,
     }
+}
+
+const MAX_INVOCATION_SERVICE_OPERATIONS: usize = 32;
+const MAX_INVOCATION_SERVICE_IDENTIFIER_BYTES: usize = 128;
+
+async fn invocation_service_routes(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Vec<ServerInvocationServiceRoute> {
+    let selection = session_model_selection(state, session_id).await;
+    let target_plugin_id = selection.provider_plugin_id.or_else(|| {
+        state
+            .plugins
+            .registry()
+            .service_registry()
+            .unique_provider(MODEL_PROVIDER_INTERFACE_ID)
+            .ok()
+            .map(str::to_owned)
+    });
+    let Some(target_plugin_id) = target_plugin_id else {
+        return Vec::new();
+    };
+    let operations = state
+        .plugins
+        .registry()
+        .manifests()
+        .get(&target_plugin_id)
+        .and_then(|manifest| {
+            manifest
+                .services
+                .iter()
+                .find(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID)
+        })
+        .map(|service| service.invocation_operations.clone())
+        .unwrap_or_default();
+    if operations.is_empty()
+        || operations.len() > MAX_INVOCATION_SERVICE_OPERATIONS
+        || operations.iter().any(|operation| {
+            operation.is_empty() || operation.len() > MAX_INVOCATION_SERVICE_IDENTIFIER_BYTES
+        })
+        || operations.iter().collect::<BTreeSet<_>>().len() != operations.len()
+    {
+        return Vec::new();
+    }
+    vec![ServerInvocationServiceRoute {
+        advertised: bcode_tool::ToolInvocationServiceRoute {
+            route_id: format!("service-route:{target_plugin_id}:{MODEL_PROVIDER_INTERFACE_ID}"),
+            interface_id: MODEL_PROVIDER_INTERFACE_ID.to_owned(),
+            operations,
+        },
+        target_plugin_id: Some(target_plugin_id),
+        payload_overlay: serde_json::json!({
+            "provider_context": selection.provider_context,
+        }),
+    }]
+}
+
+#[derive(Debug)]
+struct ServerInvocationServiceRoute {
+    advertised: bcode_tool::ToolInvocationServiceRoute,
+    target_plugin_id: Option<String>,
+    payload_overlay: serde_json::Value,
+}
+
+async fn invocation_service_host_context(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Vec<bcode_tool::ToolHostContextEntry> {
+    let routes = invocation_service_routes(state, session_id)
+        .await
+        .into_iter()
+        .map(|route| route.advertised)
+        .collect::<Vec<_>>();
+    vec![bcode_tool::ToolHostContextEntry {
+        schema: bcode_tool::TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA.to_owned(),
+        schema_version: 1,
+        payload: serde_json::to_value(routes).unwrap_or(serde_json::Value::Null),
+    }]
 }
 
 async fn prepare_server_tool(
@@ -14870,7 +14958,7 @@ async fn prepare_server_tool(
             tool_name: call.name.clone(),
             arguments: call.arguments.clone(),
         },
-        host_context: Vec::new(),
+        host_context: invocation_service_host_context(state, session_id).await,
     };
     let preparation = state
         .plugins
@@ -15140,7 +15228,6 @@ async fn execute_model_tool_batch(
                         result: format!("tool preparation failed: {message}"),
                         is_error: true,
                         content: Vec::new(),
-                        output: None,
                         semantic_result: None,
                     }),
                 ));
@@ -15154,7 +15241,6 @@ async fn execute_model_tool_batch(
                         result: "tool preparation timed out".to_string(),
                         is_error: true,
                         content: Vec::new(),
-                        output: None,
                         semantic_result: None,
                     }),
                 ));
@@ -15172,7 +15258,6 @@ async fn execute_model_tool_batch(
                             result: format!("tool authorization facts invalid: {message}"),
                             is_error: true,
                             content: Vec::new(),
-                            output: None,
                             semantic_result: None,
                         }),
                     ));
@@ -15202,7 +15287,7 @@ async fn execute_model_tool_batch(
             working_directory,
             tool,
             policy_metadata,
-            preparation.authorization,
+            preparation,
         ));
     }
 
@@ -15214,11 +15299,11 @@ async fn execute_model_tool_batch(
         let authorization_requests = ready
             .iter()
             .map(
-                |(index, call, _, tool, _, facts)| ToolAuthorizationRequest {
+                |(index, call, _, tool, _, preparation)| ToolAuthorizationRequest {
                     index: *index,
                     call: call.clone(),
                     tool: tool.clone(),
-                    facts: facts.clone(),
+                    facts: preparation.authorization.clone(),
                     context: permission_context.clone(),
                 },
             )
@@ -15251,12 +15336,19 @@ async fn execute_model_tool_batch(
             return false;
         }
         let mut approved = Vec::new();
-        for ((index, call, working_directory, tool, policy_metadata, _), decision) in
+        for ((index, call, working_directory, tool, policy_metadata, preparation), decision) in
             ready.into_iter().zip(decisions)
         {
             match decision {
                 ToolAuthorizationDecision::Allow => {
-                    approved.push((index, call, working_directory, tool, policy_metadata));
+                    approved.push((
+                        index,
+                        call,
+                        working_directory,
+                        tool,
+                        policy_metadata,
+                        preparation.descriptor,
+                    ));
                 }
                 ToolAuthorizationDecision::Ask(reason)
                 | ToolAuthorizationDecision::Deny(reason) => results.push((
@@ -15266,7 +15358,6 @@ async fn execute_model_tool_batch(
                         result: reason,
                         is_error: true,
                         content: Vec::new(),
-                        output: None,
                         semantic_result: None,
                     }),
                 )),
@@ -15291,7 +15382,7 @@ async fn execute_model_tool_batch(
         };
         let execution_count = approved.len();
         let executions = stream::iter(approved.into_iter().map(
-            |(index, call, working_directory, tool, policy_metadata)| {
+            |(index, call, working_directory, tool, policy_metadata, preparation_descriptor)| {
                 let cancel_state = Arc::clone(&cancel_state);
                 let invocation_permits = invocation_permits.clone();
                 async move {
@@ -15303,7 +15394,6 @@ async fn execute_model_tool_batch(
                                 result: "server cannot invoke a non-plugin tool".to_string(),
                                 is_error: true,
                                 content: Vec::new(),
-                                output: None,
                                 semantic_result: None,
                             }),
                         );
@@ -15317,6 +15407,7 @@ async fn execute_model_tool_batch(
                             working_directory,
                             plugin_id,
                             policy_metadata,
+                            preparation_descriptor,
                             cancel_state,
                             invocation_permits,
                         )
@@ -15359,6 +15450,7 @@ async fn execute_model_tool(
     working_directory: std::path::PathBuf,
     plugin_id: String,
     policy_metadata: ToolPolicyAuthorizationMetadata,
+    preparation_descriptor: serde_json::Value,
     cancel_state: Arc<TurnCancelState>,
     invocation_permits: Option<Arc<Semaphore>>,
 ) -> Option<ToolFinishedEventInput> {
@@ -15425,6 +15517,7 @@ async fn execute_model_tool(
         &working_directory,
         &plugin_id,
         &policy_metadata,
+        preparation_descriptor,
         cancel_state.as_ref(),
         None,
     )
@@ -15500,7 +15593,6 @@ async fn execute_model_tool(
         result: result.output,
         is_error: result.is_error,
         content: result.content,
-        output: output_blob,
         semantic_result,
     })
 }
@@ -15810,24 +15902,6 @@ fn sync_artifact_directory(directory: &Path) -> std::io::Result<()> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ModelNativeWebSearchServiceRequest {
-    query: String,
-    #[serde(default)]
-    max_results: Option<usize>,
-    #[serde(default)]
-    site: Option<String>,
-    #[serde(default)]
-    freshness: Option<String>,
-    #[serde(default)]
-    region: Option<String>,
-    #[serde(default)]
-    safe_search: Option<String>,
-}
-
-const MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE: &str = "bcode.web-search.model-native/v1";
-const MODEL_NATIVE_WEB_SEARCH_OPERATION: &str = "search";
-
 struct ServerServiceRouter<'a> {
     state: &'a ServerState,
     session_id: SessionId,
@@ -15866,28 +15940,58 @@ impl InvocationServiceRouter for ServerServiceRouter<'_> {
             if self.cancel_state.is_cancelled() {
                 return ToolInvocationServiceResolution::Cancelled;
             }
-            if request.interface_id != MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE
-                || request.operation != MODEL_NATIVE_WEB_SEARCH_OPERATION
-            {
+            let Some(route_id) = request.route_id.as_deref() else {
                 return ToolInvocationServiceResolution::Unsupported;
-            }
-            let request =
-                match serde_json::from_value::<ModelNativeWebSearchServiceRequest>(request.payload)
-                {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return ToolInvocationServiceResolution::Failed {
-                            code: "invalid_request".to_string(),
-                            message: error.to_string(),
-                        };
-                    }
+            };
+            let Some(route) = invocation_service_routes(self.state, self.session_id)
+                .await
+                .into_iter()
+                .find(|route| {
+                    route.advertised.route_id == route_id
+                        && route.advertised.interface_id == request.interface_id
+                        && route
+                            .advertised
+                            .operations
+                            .iter()
+                            .any(|operation| operation == &request.operation)
+                })
+            else {
+                return ToolInvocationServiceResolution::Unsupported;
+            };
+            let Some(mut payload) = request.payload.as_object().cloned() else {
+                return ToolInvocationServiceResolution::Failed {
+                    code: "invalid_request".to_owned(),
+                    message: "routed service payload must be a JSON object".to_owned(),
                 };
-            let service = invoke_host_provider_native_search_response(
-                self.state,
-                self.session_id,
-                &self.call.id,
-                request,
-            );
+            };
+            if let Some(overlay) = route.payload_overlay.as_object() {
+                payload.extend(overlay.clone());
+            }
+            let target_plugin_id = match route.target_plugin_id {
+                Some(plugin_id) => plugin_id,
+                None => match self
+                    .state
+                    .plugins
+                    .registry()
+                    .service_registry()
+                    .unique_provider(&request.interface_id)
+                {
+                    Ok(plugin_id) => plugin_id.to_owned(),
+                    Err(_) => return ToolInvocationServiceResolution::Unsupported,
+                },
+            };
+            let routed_payload = serde_json::Value::Object(payload);
+            let service = self
+                .state
+                .plugins
+                .invoke_service_json_scoped::<_, serde_json::Value>(
+                    &target_plugin_id,
+                    &request.interface_id,
+                    &request.operation,
+                    &routed_payload,
+                    active_plugin_scope_for_tool_call(self.state, self.session_id, &self.call.id)
+                        .await,
+                );
             let response = tokio::select! {
                 biased;
                 () = self.cancel_state.cancelled() => {
@@ -15899,16 +16003,10 @@ impl InvocationServiceRouter for ServerServiceRouter<'_> {
                 return ToolInvocationServiceResolution::Cancelled;
             }
             match response {
-                Ok(response) => match serde_json::to_value(response) {
-                    Ok(payload) => ToolInvocationServiceResolution::Responded { payload },
-                    Err(error) => ToolInvocationServiceResolution::Failed {
-                        code: "response_encode_failed".to_string(),
-                        message: error.to_string(),
-                    },
-                },
+                Ok(payload) => ToolInvocationServiceResolution::Responded { payload },
                 Err(message) => ToolInvocationServiceResolution::Failed {
                     code: "service_failed".to_string(),
-                    message,
+                    message: message.to_string(),
                 },
             }
         })
@@ -15919,7 +16017,6 @@ struct ServerExchangeBroker<'a> {
     state: &'a ServerState,
     session_id: SessionId,
     call: &'a bcode_model::ToolCall,
-    plugin_id: &'a str,
     cancel_state: &'a TurnCancelState,
 }
 
@@ -15928,14 +16025,12 @@ impl<'a> ServerExchangeBroker<'a> {
         state: &'a ServerState,
         session_id: SessionId,
         call: &'a bcode_model::ToolCall,
-        plugin_id: &'a str,
         cancel_state: &'a TurnCancelState,
     ) -> Self {
         Self {
             state,
             session_id,
             call,
-            plugin_id,
             cancel_state,
         }
     }
@@ -15968,7 +16063,6 @@ impl InvocationExchangeBroker for ServerExchangeBroker<'_> {
                 self.state,
                 self.session_id,
                 self.call,
-                self.plugin_id,
                 request.clone(),
                 self.cancel_state,
             )
@@ -15996,15 +16090,14 @@ async fn resolve_server_plugin_bridge_request(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
-    plugin_id: &str,
+    _plugin_id: &str,
     request: ServiceBridgeRequest,
     inputs: &Mutex<mpsc::Receiver<ToolInvocationInput>>,
     cancel_state: &TurnCancelState,
 ) -> Result<ServiceBridgeResponse, String> {
     Ok(match request {
         ServiceBridgeRequest::Exchange(request) => {
-            let broker =
-                ServerExchangeBroker::new(state, session_id, call, plugin_id, cancel_state);
+            let broker = ServerExchangeBroker::new(state, session_id, call, cancel_state);
             ServiceBridgeResponse::Exchange(broker.request(request).await)
         }
         ServiceBridgeRequest::ReceiveInput {
@@ -16049,7 +16142,6 @@ async fn resolve_server_exchange(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
-    plugin_id: &str,
     request: ToolExchangeRequest,
     cancel_state: &TurnCancelState,
 ) -> Result<ToolExchangeResolution, String> {
@@ -16059,56 +16151,11 @@ async fn resolve_server_exchange(
             message: "exchange does not belong to the active tool invocation".to_string(),
         });
     }
-    if request.producer_id != "bcode.question"
-        || request.schema != "bcode.question.request"
-        || request.schema_version != 1
-    {
+    if !state.has_exchange_consumer(&request).await {
         return Ok(ToolExchangeResolution::NoCompatibleConsumer);
     }
-    let interactive = bcode_tool::InteractiveToolRequest {
-        interaction_id: request.exchange_id,
-        interaction_kind: Some("bcode.question".to_string()),
-        surface_kind: "bcode.question.inline".to_string(),
-        request: request.payload,
-        required: request.response_policy == bcode_tool::ToolExchangeResponsePolicy::Required,
-        turn_behavior: bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
-        render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
-    };
-    let resolution = resolve_interactive_tool_request(
-        state,
-        session_id,
-        call,
-        plugin_id,
-        &interactive,
-        cancel_state,
-    )
-    .await?;
-    Ok(match resolution {
-        InteractiveToolResolution::Submitted { payload } => {
-            ToolExchangeResolution::Responded { payload }
-        }
-        InteractiveToolResolution::Aborted { reason, message } => match reason {
-            bcode_tool::InteractiveToolAbortReason::UserDismissed => {
-                ToolExchangeResolution::Responded {
-                    payload: serde_json::json!({"status": "dismissed"}),
-                }
-            }
-            bcode_tool::InteractiveToolAbortReason::TurnCancelled => {
-                ToolExchangeResolution::Cancelled
-            }
-            bcode_tool::InteractiveToolAbortReason::ClientDetached => {
-                ToolExchangeResolution::ConsumerDetached
-            }
-            bcode_tool::InteractiveToolAbortReason::Timeout => ToolExchangeResolution::TimedOut,
-            bcode_tool::InteractiveToolAbortReason::UnsupportedSurface => {
-                ToolExchangeResolution::NoCompatibleConsumer
-            }
-            bcode_tool::InteractiveToolAbortReason::HostError => ToolExchangeResolution::Failed {
-                code: "host_error".to_string(),
-                message: message.unwrap_or_else(|| "question exchange host failed".to_string()),
-            },
-        },
-    })
+    let resolution = resolve_tool_exchange(state, session_id, call, &request, cancel_state).await?;
+    Ok(resolution)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -16119,6 +16166,7 @@ async fn invoke_model_tool(
     working_directory: &std::path::Path,
     plugin_id: &str,
     policy_metadata: &ToolPolicyAuthorizationMetadata,
+    preparation_descriptor: serde_json::Value,
     cancel_state: &TurnCancelState,
     invocation_permits: Option<Arc<Semaphore>>,
 ) -> Result<ToolInvocationResponse, String> {
@@ -16191,6 +16239,7 @@ async fn invoke_model_tool(
         tool_call_id: call.id.clone(),
         name: call.name.clone(),
         arguments: call.arguments.clone(),
+        preparation_descriptor,
         cwd: Some(working_directory),
         artifact_dir: Some(default_session_artifact_dir(session_id)),
     };
@@ -16576,69 +16625,46 @@ async fn append_tool_contribution_event(
     }
 }
 
-async fn resolve_interactive_tool_request(
+async fn resolve_tool_exchange(
     state: &ServerState,
     session_id: SessionId,
-    call: &bcode_model::ToolCall,
-    plugin_id: &str,
-    request: &bcode_tool::InteractiveToolRequest,
+    _call: &bcode_model::ToolCall,
+    request: &ToolExchangeRequest,
     cancel_state: &TurnCancelState,
-) -> Result<InteractiveToolResolution, String> {
-    let interaction_kind = request
-        .interaction_kind
-        .clone()
-        .unwrap_or_else(|| request.surface_kind.clone());
-    let controller = if state
-        .plugins
-        .plugin_ids()
-        .iter()
-        .any(|loaded| loaded == plugin_id)
-    {
-        bcode_bundled_plugins::interaction_registry(plugin_id).and_then(|registry| {
-            registry
-                .open(&interaction_kind, request.request.clone())
-                .ok()
-                .map(|controller| Arc::new(Mutex::new(controller)))
-        })
-    } else {
-        None
-    };
-    let pending = PendingInteractiveToolRequest {
-        summary: bcode_ipc::InteractiveToolRequestSummary {
-            interaction_id: request.interaction_id.clone(),
+) -> Result<ToolExchangeResolution, String> {
+    let pending = PendingToolExchange {
+        summary: bcode_ipc::PendingToolExchangeSummary {
             session_id,
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            interaction_kind: Some(interaction_kind),
-            surface_kind: request.surface_kind.clone(),
-            request: request.request.clone(),
-            required: request.required,
-            turn_behavior: interactive_turn_behavior_to_session(request.turn_behavior),
-            render_target: interactive_render_target_to_session(request.render_target),
+            request: request.clone(),
         },
-        controller,
         resolution: Arc::new(Mutex::new(None)),
         notify: Arc::new(Notify::new()),
     };
     let resolution_slot = pending.resolution.clone();
     let notify = pending.notify.clone();
     {
-        let mut pending_interactions = state.pending_interactive_tools.lock().await;
-        if pending_interactions.contains_key(&request.interaction_id) {
+        let mut pending_interactions = state.pending_tool_exchanges.lock().await;
+        if pending_interactions.contains_key(&request.exchange_id) {
             return Err(format!(
                 "duplicate interactive tool request id: {}",
-                request.interaction_id
+                request.exchange_id
             ));
         }
-        pending_interactions.insert(request.interaction_id.clone(), pending);
+        pending_interactions.insert(request.exchange_id.clone(), pending);
     }
-    append_interactive_tool_request_created_event(state, session_id, call, request).await;
+    if !state.has_exchange_consumer(request).await {
+        let resolution = abort_tool_exchange(
+            state,
+            &request.exchange_id,
+            ToolExchangeResolution::ConsumerDetached,
+        )
+        .await;
+        return Ok(resolution);
+    }
 
-    Ok(wait_for_interactive_tool_resolution(
+    Ok(wait_for_tool_exchange_resolution(
         state,
-        session_id,
-        call,
-        &request.interaction_id,
+        &request.exchange_id,
         &resolution_slot,
         &notify,
         cancel_state,
@@ -17775,6 +17801,26 @@ fn session_events_to_sanitized_model_messages(
     format_version: Option<u16>,
     compatibility_key: Option<&str>,
 ) -> Vec<ModelMessage> {
+    let generic_result_invocations = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                Some(record.invocation_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let events = events
+        .iter()
+        .copied()
+        .filter(|event| {
+            !matches!(
+                &event.kind,
+                SessionEventKind::ToolCallFinished { tool_call_id, .. }
+                    if generic_result_invocations.contains(tool_call_id.as_str())
+            )
+        })
+        .collect::<Vec<_>>();
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
     let mut pending_tool_call_ids = Vec::<String>::new();
@@ -17850,6 +17896,42 @@ fn session_events_to_sanitized_model_messages(
                         project_tool_result_for_model_context(
                             result,
                             output.as_ref().map(trace_blob_read_path),
+                            tool_output_context_chars,
+                        ),
+                    )));
+                }
+            }
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                let tool_call_id = &record.invocation_id;
+                let result = &record.model_output;
+                let is_error = record.is_error;
+                if let Some(index) = pending_tool_call_ids
+                    .iter()
+                    .position(|pending| pending == tool_call_id)
+                {
+                    pending_tool_call_ids.remove(index);
+                    messages.push(ModelMessage {
+                        role: MessageRole::Tool,
+                        content: vec![ContentBlock::ToolResult {
+                            result: bcode_model::ToolResult {
+                                call_id: tool_call_id.clone(),
+                                output: project_tool_result_for_model_context(
+                                    result,
+                                    None,
+                                    tool_output_context_chars,
+                                ),
+                                is_error,
+                                content: tool_result_content_from_output(result),
+                            },
+                        }],
+                    });
+                } else {
+                    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+                    messages.push(plain_context_message(format!(
+                        "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {tool_call_id}; error={is_error}; result: {}",
+                        project_tool_result_for_model_context(
+                            result,
+                            None,
                             tool_output_context_chars,
                         ),
                     )));
@@ -18119,32 +18201,6 @@ fn current_unix_millis() -> u64 {
         })
 }
 
-async fn append_interactive_tool_request_resolved_event(
-    state: &ServerState,
-    session_id: SessionId,
-    interaction_id: String,
-    tool_call_id: String,
-    resolution: InteractiveToolResolution,
-) {
-    let resolution = interactive_resolution_to_session(&resolution);
-    let resolution_json = serde_json::to_string(&resolution).unwrap_or_default();
-    match state
-        .sessions
-        .append_interactive_tool_request_resolved(
-            session_id,
-            SessionEventKind::InteractiveToolRequestResolved {
-                interaction_id,
-                tool_call_id,
-                resolution_json,
-            },
-        )
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append interactive tool resolution: {error}"),
-    }
-}
-
 async fn tool_request_visual_descriptor(
     state: &ServerState,
     tool_name: &str,
@@ -18278,49 +18334,14 @@ async fn append_runtime_work_cancel_requested_event(
     }
 }
 
-async fn append_interactive_tool_request_created_event(
-    state: &ServerState,
-    session_id: SessionId,
-    call: &bcode_model::ToolCall,
-    request: &bcode_tool::InteractiveToolRequest,
-) {
-    let request_json = serde_json::to_string(&request.request).unwrap_or_default();
-    match state
-        .sessions
-        .append_interactive_tool_request_created(
-            session_id,
-            SessionEventKind::InteractiveToolRequestCreated {
-                interaction_id: request.interaction_id.clone(),
-                tool_call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                interaction_kind: request
-                    .interaction_kind
-                    .clone()
-                    .or_else(|| Some(request.surface_kind.clone())),
-                surface_kind: request.surface_kind.clone(),
-                request_json,
-                required: request.required,
-                turn_behavior: interactive_turn_behavior_to_session(request.turn_behavior),
-                render_target: interactive_render_target_to_session(request.render_target),
-            },
-        )
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append interactive tool request: {error}"),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn wait_for_interactive_tool_resolution(
+async fn wait_for_tool_exchange_resolution(
     state: &ServerState,
-    session_id: SessionId,
-    call: &bcode_model::ToolCall,
     interaction_id: &str,
-    resolution_slot: &Arc<Mutex<Option<InteractiveToolResolution>>>,
+    resolution_slot: &Arc<Mutex<Option<ToolExchangeResolution>>>,
     notify: &Arc<Notify>,
     cancel_state: &TurnCancelState,
-) -> InteractiveToolResolution {
+) -> ToolExchangeResolution {
     loop {
         let value = resolution_slot.lock().await.clone();
         if let Some(resolution) = value {
@@ -18329,149 +18350,28 @@ async fn wait_for_interactive_tool_resolution(
         tokio::select! {
             () = notify.notified() => {}
             () = cancel_state.cancelled() => {
-                return abort_interactive_tool_request(
+                return abort_tool_exchange(
                     state,
-                    session_id,
                     interaction_id,
-                    &call.id,
-                    bcode_tool::InteractiveToolAbortReason::TurnCancelled,
-                    Some("model turn cancelled".to_string()),
-                ).await;
+                    ToolExchangeResolution::Cancelled,
+                )
+                .await;
             }
         }
     }
 }
 
-async fn abort_interactive_tool_request(
+async fn abort_tool_exchange(
     state: &ServerState,
-    session_id: SessionId,
     interaction_id: &str,
-    tool_call_id: &str,
-    reason: bcode_tool::InteractiveToolAbortReason,
-    message: Option<String>,
-) -> InteractiveToolResolution {
+    resolution: ToolExchangeResolution,
+) -> ToolExchangeResolution {
     state
-        .pending_interactive_tools
+        .pending_tool_exchanges
         .lock()
         .await
         .remove(interaction_id);
-    let resolution = InteractiveToolResolution::Aborted { reason, message };
-    append_interactive_tool_request_resolved_event(
-        state,
-        session_id,
-        interaction_id.to_string(),
-        tool_call_id.to_string(),
-        resolution.clone(),
-    )
-    .await;
     resolution
-}
-
-fn interactive_resolution_to_session(
-    value: &InteractiveToolResolution,
-) -> bcode_session_models::InteractiveToolResolution {
-    match value {
-        InteractiveToolResolution::Submitted { payload } => {
-            bcode_session_models::InteractiveToolResolution::Submitted {
-                payload: payload.clone(),
-            }
-        }
-        InteractiveToolResolution::Aborted { reason, message } => {
-            bcode_session_models::InteractiveToolResolution::Aborted {
-                reason: interactive_abort_reason_to_session(*reason),
-                message: message.clone(),
-            }
-        }
-    }
-}
-
-fn interactive_resolution_from_session(
-    value: bcode_session_models::InteractiveToolResolution,
-) -> InteractiveToolResolution {
-    match value {
-        bcode_session_models::InteractiveToolResolution::Submitted { payload } => {
-            InteractiveToolResolution::Submitted { payload }
-        }
-        bcode_session_models::InteractiveToolResolution::Aborted { reason, message } => {
-            InteractiveToolResolution::Aborted {
-                reason: interactive_abort_reason_from_session(reason),
-                message,
-            }
-        }
-    }
-}
-
-const fn interactive_abort_reason_to_session(
-    value: bcode_tool::InteractiveToolAbortReason,
-) -> bcode_session_models::InteractiveToolAbortReason {
-    match value {
-        bcode_tool::InteractiveToolAbortReason::UserDismissed => {
-            bcode_session_models::InteractiveToolAbortReason::UserDismissed
-        }
-        bcode_tool::InteractiveToolAbortReason::TurnCancelled => {
-            bcode_session_models::InteractiveToolAbortReason::TurnCancelled
-        }
-        bcode_tool::InteractiveToolAbortReason::ClientDetached => {
-            bcode_session_models::InteractiveToolAbortReason::ClientDetached
-        }
-        bcode_tool::InteractiveToolAbortReason::Timeout => {
-            bcode_session_models::InteractiveToolAbortReason::Timeout
-        }
-        bcode_tool::InteractiveToolAbortReason::UnsupportedSurface => {
-            bcode_session_models::InteractiveToolAbortReason::UnsupportedSurface
-        }
-        bcode_tool::InteractiveToolAbortReason::HostError => {
-            bcode_session_models::InteractiveToolAbortReason::HostError
-        }
-    }
-}
-
-const fn interactive_abort_reason_from_session(
-    value: bcode_session_models::InteractiveToolAbortReason,
-) -> bcode_tool::InteractiveToolAbortReason {
-    match value {
-        bcode_session_models::InteractiveToolAbortReason::UserDismissed => {
-            bcode_tool::InteractiveToolAbortReason::UserDismissed
-        }
-        bcode_session_models::InteractiveToolAbortReason::TurnCancelled => {
-            bcode_tool::InteractiveToolAbortReason::TurnCancelled
-        }
-        bcode_session_models::InteractiveToolAbortReason::ClientDetached => {
-            bcode_tool::InteractiveToolAbortReason::ClientDetached
-        }
-        bcode_session_models::InteractiveToolAbortReason::Timeout => {
-            bcode_tool::InteractiveToolAbortReason::Timeout
-        }
-        bcode_session_models::InteractiveToolAbortReason::UnsupportedSurface => {
-            bcode_tool::InteractiveToolAbortReason::UnsupportedSurface
-        }
-        bcode_session_models::InteractiveToolAbortReason::HostError => {
-            bcode_tool::InteractiveToolAbortReason::HostError
-        }
-    }
-}
-
-const fn interactive_turn_behavior_to_session(
-    value: bcode_tool::InteractiveToolTurnBehavior,
-) -> bcode_session_models::InteractiveToolTurnBehavior {
-    match value {
-        bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing => {
-            bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing
-        }
-        bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction => {
-            bcode_session_models::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction
-        }
-    }
-}
-
-const fn interactive_render_target_to_session(
-    value: bcode_tool::InteractiveToolRenderTarget,
-) -> bcode_session_models::InteractiveToolRenderTarget {
-    match value {
-        bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall => {
-            bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall
-        }
-    }
 }
 
 fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolInvocationResult {
@@ -18531,7 +18431,6 @@ struct ToolFinishedEventInput {
     result: String,
     is_error: bool,
     content: Vec<ToolResultContent>,
-    output: Option<TraceBlobRef>,
     semantic_result: Option<ToolInvocationResult>,
 }
 
@@ -18555,7 +18454,6 @@ async fn append_tool_finished_event_inner(
         result,
         is_error,
         content,
-        output,
         semantic_result,
     } = input;
     let runtime_work_id = WorkId::new(format!("tool_{tool_call_id}"));
@@ -18565,24 +18463,21 @@ async fn append_tool_finished_event_inner(
         .finish(session_id, &runtime_work_id)
         .await;
     let content_note = tool_result_content_model_note(&tool_call_id, &content);
-    let semantic_result_for_transition = semantic_result.clone();
-    let event = state
+    let model_output = format!("{result}{content_note}");
+    let generic_event = state
         .sessions
-        .append_tool_call_finished(
+        .append_tool_invocation_result(
             session_id,
-            tool_call_id,
-            format!("{result}{content_note}"),
-            is_error,
-            output,
-            semantic_result,
+            bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: tool_call_id.clone(),
+                model_output: model_output.clone(),
+                is_error,
+                result: semantic_result.clone(),
+            },
         )
         .await?;
-    transition_finalized_active_artifacts(
-        state,
-        session_id,
-        semantic_result_for_transition.as_ref(),
-    );
-    publish_session_event(state, &event).await;
+    transition_finalized_active_artifacts(state, session_id, semantic_result.as_ref());
+    publish_session_event(state, &generic_event).await;
     if let Ok(runtime_event) = state
         .sessions
         .append_runtime_work_finished(
@@ -18596,7 +18491,7 @@ async fn append_tool_finished_event_inner(
     {
         publish_session_event(state, &runtime_event).await;
     }
-    Ok(event)
+    Ok(generic_event)
 }
 
 fn tool_result_content_model_note(tool_call_id: &str, content: &[ToolResultContent]) -> String {
@@ -19212,12 +19107,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
-        SessionEventKind::InteractiveToolRequestCreated { .. } => {
-            "interactive_tool_request_created"
-        }
-        SessionEventKind::InteractiveToolRequestResolved { .. } => {
-            "interactive_tool_request_resolved"
-        }
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
@@ -19246,6 +19135,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
         SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
         SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
+        SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::ToolContribution { .. } => "tool_contribution",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
@@ -19917,60 +19807,6 @@ mod tests {
     };
     use switchy::database::{DatabaseValue, query::FilterableQuery};
 
-    #[derive(Debug, Clone, serde::Deserialize)]
-    struct FixtureInteractionRequest {
-        initial: String,
-    }
-
-    #[derive(Debug, Clone, serde::Serialize)]
-    struct FixtureInteractionSnapshot {
-        value: String,
-        activations: u64,
-    }
-
-    struct FixtureInteraction {
-        snapshot: FixtureInteractionSnapshot,
-    }
-
-    impl bcode_plugin_sdk::interaction::PluginInteraction for FixtureInteraction {
-        const KIND: &'static str = "test.fixture";
-
-        type Request = FixtureInteractionRequest;
-        type Snapshot = FixtureInteractionSnapshot;
-
-        fn new(request: Self::Request) -> Self {
-            Self {
-                snapshot: FixtureInteractionSnapshot {
-                    value: request.initial,
-                    activations: 0,
-                },
-            }
-        }
-
-        fn snapshot(&self) -> Self::Snapshot {
-            self.snapshot.clone()
-        }
-
-        fn handle_input(
-            &mut self,
-            input: bcode_tool::InteractionInput,
-        ) -> bcode_tool::InteractionOutput {
-            match input {
-                bcode_tool::InteractionInput::Activate { .. } => {
-                    self.snapshot.activations = self.snapshot.activations.saturating_add(1);
-                    bcode_tool::InteractionOutput::Redraw
-                }
-                bcode_tool::InteractionInput::Submit => bcode_tool::InteractionOutput::Submitted {
-                    payload: serde_json::json!({
-                        "value": self.snapshot.value,
-                        "activations": self.snapshot.activations,
-                    }),
-                },
-                _ => bcode_tool::InteractionOutput::None,
-            }
-        }
-    }
-
     #[derive(Default)]
     struct NonReturningCancelProvider;
 
@@ -20121,15 +19957,16 @@ library = "test"
             &mut self,
             context: bcode_plugin_sdk::NativeServiceContext,
         ) -> bcode_plugin_sdk::ServiceResponse {
-            if context.request.operation == OP_NATIVE_WEB_SEARCH {
+            if context.request.operation == bcode_model::OP_NATIVE_WEB_SEARCH {
                 NON_RETURNING_SEARCH_STARTED.store(true, Ordering::SeqCst);
                 while !NON_RETURNING_SEARCH_RELEASED.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 NON_RETURNING_SEARCH_FINISHED.store(true, Ordering::SeqCst);
-                return bcode_plugin_sdk::ServiceResponse::json(
-                    &NativeWebSearchResponse::default(),
-                )
+                return bcode_plugin_sdk::ServiceResponse::json(&serde_json::json!({
+                    "provider": "test",
+                    "results": []
+                }))
                 .expect("search response should encode");
             }
             bcode_plugin_sdk::ServiceResponse::error(
@@ -20148,6 +19985,7 @@ version = "0.0.1"
 [[services]]
 interface_id = "bcode.model-provider/v1"
 name = "Test Provider"
+invocation_operations = ["native_web_search"]
 
 [concurrency]
 type = "exclusive"
@@ -20195,8 +20033,12 @@ library = "test"
                 .invoke(ToolInvocationServiceRequest {
                     invocation_id: "search-call".to_string(),
                     request_id: "search-request".to_string(),
-                    interface_id: MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE.to_string(),
-                    operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
+                    route_id: Some(
+                        "service-route:test.non-returning-search-provider:bcode.model-provider/v1"
+                            .to_owned(),
+                    ),
+                    interface_id: MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                    operation: bcode_model::OP_NATIVE_WEB_SEARCH.to_string(),
                     payload: serde_json::json!({"query": "rust"}),
                 })
                 .await
@@ -20540,8 +20382,7 @@ library = "test"
             arguments: serde_json::Value::Null,
         };
         let cancel_state = TurnCancelState::default();
-        let broker =
-            ServerExchangeBroker::new(&state, session_id, &call, "bcode.question", &cancel_state);
+        let broker = ServerExchangeBroker::new(&state, session_id, &call, &cancel_state);
         let resolution = broker
             .request(ToolExchangeRequest {
                 invocation_id: "other-call".to_string(),
@@ -20558,7 +20399,7 @@ library = "test"
             resolution,
             ToolExchangeResolution::Failed { code, .. } if code == "invocation_id_mismatch"
         ));
-        assert!(state.pending_interactive_tools.lock().await.is_empty());
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -20746,6 +20587,119 @@ library = "test"
         assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
     }
 
+    #[test]
+    fn interaction_adapter_advertisement_is_bounded_and_unique() {
+        let adapter = bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+            producer_id: "example.plugin".to_owned(),
+            exchange_schema: "example.request".to_owned(),
+            min_schema_version: 1,
+            max_schema_version: 1,
+            platform_id: "tui".to_owned(),
+            priority: 100,
+            interaction_kind: "example.interaction".to_owned(),
+            tui_surface_kind: None,
+        };
+        let context = ClientRuntimeContext {
+            interaction_adapters: vec![adapter.clone()],
+            ..ClientRuntimeContext::default()
+        };
+        assert!(validate_client_interaction_adapters(Some(&context)).is_ok());
+
+        let duplicate = ClientRuntimeContext {
+            interaction_adapters: vec![adapter.clone(), adapter.clone()],
+            ..ClientRuntimeContext::default()
+        };
+        assert_eq!(
+            validate_client_interaction_adapters(Some(&duplicate)),
+            Err("duplicate interaction adapter route")
+        );
+
+        let invalid = ClientRuntimeContext {
+            interaction_adapters: vec![
+                bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+                    producer_id: "x".repeat(MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES + 1),
+                    ..adapter
+                },
+            ],
+            ..ClientRuntimeContext::default()
+        };
+        assert!(validate_client_interaction_adapters(Some(&invalid)).is_err());
+    }
+
+    #[tokio::test]
+    async fn exchange_capabilities_are_client_scoped_and_detach_resolves_pending() {
+        let state = test_server_state(SessionManager::default());
+        let compatible_client = ClientId::new();
+        let incompatible_client = ClientId::new();
+        let adapter = bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+            producer_id: "example.plugin".to_owned(),
+            exchange_schema: "example.request".to_owned(),
+            min_schema_version: 3,
+            max_schema_version: 3,
+            platform_id: "tui".to_owned(),
+            priority: 100,
+            interaction_kind: "example.interaction".to_owned(),
+            tui_surface_kind: None,
+        };
+        state
+            .set_client_runtime_context(
+                compatible_client,
+                Some(ClientRuntimeContext {
+                    interaction_adapters: vec![adapter],
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        state
+            .set_client_runtime_context(incompatible_client, Some(ClientRuntimeContext::default()))
+            .await;
+        let request = ToolExchangeRequest {
+            invocation_id: "call-1".to_owned(),
+            exchange_id: "exchange-1".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 3,
+            payload: serde_json::json!({"opaque": true}),
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        };
+        assert!(state.has_exchange_consumer(&request).await);
+        assert!(
+            state
+                .client_supports_exchange(compatible_client, &request)
+                .await
+        );
+        assert!(
+            !state
+                .client_supports_exchange(incompatible_client, &request)
+                .await
+        );
+
+        let pending = PendingToolExchange {
+            summary: bcode_ipc::PendingToolExchangeSummary {
+                session_id: SessionId::new(),
+                request: request.clone(),
+            },
+            resolution: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+        };
+        let resolution = Arc::clone(&pending.resolution);
+        state
+            .pending_tool_exchanges
+            .lock()
+            .await
+            .insert(request.exchange_id.clone(), pending);
+        state
+            .set_client_runtime_context(compatible_client, None)
+            .await;
+        state.resolve_exchanges_without_consumers().await;
+
+        assert_eq!(
+            *resolution.lock().await,
+            Some(ToolExchangeResolution::ConsumerDetached)
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn server_exchange_broker_maps_cancellation_and_unknown_schema() {
         let state = test_server_state(SessionManager::default());
@@ -20757,8 +20711,7 @@ library = "test"
         };
         let cancelled = TurnCancelState::default();
         cancelled.cancel().await;
-        let cancelled_broker =
-            ServerExchangeBroker::new(&state, session_id, &call, "bcode.question", &cancelled);
+        let cancelled_broker = ServerExchangeBroker::new(&state, session_id, &call, &cancelled);
         assert_eq!(
             cancelled_broker
                 .request(ToolExchangeRequest {
@@ -20775,8 +20728,7 @@ library = "test"
         );
 
         let active = TurnCancelState::default();
-        let active_broker =
-            ServerExchangeBroker::new(&state, session_id, &call, "bcode.question", &active);
+        let active_broker = ServerExchangeBroker::new(&state, session_id, &call, &active);
         assert_eq!(
             active_broker
                 .request(ToolExchangeRequest {
@@ -21147,7 +21099,6 @@ library = "test"
                 result: "done".to_owned(),
                 is_error: false,
                 content: Vec::new(),
-                output: None,
                 semantic_result: Some(semantic_result),
             },
         )
@@ -25370,26 +25321,28 @@ library = "test"
             ),
             session_event(
                 3,
-                SessionEventKind::InteractiveToolRequestCreated {
-                    interaction_id: "interaction-1".to_owned(),
-                    tool_call_id: "call-1".to_owned(),
-                    tool_name: "test.tool".to_owned(),
-                    interaction_kind: Some("test.exchange".to_owned()),
-                    surface_kind: "test.surface".to_owned(),
-                    request_json: r#"{"private":"EXCHANGE_REQUEST_PRIVATE"}"#.to_owned(),
-                    required: true,
-                    turn_behavior:
-                        bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
-                    render_target:
-                        bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall,
+                SessionEventKind::ToolExchangeRequested {
+                    request: bcode_session_models::ToolExchangeRequest {
+                        invocation_id: "call-1".to_owned(),
+                        exchange_id: "interaction-1".to_owned(),
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.exchange".to_owned(),
+                        schema_version: 1,
+                        payload: serde_json::json!({"private": "EXCHANGE_REQUEST_PRIVATE"}),
+                        response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                    },
                 },
             ),
             session_event(
                 4,
-                SessionEventKind::InteractiveToolRequestResolved {
-                    interaction_id: "interaction-1".to_owned(),
-                    tool_call_id: "call-1".to_owned(),
-                    resolution_json: r#"{"private":"EXCHANGE_RESPONSE_PRIVATE"}"#.to_owned(),
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        exchange_id: "interaction-1".to_owned(),
+                        resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"private": "EXCHANGE_RESPONSE_PRIVATE"}),
+                        },
+                    },
                 },
             ),
             session_event(
@@ -25700,6 +25653,86 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn server_web_search_invocation_uses_prepared_generic_provider_route() {
+        let workspace = tempfile::tempdir().expect("native search workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent native search sessions");
+        let working_directory = workspace.path().to_path_buf();
+        let session_id = sessions
+            .create_session(Some("native search".to_owned()), working_directory.clone())
+            .await
+            .expect("native search session")
+            .id;
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from([
+                    "bcode.fake-provider".to_owned(),
+                    "bcode.web-search".to_owned(),
+                ]),
+                disabled: BTreeSet::new(),
+            },
+            &[
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+                    bcode_fake_provider_plugin::static_plugin(),
+                ),
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
+                    bcode_web_search_plugin::static_plugin(),
+                ),
+            ],
+        )
+        .expect("load web-search and fake-provider plugins");
+        let mut state = test_server_state(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        state.plugins = plugins;
+        state.selected_provider_plugin_id = Some("bcode.fake-provider".to_owned());
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                ..SessionModelSelection::default()
+            },
+        );
+        let call = bcode_model::ToolCall {
+            id: "web-native-call".to_owned(),
+            name: "web.search".to_owned(),
+            arguments: serde_json::json!({
+                "query": "rust",
+                "provider": "model_native"
+            }),
+        };
+        let (tool, preparation) = prepare_server_tool(&state, session_id, &call)
+            .await
+            .expect("prepare web search through generic host context");
+        assert_eq!(
+            preparation.descriptor["model_provider_route_id"],
+            "service-route:bcode.fake-provider:bcode.model-provider/v1"
+        );
+        let policy_metadata =
+            tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+                .expect("web search policy");
+        let response = invoke_prepared_tool_for_test(
+            &state,
+            session_id,
+            &call,
+            &working_directory,
+            tool,
+            preparation,
+            &policy_metadata,
+            &TurnCancelState::default(),
+        )
+        .await
+        .expect("invoke prepared web search");
+
+        assert!(!response.is_error, "{}", response.output);
+        assert!(response.output.contains("fake-native"));
+        assert!(response.output.contains("Result for rust"));
+    }
+
+    #[tokio::test]
     async fn server_service_router_routes_model_native_search_and_validates_identity() {
         let sessions = SessionManager::default();
         let summary = sessions
@@ -25727,8 +25760,11 @@ library = "test"
             .invoke(ToolInvocationServiceRequest {
                 invocation_id: call.id.clone(),
                 request_id: "native-search".to_string(),
-                interface_id: MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE.to_string(),
-                operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
+                route_id: Some(
+                    "service-route:bcode.fake-provider:bcode.model-provider/v1".to_owned(),
+                ),
+                interface_id: MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                operation: bcode_model::OP_NATIVE_WEB_SEARCH.to_string(),
                 payload: serde_json::json!({"query": "rust"}),
             })
             .await;
@@ -25743,8 +25779,9 @@ library = "test"
                 .invoke(ToolInvocationServiceRequest {
                     invocation_id: "wrong-call".to_string(),
                     request_id: "wrong".to_string(),
-                    interface_id: MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE.to_string(),
-                    operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
+                    route_id: Some("service-route:bcode.fake-provider:bcode.model-provider/v1".to_owned()),
+                    interface_id: MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                    operation: bcode_model::OP_NATIVE_WEB_SEARCH.to_string(),
                     payload: serde_json::json!({"query": "rust"}),
                 })
                 .await,
@@ -25855,6 +25892,7 @@ library = "test"
             working_directory,
             &plugin_id,
             policy_metadata,
+            preparation.descriptor,
             cancel_state,
             None,
         )
@@ -26185,6 +26223,7 @@ library = "test"
             policy_metadata(bcode_agent_profile::ToolPolicyOperation::Read {
                 paths: vec![workspace.path().display().to_string()],
             }),
+            serde_json::Value::Null,
             Arc::new(TurnCancelState::default()),
             None,
         )
@@ -26246,6 +26285,7 @@ library = "test"
             policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
                 command: Some("printf server-contribution".to_owned()),
             }),
+            serde_json::Value::Null,
             Arc::new(TurnCancelState::default()),
             None,
         )
@@ -26363,6 +26403,7 @@ library = "test"
             policy_metadata(bcode_agent_profile::ToolPolicyOperation::Read {
                 paths: vec![workspace.path().display().to_string()],
             }),
+            serde_json::Value::Null,
             Arc::new(TurnCancelState::default()),
             None,
         )
@@ -26371,7 +26412,7 @@ library = "test"
 
         assert!(!result.is_error, "{}", result.result);
         assert_eq!(std::fs::read_to_string(&file).expect("read source"), "foo");
-        assert!(state.pending_interactive_tools.lock().await.is_empty());
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
         let mut saw_live_contribution = false;
         while let Ok(live) = attachment.live_events.try_recv() {
             if matches!(
@@ -26430,6 +26471,7 @@ library = "test"
             policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
                 command: Some("false".to_owned()),
             }),
+            serde_json::Value::Null,
             Arc::new(TurnCancelState::default()),
             None,
         )
@@ -26494,6 +26536,7 @@ library = "test"
             workspace.path().to_path_buf(),
             "bcode.shell".to_owned(),
             policy,
+            serde_json::Value::Null,
             Arc::clone(&cancel_state),
             None,
         );
@@ -27878,105 +27921,6 @@ library = "test"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn generic_interaction_controller_crosses_real_ipc_without_web_specific_code() {
-        let sessions = SessionManager::default();
-        let session = sessions
-            .create_session(
-                Some("generic interaction".to_owned()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session");
-        let session_id = session.id;
-        let state = Arc::new(test_server_state(sessions));
-        let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
-        registry.register_interaction::<FixtureInteraction>();
-        let controller = registry
-            .open(
-                <FixtureInteraction as bcode_plugin_sdk::interaction::PluginInteraction>::KIND,
-                serde_json::json!({"initial": "fixture"}),
-            )
-            .expect("fixture controller");
-        state.pending_interactive_tools.lock().await.insert(
-            "fixture-interaction".to_owned(),
-            PendingInteractiveToolRequest {
-                summary: bcode_ipc::InteractiveToolRequestSummary {
-                    interaction_id: "fixture-interaction".to_owned(),
-                    session_id,
-                    tool_call_id: "fixture-call".to_owned(),
-                    tool_name: "fixture-tool".to_owned(),
-                    interaction_kind: Some(
-                        <FixtureInteraction as bcode_plugin_sdk::interaction::PluginInteraction>::KIND
-                            .to_owned(),
-                    ),
-                    surface_kind: "fixture.surface".to_owned(),
-                    request: serde_json::json!({"initial": "fixture"}),
-                    required: true,
-                    turn_behavior:
-                        bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
-                    render_target:
-                        bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall,
-                },
-                controller: Some(Arc::new(Mutex::new(controller))),
-                resolution: Arc::new(Mutex::new(None)),
-                notify: Arc::new(Notify::new()),
-            },
-        );
-
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
-        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
-        let server_state = Arc::clone(&state);
-        let server = tokio::spawn(async move {
-            loop {
-                let stream = listener.accept().await.expect("client connection");
-                let state = Arc::clone(&server_state);
-                tokio::spawn(async move {
-                    handle_client(stream, state).await.expect("handle client");
-                });
-            }
-        });
-        let client = bcode_client::BcodeClient::new(endpoint);
-        let initial = client
-            .interaction_snapshot("fixture-interaction".to_owned())
-            .await
-            .expect("fixture snapshot")
-            .expect("fixture pending");
-        assert_eq!(initial.interaction_kind, "test.fixture");
-        assert_eq!(initial.snapshot["value"], "fixture");
-
-        let redraw = client
-            .submit_interaction_input(
-                "fixture-interaction".to_owned(),
-                bcode_tool::InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("fixture-control"),
-                },
-            )
-            .await
-            .expect("fixture redraw");
-        assert!(matches!(
-            redraw,
-            bcode_ipc::InteractionInputResponse::Redraw { snapshot }
-                if snapshot.snapshot["activations"] == 1
-        ));
-        let submitted = client
-            .submit_interaction_input(
-                "fixture-interaction".to_owned(),
-                bcode_tool::InteractionInput::Submit,
-            )
-            .await
-            .expect("fixture submit");
-        assert!(matches!(
-            submitted,
-            bcode_ipc::InteractionInputResponse::Submitted { payload }
-                if payload["value"] == "fixture" && payload["activations"] == 1
-        ));
-        assert!(state.pending_interactive_tools.lock().await.is_empty());
-        server.abort();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn server_question_exchange_completes_original_plugin_invocation() {
         let sessions = SessionManager::default();
@@ -27989,6 +27933,15 @@ library = "test"
         let mut state = test_server_state_with_question_plugin(sessions);
         state.trace_store = TraceStore::new(trace_dir.path().to_path_buf());
         let state = Arc::new(state);
+        state
+            .set_client_runtime_context(
+                ClientId::new(),
+                Some(ClientRuntimeContext {
+                    interaction_adapters: bcode_bundled_plugins::interaction_adapters("tui"),
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
         let call = bcode_model::ToolCall {
             id: "question-call".to_string(),
             name: "question".to_string(),
@@ -28028,7 +27981,7 @@ library = "test"
         let pending = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let pending = state
-                    .pending_interactive_tools
+                    .pending_tool_exchanges
                     .lock()
                     .await
                     .values()
@@ -28042,7 +27995,10 @@ library = "test"
         })
         .await
         .expect("question exchange should become pending");
-        assert_eq!(pending.summary.interaction_id, "question-call-question");
+        assert_eq!(
+            pending.summary.request.exchange_id,
+            "question-call-question"
+        );
 
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
@@ -28057,47 +28013,87 @@ library = "test"
                 });
             }
         });
-        let client = bcode_client::BcodeClient::new(endpoint);
-        let interaction_id = pending.summary.interaction_id.clone();
-        let initial = client
-            .interaction_snapshot(interaction_id.clone())
+        let client = bcode_client::BcodeClient::new(endpoint.clone())
+            .with_interaction_adapters(bcode_bundled_plugins::interaction_adapters("tui"));
+        let pending_exchanges = client
+            .list_pending_tool_exchanges()
             .await
-            .expect("initial question snapshot")
-            .expect("question snapshot exists");
-        assert_eq!(initial.interaction_kind, "bcode.question");
-        assert_eq!(
-            initial.snapshot["answers"][0]["selected"],
-            serde_json::json!([])
-        );
-
-        let redraw = client
-            .submit_interaction_input(
+            .expect("pending exchange list");
+        assert!(pending_exchanges.iter().any(|pending| {
+            pending.session_id == session_id
+                && pending.request.invocation_id == "question-call"
+                && pending.request.exchange_id == "question-call-question"
+                && pending.request.producer_id == "bcode.question"
+                && pending.request.schema == "bcode.question.request"
+                && pending.request.schema_version == 1
+        }));
+        let interaction_id = pending.summary.request.exchange_id.clone();
+        let incompatible = bcode_client::BcodeClient::new(endpoint);
+        let error = incompatible
+            .resolve_tool_exchange(
                 interaction_id.clone(),
-                bcode_tool::InteractionInput::Activate {
-                    control_id: bcode_tool::InteractionControlId::new("question-0.option-0"),
-                },
+                bcode_session_models::ToolExchangeResolution::Cancelled,
             )
             .await
-            .expect("question option input");
-        let bcode_ipc::InteractionInputResponse::Redraw { snapshot } = redraw else {
-            panic!("question option input should redraw");
-        };
-        assert_eq!(snapshot.snapshot["answers"][0]["selected"][0], "yes");
-        let refreshed = client
-            .interaction_snapshot(interaction_id.clone())
-            .await
-            .expect("refreshed question snapshot")
-            .expect("question snapshot remains pending");
-        assert_eq!(refreshed.snapshot, snapshot.snapshot);
-
-        let submitted = client
-            .submit_interaction_input(interaction_id, bcode_tool::InteractionInput::Submit)
-            .await
-            .expect("submit question");
+            .expect_err("unadvertised client must not resolve an exchange");
         assert!(matches!(
-            submitted,
-            bcode_ipc::InteractionInputResponse::Submitted { .. }
+            error,
+            bcode_client::ClientError::Server { code, .. }
+                if code == "incompatible_exchange_consumer"
         ));
+        assert!(
+            state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&interaction_id)
+        );
+        let adapter = bcode_bundled_plugins::interaction_adapter(
+            "bcode.question",
+            "bcode.question.request",
+            1,
+            "tui",
+        )
+        .expect("question interaction adapter");
+        assert!(adapter.supports(
+            &pending.summary.request.schema,
+            pending.summary.request.schema_version
+        ));
+        let mut controller = bcode_bundled_plugins::interaction_registry("bcode.question")
+            .expect("question interaction registry")
+            .open(
+                &adapter.interaction_kind,
+                pending.summary.request.payload.clone(),
+            )
+            .expect("open local question adapter");
+        assert_eq!(
+            controller.snapshot_json()["answers"][0]["selected"],
+            serde_json::json!([])
+        );
+        assert!(matches!(
+            controller.handle_input(bcode_tool::InteractionInput::Activate {
+                control_id: bcode_tool::InteractionControlId::new("question-0.option-0"),
+            }),
+            bcode_tool::InteractionOutput::Redraw
+        ));
+        assert_eq!(
+            controller.snapshot_json()["answers"][0]["selected"][0],
+            "yes"
+        );
+        let bcode_tool::InteractionOutput::Submitted { payload } =
+            controller.handle_input(bcode_tool::InteractionInput::Submit)
+        else {
+            panic!("question submit should produce an opaque response payload");
+        };
+        assert!(
+            client
+                .resolve_tool_exchange(
+                    interaction_id,
+                    bcode_session_models::ToolExchangeResolution::Responded { payload },
+                )
+                .await
+                .expect("resolve question exchange")
+        );
 
         let response = tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -28106,7 +28102,7 @@ library = "test"
             .expect("question invocation succeeds");
         assert!(!response.is_error);
         assert!(response.output.contains("Answered"));
-        assert!(state.pending_interactive_tools.lock().await.is_empty());
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
         let history = state
             .sessions
             .session_history(session_id)
@@ -28128,13 +28124,6 @@ library = "test"
                         event.resolution,
                         bcode_session_models::ToolExchangeResolution::Responded { .. }
                     )
-        )));
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::InteractiveToolRequestResolved {
-                interaction_id,
-                ..
-            } if interaction_id == "question-call-question"
         )));
         server.abort();
     }
@@ -30523,7 +30512,12 @@ library = "test"
         assert_eq!(
             history
                 .iter()
-                .filter(|event| matches!(event.kind, SessionEventKind::ToolCallFinished { .. }))
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        SessionEventKind::ToolInvocationResultRecorded { .. }
+                    )
+                })
                 .count(),
             5,
             "completion: {completion:?}; history: {history:#?}"
@@ -31032,18 +31026,17 @@ library = "test"
                 result: canonical_result.clone(),
                 is_error: false,
                 content: Vec::new(),
-                output: None,
                 semantic_result: None,
             },
         )
         .await
         .expect("tool result event should append");
 
-        let SessionEventKind::ToolCallFinished { result, .. } = event.kind else {
-            panic!("expected tool result event");
+        let SessionEventKind::ToolInvocationResultRecorded { record } = event.kind else {
+            panic!("expected generic tool result event");
         };
-        assert_eq!(result, canonical_result);
-        assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
+        assert_eq!(record.model_output, canonical_result);
+        assert!(serde_json::from_str::<serde_json::Value>(&record.model_output).is_ok());
     }
 
     #[test]
@@ -31150,6 +31143,62 @@ library = "test"
 
         assert!(result.output.chars().count() <= 1_000);
         assert!(result.output.contains("tool output truncated"));
+    }
+
+    #[test]
+    fn generic_final_result_is_model_visible_once_during_dual_write() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("example.plugin".to_owned()),
+                    tool_name: "example.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "generic result".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_owned(),
+                    result: "legacy duplicate".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages_with_limit(&history, 1_000);
+        let results = messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                ContentBlock::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].call_id, "call-1");
+        assert_eq!(results[0].output, "generic result");
     }
 
     #[test]
@@ -31493,7 +31542,6 @@ library = "test"
                 result: "bounded final result".to_owned(),
                 is_error: false,
                 content: Vec::new(),
-                output: None,
                 semantic_result: Some(semantic_result.clone()),
             },
         )
@@ -31615,23 +31663,48 @@ library = "test"
                 result: "legacy text".to_owned(),
                 is_error: false,
                 content: Vec::new(),
-                output: None,
                 semantic_result: Some(semantic_result.clone()),
             },
         )
         .await
         .expect("tool result event should append");
 
-        let SessionEventKind::ToolCallFinished {
-            result,
-            semantic_result: persisted_semantic_result,
-            ..
-        } = event.kind
-        else {
-            panic!("expected tool result event");
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("tool result history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.invocation_id == "call-semantic"
+                    && record.model_output == "legacy text"
+                    && record.result.as_ref() == Some(&semantic_result)
+        )));
+
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ToolCallFinished { .. }))
+                .count(),
+            0,
+            "production result persistence must not dual-write the legacy finish event"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { .. }
+                ))
+                .count(),
+            1
+        );
+        let SessionEventKind::ToolInvocationResultRecorded { record } = event.kind else {
+            panic!("expected generic tool result event");
         };
-        assert_eq!(result, "legacy text");
-        assert_eq!(persisted_semantic_result, Some(semantic_result));
+        assert_eq!(record.model_output, "legacy text");
+        assert_eq!(record.result, Some(semantic_result));
     }
 
     #[test]

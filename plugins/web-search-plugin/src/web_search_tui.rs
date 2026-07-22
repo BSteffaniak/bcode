@@ -91,10 +91,10 @@ fn search_result_rows(payload: &Value, width: u16) -> Vec<Line> {
         .get("results")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    let metadata =
-        [text(payload, "query").map(|value| Span::styled(format!("“{value}”"), value_style()))]
-            .into_iter()
-            .flatten();
+    let metadata = std::iter::once(
+        text(payload, "query").map(|value| Span::styled(format!("“{value}”"), value_style())),
+    )
+    .flatten();
     let mut rows = header_rows(
         Span::styled("◆ ", accent()),
         Span::styled(format!("Search results ({result_count})"), title_style()),

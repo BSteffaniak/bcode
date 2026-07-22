@@ -8,9 +8,10 @@
 //! interpretation, terminal emulation, and shell-result rendering. Host, session, server, and
 //! generic TUI-extension code must treat shell recordings as opaque tool artifacts and must not
 //! branch on shell schema IDs, recording reference keys, MIME types, ANSI, PTY, resize, grid, or
-//! scrollback semantics. Live presentation continues through generic transient tool-stream events;
-//! durable replay is provided by shell-owned artifact references.
+//! scrollback semantics. Live presentation uses generic transient shell contributions carrying
+//! recording artifact revisions; durable replay uses shell-owned artifact references.
 
+mod contracts;
 pub mod recording;
 #[cfg(feature = "static-bundled")]
 pub mod shell_run_tui;
@@ -30,7 +31,13 @@ use bcode_tool::{
     ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult, ToolList, ToolSideEffect,
 };
-use serde::{Deserialize, Serialize};
+use contracts::{
+    SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE, SHELL_RECORDING_REF_KEY,
+    SHELL_RUN_SCHEMA, SHELL_RUN_SUMMARY_SCHEMA, SHELL_RUN_TOOL_NAME, SHELL_SCHEMA_VERSION,
+    ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments, ShellRunResult,
+    TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
+};
+use serde::Serialize;
 use serde_json::json;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -39,53 +46,11 @@ use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-enum ShellRunResult {
-    Terminal {
-        exit_code: Option<i32>,
-        timed_out: bool,
-        cancelled: bool,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-        output_tail: String,
-        output_truncated: bool,
-        output_bytes: Option<u64>,
-        retained_output_bytes: Option<u64>,
-        columns: u16,
-        rows: u16,
-        #[serde(default = "default_format_commands")]
-        format_commands: bool,
-    },
-    Captured {
-        exit_code: Option<i32>,
-        timed_out: bool,
-        cancelled: bool,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-        stdout: String,
-        stderr: String,
-        stdout_truncated: bool,
-        stderr_truncated: bool,
-        stdout_bytes: Option<u64>,
-        stderr_bytes: Option<u64>,
-    },
-}
-
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
-const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
-const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str =
-    "application/x-bcode-terminal-pty-stream; charset=utf-8";
-const SHELL_RECORDING_REF_KEY: &str = "shell_recording";
-const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=3";
-
-const fn default_format_commands() -> bool {
-    true
-}
 
 /// shell plugin.
 #[derive(Default)]
@@ -124,40 +89,9 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ShellRunArguments {
-    command: String,
-    #[serde(default)]
-    cwd: Option<PathBuf>,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-    #[serde(default)]
-    columns: Option<u16>,
-    #[serde(default)]
-    rows: Option<u16>,
-    #[serde(default)]
-    format_commands: Option<bool>,
-}
-
-impl ShellRunArguments {
-    const fn terminal_columns(&self) -> u16 {
-        match self.columns {
-            Some(columns) if columns > 0 => columns,
-            _ => DEFAULT_TERMINAL_COLUMNS,
-        }
-    }
-
-    const fn terminal_rows(&self) -> u16 {
-        match self.rows {
-            Some(rows) if rows > 0 => rows,
-            _ => DEFAULT_TERMINAL_ROWS,
-        }
-    }
-}
-
 fn shell_tool_definition() -> ToolDefinition {
     ToolDefinition {
-                name: "shell.run".to_string(),
+                name: SHELL_RUN_TOOL_NAME.to_owned(),
                 description: "Run a non-interactive shell command in pseudo-terminal mode. Commands must complete without user input: avoid editors, REPLs, watchers, pagers, and prompts; use non-interactive flags and disable paging (for example, `git --no-pager`). Interactive commands will time out.".to_string(),
                 input_schema: json!({
                     "type": "object",
@@ -269,7 +203,7 @@ fn run_shell_tool(
             sequence: 1,
             producer_id: "bcode.shell".to_owned(),
             schema: "bcode.tool.request.shell.run".to_owned(),
-            schema_version: 1,
+            schema_version: SHELL_SCHEMA_VERSION,
             operation: ToolContributionOperation::Upsert,
             persistence: ToolContributionPersistence::Durable,
             artifact: None,
@@ -304,8 +238,8 @@ fn run_shell_tool(
             contribution_id: "shell-run-summary".to_owned(),
             sequence: 1,
             producer_id: "bcode.shell".to_owned(),
-            schema: "bcode.shell.run.summary".to_owned(),
-            schema_version: 1,
+            schema: SHELL_RUN_SUMMARY_SCHEMA.to_owned(),
+            schema_version: SHELL_SCHEMA_VERSION,
             operation: ToolContributionOperation::Upsert,
             persistence: ToolContributionPersistence::Durable,
             artifact: None,
@@ -580,12 +514,6 @@ fn run_terminal_shell_command_with_environment(
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ShellInvocationAction {
-    Resize { columns: u16, rows: u16 },
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ShellAppliedResize {
     columns: u16,
@@ -625,7 +553,7 @@ impl ShellInvocationActionReader {
                 }
             };
             if input.producer_id != "bcode.shell"
-                || input.schema != "bcode.shell.invocation-input"
+                || input.schema != SHELL_INVOCATION_INPUT_SCHEMA
                 || input.schema_version != 1
             {
                 return Err("unsupported shell invocation input schema".to_owned());
@@ -801,8 +729,8 @@ fn run_terminal_shell_command_inner(
     let format_commands =
         shell_format_commands(arguments, &shell_config.output, &mut arguments_json);
     let env_config = shell_config.env;
-    let columns = arguments.terminal_columns();
-    let rows = arguments.terminal_rows();
+    let columns = arguments.terminal_columns(DEFAULT_TERMINAL_COLUMNS);
+    let rows = arguments.terminal_rows(DEFAULT_TERMINAL_ROWS);
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(portable_pty::PtySize {
@@ -1458,8 +1386,8 @@ fn shell_recording_commit_observer(
                 contribution_id: "shell-recording".to_owned(),
                 sequence: revision,
                 producer_id: "bcode.shell".to_owned(),
-                schema: "bcode.shell.run".to_owned(),
-                schema_version: 1,
+                schema: SHELL_RUN_SCHEMA.to_owned(),
+                schema_version: SHELL_SCHEMA_VERSION,
                 operation: ToolContributionOperation::Upsert,
                 persistence: ToolContributionPersistence::Transient,
                 artifact: Some(ToolContributionArtifact {
@@ -1472,7 +1400,8 @@ fn shell_recording_commit_observer(
                     revision,
                     finalized: commit.finalized,
                 }),
-                payload: serde_json::json!({"mode": "terminal"}),
+                payload: serde_json::to_value(ShellLiveRecordingPayload { mode: "terminal" })
+                    .unwrap_or(serde_json::Value::Null),
             },
         );
     })
@@ -1544,8 +1473,8 @@ fn shell_run_artifact(
         artifact: Box::new(ToolArtifact {
             artifact_id: format!("{tool_call_id}-shell-run"),
             producer_plugin_id: "bcode.shell".to_string(),
-            schema: "bcode.shell.run".to_string(),
-            schema_version: 1,
+            schema: SHELL_RUN_SCHEMA.to_owned(),
+            schema_version: SHELL_SCHEMA_VERSION,
             tool_call_id: Some(tool_call_id.to_string()),
             title: Some("Shell run".to_string()),
             metadata: serde_json::to_value(result).unwrap_or_else(|_| json!({})),
@@ -1727,8 +1656,8 @@ mod tests {
                     invocation_id,
                     input_id: format!("resize-{index}"),
                     producer_id: "bcode.shell".to_string(),
-                    schema: "bcode.shell.invocation-input".to_string(),
-                    schema_version: 1,
+                    schema: SHELL_INVOCATION_INPUT_SCHEMA.to_owned(),
+                    schema_version: SHELL_SCHEMA_VERSION,
                     payload: json!({"type":"resize","columns":columns,"rows":rows}),
                 },
             })
@@ -1759,7 +1688,7 @@ mod tests {
         let Some(ToolInvocationResult::Artifact { artifact }) = &response.result else {
             return None;
         };
-        if artifact.schema != "bcode.shell.run" {
+        if artifact.schema != SHELL_RUN_SCHEMA {
             return None;
         }
         serde_json::from_value(artifact.metadata.clone()).ok()

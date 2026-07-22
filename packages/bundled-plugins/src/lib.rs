@@ -45,6 +45,44 @@ pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiR
     }
 }
 
+/// Return all renderer interaction adapters enabled in this static bundle.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub fn interaction_adapters(
+    platform_id: &str,
+) -> Vec<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    #[cfg(feature = "static-bundled-question-plugin")]
+    {
+        vec![bcode_question_plugin::question_interaction_adapter(
+            platform_id,
+        )]
+    }
+    #[cfg(not(feature = "static-bundled-question-plugin"))]
+    {
+        let _ = platform_id;
+        Vec::new()
+    }
+}
+
+/// Select the highest-priority renderer interaction adapter for an opaque exchange.
+#[must_use]
+pub fn interaction_adapter(
+    producer_id: &str,
+    schema: &str,
+    schema_version: u32,
+    platform_id: &str,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    let adapters = interaction_adapters(platform_id);
+    bcode_plugin_sdk::interaction::select_interaction_adapter(
+        &adapters,
+        producer_id,
+        schema,
+        schema_version,
+        platform_id,
+    )
+    .cloned()
+}
+
 /// Return a renderer-neutral interaction registry for one enabled statically bundled plugin.
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
@@ -462,6 +500,8 @@ mod tests {
         assert!(super::static_bundled_plugins().is_empty());
         assert!(super::tui_registry("bcode.filesystem").is_none());
         assert!(super::interaction_registry("bcode.question").is_none());
+        assert!(super::interaction_adapter("bcode.question", "request", 1, "tui").is_none());
+        assert!(super::interaction_adapters("tui").is_empty());
     }
 
     #[cfg(feature = "static-bundled-question-plugin")]
@@ -470,6 +510,20 @@ mod tests {
         let registry = super::interaction_registry("bcode.question")
             .expect("question interaction registry is available");
         assert!(registry.supports("bcode.question"));
+        let mut adapters = super::interaction_adapters("tui");
+        assert_eq!(adapters.len(), 1);
+        let adapter = adapters.pop().expect("question adapter");
+        assert_eq!(adapter.producer_id, "bcode.question");
+        assert_eq!(adapter.platform_id, "tui");
+        assert_eq!(adapter.priority, 100);
+        assert_eq!(adapter.min_schema_version, 1);
+        assert_eq!(adapter.max_schema_version, 1);
+        assert!(adapter.supports("bcode.question.request", 1));
+        assert_eq!(adapter.interaction_kind, "bcode.question");
+        assert_eq!(
+            adapter.tui_surface_kind.as_deref(),
+            Some("bcode.question.inline")
+        );
     }
 
     #[cfg(feature = "static-bundled-vim-edit-plugin")]

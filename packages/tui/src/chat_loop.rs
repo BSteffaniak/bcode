@@ -24,14 +24,13 @@ use super::daemon_host::TuiDaemonHost;
 use super::daemon_issue;
 use super::effects::{DaemonObservation, TuiEffect, TuiEffectResult, TuiEffectRunner};
 use super::helpers;
-use super::interactive_surface::{INLINE_INTERACTIVE_SURFACE_ROW_OFFSET, InteractiveSurfaceState};
+use super::interactive_surface::InteractiveSurfaceState;
 use super::invalidation::InvalidationQueue;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
 use super::terminal_events::TuiInput;
-use super::transcript_layout::VisibleTranscriptSource;
 use super::{
     TuiError, command_palette_render, composer_flow, input, input::KeyRequest, mouse_flow,
     palette_flow, permission_dialog_render, permission_flow, render, slash_flow, slash_palette,
@@ -1488,56 +1487,24 @@ fn draw_chat_frame<W: Write>(
         if let Some(dialog) = &mut loop_state.timeline_dialog {
             timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
         }
-        if let Some(surface) = &mut loop_state.interactive_surface
-            && let Some(surface_area) = interactive_surface_area(chat, surface, transcript_area)
-        {
+        if let Some(surface) = &mut loop_state.interactive_surface {
+            let surface_area = interactive_surface_area(surface, transcript_area);
             surface.render(surface_area, frame);
         }
     })?;
     Ok(())
 }
 
-fn interactive_surface_area(
-    chat: &ActiveChat,
-    surface: &mut InteractiveSurfaceState,
-    viewport: Rect,
-) -> Option<Rect> {
-    let layout = chat.app.transcript_layout();
-    for visible in layout.visible_lines_from_top(
-        chat.app.transcript_top_row(viewport.height),
-        viewport.height,
-    ) {
-        if visible.source() != VisibleTranscriptSource::Transcript
-            || visible.row_in_entry() != INLINE_INTERACTIVE_SURFACE_ROW_OFFSET
-        {
-            continue;
-        }
-        let Some(item) = chat.app.transcript().get(visible.entry_index()) else {
-            continue;
-        };
-        let super::transcript::TranscriptItemKind::InteractiveToolRequest {
-            interaction_id: item_interaction_id,
-            surface_kind,
-            ..
-        } = item.kind()
-        else {
-            continue;
-        };
-        if item_interaction_id == surface.interaction_id() && surface_kind == surface.surface_kind()
-        {
-            let viewport_row = visible
-                .row_index
-                .saturating_sub(chat.app.transcript_top_row(viewport.height));
-            let y = viewport
-                .y
-                .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX));
-            let height = surface
-                .preferred_height(viewport.width)
-                .min(viewport.bottom().saturating_sub(y));
-            return (height > 0).then_some(Rect::new(viewport.x, y, viewport.width, height));
-        }
-    }
-    None
+fn interactive_surface_area(surface: &mut InteractiveSurfaceState, viewport: Rect) -> Rect {
+    let height = surface
+        .preferred_height(viewport.width)
+        .min(viewport.height);
+    Rect::new(
+        viewport.x,
+        viewport.bottom().saturating_sub(height),
+        viewport.width,
+        height,
+    )
 }
 
 fn take_bcode_events(
@@ -1692,33 +1659,39 @@ async fn absorb_bcode_event(
 }
 
 async fn maybe_open_interactive_surface(
-    chat: &ActiveChat,
+    _chat: &ActiveChat,
     loop_state: &mut ChatLoopState,
     event: &SessionEventKind,
 ) {
-    let SessionEventKind::InteractiveToolRequestCreated { interaction_id, .. } = event else {
-        return;
+    let (interaction_id, surface_kind, request_json) = match event {
+        SessionEventKind::ToolExchangeRequested { request } => {
+            let Some(adapter) = bcode_bundled_plugins::interaction_adapter(
+                &request.producer_id,
+                &request.schema,
+                request.schema_version,
+                "tui",
+            ) else {
+                return;
+            };
+            let Some(surface_kind) = adapter.tui_surface_kind else {
+                return;
+            };
+            (
+                request.exchange_id.clone(),
+                surface_kind,
+                serde_json::Value::to_string(&request.payload),
+            )
+        }
+        _ => return,
     };
-    let Some(interaction) = chat.app.interaction_view(interaction_id) else {
-        return;
-    };
-    let request_json = interaction
-        .snapshot
-        .as_ref()
-        .map_or_else(|| "{}".to_owned(), serde_json::Value::to_string);
     let runtime = loop_state.plugin_runtime.get_or_insert_with(|| {
         super::plugin_tui::load_default_runtime_with_static_bundled(
             &bcode_bundled_plugins::static_bundled_plugins(),
         )
         .expect("load plugin runtime for interactive TUI surfaces")
     });
-    let opened = InteractiveSurfaceState::open(
-        runtime,
-        interaction.interaction_id.clone(),
-        interaction.surface_kind.clone(),
-        &request_json,
-    )
-    .await;
+    let opened =
+        InteractiveSurfaceState::open(runtime, interaction_id, surface_kind, &request_json).await;
     loop_state.interactive_surface = opened.ok();
 }
 
@@ -1987,7 +1960,7 @@ async fn resolve_interactive_surface_dismissed<W: Write>(
     let interaction_id = surface.interaction_id().to_owned();
     execute_session_view_action(
         context.services.client,
-        SessionViewAction::ResolveInteraction {
+        SessionViewAction::ResolveExchange {
             interaction_id,
             resolution: InteractiveSurfaceState::dismissed_resolution(),
         },
@@ -2008,21 +1981,16 @@ async fn handle_interactive_surface_event<W: Write>(
     let Some(surface) = &mut loop_state.interactive_surface else {
         return Ok(false);
     };
-    if interactive_surface_area(
-        chat,
+    let _surface_area = interactive_surface_area(
         surface,
         render::transcript_area_for_frame(&chat.app, context.terminal.area()),
-    )
-    .is_none()
-    {
-        return Ok(true);
-    }
+    );
     if let Some(resolution) = surface.handle_event(&event) {
         let interaction_id = surface.interaction_id().to_owned();
         loop_state.interactive_surface = None;
         execute_session_view_action(
             context.services.client,
-            SessionViewAction::ResolveInteraction {
+            SessionViewAction::ResolveExchange {
                 interaction_id,
                 resolution,
             },

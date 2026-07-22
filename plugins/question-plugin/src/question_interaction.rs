@@ -131,7 +131,7 @@ impl QuestionInteractionController {
     fn activate_control(&mut self, control_id: &InteractionControlId) -> InteractionOutput {
         match control_id.as_str() {
             "submit" => self.submit(),
-            "cancel" => InteractionOutput::Cancelled,
+            "cancel" => dismissed(),
             value => {
                 if let Some((question_index, option_index)) = parse_option_control_id(value) {
                     self.toggle_option(question_index, option_index);
@@ -229,8 +229,14 @@ impl QuestionInteractionController {
                 InteractionOutput::Redraw
             }
             InteractionInput::Submit => self.submit(),
-            InteractionInput::Cancel => InteractionOutput::Cancelled,
+            InteractionInput::Cancel => dismissed(),
         }
+    }
+}
+
+fn dismissed() -> InteractionOutput {
+    InteractionOutput::Submitted {
+        payload: json!({"status": "dismissed"}),
     }
 }
 
@@ -319,6 +325,25 @@ mod tests {
                 required: false,
             }],
         }
+    }
+
+    #[test]
+    fn cancel_submits_plugin_owned_dismissed_response() {
+        let mut controller = QuestionInteractionController::new(request());
+        assert_eq!(
+            controller.handle_input(InteractionInput::Cancel),
+            InteractionOutput::Submitted {
+                payload: json!({"status": "dismissed"}),
+            }
+        );
+        assert_eq!(
+            controller.handle_input(InteractionInput::Activate {
+                control_id: InteractionControlId::new("cancel"),
+            }),
+            InteractionOutput::Submitted {
+                payload: json!({"status": "dismissed"}),
+            }
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@ pub use bcode_tool::{
     InteractionControlId, InteractionController, InteractionInput, InteractionNavigation,
     InteractionOutput, InteractionValue,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Boxed error returned by interaction controller factories.
@@ -37,6 +37,59 @@ pub trait PluginInteraction: Send + 'static {
 
     /// Handle semantic input from any renderer/client.
     fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput;
+}
+
+/// Advertised local adapter route for one opaque exchange schema/version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInteractionAdapterCapability {
+    /// Plugin or adapter that owns the exchange schema.
+    pub producer_id: String,
+    /// Producer-owned exchange request schema.
+    pub exchange_schema: String,
+    /// Minimum supported exchange schema version, inclusive.
+    pub min_schema_version: u32,
+    /// Maximum supported exchange schema version, inclusive.
+    pub max_schema_version: u32,
+    /// Platform that owns and executes this adapter, such as `tui` or `web`.
+    pub platform_id: String,
+    /// Selection priority within one platform; larger values win.
+    pub priority: u16,
+    /// Renderer-neutral controller kind.
+    pub interaction_kind: String,
+    /// Optional native TUI surface kind.
+    pub tui_surface_kind: Option<String>,
+}
+
+impl PluginInteractionAdapterCapability {
+    /// Return whether this adapter supports an exchange envelope.
+    #[must_use]
+    pub fn supports(&self, schema: &str, schema_version: u32) -> bool {
+        self.exchange_schema == schema
+            && (self.min_schema_version..=self.max_schema_version).contains(&schema_version)
+    }
+}
+
+/// Select the highest-priority adapter for one platform and opaque exchange envelope.
+#[must_use]
+pub fn select_interaction_adapter<'a>(
+    adapters: &'a [PluginInteractionAdapterCapability],
+    producer_id: &str,
+    schema: &str,
+    schema_version: u32,
+    platform_id: &str,
+) -> Option<&'a PluginInteractionAdapterCapability> {
+    adapters
+        .iter()
+        .filter(|adapter| {
+            adapter.producer_id == producer_id
+                && adapter.platform_id == platform_id
+                && adapter.supports(schema, schema_version)
+        })
+        .max_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| right.interaction_kind.cmp(&left.interaction_kind))
+        })
 }
 
 /// Errors returned by plugin interaction registries.
@@ -267,5 +320,60 @@ where
 
     fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
         self.inner.handle_input(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter(
+        kind: &str,
+        min_schema_version: u32,
+        max_schema_version: u32,
+        platform_id: &str,
+        priority: u16,
+    ) -> PluginInteractionAdapterCapability {
+        PluginInteractionAdapterCapability {
+            producer_id: "example.plugin".to_owned(),
+            exchange_schema: "example.request".to_owned(),
+            min_schema_version,
+            max_schema_version,
+            platform_id: platform_id.to_owned(),
+            priority,
+            interaction_kind: kind.to_owned(),
+            tui_surface_kind: None,
+        }
+    }
+
+    #[test]
+    fn adapter_selection_matches_platform_and_version_range_then_priority() {
+        let adapters = vec![
+            adapter("lower", 1, 3, "tui", 10),
+            adapter("web", 1, 3, "web", 100),
+            adapter("higher", 2, 4, "tui", 20),
+        ];
+        let selected =
+            select_interaction_adapter(&adapters, "example.plugin", "example.request", 3, "tui")
+                .expect("matching adapter");
+
+        assert_eq!(selected.interaction_kind, "higher");
+        assert!(
+            select_interaction_adapter(&adapters, "example.plugin", "example.request", 5, "tui")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn adapter_selection_is_deterministic_for_equal_priority() {
+        let adapters = vec![
+            adapter("zeta", 1, 1, "web", 10),
+            adapter("alpha", 1, 1, "web", 10),
+        ];
+        let selected =
+            select_interaction_adapter(&adapters, "example.plugin", "example.request", 1, "web")
+                .expect("matching adapter");
+
+        assert_eq!(selected.interaction_kind, "alpha");
     }
 }

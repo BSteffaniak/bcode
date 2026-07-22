@@ -49,11 +49,7 @@ pub async fn execute_session_view_action(
                 resolved_count: client.resolve_permission_batch(batch_id, approved).await?,
             })
         }
-        SessionViewAction::SubmitInteractionInput {
-            interaction_id,
-            input,
-        } => execute_interaction_input(client, interaction_id, input).await,
-        SessionViewAction::ResolveInteraction {
+        SessionViewAction::ResolveExchange {
             interaction_id,
             resolution,
         } => execute_resolve_interaction(client, interaction_id, resolution).await,
@@ -118,30 +114,14 @@ pub async fn execute_session_view_action(
     }
 }
 
-async fn execute_interaction_input(
-    client: &BcodeClient,
-    interaction_id: String,
-    input: bcode_tool::InteractionInput,
-) -> Result<SessionViewActionOutcome, ClientError> {
-    let response = client
-        .submit_interaction_input(interaction_id, input)
-        .await?;
-    Ok(SessionViewActionOutcome::InteractionInput {
-        response: serde_json::to_value(response).map_err(|error| ClientError::Server {
-            code: "interaction_response_encode_failed".to_owned(),
-            message: error.to_string(),
-        })?,
-    })
-}
-
 async fn execute_resolve_interaction(
     client: &BcodeClient,
     interaction_id: String,
-    resolution: bcode_session_models::InteractiveToolResolution,
+    resolution: bcode_session_models::ToolExchangeResolution,
 ) -> Result<SessionViewActionOutcome, ClientError> {
     Ok(SessionViewActionOutcome::InteractionResolved {
         resolved: client
-            .resolve_interactive_tool_request(interaction_id, resolution)
+            .resolve_tool_exchange(interaction_id, resolution)
             .await?,
     })
 }

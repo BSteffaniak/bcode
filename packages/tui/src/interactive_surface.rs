@@ -4,20 +4,16 @@ use bcode_plugin::{PluginLoadError, PluginRuntimeHost};
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiSurfaceOpenRequest, TokioPluginTuiHost,
 };
-use bcode_session_models::{InteractiveToolAbortReason, InteractiveToolResolution};
+use bcode_session_models::ToolExchangeResolution;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-/// Number of transcript rows before an inline interactive surface starts.
-pub const INLINE_INTERACTIVE_SURFACE_ROW_OFFSET: usize = 1;
-
 /// Runtime state for one client-rendered interactive tool surface.
 pub struct InteractiveSurfaceState {
     interaction_id: String,
-    surface_kind: String,
     surface: BoxedPluginTuiSurface,
     host: TokioPluginTuiHost,
 }
@@ -44,7 +40,6 @@ impl InteractiveSurfaceState {
         let _ = plugin_id;
         Ok(Self {
             interaction_id,
-            surface_kind,
             surface,
             host,
         })
@@ -56,15 +51,9 @@ impl InteractiveSurfaceState {
         &self.interaction_id
     }
 
-    /// Return the surface kind associated with this surface.
-    #[must_use]
-    pub fn surface_kind(&self) -> &str {
-        &self.surface_kind
-    }
-
     /// Return a user-dismissed resolution for host-level cancellation.
     #[must_use]
-    pub const fn dismissed_resolution() -> InteractiveToolResolution {
+    pub fn dismissed_resolution() -> ToolExchangeResolution {
         user_dismissed()
     }
 
@@ -80,17 +69,17 @@ impl InteractiveSurfaceState {
     }
 
     /// Handle an input event and return a close resolution when submitted or cancelled.
-    pub fn handle_event(&mut self, event: &Event) -> Option<InteractiveToolResolution> {
+    pub fn handle_event(&mut self, event: &Event) -> Option<ToolExchangeResolution> {
         match self.surface.handle_event(event, &self.host) {
             PluginTuiAction::None
             | PluginTuiAction::Redraw
             | PluginTuiAction::OpenSurface { .. } => None,
             PluginTuiAction::Close { outcome } => {
                 Some(outcome.map_or_else(user_dismissed, |payload| {
-                    InteractiveToolResolution::Submitted { payload }
+                    ToolExchangeResolution::Responded { payload }
                 }))
             }
-            PluginTuiAction::RunCommand { command } => Some(InteractiveToolResolution::Submitted {
+            PluginTuiAction::RunCommand { command } => Some(ToolExchangeResolution::Responded {
                 payload: json!({ "run_command": command }),
             }),
         }
@@ -134,9 +123,78 @@ async fn open_surface(
     })
 }
 
-const fn user_dismissed() -> InteractiveToolResolution {
-    InteractiveToolResolution::Aborted {
-        reason: InteractiveToolAbortReason::UserDismissed,
-        message: None,
+fn user_dismissed() -> ToolExchangeResolution {
+    ToolExchangeResolution::Responded {
+        payload: json!({"status": "dismissed"}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+
+    fn key(key: KeyCode) -> Event {
+        Event::Key(KeyStroke {
+            key,
+            modifiers: Modifiers::NONE,
+        })
+    }
+
+    #[tokio::test]
+    async fn question_exchange_payload_runs_entirely_in_local_tui_surface() {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        );
+        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &[plugin],
+        )
+        .expect("load local question plugin runtime");
+        let mut surface = InteractiveSurfaceState::open(
+            &runtime,
+            "question-call-question",
+            "bcode.question.inline",
+            &serde_json::json!({
+                "questions": [{
+                    "header": null,
+                    "question": "Proceed?",
+                    "options": [{
+                        "label": "Yes",
+                        "value": "yes",
+                        "description": null
+                    }],
+                    "control": "radio",
+                    "selection_mode": "single",
+                    "custom": false,
+                    "custom_mode": "additional",
+                    "required": true
+                }]
+            })
+            .to_string(),
+        )
+        .await
+        .expect("open local question TUI surface");
+
+        assert!(surface.handle_event(&key(KeyCode::Char('1'))).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
+        let resolution = surface
+            .handle_event(&key(KeyCode::Enter))
+            .expect("submit selected question answer");
+
+        assert_eq!(
+            resolution,
+            ToolExchangeResolution::Responded {
+                payload: serde_json::json!({
+                    "status": "answered",
+                    "questions": [{
+                        "question_index": 0,
+                        "selected": ["yes"],
+                        "custom": null
+                    }]
+                }),
+            }
+        );
     }
 }

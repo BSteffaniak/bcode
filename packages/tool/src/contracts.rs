@@ -70,6 +70,20 @@ pub struct ToolHostContextEntry {
     pub payload: serde_json::Value,
 }
 
+/// Host-context schema containing invocation-scoped nested service routes.
+pub const TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA: &str = "bcode.tool.service-routes";
+
+/// Opaque host-issued nested service route available to a prepared invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInvocationServiceRoute {
+    /// Opaque route identifier supplied back on service requests.
+    pub route_id: String,
+    /// Versioned service interface reachable through this route.
+    pub interface_id: String,
+    /// Operations permitted through this route.
+    pub operations: Vec<String>,
+}
+
 /// Request to prepare one invocation without performing its side effects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPreparationRequest {
@@ -107,6 +121,9 @@ pub struct ToolInvocationServiceRequest {
     pub invocation_id: String,
     /// Producer-assigned request identifier.
     pub request_id: String,
+    /// Opaque host-issued route identifier obtained during preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
     /// Versioned service interface identifier.
     pub interface_id: String,
     /// Operation within `interface_id`.

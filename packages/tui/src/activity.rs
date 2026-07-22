@@ -69,11 +69,6 @@ pub enum ActivityState {
         /// Tool name.
         name: String,
     },
-    /// Waiting for host interactive tool input.
-    WaitingInteraction {
-        /// Tool name.
-        name: String,
-    },
     /// Cancelling the active turn.
     Cancelling,
 }
@@ -108,8 +103,7 @@ impl ActivityState {
                 Self::PreparingToolExecution { name: right },
             )
             | (Self::RunningTool { name: left }, Self::RunningTool { name: right })
-            | (Self::WaitingPermission { name: left }, Self::WaitingPermission { name: right })
-            | (Self::WaitingInteraction { name: left }, Self::WaitingInteraction { name: right }) => {
+            | (Self::WaitingPermission { name: left }, Self::WaitingPermission { name: right }) => {
                 left == right
             }
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),

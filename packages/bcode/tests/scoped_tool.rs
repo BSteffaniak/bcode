@@ -145,6 +145,7 @@ async fn direct_tool_receives_canonical_scope_and_all_capabilities() {
                 .invoke_service(ToolInvocationServiceRequest {
                     invocation_id: invocation_id.clone(),
                     request_id: "service".to_string(),
+                    route_id: None,
                     interface_id: "test.service/v1".to_string(),
                     operation: "run".to_string(),
                     payload: serde_json::Value::Null,

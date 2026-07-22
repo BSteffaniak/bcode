@@ -700,12 +700,6 @@ fn push_transcript_item_rows(
                 plugin_host,
             );
         }
-        TranscriptItemKind::InteractiveToolRequest { .. } => {
-            push_interactive_surface_placeholder_rows(rows, width);
-        }
-        TranscriptItemKind::InteractiveToolResolution { .. } => {
-            push_detail_block(rows, "Interactive tool", item.text(), Color::Green, width);
-        }
         TranscriptItemKind::Usage { turn_id } => {
             push_usage_rows(rows, item, turn_id, width);
         }
@@ -776,27 +770,6 @@ fn push_transcript_item_rows(
             );
         }
     }
-}
-
-fn push_interactive_surface_placeholder_rows(rows: &mut Vec<Line>, width: u16) {
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        "Interactive tool",
-        width,
-        Style::new().fg(Color::Cyan),
-        Style::new().fg(Color::Cyan),
-    );
-    let surface_width = width.saturating_sub(2);
-    for index in 0..6 {
-        let marker = if index == 0 { "┌" } else { "│" };
-        rows.push(Line::from_spans(vec![
-            Span::styled(marker, muted_style()),
-            Span::styled(" ", muted_style()),
-            Span::styled(" ".repeat(usize::from(surface_width)), Style::new()),
-        ]));
-    }
-    rows.push(Line::default());
 }
 
 fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
@@ -1890,9 +1863,6 @@ fn activity_label(
             "waiting for permission · {}",
             tool_activity_label(name)
         )),
-        ActivityState::WaitingInteraction { name } => {
-            active(format!("waiting for input · {}", tool_activity_label(name)))
-        }
         ActivityState::Cancelling => active("cancelling".to_owned()),
     }
 }

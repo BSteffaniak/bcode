@@ -13,7 +13,9 @@ version     = { workspace = true }
 [lib]
 
 [dependencies]
+bcode_bundled_plugins = { workspace = true, optional = true }
 bcode_client = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }
@@ -46,9 +48,13 @@ bcode_ipc = { workspace = true }
 tokio     = { workspace = true, features = ["macros", "rt"] }
 
 [features]
-actix            = ["hyperchad/renderer-html-actix"]
-assets           = ["hyperchad/renderer-assets"]
-default          = ["actix", "html", "assets", "static-routes"]
+actix = ["hyperchad/renderer-html-actix"]
+assets = ["hyperchad/renderer-assets"]
+default = ["actix", "html", "assets", "static-routes"]
 fail-on-warnings = ["bcode_web_render_ui/fail-on-warnings"]
-html             = ["hyperchad/renderer-html"]
-static-routes    = ["hyperchad/router-static-routes"]
+html = ["hyperchad/renderer-html"]
+static-bundled-question-plugin = [
+    "dep:bcode_bundled_plugins",
+    "bcode_bundled_plugins/static-bundled-question-plugin",
+]
+static-routes = ["hyperchad/router-static-routes"]

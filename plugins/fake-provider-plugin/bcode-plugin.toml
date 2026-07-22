@@ -3,9 +3,10 @@ name    = "Bcode Fake Model Provider"
 version = "0.0.1"
 
 [[services]]
-description  = "Deterministic model provider used by tests and smoke flows"
-interface_id = "bcode.model-provider/v1"
-name         = "Fake Model Provider"
+description           = "Deterministic model provider used by tests and smoke flows"
+interface_id          = "bcode.model-provider/v1"
+invocation_operations = ["native_web_search"]
+name                  = "Fake Model Provider"
 
 [concurrency]
 type = "concurrent"

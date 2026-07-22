@@ -212,26 +212,6 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         semantic_result: Option<PersistedToolInvocationResult>,
     },
-    InteractiveToolRequestCreated {
-        interaction_id: String,
-        tool_call_id: String,
-        tool_name: String,
-        #[serde(default)]
-        interaction_kind: Option<String>,
-        surface_kind: String,
-        request_json: String,
-        #[serde(default)]
-        required: bool,
-        #[serde(default)]
-        turn_behavior: bcode_session_models::InteractiveToolTurnBehavior,
-        #[serde(default)]
-        render_target: bcode_session_models::InteractiveToolRenderTarget,
-    },
-    InteractiveToolRequestResolved {
-        interaction_id: String,
-        tool_call_id: String,
-        resolution_json: String,
-    },
     PermissionRequested {
         permission_id: String,
         tool_call_id: String,
@@ -498,6 +478,9 @@ enum PersistedSessionEventKind {
     ToolExchangeResolved {
         event: bcode_session_models::ToolExchangeResolutionEvent,
     },
+    ToolInvocationResultRecorded {
+        record: bcode_session_models::ToolInvocationResultRecord,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -635,36 +618,6 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 semantic_result: semantic_result
                     .as_ref()
                     .map(PersistedToolInvocationResult::from),
-            },
-            SessionEventKind::InteractiveToolRequestCreated {
-                interaction_id,
-                tool_call_id,
-                tool_name,
-                interaction_kind,
-                surface_kind,
-                request_json,
-                required,
-                turn_behavior,
-                render_target,
-            } => Self::InteractiveToolRequestCreated {
-                interaction_id: interaction_id.clone(),
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                interaction_kind: interaction_kind.clone(),
-                surface_kind: surface_kind.clone(),
-                request_json: request_json.clone(),
-                required: *required,
-                turn_behavior: *turn_behavior,
-                render_target: *render_target,
-            },
-            SessionEventKind::InteractiveToolRequestResolved {
-                interaction_id,
-                tool_call_id,
-                resolution_json,
-            } => Self::InteractiveToolRequestResolved {
-                interaction_id: interaction_id.clone(),
-                tool_call_id: tool_call_id.clone(),
-                resolution_json: resolution_json.clone(),
             },
             SessionEventKind::PermissionRequested {
                 permission_id,
@@ -876,6 +829,11 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             SessionEventKind::ToolExchangeResolved { event } => Self::ToolExchangeResolved {
                 event: event.clone(),
             },
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                Self::ToolInvocationResultRecorded {
+                    record: record.clone(),
+                }
+            }
             SessionEventKind::ToolInvocationStream { event } => Self::ToolInvocationStream {
                 event: event.clone(),
             },
@@ -1022,36 +980,6 @@ impl PersistedSessionEventKind {
                 is_error,
                 output,
                 semantic_result: semantic_result.map(PersistedToolInvocationResult::into_domain),
-            },
-            Self::InteractiveToolRequestCreated {
-                interaction_id,
-                tool_call_id,
-                tool_name,
-                interaction_kind,
-                surface_kind,
-                request_json,
-                required,
-                turn_behavior,
-                render_target,
-            } => SessionEventKind::InteractiveToolRequestCreated {
-                interaction_id,
-                tool_call_id,
-                tool_name,
-                interaction_kind,
-                surface_kind,
-                request_json,
-                required,
-                turn_behavior,
-                render_target,
-            },
-            Self::InteractiveToolRequestResolved {
-                interaction_id,
-                tool_call_id,
-                resolution_json,
-            } => SessionEventKind::InteractiveToolRequestResolved {
-                interaction_id,
-                tool_call_id,
-                resolution_json,
             },
             Self::PermissionRequested {
                 permission_id,
@@ -1249,6 +1177,9 @@ impl PersistedSessionEventKind {
             Self::ToolExchangeResolved { event } => {
                 SessionEventKind::ToolExchangeResolved { event }
             }
+            Self::ToolInvocationResultRecorded { record } => {
+                SessionEventKind::ToolInvocationResultRecorded { record }
+            }
             Self::ToolInvocationStream { event } => {
                 SessionEventKind::ToolInvocationStream { event }
             }
@@ -1443,6 +1374,31 @@ impl CurrentPersistedToolInvocationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_invocation_result_record_round_trips_through_persistence() {
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 7,
+            timestamp_ms: 9,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Json {
+                        value: r#"{"ok":true}"#.to_owned(),
+                    }),
+                },
+            },
+        };
+        let encoded = encode_session_event(&event).expect("encode generic result record");
+        let decoded = decode_session_event(&encoded).expect("decode generic result record");
+
+        assert_eq!(decoded, event);
+    }
 
     #[test]
     fn legacy_context_usage_observation_decodes_to_request_context_observation() {

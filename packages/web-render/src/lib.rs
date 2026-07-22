@@ -66,7 +66,22 @@ pub struct WebRenderState {
     access_token: Arc<str>,
     watched_sessions: Arc<Mutex<BTreeSet<SessionId>>>,
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
+    interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
     renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+}
+
+#[derive(Default)]
+struct LocalInteractionControllers {
+    entries: BTreeMap<String, bcode_plugin_sdk::interaction::BoxedPluginInteractionController>,
+}
+
+impl std::fmt::Debug for LocalInteractionControllers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalInteractionControllers")
+            .field("interaction_ids", &self.entries.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -154,11 +169,13 @@ impl WebRenderState {
     /// Create web renderer state from a daemon client and per-launch access token.
     #[must_use]
     pub fn new(client: BcodeClient, access_token: impl Into<Arc<str>>) -> Self {
+        let client = client.with_interaction_adapters(local_interaction_adapters());
         Self {
             client,
             access_token: access_token.into(),
             watched_sessions: Arc::new(Mutex::new(BTreeSet::new())),
             history_windows: Arc::new(Mutex::new(BTreeMap::new())),
+            interaction_controllers: Arc::new(Mutex::new(LocalInteractionControllers::default())),
             renderer_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -177,6 +194,7 @@ impl WebRenderState {
         let access_token = Arc::clone(&self.access_token);
         let renderer_tx = Arc::clone(&self.renderer_tx);
         let history_windows = Arc::clone(&self.history_windows);
+        let interaction_controllers = Arc::clone(&self.interaction_controllers);
         let watched_sessions = Arc::clone(&self.watched_sessions);
         tokio::spawn(async move {
             if let Err(error) = Box::pin(watch_session_updates(
@@ -185,6 +203,7 @@ impl WebRenderState {
                 session_id,
                 Arc::clone(&renderer_tx),
                 history_windows,
+                interaction_controllers,
             ))
             .await
             {
@@ -261,18 +280,26 @@ impl WebRenderState {
         let mut connection = self.client.connect("bcode-web-render").await?;
         let attached =
             attach_web_projection_window_with_request(&mut connection, session_id, request).await?;
-        session_view_from_attached_history(&self.client, attached).await
+        session_view_from_attached_history(&self.client, attached, &self.interaction_controllers)
+            .await
     }
 }
 
 async fn session_view_from_attached_history(
     client: &BcodeClient,
     attached: AttachedSessionHistory,
+    interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
 ) -> Result<SessionViewSnapshot, ClientError> {
     let mut view = view_from_attached_history(&attached);
     hydrate_session_model_status(client, attached.session.id, &mut view).await?;
     hydrate_pending_permissions(client, attached.session.id, &mut view).await?;
-    hydrate_pending_interactions(client, attached.session.id, &mut view).await?;
+    hydrate_pending_interactions(
+        client,
+        attached.session.id,
+        &mut view,
+        interaction_controllers,
+    )
+    .await?;
     Ok(snapshot_from_view(&view, &attached))
 }
 
@@ -356,35 +383,110 @@ async fn hydrate_pending_interactions(
     client: &BcodeClient,
     session_id: SessionId,
     view: &mut SessionView,
+    interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
 ) -> Result<(), ClientError> {
-    let requests = client.list_interactive_tool_requests().await?;
-    for request in requests
+    let exchanges = client.list_pending_tool_exchanges().await?;
+    let pending_ids = exchanges
+        .iter()
+        .map(|pending| pending.request.exchange_id.as_str())
+        .collect::<BTreeSet<_>>();
+    interaction_controllers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .retain(|interaction_id, _| pending_ids.contains(interaction_id.as_str()));
+    for request in exchanges
         .into_iter()
         .filter(|request| request.session_id == session_id)
     {
-        let interaction_id = request.interaction_id.clone();
-        let snapshot = client
-            .interaction_snapshot(interaction_id.clone())
-            .await?
-            .map_or(request.request, |snapshot| snapshot.snapshot);
-        let surface_kind = request.surface_kind.clone();
+        let exchange = request.request;
+        let interaction_id = exchange.exchange_id.clone();
+        let snapshot = {
+            let mut controllers = interaction_controllers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !controllers.entries.contains_key(&interaction_id)
+                && let Some(controller) = local_interaction_controller(&exchange)
+            {
+                controllers
+                    .entries
+                    .insert(interaction_id.clone(), controller);
+            }
+            controllers.entries.get(&interaction_id).map_or_else(
+                || exchange.payload.clone(),
+                |controller| controller.snapshot_json(),
+            )
+        };
+        let adapter = local_interaction_adapter(&exchange);
+        let kind = adapter.as_ref().map_or_else(
+            || exchange.schema.clone(),
+            |adapter| adapter.interaction_kind.clone(),
+        );
+        let surface_kind = adapter
+            .and_then(|adapter| adapter.tui_surface_kind)
+            .unwrap_or_else(|| exchange.schema.clone());
         view.upsert_interaction(InteractionViewSummary {
             interaction_id,
-            kind: request
-                .interaction_kind
-                .unwrap_or_else(|| surface_kind.clone()),
+            kind,
             surface_kind,
-            tool_call_id: Some(request.tool_call_id),
-            title: Some(request.tool_name),
-            required: request.required,
+            tool_call_id: Some(exchange.invocation_id),
+            title: Some(exchange.producer_id),
+            required: exchange.response_policy
+                == bcode_session_models::ToolExchangeResponsePolicy::Required,
             snapshot: Some(snapshot),
             resolved: false,
             resolution: None,
-            render_target: request.render_target,
-            turn_behavior: request.turn_behavior,
         });
     }
     Ok(())
+}
+
+#[cfg(feature = "static-bundled-question-plugin")]
+fn local_interaction_adapters()
+-> Vec<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    bcode_bundled_plugins::interaction_adapters("web")
+}
+
+#[cfg(not(feature = "static-bundled-question-plugin"))]
+const fn local_interaction_adapters()
+-> Vec<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    Vec::new()
+}
+
+#[cfg(feature = "static-bundled-question-plugin")]
+fn local_interaction_adapter(
+    exchange: &bcode_session_models::ToolExchangeRequest,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    bcode_bundled_plugins::interaction_adapter(
+        &exchange.producer_id,
+        &exchange.schema,
+        exchange.schema_version,
+        "web",
+    )
+}
+
+#[cfg(not(feature = "static-bundled-question-plugin"))]
+const fn local_interaction_adapter(
+    _exchange: &bcode_session_models::ToolExchangeRequest,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    None
+}
+
+#[cfg(feature = "static-bundled-question-plugin")]
+fn local_interaction_controller(
+    exchange: &bcode_session_models::ToolExchangeRequest,
+) -> Option<bcode_plugin_sdk::interaction::BoxedPluginInteractionController> {
+    let adapter = local_interaction_adapter(exchange)?;
+    bcode_bundled_plugins::interaction_registry(&exchange.producer_id)?
+        .open(&adapter.interaction_kind, exchange.payload.clone())
+        .ok()
+}
+
+#[cfg(not(feature = "static-bundled-question-plugin"))]
+const fn local_interaction_controller(
+    _exchange: &bcode_session_models::ToolExchangeRequest,
+) -> Option<bcode_plugin_sdk::interaction::BoxedPluginInteractionController> {
+    None
 }
 
 const fn web_projection_window_request() -> ProjectionWindowRequest {
@@ -781,7 +883,13 @@ impl WebRenderState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(session_id, request);
         }
-        let snapshot = match session_view_from_attached_history(&self.client, attached).await {
+        let snapshot = match session_view_from_attached_history(
+            &self.client,
+            attached,
+            &self.interaction_controllers,
+        )
+        .await
+        {
             Ok(snapshot) => snapshot,
             Err(error) => return error_page(&error.to_string()),
         };
@@ -790,6 +898,29 @@ impl WebRenderState {
             Err(error) => return error_page(&error.to_string()),
         };
         bcode_web_render_ui::pages::home::home(&snapshot, &sessions, self.access_token())
+    }
+
+    fn apply_local_interaction_input(
+        &self,
+        exchange: &bcode_session_models::ToolExchangeRequest,
+        input: bcode_tool::InteractionInput,
+    ) -> Option<bcode_tool::InteractionOutput> {
+        let interaction_id = &exchange.exchange_id;
+        let mut controllers = self
+            .interaction_controllers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !controllers.entries.contains_key(interaction_id)
+            && let Some(controller) = local_interaction_controller(exchange)
+        {
+            controllers
+                .entries
+                .insert(interaction_id.clone(), controller);
+        }
+        controllers
+            .entries
+            .get_mut(interaction_id)
+            .map(|controller| controller.handle_input(input))
     }
 
     async fn handle_interaction(&self, request: RouteRequest) -> hyperchad::template::Containers {
@@ -811,13 +942,65 @@ impl WebRenderState {
                     .await;
             }
         };
-        let action = SessionViewAction::SubmitInteractionInput {
-            interaction_id: form.interaction_id,
-            input,
+        let interaction_id = form.interaction_id;
+        let exchanges = match self.client.list_pending_tool_exchanges().await {
+            Ok(exchanges) => exchanges,
+            Err(error) => {
+                return self
+                    .render_session_or_initial(Some(session_id), &error.to_string())
+                    .await;
+            }
         };
-        match execute_session_view_action(&self.client, action).await {
-            Ok(_) => {
-                self.render_session_or_initial(Some(session_id), "interaction input accepted")
+        let Some(exchange) = exchanges
+            .into_iter()
+            .find(|pending| {
+                pending.session_id == session_id && pending.request.exchange_id == interaction_id
+            })
+            .map(|pending| pending.request)
+        else {
+            return self
+                .render_session_or_initial(Some(session_id), "interaction is no longer pending")
+                .await;
+        };
+        let Some(output) = self.apply_local_interaction_input(&exchange, input) else {
+            return self
+                .render_session_or_initial(
+                    Some(session_id),
+                    "no local renderer adapter supports this interaction",
+                )
+                .await;
+        };
+        let (resolution, status) = match output {
+            bcode_tool::InteractionOutput::None | bcode_tool::InteractionOutput::Redraw => {
+                return self
+                    .render_session_or_initial(Some(session_id), "interaction input accepted")
+                    .await;
+            }
+            bcode_tool::InteractionOutput::Submitted { payload } => (
+                bcode_session_models::ToolExchangeResolution::Responded { payload },
+                "interaction submitted",
+            ),
+            bcode_tool::InteractionOutput::Cancelled => (
+                bcode_session_models::ToolExchangeResolution::Cancelled,
+                "interaction cancelled",
+            ),
+        };
+        match self
+            .client
+            .resolve_tool_exchange(exchange.exchange_id.clone(), resolution)
+            .await
+        {
+            Ok(true) => {
+                self.interaction_controllers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .remove(&exchange.exchange_id);
+                self.render_session_or_initial(Some(session_id), status)
+                    .await
+            }
+            Ok(false) => {
+                self.render_session_or_initial(Some(session_id), "interaction is no longer pending")
                     .await
             }
             Err(error) => {
@@ -1020,6 +1203,7 @@ pub async fn init(state: &WebRenderState) -> Result<AppBuilder, ClientError> {
 async fn attach_watched_session(
     client: &BcodeClient,
     session_id: SessionId,
+    interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
 ) -> Result<(SessionWatcher, AttachedSessionHistory, SessionView), ClientError> {
     let mut watcher = client
         .watch_session_projection_window(session_id, web_projection_window_request())
@@ -1030,7 +1214,7 @@ async fn attach_watched_session(
     let mut view = view_from_attached_history(&attached);
     hydrate_session_model_status(client, session_id, &mut view).await?;
     hydrate_pending_permissions(client, session_id, &mut view).await?;
-    hydrate_pending_interactions(client, session_id, &mut view).await?;
+    hydrate_pending_interactions(client, session_id, &mut view, interaction_controllers).await?;
     Ok((watcher, attached, view))
 }
 
@@ -1067,6 +1251,7 @@ async fn watched_session_snapshot(
     attached: &AttachedSessionHistory,
     view: &SessionView,
     history_windows: &Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
+    interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
 ) -> Result<SessionViewSnapshot, ClientError> {
     let history_request = history_windows
         .lock()
@@ -1077,9 +1262,38 @@ async fn watched_session_snapshot(
         let mut connection = client.connect("bcode-web-render-history-refresh").await?;
         let historical =
             attach_web_projection_window_with_request(&mut connection, session_id, request).await?;
-        session_view_from_attached_history(client, historical).await
+        session_view_from_attached_history(client, historical, interaction_controllers).await
     } else {
         Ok(snapshot_from_view(view, attached))
+    }
+}
+
+fn apply_watched_event(
+    view: &mut SessionView,
+    session_id: SessionId,
+    event: SessionWatchEvent,
+) -> bool {
+    match event {
+        SessionWatchEvent::Durable(event) => {
+            match durable_event_disposition(view.snapshot().latest_sequence, event.sequence) {
+                DurableEventDisposition::Apply => view.apply_event(&event),
+                DurableEventDisposition::IgnoreDuplicate => {}
+                DurableEventDisposition::ResyncGap => {
+                    tracing::warn!(
+                        "web session watcher detected event gap for {session_id}: latest={:?}, received={}",
+                        view.snapshot().latest_sequence,
+                        event.sequence
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+        SessionWatchEvent::Live(event) => {
+            view.apply_live_event(&event);
+            false
+        }
+        SessionWatchEvent::ResyncRequired => true,
     }
 }
 
@@ -1089,9 +1303,10 @@ async fn watch_session_updates(
     session_id: SessionId,
     renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
+    interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
 ) -> Result<(), ClientError> {
     let (mut watcher, mut attached, mut view) = loop {
-        match attach_watched_session(&client, session_id).await {
+        match attach_watched_session(&client, session_id, &interaction_controllers).await {
             Ok(state) => break state,
             Err(error) => {
                 if browser_update_sender(&renderer_tx).is_none() {
@@ -1112,7 +1327,7 @@ async fn watch_session_updates(
                 }
                 tracing::warn!("web session watcher disconnected for {session_id}: {error}");
                 tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
-                match attach_watched_session(&client, session_id).await {
+                match attach_watched_session(&client, session_id, &interaction_controllers).await {
                     Ok((new_watcher, new_attached, new_view)) => {
                         watcher = new_watcher;
                         attached = new_attached;
@@ -1129,29 +1344,11 @@ async fn watch_session_updates(
             }
         };
 
-        let mut resync = false;
-        match event {
-            SessionWatchEvent::Durable(event) => {
-                match durable_event_disposition(view.snapshot().latest_sequence, event.sequence) {
-                    DurableEventDisposition::Apply => view.apply_event(&event),
-                    DurableEventDisposition::IgnoreDuplicate => {}
-                    DurableEventDisposition::ResyncGap => {
-                        tracing::warn!(
-                            "web session watcher detected event gap for {session_id}: latest={:?}, received={}",
-                            view.snapshot().latest_sequence,
-                            event.sequence
-                        );
-                        resync = true;
-                    }
-                }
-            }
-            SessionWatchEvent::Live(event) => view.apply_live_event(&event),
-            SessionWatchEvent::ResyncRequired => resync = true,
-        }
+        let resync = apply_watched_event(&mut view, session_id, event);
 
         if resync {
             let state = loop {
-                match attach_watched_session(&client, session_id).await {
+                match attach_watched_session(&client, session_id, &interaction_controllers).await {
                     Ok(state) => break state,
                     Err(error) => {
                         if browser_update_sender(&renderer_tx).is_none() {
@@ -1168,16 +1365,23 @@ async fn watch_session_updates(
         } else {
             hydrate_session_model_status(&client, session_id, &mut view).await?;
             hydrate_pending_permissions(&client, session_id, &mut view).await?;
-            hydrate_pending_interactions(&client, session_id, &mut view).await?;
+            hydrate_pending_interactions(&client, session_id, &mut view, &interaction_controllers)
+                .await?;
         }
 
         let sessions = client.list_sessions().await?;
         if let Some(summary) = sessions.iter().find(|summary| summary.id == session_id) {
             attached.session.clone_from(summary);
         }
-        let snapshot =
-            watched_session_snapshot(&client, session_id, &attached, &view, &history_windows)
-                .await?;
+        let snapshot = watched_session_snapshot(
+            &client,
+            session_id,
+            &attached,
+            &view,
+            &history_windows,
+            &interaction_controllers,
+        )
+        .await?;
         let update = ScopedSnapshotUpdate {
             scope: format!("{access_token}:{session_id}"),
             snapshot,
@@ -1230,6 +1434,63 @@ pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "static-bundled-question-plugin")]
+    #[test]
+    fn web_runs_question_adapter_locally_from_opaque_exchange() {
+        let exchange = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-1".to_owned(),
+            exchange_id: "exchange-1".to_owned(),
+            producer_id: "bcode.question".to_owned(),
+            schema: "bcode.question.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({
+                "questions": [{
+                    "header": null,
+                    "question": "Proceed?",
+                    "options": [{
+                        "label": "Yes",
+                        "value": "yes",
+                        "description": null
+                    }],
+                    "control": "radio",
+                    "selection_mode": "single",
+                    "custom": false,
+                    "custom_mode": "additional",
+                    "required": false
+                }]
+            }),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let mut controller = local_interaction_controller(&exchange)
+            .expect("question adapter should be available locally");
+        assert_eq!(
+            controller.handle_input(bcode_tool::InteractionInput::Activate {
+                control_id: bcode_tool::InteractionControlId::new("question-0.option-0"),
+            }),
+            bcode_tool::InteractionOutput::Redraw
+        );
+        let snapshot = controller.snapshot_json();
+
+        assert_eq!(snapshot["answers"][0]["selected"][0], "yes");
+        assert_eq!(
+            controller.handle_input(bcode_tool::InteractionInput::Submit),
+            bcode_tool::InteractionOutput::Submitted {
+                payload: serde_json::json!({
+                    "status": "answered",
+                    "questions": [{
+                        "question_index": 0,
+                        "selected": ["yes"],
+                        "custom": null
+                    }]
+                }),
+            }
+        );
+        let adapter = local_interaction_adapter(&exchange).expect("question adapter capability");
+        assert_eq!(adapter.interaction_kind, "bcode.question");
+        assert_eq!(adapter.platform_id, "web");
+        assert_eq!(adapter.tui_surface_kind, None);
+    }
 
     #[test]
     fn web_projection_closes_resolved_permission_but_preserves_transcript_record() {

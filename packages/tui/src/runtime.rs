@@ -70,13 +70,16 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> Result<(), TuiError> {
     let config = bcode_config::load_config();
-    let client = config.as_ref().map_or_else(
-        |_| BcodeClient::default_endpoint(),
-        |config| {
-            BcodeClient::default_endpoint()
-                .with_request_timeout(Duration::from_secs(config.client.request_timeout_secs))
-        },
-    );
+    let client = config
+        .as_ref()
+        .map_or_else(
+            |_| BcodeClient::default_endpoint(),
+            |config| {
+                BcodeClient::default_endpoint()
+                    .with_request_timeout(Duration::from_secs(config.client.request_timeout_secs))
+            },
+        )
+        .with_interaction_adapters(bcode_bundled_plugins::interaction_adapters("tui"));
     let daemon_host = super::daemon_host::TuiDaemonHost::new(static_plugins);
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();

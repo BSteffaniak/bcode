@@ -72,6 +72,7 @@ bcode_web_render = { workspace = true, features = [
     "html",
     "static-routes",
 ] }
+bcode_web_search_plugin = { workspace = true, features = ["static-bundled"] }
 hyperchad = { workspace = true, features = ["router", "router-form"] }
 switchy = { workspace = true, features = ["database", "database-schema"] }
 tempfile = { workspace = true }

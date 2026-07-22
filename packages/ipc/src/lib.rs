@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 11;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 12;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -409,16 +409,9 @@ pub enum Request {
     ComposerDraft {
         scope: ComposerDraftScope,
     },
-    ListInteractiveToolRequests,
-    GetInteractionSnapshot {
-        interaction_id: String,
-    },
-    SubmitInteractionInput {
-        interaction_id: String,
-        input: bcode_tool::InteractionInput,
-    },
-    ResolveInteractiveToolRequest {
-        interaction_id: String,
+    ListPendingToolExchanges,
+    ResolveToolExchange {
+        exchange_id: String,
         resolution_json: serde_json::Value,
     },
     /// Inspect effective model catalog and refresh state.
@@ -467,6 +460,10 @@ pub struct ClientRuntimeContext {
     pub requested_model_id: Option<String>,
     #[serde(default)]
     pub provider_context: bcode_model::ProviderRequestContext,
+    /// Renderer-owned adapters available on this client connection.
+    #[serde(default)]
+    pub interaction_adapters:
+        Vec<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability>,
     /// Redacted names of transient environment variables included in `provider_context.env`.
     #[serde(default)]
     pub env_keys: BTreeMap<String, bool>,
@@ -676,45 +673,11 @@ pub struct PermissionSummary {
     pub can_remember_policy: bool,
 }
 
-/// Pending interactive tool request summary.
+/// Pending renderer-neutral invocation exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InteractiveToolRequestSummary {
-    pub interaction_id: String,
+pub struct PendingToolExchangeSummary {
     pub session_id: SessionId,
-    pub tool_call_id: String,
-    pub tool_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interaction_kind: Option<String>,
-    pub surface_kind: String,
-    pub request: serde_json::Value,
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default)]
-    pub turn_behavior: bcode_session_models::InteractiveToolTurnBehavior,
-    #[serde(default)]
-    pub render_target: bcode_session_models::InteractiveToolRenderTarget,
-}
-
-/// Renderer-neutral interactive session snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InteractionSnapshotResponse {
-    pub interaction_id: String,
-    pub interaction_kind: String,
-    pub snapshot: serde_json::Value,
-}
-
-/// Result from submitting renderer-neutral interaction input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum InteractionInputResponse {
-    None,
-    Redraw {
-        snapshot: InteractionSnapshotResponse,
-    },
-    Submitted {
-        payload: serde_json::Value,
-    },
-    Cancelled,
+    pub request: bcode_session_models::ToolExchangeRequest,
 }
 
 /// Plugin service invocation result.
@@ -1226,16 +1189,10 @@ pub enum ResponsePayload {
     PluginContributions {
         contributions: PluginContributions,
     },
-    InteractiveToolRequestList {
-        requests: Vec<InteractiveToolRequestSummary>,
+    PendingToolExchangeList {
+        exchanges: Vec<PendingToolExchangeSummary>,
     },
-    InteractionSnapshot {
-        snapshot: Option<InteractionSnapshotResponse>,
-    },
-    InteractionInputSubmitted {
-        response: InteractionInputResponse,
-    },
-    InteractiveToolRequestResolved {
+    ToolExchangeResolved {
         resolved: bool,
     },
     /// Effective model catalog diagnostics.
@@ -2527,6 +2484,18 @@ mod tests {
                     }),
                     ..bcode_model::ProviderRequestContext::default()
                 },
+                interaction_adapters: vec![
+                    bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+                        producer_id: "example.plugin".to_owned(),
+                        exchange_schema: "example.request".to_owned(),
+                        min_schema_version: 2,
+                        max_schema_version: 4,
+                        platform_id: "tui".to_owned(),
+                        priority: 50,
+                        interaction_kind: "example.interaction".to_owned(),
+                        tui_surface_kind: None,
+                    },
+                ],
                 env_keys: BTreeMap::from([("OPENROUTER_API_KEY".to_string(), true)]),
             }),
         };

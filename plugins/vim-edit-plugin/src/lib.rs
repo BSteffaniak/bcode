@@ -1428,6 +1428,7 @@ mod tests {
                 "path": file.path(),
                 "steps": [{ "ex": "%s/foo/bar/" }]
             }),
+            preparation_descriptor: serde_json::Value::Null,
             cwd: None,
             artifact_dir: None,
         });
@@ -1454,6 +1455,7 @@ mod tests {
                 "path": file.path(),
                 "steps": [{ "ex": "%s/foo/bar/" }]
             }),
+            preparation_descriptor: serde_json::Value::Null,
             cwd: None,
             artifact_dir: None,
         });
@@ -1484,6 +1486,7 @@ mod tests {
                     { "path": first.path(), "steps": [{ "ex": "%s/beta/gamma/" }] }
                 ]
             }),
+            preparation_descriptor: serde_json::Value::Null,
             cwd: None,
             artifact_dir: None,
         });
@@ -1520,6 +1523,7 @@ mod tests {
                     { "path": first.path(), "steps": [{ "ex": "%s/beta/gamma/" }] }
                 ]
             }),
+            preparation_descriptor: serde_json::Value::Null,
             cwd: None,
             artifact_dir: None,
         });
@@ -1553,6 +1557,7 @@ mod tests {
                     { "path": second.path(), "steps": [{ "keys": "/missing<CR>" }] }
                 ]
             }),
+            preparation_descriptor: serde_json::Value::Null,
             cwd: None,
             artifact_dir: None,
         });

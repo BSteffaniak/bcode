@@ -280,7 +280,8 @@ if ! grep -F 'parallel_group_cancellation_returns_exactly_one_outcome_per_invoca
   violations=1
 fi
 
-if ! rg -U 'let service = invoke_host_provider_native_search_response\([\s\S]*tokio::select! \{[\s\S]*cancel_state\.cancelled\(\)[\s\S]*ToolInvocationServiceResolution::Cancelled' packages/server/src/lib.rs >/dev/null; then
+if ! grep -F 'let service = self' packages/server/src/lib.rs >/dev/null ||
+   ! rg -U 'invoke_service_json_scoped::<_, serde_json::Value>[\s\S]{0,500}tokio::select! \{[\s\S]{0,180}self\.cancel_state\.cancelled\(\)[\s\S]{0,180}ToolInvocationServiceResolution::Cancelled' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: server nested service routing is not cancellation-bounded." >&2
   violations=1
 fi
@@ -769,10 +770,147 @@ if grep -R -E 'emit_tool_stream_event|ToolInvocationStreamEvent::(Started|Output
   violations=1
 fi
 
-if rg -n 'ToolInvocationHostAction|InteractiveToolResumeRequest|OP_RESUME_INTERACTIVE_TOOL' \
-  packages plugins examples --glob='*.rs' >/tmp/bcode-removed-tool-host-contracts.txt; then
+if rg -n 'ToolInvocationHostAction|InteractiveToolResumeRequest|OP_RESUME_INTERACTIVE_TOOL|pub struct InteractiveToolRequest|bcode_tool::InteractiveToolRequest|pub enum InteractiveToolRenderTarget|bcode_tool::InteractiveToolRenderTarget|pub enum InteractiveToolTurnBehavior|bcode_tool::InteractiveToolTurnBehavior' \
+  packages/tool packages/server/src plugins examples --glob='*.rs' >/tmp/bcode-removed-tool-host-contracts.txt; then
   echo "Runtime architecture violation: removed tool host-action/resume contracts were reintroduced." >&2
   cat /tmp/bcode-removed-tool-host-contracts.txt >&2
+  violations=1
+fi
+
+if rg -n 'InteractiveToolRenderTarget|InteractiveToolTurnBehavior|render_target|turn_behavior' \
+  packages/session-view packages/session packages/ipc packages/server packages/tui packages/web-render --glob='*.rs' \
+  >/tmp/bcode-removed-interaction-placement.txt; then
+  echo "Runtime architecture violation: removed interaction placement/turn-behavior DTOs were reintroduced." >&2
+  cat /tmp/bcode-removed-interaction-placement.txt >&2
+  violations=1
+fi
+
+if rg -n 'InteractiveToolRequestSummary|ListInteractiveToolRequests|InteractiveToolRequestList|ResolveInteractiveToolRequest|list_interactive_tool_requests|resolve_interactive_tool_request' \
+  packages plugins examples --glob='*.rs' >/tmp/bcode-removed-interactive-summaries.txt; then
+  echo "Runtime architecture violation: removed interactive request summary protocol was reintroduced." >&2
+  cat /tmp/bcode-removed-interactive-summaries.txt >&2
+  violations=1
+fi
+
+if rg -n 'InteractiveTool|interactive_tool|PendingInteractive|pending_interactive|resume_interactive|InteractiveToolResumeRequest|OP_RESUME_INTERACTIVE_TOOL|append_interactive_tool_request_(created|resolved)_event|InteractionSnapshotResponse|InteractionInputResponse|GetInteractionSnapshot|SubmitInteractionInput|\.interaction_snapshot\(|\.submit_interaction_input\(|pub async fn (interaction_snapshot|submit_interaction_input)' \
+  packages/tool packages/ipc packages/client packages/server packages/session/models packages/session-view packages/tui packages/web-render packages/cli --glob='*.rs' \
+  >/tmp/bcode-removed-server-interaction-controller.txt; then
+  echo "Runtime architecture violation: renderer interaction state/input returned to the server protocol." >&2
+  cat /tmp/bcode-removed-server-interaction-controller.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'pub struct PendingToolExchangeSummary' packages/ipc/src/lib.rs >/dev/null ||
+   ! grep -F 'pub request: bcode_session_models::ToolExchangeRequest' packages/ipc/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: pending IPC exchange hydration no longer carries the generic exchange envelope." >&2
+  violations=1
+fi
+
+if ! grep -F 'pub struct PluginInteractionAdapterCapability' packages/plugin-sdk/src/interaction.rs >/dev/null ||
+   ! grep -F 'pub interaction_adapters:' packages/ipc/src/lib.rs >/dev/null ||
+   ! grep -F 'with_interaction_adapters' packages/client/src/lib.rs >/dev/null ||
+   ! grep -F 'client_supports_exchange' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'has_exchange_consumer' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'bcode_bundled_plugins::interaction_adapter(' packages/tui/src/effects.rs >/dev/null ||
+   ! grep -F 'SessionEventKind::ToolExchangeRequested { request }' packages/tui/src/chat_loop.rs >/dev/null ||
+   ! grep -F 'local_interaction_adapter(&exchange)' packages/web-render/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: renderer-local exchange adapter routing was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ModelNativeWebSearchServiceRequest|MODEL_NATIVE_WEB_SEARCH_SERVICE_INTERFACE|invoke_host_provider_native_search_response|bcode\.web-search\.model-native/v1' \
+  packages/server/src/lib.rs >/tmp/bcode-server-web-search-bridge.txt; then
+  echo "Runtime architecture violation: server-specific model-native web-search bridge matching was reintroduced." >&2
+  cat /tmp/bcode-server-web-search-bridge.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA' packages/tool/src/contracts.rs >/dev/null ||
+   ! grep -F 'invocation_operations' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'server_web_search_invocation_uses_prepared_generic_provider_route' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: manifest-driven generic nested-service routing coverage was removed." >&2
+  violations=1
+fi
+
+if rg 'append_tool_call_finished\(' packages scripts --glob '*.rs' --glob '*.sh' >/dev/null; then
+  echo "Runtime architecture violation: the legacy tool-finish write API was restored." >&2
+  violations=1
+fi
+if rg -U 'append_tool_invocation_result\([\s\S]{0,1200}append_tool_call_finished\(' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: production tool results still dual-write generic and legacy finish events." >&2
+  violations=1
+fi
+
+if ! grep -F 'generic_records_reopen_to_identical_canonical_and_bounded_projections' packages/session/src/db.rs >/dev/null ||
+   ! grep -F 'durable_mixed_history_replays_to_byte_identical_generic_snapshots' packages/session-view/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: deterministic generic session replay coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'generic_results_keep_parallel_tool_batch_in_one_compaction_unit' packages/server/src/context_compaction.rs >/dev/null ||
+   ! grep -F 'generic_final_result_is_model_visible_once_during_dual_write' packages/server/src/lib.rs >/dev/null ||
+   ! rg -U 'ToolInvocationResultRecorded \{ record \}[\s\S]{0,800}ContentBlock::ToolResult' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'tool_invocation_result_recorded' packages/session/src/db.rs >/dev/null; then
+  echo "Runtime architecture violation: generic result model-context/compaction cutover coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'pub struct ToolInvocationResultRecord' packages/session/models/src/lib.rs >/dev/null ||
+   ! grep -F 'ToolInvocationResultRecorded' packages/session/src/persisted.rs >/dev/null ||
+   ! grep -F 'generic_result_record_finishes_bounded_tool_run_projection' packages/session/src/db.rs >/dev/null ||
+   ! grep -F 'generic_result_record_closes_bounded_tool_projection' packages/session/src/projection.rs >/dev/null ||
+   ! grep -F 'generic_exchange_records_enter_bounded_transcript_index_opaquely' packages/session/src/db.rs >/dev/null ||
+   ! grep -F 'append_tool_invocation_result' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'session_view_projects_generic_final_result_without_legacy_finish_event' packages/session-view/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic durable final invocation result records were removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'mod contracts;' plugins/shell-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'pub const SHELL_RUN_SCHEMA' plugins/shell-plugin/src/contracts.rs >/dev/null ||
+   ! grep -F 'pub const SHELL_INVOCATION_INPUT_SCHEMA' plugins/shell-plugin/src/contracts.rs >/dev/null ||
+   ! grep -F 'pub const SHELL_RECORDING_CONTENT_TYPE' plugins/shell-plugin/src/contracts.rs >/dev/null ||
+   ! grep -F 'pub enum ShellRunResult' plugins/shell-plugin/src/contracts.rs >/dev/null ||
+   ! grep -F 'pub enum ShellInvocationAction' plugins/shell-plugin/src/contracts.rs >/dev/null; then
+  echo "Runtime architecture violation: shell-owned execution/stream/control/recording contracts were removed." >&2
+  violations=1
+fi
+
+if rg -n 'bcode\.shell\.(run|invocation-input)|application/x-bcode-(terminal-pty-stream|shell-recording)' \
+  plugins/shell-plugin/src/lib.rs >/tmp/bcode-shell-contract-literals.txt; then
+  echo "Runtime architecture violation: shell production routing bypasses its owned contract module." >&2
+  cat /tmp/bcode-shell-contract-literals.txt >&2
+  violations=1
+fi
+
+if rg -n 'ToolInvocationStreamEvent|ToolStreamVisualUpdate|OutputDelta|ArtifactUpdate|ToolOutputStream' \
+  plugins/shell-plugin/src >/tmp/bcode-shell-legacy-stream-contracts.txt; then
+  echo "Runtime architecture violation: shell transport regressed to legacy core stream DTOs." >&2
+  cat /tmp/bcode-shell-legacy-stream-contracts.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'ShellRecordingFrame::Output' plugins/shell-plugin/src/recording.rs >/dev/null ||
+   ! grep -F 'ShellRecordingFrame::ReplayOutput' plugins/shell-plugin/src/recording.rs >/dev/null ||
+   ! grep -F 'ShellRecordingFrame::Resize' plugins/shell-plugin/src/recording.rs >/dev/null ||
+   ! grep -F 'active_terminal_control_resize_reaches_pty_and_recording' plugins/shell-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'recording_replay_uses_recorded_resize_and_lifecycle_state' plugins/shell-plugin/src/shell_run_tui.rs >/dev/null; then
+  echo "Runtime architecture violation: shell-owned PTY/resize/replay payload coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'select_interaction_adapter' packages/plugin-sdk/src/interaction.rs >/dev/null ||
+   ! grep -F 'min_schema_version' packages/plugin-sdk/src/interaction.rs >/dev/null ||
+   ! grep -F 'platform_id' packages/plugin-sdk/src/interaction.rs >/dev/null ||
+   ! grep -F 'priority' packages/plugin-sdk/src/interaction.rs >/dev/null; then
+  echo "Runtime architecture violation: platform-owned version-range/priority interaction adapter selection was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'question_exchange_payload_runs_entirely_in_local_tui_surface' packages/tui/src/interactive_surface.rs >/dev/null ||
+   ! grep -F 'web_runs_question_adapter_locally_from_opaque_exchange' packages/web-render/src/lib.rs >/dev/null ||
+   ! grep -F 'question_exchange_stays_in_one_invocation_and_validates_response' packages/bcode/tests/question_exchange.rs >/dev/null; then
+  echo "Runtime architecture violation: cross-host Question exchange parity coverage was removed." >&2
   violations=1
 fi
 

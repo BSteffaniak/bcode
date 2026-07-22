@@ -1808,6 +1808,7 @@ mod tests {
             ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
                 invocation_id: "invoke".to_string(),
                 request_id: "service".to_string(),
+                route_id: None,
                 interface_id: "example/v1".to_string(),
                 operation: "run".to_string(),
                 payload: serde_json::Value::Null,

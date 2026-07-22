@@ -30,7 +30,7 @@ use bcode_session_models::{
 use switchy::{
     database::{
         Database, DatabaseError, DatabaseValue,
-        query::{FilterableQuery, SelectQuery, SortDirection},
+        query::{FilterableQuery, SortDirection},
     },
     schema::{
         MigrationError,
@@ -50,7 +50,7 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Durable storage writer epoch understood by this session database implementation.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
     crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
-pub(crate) const LEGACY_SESSION_STORAGE_WRITER_EPOCH: u32 = 1;
+pub(crate) const LEGACY_SESSION_STORAGE_WRITER_EPOCH: u32 = 2;
 const SESSION_STORAGE_CONTRACT_ID: i32 = 1;
 const SESSION_STORAGE_CONTRACT_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 2;
@@ -148,7 +148,7 @@ pub type SessionDbResult<T> = Result<T, SessionDbError>;
 /// Diagnostic state for the durable model-context projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelContextProjectionStatus {
-    /// No projection state exists, so exact compatibility reads remain active.
+    /// No projection state exists, so normal reads require explicit reindex/repair.
     Missing,
     /// Projection state matches canonical history and the current schema.
     Fresh { checkpoint: u64 },
@@ -1622,7 +1622,11 @@ impl SessionDb {
         if let Some(events) = self.projected_model_context_events().await? {
             return Ok(events);
         }
-        self.compatibility_model_context_events().await
+        Err(SessionDbError::ProjectionStale {
+            projection: "model_context",
+            checkpoint: None,
+            expected: self.last_event_sequence().await?.unwrap_or_default(),
+        })
     }
 
     /// Inspect model-context projection freshness without rebuilding or mutating it.
@@ -1730,41 +1734,6 @@ impl SessionDb {
             events.push(event);
         }
         Ok(Some(canonical_model_context_from_events(events)))
-    }
-
-    async fn compatibility_model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
-        let compaction_event = self.latest_context_compaction_event().await?;
-        let compacted_through_sequence =
-            compaction_event
-                .as_ref()
-                .and_then(|event| match &event.kind {
-                    SessionEventKind::ContextCompacted {
-                        compacted_through_sequence,
-                        ..
-                    }
-                    | SessionEventKind::ProviderContextCompacted {
-                        compacted_through_sequence,
-                        ..
-                    } => Some(*compacted_through_sequence),
-                    _ => None,
-                });
-        let rows = model_context_events_query(&**self.db, compacted_through_sequence)
-            .execute(&**self.db)
-            .await?;
-        let mut candidates = Vec::with_capacity(
-            rows.len()
-                .saturating_add(usize::from(compaction_event.is_some())),
-        );
-        if let Some(event) = compaction_event {
-            candidates.push(event);
-        }
-        for row in rows {
-            let payload = required_string(&row, "payload")?;
-            if let Some(event) = decode_session_event_degraded(&payload) {
-                candidates.push(event);
-            }
-        }
-        Ok(canonical_model_context_from_events(candidates))
     }
 
     /// Return the authoritative current context generation.
@@ -3092,6 +3061,25 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
             }
             insert_tool_result_transcript_item(db, event, tool_call_id, *is_error).await?;
         }
+        SessionEventKind::ToolInvocationResultRecorded { record } => {
+            db.update("tool_runs")
+                .value("event_seq_end", seq_to_value(event.sequence))
+                .value("status", if record.is_error { "error" } else { "complete" })
+                .value("is_error", bool_to_value(record.is_error))
+                .where_eq("tool_call_id", record.invocation_id.clone())
+                .execute(db)
+                .await?;
+            if let Some(ToolInvocationResult::Artifact { artifact }) = &record.result {
+                project_artifact_references(db, event.sequence, artifact).await?;
+            }
+            finalize_tool_transcript_item(
+                db,
+                &record.invocation_id,
+                event.sequence,
+                record.is_error,
+            )
+            .await?;
+        }
         SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
             insert_transcript_item(
                 db,
@@ -3120,6 +3108,28 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
                 "tool_contribution",
                 "complete",
                 Some(serde_json::to_string(contribution)?),
+            )
+            .await?;
+        }
+        SessionEventKind::ToolExchangeRequested { request } => {
+            insert_transcript_item(
+                db,
+                event,
+                "runtime",
+                "tool_exchange_requested",
+                "running",
+                Some(serde_json::to_string(request)?),
+            )
+            .await?;
+        }
+        SessionEventKind::ToolExchangeResolved { event: resolution } => {
+            insert_transcript_item(
+                db,
+                event,
+                "runtime",
+                "tool_exchange_resolved",
+                "complete",
+                Some(serde_json::to_string(resolution)?),
             )
             .await?;
         }
@@ -3300,6 +3310,35 @@ async fn insert_tool_result_transcript_item(
     .await
 }
 
+async fn finalize_tool_transcript_item(
+    db: &dyn Database,
+    tool_call_id: &str,
+    event_sequence: u64,
+    is_error: bool,
+) -> SessionDbResult<()> {
+    let row = db
+        .select("tool_runs")
+        .columns(&["event_seq_start"])
+        .where_eq("tool_call_id", tool_call_id.to_owned())
+        .execute_first(db)
+        .await?;
+    let Some(event_seq_start) = row
+        .as_ref()
+        .map(|row| required_i64(row, "event_seq_start").map(i64_to_u64))
+        .transpose()?
+    else {
+        return Ok(());
+    };
+    db.update("transcript_items")
+        .value("event_seq_end", seq_to_value(event_sequence))
+        .value("kind", "result")
+        .value("status", if is_error { "error" } else { "complete" })
+        .where_eq("transcript_seq", seq_to_value(event_seq_start))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 async fn update_tool_transcript_item_end(
     db: &dyn Database,
     tool_call_id: &str,
@@ -3349,12 +3388,6 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
-        SessionEventKind::InteractiveToolRequestCreated { .. } => {
-            "interactive_tool_request_created"
-        }
-        SessionEventKind::InteractiveToolRequestResolved { .. } => {
-            "interactive_tool_request_resolved"
-        }
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
@@ -3383,6 +3416,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
         SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
         SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
+        SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::ToolContribution { .. } => "tool_contribution",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
@@ -3561,27 +3595,6 @@ fn input_history_entry_from_row(
     })
 }
 
-fn model_context_events_query(
-    db: &dyn Database,
-    compacted_through_sequence: Option<u64>,
-) -> SelectQuery<'static> {
-    let mut select = db
-        .select("events")
-        .columns(&["payload"])
-        .where_in(
-            "event_type",
-            MODEL_CONTEXT_EVENT_TYPES
-                .iter()
-                .map(|event_type| DatabaseValue::String((*event_type).to_string()))
-                .collect::<Vec<_>>(),
-        )
-        .sort("event_seq", SortDirection::Asc);
-    if let Some(boundary) = compacted_through_sequence {
-        select = select.where_gt("event_seq", seq_to_value(boundary));
-    }
-    select
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextHistoryRole {
     ModelVisible,
@@ -3589,25 +3602,13 @@ enum ContextHistoryRole {
     Excluded,
 }
 
-const MODEL_CONTEXT_EVENT_TYPES: &[&str] = &[
-    "user_message",
-    "assistant_message",
-    "tool_call_requested",
-    "tool_call_finished",
-    "system_message",
-    "working_directory_changed",
-    "context_compacted",
-    "provider_context_compacted",
-    "model_turn_started",
-    "model_turn_finished",
-];
-
 const fn context_history_role(kind: &SessionEventKind) -> ContextHistoryRole {
     match kind {
         SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::ToolCallRequested { .. }
         | SessionEventKind::ToolCallFinished { .. }
+        | SessionEventKind::ToolInvocationResultRecorded { .. }
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::ContextCompacted { .. }
@@ -3625,6 +3626,7 @@ const fn context_history_role_from_name(event_type: &str) -> ContextHistoryRole 
         | b"assistant_message"
         | b"tool_call_requested"
         | b"tool_call_finished"
+        | b"tool_invocation_result_recorded"
         | b"system_message"
         | b"working_directory_changed"
         | b"context_compacted"
@@ -3645,6 +3647,25 @@ fn canonical_model_context_from_events(
     events: impl IntoIterator<Item = SessionEvent>,
 ) -> Vec<SessionEvent> {
     let events = events.into_iter().collect::<Vec<_>>();
+    let generic_result_invocations = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                Some(record.invocation_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let events = events
+        .into_iter()
+        .filter(|event| {
+            !matches!(
+                &event.kind,
+                SessionEventKind::ToolCallFinished { tool_call_id, .. }
+                    if generic_result_invocations.contains(tool_call_id)
+            )
+        })
+        .collect::<Vec<_>>();
     let Some(marker) = events
         .iter()
         .filter(|event| {
@@ -3699,6 +3720,7 @@ const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static str 
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
@@ -4521,6 +4543,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_result_record_finishes_bounded_tool_run_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "tool-1".to_owned(),
+                producer_plugin_id: Some("example.plugin".to_owned()),
+                tool_name: "example.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+                request_visual: None,
+                legacy_request_presentation: None,
+            },
+        ))
+        .await
+        .expect("append generic tool request");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "tool-1".to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    result: None,
+                },
+            },
+        ))
+        .await
+        .expect("append generic tool result");
+
+        assert!(
+            db.active_tool_runs()
+                .await
+                .expect("active tool runs")
+                .is_empty()
+        );
+        let completed = db
+            .tool_runs_by_status("complete")
+            .await
+            .expect("completed tool runs");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].event_seq_end, Some(1));
+        let transcript = db
+            .latest_transcript_items(10)
+            .await
+            .expect("bounded transcript");
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].event_seq_end, 1);
+        assert_eq!(transcript[0].status, "complete");
+    }
+
+    #[tokio::test]
+    async fn generic_exchange_records_enter_bounded_transcript_index_opaquely() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-1".to_owned(),
+            exchange_id: "exchange-1".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 7,
+            payload: serde_json::json!({"opaque": [1, 2]}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ToolExchangeRequested {
+                request: request.clone(),
+            },
+        ))
+        .await
+        .expect("append exchange request");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: request.invocation_id,
+                    exchange_id: request.exchange_id,
+                    resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                        payload: serde_json::json!({"opaque_response": true}),
+                    },
+                },
+            },
+        ))
+        .await
+        .expect("append exchange resolution");
+
+        let transcript = db
+            .latest_transcript_items(10)
+            .await
+            .expect("bounded transcript");
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].kind, "tool_exchange_requested");
+        assert_eq!(transcript[0].status, "running");
+        assert!(
+            transcript[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("\"opaque\":[1,2]"))
+        );
+        assert_eq!(transcript[1].kind, "tool_exchange_resolved");
+        assert_eq!(transcript[1].status, "complete");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn generic_records_reopen_to_identical_canonical_and_bounded_projections() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let events = vec![
+            event(
+                session_id,
+                0,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("future.plugin".to_owned()),
+                    tool_name: "future.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call-1".to_owned(),
+                        sequence: 1,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+                        message: Some("waiting".to_owned()),
+                        metadata: serde_json::json!({"opaque": true}),
+                    },
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolContribution {
+                    event: bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        contribution_id: "surface".to_owned(),
+                        sequence: 1,
+                        producer_id: "future.plugin".to_owned(),
+                        schema: "future.schema".to_owned(),
+                        schema_version: 9,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        artifact: None,
+                        payload: serde_json::json!({"opaque": [1, 2]}),
+                    },
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::ToolExchangeRequested {
+                    request: bcode_session_models::ToolExchangeRequest {
+                        invocation_id: "call-1".to_owned(),
+                        exchange_id: "exchange-1".to_owned(),
+                        producer_id: "future.plugin".to_owned(),
+                        schema: "future.exchange".to_owned(),
+                        schema_version: 3,
+                        payload: serde_json::json!({"question": true}),
+                        response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                    },
+                },
+            ),
+            event(
+                session_id,
+                4,
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        exchange_id: "exchange-1".to_owned(),
+                        resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"answer": 42}),
+                        },
+                    },
+                },
+            ),
+            event(
+                session_id,
+                5,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "done".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
+                },
+            ),
+        ];
+        for event in &events {
+            db.append_event(event).await.expect("append generic event");
+        }
+        let before_events = db.all_events_strict().await.expect("canonical events");
+        let before_transcript = db
+            .latest_transcript_items(32)
+            .await
+            .expect("bounded transcript");
+        let before_tools = db.tool_runs_by_status("complete").await.expect("tool runs");
+        let before_context = db.model_context_events().await.expect("model context");
+        drop(db);
+
+        let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("reopen session db");
+        assert_eq!(
+            reopened.all_events_strict().await.expect("reopened events"),
+            before_events
+        );
+        assert_eq!(
+            reopened
+                .latest_transcript_items(32)
+                .await
+                .expect("reopened transcript"),
+            before_transcript
+        );
+        assert_eq!(
+            reopened
+                .tool_runs_by_status("complete")
+                .await
+                .expect("reopened tools"),
+            before_tools
+        );
+        assert_eq!(
+            reopened
+                .model_context_events()
+                .await
+                .expect("reopened context"),
+            before_context
+        );
+    }
+
+    #[tokio::test]
     async fn active_runtime_work_uses_projection_rows() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -4676,32 +4950,6 @@ mod tests {
         assert_eq!(db.last_event_sequence().await.expect("last"), Some(2));
     }
 
-    #[tokio::test]
-    async fn model_context_query_selects_only_payload_after_filtering_semantic_types() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let session_id = SessionId::new();
-        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
-            .await
-            .expect("open session db");
-        let query = model_context_events_query(db.database(), Some(42));
-
-        assert_eq!(query.columns, &["payload"]);
-        assert_eq!(query.sorts.as_ref().map(Vec::len), Some(1));
-        assert_eq!(query.filters.as_ref().map(Vec::len), Some(2));
-        let values = query
-            .filters
-            .as_ref()
-            .expect("semantic and boundary filters")
-            .iter()
-            .flat_map(|filter| filter.values().unwrap_or_default())
-            .collect::<Vec<_>>();
-        assert_eq!(values.len(), MODEL_CONTEXT_EVENT_TYPES.len() + 1);
-        for event_type in MODEL_CONTEXT_EVENT_TYPES {
-            assert!(values.contains(&&DatabaseValue::String((*event_type).to_string())));
-        }
-        assert!(values.contains(&&seq_to_value(42)));
-    }
-
     #[test]
     fn context_history_roles_separate_model_visible_structural_and_excluded_events() {
         assert!(is_model_context_event_type("model_turn_started"));
@@ -4723,12 +4971,6 @@ mod tests {
         let db = SessionDb::open_turso(session_id, &path)
             .await
             .expect("open benchmark database copy");
-        let compatibility_started_at = std::time::Instant::now();
-        let compatibility = db
-            .model_context_events()
-            .await
-            .expect("compatibility context");
-        let compatibility_elapsed_ms = compatibility_started_at.elapsed().as_millis();
         if matches!(
             db.model_context_projection_status()
                 .await
@@ -4755,13 +4997,11 @@ mod tests {
         projected_samples_ms.sort_unstable();
         let projected_p95_ms = projected_samples_ms[18];
         eprintln!(
-            "model_context_events: events={}, compatibility_elapsed_ms={}, projected_samples_ms={:?}, projected_p95_ms={}",
+            "model_context_events: events={}, projected_samples_ms={:?}, projected_p95_ms={}",
             projected.len(),
-            compatibility_elapsed_ms,
             projected_samples_ms,
             projected_p95_ms
         );
-        assert_eq!(projected, compatibility);
     }
 
     #[tokio::test]
@@ -4799,16 +5039,21 @@ mod tests {
                 .expect("projection status"),
             ModelContextProjectionStatus::Missing
         );
-        let context = reopened
-            .model_context_events()
-            .await
-            .expect("exact compatibility context");
-        assert_eq!(context.len(), 1);
-        assert_eq!(context[0].sequence, 0);
+        assert!(matches!(
+            reopened
+                .model_context_events()
+                .await
+                .expect_err("normal reads must require explicit reindex"),
+            SessionDbError::ProjectionStale {
+                projection: "model_context",
+                checkpoint: None,
+                expected: 0
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn projected_context_matches_canonical_across_compaction_transitions() {
+    async fn explicit_reindex_projects_canonical_compaction_transitions() {
         let scenarios = [
             (
                 "uncompacted",
@@ -4816,6 +5061,7 @@ mod tests {
                     message(SessionId::new(), 0, "first"),
                     message(SessionId::new(), 1, "second"),
                 ],
+                vec![0, 1],
             ),
             (
                 "local-to-local",
@@ -4826,6 +5072,7 @@ mod tests {
                     local_marker(SessionId::new(), 3, 2),
                     message(SessionId::new(), 4, "new"),
                 ],
+                vec![3, 4],
             ),
             (
                 "local-to-provider",
@@ -4836,6 +5083,7 @@ mod tests {
                     provider_marker(SessionId::new(), 3, 2),
                     message(SessionId::new(), 4, "new"),
                 ],
+                vec![3, 4],
             ),
             (
                 "provider-to-local",
@@ -4846,6 +5094,7 @@ mod tests {
                     local_marker(SessionId::new(), 3, 2),
                     message(SessionId::new(), 4, "new"),
                 ],
+                vec![3, 4],
             ),
             (
                 "provider-to-provider",
@@ -4856,10 +5105,11 @@ mod tests {
                     provider_marker(SessionId::new(), 3, 2),
                     message(SessionId::new(), 4, "new"),
                 ],
+                vec![3, 4],
             ),
         ];
 
-        for (name, template) in scenarios {
+        for (name, template, expected_sequences) in scenarios {
             let temp_dir = tempfile::tempdir().expect("temp dir");
             let session_id = SessionId::new();
             let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
@@ -4877,16 +5127,27 @@ mod tests {
                     .await
                     .unwrap_or_else(|error| panic!("insert {name} canonical event: {error}"));
             }
-            let compatibility = db
-                .model_context_events()
-                .await
-                .unwrap_or_else(|error| panic!("load {name} compatibility context: {error}"));
+            assert!(matches!(
+                db.model_context_events().await,
+                Err(SessionDbError::ProjectionStale {
+                    projection: "model_context",
+                    checkpoint: None,
+                    ..
+                })
+            ));
             reindex_model_context_for_test(&db, temp_dir.path(), session_id).await;
             let projected = db
                 .model_context_events()
                 .await
                 .unwrap_or_else(|error| panic!("load {name} projected context: {error}"));
-            assert_eq!(projected, compatibility, "scenario {name}");
+            assert_eq!(
+                projected
+                    .iter()
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                expected_sequences,
+                "scenario {name}"
+            );
         }
     }
 
@@ -4993,10 +5254,16 @@ mod tests {
                 .expect("missing status"),
             ModelContextProjectionStatus::Missing
         );
-        let compatibility = db
-            .model_context_events()
-            .await
-            .expect("compatibility context");
+        assert!(matches!(
+            db.model_context_events()
+                .await
+                .expect_err("missing projection requires explicit reindex"),
+            SessionDbError::ProjectionStale {
+                projection: "model_context",
+                checkpoint: None,
+                expected: 2
+            }
+        ));
 
         assert_eq!(
             reindex_model_context_for_test(&db, temp_dir.path(), session_id).await,
@@ -5008,9 +5275,13 @@ mod tests {
                 .expect("fresh status"),
             ModelContextProjectionStatus::Fresh { checkpoint: 2 }
         );
+        let projected = db.model_context_events().await.expect("projected context");
         assert_eq!(
-            db.model_context_events().await.expect("projected context"),
-            compatibility
+            projected
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
         );
     }
 
@@ -5108,17 +5379,6 @@ mod tests {
             context[3].kind,
             SessionEventKind::ModelTurnFinished { .. }
         ));
-
-        db.database()
-            .delete("model_context_projection_state")
-            .execute(db.database())
-            .await
-            .expect("remove projection state for compatibility comparison");
-        let compatibility = db
-            .model_context_events()
-            .await
-            .expect("compatibility context");
-        assert_eq!(context, compatibility);
     }
 
     #[tokio::test]
@@ -6304,8 +6564,22 @@ mod tests {
         .await
         .expect("insert newest semantic event");
         tx.commit().await.expect("commit");
+        assert!(matches!(
+            db.model_context_events()
+                .await
+                .expect_err("normal context read must not scan canonical events"),
+            SessionDbError::ProjectionStale {
+                projection: "model_context",
+                checkpoint: None,
+                expected: 8_706
+            }
+        ));
 
-        let events = db.model_context_events().await.expect("model context");
+        assert_eq!(
+            reindex_model_context_for_test(&db, temp_dir.path(), session_id).await,
+            8_707
+        );
+        let events = db.model_context_events().await.expect("projected context");
         assert_eq!(events.len(), 514);
         assert_eq!(events.first().map(|event| event.sequence), Some(0));
         assert_eq!(events.last().map(|event| event.sequence), Some(8_706));
@@ -6446,7 +6720,14 @@ mod tests {
             .model_context_events()
             .await
             .expect_err("malformed marker must not be ignored");
-        assert!(matches!(error, SessionDbError::PersistedEvent(_)));
+        assert!(matches!(
+            error,
+            SessionDbError::ProjectionStale {
+                projection: "model_context",
+                checkpoint: None,
+                expected: 0
+            }
+        ));
         assert_eq!(
             db.last_event_sequence().await.expect("last sequence"),
             Some(0)

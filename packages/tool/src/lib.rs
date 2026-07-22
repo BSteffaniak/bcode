@@ -14,10 +14,10 @@ pub use bcode_tool_models::{
     ToolInvocationInputResolution, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
 };
 pub use contracts::{
-    PreparedToolInvocation, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
-    ToolAuthorizationFact, ToolExecutionOptions, ToolHostContextEntry, ToolInvocationDescriptor,
-    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolPreparationRequest,
-    ToolPreparationResponse,
+    PreparedToolInvocation, TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA, ToolArtifactWriteRequest,
+    ToolArtifactWriteResolution, ToolAuthorizationFact, ToolExecutionOptions, ToolHostContextEntry,
+    ToolInvocationDescriptor, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
+    ToolInvocationServiceRoute, ToolPreparationRequest, ToolPreparationResponse,
 };
 
 pub use interaction::{
@@ -388,6 +388,9 @@ pub struct ToolInvocationRequest {
     pub tool_call_id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Opaque tool-owner-produced descriptor returned by preparation.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub preparation_descriptor: serde_json::Value,
     /// Canonical session working directory for this invocation.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
@@ -539,66 +542,6 @@ pub struct ToolArtifactRef {
     pub byte_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-}
-
-/// Generic request for host-owned interactive tool UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InteractiveToolRequest {
-    pub interaction_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interaction_kind: Option<String>,
-    pub surface_kind: String,
-    #[serde(default)]
-    pub request: serde_json::Value,
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default)]
-    pub turn_behavior: InteractiveToolTurnBehavior,
-    #[serde(default)]
-    pub render_target: InteractiveToolRenderTarget,
-}
-
-/// How an interactive tool request affects the active model turn.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InteractiveToolTurnBehavior {
-    #[default]
-    AwaitBeforeContinuing,
-    CompleteTurnWithPendingInteraction,
-}
-
-/// Core-understood resolution for an interactive tool request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum InteractiveToolResolution {
-    Submitted {
-        payload: serde_json::Value,
-    },
-    Aborted {
-        reason: InteractiveToolAbortReason,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-    },
-}
-
-/// Infrastructure-level reason an interactive tool request could not be submitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InteractiveToolAbortReason {
-    UserDismissed,
-    TurnCancelled,
-    ClientDetached,
-    Timeout,
-    UnsupportedSurface,
-    HostError,
-}
-
-/// Host render target for an interactive tool request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InteractiveToolRenderTarget {
-    #[default]
-    TranscriptToolCall,
 }
 
 /// Semantic tool result values that UI layers can render without parsing text.
