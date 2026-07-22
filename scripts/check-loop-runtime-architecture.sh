@@ -223,6 +223,24 @@ for primitive in 'invoker.prepare_tool(' 'authorization.authorize_batch(' '.invo
 done
 rm -f "$runtime_production"
 
+if ! rg -U 'impl ToolInvoker for SdkToolInvoker[\s\S]*fn prepare_tool[\s\S]*ToolSource::Inline[\s\S]*ToolSource::Plugin' packages/bcode/src/lib.rs >/dev/null \
+  || ! rg -U 'impl ToolInvoker for SdkToolInvoker[\s\S]*fn invoke_tool[\s\S]*ToolSource::Inline[\s\S]*ToolSource::Plugin' packages/bcode/src/lib.rs >/dev/null \
+  || ! grep -F 'direct_static_dynamic_and_future_remote_adapters_share_scheduler_semantics' packages/bcode/tests/embedded_scoped_plugin.rs >/dev/null \
+  || ! grep -F 'impl ToolInvoker for FutureRemoteInvoker' packages/bcode/tests/embedded_scoped_plugin.rs >/dev/null; then
+  echo "Runtime architecture violation: direct, static-plugin, dynamic-plugin, and future-remote adapters must share ToolInvoker preparation/invocation contracts." >&2
+  violations=1
+fi
+
+if ! rg -U 'pub async fn run<P>\([\s\S]*self\.generate_text_with_provider\(provider, prompt\)\.await' packages/bcode/src/lib.rs >/dev/null \
+  || ! rg -U 'generate_text_with_provider_with_options<P>\([\s\S]*\.run_provider_tool_loop\(' packages/bcode/src/lib.rs >/dev/null \
+  || ! rg -U 'pub fn stream<P>\([\s\S]*self\.stream_with_cancellation\(' packages/bcode/src/lib.rs >/dev/null \
+  || ! rg -U 'fn stream_request<P>\([\s\S]*self\.runtime\.run_streaming_provider_tool_loop\(' packages/bcode/src/lib.rs >/dev/null \
+  || ! grep -F 'sdk_builder_routes_provider_round_planner_through_canonical_loop' packages/bcode/tests/provider_tool_loop.rs >/dev/null \
+  || ! grep -F 'stream_text_builder_uses_canonical_tool_loop_and_retains_scoped_events' packages/bcode/tests/provider_tool_loop.rs >/dev/null; then
+  echo "Runtime architecture violation: SDK high-level run/stream paths must delegate automatically to the canonical runtime loop." >&2
+  violations=1
+fi
+
 for legacy_sdk_loop in 'run_provider_tool_loop_in_scope' 'append_provider_tool_calls' 'append_tool_results' 'ToolRoundState::new(request.max_tool_rounds)' 'ScopedAgentEventSink' 'unbounded_channel();'; do
   if grep -F "$legacy_sdk_loop" packages/bcode/src/lib.rs >/dev/null; then
     echo "Runtime architecture violation: SDK reintroduced duplicate provider/tool loop fragment '$legacy_sdk_loop'." >&2
@@ -474,6 +492,56 @@ if rg -n 'ToolInvocationStreamEvent::(Started|Status|Finished)|emit_tool_status'
   plugins/shell-plugin/src --glob '*.rs' >/tmp/bcode-shell-legacy-lifecycle.txt; then
   echo "Runtime architecture violation: shell plugin reintroduced legacy invocation lifecycle stream events." >&2
   cat /tmp/bcode-shell-legacy-lifecycle.txt >&2
+  violations=1
+fi
+
+canonical_invocation_contracts="packages/tool/src/contracts.rs packages/tool/models/src/lib.rs packages/agent-runtime/src/turn.rs"
+for required in \
+  'ToolInvocationLifecycleEvent' \
+  'ToolContributionEvent' \
+  'ToolExchangeRequest' \
+  'ToolInvocationInput' \
+  'ToolInvocationServiceRequest' \
+  'ToolArtifactWriteRequest' \
+  'InvocationCancellation'; do
+  if ! rg -q "$required" $canonical_invocation_contracts; then
+    echo "Runtime architecture violation: neutral duplex invocation channel $required is missing." >&2
+    violations=1
+  fi
+done
+if rg -n 'ToolInvocationStreamEvent|ToolOutputStream|PluginVisualDescriptor|InteractiveTool|HostModelNativeWebSearch|\bPty\b|\bStdout\b|\bStderr\b' \
+  $canonical_invocation_contracts >/tmp/bcode-canonical-invocation-domain-variants.txt; then
+  echo "Runtime architecture violation: canonical invocation communication regained a concrete transport/domain variant." >&2
+  cat /tmp/bcode-canonical-invocation-domain-variants.txt >&2
+  violations=1
+fi
+if ! grep -F 'direct_rust_tool_uses_every_neutral_invocation_capability' packages/agent-runtime/src/lib.rs >/dev/null \
+  || ! grep -F 'dynamic_loader_supports_all_bridge_families_and_cancellation' packages/plugin/src/lib.rs >/dev/null \
+  || ! grep -F 'static_loader_supports_all_bridge_families_and_cancellation' packages/plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: direct/static/dynamic duplex channel conformance coverage was removed." >&2
+  violations=1
+fi
+native_service_context_body="$(sed -n '/pub struct NativeServiceContext {/,/^}/p' packages/plugin-sdk/src/lib.rs)"
+if ! grep -q 'events: ServiceEventEmitter' <<<"$native_service_context_body" \
+  || ! grep -q 'cancellation: ServiceCancellation' <<<"$native_service_context_body" \
+  || ! grep -q 'bridge: ServiceBridge' <<<"$native_service_context_body" \
+  || grep -Eq 'Tui|InteractionRegistry|render_target|transcript|terminal' <<<"$native_service_context_body"; then
+  echo "Runtime architecture violation: native plugin ABI service context must remain generic and renderer-neutral." >&2
+  violations=1
+fi
+
+plugin_runtime_host_body="$(sed -n '/pub struct PluginRuntimeHost {/,/^}/p' packages/plugin/src/lib.rs)"
+static_plugin_vtable_body="$(sed -n '/pub struct StaticPluginVtable {/,/^}/p' packages/plugin-sdk/src/lib.rs)"
+if grep -Eq 'PluginTuiRegistry|PluginInteractionRegistry|PluginTuiSurface|InteractionController|render_target|transcript' <<<"$plugin_runtime_host_body" \
+  || grep -Eq 'PluginTuiRegistry|PluginInteractionRegistry|PluginTuiSurface|InteractionController|render_target|transcript' <<<"$static_plugin_vtable_body"; then
+  echo "Runtime architecture violation: the base plugin runtime or ABI vtable regained TUI/interaction/transcript ownership." >&2
+  violations=1
+fi
+if ! grep -Eq '^default[[:space:]]*=[[:space:]]*\[\]' packages/plugin-sdk/Cargo.toml \
+  || ! grep -Eq '^bmux_tui[[:space:]]*=.*optional[[:space:]]*=[[:space:]]*true' packages/plugin-sdk/Cargo.toml \
+  || rg -n 'bcode_tui|bmux_tui' packages/plugin/Cargo.toml packages/agent-runtime/Cargo.toml packages/tool/Cargo.toml >/tmp/bcode-base-plugin-tui-dependencies.txt; then
+  echo "Runtime architecture violation: neutral plugin/runtime crates must keep TUI dependencies optional and outside the base host." >&2
+  cat /tmp/bcode-base-plugin-tui-dependencies.txt >&2 2>/dev/null || true
   violations=1
 fi
 
