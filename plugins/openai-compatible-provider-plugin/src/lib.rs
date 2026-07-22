@@ -5266,6 +5266,7 @@ fn apply_provider_static_metadata(settings: &Settings, models: Vec<ModelInfo>) -
     models
         .into_iter()
         .map(|mut model| {
+            model.cache = openai_model_cache_info(settings.dialect);
             if matches!(provider_id, Some("openai" | "xai")) {
                 model.capabilities.extend([
                     ModelCapability::ToolCalls,
@@ -5371,7 +5372,7 @@ fn model_infos_from_items_without_catalog(
             capabilities: model_capabilities_for(&model),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
-            cache: openai_model_cache_info(),
+            cache: openai_model_cache_info(OpenAiCompatibleDialect::ChatCompletions),
             metadata_source: provider_api_context_window(&model.metadata)
                 .map(|_| ModelMetadataSource::ProviderApi),
             pricing: pricing_from_provider_api(&model.metadata),
@@ -5490,15 +5491,16 @@ fn value_to_u32(value: &serde_json::Value) -> Option<u32> {
         .or_else(|| value.as_str().and_then(|value| value.parse::<u32>().ok()))
 }
 
-fn openai_model_cache_info() -> bcode_model::ModelCacheInfo {
-    bcode_model::ModelCacheInfo {
-        capabilities: BTreeSet::from([
-            bcode_model::ModelCacheCapability::PromptCacheKey,
-            bcode_model::ModelCacheCapability::AutomaticPrefixCache,
-            bcode_model::ModelCacheCapability::CacheUsageReporting,
-            bcode_model::ModelCacheCapability::PreviousResponseId,
-        ]),
+fn openai_model_cache_info(dialect: OpenAiCompatibleDialect) -> bcode_model::ModelCacheInfo {
+    let mut capabilities = BTreeSet::from([
+        bcode_model::ModelCacheCapability::PromptCacheKey,
+        bcode_model::ModelCacheCapability::AutomaticPrefixCache,
+        bcode_model::ModelCacheCapability::CacheUsageReporting,
+    ]);
+    if dialect.supports_native_conversation_reuse() {
+        capabilities.insert(bcode_model::ModelCacheCapability::PreviousResponseId);
     }
+    bcode_model::ModelCacheInfo { capabilities }
 }
 
 fn model_capabilities_for(_model: &ModelResponseItem) -> BTreeSet<ModelCapability> {
@@ -7648,6 +7650,23 @@ mod tests {
     }
 
     #[test]
+    fn openai_preflight_rejects_reuse_on_unsupported_dialects() {
+        let mut request = test_request(Vec::new());
+        request.tool_call_policy.parallel = false;
+        request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Auto;
+
+        for dialect in [
+            OpenAiCompatibleDialect::ChatCompletions,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        ] {
+            let settings = test_settings(test_api_key_auth(), dialect);
+            let error = validate_openai_request(&settings, &request)
+                .expect_err("unsupported dialect must reject native reuse");
+            assert_eq!(error.code, "conversation_reuse_unsupported");
+        }
+    }
+
+    #[test]
     fn openai_preflight_validates_reuse_and_tool_choice() {
         let responses = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
         let mut request = test_request(Vec::new());
@@ -8329,6 +8348,57 @@ mod tests {
         assert_eq!(
             select_default_model_info(&model_infos).map(|model| model.model_id.as_str()),
             Some("gpt-4.1")
+        );
+    }
+
+    #[test]
+    fn model_cache_capabilities_are_dialect_specific() {
+        for dialect in [
+            OpenAiCompatibleDialect::ChatCompletions,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        ] {
+            assert!(
+                !openai_model_cache_info(dialect)
+                    .capabilities
+                    .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
+            );
+        }
+        assert!(
+            openai_model_cache_info(OpenAiCompatibleDialect::ResponsesApi)
+                .capabilities
+                .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
+        );
+    }
+
+    #[test]
+    fn provider_static_metadata_applies_dialect_cache_capabilities() {
+        let model = model_infos_from_ids(&["model".to_string()], Some("model"))
+            .into_iter()
+            .next()
+            .expect("model info");
+        let chat = apply_provider_static_metadata(
+            &test_settings(
+                test_api_key_auth(),
+                OpenAiCompatibleDialect::ChatCompletions,
+            ),
+            vec![model.clone()],
+        );
+        let responses = apply_provider_static_metadata(
+            &test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi),
+            vec![model],
+        );
+
+        assert!(
+            !chat[0]
+                .cache
+                .capabilities
+                .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
+        );
+        assert!(
+            responses[0]
+                .cache
+                .capabilities
+                .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
         );
     }
 

@@ -8056,6 +8056,20 @@ async fn handle_default_model_status(
     .await
 }
 
+async fn provider_models(
+    state: &ServerState,
+    provider_plugin_id: Option<String>,
+    request: bcode_model::ModelListRequest,
+) -> Result<ModelList, String> {
+    invoke_model_provider_json_blocking::<_, ModelList>(
+        state,
+        provider_plugin_id,
+        OP_MODELS,
+        request,
+    )
+    .await
+}
+
 async fn resolved_provider_models_view(
     state: &ServerState,
     provider_plugin_id: Option<String>,
@@ -8063,13 +8077,7 @@ async fn resolved_provider_models_view(
     view: bcode_model_catalog::ModelListView,
 ) -> Result<ModelList, String> {
     let selected_model_id = request.selected_model_id.clone();
-    let models = invoke_model_provider_json_blocking::<_, ModelList>(
-        state,
-        provider_plugin_id,
-        OP_MODELS,
-        request,
-    )
-    .await?;
+    let models = provider_models(state, provider_plugin_id, request).await?;
     state.model_catalog.refresh_if_stale();
     Ok(state
         .model_catalog
@@ -13595,8 +13603,21 @@ async fn build_model_turn_request(
         projection_timer.elapsed_ms(),
         metric_labels.clone(),
     );
+    let model_cache_info = resolve_model_cache_info(
+        state,
+        provider_plugin_id,
+        Some(&model_id),
+        &provider_context,
+    )
+    .await;
     let conversation_reuse_timer = state.metrics.timer();
-    let conversation_reuse = plan_conversation_reuse(state, &projection, messages.len()).await;
+    let conversation_reuse = plan_conversation_reuse(
+        state,
+        &projection,
+        messages.len(),
+        model_cache_info.as_ref(),
+    )
+    .await;
     state.metrics.record_histogram_with_labels(
         "model.request_build.conversation_reuse_plan_duration_ms",
         conversation_reuse_timer.elapsed_ms(),
@@ -13605,10 +13626,8 @@ async fn build_model_turn_request(
     let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
     insert_reasoning_metadata(&mut metadata, &parameters);
-    if let Some(cache_info) =
-        resolve_model_cache_info(state, provider_plugin_id, selected_model_id).await
-    {
-        insert_model_cache_metadata(&mut metadata, &cache_info);
+    if let Some(cache_info) = &model_cache_info {
+        insert_model_cache_metadata(&mut metadata, cache_info);
     }
     metadata.insert(
         "bcode_context_through_sequence".to_string(),
@@ -14134,12 +14153,13 @@ async fn resolve_model_cache_info(
     state: &ServerState,
     provider_plugin_id: Option<&str>,
     selected_model_id: Option<&str>,
+    provider_context: &bcode_model::ProviderRequestContext,
 ) -> Option<bcode_model::ModelCacheInfo> {
-    let models = resolved_provider_models(
+    let models = provider_models(
         state,
         provider_plugin_id.map(ToOwned::to_owned),
         bcode_model::ModelListRequest {
-            provider_context: bcode_model::ProviderRequestContext::default(),
+            provider_context: provider_context.clone(),
             selected_model_id: selected_model_id.map(ToOwned::to_owned),
         },
     )
@@ -14448,13 +14468,21 @@ impl ConversationProjection {
     }
 }
 
+fn supports_provider_conversation_reuse(cache_info: Option<&bcode_model::ModelCacheInfo>) -> bool {
+    cache_info.is_some_and(|info| {
+        info.capabilities
+            .contains(&bcode_model::ModelCacheCapability::PreviousResponseId)
+    })
+}
+
 async fn plan_conversation_reuse(
     state: &ServerState,
     projection: &ConversationProjection,
     message_count: usize,
+    cache_info: Option<&bcode_model::ModelCacheInfo>,
 ) -> bcode_model::ConversationReuseHints {
     let mode = state.conversation_reuse_mode;
-    if !mode.is_enabled() {
+    if !mode.is_enabled() || !supports_provider_conversation_reuse(cache_info) {
         return bcode_model::ConversationReuseHints::default();
     }
 
@@ -21963,6 +21991,18 @@ library = "test"
             "git failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn provider_conversation_reuse_requires_declared_previous_response_support() {
+        let unsupported = bcode_model::ModelCacheInfo::default();
+        let supported = bcode_model::ModelCacheInfo {
+            capabilities: BTreeSet::from([bcode_model::ModelCacheCapability::PreviousResponseId]),
+        };
+
+        assert!(!supports_provider_conversation_reuse(None));
+        assert!(!supports_provider_conversation_reuse(Some(&unsupported)));
+        assert!(supports_provider_conversation_reuse(Some(&supported)));
     }
 
     #[test]
