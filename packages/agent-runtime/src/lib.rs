@@ -375,7 +375,10 @@ pub struct AgentTurnResponse {
     pub text: String,
     /// Provider-reported stop reason, when the provider finished normally.
     pub stop_reason: Option<StopReason>,
-    /// Last provider-reported token usage snapshot, when available.
+    /// Aggregated provider-reported usage across every completed provider round in this agent turn.
+    ///
+    /// Each token bucket is summed with saturation only when every completed round reported that
+    /// bucket; otherwise it remains unknown. Estimated tokens are never mixed into this value.
     pub usage: Option<TokenUsage>,
     /// Total turn latency in milliseconds.
     pub latency_ms: u64,
@@ -2950,10 +2953,11 @@ fn completed_agent_response(
     started: Instant,
     events: Vec<AgentRuntimeEvent>,
 ) -> AgentTurnResponse {
+    let usage = aggregate_finished_usage(&events).or(response.usage);
     AgentTurnResponse {
         text: response.text,
         stop_reason: response.stop_reason,
-        usage: response.usage,
+        usage,
         latency_ms: duration_millis(started.elapsed()),
         termination_reason: AgentLoopTerminationReason::ProviderStop,
         events,
@@ -2965,14 +2969,44 @@ fn stopped_agent_response(
     started: Instant,
     events: Vec<AgentRuntimeEvent>,
 ) -> AgentTurnResponse {
+    let usage = aggregate_finished_usage(&events).or(response.usage);
     AgentTurnResponse {
         text: response.text,
         stop_reason: response.stop_reason,
-        usage: response.usage,
+        usage,
         latency_ms: duration_millis(started.elapsed()),
         termination_reason: AgentLoopTerminationReason::StopCondition,
         events,
     }
+}
+
+fn aggregate_finished_usage(events: &[AgentRuntimeEvent]) -> Option<TokenUsage> {
+    let usages = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::Finished { usage, .. } => usage.as_ref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!usages.is_empty()).then(|| TokenUsage {
+        input_tokens: aggregate_complete_bucket(&usages, |usage| usage.input_tokens),
+        output_tokens: aggregate_complete_bucket(&usages, |usage| usage.output_tokens),
+        total_tokens: aggregate_complete_bucket(&usages, |usage| usage.total_tokens),
+        cached_input_tokens: aggregate_complete_bucket(&usages, |usage| usage.cached_input_tokens),
+        cache_write_input_tokens: aggregate_complete_bucket(&usages, |usage| {
+            usage.cache_write_input_tokens
+        }),
+        reasoning_tokens: aggregate_complete_bucket(&usages, |usage| usage.reasoning_tokens),
+    })
+}
+
+fn aggregate_complete_bucket(
+    usages: &[&TokenUsage],
+    bucket: impl Fn(&TokenUsage) -> Option<u32>,
+) -> Option<u32> {
+    usages.iter().try_fold(0_u32, |total, usage| {
+        Some(total.saturating_add(bucket(usage)?))
+    })
 }
 
 fn initial_loop_messages(request: &AgentTurnRequest) -> Vec<ModelMessage> {
@@ -3843,6 +3877,52 @@ mod tests {
         fn emit(&self, _event: ScopedTurnEvent) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn aggregate_finished_usage_sums_every_reported_round_without_fabricating_buckets() {
+        let events = vec![
+            AgentRuntimeEvent::Finished {
+                stop_reason: StopReason::ToolCall,
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    total_tokens: Some(12),
+                    cached_input_tokens: Some(3),
+                    ..TokenUsage::default()
+                }),
+                latency_ms: 1,
+            },
+            AgentRuntimeEvent::Finished {
+                stop_reason: StopReason::EndTurn,
+                usage: Some(TokenUsage {
+                    input_tokens: Some(20),
+                    output_tokens: Some(4),
+                    total_tokens: Some(24),
+                    reasoning_tokens: Some(1),
+                    ..TokenUsage::default()
+                }),
+                latency_ms: 1,
+            },
+        ];
+
+        let usage = aggregate_finished_usage(&events).expect("aggregated usage");
+        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.output_tokens, Some(6));
+        assert_eq!(usage.total_tokens, Some(36));
+        assert_eq!(usage.cached_input_tokens, None);
+        assert_eq!(usage.cache_write_input_tokens, None);
+        assert_eq!(usage.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn aggregate_finished_usage_is_none_when_providers_report_no_usage() {
+        let events = vec![AgentRuntimeEvent::Finished {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+            latency_ms: 1,
+        }];
+        assert_eq!(aggregate_finished_usage(&events), None);
     }
 
     #[test]

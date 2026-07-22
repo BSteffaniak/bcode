@@ -8161,6 +8161,27 @@ pub struct GenerateTextResponse {
     pub runtime: AgentTurnResponse,
 }
 
+impl GenerateTextResponse {
+    /// Return aggregate provider-reported usage across all completed provider rounds.
+    ///
+    /// This is `None` when the provider supplied no usage. Individual buckets remain `None` when
+    /// any completed provider round omitted that bucket. Estimated values are never mixed into
+    /// this provider-reported aggregate.
+    #[must_use]
+    pub const fn usage(&self) -> Option<&TokenUsage> {
+        self.runtime.usage.as_ref()
+    }
+
+    /// Estimate total turn cost from aggregate provider-reported usage and explicit pricing.
+    ///
+    /// The returned value retains currency and pricing-source provenance. `None` means complete
+    /// reported usage and pricing coverage were unavailable; it never means zero cost.
+    #[must_use]
+    pub fn estimated_cost(&self, pricing: &ModelPricingInfo) -> Option<ModelCostEstimate> {
+        pricing.estimate_cost(self.usage()?)
+    }
+}
+
 impl From<AgentTurnResponse> for GenerateTextResponse {
     fn from(runtime: AgentTurnResponse) -> Self {
         Self {

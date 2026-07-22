@@ -1052,19 +1052,36 @@ pub struct ModelCostEstimate {
 
 impl ModelPricingInfo {
     /// Estimate cost for provider-reported token usage.
+    /// Returns `Some` only when the provider reported complete input/output usage and every
+    /// non-zero separately priced cache bucket has corresponding pricing. Legitimate zero-cost or
+    /// sub-micro estimates remain `Some(0)`. Returns `None` rather than silently producing a
+    /// partial total when usage or pricing coverage is incomplete.
     #[must_use]
     pub fn estimate_cost(&self, usage: &TokenUsage) -> Option<ModelCostEstimate> {
+        let input = usage.input_tokens?;
+        let output = usage.output_tokens?;
         let cached = usage.cached_input_tokens.unwrap_or_default();
         let cache_write = usage.cache_write_input_tokens.unwrap_or_default();
-        let uncached_input = usage.uncached_input_tokens().unwrap_or_default();
-        let output = usage.output_tokens.unwrap_or_default();
+        if self.cached_input.is_some() && usage.cached_input_tokens.is_none()
+            || self.cache_write_input.is_some() && usage.cache_write_input_tokens.is_none()
+        {
+            return None;
+        }
+        let uncached_input = input.saturating_sub(cached);
+        if uncached_input > 0 && self.input.is_none()
+            || cached > 0 && self.cached_input.is_none()
+            || cache_write > 0 && self.cache_write_input.is_none()
+            || output > 0 && self.output.is_none()
+        {
+            return None;
+        }
         let mut total_micros = 0_u64;
         total_micros = total_micros.saturating_add(price_bucket_micros(uncached_input, self.input));
         total_micros = total_micros.saturating_add(price_bucket_micros(cached, self.cached_input));
         total_micros =
             total_micros.saturating_add(price_bucket_micros(cache_write, self.cache_write_input));
         total_micros = total_micros.saturating_add(price_bucket_micros(output, self.output));
-        (total_micros > 0).then(|| ModelCostEstimate {
+        Some(ModelCostEstimate {
             currency: self.currency.clone(),
             total_micros,
             source: self.source,
@@ -3071,6 +3088,89 @@ mod tests {
         let cost = pricing.estimate_cost(&usage).expect("cost should estimate");
 
         assert_eq!(cost.total_micros, 2_675_000);
+    }
+
+    #[test]
+    fn pricing_estimate_preserves_zero_cost_as_known() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: Some(ModelTokenPrice::from_micros(0)),
+            cached_input: None,
+            cache_write_input: None,
+            output: Some(ModelTokenPrice::from_micros(0)),
+            source: ModelPricingSource::UserOverride,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(42),
+            output_tokens: Some(0),
+            ..TokenUsage::default()
+        };
+
+        let estimate = pricing.estimate_cost(&usage).expect("known free cost");
+        assert_eq!(estimate.total_micros, 0);
+    }
+
+    #[test]
+    fn pricing_estimate_preserves_sub_micro_rounding_as_known() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: Some(ModelTokenPrice::from_micros(1)),
+            cached_input: None,
+            cache_write_input: None,
+            output: Some(ModelTokenPrice::from_micros(1)),
+            source: ModelPricingSource::UserOverride,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(0),
+            ..TokenUsage::default()
+        };
+
+        let estimate = pricing.estimate_cost(&usage).expect("known rounded cost");
+        assert_eq!(estimate.total_micros, 0);
+    }
+
+    #[test]
+    fn pricing_estimate_rejects_partial_pricing_coverage() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: Some(ModelTokenPrice::from_micros(1)),
+            cached_input: None,
+            cache_write_input: None,
+            output: None,
+            source: ModelPricingSource::UserOverride,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            ..TokenUsage::default()
+        };
+
+        assert!(pricing.estimate_cost(&usage).is_none());
+    }
+
+    #[test]
+    fn pricing_estimate_rejects_unknown_separately_priced_cache_usage() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: Some(ModelTokenPrice::from_micros(1)),
+            cached_input: Some(ModelTokenPrice::from_micros(1)),
+            cache_write_input: None,
+            output: Some(ModelTokenPrice::from_micros(1)),
+            source: ModelPricingSource::UserOverride,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cached_input_tokens: None,
+            ..TokenUsage::default()
+        };
+
+        assert!(pricing.estimate_cost(&usage).is_none());
     }
 
     #[test]
