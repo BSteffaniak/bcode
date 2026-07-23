@@ -2287,6 +2287,39 @@ async fn handle_event<W: Write>(
             )
             .await
         }
+        Event::Mouse(mouse)
+            if loop_state.interactive_surface.is_some()
+                && interactive_surface_event_route(
+                    context.services.keymap,
+                    &Event::Mouse(mouse),
+                ) == InteractiveSurfaceEventRoute::HostMouse =>
+        {
+            let surface_area = loop_state
+                .interactive_surface
+                .as_mut()
+                .map(|surface| {
+                    interactive_surface_area(
+                        surface,
+                        render::transcript_area_for_frame(&chat.app, context.terminal.area()),
+                    )
+                })
+                .expect("active interactive surface");
+            if surface_area.contains(mouse.position) {
+                handle_interactive_surface_event(context, chat, loop_state, Event::Mouse(mouse))
+                    .await
+            } else {
+                let hit_id = mouse_flow::mouse_hit_id(context.terminal.hits(), mouse);
+                mouse_flow::handle_mouse(
+                    hit_id,
+                    context.services.client,
+                    chat,
+                    &mut loop_state.permission_dialog,
+                    mouse,
+                    context.mouse_scroll_rows,
+                )
+                .await
+            }
+        }
         Event::Key(stroke)
             if loop_state.interactive_surface.is_some()
                 && matches!(
@@ -2359,6 +2392,7 @@ async fn handle_event<W: Write>(
 enum InteractiveSurfaceEventRoute {
     Host(BmuxAction),
     TranscriptMouse,
+    HostMouse,
     Surface,
 }
 
@@ -2366,6 +2400,8 @@ fn interactive_surface_event_route(
     keymap: &BmuxKeyMap,
     event: &Event,
 ) -> InteractiveSurfaceEventRoute {
+    // Host-owned transcript and app actions win first. Wheel events always scroll the
+    // transcript, while other pointer events are classified by dock bounds at dispatch.
     match event {
         Event::Key(stroke) => interactive_surface_host_key(keymap, *stroke).map_or(
             InteractiveSurfaceEventRoute::Surface,
@@ -2379,12 +2415,10 @@ fn interactive_surface_event_route(
         {
             InteractiveSurfaceEventRoute::TranscriptMouse
         }
-        Event::Paste(_)
-        | Event::Focus(_)
-        | Event::Tick
-        | Event::Mouse(_)
-        | Event::Resize(_)
-        | Event::User(_) => InteractiveSurfaceEventRoute::Surface,
+        Event::Mouse(_) => InteractiveSurfaceEventRoute::HostMouse,
+        Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::Resize(_) | Event::User(_) => {
+            InteractiveSurfaceEventRoute::Surface
+        }
     }
 }
 
@@ -3064,7 +3098,7 @@ mod scheduler_tests {
                     bmux_tui::geometry::Point::new(4, 8),
                 )),
             ),
-            InteractiveSurfaceEventRoute::Surface
+            InteractiveSurfaceEventRoute::HostMouse
         );
     }
 

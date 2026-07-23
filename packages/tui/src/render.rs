@@ -308,6 +308,26 @@ fn docked_frame_preserves_anchored_transcript_top_and_latest_indicator() {
 
 #[cfg(test)]
 #[test]
+fn bottom_dock_handles_short_narrow_and_resized_terminals() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    for terminal in [
+        Rect::new(0, 0, 8, 6),
+        Rect::new(0, 0, 24, 8),
+        Rect::new(0, 0, 120, 40),
+        Rect::new(0, 0, 18, 7),
+    ] {
+        let (layout, dock) = prepare_frame_with_bottom_dock(&mut app, terminal, 100)
+            .expect("constrained frame layout");
+        let transcript = transcript_area_for_body(&app, layout.body);
+        assert!(transcript.bottom() <= dock.y);
+        assert!(dock.right() <= terminal.right());
+        assert!(dock.bottom() <= terminal.bottom());
+        assert!(transcript.height >= 1 || layout.body.height == 0);
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn zero_height_bottom_dock_preserves_normal_layout() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     let terminal = Rect::new(0, 0, 80, 20);

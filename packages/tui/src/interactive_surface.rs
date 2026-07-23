@@ -364,6 +364,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submitted_resolution_is_retained_until_host_confirmation_and_can_retry() {
+        let plugin_runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &[bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+                bcode_question_plugin::static_plugin(),
+            )],
+        )
+        .expect("question runtime");
+        let mut surface = InteractiveSurfaceState::open(
+            &plugin_runtime,
+            "question-call-question",
+            "bcode.question.inline",
+            &serde_json::json!({
+                "questions": [{
+                    "header": null,
+                    "question": "Proceed?",
+                    "options": [{"label": "Yes", "value": "yes", "description": null}],
+                    "control": "radio",
+                    "selection_mode": "single",
+                    "custom": false,
+                    "custom_mode": "additional",
+                    "required": true
+                }]
+            })
+            .to_string(),
+        )
+        .await
+        .expect("question surface");
+
+        assert!(surface.handle_event(&key(KeyCode::Enter)).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
+        let submitted = surface
+            .handle_event(&key(KeyCode::Enter))
+            .expect("submitted response");
+        let ToolExchangeResolution::Responded {
+            payload: submitted_payload,
+        } = &submitted
+        else {
+            panic!("question must submit an answered response");
+        };
+        assert_eq!(submitted_payload["status"], "answered");
+        assert_eq!(submitted_payload["questions"][0]["selected"][0], "yes");
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Escape)),
+            Some(submitted.clone())
+        );
+        surface.clear_pending_resolution();
+        assert_eq!(surface.handle_event(&key(KeyCode::Enter)), Some(submitted));
+    }
+
+    #[tokio::test]
     async fn question_exchange_payload_runs_entirely_in_local_tui_surface() {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
