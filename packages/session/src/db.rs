@@ -2452,6 +2452,7 @@ async fn validate_migrated_storage(
     );
     if let Some((tail, _)) = events.last() {
         project_materialized_checkpoints_at_tail(db, tail).await?;
+        project_session_compatibility_state(db, tail).await?;
     }
     let canonical_tail = events.last().map(|(event, _)| event.sequence);
     validate_all_projection_checkpoints_at_tail(db, canonical_tail).await?;
@@ -2522,7 +2523,7 @@ async fn project_migration_event(
         timer.elapsed_ms(),
     );
     let timer = metrics.timer();
-    project_session_compatibility(db, event, issue).await?;
+    project_session_compatibility_issue(db, issue).await?;
     metrics.record_histogram(
         "session.migration.projector.compatibility_duration_ms",
         timer.elapsed_ms(),
@@ -3351,9 +3352,8 @@ const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 6] = [
     MaterializedProjection::RuntimeWork,
 ];
 
-async fn project_session_compatibility(
+async fn project_session_compatibility_issue(
     db: &dyn Database,
-    event: &SessionEvent,
     issue: Option<&SessionEventCompatibilityIssue>,
 ) -> SessionDbResult<()> {
     if let Some(issue) = issue {
@@ -3380,6 +3380,13 @@ async fn project_session_compatibility(
             .execute(db)
             .await?;
     }
+    Ok(())
+}
+
+async fn project_session_compatibility_state(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
     db.upsert("session_compatibility_state")
         .unique(&["projection_id"])
         .value("projection_id", DatabaseValue::Int32(1))
@@ -3393,6 +3400,15 @@ async fn project_session_compatibility(
         .execute(db)
         .await?;
     Ok(())
+}
+
+async fn project_session_compatibility(
+    db: &dyn Database,
+    event: &SessionEvent,
+    issue: Option<&SessionEventCompatibilityIssue>,
+) -> SessionDbResult<()> {
+    project_session_compatibility_issue(db, issue).await?;
+    project_session_compatibility_state(db, event).await
 }
 
 async fn project_materialized_event_without_checkpoints(

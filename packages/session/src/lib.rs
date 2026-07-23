@@ -6549,6 +6549,33 @@ mod tests {
         session_id
     }
 
+    async fn decoded_log_high_water_proxy(root: &std::path::Path, session_id: SessionId) -> u64 {
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, root)
+            .await
+            .expect("benchmark DB for memory proxy");
+        let rows = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .execute(db.database())
+            .await
+            .expect("benchmark canonical payloads");
+        let payload_bytes = rows.iter().fold(0_u64, |total, row| {
+            let bytes = match row.get("payload") {
+                Some(switchy::database::DatabaseValue::String(payload)) => payload.len(),
+                _ => panic!("benchmark canonical payload missing"),
+            };
+            total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+        });
+        payload_bytes.saturating_add(
+            u64::try_from(rows.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    u64::try_from(std::mem::size_of::<SessionEvent>()).unwrap_or(u64::MAX),
+                ),
+        )
+    }
+
     async fn prepare_session_until_terminal(
         manager: &SessionManager,
         session_id: SessionId,
@@ -7158,6 +7185,26 @@ mod tests {
         assert_eq!(db.storage_writer_epoch().await.expect("epoch"), 3);
         assert_eq!(db.all_events_strict().await.expect("history").len(), 100);
         std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual generated legacy-session decoded-log memory proxy"]
+    async fn benchmark_generated_legacy_session_memory_proxies() {
+        for profile in [
+            MigrationBenchmarkProfile::Small,
+            MigrationBenchmarkProfile::Medium,
+            MigrationBenchmarkProfile::Large,
+        ] {
+            let root = unique_temp_dir();
+            let session_id = generate_legacy_migration_benchmark_store(&root, profile).await;
+            let proxy = decoded_log_high_water_proxy(&root, session_id).await;
+            eprintln!(
+                "migration_memory_proxy profile={} events={} decoded_log_bytes={proxy}",
+                profile.name(),
+                profile.event_count(),
+            );
+            std::fs::remove_dir_all(root).expect("memory proxy cleanup");
+        }
     }
 
     #[tokio::test]

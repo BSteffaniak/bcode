@@ -27871,11 +27871,36 @@ library = "test"
             .connect("legacy-migration-observer-test")
             .await
             .expect("connect second observer");
-        let joined = observer
+        let mut joined = observer
             .prepare_session_open(session_id)
             .await
             .expect("join preparation");
         assert_eq!(joined.operation_id, initial.operation_id);
+        while joined.progress.stage < bcode_session_models::SessionMigrationStage::CopyingBackup {
+            joined = observer
+                .wait_session_open_progress(
+                    session_id,
+                    joined.operation_id,
+                    joined.revision,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("wait for backup copy stage");
+        }
+        assert_eq!(
+            joined.progress.stage,
+            bcode_session_models::SessionMigrationStage::CopyingBackup,
+            "responsiveness probe must run during backup copy"
+        );
+        let unrelated_started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(1), client.ping())
+            .await
+            .expect("active migration starved unrelated ping")
+            .expect("unrelated ping during migration");
+        assert!(
+            unrelated_started.elapsed() < Duration::from_secs(1),
+            "unrelated ping exceeded migration responsiveness threshold"
+        );
         for stop in [
             client.server_stop_if_idle().await,
             client.server_stop().await,
