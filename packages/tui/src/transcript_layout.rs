@@ -196,6 +196,15 @@ impl TranscriptLayoutCache {
     ) -> Option<usize> {
         self.entries.entry_start_row(&source, entry_index)
     }
+
+    /// Return a stable pointer to the first cached row of a transcript entry for cache-reuse tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn transcript_entry_row_ptr(&self, entry_index: usize) -> Option<*const Line> {
+        let start = self.entry_start_row(VisibleTranscriptSource::Transcript, entry_index)?;
+        let line = self.line_at_row(start)?;
+        self.line(line).map(std::ptr::from_ref)
+    }
 }
 
 impl From<RetainedSectionedListLine<VisibleTranscriptSource>> for VisibleTranscriptLine {

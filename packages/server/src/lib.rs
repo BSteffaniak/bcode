@@ -5404,7 +5404,7 @@ struct ActiveArtifactReference {
     revision: u64,
     finalized: bool,
     abandoned: bool,
-    contribution_snapshot: Option<ToolContributionEvent>,
+    contribution_snapshot: Option<bcode_session_models::ToolContributionEnvelope>,
 }
 
 impl ActiveArtifactReference {
@@ -16715,7 +16715,8 @@ async fn append_tool_contribution_envelope(
     }
     if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
         if let Some(artifact_event) = contribution_artifact_stream_event(event)
-            && let Err(error) = update_active_artifact(state, session_id, &artifact_event, None)
+            && let Err(error) =
+                update_active_artifact(state, session_id, &artifact_event, Some(envelope.clone()))
         {
             tracing::warn!(%error, "discarded placed contribution with invalid artifact revision");
             return;
@@ -16761,8 +16762,15 @@ async fn append_tool_contribution_event(
     }
     if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
         if let Some(artifact_event) = contribution_artifact_stream_event(&event)
-            && let Err(error) =
-                update_active_artifact(state, session_id, &artifact_event, Some(event.clone()))
+            && let Err(error) = update_active_artifact(
+                state,
+                session_id,
+                &artifact_event,
+                Some(bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Hidden,
+                    event.clone(),
+                )),
+            )
         {
             tracing::warn!(%error, "discarded tool contribution with invalid artifact revision");
             return;
@@ -16844,7 +16852,7 @@ fn update_active_artifact(
     state: &ServerState,
     session_id: SessionId,
     event: &ToolInvocationStreamEvent,
-    contribution_snapshot: Option<ToolContributionEvent>,
+    contribution_snapshot: Option<bcode_session_models::ToolContributionEnvelope>,
 ) -> Result<(), String> {
     let ToolInvocationStreamEvent::ArtifactUpdate {
         tool_call_id,
@@ -16971,10 +16979,10 @@ fn active_artifact_snapshot_events(
                         event: artifact.stream_event(key),
                     },
                 },
-                |event| bcode_session_models::SessionLiveEvent {
+                |envelope| bcode_session_models::SessionLiveEvent {
                     session_id,
-                    kind: SessionLiveEventKind::ToolContribution {
-                        event: event.clone(),
+                    kind: SessionLiveEventKind::ToolContributionPlaced {
+                        envelope: envelope.clone(),
                     },
                 },
             )
@@ -20620,7 +20628,7 @@ library = "test"
             true,
         )
         .await;
-        assert!(unknown_model.provider);
+        assert!(!unknown_model.provider);
         assert!(!unknown_model.model);
         assert!(unknown_model.runtime);
         assert!(
@@ -20695,7 +20703,12 @@ library = "test"
         )
         .await;
 
-        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        assert_eq!(
+            completion.outcome,
+            ModelTurnOutcome::Completed,
+            "{:?}",
+            completion.message
+        );
     }
 
     #[tokio::test]
@@ -26454,8 +26467,8 @@ library = "test"
             .events
             .iter()
             .filter_map(|event| match &event.kind {
-                SessionEventKind::ToolCallFinished { tool_call_id, .. } => {
-                    Some(tool_call_id.clone())
+                SessionEventKind::ToolInvocationResultRecorded { record } => {
+                    Some(record.invocation_id.clone())
                 }
                 _ => None,
             })
@@ -26528,6 +26541,7 @@ library = "test"
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn server_persists_shell_owned_contribution_opaquely() {
         let workspace = tempfile::tempdir().expect("shell contribution workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
@@ -26569,10 +26583,14 @@ library = "test"
         let mut saw_recording_contribution = false;
         while let Ok(live) = attachment.live_events.try_recv() {
             match live.kind {
-                SessionLiveEventKind::ToolContribution { event }
-                    if event.contribution_id == "shell-recording" =>
+                SessionLiveEventKind::ToolContributionPlaced { envelope }
+                    if envelope.contribution.contribution_id == "shell-recording" =>
                 {
-                    saw_recording_contribution |= event.artifact.is_some();
+                    assert_eq!(
+                        envelope.placement,
+                        bcode_session_models::ToolContributionPlacement::Progress
+                    );
+                    saw_recording_contribution |= envelope.contribution.artifact.is_some();
                 }
                 SessionLiveEventKind::ToolOutputDelta {
                     event: ToolInvocationStreamEvent::ArtifactUpdate { .. },
@@ -26587,8 +26605,11 @@ library = "test"
                 .iter()
                 .any(|snapshot| matches!(
                     &snapshot.kind,
-                    SessionLiveEventKind::ToolContribution { event }
-                        if event.contribution_id == "shell-recording" && event.artifact.is_some()
+                    SessionLiveEventKind::ToolContributionPlaced { envelope }
+                        if envelope.contribution.contribution_id == "shell-recording"
+                            && envelope.contribution.artifact.is_some()
+                            && envelope.placement
+                                == bcode_session_models::ToolContributionPlacement::Progress
                 ))
         );
 
@@ -26600,10 +26621,12 @@ library = "test"
         let contribution = history
             .iter()
             .find_map(|event| match &event.kind {
-                SessionEventKind::ToolContribution { event }
-                    if event.schema == "bcode.shell.run.summary" =>
+                SessionEventKind::ToolContributionPlaced { envelope }
+                    if envelope.contribution.schema == "bcode.shell.run.summary"
+                        && envelope.placement
+                            == bcode_session_models::ToolContributionPlacement::Result =>
                 {
-                    Some(event)
+                    Some(&envelope.contribution)
                 }
                 _ => None,
             })
@@ -26690,10 +26713,12 @@ library = "test"
         while let Ok(live) = attachment.live_events.try_recv() {
             if matches!(
                 live.kind,
-                SessionLiveEventKind::ToolContribution { event }
-                    if event.invocation_id == "vim-preview"
-                        && event.schema == "bcode.vim-edit.live"
-                        && event.sequence >= 1
+                SessionLiveEventKind::ToolContributionPlaced { envelope }
+                    if envelope.contribution.invocation_id == "vim-preview"
+                        && envelope.contribution.schema == "bcode.vim-edit.live"
+                        && envelope.contribution.sequence >= 1
+                        && envelope.placement
+                            == bcode_session_models::ToolContributionPlacement::Progress
             ) {
                 saw_live_contribution = true;
             }
@@ -26706,12 +26731,14 @@ library = "test"
             .expect("Vim preview history");
         assert!(history.iter().any(|entry| matches!(
             &entry.kind,
-            SessionEventKind::ToolContribution { event }
-                if event.invocation_id == "vim-preview"
-                    && event.contribution_id == "playback"
-                    && event.schema == "bcode.vim-edit.playback"
-                    && event.persistence
+            SessionEventKind::ToolContributionPlaced { envelope }
+                if envelope.contribution.invocation_id == "vim-preview"
+                    && envelope.contribution.contribution_id == "playback"
+                    && envelope.contribution.schema == "bcode.vim-edit.playback"
+                    && envelope.contribution.persistence
                         == bcode_session_models::ToolContributionPersistence::Durable
+                    && envelope.placement
+                        == bcode_session_models::ToolContributionPlacement::Result
         )));
     }
 
@@ -28005,23 +28032,26 @@ library = "test"
                 else {
                     continue;
                 };
-                let bcode_session_models::SessionLiveEventKind::ToolOutputDelta {
-                    event:
-                        ToolInvocationStreamEvent::ArtifactUpdate {
-                            artifact_id,
-                            reference_key,
-                            finalized: false,
-                            ..
-                        },
+                let bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+                    envelope,
                 } = event.kind
                 else {
                     continue;
                 };
+                let Some(artifact) = envelope.contribution.artifact else {
+                    continue;
+                };
+                if envelope.placement
+                    != bcode_session_models::ToolContributionPlacement::Progress
+                    || artifact.finalized
+                {
+                    continue;
+                }
                 let range = client
                     .session_artifact_range(
                         session_id,
-                        artifact_id,
-                        reference_key,
+                        artifact.artifact_id,
+                        artifact.reference_key,
                         0,
                         MAX_ARTIFACT_RANGE_BYTES,
                     )
@@ -28432,7 +28462,7 @@ library = "test"
                 selected_provider_plugin_id: None,
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
-                prompt_cache_mode: bcode_model::PromptCacheMode::default(),
+                prompt_cache_mode: bcode_model::PromptCacheMode::Off,
                 conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,

@@ -5210,6 +5210,78 @@ fn canonical_generic_result_record_renders_filesystem_source_viewer() {
 }
 
 #[test]
+fn compact_to_rich_request_reuses_unrelated_layout_entry() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-read".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.read".to_owned(),
+            arguments_json: serde_json::json!({"path": "src/lib.rs"}).to_string(),
+            working_directory: None,
+            request_visual: None,
+            legacy_request_presentation: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::SystemMessage {
+            text: "unchanged sibling".to_owned(),
+        },
+    ));
+    let _ = render_app_text(&mut app);
+    let request_id = app.transcript()[0].id();
+    let sibling_id = app.transcript()[1].id();
+    let sibling_row = app
+        .transcript_layout()
+        .transcript_entry_row_ptr(1)
+        .expect("sibling cached row");
+
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolContributionPlaced {
+            envelope: bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Request,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-read".to_owned(),
+                    contribution_id: "request".to_owned(),
+                    sequence: 1,
+                    producer_id: "bcode.filesystem".to_owned(),
+                    schema: "bcode.filesystem.request".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
+                    payload: serde_json::json!({
+                        "operation": "filesystem.read",
+                        "path": "src/lib.rs",
+                    }),
+                },
+            ),
+        },
+    ));
+    let rendered = render_app_text(&mut app);
+
+    assert_eq!(app.transcript().len(), 2);
+    assert_eq!(app.transcript()[0].id(), request_id);
+    assert_eq!(app.transcript()[1].id(), sibling_id);
+    assert_eq!(
+        app.transcript_layout()
+            .transcript_entry_row_ptr(1)
+            .expect("retained sibling row"),
+        sibling_row
+    );
+    assert!(rendered.contains("src/lib.rs"), "{rendered}");
+    assert!(!rendered.contains("\"path\""), "{rendered}");
+}
+
+#[test]
 fn durable_request_contribution_replaces_raw_arguments_and_survives_lifecycle() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);

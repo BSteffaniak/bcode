@@ -1610,6 +1610,40 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn shell_contribution_envelopes_preserve_placement_identity_and_sequence() {
+        let event = ToolContributionEvent {
+            invocation_id: "call-1".to_owned(),
+            contribution_id: "request".to_owned(),
+            sequence: 7,
+            producer_id: "bcode.shell".to_owned(),
+            schema: "test.shell".to_owned(),
+            schema_version: 1,
+            operation: ToolContributionOperation::Upsert,
+            persistence: ToolContributionPersistence::Durable,
+            artifact: None,
+            payload: serde_json::json!({"command": "echo test"}),
+        };
+        for placement in [
+            ToolContributionPlacement::Request,
+            ToolContributionPlacement::Progress,
+            ToolContributionPlacement::Result,
+        ] {
+            let envelope = bcode_tool::ToolContributionEnvelope::new(placement, event.clone());
+            let encoded = serde_json::to_vec(&envelope).expect("envelope encodes");
+            let decoded: bcode_tool::ToolContributionEnvelope =
+                serde_json::from_slice(&encoded).expect("envelope decodes");
+            assert_eq!(decoded.placement, placement);
+            assert_eq!(decoded.contribution.invocation_id, "call-1");
+            assert_eq!(decoded.contribution.contribution_id, "request");
+            assert_eq!(decoded.contribution.sequence, 7);
+            assert_eq!(
+                decoded.contribution.persistence,
+                ToolContributionPersistence::Durable
+            );
+        }
+    }
+
+    #[test]
     fn shell_request_visual_is_generic_contribution_only() {
         assert!(shell_tool_definition().ui.request_visual.is_none());
     }
@@ -2104,8 +2138,10 @@ mod tests {
             .lock()
             .expect("events")
             .iter()
-            .filter_map(|payload| serde_json::from_slice::<ToolContributionEvent>(payload).ok())
-            .filter_map(|event| event.artifact)
+            .filter_map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolContributionEnvelope>(payload).ok()
+            })
+            .filter_map(|envelope| envelope.contribution.artifact)
             .map(|artifact| {
                 (
                     artifact.committed_bytes,
@@ -2674,9 +2710,10 @@ mod tests {
         let mut ipc_bytes = 0_usize;
         for payload in events.iter() {
             ipc_bytes = ipc_bytes.saturating_add(payload.len());
-            let event: ToolContributionEvent =
-                serde_json::from_slice(payload).expect("artifact contribution");
-            let artifact = event.artifact.expect("artifact revision");
+            let envelope: bcode_tool::ToolContributionEnvelope =
+                serde_json::from_slice(payload).expect("artifact contribution envelope");
+            assert_eq!(envelope.placement, ToolContributionPlacement::Progress);
+            let artifact = envelope.contribution.artifact.expect("artifact revision");
             assert!(artifact.committed_bytes >= committed);
             committed = artifact.committed_bytes;
             revisions = revisions.max(usize::try_from(artifact.revision).unwrap_or(usize::MAX));
@@ -2796,8 +2833,12 @@ mod tests {
         let recorded_events = recorded_events.lock().expect("recorded lock");
         assert!(!recorded_events.is_empty());
         assert!(recorded_events.iter().all(|payload| {
-            serde_json::from_slice::<ToolContributionEvent>(payload)
-                .is_ok_and(|event| event.artifact.is_some())
+            serde_json::from_slice::<bcode_tool::ToolContributionEnvelope>(payload).is_ok_and(
+                |envelope| {
+                    envelope.placement == ToolContributionPlacement::Progress
+                        && envelope.contribution.artifact.is_some()
+                },
+            )
         }));
         drop(recorded_events);
     }

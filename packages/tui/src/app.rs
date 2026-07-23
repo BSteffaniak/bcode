@@ -548,7 +548,6 @@ impl BmuxApp {
         self.plugin_presentation = Some(Arc::new(
             crate::plugin_tui::PluginTuiPresentation::from_shared(host),
         ));
-        self.suppress_generic_tool_requests_with_rich_contributions();
     }
 
     /// Set persistent local plugin presentation state.
@@ -557,7 +556,6 @@ impl BmuxApp {
         presentation: Arc<crate::plugin_tui::PluginTuiPresentation>,
     ) {
         self.plugin_presentation = Some(presentation);
-        self.suppress_generic_tool_requests_with_rich_contributions();
     }
 
     /// Return the local plugin runtime used for client-side presentation projection.
@@ -2407,50 +2405,7 @@ impl BmuxApp {
         {
             return;
         }
-        if !self.push_shared_terminal_item(event_sequence) {
-            return;
-        }
-        self.suppress_generic_tool_request_for_contribution(contribution);
-    }
-
-    fn suppress_generic_tool_requests_with_rich_contributions(&mut self) {
-        let contributions = self
-            .session_view
-            .snapshot()
-            .contributions
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for contribution in &contributions {
-            self.suppress_generic_tool_request_for_contribution(contribution);
-        }
-    }
-
-    fn suppress_generic_tool_request_for_contribution(
-        &mut self,
-        contribution: &bcode_session_models::ToolContributionEvent,
-    ) {
-        let has_adapter = self.plugin_presentation().is_some_and(|presentation| {
-            presentation
-                .host()
-                .visual_adapter(
-                    &contribution.schema,
-                    contribution.schema_version,
-                    "tui",
-                    Some(&contribution.producer_id),
-                )
-                .is_some()
-        });
-        if !has_adapter {
-            return;
-        }
-        self.transcript.retain(|item| {
-            !matches!(
-                item.kind(),
-                TranscriptItemKind::ToolRequest { tool_call_id, .. }
-                    if tool_call_id == &contribution.invocation_id
-            )
-        });
+        self.push_shared_terminal_item(event_sequence);
     }
 
     fn contribution_backs_active_visual(
@@ -2532,7 +2487,6 @@ impl BmuxApp {
                 arguments_json,
                 working_directory,
                 request_visual,
-                legacy_request_presentation: _legacy_legacy_request_presentation,
                 ..
             } => {
                 self.record_shared_active_tool_requested(tool_call_id);
@@ -2586,7 +2540,6 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-                legacy_request_presentation: _legacy_legacy_request_presentation,
                 policy_source,
                 policy_reason,
                 ..
@@ -3146,7 +3099,7 @@ impl BmuxApp {
         let Some(item) = self.shared_terminal_item(sequence) else {
             return false;
         };
-        self.transcript.push(item);
+        self.transcript.upsert_shared_item(item);
         true
     }
 
@@ -3359,6 +3312,7 @@ impl BmuxApp {
                     &item.kind,
                     bcode_session_view_models::TranscriptViewItemKind::ToolContribution {
                         contribution: item_contribution,
+                        ..
                     } if item_contribution.invocation_id == contribution.invocation_id
                         && item_contribution.contribution_id == contribution.contribution_id
                         && item_contribution.sequence == contribution.sequence

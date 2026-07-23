@@ -732,7 +732,10 @@ fn push_transcript_item_rows(
         TranscriptItemKind::SkillError => {
             push_detail_block(rows, "Skill error", item.text(), Color::Red, width);
         }
-        TranscriptItemKind::ToolContribution { contribution } => {
+        TranscriptItemKind::ToolContribution {
+            contribution,
+            placement,
+        } => {
             let artifact = bcode_session_models::ToolArtifact {
                 artifact_id: format!(
                     "{}-{}",
@@ -750,6 +753,13 @@ fn push_transcript_item_rows(
             if canonical_plugin_visual_available(&visual, plugin_host) {
                 push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
                 rows.push(Line::default());
+            } else if matches!(
+                placement,
+                bcode_session_models::ToolContributionPlacement::Request
+                    | bcode_session_models::ToolContributionPlacement::Progress
+                    | bcode_session_models::ToolContributionPlacement::Result
+            ) {
+                push_meta_block(rows, item.text(), width);
             }
         }
         TranscriptItemKind::Generic => {

@@ -285,6 +285,51 @@ mod tests {
     }
 
     #[test]
+    fn unknown_future_placement_is_rejected_without_payload_fallback() {
+        let contribution = serde_json::json!({
+            "schema_version": ToolContributionEnvelope::SCHEMA_VERSION,
+            "placement": "future_surface",
+            "contribution": {
+                "invocation_id": "call-1",
+                "contribution_id": "surface",
+                "sequence": 1,
+                "producer_id": "example.plugin",
+                "schema": "example.surface",
+                "schema_version": 1,
+                "operation": "upsert",
+                "persistence": "durable",
+                "payload": {"opaque": true}
+            }
+        });
+        let error = serde_json::from_value::<ToolContributionEnvelope>(contribution)
+            .expect_err("unknown placement must not silently become visible");
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn unsupported_envelope_version_remains_explicit() {
+        let contribution = ToolContributionEvent {
+            invocation_id: "call-1".to_owned(),
+            contribution_id: "surface".to_owned(),
+            sequence: 1,
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.surface".to_owned(),
+            schema_version: 1,
+            operation: ToolContributionOperation::Upsert,
+            persistence: ToolContributionPersistence::Durable,
+            artifact: None,
+            payload: serde_json::json!({"opaque": true}),
+        };
+        let mut envelope =
+            ToolContributionEnvelope::new(ToolContributionPlacement::Hidden, contribution);
+        envelope.schema_version = ToolContributionEnvelope::SCHEMA_VERSION.saturating_add(1);
+        assert_ne!(
+            envelope.schema_version,
+            ToolContributionEnvelope::SCHEMA_VERSION
+        );
+    }
+
+    #[test]
     fn contribution_without_artifact_remains_decode_compatible() {
         let contribution: ToolContributionEvent = serde_json::from_value(serde_json::json!({
             "invocation_id": "call-1",

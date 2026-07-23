@@ -223,6 +223,43 @@ mod tests {
     }
 
     #[test]
+    fn large_invocation_history_remains_bounded_by_resident_window_policy() {
+        const TURNS: u64 = 512;
+        const TARGET_EVENTS: usize = 128;
+        let mut events = Vec::new();
+        for turn in 0..TURNS {
+            let user_sequence = turn.saturating_mul(3).saturating_add(1);
+            events.push(user(user_sequence));
+            events.push(event(
+                user_sequence.saturating_add(1),
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: format!("call-{turn}"),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ));
+            events.push(assistant(user_sequence.saturating_add(2)));
+        }
+        let mut window = TranscriptResidentWindow::new(&events);
+        let trim = window.trim_if_allowed(TranscriptWindowPolicy {
+            max_events: 256,
+            target_events: TARGET_EVENTS,
+            allow_trim: true,
+        });
+
+        assert!(trim.trimmed());
+        assert!(window.len() <= TARGET_EVENTS);
+        assert!(matches!(
+            window.events().first().map(|event| &event.kind),
+            Some(SessionEventKind::UserMessage { .. })
+        ));
+    }
+
+    #[test]
     fn does_not_trim_when_disallowed() {
         let events = [user(1), assistant(2), user(3), assistant(4), user(5)];
         let mut window = TranscriptResidentWindow::new(&events);

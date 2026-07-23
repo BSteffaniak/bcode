@@ -772,6 +772,19 @@ fn transcript_item(item: &bcode_session_view_models::TranscriptViewItem) -> Cont
     }
 }
 
+fn compact_unsupported_contribution(
+    placement: bcode_session_models::ToolContributionPlacement,
+) -> Containers {
+    let label = match placement {
+        bcode_session_models::ToolContributionPlacement::Request => "tool request",
+        bcode_session_models::ToolContributionPlacement::Progress => "tool progress",
+        bcode_session_models::ToolContributionPlacement::Result => "tool result",
+        bcode_session_models::ToolContributionPlacement::Supplemental
+        | bcode_session_models::ToolContributionPlacement::Hidden => return Containers::default(),
+    };
+    container! { div color="#8b949e" { (label) } }
+}
+
 fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
     match kind {
         TranscriptViewItemKind::UserMessage { message }
@@ -845,7 +858,10 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
         TranscriptViewItemKind::PluginVisual { visual } => {
             render_plugin_visual("plugin visual", visual)
         }
-        TranscriptViewItemKind::ToolContribution { contribution } => {
+        TranscriptViewItemKind::ToolContribution {
+            contribution,
+            placement,
+        } => {
             let visual = PluginVisualView::from(bcode_session_models::PluginVisualDescriptor {
                 visual_id: Some(format!(
                     "{}-{}",
@@ -861,7 +877,7 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
             VISUAL_ADAPTERS
                 .get(&(contribution.schema.as_str(), contribution.schema_version))
                 .and_then(|adapter| adapter(&visual))
-                .unwrap_or_default()
+                .unwrap_or_else(|| compact_unsupported_contribution(*placement))
         }
     }
 }
@@ -2190,6 +2206,7 @@ mod tests {
     #[test]
     fn unknown_contribution_has_no_raw_web_fallback() {
         let kind = TranscriptViewItemKind::ToolContribution {
+            placement: bcode_session_models::ToolContributionPlacement::Request,
             contribution: bcode_session_models::ToolContributionEvent {
                 invocation_id: "call".to_owned(),
                 contribution_id: "surface".to_owned(),
@@ -2212,6 +2229,7 @@ mod tests {
     #[test]
     fn git_contribution_renders_through_schema_adapter_without_fallback() {
         let kind = TranscriptViewItemKind::ToolContribution {
+            placement: bcode_session_models::ToolContributionPlacement::Request,
             contribution: bcode_session_models::ToolContributionEvent {
                 invocation_id: "git-call".to_owned(),
                 contribution_id: "clone-request".to_owned(),
@@ -2238,6 +2256,7 @@ mod tests {
     #[test]
     fn unsupported_shell_contribution_has_no_raw_web_fallback() {
         let kind = TranscriptViewItemKind::ToolContribution {
+            placement: bcode_session_models::ToolContributionPlacement::Request,
             contribution: bcode_session_models::ToolContributionEvent {
                 invocation_id: "shell-call".to_owned(),
                 contribution_id: "shell-run-summary".to_owned(),

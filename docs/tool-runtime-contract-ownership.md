@@ -68,7 +68,9 @@ compatibility but default to hidden presentation.
 
 Placement selects semantic composition only; it never selects a renderer. Request, progress, and
 result contribution slots coexist; result placement does not replace request context or supersede the
-canonical semantic `ToolInvocationResultRecorded` result card. Plugins continue to own
+canonical semantic `ToolInvocationResultRecorded` result card. Placement is event-owned rather than
+manifest capability metadata: manifests advertise adapter schemas and versions, while an emitted
+envelope declares the slot used by that specific contribution. Plugins continue to own
 payload schemas and adapters, `SessionView` owns stable slot identity and ordering, and each renderer
 owns native styling. Renderers may expose raw contribution payloads only on an explicit diagnostic or
 developer surface, never as a normal transcript fallback.
@@ -115,3 +117,9 @@ Forbidden direction includes:
 ## Compatibility boundary
 
 Legacy executor adaptation may reconstruct old transport requests only inside explicitly named compatibility adapters. Canonical preparation and invocation APIs remain transport-free. Compatibility adapters must be deleted when their callers migrate; they are not valid extension points for new behavior.
+
+Persisted unplaced `ToolContribution` and legacy request-presentation fields are decode-only
+compatibility facts. Session decoding retains their semantic payload, and projection assigns hidden
+placement to unplaced contributions. TUI and web render paths do not inspect legacy presentation
+metadata or infer visibility from old contribution schemas. New writes use
+`ToolContributionEnvelope` and the append-only `ToolContributionPlaced` event.

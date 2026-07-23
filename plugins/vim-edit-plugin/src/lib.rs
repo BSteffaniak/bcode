@@ -1172,7 +1172,7 @@ mod tests {
     use std::ffi::c_void;
 
     extern "C" fn collect_event(payload: *const u8, len: usize, user_data: *mut c_void) {
-        let events = unsafe { &mut *(user_data.cast::<Vec<ToolContributionEvent>>()) };
+        let events = unsafe { &mut *(user_data.cast::<Vec<ToolContributionEnvelope>>()) };
         let payload = unsafe { std::slice::from_raw_parts(payload, len) };
         events.push(serde_json::from_slice(payload).expect("contribution event"));
     }
@@ -1306,7 +1306,7 @@ mod tests {
         }
         let file = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(file.path(), "foo bar").expect("write temp file");
-        let mut events = Vec::<ToolContributionEvent>::new();
+        let mut events = Vec::<ToolContributionEnvelope>::new();
         let emitter = ServiceEventEmitter::new(
             Some(collect_event),
             std::ptr::addr_of_mut!(events).cast::<c_void>(),
@@ -1323,21 +1323,22 @@ mod tests {
         assert!(!response.is_error, "{}", response.output);
         let live_events = events
             .iter()
-            .filter(|event| event.schema == VIM_EDIT_LIVE_SCHEMA)
+            .filter(|event| event.contribution.schema == VIM_EDIT_LIVE_SCHEMA)
             .collect::<Vec<_>>();
         assert!(live_events.len() >= 3, "{events:#?}");
-        assert_eq!(live_events[0].contribution_id, "vim-live");
-        assert_eq!(live_events[0].payload["phase"], "started");
+        assert_eq!(live_events[0].contribution.contribution_id, "vim-live");
+        assert_eq!(live_events[0].contribution.payload["phase"], "started");
         assert!(live_events.iter().any(|event| {
-            event.payload["phase"] == "running" && event.payload.get("context").is_some()
+            event.contribution.payload["phase"] == "running"
+                && event.contribution.payload.get("context").is_some()
         }));
         assert_eq!(
-            live_events.last().map(|event| event.operation),
+            live_events.last().map(|event| event.contribution.operation),
             Some(ToolContributionOperation::Remove)
         );
         assert!(events.iter().any(|event| {
-            event.schema == VIM_EDIT_PLAYBACK_SCHEMA
-                && event.persistence == ToolContributionPersistence::Durable
+            event.contribution.schema == VIM_EDIT_PLAYBACK_SCHEMA
+                && event.contribution.persistence == ToolContributionPersistence::Durable
         }));
     }
 
@@ -1345,7 +1346,7 @@ mod tests {
     fn live_event_stream_emits_error_for_missing_nvim() {
         let file = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(file.path(), "foo").expect("write temp file");
-        let mut events = Vec::<ToolContributionEvent>::new();
+        let mut events = Vec::<ToolContributionEnvelope>::new();
         let emitter = ServiceEventEmitter::new(
             Some(collect_event),
             std::ptr::addr_of_mut!(events).cast::<c_void>(),
@@ -1361,11 +1362,13 @@ mod tests {
         );
         assert!(response.is_error);
         assert_eq!(
-            events.first().map(|event| &event.payload["phase"]),
+            events
+                .first()
+                .map(|event| &event.contribution.payload["phase"]),
             Some(&json!("started"))
         );
         assert_eq!(
-            events.last().map(|event| event.operation),
+            events.last().map(|event| event.contribution.operation),
             Some(ToolContributionOperation::Remove)
         );
     }
@@ -1383,7 +1386,7 @@ mod tests {
             },
             events: Vec::new(),
         };
-        let mut events = Vec::<ToolContributionEvent>::new();
+        let mut events = Vec::<ToolContributionEnvelope>::new();
         let emitter = ServiceEventEmitter::new(
             Some(collect_event),
             std::ptr::addr_of_mut!(events).cast::<c_void>(),
@@ -1400,21 +1403,30 @@ mod tests {
         assert!(response.result.is_none());
         let playback = events
             .iter()
-            .find(|event| event.contribution_id == "playback")
+            .find(|event| event.contribution.contribution_id == "playback")
             .expect("durable playback contribution");
-        assert_eq!(playback.schema, VIM_EDIT_PLAYBACK_SCHEMA);
-        assert_eq!(playback.producer_id, VIM_EDIT_PLUGIN_ID);
-        assert_eq!(playback.persistence, ToolContributionPersistence::Durable);
-        assert_eq!(playback.payload["tool_name"], "vim_edit.preview");
-        assert_eq!(playback.payload["path"], "src/lib.rs");
-        assert_eq!(playback.payload["summary"], "vim edit changed file");
-        assert_eq!(playback.payload["success"], true);
-        assert!(playback.payload.get("events").is_some());
-        assert!(playback.payload.get("frames").is_some());
-        assert_eq!(playback.payload["frame_count"], 0);
-        assert_eq!(playback.payload["frames_truncated"], false);
-        assert_eq!(playback.payload["diff_truncated"], false);
-        assert!(playback.payload.get("final_context").is_some());
+        assert_eq!(playback.contribution.schema, VIM_EDIT_PLAYBACK_SCHEMA);
+        assert_eq!(playback.contribution.producer_id, VIM_EDIT_PLUGIN_ID);
+        assert_eq!(
+            playback.contribution.persistence,
+            ToolContributionPersistence::Durable
+        );
+        assert_eq!(
+            playback.contribution.payload["tool_name"],
+            "vim_edit.preview"
+        );
+        assert_eq!(playback.contribution.payload["path"], "src/lib.rs");
+        assert_eq!(
+            playback.contribution.payload["summary"],
+            "vim edit changed file"
+        );
+        assert_eq!(playback.contribution.payload["success"], true);
+        assert!(playback.contribution.payload.get("events").is_some());
+        assert!(playback.contribution.payload.get("frames").is_some());
+        assert_eq!(playback.contribution.payload["frame_count"], 0);
+        assert_eq!(playback.contribution.payload["frames_truncated"], false);
+        assert_eq!(playback.contribution.payload["diff_truncated"], false);
+        assert!(playback.contribution.payload.get("final_context").is_some());
     }
 
     #[test]

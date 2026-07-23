@@ -729,7 +729,7 @@ fi
 
 if ! grep -F 'clone_request_uses_durable_generic_contribution_without_legacy_visual' plugins/git-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'renders_clone_request_from_generic_contribution_payload' plugins/git-plugin/src/git_tui.rs >/dev/null ||
-   ! grep -F 'TranscriptItemKind::ToolContribution { contribution }' packages/tui/src/render.rs >/dev/null; then
+   ! grep -F 'TranscriptItemKind::ToolContribution {' packages/tui/src/render.rs >/dev/null; then
   echo "Runtime architecture violation: generic Git contribution adapter coverage was removed." >&2
   violations=1
 fi

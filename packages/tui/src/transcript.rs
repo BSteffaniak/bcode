@@ -112,6 +112,8 @@ pub enum TranscriptItemKind {
     ToolContribution {
         /// Opaque contribution envelope.
         contribution: Box<bcode_session_models::ToolContributionEvent>,
+        /// Renderer-neutral semantic placement.
+        placement: bcode_session_models::ToolContributionPlacement,
     },
     /// Generic fallback item.
     Generic,
@@ -863,15 +865,24 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
                 TranscriptItemKind::Generic,
             )
         }
-        TranscriptViewItemKind::ToolContribution { contribution } => {
-            let fallback = serde_json::to_string_pretty(contribution)
-                .unwrap_or_else(|_| contribution.payload.to_string());
+        TranscriptViewItemKind::ToolContribution {
+            contribution,
+            placement,
+        } => {
+            let fallback = match placement {
+                bcode_session_models::ToolContributionPlacement::Request => "tool request",
+                bcode_session_models::ToolContributionPlacement::Progress => "tool progress",
+                bcode_session_models::ToolContributionPlacement::Result => "tool result",
+                bcode_session_models::ToolContributionPlacement::Supplemental
+                | bcode_session_models::ToolContributionPlacement::Hidden => "",
+            };
             TranscriptItem::with_kind(
                 "Tool contribution",
-                fallback,
+                fallback.to_owned(),
                 item.streaming,
                 TranscriptItemKind::ToolContribution {
                     contribution: Box::new(contribution.clone()),
+                    placement: *placement,
                 },
             )
         }

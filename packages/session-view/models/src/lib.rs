@@ -698,9 +698,10 @@ pub enum TranscriptViewItemKind {
     SystemMessage { message: ChatMessageView },
     /// Generic plugin visual payload.
     PluginVisual { visual: PluginVisualView },
-    /// Opaque schema-versioned tool contribution with generic fallback rendering.
+    /// Opaque schema-versioned tool contribution with explicit semantic placement.
     ToolContribution {
         contribution: bcode_session_models::ToolContributionEvent,
+        placement: bcode_session_models::ToolContributionPlacement,
     },
 }
 
