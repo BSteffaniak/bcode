@@ -10,6 +10,7 @@ use super::transcript_layout::{
     TranscriptLayoutFingerprint, TranscriptLayoutSignature, TranscriptLayoutSpec,
 };
 use bcode_config::TuiDiffViewerConfig;
+use std::time::Instant;
 
 /// Prepare transcript layout and viewport projections for a frame body.
 pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
@@ -56,10 +57,13 @@ fn max_bottom_overscroll(area: Rect) -> usize {
 }
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {
+    let started = Instant::now();
     let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
     let input = TranscriptLayoutInput::from_app(app, width);
     let fingerprint = input.fingerprint();
     if transcript_layout.is_current(&fingerprint) {
+        transcript_layout
+            .record_cache_hit(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
         *app.transcript_layout_mut() = transcript_layout;
         return;
     }

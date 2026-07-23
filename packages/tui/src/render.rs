@@ -1135,11 +1135,19 @@ fn push_canonical_plugin_visual_rows(
         );
         return;
     };
-    if let Some(native_rows) = registry.visual_rows(
+    let visual_started = Instant::now();
+    let native_rows = registry.visual_rows(
         &route.schema,
         &visual.payload,
         &plugin_visual_context(width, working_directory),
-    ) {
+    );
+    presentation.record_visual_timing(
+        "render_rows",
+        &route.plugin_id,
+        &route.schema,
+        visual_started,
+    );
+    if let Some(native_rows) = native_rows {
         rows.extend(native_rows);
         return;
     }

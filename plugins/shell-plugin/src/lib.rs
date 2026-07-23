@@ -2644,18 +2644,18 @@ mod tests {
     }
 
     struct FixedChunkReader {
-        remaining_chunks: usize,
+        remaining_bytes: usize,
         chunk: Vec<u8>,
     }
 
     impl Read for FixedChunkReader {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            if self.remaining_chunks == 0 {
+            if self.remaining_bytes == 0 {
                 return Ok(0);
             }
-            let len = self.chunk.len().min(buffer.len());
+            let len = self.chunk.len().min(buffer.len()).min(self.remaining_bytes);
             buffer[..len].copy_from_slice(&self.chunk[..len]);
-            self.remaining_chunks = self.remaining_chunks.saturating_sub(1);
+            self.remaining_bytes = self.remaining_bytes.saturating_sub(len);
             Ok(len)
         }
     }
@@ -2668,7 +2668,8 @@ mod tests {
         ipc_bytes: usize,
     }
 
-    fn run_small_chunk_workload(chunks: usize, chunk_bytes: usize) -> ChunkWorkloadMetrics {
+    fn run_output_chunk_workload(output_bytes: usize, chunk_bytes: usize) -> ChunkWorkloadMetrics {
+        let chunks = output_bytes.div_ceil(chunk_bytes);
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("many-chunks.bcsr");
         let events = Mutex::new(Vec::<Vec<u8>>::new());
@@ -2678,7 +2679,7 @@ mod tests {
         );
         let mut output = read_limited_streaming(
             FixedChunkReader {
-                remaining_chunks: chunks,
+                remaining_bytes: output_bytes,
                 chunk: vec![b'x'; chunk_bytes],
             },
             emitter,
@@ -2721,7 +2722,7 @@ mod tests {
         let notification_count = events.len();
         drop(events);
         let recording_bytes = std::fs::metadata(&path).expect("recording metadata").len();
-        let raw_bytes = chunks.saturating_mul(chunk_bytes);
+        let raw_bytes = output_bytes;
         assert!(revisions <= chunks.saturating_mul(2).saturating_add(2));
         let (_, frames) = recording::read_recording(&path).expect("recording");
         let exact_output_bytes = frames
@@ -2741,8 +2742,25 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_output_chunk_matrix_preserves_exact_bytes_and_expected_updates() {
+        const OUTPUT_VOLUMES: [usize; 3] = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
+        const CHUNK_BYTES: [usize; 3] = [17, 4 * 1024, 16 * 1024];
+
+        for output_bytes in OUTPUT_VOLUMES {
+            for chunk_bytes in CHUNK_BYTES {
+                let chunks = output_bytes.div_ceil(chunk_bytes);
+                let metrics = run_output_chunk_workload(output_bytes, chunk_bytes);
+                assert_eq!(metrics.raw_bytes, output_bytes);
+                assert_eq!(metrics.notification_count, chunks.saturating_add(2));
+                assert!(metrics.recording_bytes >= u64::try_from(output_bytes).unwrap_or(u64::MAX));
+                assert!(metrics.ipc_bytes > 0);
+            }
+        }
+    }
+
+    #[test]
     fn thousands_of_small_pty_chunks_emit_only_linear_artifact_notifications() {
-        let metrics = run_small_chunk_workload(4_096, 17);
+        let metrics = run_output_chunk_workload(4_096 * 17, 17);
         assert!(
             metrics.recording_bytes
                 <= u64::try_from(metrics.raw_bytes.saturating_mul(6)).unwrap_or(u64::MAX)
@@ -2752,8 +2770,8 @@ mod tests {
 
     #[test]
     fn live_notification_transport_scales_linearly_with_recording_input() {
-        let small = run_small_chunk_workload(512, 17);
-        let large = run_small_chunk_workload(4_096, 17);
+        let small = run_output_chunk_workload(512 * 17, 17);
+        let large = run_output_chunk_workload(4_096 * 17, 17);
         let input_scale = large.raw_bytes / small.raw_bytes;
 
         assert_eq!(input_scale, 8);

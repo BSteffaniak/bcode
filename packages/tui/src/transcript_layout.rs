@@ -2,6 +2,8 @@
 
 use bmux_tui::prelude::Line;
 use bmux_tui::retained_sectioned_list::{RetainedSectionedListLayout, RetainedSectionedListLine};
+use std::cell::Cell;
+use std::time::Instant;
 
 /// Stable identity for a rendered transcript entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,12 +35,71 @@ impl TranscriptLayoutFingerprint {
     }
 }
 
+/// Reason one transcript layout synchronization performed work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptLayoutInvalidation {
+    /// The fingerprint already matched, so no entries were scanned or rebuilt.
+    CacheHit,
+    /// Layout inputs changed without requiring a complete cache reset.
+    Incremental,
+    /// Terminal width changed and required a complete cache reset.
+    Width,
+    /// The caller explicitly requested a complete cache reset.
+    Explicit,
+}
+
+impl TranscriptLayoutInvalidation {
+    /// Return the stable low-cardinality metric label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::Incremental => "incremental",
+            Self::Width => "width",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+/// Work performed by one transcript layout synchronization attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptLayoutSyncStats {
+    /// Invalidation category for this attempt.
+    pub invalidation: TranscriptLayoutInvalidation,
+    /// Entry signatures inspected by the retained layout.
+    pub entries_scanned: usize,
+    /// Entry signatures whose rows were regenerated.
+    pub signatures_changed: usize,
+    /// Entries rebuilt after a signature change.
+    pub entries_rebuilt: usize,
+    /// Total rows generated for rebuilt entries.
+    pub rows_regenerated: usize,
+    /// Complete synchronization duration in microseconds.
+    pub duration_micros: u64,
+}
+
+impl TranscriptLayoutSyncStats {
+    /// Construct a cache-hit observation.
+    #[must_use]
+    pub const fn cache_hit(duration_micros: u64) -> Self {
+        Self {
+            invalidation: TranscriptLayoutInvalidation::CacheHit,
+            entries_scanned: 0,
+            signatures_changed: 0,
+            entries_rebuilt: 0,
+            rows_regenerated: 0,
+            duration_micros,
+        }
+    }
+}
+
 /// Cached transcript layout rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TranscriptLayoutCache {
     width: Option<u16>,
     fingerprint: Option<TranscriptLayoutFingerprint>,
     entries: RetainedSectionedListLayout<VisibleTranscriptSource, TranscriptLayoutSignature>,
+    sync_stats: Vec<TranscriptLayoutSyncStats>,
 }
 
 /// A rendered line inside the transcript's global row space.
@@ -89,11 +150,23 @@ impl TranscriptLayoutCache {
         self.fingerprint.as_ref() == Some(fingerprint)
     }
 
+    /// Record one cache-hit synchronization attempt.
+    pub fn record_cache_hit(&mut self, duration_micros: u64) {
+        self.sync_stats
+            .push(TranscriptLayoutSyncStats::cache_hit(duration_micros));
+    }
+
+    /// Drain synchronization work observations accumulated since the previous call.
+    pub fn drain_sync_stats(&mut self) -> Vec<TranscriptLayoutSyncStats> {
+        std::mem::take(&mut self.sync_stats)
+    }
+
     /// Synchronize the cache for a terminal width and current transcript data.
     pub fn sync<TS, TR, PS, PR, HS, HR, R>(
         &mut self,
         spec: TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R>,
-    ) where
+    ) -> TranscriptLayoutSyncStats
+    where
         TS: Fn(usize) -> TranscriptLayoutSignature,
         TR: Fn(usize) -> Vec<Line>,
         PS: Fn(usize) -> TranscriptLayoutSignature,
@@ -102,11 +175,29 @@ impl TranscriptLayoutCache {
         HR: FnOnce() -> Vec<Line>,
         R: FnOnce() -> bool,
     {
-        if self.width != Some(spec.width) || (spec.reset)() {
+        let started = Instant::now();
+        let width_changed = self.width != Some(spec.width);
+        let explicit_reset = (spec.reset)();
+        let invalidation = if width_changed {
+            TranscriptLayoutInvalidation::Width
+        } else if explicit_reset {
+            TranscriptLayoutInvalidation::Explicit
+        } else {
+            TranscriptLayoutInvalidation::Incremental
+        };
+        if width_changed || explicit_reset {
             self.width = Some(spec.width);
             self.fingerprint = None;
             self.entries.clear();
         }
+
+        let history_signature = (spec.history_banner_signature)();
+        let entries_scanned = spec
+            .transcript_len
+            .saturating_add(spec.pending_len)
+            .saturating_add(usize::from(history_signature.is_some()));
+        let signatures_changed = Cell::new(0_usize);
+        let rows_regenerated = Cell::new(0_usize);
 
         self.entries.sync_sections([
             VisibleTranscriptSource::HistoryBanner,
@@ -117,22 +208,36 @@ impl TranscriptLayoutCache {
             &VisibleTranscriptSource::Transcript,
             spec.transcript_len,
             spec.transcript_signature,
-            spec.transcript_rows,
+            |index| {
+                let rows = (spec.transcript_rows)(index);
+                signatures_changed.set(signatures_changed.get().saturating_add(1));
+                rows_regenerated.set(rows_regenerated.get().saturating_add(rows.len()));
+                rows
+            },
         );
         self.entries.sync_section(
             &VisibleTranscriptSource::Pending,
             spec.pending_len,
             spec.pending_signature,
-            spec.pending_rows,
+            |index| {
+                let rows = (spec.pending_rows)(index);
+                signatures_changed.set(signatures_changed.get().saturating_add(1));
+                rows_regenerated.set(rows_regenerated.get().saturating_add(rows.len()));
+                rows
+            },
         );
-        match (spec.history_banner_signature)() {
+        match history_signature {
             Some(signature) => {
                 let rows = (spec.history_banner_rows)();
                 self.entries.sync_section(
                     &VisibleTranscriptSource::HistoryBanner,
                     1,
                     |_| signature.clone(),
-                    |_| rows.clone(),
+                    |_| {
+                        signatures_changed.set(signatures_changed.get().saturating_add(1));
+                        rows_regenerated.set(rows_regenerated.get().saturating_add(rows.len()));
+                        rows.clone()
+                    },
                 );
             }
             None => self
@@ -140,6 +245,16 @@ impl TranscriptLayoutCache {
                 .clear_section(&VisibleTranscriptSource::HistoryBanner),
         }
         self.fingerprint = Some(spec.fingerprint);
+        let stats = TranscriptLayoutSyncStats {
+            invalidation,
+            entries_scanned,
+            signatures_changed: signatures_changed.get(),
+            entries_rebuilt: signatures_changed.get(),
+            rows_regenerated: rows_regenerated.get(),
+            duration_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        };
+        self.sync_stats.push(stats);
+        stats
     }
 
     /// Return total rendered row count for the cached transcript document.
@@ -253,4 +368,71 @@ pub struct TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R> {
     pub history_banner_rows: HR,
     /// Return whether all cached rows must be discarded.
     pub reset: R,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(clippy::type_complexity)]
+    fn spec(
+        fingerprint: &str,
+        transcript_len: usize,
+    ) -> TranscriptLayoutSpec<
+        impl Fn(usize) -> TranscriptLayoutSignature,
+        impl Fn(usize) -> Vec<Line>,
+        impl Fn(usize) -> TranscriptLayoutSignature,
+        impl Fn(usize) -> Vec<Line>,
+        impl FnOnce() -> Option<TranscriptLayoutSignature>,
+        impl FnOnce() -> Vec<Line>,
+        impl FnOnce() -> bool,
+    > {
+        TranscriptLayoutSpec {
+            width: 80,
+            fingerprint: TranscriptLayoutFingerprint::new(fingerprint.to_owned()),
+            transcript_len,
+            pending_len: 0,
+            transcript_signature: |index| TranscriptLayoutSignature::new(format!("item-{index}")),
+            transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+            pending_signature: |index| TranscriptLayoutSignature::new(format!("pending-{index}")),
+            pending_rows: |_| Vec::new(),
+            history_banner_signature: || None,
+            history_banner_rows: Vec::new,
+            reset: || false,
+        }
+    }
+
+    #[test]
+    fn sync_stats_report_scans_and_rebuilds() {
+        let mut cache = TranscriptLayoutCache::default();
+
+        let initial = cache.sync(spec("one", 10));
+        assert_eq!(initial.invalidation, TranscriptLayoutInvalidation::Width);
+        assert_eq!(initial.entries_scanned, 10);
+        assert_eq!(initial.signatures_changed, 10);
+        assert_eq!(initial.entries_rebuilt, 10);
+        assert_eq!(initial.rows_regenerated, 10);
+
+        let unchanged = cache.sync(spec("two", 10));
+        assert_eq!(
+            unchanged.invalidation,
+            TranscriptLayoutInvalidation::Incremental
+        );
+        assert_eq!(unchanged.entries_scanned, 10);
+        assert_eq!(unchanged.signatures_changed, 0);
+        assert_eq!(unchanged.entries_rebuilt, 0);
+        assert_eq!(unchanged.rows_regenerated, 0);
+    }
+
+    #[test]
+    fn cache_hits_are_recorded_without_scanning() {
+        let mut cache = TranscriptLayoutCache::default();
+        cache.record_cache_hit(7);
+
+        assert_eq!(
+            cache.drain_sync_stats(),
+            vec![TranscriptLayoutSyncStats::cache_hit(7)]
+        );
+        assert!(cache.drain_sync_stats().is_empty());
+    }
 }

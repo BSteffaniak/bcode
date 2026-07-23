@@ -329,6 +329,7 @@ async fn run_chat_loop<W: Write>(
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, &settings.keymap);
         loop_state.telemetry.flush_if_due(Instant::now());
+        record_artifact_stream_stats(loop_state);
         if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
             needs_redraw = true;
         }
@@ -1473,12 +1474,51 @@ fn report_nonfatal_client_error(chat: &mut ActiveChat, label: &str, error: &Clie
         .set_status(daemon_issue::client_issue_status(label, error));
 }
 
+fn record_artifact_stream_stats(loop_state: &mut ChatLoopState) {
+    let stats = loop_state.artifact_stream.drain_stats();
+    loop_state
+        .telemetry
+        .add_counter("tui.artifact.target_observed_total", stats.observed_targets);
+    loop_state.telemetry.add_counter(
+        "tui.artifact.target_coalesced_total",
+        stats.coalesced_targets,
+    );
+    loop_state
+        .telemetry
+        .add_counter("tui.artifact.fetch_started_total", stats.fetches_started);
+    loop_state
+        .telemetry
+        .add_counter("tui.artifact.completion_total", stats.completions);
+    loop_state.telemetry.add_counter(
+        "tui.artifact.stale_completion_total",
+        stats.stale_completions,
+    );
+    loop_state
+        .telemetry
+        .add_counter("tui.artifact.delivered_total", stats.delivered_chunks);
+    loop_state
+        .telemetry
+        .add_counter("tui.artifact.delivered_bytes", stats.delivered_bytes);
+    loop_state
+        .telemetry
+        .add_counter("tui.artifact.retry_total", stats.retries);
+    loop_state.telemetry.add_counter(
+        "tui.artifact.terminal_failure_total",
+        stats.terminal_failures,
+    );
+    loop_state.telemetry.set_gauge(
+        "tui.artifact.backlog",
+        i64::try_from(stats.backlog).unwrap_or(i64::MAX),
+    );
+}
+
 fn next_redraw_at(last_redraw: Instant) -> Instant {
     last_redraw
         .checked_add(TARGET_FRAME_INTERVAL)
         .unwrap_or(last_redraw)
 }
 
+#[allow(clippy::too_many_lines)]
 fn draw_chat_frame<W: Write>(
     terminal: &mut Terminal<&mut W>,
     chat: &mut ActiveChat,
@@ -1508,6 +1548,56 @@ fn draw_chat_frame<W: Write>(
         },
         |(_layout, dock)| dock,
     );
+    for stats in chat.app.transcript_layout_mut().drain_sync_stats() {
+        let mut labels = bcode_metrics::MetricLabels::new();
+        labels.insert(
+            "invalidation".to_owned(),
+            stats.invalidation.label().to_owned(),
+        );
+        loop_state.telemetry.add_counter_with_labels(
+            "tui.transcript.sync_total",
+            1,
+            labels.clone(),
+        );
+        loop_state.telemetry.add_counter_with_labels(
+            "tui.transcript.entries_scanned",
+            u64::try_from(stats.entries_scanned).unwrap_or(u64::MAX),
+            labels.clone(),
+        );
+        loop_state.telemetry.add_counter_with_labels(
+            "tui.transcript.signatures_changed",
+            u64::try_from(stats.signatures_changed).unwrap_or(u64::MAX),
+            labels.clone(),
+        );
+        loop_state.telemetry.add_counter_with_labels(
+            "tui.transcript.entries_rebuilt",
+            u64::try_from(stats.entries_rebuilt).unwrap_or(u64::MAX),
+            labels.clone(),
+        );
+        loop_state.telemetry.add_counter_with_labels(
+            "tui.transcript.rows_regenerated",
+            u64::try_from(stats.rows_regenerated).unwrap_or(u64::MAX),
+            labels.clone(),
+        );
+        loop_state.telemetry.record_histogram_with_labels(
+            "tui.transcript.sync_us",
+            stats.duration_micros,
+            labels,
+        );
+    }
+    if let Some(presentation) = chat.app.plugin_presentation() {
+        for timing in presentation.drain_timings() {
+            let mut labels = bcode_metrics::MetricLabels::new();
+            labels.insert("operation".to_owned(), timing.operation.to_owned());
+            labels.insert("plugin_id".to_owned(), timing.plugin_id);
+            labels.insert("schema".to_owned(), timing.schema);
+            loop_state.telemetry.record_histogram_with_labels(
+                "tui.plugin_visual.duration_us",
+                timing.duration_micros,
+                labels,
+            );
+        }
+    }
     let prepare_ms = elapsed_millis(prepare_started);
     let theme = render::TuiTheme::for_app(&chat.app);
     let draw_started = Instant::now();

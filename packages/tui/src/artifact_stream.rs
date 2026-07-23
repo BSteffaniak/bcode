@@ -83,11 +83,26 @@ fn finalized_artifact_error_is_terminal(error: &ClientError) -> bool {
     )
 }
 
+#[derive(Debug, Default)]
+pub struct ArtifactStreamStats {
+    pub observed_targets: u64,
+    pub coalesced_targets: u64,
+    pub fetches_started: u64,
+    pub completions: u64,
+    pub stale_completions: u64,
+    pub delivered_chunks: u64,
+    pub delivered_bytes: u64,
+    pub retries: u64,
+    pub terminal_failures: u64,
+    pub backlog: u64,
+}
+
 pub struct ArtifactStreamCoordinator {
     artifact_fetches: BTreeMap<ActiveArtifactKey, ActiveArtifactFetchState>,
     artifact_fetch_sender: tokio::sync::mpsc::UnboundedSender<ActiveArtifactFetchCompletion>,
     artifact_fetch_receiver: tokio::sync::mpsc::UnboundedReceiver<ActiveArtifactFetchCompletion>,
     passive_client: BcodeClient,
+    stats: ArtifactStreamStats,
 }
 
 impl ArtifactStreamCoordinator {
@@ -99,7 +114,26 @@ impl ArtifactStreamCoordinator {
             artifact_fetch_sender,
             artifact_fetch_receiver,
             passive_client,
+            stats: ArtifactStreamStats::default(),
         }
+    }
+
+    pub(crate) fn drain_stats(&mut self) -> ArtifactStreamStats {
+        self.stats.backlog = u64::try_from(
+            self.artifact_fetches
+                .values()
+                .filter(|state| {
+                    state.fetching
+                        || state.next_offset
+                            < state
+                                .target
+                                .as_ref()
+                                .map_or(0, |target| target.committed_bytes)
+                })
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        std::mem::take(&mut self.stats)
     }
 
     pub(crate) fn retain_session(&mut self, session_id: Option<SessionId>) {
@@ -255,6 +289,7 @@ impl ArtifactStreamCoordinator {
         target: ActiveArtifactTarget,
         incomplete: bool,
     ) {
+        self.stats.observed_targets = self.stats.observed_targets.saturating_add(1);
         let state = self.artifact_fetches.entry(key.clone()).or_default();
         if incomplete {
             state.fetching = false;
@@ -263,6 +298,7 @@ impl ArtifactStreamCoordinator {
                 "active artifact is incomplete because its producer stopped before finalization"
                     .to_owned(),
             );
+            self.stats.terminal_failures = self.stats.terminal_failures.saturating_add(1);
             return;
         }
         if state
@@ -270,7 +306,11 @@ impl ArtifactStreamCoordinator {
             .as_ref()
             .is_some_and(|current| target.revision <= current.revision)
         {
+            self.stats.coalesced_targets = self.stats.coalesced_targets.saturating_add(1);
             return;
+        }
+        if state.fetching && state.target.is_some() {
+            self.stats.coalesced_targets = self.stats.coalesced_targets.saturating_add(1);
         }
         state.target = Some(target);
         self.schedule_active_artifact_fetch(session_id, key);
@@ -300,6 +340,7 @@ impl ArtifactStreamCoordinator {
         let target_revision = target.revision;
         let requested_end = requested_offset.saturating_add(u64::from(length));
         state.fetching = true;
+        self.stats.fetches_started = self.stats.fetches_started.saturating_add(1);
         state.retry_at = None;
         let client = self.passive_client.clone();
         let sender = self.artifact_fetch_sender.clone();
@@ -332,6 +373,7 @@ impl ArtifactStreamCoordinator {
         completion: ActiveArtifactFetchCompletion,
         deliver: impl FnOnce(&PluginTuiArtifactChunk) -> Result<bool, String>,
     ) -> bool {
+        self.stats.completions = self.stats.completions.saturating_add(1);
         let key = completion.key.clone();
         let chunk = {
             let Some(state) = self.artifact_fetches.get_mut(&key) else {
@@ -343,6 +385,7 @@ impl ArtifactStreamCoordinator {
                 completion.requested_offset,
                 state.next_offset,
             ) {
+                self.stats.stale_completions = self.stats.stale_completions.saturating_add(1);
                 return false;
             }
             state.fetching = false;
@@ -360,8 +403,11 @@ impl ArtifactStreamCoordinator {
                         );
                         state.retry_at = None;
                         state.terminal_error = Some(error_message);
+                        self.stats.terminal_failures =
+                            self.stats.terminal_failures.saturating_add(1);
                     } else {
                         Self::defer_active_artifact_fetch(state, &error_message);
+                        self.stats.retries = self.stats.retries.saturating_add(1);
                     }
                     return false;
                 }
@@ -376,6 +422,7 @@ impl ArtifactStreamCoordinator {
                 Ok(expected_end) => expected_end,
                 Err(error) => {
                     Self::defer_active_artifact_fetch(state, error);
+                    self.stats.retries = self.stats.retries.saturating_add(1);
                     return false;
                 }
             };
@@ -416,16 +463,23 @@ impl ArtifactStreamCoordinator {
                     state.next_offset = expected_end;
                     state.consecutive_failures = 0;
                     state.retry_at = None;
+                    self.stats.delivered_chunks = self.stats.delivered_chunks.saturating_add(1);
+                    self.stats.delivered_bytes = self
+                        .stats
+                        .delivered_bytes
+                        .saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX));
                     redraw = true;
                 }
                 Ok(false) => {
                     let error = "artifact schema has no owning visual adapter".to_owned();
                     tracing::warn!(%error, "active artifact delivery stopped");
                     state.terminal_error = Some(error);
+                    self.stats.terminal_failures = self.stats.terminal_failures.saturating_add(1);
                 }
                 Err(error) => {
                     tracing::warn!(%error, "active artifact delivery failed");
                     state.terminal_error = Some(error);
+                    self.stats.terminal_failures = self.stats.terminal_failures.saturating_add(1);
                 }
             }
         }

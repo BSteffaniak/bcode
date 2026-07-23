@@ -7,6 +7,20 @@ use bcode_plugin_sdk::tui::{
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Bounded route metadata and duration for one generic plugin visual operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginVisualTiming {
+    /// Stable operation label.
+    pub operation: &'static str,
+    /// Routed plugin identifier.
+    pub plugin_id: String,
+    /// Routed schema identifier.
+    pub schema: String,
+    /// Duration in microseconds.
+    pub duration_micros: u64,
+}
 
 /// Process-local presentation state for one TUI instance.
 ///
@@ -17,6 +31,7 @@ pub struct PluginTuiPresentation {
     host: Arc<PluginHost>,
     registries: Mutex<BTreeMap<String, Arc<PluginTuiRegistry>>>,
     revision: AtomicU64,
+    timings: Mutex<Vec<PluginVisualTiming>>,
 }
 
 impl PluginTuiPresentation {
@@ -33,6 +48,7 @@ impl PluginTuiPresentation {
             host,
             registries: Mutex::new(BTreeMap::new()),
             revision: AtomicU64::new(0),
+            timings: Mutex::new(Vec::new()),
         }
     }
 
@@ -98,6 +114,38 @@ impl PluginTuiPresentation {
         })
     }
 
+    /// Drain bounded generic visual-operation timings.
+    pub fn drain_timings(&self) -> Vec<PluginVisualTiming> {
+        self.timings
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut timings| std::mem::take(&mut *timings))
+    }
+
+    /// Record one bounded routed visual-operation timing.
+    pub fn record_visual_timing(
+        &self,
+        operation: &'static str,
+        plugin_id: &str,
+        schema: &str,
+        started: Instant,
+    ) {
+        self.record_timing(PluginVisualTiming {
+            operation,
+            plugin_id: plugin_id.to_owned(),
+            schema: schema.to_owned(),
+            duration_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        });
+    }
+
+    fn record_timing(&self, timing: PluginVisualTiming) {
+        if let Ok(mut timings) = self.timings.lock() {
+            const MAX_PENDING_TIMINGS: usize = 256;
+            if timings.len() < MAX_PENDING_TIMINGS {
+                timings.push(timing);
+            }
+        }
+    }
+
     /// Deliver opaque artifact bytes to the retained adapter selected by generic routing metadata.
     ///
     /// # Errors
@@ -114,7 +162,14 @@ impl PluginTuiPresentation {
         let Some(registry) = self.registry(&route.plugin_id) else {
             return Ok(false);
         };
+        let started = Instant::now();
         let delivered = registry.visual_artifact_chunk(chunk)?;
+        self.record_timing(PluginVisualTiming {
+            operation: "artifact_delivery",
+            plugin_id: route.plugin_id.clone(),
+            schema: route.schema,
+            duration_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        });
         if delivered {
             self.revision.fetch_add(1, Ordering::Relaxed);
         }

@@ -87,23 +87,41 @@ impl TuiTelemetry {
     }
 
     pub(crate) fn add_counter(&mut self, name: &str, value: u64) {
+        self.add_counter_with_labels(name, value, MetricLabels::new());
+    }
+
+    pub(crate) fn add_counter_with_labels(&mut self, name: &str, value: u64, labels: MetricLabels) {
         if !self.enabled || value == 0 {
             return;
         }
-        let entry = self
-            .counters
-            .entry((name.to_owned(), MetricLabels::new()))
-            .or_default();
+        let entry = self.counters.entry((name.to_owned(), labels)).or_default();
         *entry = entry.saturating_add(value);
         self.flush_if_due(Instant::now());
     }
 
     pub(crate) fn record_histogram(&mut self, name: &str, value: u64) {
+        self.record_histogram_with_labels(name, value, MetricLabels::new());
+    }
+
+    pub(crate) fn set_gauge(&mut self, name: &str, value: i64) {
         if !self.enabled {
             return;
         }
-        self.histograms
-            .push(((name.to_owned(), MetricLabels::new()), value));
+        self.gauges
+            .insert((name.to_owned(), MetricLabels::new()), value);
+        self.flush_if_due(Instant::now());
+    }
+
+    pub(crate) fn record_histogram_with_labels(
+        &mut self,
+        name: &str,
+        value: u64,
+        labels: MetricLabels,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.histograms.push(((name.to_owned(), labels), value));
         self.flush_if_due(Instant::now());
     }
 
