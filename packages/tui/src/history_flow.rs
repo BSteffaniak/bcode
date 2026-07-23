@@ -7,7 +7,7 @@ use bcode_session_models::{
     ProjectionWindowRequest, ProjectionWindowTarget, SessionHistoryCursor, SessionHistoryDirection,
     SessionHistoryQuery, SessionId, SessionProjectionKind,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::TuiError;
@@ -101,6 +101,48 @@ pub async fn attach_session_event_stream(
     .await
 }
 
+/// Attach to a session, but hold live event forwarding until the receiver is released.
+pub async fn attach_paused_session_event_stream(
+    client: &BcodeClient,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+) -> Result<
+    (
+        bcode_client::AttachedSessionHistory,
+        JoinHandle<()>,
+        oneshot::Sender<()>,
+    ),
+    TuiError,
+> {
+    let mut connection = client.connect("bcode-tui-bmux").await?;
+    let request = initial_transcript_window_request(bmux_tui::geometry::Rect::new(0, 0, 80, 24));
+    let attached = attach_projection_window(&mut connection, session_id, request.clone()).await?;
+    let reconnect_client = client.clone();
+    let (release_sender, release_receiver) = oneshot::channel();
+    let event_task = tokio::spawn(async move {
+        if release_receiver.await.is_err() {
+            return;
+        }
+        reconnecting_event_stream(
+            reconnect_client,
+            session_id,
+            event_sender,
+            connection,
+            move |connection, session_id| {
+                let request = request.clone();
+                Box::pin(async move {
+                    connection
+                        .attach_session_projection_window_with_input_history(session_id, request)
+                        .await
+                        .map(resynchronization_events)
+                })
+            },
+        )
+        .await;
+    });
+    Ok((attached, event_task, release_sender))
+}
+
 /// Attach to a session with a bounded recent history limit and forward live events into the UI event channel.
 #[allow(dead_code)]
 pub async fn attach_session_event_stream_with_limit(
@@ -144,21 +186,7 @@ pub async fn attach_session_event_stream_with_window_request(
     request: ProjectionWindowRequest,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
-    let attached = match connection
-        .attach_session_projection_window_with_input_history(session_id, request.clone())
-        .await
-    {
-        Ok(attached) => attached,
-        Err(bcode_client::ClientError::Server { code, message })
-            if code == "projection_stale" || code == "session_repair_required" =>
-        {
-            return Err(TuiError::SessionUnavailable {
-                session_id,
-                reason: message,
-            });
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let attached = attach_projection_window(&mut connection, session_id, request.clone()).await?;
     let reconnect_client = client.clone();
     let event_task = spawn_reconnecting_window_event_stream(
         reconnect_client,
@@ -168,6 +196,28 @@ pub async fn attach_session_event_stream_with_window_request(
         connection,
     );
     Ok((attached, event_task))
+}
+
+async fn attach_projection_window(
+    connection: &mut bcode_client::ClientConnection,
+    session_id: SessionId,
+    request: ProjectionWindowRequest,
+) -> Result<bcode_client::AttachedSessionHistory, TuiError> {
+    match connection
+        .attach_session_projection_window_with_input_history(session_id, request)
+        .await
+    {
+        Ok(attached) => Ok(attached),
+        Err(bcode_client::ClientError::Server { code, message })
+            if code == "projection_stale" || code == "session_repair_required" =>
+        {
+            Err(TuiError::SessionUnavailable {
+                session_id,
+                reason: message,
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn spawn_reconnecting_recent_event_stream(

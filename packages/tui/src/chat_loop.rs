@@ -983,6 +983,9 @@ fn apply_submit_message_result(
             if result.committed_agent_id.is_some() {
                 let _committed = chat.app.take_pending_agent();
             }
+            if let Some(release) = result.event_stream_release {
+                let _released = release.send(());
+            }
             match result.acceptance.disposition {
                 bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
                     chat.app.mark_pending_submission_sent();
@@ -2234,6 +2237,39 @@ mod scheduler_tests {
             event_task: None,
             opening_session_id: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_submit_installs_session_before_releasing_event_stream() {
+        let mut chat = test_chat();
+        chat.app.replace_composer_with("initial prompt");
+        chat.app.stage_submission();
+        let session_id = bcode_session_models::SessionId::new();
+        let (release_sender, mut release_receiver) = tokio::sync::oneshot::channel();
+        let event_task = tokio::spawn(std::future::pending());
+
+        apply_submit_message_result(
+            &mut chat,
+            "initial prompt",
+            Ok(super::super::effects::SubmitMessageResult {
+                session_id,
+                created_session: None,
+                acceptance: bcode_client::MessageAcceptance::sent(),
+                committed_agent_id: None,
+                event_task: Some(event_task),
+                event_stream_release: Some(release_sender),
+            }),
+        );
+
+        assert_eq!(chat.session_id, Some(session_id));
+        assert!(matches!(
+            release_receiver.try_recv(),
+            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(chat.event_task.is_some());
+        if let Some(event_task) = chat.event_task.take() {
+            event_task.abort();
         }
     }
 

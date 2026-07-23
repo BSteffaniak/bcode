@@ -13,7 +13,7 @@ use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
 use bcode_skill_models::SkillId;
 use bcode_worktree_models::{WorktreeCreateRequest, WorktreeCreateResponse};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::{
@@ -608,6 +608,8 @@ pub struct SubmitMessageResult {
     pub committed_agent_id: Option<String>,
     /// Event stream task for a newly-created session.
     pub event_task: Option<JoinHandle<()>>,
+    /// Releases a newly-created session stream after the TUI installs the session id.
+    pub event_stream_release: Option<oneshot::Sender<()>>,
 }
 
 /// Reasoning effort cycle outcome.
@@ -1593,6 +1595,7 @@ async fn submit_message(
     let mut message = message;
     let mut created_session = None;
     let mut event_task = None;
+    let mut event_stream_release = None;
     let session_id = if let Some(session_id) = session_id {
         session_id
     } else {
@@ -1609,8 +1612,8 @@ async fn submit_message(
             },
         )
         .await;
-        let (attached, task) =
-            history_flow::attach_session_event_stream(client, session.id, event_sender)
+        let (attached, task, release) =
+            history_flow::attach_paused_session_event_stream(client, session.id, event_sender)
                 .await
                 .map_err(|error| match error {
                     TuiError::Client(error) => error,
@@ -1631,6 +1634,7 @@ async fn submit_message(
         })?;
         created_session = Some(attached.session);
         event_task = Some(task);
+        event_stream_release = Some(release);
         session_id
     };
     apply_submit_runtime_selections(
@@ -1664,6 +1668,7 @@ async fn submit_message(
         acceptance,
         committed_agent_id: agent_id,
         event_task,
+        event_stream_release,
     })
 }
 
