@@ -396,12 +396,12 @@ fn summarize_domain(
         .map(|row| row.max)
         .max()
         .unwrap_or(0);
-    let health = if error_count > 0 || slowest >= 30_000 {
+    let mut health = if error_count > 0 || slowest >= 30_000 {
         MetricsHealth::Warning
     } else {
         MetricsHealth::Good
     };
-    let cards = vec![
+    let mut cards = vec![
         MetricCard {
             title: "Events".to_owned(),
             value: events.len().to_string(),
@@ -439,7 +439,17 @@ fn summarize_domain(
             health: MetricsHealth::Good,
         },
     ];
+    if domain == MetricDomain::Tui {
+        cards.extend(tui_health_cards(&events));
+    }
     let mut recommendations = recommendations_for_rows(&rows);
+    recommendations.extend(domain_recommendations(domain, &events));
+    if recommendations
+        .iter()
+        .any(|recommendation| recommendation.health != MetricsHealth::Good)
+    {
+        health = MetricsHealth::Warning;
+    }
     if domain == MetricDomain::Overview {
         recommendations.extend(analysis.anomalies.iter().take(8).map(|anomaly| {
             MetricRecommendation {
@@ -742,6 +752,183 @@ fn series_for_domain(events: &[&MetricEvent]) -> Vec<MetricSeries> {
     }]
 }
 
+fn event_value_total(events: &[&MetricEvent], name: &str) -> u64 {
+    events
+        .iter()
+        .filter(|event| event.name == name && event.value > 0)
+        .fold(0_u64, |total, event| {
+            total.saturating_add(u64::try_from(event.value).unwrap_or(u64::MAX))
+        })
+}
+
+fn plugin_work_total(events: &[&MetricEvent], diagnostic: &str) -> u64 {
+    events
+        .iter()
+        .filter(|event| {
+            event.name == "tui.plugin_visual.work"
+                && event.labels.get("diagnostic").map(String::as_str) == Some(diagnostic)
+                && event.value > 0
+        })
+        .fold(0_u64, |total, event| {
+            total.saturating_add(u64::try_from(event.value).unwrap_or(u64::MAX))
+        })
+}
+
+fn ratio_tenths(numerator: u64, denominator: u64) -> String {
+    if denominator == 0 {
+        return "n/a".to_owned();
+    }
+    let tenths = numerator.saturating_mul(10).saturating_div(denominator);
+    format!("{}.{}x", tenths / 10, tenths % 10)
+}
+
+fn tui_health_cards(events: &[&MetricEvent]) -> Vec<MetricCard> {
+    let frames = event_value_total(events, "tui.frame.total");
+    let over_budget = event_value_total(events, "tui.frame.over_budget_total");
+    let frame_warning = frames >= 10 && over_budget.saturating_mul(10) >= frames;
+    let decoded_bytes = plugin_work_total(events, "decode_bytes");
+    let emulated_bytes = plugin_work_total(events, "emulate_bytes");
+    let replay_warning = decoded_bytes > 0 && emulated_bytes >= decoded_bytes.saturating_mul(2);
+    let failures = event_value_total(events, "tui.artifact.terminal_failure_total");
+    let telemetry_drops = event_value_total(events, "tui.telemetry.dropped_total")
+        .saturating_add(event_value_total(events, "tui.telemetry.failed_total"));
+    vec![
+        MetricCard {
+            title: "Frame budget".to_owned(),
+            value: format!("{over_budget}/{frames}"),
+            detail: "frames at or above 16 ms".to_owned(),
+            health: if frame_warning {
+                MetricsHealth::Warning
+            } else {
+                MetricsHealth::Good
+            },
+        },
+        MetricCard {
+            title: "Replay work".to_owned(),
+            value: ratio_tenths(emulated_bytes, decoded_bytes),
+            detail: "emulated / decoded bytes".to_owned(),
+            health: if replay_warning {
+                MetricsHealth::Warning
+            } else {
+                MetricsHealth::Good
+            },
+        },
+        MetricCard {
+            title: "Artifact failures".to_owned(),
+            value: failures.to_string(),
+            detail: "terminal hydration failures".to_owned(),
+            health: if failures > 0 {
+                MetricsHealth::Warning
+            } else {
+                MetricsHealth::Good
+            },
+        },
+        MetricCard {
+            title: "Telemetry loss".to_owned(),
+            value: telemetry_drops.to_string(),
+            detail: "dropped or failed batches".to_owned(),
+            health: if telemetry_drops > 0 {
+                MetricsHealth::Warning
+            } else {
+                MetricsHealth::Good
+            },
+        },
+    ]
+}
+
+fn domain_recommendations(
+    domain: MetricDomain,
+    events: &[&MetricEvent],
+) -> Vec<MetricRecommendation> {
+    let mut recommendations = Vec::new();
+    if domain == MetricDomain::Tui {
+        let frames = event_value_total(events, "tui.frame.total");
+        let over_budget = event_value_total(events, "tui.frame.over_budget_total");
+        if frames >= 10 && over_budget.saturating_mul(10) >= frames {
+            recommendations.push(MetricRecommendation {
+                health: MetricsHealth::Warning,
+                title: "Sustained frame-budget misses".to_owned(),
+                detail: format!(
+                    "{over_budget} of {frames} frames met or exceeded the 16 ms frame budget"
+                ),
+                metric: "tui.frame.over_budget_total".to_owned(),
+                labels: MetricLabels::new(),
+            });
+        }
+        let decoded_bytes = plugin_work_total(events, "decode_bytes");
+        let emulated_bytes = plugin_work_total(events, "emulate_bytes");
+        if decoded_bytes > 0 && emulated_bytes >= decoded_bytes.saturating_mul(2) {
+            recommendations.push(MetricRecommendation {
+                health: MetricsHealth::Warning,
+                title: "Terminal replay amplification".to_owned(),
+                detail: format!(
+                    "emulated bytes are {} decoded bytes; inspect adapter resets and discontinuities",
+                    ratio_tenths(emulated_bytes, decoded_bytes)
+                ),
+                metric: "tui.plugin_visual.work".to_owned(),
+                labels: MetricLabels::from([(
+                    "diagnostic".to_owned(),
+                    "emulate_bytes".to_owned(),
+                )]),
+            });
+        }
+        let changed = event_value_total(events, "tui.transcript.signatures_changed");
+        let rebuilt = event_value_total(events, "tui.transcript.entries_rebuilt");
+        if rebuilt > changed && rebuilt > 0 {
+            recommendations.push(MetricRecommendation {
+                health: MetricsHealth::Warning,
+                title: "Transcript rebuild amplification".to_owned(),
+                detail: format!(
+                    "rebuilt {rebuilt} entries for {changed} changed signatures; inspect invalidation scope"
+                ),
+                metric: "tui.transcript.entries_rebuilt".to_owned(),
+                labels: MetricLabels::new(),
+            });
+        }
+        let artifact_failures = event_value_total(events, "tui.artifact.terminal_failure_total");
+        if artifact_failures > 0 {
+            recommendations.push(MetricRecommendation {
+                health: MetricsHealth::Warning,
+                title: "Artifact hydration failures".to_owned(),
+                detail: format!(
+                    "{artifact_failures} artifact fetches stopped retrying; inspect availability and range errors"
+                ),
+                metric: "tui.artifact.terminal_failure_total".to_owned(),
+                labels: MetricLabels::new(),
+            });
+        }
+        let telemetry_drops = event_value_total(events, "tui.telemetry.dropped_total");
+        let telemetry_failures = event_value_total(events, "tui.telemetry.failed_total");
+        if telemetry_drops > 0 || telemetry_failures > 0 {
+            recommendations.push(MetricRecommendation {
+                health: MetricsHealth::Warning,
+                title: "TUI telemetry loss".to_owned(),
+                detail: format!(
+                    "{telemetry_drops} pending batches were dropped and {telemetry_failures} deliveries failed"
+                ),
+                metric: "tui.telemetry.dropped_total".to_owned(),
+                labels: MetricLabels::new(),
+            });
+        }
+    } else if domain == MetricDomain::Tool {
+        let received = event_value_total(events, "tool.artifact_update.received_total");
+        let published = event_value_total(events, "tool.artifact_update.published_total");
+        if received >= 16 && published > 0 && received >= published.saturating_mul(4) {
+            recommendations.push(MetricRecommendation {
+                health: MetricsHealth::Warning,
+                title: "High artifact-update coalescing ratio".to_owned(),
+                detail: format!(
+                    "received {received} raw artifact updates for {published} publications ({}); correlate upstream work before batching publication",
+                    ratio_tenths(received, published)
+                ),
+                metric: "tool.artifact_update.received_total".to_owned(),
+                labels: MetricLabels::new(),
+            });
+        }
+    }
+    recommendations
+}
+
 fn recommendations_for_rows(rows: &[MetricTableRow]) -> Vec<MetricRecommendation> {
     rows.iter()
         .filter(|row| {
@@ -973,6 +1160,132 @@ mod tests {
             .find(|summary| summary.domain == MetricDomain::Tui)
             .expect("TUI domain should be present");
         assert_eq!(tui.rows.len(), 1);
+    }
+
+    #[test]
+    fn tui_dashboard_cards_and_recommendations_cover_actionable_failures() {
+        let mut events = vec![
+            event("tui.frame.total", 100, &[]),
+            event("tui.frame.over_budget_total", 20, &[]),
+            event("tui.transcript.signatures_changed", 2, &[]),
+            event("tui.transcript.entries_rebuilt", 20, &[]),
+            event("tui.artifact.terminal_failure_total", 1, &[]),
+            event("tui.telemetry.dropped_total", 1, &[]),
+        ];
+        events.push(event(
+            "tui.plugin_visual.work",
+            100,
+            &[("plugin_id", "bcode.shell"), ("diagnostic", "decode_bytes")],
+        ));
+        events.push(event(
+            "tui.plugin_visual.work",
+            300,
+            &[
+                ("plugin_id", "bcode.shell"),
+                ("diagnostic", "emulate_bytes"),
+            ],
+        ));
+        let report = MetricsReport {
+            descriptors: descriptors_from_events(&events),
+            snapshot: snapshot_from_events(&events),
+            events,
+            ..MetricsReport::default()
+        };
+        let dashboard = dashboard_from_report(&report);
+        let tui = dashboard
+            .domains
+            .iter()
+            .find(|summary| summary.domain == MetricDomain::Tui)
+            .expect("TUI domain");
+        assert_eq!(tui.health, MetricsHealth::Warning);
+        for title in [
+            "Sustained frame-budget misses",
+            "Terminal replay amplification",
+            "Transcript rebuild amplification",
+            "Artifact hydration failures",
+            "TUI telemetry loss",
+        ] {
+            assert!(
+                tui.recommendations
+                    .iter()
+                    .any(|recommendation| recommendation.title == title),
+                "missing {title}"
+            );
+        }
+        for title in [
+            "Frame budget",
+            "Replay work",
+            "Artifact failures",
+            "Telemetry loss",
+        ] {
+            assert!(
+                tui.cards
+                    .iter()
+                    .any(|card| card.title == title && card.health == MetricsHealth::Warning),
+                "missing warning card {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_dashboard_recommends_only_material_raw_update_amplification() {
+        let events = vec![
+            event("tool.artifact_update.received_total", 64, &[]),
+            event("tool.artifact_update.published_total", 8, &[]),
+        ];
+        let report = MetricsReport {
+            descriptors: descriptors_from_events(&events),
+            snapshot: snapshot_from_events(&events),
+            events,
+            ..MetricsReport::default()
+        };
+        let dashboard = dashboard_from_report(&report);
+        let tool = dashboard
+            .domains
+            .iter()
+            .find(|summary| summary.domain == MetricDomain::Tool)
+            .expect("Tool domain");
+        assert!(tool.recommendations.iter().any(|recommendation| {
+            recommendation.title == "High artifact-update coalescing ratio"
+                && recommendation.detail.contains("8.0x")
+        }));
+    }
+
+    #[test]
+    fn frame_heavy_dashboard_queries_keep_rows_series_and_facets_bounded() {
+        let mut events = (0..5_000)
+            .map(|index| event("tui.frame.total_ms", i64::from((index % 30) + 1), &[]))
+            .collect::<Vec<_>>();
+        for index in 0..150 {
+            events.push(event(
+                &format!("tui.test.metric_{index}"),
+                i64::from(index + 1),
+                &[("bounded", "yes")],
+            ));
+        }
+        for index in 0..50 {
+            events.push(event(
+                "tui.test.facets",
+                1,
+                &[("outcome", &format!("value-{index}"))],
+            ));
+        }
+        let report = MetricsReport {
+            descriptors: descriptors_from_events(&events),
+            snapshot: snapshot_from_events(&events),
+            events,
+            ..MetricsReport::default()
+        };
+        let result = query_dashboard_report(&report, &MetricsDashboardQuery::default());
+        let tui = result
+            .dashboard
+            .domains
+            .iter()
+            .find(|summary| summary.domain == MetricDomain::Tui)
+            .expect("TUI domain");
+        assert_eq!(tui.rows.len(), default_query_limit());
+        assert!(tui.series.iter().all(|series| series.points.len() <= 80));
+        assert!(result.facets.iter().all(|facet| facet.values.len() <= 20));
     }
 
     #[test]

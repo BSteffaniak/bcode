@@ -1450,8 +1450,18 @@ impl MetricsState {
                     name: name.to_owned(),
                     kind,
                     unit: infer_unit(name),
-                    description: None,
-                    label_keys: label_keys.clone(),
+                    description: metric_metadata(name)
+                        .map(|metadata| metadata.description.to_owned()),
+                    label_keys: metric_metadata(name).map_or_else(
+                        || label_keys.clone(),
+                        |metadata| {
+                            metadata
+                                .label_keys
+                                .iter()
+                                .map(|label| (*label).to_owned())
+                                .collect()
+                        },
+                    ),
                 },
             );
         }
@@ -1483,16 +1493,10 @@ impl MetricsState {
     }
 
     fn observe_descriptor(&mut self, key: &str, kind: MetricKind, labels: &MetricLabels) {
-        let descriptor =
-            self.descriptors
-                .entry(key.to_owned())
-                .or_insert_with(|| MetricDescriptor {
-                    name: key.to_owned(),
-                    kind,
-                    unit: infer_unit(key),
-                    description: None,
-                    label_keys: Vec::new(),
-                });
+        let descriptor = self
+            .descriptors
+            .entry(key.to_owned())
+            .or_insert_with(|| metric_descriptor(key, kind));
         for label in labels.keys() {
             if !descriptor.label_keys.contains(label) {
                 descriptor.label_keys.push(label.clone());
@@ -1891,16 +1895,9 @@ pub fn snapshot_from_events(events: &[MetricEvent]) -> MetricsSnapshot {
 pub fn descriptors_from_events(events: &[MetricEvent]) -> BTreeMap<String, MetricDescriptor> {
     let mut descriptors = BTreeMap::new();
     for event in events {
-        let descriptor =
-            descriptors
-                .entry(event.name.clone())
-                .or_insert_with(|| MetricDescriptor {
-                    name: event.name.clone(),
-                    kind: event.kind,
-                    unit: infer_unit(&event.name),
-                    description: None,
-                    label_keys: Vec::new(),
-                });
+        let descriptor = descriptors
+            .entry(event.name.clone())
+            .or_insert_with(|| metric_descriptor(&event.name, event.kind));
         for key in event.labels.keys() {
             if !descriptor.label_keys.contains(key) {
                 descriptor.label_keys.push(key.clone());
@@ -2004,6 +2001,150 @@ fn read_jsonl_events_tail(path: &Path, max_bytes: u64) -> Vec<MetricEvent> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct StaticMetricMetadata {
+    description: &'static str,
+    label_keys: &'static [&'static str],
+}
+
+fn metric_descriptor(name: &str, kind: MetricKind) -> MetricDescriptor {
+    let metadata = metric_metadata(name);
+    MetricDescriptor {
+        name: name.to_owned(),
+        kind,
+        unit: infer_unit(name),
+        description: metadata.map(|metadata| metadata.description.to_owned()),
+        label_keys: metadata.map_or_else(Vec::new, |metadata| {
+            metadata
+                .label_keys
+                .iter()
+                .map(|label| (*label).to_owned())
+                .collect()
+        }),
+    }
+}
+
+fn metric_metadata(name: &str) -> Option<StaticMetricMetadata> {
+    tui_metric_metadata(name).or_else(|| tool_artifact_metric_metadata(name))
+}
+
+fn tui_metric_metadata(name: &str) -> Option<StaticMetricMetadata> {
+    let (description, label_keys): (&str, &[&str]) = match name {
+        "tui.frame.total" => ("Rendered TUI frames.", &[]),
+        "tui.frame.prepare_ms" => ("TUI frame preparation duration.", &[]),
+        "tui.frame.draw_ms" => ("Terminal draw duration.", &[]),
+        "tui.frame.total_ms" => ("Total TUI frame duration.", &[]),
+        "tui.frame.over_budget_total" => ("Frames at or above the 16 ms budget.", &[]),
+        "tui.frame.schedule_delay_ms" => ("Delay beyond the intended redraw time.", &[]),
+        "tui.transcript.sync_total" => (
+            "Transcript cache synchronization attempts.",
+            &["invalidation"],
+        ),
+        "tui.transcript.entries_scanned" => (
+            "Transcript entries inspected during synchronization.",
+            &["invalidation"],
+        ),
+        "tui.transcript.signatures_changed" => (
+            "Transcript entry signatures changed during synchronization.",
+            &["invalidation"],
+        ),
+        "tui.transcript.entries_rebuilt" => (
+            "Transcript entries rebuilt during synchronization.",
+            &["invalidation"],
+        ),
+        "tui.transcript.rows_regenerated" => (
+            "Transcript rows regenerated during synchronization.",
+            &["invalidation"],
+        ),
+        "tui.transcript.sync_us" => (
+            "Transcript cache synchronization duration.",
+            &["invalidation"],
+        ),
+        "tui.artifact.target_observed_total" => {
+            ("Artifact stream targets observed by the TUI.", &[])
+        }
+        "tui.artifact.target_coalesced_total" => {
+            ("Artifact target revisions replaced before fetching.", &[])
+        }
+        "tui.artifact.fetch_started_total" => ("Artifact range fetches started.", &[]),
+        "tui.artifact.completion_total" => ("Artifact range fetch completions processed.", &[]),
+        "tui.artifact.stale_completion_total" => {
+            ("Stale artifact fetch completions discarded.", &[])
+        }
+        "tui.artifact.delivered_total" => ("Artifact chunks delivered to visual adapters.", &[]),
+        "tui.artifact.delivered_bytes" => ("Artifact bytes delivered to visual adapters.", &[]),
+        "tui.artifact.retry_total" => ("Artifact range fetch retries scheduled.", &[]),
+        "tui.artifact.terminal_failure_total" => {
+            ("Artifact hydration failures that stopped retrying.", &[])
+        }
+        "tui.artifact.backlog" => (
+            "Artifact streams fetching or awaiting committed bytes.",
+            &[],
+        ),
+        "tui.plugin_visual.work" => (
+            "Bounded plugin visual work reported by an adapter.",
+            &["plugin_id", "diagnostic"],
+        ),
+        "tui.plugin_visual.duration_us" => (
+            "Plugin visual rendering or artifact-delivery duration.",
+            &["operation", "plugin_id", "schema"],
+        ),
+        "tui.telemetry.batch_total" => ("TUI telemetry batches offered for delivery.", &[]),
+        "tui.telemetry.batch_observations" => {
+            ("Observations aggregated into TUI telemetry batches.", &[])
+        }
+        "tui.telemetry.delivered_observations" => {
+            ("TUI telemetry observations accepted by the daemon.", &[])
+        }
+        "tui.telemetry.dropped_total" => {
+            ("Replaceable pending TUI telemetry batches dropped.", &[])
+        }
+        "tui.telemetry.failed_total" => ("TUI telemetry batch delivery failures.", &[]),
+        "tui.telemetry.failed_observations" => {
+            ("TUI telemetry observations in failed batches.", &[])
+        }
+        _ => return None,
+    };
+    Some(StaticMetricMetadata {
+        description,
+        label_keys,
+    })
+}
+
+fn tool_artifact_metric_metadata(name: &str) -> Option<StaticMetricMetadata> {
+    let (description, label_keys): (&str, &[&str]) = match name {
+        "tool.artifact_update.received_total" => (
+            "Raw artifact updates received before server coalescing.",
+            &["producer", "schema", "finalized"],
+        ),
+        "tool.artifact_update.committed_delta_bytes" => (
+            "Committed-byte growth between raw artifact updates.",
+            &["producer", "schema", "finalized"],
+        ),
+        "tool.artifact_update.interarrival_ms" => (
+            "Time between raw updates for one artifact.",
+            &["producer", "schema", "finalized"],
+        ),
+        "tool.artifact_update.coalesced_total" => (
+            "Pending artifact updates replaced before publication.",
+            &["producer", "schema", "finalized"],
+        ),
+        "tool.artifact_update.published_total" => (
+            "Artifact updates published after server coalescing.",
+            &["producer", "schema", "finalized"],
+        ),
+        "tool.artifact_update.publish_delay_ms" => (
+            "Delay from artifact update receipt to publication.",
+            &["producer", "schema", "finalized"],
+        ),
+        _ => return None,
+    };
+    Some(StaticMetricMetadata {
+        description,
+        label_keys,
+    })
+}
+
 fn infer_unit(key: &str) -> Option<String> {
     if key.ends_with("_ms") {
         Some("ms".to_owned())
@@ -2074,6 +2215,69 @@ mod tests {
             }],
         };
         assert!(too_many_labels.validate_for_namespace("tui.").is_err());
+    }
+
+    #[test]
+    fn tui_metric_descriptors_define_units_descriptions_and_bounded_labels() {
+        let events = vec![
+            MetricEvent {
+                unix_ms: 1,
+                name: "tui.frame.total_ms".to_owned(),
+                kind: MetricKind::Histogram,
+                value: 17,
+                labels: MetricLabels::new(),
+            },
+            MetricEvent {
+                unix_ms: 2,
+                name: "tui.plugin_visual.work".to_owned(),
+                kind: MetricKind::Counter,
+                value: 10,
+                labels: MetricLabels::from([
+                    ("plugin_id".to_owned(), "bcode.shell".to_owned()),
+                    ("diagnostic".to_owned(), "emulate_bytes".to_owned()),
+                ]),
+            },
+            MetricEvent {
+                unix_ms: 3,
+                name: "tool.artifact_update.received_total".to_owned(),
+                kind: MetricKind::Counter,
+                value: 1,
+                labels: MetricLabels::from([
+                    ("producer".to_owned(), "bcode.shell".to_owned()),
+                    ("schema".to_owned(), "bcode.shell.recording".to_owned()),
+                    ("finalized".to_owned(), "false".to_owned()),
+                ]),
+            },
+        ];
+        let descriptors = descriptors_from_events(&events);
+        let frame = &descriptors["tui.frame.total_ms"];
+        assert_eq!(frame.unit.as_deref(), Some("ms"));
+        assert_eq!(
+            frame.description.as_deref(),
+            Some("Total TUI frame duration.")
+        );
+        assert!(frame.label_keys.is_empty());
+        let plugin_work = &descriptors["tui.plugin_visual.work"];
+        assert_eq!(plugin_work.unit, None);
+        assert_eq!(
+            plugin_work.label_keys,
+            vec!["plugin_id".to_owned(), "diagnostic".to_owned()]
+        );
+        let artifact = &descriptors["tool.artifact_update.received_total"];
+        assert_eq!(artifact.unit.as_deref(), Some("count"));
+        assert_eq!(
+            artifact.label_keys,
+            vec![
+                "producer".to_owned(),
+                "schema".to_owned(),
+                "finalized".to_owned(),
+            ]
+        );
+        assert!(
+            descriptors
+                .values()
+                .all(|descriptor| descriptor.label_keys.len() <= MAX_CLIENT_METRIC_LABELS)
+        );
     }
 
     #[test]
