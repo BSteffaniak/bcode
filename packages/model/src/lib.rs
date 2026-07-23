@@ -1843,7 +1843,7 @@ pub enum ToolChoice {
 pub struct ToolCallRequestPolicy {
     /// Permit the provider to generate multiple independent tool calls in one response.
     #[serde(default)]
-    pub parallel: bool,
+    pub parallel: Option<bool>,
     /// Control whether or which tool the provider should call when supported.
     #[serde(default)]
     pub choice: ToolChoice,
@@ -1852,10 +1852,10 @@ pub struct ToolCallRequestPolicy {
 /// Capability inputs required before parallel tool calls may be advertised to a provider.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParallelToolCallCapabilities {
-    /// Provider transport advertises parallel tool-call support.
-    pub provider: bool,
-    /// Selected model advertises parallel tool-call support.
-    pub model: bool,
+    /// Provider transport support, or `None` when unknown.
+    pub provider: Option<bool>,
+    /// Selected model support, or `None` when unknown.
+    pub model: Option<bool>,
     /// Host runtime can safely authorize, schedule, cancel, and order a parallel tool batch.
     pub runtime: bool,
 }
@@ -1864,10 +1864,18 @@ impl ParallelToolCallCapabilities {
     /// Negotiate provider-visible policy from requested intent and all required capabilities.
     #[must_use]
     pub const fn negotiate(self, requested: bool, choice: ToolChoice) -> ToolCallRequestPolicy {
-        ToolCallRequestPolicy {
-            parallel: requested && self.provider && self.model && self.runtime,
-            choice,
-        }
+        let parallel = if !requested
+            || !self.runtime
+            || matches!(self.provider, Some(false))
+            || matches!(self.model, Some(false))
+        {
+            Some(false)
+        } else if matches!(self.provider, Some(true)) && matches!(self.model, Some(true)) {
+            Some(true)
+        } else {
+            None
+        };
+        ToolCallRequestPolicy { parallel, choice }
     }
 }
 
@@ -2503,7 +2511,7 @@ fn collect_output_and_tool_features(
     }
     if request.tools.is_empty()
         && matches!(request.tool_call_policy.choice, ToolChoice::Auto)
-        && !request.tool_call_policy.parallel
+        && request.tool_call_policy.parallel != Some(true)
     {
         return;
     }
@@ -2514,7 +2522,7 @@ fn collect_output_and_tool_features(
         ToolChoice::Tool { .. } => ToolChoiceMode::Named,
     };
     features.insert(RequestedModelFeature::ToolChoice(mode));
-    if request.tool_call_policy.parallel {
+    if request.tool_call_policy.parallel == Some(true) {
         features.insert(RequestedModelFeature::ToolChoice(ToolChoiceMode::Parallel));
     }
 }
@@ -3008,7 +3016,7 @@ mod tests {
     #[test]
     fn typed_tool_call_policy_round_trips_parallel_intent() {
         let policy = ToolCallRequestPolicy {
-            parallel: true,
+            parallel: Some(true),
             ..ToolCallRequestPolicy::default()
         };
         let encoded = serde_json::to_value(&policy).expect("policy should encode");
@@ -3019,21 +3027,24 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_policy_requires_intent_provider_model_and_runtime() {
+    fn parallel_tool_policy_preserves_supported_disabled_and_unknown_states() {
         let ready = ParallelToolCallCapabilities {
-            provider: true,
-            model: true,
+            provider: Some(true),
+            model: Some(true),
             runtime: true,
         };
-        assert!(ready.negotiate(true, ToolChoice::Auto).parallel);
-        assert!(!ready.negotiate(false, ToolChoice::Auto).parallel);
+        assert_eq!(ready.negotiate(true, ToolChoice::Auto).parallel, Some(true));
+        assert_eq!(
+            ready.negotiate(false, ToolChoice::Auto).parallel,
+            Some(false)
+        );
         for capabilities in [
             ParallelToolCallCapabilities {
-                provider: false,
+                provider: Some(false),
                 ..ready
             },
             ParallelToolCallCapabilities {
-                model: false,
+                model: Some(false),
                 ..ready
             },
             ParallelToolCallCapabilities {
@@ -3041,7 +3052,25 @@ mod tests {
                 ..ready
             },
         ] {
-            assert!(!capabilities.negotiate(true, ToolChoice::Auto).parallel);
+            assert_eq!(
+                capabilities.negotiate(true, ToolChoice::Auto).parallel,
+                Some(false)
+            );
+        }
+        for capabilities in [
+            ParallelToolCallCapabilities {
+                provider: None,
+                ..ready
+            },
+            ParallelToolCallCapabilities {
+                model: None,
+                ..ready
+            },
+        ] {
+            assert_eq!(
+                capabilities.negotiate(true, ToolChoice::Auto).parallel,
+                None
+            );
         }
     }
 

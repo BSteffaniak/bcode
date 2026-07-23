@@ -1677,6 +1677,7 @@ impl AgentRuntime {
     ///
     /// Returns an error under the same conditions as [`Self::run_provider_tool_loop`].
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     pub async fn run_provider_tool_loop_in_scope<P, C, A, I, O, R>(
         &self,
         provider: &mut P,
@@ -1700,7 +1701,9 @@ impl AgentRuntime {
         R: ProviderRoundPlanner + ?Sized,
     {
         validate_tool_host_context(host_context)?;
-        request.tool_call_policy.parallel &= options.parallel;
+        if !options.parallel {
+            request.tool_call_policy.parallel = Some(false);
+        }
         let negotiated_parallel_policy = request.tool_call_policy.parallel;
         let mut rounds = ToolRoundState::new(request.max_tool_rounds);
         let turn_cancellation = request.cancellation.clone();
@@ -2761,7 +2764,7 @@ async fn run_planned_provider_round<P, R>(
     turn_cancellation: &CancellationToken,
     started: Instant,
     timeout: Duration,
-    negotiated_parallel_policy: bool,
+    negotiated_parallel_policy: Option<bool>,
     scope: &TurnScope,
 ) -> Result<PlannedProviderRound>
 where
@@ -4521,8 +4524,9 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 1);
-        assert!(
-            !requests[0].tool_call_policy.parallel,
+        assert_eq!(
+            requests[0].tool_call_policy.parallel,
+            Some(false),
             "scheduler support must not upgrade unsupported provider/model capability"
         );
         drop(requests);
@@ -4538,7 +4542,7 @@ mod tests {
             Arc::clone(&requests),
         );
         let mut request = AgentTurnRequest::new("model", "no tools");
-        request.tool_call_policy.parallel = true;
+        request.tool_call_policy.parallel = Some(true);
 
         AgentRuntime::new()
             .run_provider_tool_loop(
@@ -4562,7 +4566,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].tool_call_policy.parallel);
+        assert_eq!(requests[0].tool_call_policy.parallel, Some(true));
         drop(requests);
     }
 
@@ -4576,7 +4580,7 @@ mod tests {
             Arc::clone(&requests),
         );
         let mut request = AgentTurnRequest::new("model", "no tools");
-        request.tool_call_policy.parallel = true;
+        request.tool_call_policy.parallel = Some(true);
 
         AgentRuntime::new()
             .run_provider_tool_loop(
@@ -4603,7 +4607,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 1);
-        assert!(!requests[0].tool_call_policy.parallel);
+        assert_eq!(requests[0].tool_call_policy.parallel, Some(false));
         drop(requests);
     }
 

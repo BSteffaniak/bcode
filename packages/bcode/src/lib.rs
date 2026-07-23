@@ -3998,10 +3998,15 @@ impl ProviderRegistry {
         selector: &ModelSelector,
     ) -> bcode_model::ParallelToolCallCapabilities {
         let feature = RequestedModelFeature::ToolChoice(ToolChoiceMode::Parallel);
-        let guaranteed = self.feature_support(selector, feature).is_guaranteed();
+        let support = self.feature_support(selector, feature);
+        let supported = match support {
+            NegotiatedFeatureSupport::Guaranteed { .. } => Some(true),
+            NegotiatedFeatureSupport::Unsupported { .. } => Some(false),
+            NegotiatedFeatureSupport::Unknown { .. } => None,
+        };
         bcode_model::ParallelToolCallCapabilities {
-            provider: guaranteed,
-            model: guaranteed,
+            provider: supported,
+            model: supported,
             runtime: true,
         }
     }
@@ -6923,7 +6928,7 @@ impl Agent {
     {
         let mut request = request;
         request.tool_call_policy = self.parallel_tool_capabilities.negotiate(
-            request.tool_call_policy.parallel,
+            request.tool_call_policy.parallel.unwrap_or(true),
             request.tool_call_policy.choice.clone(),
         );
         #[cfg(feature = "embedded-plugins")]
@@ -7408,7 +7413,7 @@ impl AgentBuilder {
         self.selection_provenance.model = Some(ModelSelectionSource::PerRequest);
         self.model_metadata_source = None;
         self.model_pricing = None;
-        self.parallel_tool_capabilities.model = false;
+        self.parallel_tool_capabilities.model = None;
         self
     }
 
@@ -7435,8 +7440,8 @@ impl AgentBuilder {
             self.selection_provenance.provider = Some(ModelSelectionSource::PerRequest);
         }
         self.registration_source = None;
-        self.parallel_tool_capabilities.provider = false;
-        self.parallel_tool_capabilities.model = false;
+        self.parallel_tool_capabilities.provider = None;
+        self.parallel_tool_capabilities.model = None;
         self
     }
 
@@ -7448,8 +7453,8 @@ impl AgentBuilder {
         self.registration_source = None;
         self.model_metadata_source = None;
         self.model_pricing = None;
-        self.parallel_tool_capabilities.provider = false;
-        self.parallel_tool_capabilities.model = false;
+        self.parallel_tool_capabilities.provider = None;
+        self.parallel_tool_capabilities.model = None;
         self
     }
 

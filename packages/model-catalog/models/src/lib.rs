@@ -379,8 +379,8 @@ pub struct CatalogCapabilities {
     #[serde(default)]
     pub tool_use: bool,
     /// Supports multiple independent tool calls in one model response.
-    #[serde(default)]
-    pub parallel_tool_calls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     /// Supports structured output controls.
     #[serde(default)]
     pub structured_outputs: bool,

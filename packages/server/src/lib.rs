@@ -14156,18 +14156,22 @@ async fn resolve_parallel_tool_call_capabilities(
     });
     let feature =
         bcode_model::RequestedModelFeature::ToolChoice(bcode_model::ToolChoiceMode::Parallel);
-    let guaranteed = provider
+    let support = provider
         .as_ref()
         .zip(model.as_ref())
-        .is_some_and(|(provider, model)| {
+        .map(|(provider, model)| {
             provider
                 .feature_support
                 .negotiate(&model.feature_support, feature)
-                .is_guaranteed()
         });
+    let supported = match support {
+        Some(bcode_model::NegotiatedFeatureSupport::Guaranteed { .. }) => Some(true),
+        Some(bcode_model::NegotiatedFeatureSupport::Unsupported { .. }) => Some(false),
+        Some(bcode_model::NegotiatedFeatureSupport::Unknown { .. }) | None => None,
+    };
     bcode_model::ParallelToolCallCapabilities {
-        provider: guaranteed,
-        model: guaranteed,
+        provider: supported,
+        model: supported,
         runtime,
     }
 }
@@ -20639,7 +20643,7 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn server_parallel_policy_requires_intent_provider_model_and_runtime_support() {
+    async fn server_parallel_policy_preserves_supported_disabled_and_unknown_states() {
         let state = test_server_state_with_fake_provider(SessionManager::default());
         let supported = resolve_parallel_tool_call_capabilities(
             &state,
@@ -20649,18 +20653,20 @@ library = "test"
             true,
         )
         .await;
-        assert!(supported.provider);
-        assert!(supported.model);
+        assert_eq!(supported.provider, Some(true));
+        assert_eq!(supported.model, Some(true));
         assert!(supported.runtime);
-        assert!(
+        assert_eq!(
             supported
                 .negotiate(true, bcode_model::ToolChoice::Auto)
-                .parallel
+                .parallel,
+            Some(true)
         );
-        assert!(
-            !supported
+        assert_eq!(
+            supported
                 .negotiate(false, bcode_model::ToolChoice::Auto)
-                .parallel
+                .parallel,
+            Some(false)
         );
 
         let without_runtime = resolve_parallel_tool_call_capabilities(
@@ -20671,13 +20677,14 @@ library = "test"
             false,
         )
         .await;
-        assert!(without_runtime.provider);
-        assert!(without_runtime.model);
+        assert_eq!(without_runtime.provider, Some(true));
+        assert_eq!(without_runtime.model, Some(true));
         assert!(!without_runtime.runtime);
-        assert!(
-            !without_runtime
+        assert_eq!(
+            without_runtime
                 .negotiate(true, bcode_model::ToolChoice::Auto)
-                .parallel
+                .parallel,
+            Some(false)
         );
 
         let unknown_model = resolve_parallel_tool_call_capabilities(
@@ -20688,13 +20695,14 @@ library = "test"
             true,
         )
         .await;
-        assert!(!unknown_model.provider);
-        assert!(!unknown_model.model);
+        assert_eq!(unknown_model.provider, None);
+        assert_eq!(unknown_model.model, None);
         assert!(unknown_model.runtime);
-        assert!(
-            !unknown_model
+        assert_eq!(
+            unknown_model
                 .negotiate(true, bcode_model::ToolChoice::Auto)
-                .parallel
+                .parallel,
+            None
         );
 
         let without_provider = resolve_parallel_tool_call_capabilities(
@@ -20705,11 +20713,12 @@ library = "test"
             true,
         )
         .await;
-        assert!(!without_provider.provider);
-        assert!(
-            !without_provider
+        assert_eq!(without_provider.provider, None);
+        assert_eq!(
+            without_provider
                 .negotiate(true, bcode_model::ToolChoice::Auto)
-                .parallel
+                .parallel,
+            None
         );
     }
 

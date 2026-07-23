@@ -412,7 +412,7 @@ if rg -n 'tool_call_policy\.parallel = options\.parallel|tool_call_policy\.paral
   echo "Runtime architecture violation: canonical runtime upgrades negotiated provider parallel capability from scheduler configuration." >&2
   violations=1
 fi
-if ! rg -n 'tool_call_policy\.parallel &= options\.parallel' packages/agent-runtime/src/lib.rs >/dev/null; then
+if ! rg -U 'if !options\.parallel \{\s*request\.tool_call_policy\.parallel = Some\(false\);' packages/agent-runtime/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: canonical runtime lost sequential fallback for negotiated parallel policy." >&2
   violations=1
 fi
@@ -641,12 +641,12 @@ if ! grep -F 'RuntimePhaseDuration::start("preparation", Some(provider_round))' 
 fi
 
 if ! grep -F 'pub struct ParallelToolCallCapabilities' packages/model/src/lib.rs >/dev/null ||
-   ! grep -F 'requested && self.provider && self.model && self.runtime' packages/model/src/lib.rs >/dev/null ||
-   ! grep -F 'parallel_tool_policy_requires_intent_provider_model_and_runtime' packages/model/src/lib.rs >/dev/null ||
+   ! grep -F 'matches!(self.provider, Some(true)) && matches!(self.model, Some(true))' packages/model/src/lib.rs >/dev/null ||
+   ! grep -F 'parallel_tool_policy_preserves_supported_disabled_and_unknown_states' packages/model/src/lib.rs >/dev/null ||
    ! grep -F 'provider_registry_negotiates_parallel_only_when_provider_and_model_support_it' packages/bcode/tests/provider_defaults.rs >/dev/null ||
    ! grep -F 'sdk_parallel_signal_falls_back_when_one_capability_is_missing' packages/bcode/tests/provider_tool_loop.rs >/dev/null ||
    ! grep -F 'changing_model_after_capability_resolution_invalidates_parallel_signal' packages/bcode/tests/provider_tool_loop.rs >/dev/null ||
-   ! grep -F 'server_parallel_policy_requires_intent_provider_model_and_runtime_support' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'server_parallel_policy_preserves_supported_disabled_and_unknown_states' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'unknown_model_is_not_upgraded_to_parallel_tool_calls' packages/model-catalog/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: parallel tool-call capability negotiation was weakened." >&2
   violations=1
@@ -659,7 +659,7 @@ if rg -n 'tool_call_policy: bcode_model::ToolCallRequestPolicy \{[[:space:]]*$' 
   violations=1
 fi
 
-if ! grep -F 'parallel_tool_calls: bool' packages/model-catalog/models/src/lib.rs >/dev/null ||
+if ! grep -F 'parallel_tool_calls: Option<bool>' packages/model-catalog/models/src/lib.rs >/dev/null ||
    ! grep -F 'ModelCapability::ParallelToolCalls' packages/model-catalog/src/lib.rs >/dev/null ||
    ! grep -F 'ProviderCapability::ParallelToolCalls' plugins/fake-provider-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'ProviderCapability::ParallelToolCalls' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null ||

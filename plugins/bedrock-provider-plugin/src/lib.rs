@@ -289,7 +289,7 @@ fn validate_bedrock_request(request: &ModelTurnRequest) -> Result<(), ProviderEr
             "Bedrock reasoning controls are not supported by this provider adapter",
         ));
     }
-    if request.tool_call_policy.parallel {
+    if request.tool_call_policy.parallel == Some(true) {
         return Err(provider_error(
             "bedrock_parallel_tool_policy_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
@@ -2869,7 +2869,7 @@ mod tests {
                 return;
             }
             if matches!(request.tool_call_policy.choice, ToolChoice::Required) {
-                let tool_count = if request.tool_call_policy.parallel {
+                let tool_count = if request.tool_call_policy.parallel == Some(true) {
                     request.tools.len()
                 } else {
                     1
@@ -3317,7 +3317,7 @@ mod tests {
         assert_eq!(error.code, "bedrock_reasoning_controls_unsupported");
 
         request.parameters = bcode_model::ModelParameters::default();
-        request.tool_call_policy.parallel = true;
+        request.tool_call_policy.parallel = Some(true);
         let error = validate_bedrock_request(&request).expect_err("parallel policy must fail");
         assert_eq!(error.code, "bedrock_parallel_tool_policy_unsupported");
     }

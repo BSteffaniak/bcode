@@ -221,7 +221,7 @@ fn capabilities_from_modalities<'a>(
         // This discovery module only consumes `/v1/language-models`, so every model represented
         // here belongs to that documented API surface.
         tool_use: true,
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,
@@ -238,7 +238,7 @@ mod tests {
         let capabilities = capabilities_from_modalities(["text"].into_iter(), ["text"].into_iter());
 
         assert!(capabilities.tool_use);
-        assert!(capabilities.parallel_tool_calls);
+        assert_eq!(capabilities.parallel_tool_calls, Some(true));
     }
 
     #[test]
@@ -246,6 +246,6 @@ mod tests {
         let capabilities = capabilities_from_modalities(std::iter::empty(), std::iter::empty());
 
         assert!(capabilities.tool_use);
-        assert!(capabilities.parallel_tool_calls);
+        assert_eq!(capabilities.parallel_tool_calls, Some(true));
     }
 }

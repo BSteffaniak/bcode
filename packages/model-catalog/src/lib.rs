@@ -5,9 +5,9 @@
 //! Model catalog loading, validation, and static artifact generation.
 
 use bcode_model::{
-    ModelCacheCapability, ModelCacheInfo, ModelCapability, ModelInfo, ModelMetadataSource,
-    ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelReasoningCapabilitySource,
-    ModelReasoningInfo, ModelTokenPrice,
+    CapabilitySource, CapabilitySupport, ModelCacheCapability, ModelCacheInfo, ModelCapability,
+    ModelInfo, ModelMetadataSource, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
+    ModelReasoningCapabilitySource, ModelReasoningInfo, ModelTokenPrice, ToolChoiceMode,
 };
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
@@ -856,6 +856,11 @@ fn enrich_from_defaults(mut model: ModelInfo, defaults: &ModelCatalogDefaults) -
     model
         .capabilities
         .extend(capabilities_from_catalog(&defaults.capabilities));
+    apply_parallel_tool_feature_support(
+        &mut model,
+        defaults.capabilities.parallel_tool_calls,
+        CapabilitySource::BundledCatalog,
+    );
     if model.cache.capabilities.is_empty() {
         model.cache = cache_info_from_catalog(&defaults.capabilities);
     }
@@ -884,6 +889,15 @@ fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelIn
     model
         .capabilities
         .extend(capabilities_from_catalog(&entry.capabilities));
+    apply_parallel_tool_feature_support(
+        &mut model,
+        entry.capabilities.parallel_tool_calls,
+        if remote {
+            CapabilitySource::ProviderApi
+        } else {
+            CapabilitySource::BundledCatalog
+        },
+    );
     if model.cache.capabilities.is_empty() {
         model.cache = cache_info_from_catalog(&entry.capabilities);
     }
@@ -918,7 +932,14 @@ fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
         context_window: entry.context_window,
         max_output_tokens: entry.max_output_tokens,
         capabilities: capabilities_from_catalog(&entry.capabilities),
-        feature_support: bcode_model::ModelFeatureSupport::default(),
+        feature_support: feature_support_from_catalog(
+            &entry.capabilities,
+            if entry_is_remote(entry) {
+                CapabilitySource::ProviderApi
+            } else {
+                CapabilitySource::BundledCatalog
+            },
+        ),
         reasoning: reasoning_from_catalog(entry),
         cache: cache_info_from_catalog(&entry.capabilities),
         metadata_source: Some(if entry_is_remote(entry) {
@@ -937,6 +958,50 @@ fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
     model
 }
 
+fn feature_support_from_catalog(
+    capabilities: &CatalogCapabilities,
+    source: CapabilitySource,
+) -> bcode_model::ModelFeatureSupport {
+    let mut support = bcode_model::ModelFeatureSupport::default();
+    if let Some(parallel) = capabilities.parallel_tool_calls {
+        support.tool_choice.insert(
+            ToolChoiceMode::Parallel,
+            if parallel {
+                CapabilitySupport::Supported { source }
+            } else {
+                CapabilitySupport::Unsupported {
+                    source,
+                    reason: "model catalog explicitly marks parallel tool calls unsupported"
+                        .to_string(),
+                }
+            },
+        );
+    }
+    support
+}
+
+fn apply_parallel_tool_feature_support(
+    model: &mut ModelInfo,
+    parallel: Option<bool>,
+    source: CapabilitySource,
+) {
+    let Some(parallel) = parallel else {
+        return;
+    };
+    model.feature_support.tool_choice.insert(
+        ToolChoiceMode::Parallel,
+        if parallel {
+            CapabilitySupport::Supported { source }
+        } else {
+            CapabilitySupport::Unsupported {
+                source,
+                reason: "model catalog explicitly marks parallel tool calls unsupported"
+                    .to_string(),
+            }
+        },
+    );
+}
+
 fn capabilities_from_catalog(
     capabilities: &CatalogCapabilities,
 ) -> std::collections::BTreeSet<ModelCapability> {
@@ -947,7 +1012,7 @@ fn capabilities_from_catalog(
     if capabilities.tool_use {
         result.insert(ModelCapability::ToolCalls);
     }
-    if capabilities.parallel_tool_calls {
+    if capabilities.parallel_tool_calls == Some(true) {
         result.insert(ModelCapability::ParallelToolCalls);
     }
     if capabilities.prompt_cache {
@@ -1370,7 +1435,10 @@ pub(crate) const fn merge_capabilities(
         image_input: left.image_input || right.image_input,
         text_output: left.text_output || right.text_output,
         tool_use: left.tool_use || right.tool_use,
-        parallel_tool_calls: left.parallel_tool_calls || right.parallel_tool_calls,
+        parallel_tool_calls: match right.parallel_tool_calls {
+            Some(value) => Some(value),
+            None => left.parallel_tool_calls,
+        },
         structured_outputs: left.structured_outputs || right.structured_outputs,
         reasoning: left.reasoning || right.reasoning,
         prompt_cache: left.prompt_cache || right.prompt_cache,
@@ -1588,6 +1656,15 @@ mod tests {
                 .capabilities
                 .contains(&ModelCapability::ParallelToolCalls)
         );
+        assert_eq!(
+            enriched
+                .feature_support
+                .tool_choice
+                .get(&ToolChoiceMode::Parallel),
+            Some(&CapabilitySupport::Supported {
+                source: CapabilitySource::BundledCatalog,
+            })
+        );
     }
 
     #[test]
@@ -1613,6 +1690,13 @@ mod tests {
             !enriched
                 .capabilities
                 .contains(&ModelCapability::ParallelToolCalls)
+        );
+        assert_eq!(
+            enriched
+                .feature_support
+                .tool_choice
+                .get(&ToolChoiceMode::Parallel),
+            None
         );
     }
 

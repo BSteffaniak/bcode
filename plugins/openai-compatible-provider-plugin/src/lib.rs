@@ -2867,7 +2867,9 @@ fn validate_openai_request(
             "stop sequences are not supported by this Responses API adapter",
         ));
     }
-    if request.tool_call_policy.parallel && !settings.dialect.supports_parallel_tool_policy() {
+    if request.tool_call_policy.parallel == Some(true)
+        && !settings.dialect.supports_parallel_tool_policy()
+    {
         return Err(provider_error(
             "parallel_tool_policy_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
@@ -3152,8 +3154,11 @@ fn build_chat_completion_request(
         }),
         tools: model_tools_to_chat_tools(request, settings.dialect)?,
         tool_choice: openai_tool_choice(request, false),
-        parallel_tool_calls: (!request.tools.is_empty())
-            .then_some(request.tool_call_policy.parallel),
+        parallel_tool_calls: if request.tools.is_empty() {
+            None
+        } else {
+            request.tool_call_policy.parallel
+        },
         response_format: chat_response_format(request),
         temperature: request.parameters.temperature,
         max_tokens: request.parameters.max_output_tokens,
@@ -4025,9 +4030,13 @@ fn build_responses_request(
         .collect(),
         tools: model_tools_to_responses_tools(request, settings.dialect)?,
         tool_choice: openai_tool_choice(request, true),
-        parallel_tool_calls: (!request.tools.is_empty()
-            && settings.dialect.supports_parallel_tool_policy())
-        .then_some(request.tool_call_policy.parallel),
+        parallel_tool_calls: if !request.tools.is_empty()
+            && settings.dialect.supports_parallel_tool_policy()
+        {
+            request.tool_call_policy.parallel
+        } else {
+            None
+        },
         text: responses_text_options(settings, request),
         reasoning: responses_reasoning_options(settings, request),
         include: responses_include(settings.dialect.reasoning_request_shape(), request),
@@ -7583,7 +7592,7 @@ mod tests {
     fn responses_request_projects_typed_openai_extension() {
         let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
         let mut request = test_request(Vec::new());
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         request
             .provider_context
             .set_extension(&OpenAiResponsesRequestOptions {
@@ -7607,7 +7616,7 @@ mod tests {
     fn typed_openai_extension_rejects_malformed_payload() {
         let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
         let mut request = test_request(Vec::new());
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         request.provider_context.request.insert(
             format!("bcode.extension/{PROVIDER_ID}"),
             bcode_model::ProviderRequestValue::String("not-an-object".to_string()),
@@ -7625,7 +7634,7 @@ mod tests {
             OpenAiCompatibleDialect::ChatCompletions,
         );
         let mut request = test_request(Vec::new());
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         request
             .provider_context
             .set_extension(&OpenAiResponsesRequestOptions::default())
@@ -7651,7 +7660,7 @@ mod tests {
             OpenAiCompatibleDialect::ChatCompletions,
         );
         let mut request = test_request(Vec::new());
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         request.parameters.reasoning_budget_tokens = Some(128);
         let error = validate_openai_request(&chat, &request).expect_err("budget must fail");
         assert_eq!(error.code, "reasoning_budget_unsupported");
@@ -7695,7 +7704,7 @@ mod tests {
             }],
         };
         let mut request = test_request(vec![message.clone()]);
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
 
         for settings in [
             test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi),
@@ -7727,7 +7736,7 @@ mod tests {
     #[test]
     fn openai_preflight_negotiates_reuse_by_dialect() {
         let mut request = test_request(Vec::new());
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Auto;
 
         let chat = test_settings(
@@ -7750,7 +7759,7 @@ mod tests {
     fn openai_preflight_validates_reuse_and_tool_choice() {
         let responses = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
         let mut request = test_request(Vec::new());
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         request.conversation_reuse.previous_provider_response_id = Some("response".to_string());
         let error = validate_openai_request(&responses, &request).expect_err("disabled reuse");
         assert_eq!(error.code, "conversation_reuse_disabled");
@@ -8095,7 +8104,7 @@ mod tests {
             messages,
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy {
-                parallel: true,
+                parallel: Some(true),
                 ..bcode_model::ToolCallRequestPolicy::default()
             },
             structured_output: None,
@@ -8918,7 +8927,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         }];
         request.tool_call_policy = bcode_model::ToolCallRequestPolicy {
-            parallel: true,
+            parallel: Some(true),
             choice: bcode_model::ToolChoice::Required,
         };
 
@@ -8926,7 +8935,7 @@ mod tests {
             openai_tool_choice(&request, false),
             Some(serde_json::Value::String("required".to_string()))
         );
-        assert!(request.tool_call_policy.parallel);
+        assert_eq!(request.tool_call_policy.parallel, Some(true));
     }
 
     #[test]
@@ -8963,7 +8972,7 @@ mod tests {
             description: "Lookup data".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         let settings = test_settings(
             test_api_key_auth(),
             OpenAiCompatibleDialect::ChatCompletions,
@@ -8980,6 +8989,29 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn chat_completions_request_omits_unknown_parallel_policy() {
+        let mut request = test_request(Vec::new());
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "lookup".to_string(),
+            description: "Lookup data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.tool_call_policy.parallel = None;
+        let settings = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+
+        let body = serde_json::to_value(
+            build_chat_completion_request(&settings, &request, "model")
+                .expect("request should build"),
+        )
+        .expect("request should encode");
+
+        assert!(body.get("parallel_tool_calls").is_none());
     }
 
     #[test]
@@ -9145,7 +9177,7 @@ mod tests {
     #[test]
     fn responses_api_request_disables_parallel_calls_when_typed_policy_is_false() {
         let mut request = test_request_with_tool(vec![text_message(MessageRole::User, "hello")]);
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
 
         let body =
@@ -9176,7 +9208,7 @@ mod tests {
     #[test]
     fn chatgpt_codex_request_disables_parallel_calls_when_typed_policy_is_false() {
         let mut request = test_request_with_tool(vec![text_message(MessageRole::User, "hello")]);
-        request.tool_call_policy.parallel = false;
+        request.tool_call_policy.parallel = Some(false);
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
 
         let body =

@@ -206,8 +206,8 @@ fn agent_builder(invoker: Arc<ParallelInvoker>) -> bcode::AgentBuilder {
             ..bcode::ToolExecutionOptions::default()
         })
         .parallel_tool_capabilities(bcode_model::ParallelToolCallCapabilities {
-            provider: true,
-            model: true,
+            provider: Some(true),
+            model: Some(true),
             runtime: true,
         })
         .inline_tool(definition("first"), |_| {
@@ -246,7 +246,7 @@ impl ProviderRoundPlanner for SdkPlanner {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let mut request = context.proposed_request.clone();
-            request.tool_call_policy.parallel = false;
+            request.tool_call_policy.parallel = Some(false);
             request
                 .metadata
                 .insert("sdk_planner".to_string(), context.round.to_string());
@@ -276,7 +276,7 @@ async fn sdk_builder_routes_provider_round_planner_through_canonical_loop() {
     assert!(
         requests
             .iter()
-            .all(|request| request.tool_call_policy.parallel),
+            .all(|request| request.tool_call_policy.parallel == Some(true)),
         "host planner must not override scheduler-owned provider parallel intent"
     );
     assert_eq!(
@@ -305,7 +305,7 @@ async fn changing_model_after_capability_resolution_invalidates_parallel_signal(
             .lock()
             .expect("provider requests lock")
             .iter()
-            .all(|request| !request.tool_call_policy.parallel)
+            .all(|request| request.tool_call_policy.parallel == Some(false))
     );
 }
 
@@ -316,8 +316,8 @@ async fn sdk_parallel_signal_falls_back_when_one_capability_is_missing() {
     let (invoker, _) = invoker();
     let agent = agent_builder(invoker)
         .parallel_tool_capabilities(bcode_model::ParallelToolCallCapabilities {
-            provider: true,
-            model: false,
+            provider: Some(true),
+            model: Some(false),
             runtime: true,
         })
         .build();
@@ -331,7 +331,7 @@ async fn sdk_parallel_signal_falls_back_when_one_capability_is_missing() {
             .lock()
             .expect("provider requests lock")
             .iter()
-            .all(|request| !request.tool_call_policy.parallel)
+            .all(|request| request.tool_call_policy.parallel == Some(false))
     );
 }
 
@@ -362,7 +362,7 @@ async fn high_level_run_executes_provider_batch_once_and_returns_results_in_prov
     assert!(
         requests
             .iter()
-            .all(|request| request.tool_call_policy.parallel),
+            .all(|request| request.tool_call_policy.parallel == Some(true)),
         "canonical scheduler parallel intent must reach every provider continuation"
     );
     let feedback = &requests[1].messages;

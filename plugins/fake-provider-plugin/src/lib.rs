@@ -733,7 +733,7 @@ fn fake_tool_call_count(request: &ModelTurnRequest) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_else(|| {
             usize::from(
-                request.tool_call_policy.parallel
+                request.tool_call_policy.parallel == Some(true)
                     && request.tools.len() > 1
                     && matches!(request.tool_call_policy.choice, ToolChoice::Required),
             ) * request.tools.len()
@@ -741,17 +741,20 @@ fn fake_tool_call_count(request: &ModelTurnRequest) -> usize {
 }
 
 fn validate_fake_parallel_tool_policy(request: &ModelTurnRequest) -> Option<ServiceResponse> {
-    FAKE_LAST_PARALLEL_TOOL_POLICY.store(request.tool_call_policy.parallel, Ordering::Release);
+    FAKE_LAST_PARALLEL_TOOL_POLICY.store(
+        request.tool_call_policy.parallel == Some(true),
+        Ordering::Release,
+    );
     let expected = request
         .provider_context
         .settings
         .get("fake_expected_parallel_tool_policy")
         .and_then(|value| value.parse::<bool>().ok())?;
-    (request.tool_call_policy.parallel != expected).then(|| {
+    (request.tool_call_policy.parallel != Some(expected)).then(|| {
         ServiceResponse::error(
             "unexpected_parallel_tool_policy",
             format!(
-                "expected parallel tool policy {expected}, received {}",
+                "expected parallel tool policy {expected}, received {:?}",
                 request.tool_call_policy.parallel
             ),
         )

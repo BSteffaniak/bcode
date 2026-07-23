@@ -598,7 +598,7 @@ where
         }),
     });
     request.tool_call_policy = ToolCallRequestPolicy {
-        parallel: false,
+        parallel: Some(false),
         choice: ToolChoice::Required,
     };
     let summary = run_turn(invoker, options, TOOL_CALLING, &request, false)?;
@@ -608,7 +608,7 @@ where
             "advertised tool support did not produce a completed required tool call",
         );
     }
-    if !request.tool_call_policy.parallel && summary.tool_calls.len() != 1 {
+    if request.tool_call_policy.parallel != Some(true) && summary.tool_calls.len() != 1 {
         return violation(
             TOOL_CALLING,
             "provider emitted multiple tool calls while parallel tool calls were disabled",
@@ -652,7 +652,7 @@ where
         })
         .collect();
     request.tool_call_policy = ToolCallRequestPolicy {
-        parallel: true,
+        parallel: Some(true),
         choice: ToolChoice::Required,
     };
     let summary = run_turn(invoker, options, PARALLEL_TOOL_CALLING, &request, false)?;
@@ -695,7 +695,7 @@ where
 {
     request.turn_id.push_str("-continuation");
     request.tool_call_policy = ToolCallRequestPolicy {
-        parallel: false,
+        parallel: Some(false),
         choice: ToolChoice::None,
     };
     request.messages.push(ModelMessage {
