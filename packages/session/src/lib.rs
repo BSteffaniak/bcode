@@ -64,13 +64,7 @@ use tokio::task::spawn_blocking;
 /// Return the stable kind name when a session event is live-only and must not be persisted.
 const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'static str> {
     match kind {
-        SessionEventKind::ToolInvocationStream {
-            event:
-                bcode_session_models::ToolInvocationStreamEvent::OutputDelta { .. }
-                | bcode_session_models::ToolInvocationStreamEvent::VisualUpdate { .. }
-                | bcode_session_models::ToolInvocationStreamEvent::ArtifactUpdate { .. }
-                | bcode_session_models::ToolInvocationStreamEvent::LegacyPresentation { .. },
-        } => Some("tool_invocation_stream"),
+        SessionEventKind::ToolInvocationStream { .. } => Some("tool_invocation_stream"),
         SessionEventKind::ToolContribution { event }
             if matches!(
                 event.persistence,
@@ -100,10 +94,7 @@ fn ensure_durable_session_event_kind(
         }
         return Err(SessionError::LiveEventPersistenceRejected { event_kind });
     }
-    if matches!(
-        kind,
-        SessionEventKind::ToolInvocationStream { .. } | SessionEventKind::ToolContribution { .. }
-    ) {
+    if matches!(kind, SessionEventKind::ToolContribution { .. }) {
         let payload_bytes = serde_json::to_vec(kind)
             .map_err(|error| SessionError::EventSerialization(error.to_string()))?
             .len();
@@ -116,7 +107,7 @@ fn ensure_durable_session_event_kind(
                 );
             }
             return Err(SessionError::DurableEventPayloadTooLarge {
-                event_kind: "tool_invocation_stream",
+                event_kind: "tool_contribution",
                 payload_bytes,
                 max_bytes: MAX_DURABLE_GENERIC_EVENT_BYTES,
             });
@@ -4814,32 +4805,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_tool_stream_payload_limit_rejects_oversized_status_only() {
+    async fn durable_boundary_rejects_tool_stream_status_regardless_of_payload_size() {
         let manager = SessionManager::default();
         let session = manager
-            .create_session(Some("payload-limit".to_owned()), test_working_directory())
+            .create_session(Some("stream-boundary".to_owned()), test_working_directory())
             .await
             .expect("session should create");
-        let error = manager
-            .append_event(
-                session.id,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::Status {
-                        tool_call_id: "call".to_owned(),
-                        sequence: 1,
-                        message: "x".repeat(MAX_DURABLE_GENERIC_EVENT_BYTES),
+        for message in [
+            "status".to_owned(),
+            "x".repeat(MAX_DURABLE_GENERIC_EVENT_BYTES),
+        ] {
+            let error = manager
+                .append_event(
+                    session.id,
+                    SessionEventKind::ToolInvocationStream {
+                        event: ToolInvocationStreamEvent::Status {
+                            tool_call_id: "call".to_owned(),
+                            sequence: 1,
+                            message,
+                        },
                     },
-                },
-            )
-            .await
-            .expect_err("oversized status must be rejected");
-        assert!(matches!(
-            error,
-            SessionError::DurableEventPayloadTooLarge {
-                event_kind: "tool_invocation_stream",
-                ..
-            }
-        ));
+                )
+                .await
+                .expect_err("tool stream status must remain live-only");
+            assert!(matches!(
+                error,
+                SessionError::LiveEventPersistenceRejected {
+                    event_kind: "tool_invocation_stream"
+                }
+            ));
+        }
 
         let large_semantic_message = "y".repeat(MAX_DURABLE_GENERIC_EVENT_BYTES + 1);
         manager
@@ -4919,6 +4914,26 @@ mod tests {
                         sections: Vec::new(),
                     },
                 ),
+            },
+            ToolInvocationStreamEvent::Status {
+                tool_call_id: "call".to_owned(),
+                sequence: 5,
+                message: "legacy status".to_owned(),
+            },
+            ToolInvocationStreamEvent::Started {
+                tool_call_id: "call".to_owned(),
+                tool_name: "fixture.tool".to_owned(),
+                sequence: 6,
+                terminal: false,
+                columns: None,
+                rows: None,
+                started_at_ms: None,
+            },
+            ToolInvocationStreamEvent::Finished {
+                tool_call_id: "call".to_owned(),
+                sequence: 7,
+                is_error: false,
+                finished_at_ms: None,
             },
         ];
 

@@ -38,10 +38,11 @@ use bcode_agent_profile::{
     ToolPolicyAuthorizationMetadata, tool_policy_authorization_metadata,
 };
 use bcode_agent_runtime::{
-    ArtifactCommitGuard, CancellationToken, InvocationArtifactSink, InvocationCapabilityFuture,
-    InvocationExchangeBroker, InvocationInputRouter, InvocationScope, InvocationServiceRouter,
-    RegisteredTool, RuntimeFuture, ToolAuthorizationCoordinator, ToolAuthorizationDecision,
-    ToolAuthorizationRequest, ToolSource, TurnGeneration, TurnScope,
+    ArtifactCommitGuard, CancellationToken, InvocationArtifactSink, InvocationCancellation,
+    InvocationCapabilityFuture, InvocationExchangeBroker, InvocationInputRouter, InvocationScope,
+    InvocationServiceRouter, PreparationScope, RegisteredTool, RuntimeError, RuntimeFuture,
+    ToolAuthorizationCoordinator, ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCatalog,
+    ToolInvoker, ToolSource, TurnGeneration, TurnScope, UnifiedToolCatalog,
 };
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
@@ -95,10 +96,11 @@ use bcode_skill_models::{
     SkillToolPolicyTarget,
 };
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL, TOOL_SERVICE_INTERFACE_ID,
-    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolDefinition as ServiceToolDefinition,
-    ToolExchangeRequest, ToolExchangeResolution, ToolInvocationDescriptor, ToolInvocationInput,
-    ToolInvocationInputResolution, ToolInvocationRequest, ToolInvocationResponse,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL, PreparedToolInvocation,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
+    ToolDefinition as ServiceToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
+    ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
+    ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
     ToolList, ToolOutputStream, ToolPreparationRequest, ToolPreparationResponse, ToolResultContent,
@@ -12616,11 +12618,10 @@ async fn handle_provider_turn_event(
             .await;
         }
         ProviderTurnEvent::ToolCallStarted { call_id, name } => {
-            let preview_metadata = find_tool_provider(state, &name)
+            let preview_metadata = registered_server_tool(state, &name)
                 .await
                 .ok()
-                .flatten()
-                .and_then(|(_, definition)| definition.ui.request_visual);
+                .and_then(|tool| tool.definition.ui.request_visual);
             stream_progress.start_tool_call(call_id.clone(), name.clone(), preview_metadata);
             publish_provider_stream_progress_live(
                 state,
@@ -12821,11 +12822,10 @@ async fn handle_provider_tool_call_finished_event(
     )
     .await;
     let preview_fields = StreamingJsonStringFields::from_json_value(&call.arguments);
-    let preview_metadata = find_tool_provider(state, &call.name)
+    let preview_metadata = registered_server_tool(state, &call.name)
         .await
         .ok()
-        .flatten()
-        .and_then(|(_, definition)| definition.ui.request_visual);
+        .and_then(|tool| tool.definition.ui.request_visual);
     if let Some(preview) = preview_metadata
         .as_ref()
         .and_then(|metadata| live_tool_argument_preview_from_fields(metadata, &preview_fields))
@@ -15105,34 +15105,207 @@ async fn invocation_service_host_context(
     }]
 }
 
-async fn prepare_server_tool(
+#[derive(Debug)]
+struct ServerToolInvoker<'a> {
+    state: &'a ServerState,
+    session_id: SessionId,
+    working_directory: &'a Path,
+    cancel_state: &'a TurnCancelState,
+}
+
+impl<'a> ServerToolInvoker<'a> {
+    const fn new(
+        state: &'a ServerState,
+        session_id: SessionId,
+        working_directory: &'a Path,
+        cancel_state: &'a TurnCancelState,
+    ) -> Self {
+        Self {
+            state,
+            session_id,
+            working_directory,
+            cancel_state,
+        }
+    }
+}
+
+impl ToolInvoker for ServerToolInvoker<'_> {
+    fn prepare_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        request: &'a ToolPreparationRequest,
+        scope: &'a PreparationScope,
+    ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+        Box::pin(async move {
+            let ToolSource::Plugin { plugin_id } = &tool.source else {
+                return Err(RuntimeError::ToolPreparation {
+                    tool_name: request.invocation.tool_name.clone(),
+                    message: "server cannot prepare a non-plugin tool".to_owned(),
+                });
+            };
+            if !scope.accepts_work() || self.cancel_state.is_cancelled() {
+                return Err(RuntimeError::Cancelled);
+            }
+            let request = ToolPreparationRequest {
+                invocation: request.invocation.clone(),
+                host_context: scope.host_context().to_vec(),
+            };
+            self.state
+                .plugins
+                .invoke_service_json_scoped::<_, ToolPreparationResponse>(
+                    plugin_id,
+                    TOOL_SERVICE_INTERFACE_ID,
+                    OP_PREPARE_TOOL,
+                    &request,
+                    active_plugin_scope_for_tool_call(
+                        self.state,
+                        self.session_id,
+                        &request.invocation.invocation_id,
+                    )
+                    .await,
+                )
+                .await
+                .map_err(|error| RuntimeError::ToolPreparation {
+                    tool_name: request.invocation.tool_name,
+                    message: error.to_string(),
+                })
+        })
+    }
+
+    fn invoke_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        invocation: &'a PreparedToolInvocation,
+        scope: &'a InvocationScope,
+    ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+        Box::pin(async move {
+            let ToolSource::Plugin { plugin_id } = &tool.source else {
+                return Err(RuntimeError::ToolExecution {
+                    tool_name: invocation.invocation.tool_name.clone(),
+                    message: "server cannot invoke a non-plugin tool".to_owned(),
+                });
+            };
+            let policy_metadata = tool_policy_authorization_metadata(
+                &invocation.preparation.authorization,
+                &invocation.invocation.tool_name,
+            )
+            .map_err(|message| RuntimeError::ToolExecution {
+                tool_name: invocation.invocation.tool_name.clone(),
+                message,
+            })?;
+            let call = bcode_model::ToolCall {
+                id: invocation.invocation.invocation_id.clone(),
+                name: invocation.invocation.tool_name.clone(),
+                arguments: invocation.invocation.arguments.clone(),
+            };
+            invoke_model_tool(
+                self.state,
+                self.session_id,
+                &call,
+                self.working_directory,
+                plugin_id,
+                &policy_metadata,
+                invocation.preparation.descriptor.clone(),
+                self.cancel_state,
+                Some(scope),
+                None,
+            )
+            .await
+            .map_err(|message| RuntimeError::ToolExecution {
+                tool_name: call.name,
+                message,
+            })
+        })
+    }
+}
+
+async fn collect_server_tool_catalog(state: &ServerState) -> Result<UnifiedToolCatalog, String> {
+    let mut catalog = UnifiedToolCatalog::new();
+    let mut registered_names = BTreeSet::new();
+    for plugin_id in tool_provider_plugin_ids(state) {
+        let list = state
+            .plugins
+            .invoke_service_json::<_, ToolList>(
+                &plugin_id,
+                TOOL_SERVICE_INTERFACE_ID,
+                OP_LIST_TOOLS,
+                &ListToolsRequest::default(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        for definition in list.tools {
+            if registered_names.insert(definition.name.clone()) {
+                catalog.insert(RegisteredTool::plugin(definition, plugin_id.clone()));
+            }
+        }
+    }
+    Ok(catalog)
+}
+
+async fn registered_server_tool(
+    state: &ServerState,
+    tool_name: &str,
+) -> Result<RegisteredTool, String> {
+    collect_server_tool_catalog(state)
+        .await?
+        .find_tool(tool_name)
+        .ok_or_else(|| format!("tool not found: {tool_name}"))
+}
+
+async fn prepare_registered_server_tool(
     state: &ServerState,
     session_id: SessionId,
+    tool: RegisteredTool,
     call: &bcode_model::ToolCall,
-) -> Result<(RegisteredTool, ToolPreparationResponse), String> {
-    let (plugin_id, definition) = find_tool_provider(state, &call.name)
-        .await?
-        .ok_or_else(|| format!("tool not found: {}", call.name))?;
+    cancel_state: &TurnCancelState,
+) -> Result<ToolPreparationResponse, String> {
+    let host_context = invocation_service_host_context(state, session_id).await;
     let request = ToolPreparationRequest {
         invocation: ToolInvocationDescriptor {
             invocation_id: call.id.clone(),
             tool_name: call.name.clone(),
             arguments: call.arguments.clone(),
         },
-        host_context: invocation_service_host_context(state, session_id).await,
+        host_context: host_context.clone(),
     };
-    let preparation = state
-        .plugins
-        .invoke_service_json_scoped::<_, ToolPreparationResponse>(
-            &plugin_id,
-            TOOL_SERVICE_INTERFACE_ID,
-            OP_PREPARE_TOOL,
-            &request,
-            active_plugin_scope_for_tool_call(state, session_id, &call.id).await,
-        )
+    let scope = PreparationScope::new(
+        TurnScope::without_events(
+            format!("server-tool-preparation:{session_id}"),
+            TurnGeneration::new(0),
+        ),
+        host_context,
+    );
+    let working_directory = state
+        .sessions
+        .session_working_directory(session_id)
         .await
         .map_err(|error| error.to_string())?;
-    Ok((RegisteredTool::plugin(definition, plugin_id), preparation))
+    let invoker = ServerToolInvoker::new(state, session_id, &working_directory, cancel_state);
+    let preparation = invoker
+        .prepare_tool(&tool, &request, &scope)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(preparation)
+}
+
+async fn prepare_server_tool_with_cancel(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    cancel_state: &TurnCancelState,
+) -> Result<(RegisteredTool, ToolPreparationResponse), String> {
+    let tool = registered_server_tool(state, &call.name).await?;
+    let preparation =
+        prepare_registered_server_tool(state, session_id, tool.clone(), call, cancel_state).await?;
+    Ok((tool, preparation))
+}
+
+async fn prepare_server_tool(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+) -> Result<(RegisteredTool, ToolPreparationResponse), String> {
+    prepare_server_tool_with_cancel(state, session_id, call, &TurnCancelState::default()).await
 }
 
 #[derive(Clone, Copy)]
@@ -15365,21 +15538,58 @@ async fn execute_model_tool_batch(
     tool_policy: bcode_session_models::TurnToolPolicy,
 ) -> bool {
     let call_count = calls.len();
+    let catalog = match tokio::select! {
+        biased;
+        () = cancel_state.cancelled() => return false,
+        catalog = tokio::time::timeout(
+            Duration::from_millis(state.tool_execution.preparation_timeout_ms.get()),
+            collect_server_tool_catalog(state),
+        ) => catalog,
+    } {
+        Ok(Ok(catalog)) => catalog,
+        Ok(Err(message)) => {
+            tracing::warn!(%message, "failed to build server tool registry");
+            return false;
+        }
+        Err(_) => {
+            tracing::warn!("timed out building server tool registry");
+            return false;
+        }
+    };
     let mut ready = Vec::new();
     let mut results = Vec::new();
     for (index, call) in calls.into_iter().enumerate() {
         if cancel_state.is_cancelled() {
             return false;
         }
+        let Some(tool) = catalog.find_tool(&call.name) else {
+            results.push((
+                index,
+                Some(ToolFinishedEventInput {
+                    tool_call_id: call.id,
+                    result: format!("tool not found: {}", call.name),
+                    is_error: true,
+                    content: Vec::new(),
+                    semantic_result: None,
+                }),
+            ));
+            continue;
+        };
         let preparation = tokio::select! {
             biased;
             () = cancel_state.cancelled() => return false,
             preparation = tokio::time::timeout(
                 Duration::from_millis(state.tool_execution.preparation_timeout_ms.get()),
-                prepare_server_tool(state, session_id, &call),
+                prepare_registered_server_tool(
+                    state,
+                    session_id,
+                    tool.clone(),
+                    &call,
+                    cancel_state.as_ref(),
+                ),
             ) => preparation,
         };
-        let (tool, preparation) = match preparation {
+        let preparation = match preparation {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(message)) => {
                 results.push((
@@ -15497,19 +15707,12 @@ async fn execute_model_tool_batch(
             return false;
         }
         let mut approved = Vec::new();
-        for ((index, call, working_directory, tool, policy_metadata, preparation), decision) in
+        for ((index, call, working_directory, tool, _policy_metadata, preparation), decision) in
             ready.into_iter().zip(decisions)
         {
             match decision {
                 ToolAuthorizationDecision::Allow => {
-                    approved.push((
-                        index,
-                        call,
-                        working_directory,
-                        tool,
-                        policy_metadata,
-                        preparation.descriptor,
-                    ));
+                    approved.push((index, call, working_directory, tool, preparation));
                 }
                 ToolAuthorizationDecision::Ask(reason)
                 | ToolAuthorizationDecision::Deny(reason) => results.push((
@@ -15543,22 +15746,10 @@ async fn execute_model_tool_batch(
         };
         let execution_count = approved.len();
         let executions = stream::iter(approved.into_iter().map(
-            |(index, call, working_directory, tool, policy_metadata, preparation_descriptor)| {
+            |(index, call, working_directory, tool, preparation)| {
                 let cancel_state = Arc::clone(&cancel_state);
                 let invocation_permits = invocation_permits.clone();
                 async move {
-                    let ToolSource::Plugin { plugin_id } = tool.source else {
-                        return (
-                            index,
-                            Some(ToolFinishedEventInput {
-                                tool_call_id: call.id,
-                                result: "server cannot invoke a non-plugin tool".to_string(),
-                                is_error: true,
-                                content: Vec::new(),
-                                semantic_result: None,
-                            }),
-                        );
-                    };
                     (
                         index,
                         execute_model_tool(
@@ -15566,9 +15757,8 @@ async fn execute_model_tool_batch(
                             session_id,
                             call,
                             working_directory,
-                            plugin_id,
-                            policy_metadata,
-                            preparation_descriptor,
+                            tool,
+                            preparation,
                             cancel_state,
                             invocation_permits,
                         )
@@ -15609,13 +15799,15 @@ async fn execute_model_tool(
     session_id: SessionId,
     call: bcode_model::ToolCall,
     working_directory: std::path::PathBuf,
-    plugin_id: String,
-    policy_metadata: ToolPolicyAuthorizationMetadata,
-    preparation_descriptor: serde_json::Value,
+    tool: RegisteredTool,
+    preparation: ToolPreparationResponse,
     cancel_state: Arc<TurnCancelState>,
     invocation_permits: Option<Arc<Semaphore>>,
 ) -> Option<ToolFinishedEventInput> {
-    let producer_plugin_id = Some(plugin_id.clone());
+    let producer_plugin_id = match &tool.source {
+        ToolSource::Plugin { plugin_id } => Some(plugin_id.clone()),
+        ToolSource::Inline => None,
+    };
     if cancel_state.is_cancelled() {
         cancel_registered_runtime_work(
             state,
@@ -15671,25 +15863,33 @@ async fn execute_model_tool(
         .span("tool.invocation")
         .labels(tool_labels.clone());
     let tool_start = Instant::now();
-    let result = invoke_model_tool(
-        state,
-        session_id,
-        &call,
-        &working_directory,
-        &plugin_id,
-        &policy_metadata,
-        preparation_descriptor,
-        cancel_state.as_ref(),
-        None,
-    )
-    .await
-    .unwrap_or_else(|error| ToolInvocationResponse {
-        output: error,
-        is_error: true,
-        content: Vec::new(),
-        full_output: None,
-        result: None,
-    });
+    let invocation = PreparedToolInvocation {
+        invocation: ToolInvocationDescriptor {
+            invocation_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        },
+        preparation,
+    };
+    let invocation_scope = InvocationScope::new(
+        TurnScope::without_events(
+            format!("server-tool-invocation:{session_id}"),
+            TurnGeneration::new(0),
+        ),
+        call.id.clone(),
+    );
+    let invoker =
+        ServerToolInvoker::new(state, session_id, &working_directory, cancel_state.as_ref());
+    let result = invoker
+        .invoke_tool(&tool, &invocation, &invocation_scope)
+        .await
+        .unwrap_or_else(|error| ToolInvocationResponse {
+            output: error.to_string(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        });
     if cancel_state.is_cancelled() {
         append_tool_invocation_terminal_event(
             state,
@@ -16319,6 +16519,15 @@ async fn resolve_server_exchange(
     Ok(resolution)
 }
 
+#[derive(Debug)]
+struct ServerPluginInvocationCancellation(bcode_plugin::PluginInvocationCancelHandle);
+
+impl InvocationCancellation for ServerPluginInvocationCancellation {
+    fn request_cancel(&self) {
+        self.0.cancel();
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn invoke_model_tool(
     state: &ServerState,
@@ -16329,6 +16538,7 @@ async fn invoke_model_tool(
     policy_metadata: &ToolPolicyAuthorizationMetadata,
     preparation_descriptor: serde_json::Value,
     cancel_state: &TurnCancelState,
+    invocation_scope: Option<&InvocationScope>,
     invocation_permits: Option<Arc<Semaphore>>,
 ) -> Result<ToolInvocationResponse, String> {
     if cancel_state.is_cancelled() {
@@ -16430,12 +16640,33 @@ async fn invoke_model_tool(
             CancellationHandle::PluginInvocation(invocation.cancel.clone()),
         )
         .await;
+    let scope_cancellation = invocation_scope.map(InvocationScope::cancellation);
+    if invocation_scope.is_some_and(|scope| {
+        !scope.register_cancellation(Arc::new(ServerPluginInvocationCancellation(
+            invocation.cancel.clone(),
+        )))
+    }) {
+        invocation.cancel.cancel();
+        return Ok(tool_error("tool cancelled before invocation became active"));
+    }
     let mut tool_output_publisher = ToolOutputLivePublisher::new();
     let mut stream_sequences: BTreeMap<String, u64> = BTreeMap::new();
     let response = loop {
         tokio::select! {
             biased;
             () = cancel_state.cancelled() => {
+                invocation.cancel.cancel();
+                drop(bridge_resolutions);
+                input_receiver.lock().await.close();
+                return Ok(tool_error("tool invocation cancelled"));
+            }
+            () = async {
+                if let Some(cancellation) = &scope_cancellation {
+                    cancellation.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
                 invocation.cancel.cancel();
                 drop(bridge_resolutions);
                 input_receiver.lock().await.close();
@@ -16562,6 +16793,9 @@ async fn invoke_model_tool(
         }
     }
     tool_output_publisher.finish(state, session_id).await;
+    if let Some(scope) = invocation_scope {
+        let _ = scope.unregister_cancellation();
+    }
     let response: ToolInvocationResponse =
         bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())?;
     Ok(response)
@@ -17150,15 +17384,6 @@ async fn append_tool_stream_event(
     if is_legacy_tool_presentation_stream_event(&event) {
         return;
     }
-
-    match state
-        .sessions
-        .append_event(session_id, SessionEventKind::ToolInvocationStream { event })
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append tool stream event: {error}"),
-    }
     if let Some((work_id, message)) = progress {
         append_runtime_work_progress_event(state, session_id, work_id, message, None, None).await;
     }
@@ -17661,28 +17886,6 @@ fn skill_tool_policy_reason(outcome: &SkillToolPolicyOutcome) -> Option<String> 
         | SkillToolPolicyOutcome::Ask { reason }
         | SkillToolPolicyOutcome::Deny { reason } => Some(reason.clone()),
     }
-}
-
-async fn find_tool_provider(
-    state: &ServerState,
-    tool_name: &str,
-) -> Result<Option<(String, ServiceToolDefinition)>, String> {
-    for plugin_id in tool_provider_plugin_ids(state) {
-        let list = state
-            .plugins
-            .invoke_service_json::<_, ToolList>(
-                &plugin_id,
-                TOOL_SERVICE_INTERFACE_ID,
-                OP_LIST_TOOLS,
-                &ListToolsRequest::default(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(tool) = list.tools.into_iter().find(|tool| tool.name == tool_name) {
-            return Ok(Some((plugin_id, tool)));
-        }
-    }
-    Ok(None)
 }
 
 fn tool_provider_plugin_ids(state: &ServerState) -> Vec<String> {
@@ -18446,11 +18649,10 @@ async fn tool_request_visual_descriptor(
     tool_name: &str,
     arguments_json: &str,
 ) -> Option<PluginVisualDescriptor> {
-    let metadata = find_tool_provider(state, tool_name)
+    let metadata = registered_server_tool(state, tool_name)
         .await
-        .ok()
-        .flatten()?
-        .1
+        .ok()?
+        .definition
         .ui
         .request_visual?;
     let arguments = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
@@ -26282,6 +26484,7 @@ library = "test"
             preparation.descriptor,
             cancel_state,
             None,
+            None,
         )
         .await
     }
@@ -26546,6 +26749,35 @@ library = "test"
         .expect("all permissions should resolve before invocation starts")
     }
 
+    async fn execute_server_tool_for_test(
+        state: &ServerState,
+        session_id: SessionId,
+        call: bcode_model::ToolCall,
+        working_directory: PathBuf,
+        expected_plugin_id: &str,
+        cancel_state: Arc<TurnCancelState>,
+        invocation_permits: Option<Arc<Semaphore>>,
+    ) -> Option<ToolFinishedEventInput> {
+        let (tool, preparation) = prepare_server_tool(state, session_id, &call)
+            .await
+            .expect("server test tool preparation");
+        assert!(matches!(
+            &tool.source,
+            ToolSource::Plugin { plugin_id } if plugin_id == expected_plugin_id
+        ));
+        execute_model_tool(
+            state,
+            session_id,
+            call,
+            working_directory,
+            tool,
+            preparation,
+            cancel_state,
+            invocation_permits,
+        )
+        .await
+    }
+
     async fn assert_persisted_tool_results_in_order(
         state: &ServerState,
         session_id: SessionId,
@@ -26597,7 +26829,7 @@ library = "test"
             .id;
         let mut state = test_server_state_with_filesystem_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
-        let result = execute_model_tool(
+        let result = execute_server_tool_for_test(
             &state,
             session_id,
             bcode_model::ToolCall {
@@ -26606,11 +26838,7 @@ library = "test"
                 arguments: serde_json::json!({"path": workspace.path(), "max_entries": 10}),
             },
             workspace.path().to_path_buf(),
-            "bcode.filesystem".to_owned(),
-            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Read {
-                paths: vec![workspace.path().display().to_string()],
-            }),
-            serde_json::Value::Null,
+            "bcode.filesystem",
             Arc::new(TurnCancelState::default()),
             None,
         )
@@ -26660,7 +26888,7 @@ library = "test"
             .expect("shell contribution session should attach");
         let mut state = test_server_state_with_shell_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
-        let result = execute_model_tool(
+        let result = execute_server_tool_for_test(
             &state,
             session_id,
             bcode_model::ToolCall {
@@ -26669,11 +26897,7 @@ library = "test"
                 arguments: serde_json::json!({"command": "printf server-contribution"}),
             },
             workspace.path().to_path_buf(),
-            "bcode.shell".to_owned(),
-            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
-                command: Some("printf server-contribution".to_owned()),
-            }),
-            serde_json::Value::Null,
+            "bcode.shell",
             Arc::new(TurnCancelState::default()),
             None,
         )
@@ -26783,7 +27007,7 @@ library = "test"
         let mut state = test_server_state_with_vim_edit_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
 
-        let result = execute_model_tool(
+        let result = execute_server_tool_for_test(
             &state,
             session_id,
             bcode_model::ToolCall {
@@ -26795,11 +27019,7 @@ library = "test"
                 }),
             },
             workspace.path().to_path_buf(),
-            "bcode.vim-edit".to_owned(),
-            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Read {
-                paths: vec![workspace.path().display().to_string()],
-            }),
-            serde_json::Value::Null,
+            "bcode.vim-edit",
             Arc::new(TurnCancelState::default()),
             None,
         )
@@ -26858,7 +27078,7 @@ library = "test"
             .id;
         let mut state = test_server_state_with_shell_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
-        let result = execute_model_tool(
+        let result = execute_server_tool_for_test(
             &state,
             session_id,
             bcode_model::ToolCall {
@@ -26867,11 +27087,7 @@ library = "test"
                 arguments: serde_json::json!({"command": "false"}),
             },
             workspace.path().to_path_buf(),
-            "bcode.shell".to_owned(),
-            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
-                command: Some("false".to_owned()),
-            }),
-            serde_json::Value::Null,
+            "bcode.shell",
             Arc::new(TurnCancelState::default()),
             None,
         )
@@ -26926,17 +27142,12 @@ library = "test"
             arguments: serde_json::json!({"command": "sleep 30"}),
         };
         let cancel_state = Arc::new(TurnCancelState::default());
-        let policy = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
-            command: Some("sleep 30".to_owned()),
-        });
-        let invocation = execute_model_tool(
+        let invocation = execute_server_tool_for_test(
             &state,
             session_id,
             call,
             workspace.path().to_path_buf(),
-            "bcode.shell".to_owned(),
-            policy,
-            serde_json::Value::Null,
+            "bcode.shell",
             Arc::clone(&cancel_state),
             None,
         );
@@ -26997,6 +27208,149 @@ library = "test"
                 .active_invocations
                 .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_tool_invoker_scope_cancellation_signals_plugin_handle_immediately() {
+        let workspace = tempfile::tempdir().expect("scope-cancelled shell workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent scope-cancelled shell sessions");
+        let session_id = sessions
+            .create_session(
+                Some("scope-cancelled shell".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("scope-cancelled shell session")
+            .id;
+        let mut state = test_server_state_with_shell_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let call = bcode_model::ToolCall {
+            id: "scope-cancelled-shell".to_owned(),
+            name: "shell.run".to_owned(),
+            arguments: serde_json::json!({"command": "sleep 30"}),
+        };
+        let cancel_state = TurnCancelState::default();
+        let (tool, preparation) =
+            prepare_server_tool_with_cancel(&state, session_id, &call, &cancel_state)
+                .await
+                .expect("scope-cancelled shell preparation");
+        let invocation = PreparedToolInvocation {
+            invocation: ToolInvocationDescriptor {
+                invocation_id: call.id.clone(),
+                tool_name: call.name,
+                arguments: call.arguments,
+            },
+            preparation,
+        };
+        let turn_scope = TurnScope::without_events("server-scope-cancel", TurnGeneration::new(1));
+        let invocation_scope = InvocationScope::new(turn_scope, call.id.clone());
+        let invoker = ServerToolInvoker::new(&state, session_id, workspace.path(), &cancel_state);
+        let invoke = invoker.invoke_tool(&tool, &invocation, &invocation_scope);
+        let cancel = async {
+            loop {
+                if state
+                    .active_plugin_invocations
+                    .lock()
+                    .expect("active invocation registry")
+                    .contains_key(&(session_id, call.id.clone()))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(invocation_scope.turn().control().begin_cancellation());
+        };
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(invoke, cancel)
+        })
+        .await
+        .expect("scope cancellation must close locally");
+        let response = response.expect("scope-cancelled invocation response");
+        assert!(response.is_error);
+        assert!(response.output.contains("cancelled"));
+        assert!(!cancel_state.is_cancelled());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_registry_unknown_call_preserves_registered_sibling_and_provider_order() {
+        let workspace = tempfile::tempdir().expect("registry batch workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent registry batch sessions");
+        let session_id = sessions
+            .create_session(
+                Some("registry mixed batch".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("registry mixed session")
+            .id;
+        let mut state = test_server_state_with_filesystem_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            current_turn,
+        );
+        assert!(
+            execute_model_tool_batch(
+                &state,
+                session_id,
+                vec![
+                    bcode_model::ToolCall {
+                        id: "unknown-first".to_owned(),
+                        name: "future.unknown".to_owned(),
+                        arguments: serde_json::Value::Null,
+                    },
+                    bcode_model::ToolCall {
+                        id: "known-second".to_owned(),
+                        name: "filesystem.list".to_owned(),
+                        arguments: serde_json::json!({
+                            "path": workspace.path(),
+                            "max_entries": 10
+                        }),
+                    },
+                ],
+                Arc::new(TurnCancelState::default()),
+                &mut command_context,
+                bcode_session_models::TurnToolPolicy::Enabled,
+            )
+            .await
+        );
+        assert_persisted_tool_results_in_order(
+            &state,
+            session_id,
+            &["unknown-first".to_owned(), "known-second".to_owned()],
+        )
+        .await;
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("registry mixed history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.invocation_id == "unknown-first"
+                    && record.is_error
+                    && record.model_output.contains("tool not found")
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.invocation_id == "known-second"
+                    && !record.is_error
+                    && record.model_output.contains("entries")
+        )));
     }
 
     #[cfg(unix)]
@@ -28972,6 +29326,43 @@ library = "test"
         assert!(!history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ToolInvocationStream { event } if event == &finished
+        )));
+    }
+
+    #[tokio::test]
+    async fn tool_stream_status_persists_only_generic_runtime_work_progress() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("status".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created")
+            .id;
+        let state = test_server_state(sessions);
+        append_tool_stream_event(
+            &state,
+            session_id,
+            ToolInvocationStreamEvent::Status {
+                tool_call_id: "call-1".to_owned(),
+                sequence: 1,
+                message: "working".to_owned(),
+            },
+        )
+        .await;
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("status history");
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }))
+        );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::RuntimeWorkProgress { work_id, message, .. }
+                if work_id.0 == "tool_call-1" && message == "working"
         )));
     }
 

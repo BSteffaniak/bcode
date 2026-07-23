@@ -1022,6 +1022,31 @@ if ! grep -F 'direct_tool_receives_canonical_scope_and_all_capabilities' package
   violations=1
 fi
 
+if ! grep -F 'SessionEventKind::ToolInvocationStream { .. } => Some("tool_invocation_stream")' packages/session/src/lib.rs >/dev/null ||
+   rg -U 'append_event\([\s\S]{0,160}SessionEventKind::ToolInvocationStream' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'tool_stream_status_persists_only_generic_runtime_work_progress' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'durable_boundary_rejects_tool_stream_status_regardless_of_payload_size' packages/session/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: current production may persist legacy tool stream events." >&2
+  violations=1
+fi
+
+if rg -n '\bfind_tool_provider\b' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'async fn collect_server_tool_catalog' packages/server/src/lib.rs >/dev/null ||
+   ! rg -U 'async fn execute_model_tool_batch\([\s\S]{0,2200}collect_server_tool_catalog\(state\)[\s\S]{0,2200}catalog\.find_tool\(&call\.name\)' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'server_registry_unknown_call_preserves_registered_sibling_and_provider_order' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: production server calls are not resolved through the unified invoker registry." >&2
+  violations=1
+fi
+
+if ! grep -F 'struct ServerToolInvoker' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'impl ToolInvoker for ServerToolInvoker' packages/server/src/lib.rs >/dev/null ||
+   ! rg -U 'prepare_registered_server_tool\([\s\S]{0,2200}invoker[\s\n]*\.prepare_tool\(' packages/server/src/lib.rs >/dev/null ||
+   ! rg -U 'async fn execute_model_tool\([\s\S]{0,4200}invoker[\s\n]*\.invoke_tool\(' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'server_tool_invoker_scope_cancellation_signals_plugin_handle_immediately' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: production server tool preparation/invocation bypasses ServerToolInvoker." >&2
+  violations=1
+fi
+
 if ! grep -F 'select_interaction_adapter' packages/plugin-sdk/src/interaction.rs >/dev/null ||
    ! grep -F 'min_schema_version' packages/plugin-sdk/src/interaction.rs >/dev/null ||
    ! grep -F 'platform_id' packages/plugin-sdk/src/interaction.rs >/dev/null ||
