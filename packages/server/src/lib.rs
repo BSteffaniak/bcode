@@ -38,11 +38,12 @@ use bcode_agent_profile::{
     ToolPolicyAuthorizationMetadata, tool_policy_authorization_metadata,
 };
 use bcode_agent_runtime::{
-    ArtifactCommitGuard, CancellationToken, InvocationArtifactSink, InvocationCancellation,
-    InvocationCapabilityFuture, InvocationExchangeBroker, InvocationInputRouter, InvocationScope,
-    InvocationServiceRouter, PreparationScope, RegisteredTool, RuntimeError, RuntimeFuture,
-    ToolAuthorizationCoordinator, ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCatalog,
-    ToolInvoker, ToolSource, TurnGeneration, TurnScope, UnifiedToolCatalog,
+    AgentRuntime, ArtifactCommitGuard, CancellationToken, InvocationArtifactSink,
+    InvocationCancellation, InvocationCapabilityFuture, InvocationExchangeBroker,
+    InvocationInputRouter, InvocationScope, InvocationServiceRouter, PreparationScope,
+    RegisteredTool, RuntimeError, RuntimeFuture, ScopedTurnEvent, ToolAuthorizationCoordinator,
+    ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCatalog, ToolInvoker, ToolRoundState,
+    ToolSource, TurnEventSink, TurnGeneration, TurnScope, UnifiedToolCatalog,
 };
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
@@ -81,8 +82,7 @@ use bcode_session_models::{
     PluginVisualDescriptor, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkKind,
     RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind, SessionTokenUsage,
     SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolContributionEvent,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
-    TraceBlobRef, TraceRedaction, WorkId,
+    ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, TraceRedaction, WorkId,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -103,14 +103,14 @@ use bcode_tool::{
     ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
     ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
-    ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
-    ToolList, ToolOutputStream, ToolPreparationRequest, ToolPreparationResponse, ToolResultContent,
+    ToolInvocationServiceResolution, ToolList, ToolPreparationRequest, ToolPreparationResponse,
+    ToolResultContent,
 };
 use bcode_workflow::{
     WorkflowApprovalResolver, WorkflowError, WorkflowGrantScope, WorkflowPolicyGrant,
     WorkflowToolCapability,
 };
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -129,7 +129,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
-use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 const CLIENT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -222,7 +222,6 @@ pub struct ServerState {
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     active_contributions: Arc<StdMutex<BTreeMap<ActiveContributionKey, ToolContributionEvent>>>,
-    active_plugin_visuals: Arc<StdMutex<BTreeMap<(SessionId, String), ToolInvocationStreamEvent>>>,
     next_permission_id: Mutex<u64>,
     next_permission_batch_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
@@ -1298,7 +1297,6 @@ impl ServerState {
             active_plugin_invocations: Arc::default(),
             active_artifacts: Arc::default(),
             active_contributions: Arc::default(),
-            active_plugin_visuals: Arc::default(),
             next_permission_id: Mutex::new(1),
             next_permission_batch_id: Mutex::new(1),
             clients: Mutex::default(),
@@ -5753,7 +5751,6 @@ struct ActivePluginInvocation {
 struct ActivePluginInvocationRegistration {
     invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
-    active_plugin_visuals: Arc<StdMutex<BTreeMap<(SessionId, String), ToolInvocationStreamEvent>>>,
     key: (SessionId, String),
 }
 
@@ -5761,9 +5758,6 @@ impl ActivePluginInvocationRegistration {
     fn register(
         invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
         active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
-        active_plugin_visuals: Arc<
-            StdMutex<BTreeMap<(SessionId, String), ToolInvocationStreamEvent>>,
-        >,
         session_id: SessionId,
         tool_call_id: &str,
         invocation: ActivePluginInvocation,
@@ -5780,7 +5774,6 @@ impl ActivePluginInvocationRegistration {
         Ok(Self {
             invocations,
             active_artifacts,
-            active_plugin_visuals,
             key,
         })
     }
@@ -5804,9 +5797,6 @@ impl Drop for ActivePluginInvocationRegistration {
                 artifact.abandoned = true;
                 artifact.revision = artifact.revision.saturating_add(1);
             }
-        }
-        if let Ok(mut visuals) = self.active_plugin_visuals.lock() {
-            visuals.remove(&self.key);
         }
     }
 }
@@ -7693,6 +7683,44 @@ async fn process_steering_message_command(
     };
     if let Some(sender) = completion_sender {
         let _sent = sender.send(completion);
+    }
+}
+
+async fn wait_for_server_tool_batch<'a, T>(
+    state: &ServerState,
+    session_id: SessionId,
+    context: &mut RuntimeCommandContext<'_>,
+    cancel_state: &TurnCancelState,
+    scope: &TurnScope,
+    mut batch: ProviderCallFuture<'a, T>,
+) -> FinalizedProviderCall<T>
+where
+    T: Send + 'a,
+{
+    loop {
+        tokio::select! {
+            result = &mut batch => return FinalizedProviderCall::Completed(result),
+            cancel_command = context.cancel_commands.recv() => {
+                if let Some(command) = cancel_command {
+                    process_cancel_turn_command(
+                        state,
+                        session_id,
+                        context.followup_commands,
+                        context.queued_followups,
+                        command,
+                    )
+                    .await;
+                }
+                if cancel_state.is_cancelled() {
+                    let _ = scope.control().begin_cancellation();
+                    return FinalizedProviderCall::Cancelled(batch.await);
+                }
+            }
+            () = cancel_state.cancelled() => {
+                let _ = scope.control().begin_cancellation();
+                return FinalizedProviderCall::Cancelled(batch.await);
+            }
+        }
     }
 }
 
@@ -10166,8 +10194,6 @@ async fn handle_resolve_permission_batch(
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MODEL_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const MODEL_STREAM_FLUSH_BYTES: usize = 512;
-const TOOL_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
-const TOOL_OUTPUT_FLUSH_BYTES: usize = 4096;
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
 const MODEL_NO_PROGRESS_TIMEOUT_CODE: &str = "model_no_progress_timeout";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
@@ -10205,360 +10231,6 @@ struct ToolArgumentStreamProgress {
 #[derive(Debug, Default)]
 struct ModelStreamProgress {
     active_tool_call: Option<ToolArgumentStreamProgress>,
-}
-
-#[derive(Debug)]
-enum ToolOutputLivePublisherEvent {
-    FlushDue { generation: u64 },
-}
-
-#[derive(Debug)]
-struct PendingArtifactUpdate {
-    event: ToolInvocationStreamEvent,
-    enqueued_at: Instant,
-}
-
-#[derive(Debug)]
-struct ToolOutputLivePublisher {
-    pending_output: Option<ToolOutputStreamAccumulator>,
-    pending_artifacts: BTreeMap<(String, String, String), PendingArtifactUpdate>,
-    pending_visuals: BTreeMap<String, ToolInvocationStreamEvent>,
-    artifact_last_seen: BTreeMap<(String, String, String), (u64, Instant)>,
-    flush_generation: u64,
-    flush_tx: mpsc::UnboundedSender<ToolOutputLivePublisherEvent>,
-    flush_rx: mpsc::UnboundedReceiver<ToolOutputLivePublisherEvent>,
-}
-
-impl ToolOutputLivePublisher {
-    fn new() -> Self {
-        let (flush_tx, flush_rx) = mpsc::unbounded_channel();
-        Self {
-            pending_output: None,
-            pending_artifacts: BTreeMap::new(),
-            pending_visuals: BTreeMap::new(),
-            artifact_last_seen: BTreeMap::new(),
-            flush_generation: 0,
-            flush_tx,
-            flush_rx,
-        }
-    }
-
-    async fn next_event(&mut self) -> Option<ToolOutputLivePublisherEvent> {
-        self.flush_rx.recv().await
-    }
-
-    async fn push_stream_event(
-        &mut self,
-        state: &ServerState,
-        session_id: SessionId,
-        event: ToolInvocationStreamEvent,
-    ) {
-        if matches!(event, ToolInvocationStreamEvent::VisualUpdate { .. }) {
-            let was_empty = self.pending_visuals.is_empty();
-            self.enqueue_visual_update(event);
-            if was_empty {
-                self.schedule_flush();
-            }
-            return;
-        }
-        if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
-            let (was_empty, finalized) = self.enqueue_artifact_update(&state.metrics, event);
-            if finalized {
-                self.flush(state, session_id).await;
-            } else if was_empty {
-                self.schedule_flush();
-            }
-            return;
-        }
-        let ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id,
-            stream,
-            sequence,
-            text,
-            byte_len,
-        } = event
-        else {
-            self.flush(state, session_id).await;
-            append_tool_stream_event(state, session_id, event).await;
-            return;
-        };
-
-        let can_absorb = self
-            .pending_output
-            .as_ref()
-            .is_some_and(|output| output.can_absorb(&tool_call_id, stream));
-        if !can_absorb {
-            self.flush(state, session_id).await;
-            self.pending_output = Some(ToolOutputStreamAccumulator::new(
-                tool_call_id,
-                stream,
-                sequence,
-                text,
-                byte_len,
-            ));
-            self.schedule_flush();
-        } else if let Some(output) = self.pending_output.as_mut() {
-            output.push(&text, byte_len);
-        }
-
-        if self
-            .pending_output
-            .as_ref()
-            .is_some_and(ToolOutputStreamAccumulator::should_flush)
-        {
-            self.flush(state, session_id).await;
-        }
-    }
-
-    fn enqueue_visual_update(&mut self, event: ToolInvocationStreamEvent) {
-        let ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. } = &event else {
-            unreachable!("visual enqueue requires a visual update");
-        };
-        self.pending_visuals.insert(tool_call_id.clone(), event);
-    }
-
-    fn enqueue_artifact_update(
-        &mut self,
-        metrics: &MetricsRegistry,
-        event: ToolInvocationStreamEvent,
-    ) -> (bool, bool) {
-        let ToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id,
-            artifact_id,
-            reference_key,
-            producer_plugin_id,
-            schema,
-            committed_bytes,
-            finalized,
-            ..
-        } = &event
-        else {
-            unreachable!("artifact enqueue requires an artifact update");
-        };
-        let key = (
-            tool_call_id.clone(),
-            artifact_id.clone(),
-            reference_key.clone(),
-        );
-        let now = Instant::now();
-        let mut labels = MetricLabels::new();
-        labels.insert("producer".to_owned(), producer_plugin_id.clone());
-        labels.insert("schema".to_owned(), schema.clone());
-        labels.insert("finalized".to_owned(), finalized.to_string());
-        metrics.add_counter_with_labels("tool.artifact_update.received_total", 1, labels.clone());
-        if let Some((previous_bytes, previous_at)) = self
-            .artifact_last_seen
-            .insert(key.clone(), (*committed_bytes, now))
-        {
-            metrics.record_histogram_with_labels(
-                "tool.artifact_update.committed_delta_bytes",
-                committed_bytes.saturating_sub(previous_bytes),
-                labels.clone(),
-            );
-            metrics.record_histogram_with_labels(
-                "tool.artifact_update.interarrival_ms",
-                u64::try_from(now.saturating_duration_since(previous_at).as_millis())
-                    .unwrap_or(u64::MAX),
-                labels.clone(),
-            );
-        }
-        let was_empty = self.pending_artifacts.is_empty();
-        let finalized = *finalized;
-        if self
-            .pending_artifacts
-            .insert(
-                key,
-                PendingArtifactUpdate {
-                    event,
-                    enqueued_at: now,
-                },
-            )
-            .is_some()
-        {
-            metrics.add_counter_with_labels("tool.artifact_update.coalesced_total", 1, labels);
-        }
-        (was_empty, finalized)
-    }
-
-    async fn handle_event(
-        &mut self,
-        state: &ServerState,
-        session_id: SessionId,
-        event: ToolOutputLivePublisherEvent,
-    ) {
-        match event {
-            ToolOutputLivePublisherEvent::FlushDue { generation }
-                if generation == self.flush_generation =>
-            {
-                self.flush(state, session_id).await;
-            }
-            ToolOutputLivePublisherEvent::FlushDue { .. } => {}
-        }
-    }
-
-    async fn finish(&mut self, state: &ServerState, session_id: SessionId) {
-        self.flush(state, session_id).await;
-    }
-
-    async fn flush(&mut self, state: &ServerState, session_id: SessionId) {
-        self.flush_generation = self.flush_generation.wrapping_add(1);
-        flush_tool_output_stream(state, session_id, &mut self.pending_output).await;
-        let artifacts = std::mem::take(&mut self.pending_artifacts);
-        for pending in artifacts.into_values() {
-            record_artifact_update_published(&state.metrics, &pending);
-            append_tool_stream_event(state, session_id, pending.event).await;
-        }
-        let visuals = std::mem::take(&mut self.pending_visuals);
-        for event in visuals.into_values() {
-            append_tool_stream_event(state, session_id, event).await;
-        }
-    }
-
-    fn schedule_flush(&mut self) {
-        self.flush_generation = self.flush_generation.wrapping_add(1);
-        let generation = self.flush_generation;
-        let flush_tx = self.flush_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(TOOL_OUTPUT_FLUSH_INTERVAL).await;
-            let _ = flush_tx.send(ToolOutputLivePublisherEvent::FlushDue { generation });
-        });
-    }
-}
-
-fn record_artifact_update_published(metrics: &MetricsRegistry, pending: &PendingArtifactUpdate) {
-    let ToolInvocationStreamEvent::ArtifactUpdate {
-        producer_plugin_id,
-        schema,
-        finalized,
-        ..
-    } = &pending.event
-    else {
-        return;
-    };
-    let mut labels = MetricLabels::new();
-    labels.insert("producer".to_owned(), producer_plugin_id.clone());
-    labels.insert("schema".to_owned(), schema.clone());
-    labels.insert("finalized".to_owned(), finalized.to_string());
-    metrics.add_counter_with_labels("tool.artifact_update.published_total", 1, labels.clone());
-    metrics.record_histogram_with_labels(
-        "tool.artifact_update.publish_delay_ms",
-        u64::try_from(pending.enqueued_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-        labels,
-    );
-}
-
-#[derive(Debug)]
-struct ToolOutputStreamAccumulator {
-    tool_call_id: String,
-    stream: SessionToolOutputStream,
-    first_sequence: u64,
-    text: String,
-    byte_len: usize,
-    last_flush: Instant,
-}
-
-impl ToolOutputStreamAccumulator {
-    fn new(
-        tool_call_id: String,
-        stream: SessionToolOutputStream,
-        sequence: u64,
-        text: String,
-        byte_len: usize,
-    ) -> Self {
-        Self {
-            tool_call_id,
-            stream,
-            first_sequence: sequence,
-            text,
-            byte_len,
-            last_flush: Instant::now(),
-        }
-    }
-
-    fn can_absorb(&self, tool_call_id: &str, stream: SessionToolOutputStream) -> bool {
-        self.tool_call_id == tool_call_id && self.stream == stream
-    }
-
-    fn push(&mut self, text: &str, byte_len: usize) {
-        self.text.push_str(text);
-        self.byte_len = self.byte_len.saturating_add(byte_len);
-    }
-
-    fn should_flush(&self) -> bool {
-        self.byte_len >= TOOL_OUTPUT_FLUSH_BYTES
-            || self.last_flush.elapsed() >= TOOL_OUTPUT_FLUSH_INTERVAL
-    }
-
-    fn into_event(self) -> ToolInvocationStreamEvent {
-        ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id: self.tool_call_id,
-            stream: self.stream,
-            sequence: self.first_sequence,
-            text: self.text,
-            byte_len: self.byte_len,
-        }
-    }
-}
-
-async fn flush_tool_output_stream(
-    state: &ServerState,
-    session_id: SessionId,
-    pending_output: &mut Option<ToolOutputStreamAccumulator>,
-) {
-    if let Some(output) = pending_output.take() {
-        let _ = state
-            .sessions
-            .publish_live_event(
-                session_id,
-                SessionLiveEventKind::ToolOutputDelta {
-                    event: output.into_event(),
-                },
-            )
-            .await;
-    }
-}
-
-#[cfg(test)]
-async fn push_tool_output_stream(
-    state: &ServerState,
-    session_id: SessionId,
-    pending_output: &mut Option<ToolOutputStreamAccumulator>,
-    event: ToolInvocationStreamEvent,
-) {
-    let ToolInvocationStreamEvent::OutputDelta {
-        tool_call_id,
-        stream,
-        sequence,
-        text,
-        byte_len,
-    } = event
-    else {
-        append_tool_stream_event(state, session_id, event).await;
-        return;
-    };
-
-    let can_absorb = pending_output
-        .as_ref()
-        .is_some_and(|output| output.can_absorb(&tool_call_id, stream));
-    if !can_absorb {
-        flush_tool_output_stream(state, session_id, pending_output).await;
-        *pending_output = Some(ToolOutputStreamAccumulator::new(
-            tool_call_id,
-            stream,
-            sequence,
-            text,
-            byte_len,
-        ));
-    } else if let Some(output) = pending_output.as_mut() {
-        output.push(&text, byte_len);
-    }
-
-    if pending_output
-        .as_ref()
-        .is_some_and(ToolOutputStreamAccumulator::should_flush)
-    {
-        flush_tool_output_stream(state, session_id, pending_output).await;
-    }
 }
 
 #[derive(Debug)]
@@ -15617,6 +15289,8 @@ struct ServerToolInvoker<'a> {
     session_id: SessionId,
     working_directory: &'a Path,
     cancel_state: &'a TurnCancelState,
+    persist_requests: bool,
+    persist_lifecycle: bool,
 }
 
 impl<'a> ServerToolInvoker<'a> {
@@ -15631,7 +15305,15 @@ impl<'a> ServerToolInvoker<'a> {
             session_id,
             working_directory,
             cancel_state,
+            persist_requests: false,
+            persist_lifecycle: true,
         }
+    }
+
+    const fn for_production_batch(mut self) -> Self {
+        self.persist_requests = true;
+        self.persist_lifecycle = false;
+        self
     }
 }
 
@@ -15656,7 +15338,8 @@ impl ToolInvoker for ServerToolInvoker<'_> {
                 invocation: request.invocation.clone(),
                 host_context: scope.host_context().to_vec(),
             };
-            self.state
+            let preparation = self
+                .state
                 .plugins
                 .invoke_service_json_scoped::<_, ToolPreparationResponse>(
                     plugin_id,
@@ -15672,9 +15355,30 @@ impl ToolInvoker for ServerToolInvoker<'_> {
                 )
                 .await
                 .map_err(|error| RuntimeError::ToolPreparation {
-                    tool_name: request.invocation.tool_name,
+                    tool_name: request.invocation.tool_name.clone(),
                     message: error.to_string(),
-                })
+                })?;
+            tool_policy_authorization_metadata(
+                &preparation.authorization,
+                &request.invocation.tool_name,
+            )
+            .map_err(|message| RuntimeError::ToolPreparation {
+                tool_name: request.invocation.tool_name.clone(),
+                message,
+            })?;
+            if self.persist_requests {
+                append_tool_request_event(
+                    self.state,
+                    self.session_id,
+                    request.invocation.invocation_id.clone(),
+                    request.invocation.tool_name.clone(),
+                    serde_json::to_string(&request.invocation.arguments).unwrap_or_default(),
+                    Some(plugin_id.clone()),
+                    self.working_directory,
+                )
+                .await;
+            }
+            Ok(preparation)
         })
     }
 
@@ -15684,45 +15388,153 @@ impl ToolInvoker for ServerToolInvoker<'_> {
         invocation: &'a PreparedToolInvocation,
         scope: &'a InvocationScope,
     ) -> RuntimeFuture<'a, ToolInvocationResponse> {
-        Box::pin(async move {
-            let ToolSource::Plugin { plugin_id } = &tool.source else {
-                return Err(RuntimeError::ToolExecution {
-                    tool_name: invocation.invocation.tool_name.clone(),
-                    message: "server cannot invoke a non-plugin tool".to_owned(),
-                });
-            };
-            let policy_metadata = tool_policy_authorization_metadata(
-                &invocation.preparation.authorization,
-                &invocation.invocation.tool_name,
-            )
-            .map_err(|message| RuntimeError::ToolExecution {
-                tool_name: invocation.invocation.tool_name.clone(),
-                message,
-            })?;
-            let call = bcode_model::ToolCall {
-                id: invocation.invocation.invocation_id.clone(),
-                name: invocation.invocation.tool_name.clone(),
-                arguments: invocation.invocation.arguments.clone(),
-            };
-            invoke_model_tool(
-                self.state,
-                self.session_id,
-                &call,
-                self.working_directory,
-                plugin_id,
-                &policy_metadata,
-                invocation.preparation.descriptor.clone(),
-                self.cancel_state,
-                Some(scope),
-                None,
-            )
-            .await
-            .map_err(|message| RuntimeError::ToolExecution {
-                tool_name: call.name,
-                message,
-            })
-        })
+        Box::pin(invoke_server_registered_tool(self, tool, invocation, scope))
     }
+}
+
+async fn invoke_server_registered_tool(
+    invoker: &ServerToolInvoker<'_>,
+    tool: &RegisteredTool,
+    invocation: &PreparedToolInvocation,
+    scope: &InvocationScope,
+) -> Result<ToolInvocationResponse, RuntimeError> {
+    let ToolSource::Plugin { plugin_id } = &tool.source else {
+        return Err(RuntimeError::ToolExecution {
+            tool_name: invocation.invocation.tool_name.clone(),
+            message: "server cannot invoke a non-plugin tool".to_owned(),
+        });
+    };
+    let policy_metadata = tool_policy_authorization_metadata(
+        &invocation.preparation.authorization,
+        &invocation.invocation.tool_name,
+    )
+    .map_err(|message| RuntimeError::ToolExecution {
+        tool_name: invocation.invocation.tool_name.clone(),
+        message,
+    })?;
+    let call = bcode_model::ToolCall {
+        id: invocation.invocation.invocation_id.clone(),
+        name: invocation.invocation.tool_name.clone(),
+        arguments: invocation.invocation.arguments.clone(),
+    };
+    let tool_labels =
+        tool_invocation_metric_labels(invoker.session_id, &call.name, Some(plugin_id.as_str()));
+    let tool_span = invoker
+        .state
+        .metrics
+        .span("tool.invocation")
+        .labels(tool_labels.clone());
+    let tool_start = Instant::now();
+    if invoker.persist_lifecycle {
+        append_tool_invocation_lifecycle_event(
+            invoker.state,
+            invoker.session_id,
+            bcode_session_models::ToolInvocationLifecycleEvent {
+                invocation_id: call.id.clone(),
+                sequence: 0,
+                stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                message: None,
+                metadata: serde_json::Value::Null,
+            },
+        )
+        .await;
+    }
+    let result = invoke_plugin_tool_transport(
+        invoker.state,
+        invoker.session_id,
+        &call,
+        invoker.working_directory,
+        plugin_id,
+        &policy_metadata,
+        invocation.preparation.descriptor.clone(),
+        invoker.cancel_state,
+        Some(scope),
+        !invoker.persist_lifecycle,
+    )
+    .await
+    .unwrap_or_else(tool_error);
+    if invoker.cancel_state.is_cancelled() || !scope.accepts_work() {
+        let _ = scope.turn().control().begin_cancellation();
+        if invoker.persist_lifecycle {
+            append_tool_invocation_terminal_event(
+                invoker.state,
+                invoker.session_id,
+                &call.id,
+                bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+            )
+            .await;
+        }
+        tool_span.finish_err();
+        return Err(RuntimeError::Cancelled);
+    }
+    finish_server_registered_tool(invoker, call, result, tool_labels, tool_span, tool_start).await
+}
+
+async fn finish_server_registered_tool(
+    invoker: &ServerToolInvoker<'_>,
+    call: bcode_model::ToolCall,
+    result: ToolInvocationResponse,
+    tool_labels: MetricLabels,
+    tool_span: bcode_metrics::MetricsSpan,
+    tool_start: Instant,
+) -> Result<ToolInvocationResponse, RuntimeError> {
+    let lifecycle_stage = if result.is_error {
+        bcode_session_models::ToolInvocationLifecycleStage::Failed
+    } else {
+        bcode_session_models::ToolInvocationLifecycleStage::Completed
+    };
+    if invoker.persist_lifecycle {
+        append_tool_invocation_terminal_event(
+            invoker.state,
+            invoker.session_id,
+            &call.id,
+            lifecycle_stage,
+        )
+        .await;
+    }
+    let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
+    let output_bytes = artifact_output.len();
+    invoker.state.metrics.record_histogram_with_labels(
+        "tool.invocation.output_bytes",
+        usize_to_u64(output_bytes),
+        tool_labels.clone(),
+    );
+    if result.is_error {
+        invoker.state.metrics.add_counter_with_labels(
+            "tool.invocation.errors_total",
+            1,
+            tool_labels,
+        );
+        tool_span.finish_err();
+    } else {
+        tool_span.finish_ok();
+    }
+    let output_blob = (invoker.state.observability.persist_tool_io
+        || invoker.state.observability.debug_enabled())
+    .then(|| {
+        invoker.state.trace_store.write_text_blob(
+            invoker.session_id,
+            &format!("tool-output-{}", call.id),
+            artifact_output,
+            0,
+        )
+    })
+    .flatten();
+    append_trace_event(
+        invoker.state,
+        invoker.session_id,
+        None,
+        SessionTracePhase::ToolInvocationFinished,
+        SessionTracePayload::ToolInvocationFinished {
+            tool_call_id: call.id,
+            duration_ms: elapsed_ms(tool_start),
+            is_error: result.is_error,
+            output_bytes,
+            output: output_blob,
+        },
+    )
+    .await;
+    Ok(result)
 }
 
 async fn collect_server_tool_catalog(state: &ServerState) -> Result<UnifiedToolCatalog, String> {
@@ -16038,298 +15850,257 @@ impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-async fn execute_model_tool_batch(
+enum SessionInvocationSinkMessage {
+    Event(Box<ScopedTurnEvent>),
+    Flush(oneshot::Sender<Result<(), String>>),
+}
+
+#[derive(Debug)]
+struct SessionInvocationSink {
+    sender: StdMutex<Option<mpsc::Sender<SessionInvocationSinkMessage>>>,
+}
+
+impl SessionInvocationSink {
+    fn new(capacity: usize) -> (Arc<Self>, mpsc::Receiver<SessionInvocationSinkMessage>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            Arc::new(Self {
+                sender: StdMutex::new(Some(sender)),
+            }),
+            receiver,
+        )
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        let sink_sender = self
+            .sender
+            .lock()
+            .map_err(|_| "session invocation sink sender poisoned".to_owned())?
+            .take()
+            .ok_or_else(|| "session invocation sink is already closed".to_owned())?;
+        let (acknowledgement, receiver) = oneshot::channel();
+        sink_sender
+            .send(SessionInvocationSinkMessage::Flush(acknowledgement))
+            .await
+            .map_err(|_| "session invocation sink closed before flush".to_owned())?;
+        receiver
+            .await
+            .map_err(|_| "session invocation sink flush acknowledgement closed".to_owned())?
+    }
+}
+
+impl TurnEventSink for SessionInvocationSink {
+    fn emit(&self, event: ScopedTurnEvent) -> bool {
+        self.sender.lock().is_ok_and(|sender| {
+            sender.as_ref().is_some_and(|sender| {
+                sender
+                    .try_send(SessionInvocationSinkMessage::Event(Box::new(event)))
+                    .is_ok()
+            })
+        })
+    }
+}
+
+async fn drain_session_invocation_sink(
     state: &ServerState,
+    session_id: SessionId,
+    mut receiver: mpsc::Receiver<SessionInvocationSinkMessage>,
+) {
+    let mut failure = None;
+    while let Some(message) = receiver.recv().await {
+        match message {
+            SessionInvocationSinkMessage::Event(event) if failure.is_none() => {
+                if let Err(error) = persist_scoped_turn_event(state, session_id, *event).await {
+                    failure = Some(error);
+                    receiver.close();
+                }
+            }
+            SessionInvocationSinkMessage::Event(_) => {}
+            SessionInvocationSinkMessage::Flush(sender) => {
+                let _ = sender.send(failure.clone().map_or(Ok(()), Err));
+                break;
+            }
+        }
+    }
+}
+
+async fn persist_scoped_turn_event(
+    state: &ServerState,
+    session_id: SessionId,
+    event: ScopedTurnEvent,
+) -> Result<(), String> {
+    match event {
+        ScopedTurnEvent::Runtime(_) => Ok(()),
+        ScopedTurnEvent::InvocationLifecycle(event) => {
+            let invocation_id = event.invocation_id.clone();
+            let terminal = matches!(
+                event.stage,
+                bcode_session_models::ToolInvocationLifecycleStage::Completed
+                    | bcode_session_models::ToolInvocationLifecycleStage::Failed
+                    | bcode_session_models::ToolInvocationLifecycleStage::Cancelled
+            );
+            let appended = state
+                .sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::ToolInvocationLifecycle { event },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            publish_session_event(state, &appended).await;
+            if terminal {
+                clear_active_contributions(state, session_id, &invocation_id).await;
+            }
+            Ok(())
+        }
+        ScopedTurnEvent::Contribution(event) => {
+            let invocation_id = event.invocation_id.clone();
+            let producer_id = event.producer_id.clone();
+            append_tool_contribution_event(state, session_id, &invocation_id, &producer_id, event)
+                .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_model_tool_batch<'a>(
+    state: &'a ServerState,
     session_id: SessionId,
     calls: Vec<bcode_model::ToolCall>,
     cancel_state: Arc<TurnCancelState>,
-    command_context: &mut RuntimeCommandContext<'_>,
+    command_context: &'a mut RuntimeCommandContext<'_>,
     execution: &bcode_session_models::TurnExecutionOptions,
-) -> bool {
+) -> ProviderCallFuture<'a, bool> {
     let tool_policy = execution.tools;
     let tool_allowlist = execution
         .tool_allowlist
         .as_ref()
         .map(|tools| tools.iter().cloned().collect::<BTreeSet<_>>());
-    let call_count = calls.len();
-    let catalog = match tokio::select! {
-        biased;
-        () = cancel_state.cancelled() => return false,
-        catalog = tokio::time::timeout(
-            Duration::from_millis(state.tool_execution.preparation_timeout_ms.get()),
-            collect_server_tool_catalog(state),
-        ) => catalog,
-    } {
-        Ok(Ok(catalog)) => catalog,
-        Ok(Err(message)) => {
-            tracing::warn!(%message, "failed to build server tool registry");
-            return false;
-        }
-        Err(_) => {
-            tracing::warn!("timed out building server tool registry");
-            return false;
-        }
-    };
-    let mut ready = Vec::new();
-    let mut results = Vec::new();
-    for (index, call) in calls.into_iter().enumerate() {
-        if cancel_state.is_cancelled() {
-            return false;
-        }
-        if tool_allowlist
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&call.name))
-        {
-            results.push((
-                index,
-                Some(ToolFinishedEventInput {
-                    tool_call_id: call.id,
-                    result: format!("tool denied by turn allowlist: {}", call.name),
-                    is_error: true,
-                    content: Vec::new(),
-                    semantic_result: None,
-                }),
-            ));
-            continue;
-        }
-        let Some(tool) = catalog.find_tool(&call.name) else {
-            results.push((
-                index,
-                Some(ToolFinishedEventInput {
-                    tool_call_id: call.id,
-                    result: format!("tool not found: {}", call.name),
-                    is_error: true,
-                    content: Vec::new(),
-                    semantic_result: None,
-                }),
-            ));
-            continue;
-        };
-        let preparation = tokio::select! {
+    let agent_profile = execution.agent_profile.clone();
+    Box::pin(async move {
+        let catalog = match tokio::select! {
             biased;
             () = cancel_state.cancelled() => return false,
-            preparation = tokio::time::timeout(
+            catalog = tokio::time::timeout(
                 Duration::from_millis(state.tool_execution.preparation_timeout_ms.get()),
-                prepare_registered_server_tool(
-                    state,
-                    session_id,
-                    tool.clone(),
-                    &call,
-                    cancel_state.as_ref(),
-                ),
-            ) => preparation,
-        };
-        let preparation = match preparation {
-            Ok(Ok(prepared)) => prepared,
+                collect_server_tool_catalog(state),
+            ) => catalog,
+        } {
+            Ok(Ok(catalog)) => catalog,
             Ok(Err(message)) => {
-                results.push((
-                    index,
-                    Some(ToolFinishedEventInput {
-                        tool_call_id: call.id,
-                        result: format!("tool preparation failed: {message}"),
-                        is_error: true,
-                        content: Vec::new(),
-                        semantic_result: None,
-                    }),
-                ));
-                continue;
+                tracing::warn!(%message, "failed to build server tool registry");
+                return false;
             }
             Err(_) => {
-                results.push((
-                    index,
-                    Some(ToolFinishedEventInput {
-                        tool_call_id: call.id,
-                        result: "tool preparation timed out".to_string(),
-                        is_error: true,
-                        content: Vec::new(),
-                        semantic_result: None,
-                    }),
-                ));
-                continue;
+                tracing::warn!("timed out building server tool registry");
+                return false;
             }
         };
-        let policy_metadata =
-            match tool_policy_authorization_metadata(&preparation.authorization, &call.name) {
-                Ok(metadata) => metadata,
-                Err(message) => {
-                    results.push((
-                        index,
-                        Some(ToolFinishedEventInput {
-                            tool_call_id: call.id,
-                            result: format!("tool authorization facts invalid: {message}"),
-                            is_error: true,
-                            content: Vec::new(),
-                            semantic_result: None,
-                        }),
-                    ));
-                    continue;
+        let catalog = if let Some(tool_allowlist) = tool_allowlist {
+            let mut filtered = UnifiedToolCatalog::new();
+            for tool in catalog.tools() {
+                if tool_allowlist.contains(&tool.definition.name) {
+                    filtered.insert(tool);
                 }
-            };
+            }
+            filtered
+        } else {
+            catalog
+        };
         let Ok(working_directory) = state.sessions.session_working_directory(session_id).await
         else {
             return false;
         };
-        append_tool_request_event(
-            state,
-            session_id,
-            call.id.clone(),
-            call.name.clone(),
-            serde_json::to_string(&call.arguments).unwrap_or_default(),
-            match &tool.source {
-                ToolSource::Plugin { plugin_id } => Some(plugin_id.clone()),
-                ToolSource::Inline => None,
-            },
-            &working_directory,
-        )
-        .await;
-        ready.push((
-            index,
-            call,
-            working_directory,
-            tool,
-            policy_metadata,
-            preparation,
-        ));
-    }
-
-    if !ready.is_empty() {
-        let agent_id = execution
-            .agent_profile
-            .clone()
-            .unwrap_or(session_agent_selection(state, session_id).await);
-        let permission_context = bcode_agent_runtime::RuntimePermissionContext {
-            session_id,
-            agent_id: agent_id.clone(),
-        };
-        let authorization_requests = ready
-            .iter()
-            .map(
-                |(index, call, _, tool, _, preparation)| ToolAuthorizationRequest {
-                    index: *index,
-                    call: call.clone(),
-                    tool: tool.clone(),
-                    facts: preparation.authorization.clone(),
-                    context: permission_context.clone(),
-                },
-            )
-            .collect::<Vec<_>>();
-        let authorization_scope = TurnScope::without_events(
+        let host_context = invocation_service_host_context(state, session_id).await;
+        let sink_capacity = calls.len().saturating_mul(8).max(32);
+        let (sink, sink_receiver) = SessionInvocationSink::new(sink_capacity);
+        let sink_drain = drain_session_invocation_sink(state, session_id, sink_receiver);
+        let scope = TurnScope::new(
             format!("server-tool-batch:{session_id}"),
-            TurnGeneration::new(0),
+            TurnGeneration::new(1),
+            sink.clone(),
         );
+        let invoker =
+            ServerToolInvoker::new(state, session_id, &working_directory, cancel_state.as_ref())
+                .for_production_batch();
+        let agent_id = agent_profile.unwrap_or(session_agent_selection(state, session_id).await);
         let coordinator = ServerAuthorizationCoordinator::new(
             state,
             session_id,
             cancel_state.as_ref(),
-            call_count,
+            calls.len(),
             tool_policy,
             &agent_id,
         );
-        let authorization =
-            coordinator.authorize_batch(&authorization_requests, &authorization_scope);
-        let ProviderCallWait::Completed(Ok(decisions)) = wait_for_provider_call(
-            state,
+        let permission_context = bcode_agent_runtime::RuntimePermissionContext {
             session_id,
-            command_context,
-            cancel_state.as_ref(),
-            Box::pin(authorization),
-        )
-        .await
-        else {
+            agent_id: agent_id.clone(),
+        };
+        let mut rounds = ToolRoundState::new(1);
+        let runtime = AgentRuntime::new();
+        let batch_flow = async {
+            let execution = runtime.execute_prepared_tool_batch_with_host_context(
+                &catalog,
+                &coordinator,
+                &invoker,
+                &calls,
+                &mut rounds,
+                &permission_context,
+                &host_context,
+                state.tool_execution,
+                &scope,
+            );
+            let completed = wait_for_server_tool_batch(
+                state,
+                session_id,
+                command_context,
+                cancel_state.as_ref(),
+                &scope,
+                Box::pin(execution),
+            )
+            .await;
+            let batch = match completed {
+                FinalizedProviderCall::Completed(Ok(batch)) => Some(batch),
+                FinalizedProviderCall::Completed(Err(_)) | FinalizedProviderCall::Cancelled(_) => {
+                    let _ = scope.control().begin_cancellation();
+                    None
+                }
+            };
+            let flush = sink.flush().await;
+            flush.map(|()| batch)
+        };
+        let (batch, ()) = tokio::join!(batch_flow, sink_drain);
+        let Ok(Some(batch)) = batch else {
             return false;
         };
-        if decisions.len() != ready.len() {
+        if cancel_state.is_cancelled() {
             return false;
         }
-        let mut approved = Vec::new();
-        for ((index, call, working_directory, tool, _policy_metadata, preparation), decision) in
-            ready.into_iter().zip(decisions)
-        {
-            match decision {
-                ToolAuthorizationDecision::Allow => {
-                    approved.push((index, call, working_directory, tool, preparation));
-                }
-                ToolAuthorizationDecision::Ask(reason)
-                | ToolAuthorizationDecision::Deny(reason) => results.push((
-                    index,
-                    Some(ToolFinishedEventInput {
-                        tool_call_id: call.id,
-                        result: reason,
-                        is_error: true,
-                        content: Vec::new(),
-                        semantic_result: None,
-                    }),
-                )),
-            }
-        }
-        if approved.is_empty() {
-            results.sort_by_key(|(index, _)| *index);
-            for (_, result) in results {
-                if let Some(result) = result {
-                    append_tool_finished_event(state, session_id, result).await;
-                }
-            }
-            return !cancel_state.is_cancelled();
-        }
-        let invocation_permits = if state.tool_execution.parallel {
-            state
-                .tool_execution
-                .max_concurrency
-                .map(|limit| Arc::new(Semaphore::new(limit.get())))
-        } else {
-            Some(Arc::new(Semaphore::new(1)))
-        };
-        let execution_count = approved.len();
-        let executions = stream::iter(approved.into_iter().map(
-            |(index, call, working_directory, tool, preparation)| {
-                let cancel_state = Arc::clone(&cancel_state);
-                let invocation_permits = invocation_permits.clone();
-                async move {
-                    (
-                        index,
-                        execute_model_tool(
-                            state,
-                            session_id,
-                            call,
-                            working_directory,
-                            tool,
-                            preparation,
-                            cancel_state,
-                            invocation_permits,
-                        )
-                        .await,
-                    )
-                }
-            },
-        ))
-        .buffer_unordered(execution_count)
-        .collect::<Vec<_>>();
-        let finalized = wait_for_finalizable_provider_call(
-            state,
-            session_id,
-            command_context,
-            cancel_state.as_ref(),
-            Box::pin(executions),
-        )
-        .await;
-        let executed = match finalized {
-            FinalizedProviderCall::Completed(executed)
-            | FinalizedProviderCall::Cancelled(executed) => executed,
-        };
-        results.extend(executed);
-    }
 
-    results.sort_by_key(|(index, _)| *index);
-    for (_, result) in results {
-        if let Some(result) = result {
-            append_tool_finished_event(state, session_id, result).await;
+        for (call, result) in calls.clone().into_iter().zip(batch.results) {
+            let input = match result {
+                Ok(output) => ToolFinishedEventInput {
+                    tool_call_id: call.id,
+                    result: output.invocation.output,
+                    is_error: output.invocation.is_error,
+                    content: output.invocation.content,
+                    semantic_result: output.invocation.result.map(service_tool_result_to_session),
+                },
+                Err(error) => ToolFinishedEventInput {
+                    tool_call_id: call.id,
+                    result: error.to_string(),
+                    is_error: true,
+                    content: Vec::new(),
+                    semantic_result: None,
+                },
+            };
+            append_tool_finished_event(state, session_id, input).await;
         }
-    }
-    !cancel_state.is_cancelled()
+        !cancel_state.is_cancelled()
+    })
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(test)]
 async fn execute_model_tool(
     state: &ServerState,
     session_id: SessionId,
@@ -16338,72 +16109,15 @@ async fn execute_model_tool(
     tool: RegisteredTool,
     preparation: ToolPreparationResponse,
     cancel_state: Arc<TurnCancelState>,
-    invocation_permits: Option<Arc<Semaphore>>,
 ) -> Option<ToolFinishedEventInput> {
-    let producer_plugin_id = match &tool.source {
-        ToolSource::Plugin { plugin_id } => Some(plugin_id.clone()),
-        ToolSource::Inline => None,
-    };
-    if cancel_state.is_cancelled() {
-        cancel_registered_runtime_work(
-            state,
-            session_id,
-            WorkId::new(format!("tool_{}", call.id)),
-            None,
-        )
-        .await;
-        return None;
-    }
-    let _invocation_permit = if let Some(permits) = invocation_permits {
-        Some(tokio::select! {
-            biased;
-            () = cancel_state.cancelled() => {
-                cancel_registered_runtime_work(
-                    state,
-                    session_id,
-                    WorkId::new(format!("tool_{}", call.id)),
-                    None,
-                )
-                .await;
-                return None;
-            }
-            permit = permits.acquire_owned() => {
-                match permit {
-                    Ok(permit) => permit,
-                    Err(_) => return None,
-                }
-            }
-        })
-    } else {
-        None
-    };
     if cancel_state.is_cancelled() {
         return None;
     }
-    append_tool_invocation_lifecycle_event(
-        state,
-        session_id,
-        bcode_session_models::ToolInvocationLifecycleEvent {
-            invocation_id: call.id.clone(),
-            sequence: 0,
-            stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
-            message: None,
-            metadata: serde_json::Value::Null,
-        },
-    )
-    .await;
-    let tool_labels =
-        tool_invocation_metric_labels(session_id, &call.name, producer_plugin_id.as_deref());
-    let tool_span = state
-        .metrics
-        .span("tool.invocation")
-        .labels(tool_labels.clone());
-    let tool_start = Instant::now();
     let invocation = PreparedToolInvocation {
         invocation: ToolInvocationDescriptor {
             invocation_id: call.id.clone(),
             tool_name: call.name.clone(),
-            arguments: call.arguments.clone(),
+            arguments: call.arguments,
         },
         preparation,
     };
@@ -16419,78 +16133,13 @@ async fn execute_model_tool(
     let result = invoker
         .invoke_tool(&tool, &invocation, &invocation_scope)
         .await
-        .unwrap_or_else(|error| ToolInvocationResponse {
-            output: error.to_string(),
-            is_error: true,
-            content: Vec::new(),
-            full_output: None,
-            result: None,
-        });
-    if cancel_state.is_cancelled() {
-        append_tool_invocation_terminal_event(
-            state,
-            session_id,
-            &call.id,
-            bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
-        )
-        .await;
-        tool_span.finish_err();
-        return None;
-    }
-    let lifecycle_stage = if result.is_error {
-        bcode_session_models::ToolInvocationLifecycleStage::Failed
-    } else {
-        bcode_session_models::ToolInvocationLifecycleStage::Completed
-    };
-    append_tool_invocation_terminal_event(state, session_id, &call.id, lifecycle_stage).await;
-    let semantic_result = result.result.clone().map(service_tool_result_to_session);
-    let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
-    let output_bytes = artifact_output.len();
-    state.metrics.record_histogram_with_labels(
-        "tool.invocation.output_bytes",
-        usize_to_u64(output_bytes),
-        tool_labels.clone(),
-    );
-    if result.is_error {
-        state.metrics.add_counter_with_labels(
-            "tool.invocation.errors_total",
-            1,
-            tool_labels.clone(),
-        );
-        tool_span.finish_err();
-    } else {
-        tool_span.finish_ok();
-    }
-    let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
-        .then(|| {
-            state.trace_store.write_text_blob(
-                session_id,
-                &format!("tool-output-{}", call.id),
-                artifact_output,
-                0,
-            )
-        })
-        .flatten();
-    append_trace_event(
-        state,
-        session_id,
-        None,
-        SessionTracePhase::ToolInvocationFinished,
-        SessionTracePayload::ToolInvocationFinished {
-            tool_call_id: call.id.clone(),
-            duration_ms: elapsed_ms(tool_start),
-            is_error: result.is_error,
-            output_bytes,
-            output: output_blob.clone(),
-        },
-    )
-    .await;
+        .ok()?;
     Some(ToolFinishedEventInput {
         tool_call_id: call.id,
         result: result.output,
         is_error: result.is_error,
         content: result.content,
-        semantic_result,
+        semantic_result: result.result.map(service_tool_result_to_session),
     })
 }
 
@@ -17065,7 +16714,7 @@ impl InvocationCancellation for ServerPluginInvocationCancellation {
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn invoke_model_tool(
+async fn invoke_plugin_tool_transport(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
@@ -17075,7 +16724,7 @@ async fn invoke_model_tool(
     preparation_descriptor: serde_json::Value,
     cancel_state: &TurnCancelState,
     invocation_scope: Option<&InvocationScope>,
-    invocation_permits: Option<Arc<Semaphore>>,
+    route_canonical_events_to_scope: bool,
 ) -> Result<ToolInvocationResponse, String> {
     if cancel_state.is_cancelled() {
         return Ok(ToolInvocationResponse {
@@ -17086,19 +16735,6 @@ async fn invoke_model_tool(
             result: None,
         });
     }
-    let _invocation_permit = if let Some(permits) = invocation_permits {
-        Some(tokio::select! {
-            biased;
-            () = cancel_state.cancelled() => {
-                return Ok(tool_error("tool cancelled before invocation admission"));
-            }
-            permit = permits.acquire_owned() => {
-                permit.map_err(|_| "tool invocation admission closed".to_string())?
-            }
-        })
-    } else {
-        None
-    };
     if cancel_state.is_cancelled() {
         return Ok(tool_error("tool cancelled before invocation"));
     }
@@ -17134,7 +16770,6 @@ async fn invoke_model_tool(
     let _action_registration = ActivePluginInvocationRegistration::register(
         Arc::clone(&state.active_plugin_invocations),
         Arc::clone(&state.active_artifacts),
-        Arc::clone(&state.active_plugin_visuals),
         session_id,
         &call.id,
         ActivePluginInvocation {
@@ -17185,8 +16820,6 @@ async fn invoke_model_tool(
         invocation.cancel.cancel();
         return Ok(tool_error("tool cancelled before invocation became active"));
     }
-    let mut tool_output_publisher = ToolOutputLivePublisher::new();
-    let mut stream_sequences: BTreeMap<String, u64> = BTreeMap::new();
     let response = loop {
         tokio::select! {
             biased;
@@ -17207,11 +16840,6 @@ async fn invoke_model_tool(
                 drop(bridge_resolutions);
                 input_receiver.lock().await.close();
                 return Ok(tool_error("tool invocation cancelled"));
-            }
-            publisher_event = tool_output_publisher.next_event() => {
-                if let Some(publisher_event) = publisher_event {
-                    tool_output_publisher.handle_event(state, session_id, publisher_event).await;
-                }
             }
             bridge_call = async {
                 bridge_requests
@@ -17248,13 +16876,24 @@ async fn invoke_model_tool(
                                 bcode_session_models::ToolInvocationLifecycleEvent,
                             >(&payload)
                             {
-                                append_plugin_tool_lifecycle_event(
-                                    state,
-                                    session_id,
-                                    &call.id,
-                                    lifecycle,
-                                )
-                                .await;
+                                if route_canonical_events_to_scope {
+                                    if let Some(scope) = invocation_scope
+                                        && !scope.emit_lifecycle(lifecycle)
+                                    {
+                                        return Err(
+                                            "session invocation sink rejected lifecycle event"
+                                                .to_owned(),
+                                        );
+                                    }
+                                } else {
+                                    append_plugin_tool_lifecycle_event(
+                                        state,
+                                        session_id,
+                                        &call.id,
+                                        lifecycle,
+                                    )
+                                    .await;
+                                }
                             } else if let Ok(envelope) = serde_json::from_slice::<
                                 bcode_session_models::ToolContributionEnvelope,
                             >(&payload)
@@ -17271,25 +16910,26 @@ async fn invoke_model_tool(
                                 bcode_session_models::ToolContributionEvent,
                             >(&payload)
                             {
-                                append_tool_contribution_event(
+                                if route_canonical_events_to_scope {
+                                    if let Some(scope) = invocation_scope
+                                        && !scope.emit_contribution(contribution)
+                                    {
+                                        return Err(
+                                            "session invocation sink rejected contribution"
+                                                .to_owned(),
+                                        );
+                                    }
+                                } else if let Err(error) = append_tool_contribution_event(
                                     state,
                                     session_id,
                                     &call.id,
                                     plugin_id,
                                     contribution,
                                 )
-                                .await;
-                            } else if let Ok(event) = serde_json::from_slice::<
-                                ServiceToolInvocationStreamEvent,
-                            >(&payload)
-                            {
-                                let event = normalize_tool_stream_event_sequence(
-                                    event,
-                                    &mut stream_sequences,
-                                );
-                                tool_output_publisher
-                                    .push_stream_event(state, session_id, event)
-                                    .await;
+                                .await
+                                {
+                                    tracing::warn!(%error, "failed to route tool contribution");
+                                }
                             }
                         }
                     }
@@ -17308,7 +16948,15 @@ async fn invoke_model_tool(
         if let Ok(lifecycle) =
             serde_json::from_slice::<bcode_session_models::ToolInvocationLifecycleEvent>(&payload)
         {
-            append_plugin_tool_lifecycle_event(state, session_id, &call.id, lifecycle).await;
+            if route_canonical_events_to_scope {
+                if let Some(scope) = invocation_scope
+                    && !scope.emit_lifecycle(lifecycle)
+                {
+                    return Err("session invocation sink rejected lifecycle event".to_owned());
+                }
+            } else {
+                append_plugin_tool_lifecycle_event(state, session_id, &call.id, lifecycle).await;
+            }
         } else if let Ok(envelope) =
             serde_json::from_slice::<bcode_session_models::ToolContributionEnvelope>(&payload)
         {
@@ -17317,18 +16965,20 @@ async fn invoke_model_tool(
         } else if let Ok(contribution) =
             serde_json::from_slice::<bcode_session_models::ToolContributionEvent>(&payload)
         {
-            append_tool_contribution_event(state, session_id, &call.id, plugin_id, contribution)
-                .await;
-        } else if let Ok(event) =
-            serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
-        {
-            let event = normalize_tool_stream_event_sequence(event, &mut stream_sequences);
-            tool_output_publisher
-                .push_stream_event(state, session_id, event)
-                .await;
+            if route_canonical_events_to_scope {
+                if let Some(scope) = invocation_scope
+                    && !scope.emit_contribution(contribution)
+                {
+                    return Err("session invocation sink rejected contribution".to_owned());
+                }
+            } else if let Err(error) =
+                append_tool_contribution_event(state, session_id, &call.id, plugin_id, contribution)
+                    .await
+            {
+                tracing::warn!(%error, "failed to route trailing tool contribution");
+            }
         }
     }
-    tool_output_publisher.finish(state, session_id).await;
     if let Some(scope) = invocation_scope {
         let _ = scope.unregister_cancellation();
     }
@@ -17584,7 +17234,7 @@ async fn append_tool_contribution_event(
     invocation_id: &str,
     producer_id: &str,
     event: bcode_session_models::ToolContributionEvent,
-) {
+) -> Result<(), String> {
     if event.invocation_id != invocation_id || event.producer_id != producer_id {
         tracing::warn!(
             expected_invocation_id = invocation_id,
@@ -17593,7 +17243,7 @@ async fn append_tool_contribution_event(
             actual_producer_id = event.producer_id,
             "discarded tool contribution with mismatched invocation or producer identity"
         );
-        return;
+        return Err("tool contribution identity does not match the active invocation".to_owned());
     }
     if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
         if let Some(artifact_event) = contribution_artifact_stream_event(&event)
@@ -17607,8 +17257,7 @@ async fn append_tool_contribution_event(
                 )),
             )
         {
-            tracing::warn!(%error, "discarded tool contribution with invalid artifact revision");
-            return;
+            return Err(error);
         }
         match update_active_contribution(state, session_id, &event) {
             Ok(true) => {
@@ -17621,18 +17270,17 @@ async fn append_tool_contribution_event(
                     .await;
             }
             Ok(false) => {}
-            Err(error) => tracing::warn!(%error, "discarded invalid active tool contribution"),
+            Err(error) => return Err(error),
         }
-        return;
+        return Ok(());
     }
-    match state
+    let appended = state
         .sessions
         .append_event(session_id, SessionEventKind::ToolContribution { event })
         .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!(%error, "failed to append tool contribution event"),
-    }
+        .map_err(|error| error.to_string())?;
+    publish_session_event(state, &appended).await;
+    Ok(())
 }
 
 async fn resolve_tool_exchange(
@@ -17803,7 +17451,7 @@ fn active_artifact_snapshot_events(
         .active_artifacts
         .lock()
         .map_err(|_| "active artifact registry poisoned".to_owned())?;
-    let mut events = artifacts
+    let events = artifacts
         .iter()
         .filter(|(key, _)| key.session_id == session_id)
         .map(|(key, artifact)| {
@@ -17824,389 +17472,7 @@ fn active_artifact_snapshot_events(
         })
         .collect::<Vec<_>>();
     drop(artifacts);
-    let visuals = state
-        .active_plugin_visuals
-        .lock()
-        .map_err(|_| "active plugin visual registry poisoned".to_owned())?;
-    events.extend(
-        visuals
-            .iter()
-            .filter(|((visual_session_id, _), _)| *visual_session_id == session_id)
-            .map(|(_, event)| bcode_session_models::SessionLiveEvent {
-                session_id,
-                kind: SessionLiveEventKind::ToolOutputDelta {
-                    event: event.clone(),
-                },
-            }),
-    );
-    drop(visuals);
     Ok(events)
-}
-
-fn update_active_plugin_visual(
-    state: &ServerState,
-    session_id: SessionId,
-    tool_call_id: &str,
-    event: &ToolInvocationStreamEvent,
-) -> Result<(), String> {
-    state
-        .active_plugin_visuals
-        .lock()
-        .map_err(|_| "active plugin visual registry poisoned".to_owned())?
-        .insert((session_id, tool_call_id.to_owned()), event.clone());
-    Ok(())
-}
-
-fn remove_active_plugin_visual(state: &ServerState, session_id: SessionId, tool_call_id: &str) {
-    if let Ok(mut visuals) = state.active_plugin_visuals.lock() {
-        visuals.remove(&(session_id, tool_call_id.to_owned()));
-    }
-}
-
-/// Publish ephemeral tool output and visuals, or append bounded lifecycle events.
-///
-/// `OutputDelta` carries raw live tool output, including PTY bytes. `VisualUpdate` carries
-/// replaceable plugin presentation state. Both are transient and broadcast only to attached
-/// clients; the latest active visual is retained in memory for reattach. Durable history stores
-/// the request, bounded lifecycle metadata, final status, and bounded final result.
-async fn append_tool_stream_event(
-    state: &ServerState,
-    session_id: SessionId,
-    event: ToolInvocationStreamEvent,
-) {
-    if active_turn_cancel_state(state, session_id)
-        .await
-        .is_some_and(|cancel_state| cancel_state.is_cancelled())
-    {
-        return;
-    }
-    let progress = runtime_work_progress_from_tool_stream_event(&event);
-    if let ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. } = &event {
-        if let Err(error) = update_active_plugin_visual(state, session_id, tool_call_id, &event) {
-            tracing::warn!("failed to update active plugin visual registry: {error}");
-            return;
-        }
-        let _ = state
-            .sessions
-            .publish_live_event(session_id, SessionLiveEventKind::ToolOutputDelta { event })
-            .await;
-        return;
-    }
-    if let ToolInvocationStreamEvent::Finished { tool_call_id, .. } = &event {
-        remove_active_plugin_visual(state, session_id, tool_call_id);
-        return;
-    }
-    if matches!(event, ToolInvocationStreamEvent::Started { .. }) {
-        return;
-    }
-    if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
-        if let Err(error) = update_active_artifact(state, session_id, &event, None) {
-            tracing::warn!("failed to update active artifact: {error}");
-            return;
-        }
-        let _ = state
-            .sessions
-            .publish_live_event(session_id, SessionLiveEventKind::ToolOutputDelta { event })
-            .await;
-        return;
-    }
-    if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
-        let _ = state
-            .sessions
-            .publish_live_event(session_id, SessionLiveEventKind::ToolOutputDelta { event })
-            .await;
-        return;
-    }
-    if is_legacy_tool_presentation_stream_event(&event) {
-        return;
-    }
-    if let Some((work_id, message)) = progress {
-        append_runtime_work_progress_event(state, session_id, work_id, message, None, None).await;
-    }
-}
-
-const fn is_legacy_tool_presentation_stream_event(event: &ToolInvocationStreamEvent) -> bool {
-    matches!(event, ToolInvocationStreamEvent::LegacyPresentation { .. })
-}
-
-fn runtime_work_progress_from_tool_stream_event(
-    event: &ToolInvocationStreamEvent,
-) -> Option<(WorkId, String)> {
-    match event {
-        ToolInvocationStreamEvent::Status {
-            tool_call_id,
-            message,
-            ..
-        } => Some((WorkId::new(format!("tool_{tool_call_id}")), message.clone())),
-        ToolInvocationStreamEvent::Started {
-            tool_call_id,
-            tool_name,
-            ..
-        } => Some((
-            WorkId::new(format!("tool_{tool_call_id}")),
-            format!("started {tool_name}"),
-        )),
-        ToolInvocationStreamEvent::Finished {
-            tool_call_id,
-            is_error,
-            ..
-        } => Some((
-            WorkId::new(format!("tool_{tool_call_id}")),
-            if *is_error {
-                "finished with error"
-            } else {
-                "finished"
-            }
-            .to_string(),
-        )),
-        ToolInvocationStreamEvent::OutputDelta { .. }
-        | ToolInvocationStreamEvent::VisualUpdate { .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { .. }
-        | ToolInvocationStreamEvent::LegacyTransientPruned { .. } => None,
-    }
-}
-
-fn normalize_tool_stream_event_sequence(
-    event: ServiceToolInvocationStreamEvent,
-    stream_sequences: &mut BTreeMap<String, u64>,
-) -> ToolInvocationStreamEvent {
-    let event = convert_tool_stream_event(event);
-    let tool_call_id = match &event {
-        ToolInvocationStreamEvent::Started { tool_call_id, .. }
-        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
-        | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyTransientPruned { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id.clone(),
-    };
-    let next = stream_sequences
-        .entry(tool_call_id)
-        .and_modify(|sequence| *sequence = sequence.saturating_add(1))
-        .or_insert(1);
-    let sequence = *next;
-    set_tool_stream_event_sequence(event, sequence)
-}
-
-#[allow(clippy::too_many_lines)] // Exhaustively rewrites every generic stream variant's sequence.
-fn set_tool_stream_event_sequence(
-    event: ToolInvocationStreamEvent,
-    sequence: u64,
-) -> ToolInvocationStreamEvent {
-    match event {
-        ToolInvocationStreamEvent::Started {
-            tool_call_id,
-            tool_name,
-            terminal,
-            columns,
-            rows,
-            started_at_ms,
-            ..
-        } => ToolInvocationStreamEvent::Started {
-            tool_call_id,
-            tool_name,
-            sequence,
-            terminal,
-            columns,
-            rows,
-            started_at_ms,
-        },
-        ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id,
-            stream,
-            text,
-            byte_len,
-            ..
-        } => ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id,
-            stream,
-            sequence,
-            text,
-            byte_len,
-        },
-        ToolInvocationStreamEvent::VisualUpdate {
-            tool_call_id,
-            visual,
-            streaming,
-            ..
-        } => ToolInvocationStreamEvent::VisualUpdate {
-            tool_call_id,
-            sequence,
-            visual,
-            streaming,
-        },
-        ToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id,
-            artifact_id,
-            reference_key,
-            producer_plugin_id,
-            schema,
-            schema_version,
-            content_type,
-            storage_uri,
-            committed_bytes,
-            revision,
-            availability,
-            finalized,
-            ..
-        } => ToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id,
-            sequence,
-            artifact_id,
-            reference_key,
-            producer_plugin_id,
-            schema,
-            schema_version,
-            content_type,
-            storage_uri,
-            committed_bytes,
-            revision,
-            availability,
-            finalized,
-        },
-        ToolInvocationStreamEvent::Status {
-            tool_call_id,
-            message,
-            ..
-        } => ToolInvocationStreamEvent::Status {
-            tool_call_id,
-            sequence,
-            message,
-        },
-        ToolInvocationStreamEvent::LegacyPresentation {
-            tool_call_id,
-            presentation,
-            ..
-        } => ToolInvocationStreamEvent::LegacyPresentation {
-            tool_call_id,
-            sequence,
-            presentation,
-        },
-        event @ ToolInvocationStreamEvent::LegacyTransientPruned { .. } => event,
-        ToolInvocationStreamEvent::Finished {
-            tool_call_id,
-            is_error,
-            finished_at_ms,
-            ..
-        } => ToolInvocationStreamEvent::Finished {
-            tool_call_id,
-            sequence,
-            is_error,
-            finished_at_ms,
-        },
-    }
-}
-
-fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInvocationStreamEvent {
-    match event {
-        ServiceToolInvocationStreamEvent::Started {
-            tool_call_id,
-            tool_name,
-            sequence,
-            terminal,
-            columns,
-            rows,
-            started_at_ms,
-        } => ToolInvocationStreamEvent::Started {
-            tool_call_id,
-            tool_name,
-            sequence,
-            terminal,
-            columns,
-            rows,
-            started_at_ms: started_at_ms.or_else(|| Some(current_unix_millis())),
-        },
-        ServiceToolInvocationStreamEvent::OutputDelta {
-            tool_call_id,
-            stream,
-            sequence,
-            text,
-            byte_len,
-        } => ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id,
-            stream: convert_tool_output_stream(stream),
-            sequence,
-            text,
-            byte_len,
-        },
-        ServiceToolInvocationStreamEvent::VisualUpdate {
-            tool_call_id,
-            sequence,
-            visual,
-            streaming,
-        } => ToolInvocationStreamEvent::VisualUpdate {
-            tool_call_id,
-            sequence,
-            visual: bcode_session_models::PluginVisualDescriptor {
-                visual_id: visual.visual_id,
-                producer_plugin_id: visual.producer_plugin_id,
-                schema: visual.schema,
-                schema_version: visual.schema_version,
-                title: visual.title,
-                subtitle: visual.subtitle,
-                payload: visual.payload,
-            },
-            streaming,
-        },
-        ServiceToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id,
-            sequence,
-            artifact_id,
-            reference_key,
-            producer_plugin_id,
-            schema,
-            schema_version,
-            content_type,
-            storage_uri,
-            committed_bytes,
-            revision,
-            finalized,
-        } => ToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id,
-            sequence,
-            artifact_id,
-            reference_key,
-            producer_plugin_id,
-            schema,
-            schema_version,
-            content_type,
-            storage_uri,
-            committed_bytes,
-            revision,
-            availability: None,
-            finalized,
-        },
-        ServiceToolInvocationStreamEvent::Status {
-            tool_call_id,
-            sequence,
-            message,
-        } => ToolInvocationStreamEvent::Status {
-            tool_call_id,
-            sequence,
-            message,
-        },
-        ServiceToolInvocationStreamEvent::Finished {
-            tool_call_id,
-            sequence,
-            is_error,
-            finished_at_ms,
-        } => ToolInvocationStreamEvent::Finished {
-            tool_call_id,
-            sequence,
-            is_error,
-            finished_at_ms: finished_at_ms.or_else(|| Some(current_unix_millis())),
-        },
-    }
-}
-
-const fn convert_tool_output_stream(stream: ToolOutputStream) -> SessionToolOutputStream {
-    match stream {
-        ToolOutputStream::Stdout => SessionToolOutputStream::Stdout,
-        ToolOutputStream::Stderr => SessionToolOutputStream::Stderr,
-        ToolOutputStream::Pty => SessionToolOutputStream::Pty,
-    }
 }
 
 async fn evaluate_agent_tool_policy_with_metadata(
@@ -20781,10 +20047,7 @@ mod tests {
     use super::*;
     #[allow(clippy::wildcard_imports)]
     use crate::context_compaction::*;
-    use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolCardPresentation,
-        LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
-    };
+    use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
     use switchy::database::DatabaseValue;
 
     fn open_progress_snapshot(
@@ -21883,7 +21146,6 @@ library = "test"
         let registration = ActivePluginInvocationRegistration::register(
             Arc::clone(&invocations),
             Arc::clone(&active_artifacts),
-            Arc::new(StdMutex::new(BTreeMap::new())),
             session_id,
             "call-1",
             ActivePluginInvocation {
@@ -21902,7 +21164,6 @@ library = "test"
             ActivePluginInvocationRegistration::register(
                 Arc::clone(&invocations),
                 Arc::clone(&active_artifacts),
-                Arc::new(StdMutex::new(BTreeMap::new())),
                 session_id,
                 "call-1",
                 ActivePluginInvocation {
@@ -21937,7 +21198,6 @@ library = "test"
         let registration = ActivePluginInvocationRegistration::register(
             Arc::clone(&state.active_plugin_invocations),
             Arc::clone(&state.active_artifacts),
-            Arc::clone(&state.active_plugin_visuals),
             session_id,
             tool_call_id,
             ActivePluginInvocation {
@@ -22102,7 +21362,6 @@ library = "test"
         let registration = ActivePluginInvocationRegistration::register(
             Arc::clone(&state.active_plugin_invocations),
             Arc::clone(&state.active_artifacts),
-            Arc::clone(&state.active_plugin_visuals),
             session_id,
             "call-transition",
             ActivePluginInvocation {
@@ -22226,7 +21485,6 @@ library = "test"
         let registration = ActivePluginInvocationRegistration::register(
             Arc::clone(&state.active_plugin_invocations),
             Arc::clone(&state.active_artifacts),
-            Arc::clone(&state.active_plugin_visuals),
             session_id,
             "call-abandoned",
             ActivePluginInvocation {
@@ -24011,53 +23269,6 @@ library = "test"
             ralph_iteration_status_from_model_outcome(Some(ModelTurnOutcome::Error)),
             "work_failed"
         );
-    }
-
-    #[test]
-    fn tool_stream_sequence_normalization_is_monotonic_per_call() {
-        let mut sequences = BTreeMap::new();
-        let first = normalize_tool_stream_event_sequence(
-            ServiceToolInvocationStreamEvent::Started {
-                tool_call_id: "call-a".to_string(),
-                tool_name: "shell.run".to_string(),
-                sequence: 99,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: Some(1),
-            },
-            &mut sequences,
-        );
-        let second = normalize_tool_stream_event_sequence(
-            ServiceToolInvocationStreamEvent::Status {
-                tool_call_id: "call-a".to_string(),
-                sequence: 99,
-                message: "running".to_string(),
-            },
-            &mut sequences,
-        );
-        let other_call = normalize_tool_stream_event_sequence(
-            ServiceToolInvocationStreamEvent::Finished {
-                tool_call_id: "call-b".to_string(),
-                sequence: 99,
-                is_error: false,
-                finished_at_ms: Some(2),
-            },
-            &mut sequences,
-        );
-
-        assert!(matches!(
-            first,
-            ToolInvocationStreamEvent::Started { sequence: 1, .. }
-        ));
-        assert!(matches!(
-            second,
-            ToolInvocationStreamEvent::Status { sequence: 2, .. }
-        ));
-        assert!(matches!(
-            other_call,
-            ToolInvocationStreamEvent::Finished { sequence: 1, .. }
-        ));
     }
 
     #[test]
@@ -27078,7 +26289,7 @@ library = "test"
         let ToolSource::Plugin { plugin_id } = tool.source else {
             return Err("server test tool must be plugin-backed".to_string());
         };
-        invoke_model_tool(
+        invoke_plugin_tool_transport(
             state,
             session_id,
             call,
@@ -27088,7 +26299,7 @@ library = "test"
             preparation.descriptor,
             cancel_state,
             None,
-            None,
+            false,
         )
         .await
     }
@@ -27360,7 +26571,6 @@ library = "test"
         working_directory: PathBuf,
         expected_plugin_id: &str,
         cancel_state: Arc<TurnCancelState>,
-        invocation_permits: Option<Arc<Semaphore>>,
     ) -> Option<ToolFinishedEventInput> {
         let (tool, preparation) = prepare_server_tool(state, session_id, &call)
             .await
@@ -27377,7 +26587,6 @@ library = "test"
             tool,
             preparation,
             cancel_state,
-            invocation_permits,
         )
         .await
     }
@@ -27443,22 +26652,22 @@ library = "test"
             .id;
         let mut state = test_server_state_with_filesystem_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let call = bcode_model::ToolCall {
+            id: "filesystem-image".to_owned(),
+            name: "filesystem.read".to_owned(),
+            arguments: serde_json::json!({"path": image_path}),
+        };
+        let (tool, preparation) = prepare_server_tool(&state, session_id, &call)
+            .await
+            .expect("filesystem tool preparation");
         let result = execute_model_tool(
             &state,
             session_id,
-            bcode_model::ToolCall {
-                id: "filesystem-image".to_owned(),
-                name: "filesystem.read".to_owned(),
-                arguments: serde_json::json!({"path": image_path}),
-            },
+            call,
             workspace.path().to_path_buf(),
-            "bcode.filesystem".to_owned(),
-            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Read {
-                paths: vec![workspace.path().display().to_string()],
-            }),
-            serde_json::Value::Null,
+            tool,
+            preparation,
             Arc::new(TurnCancelState::default()),
-            None,
         )
         .await
         .expect("filesystem image result");
@@ -27539,7 +26748,6 @@ library = "test"
             workspace.path().to_path_buf(),
             "bcode.filesystem",
             Arc::new(TurnCancelState::default()),
-            None,
         )
         .await
         .expect("filesystem list result");
@@ -27598,7 +26806,6 @@ library = "test"
             workspace.path().to_path_buf(),
             "bcode.shell",
             Arc::new(TurnCancelState::default()),
-            None,
         )
         .await
         .expect("shell contribution result");
@@ -27720,7 +26927,6 @@ library = "test"
             workspace.path().to_path_buf(),
             "bcode.vim-edit",
             Arc::new(TurnCancelState::default()),
-            None,
         )
         .await
         .expect("Vim preview result");
@@ -27788,7 +26994,6 @@ library = "test"
             workspace.path().to_path_buf(),
             "bcode.shell",
             Arc::new(TurnCancelState::default()),
-            None,
         )
         .await
         .expect("failed shell should produce a tool result");
@@ -27848,7 +27053,6 @@ library = "test"
             workspace.path().to_path_buf(),
             "bcode.shell",
             Arc::clone(&cancel_state),
-            None,
         );
         let cancellation =
             async {
@@ -27966,9 +27170,7 @@ library = "test"
         })
         .await
         .expect("scope cancellation must close locally");
-        let response = response.expect("scope-cancelled invocation response");
-        assert!(response.is_error);
-        assert!(response.output.contains("cancelled"));
+        assert!(matches!(response, Err(RuntimeError::Cancelled)));
         assert!(!cancel_state.is_cancelled());
     }
 
@@ -28050,6 +27252,103 @@ library = "test"
                     && !record.is_error
                     && record.model_output.contains("entries")
         )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_server_batch_cancellation_closes_running_tool_without_result() {
+        let workspace = tempfile::tempdir().expect("canonical cancellation workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent canonical cancellation sessions");
+        let session_id = sessions
+            .create_session(
+                Some("canonical batch cancellation".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("canonical cancellation session")
+            .id;
+        let mut state = test_server_state_with_shell_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new(state);
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let task_state = Arc::clone(&state);
+        let task_cancel = Arc::clone(&cancel_state);
+        let task = tokio::spawn(async move {
+            let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+            let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+            let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+            let queued_followups = AtomicUsize::new(0);
+            let current_turn = Arc::new(Mutex::new(None));
+            let mut command_context = RuntimeCommandContext::new(
+                &mut followup_rx,
+                &mut steering_rx,
+                &mut cancel_rx,
+                &queued_followups,
+                current_turn,
+            );
+            execute_model_tool_batch(
+                task_state.as_ref(),
+                session_id,
+                vec![bcode_model::ToolCall {
+                    id: "canonical-cancelled-shell".to_owned(),
+                    name: "shell.run".to_owned(),
+                    arguments: serde_json::json!({"command": "sleep 30"}),
+                }],
+                task_cancel,
+                &mut command_context,
+                &bcode_session_models::TurnExecutionOptions::default(),
+            )
+            .await
+        });
+        let pending = wait_for_pending_permissions(state.as_ref(), 1).await;
+        approve_pending_permission_for_test(state.as_ref(), &pending[0]).await;
+        loop {
+            if state
+                .active_plugin_invocations
+                .lock()
+                .expect("active invocation registry")
+                .contains_key(&(session_id, "canonical-cancelled-shell".to_owned()))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        cancel_state.close();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("canonical batch cancellation must complete locally")
+                .expect("canonical cancellation task must not panic")
+        );
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("canonical cancellation history");
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.invocation_id == "canonical-cancelled-shell"
+        )));
+        let stages = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationLifecycle { event }
+                    if event.invocation_id == "canonical-cancelled-shell" =>
+                {
+                    Some(event.stage)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                bcode_session_models::ToolInvocationLifecycleStage::Started,
+                bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -28197,7 +27496,7 @@ library = "test"
         );
 
         assert!(
-            tokio::time::timeout(Duration::from_secs(10), task)
+            tokio::time::timeout(Duration::from_secs(30), task)
                 .await
                 .expect("parallel shell batch should finish")
                 .expect("parallel shell batch task should not panic")
@@ -30304,187 +29603,128 @@ library = "test"
         }
     }
 
-    #[test]
-    fn tool_output_publisher_coalesces_visual_updates_by_tool_call() {
-        let mut publisher = ToolOutputLivePublisher::new();
-        let update = |sequence| ToolInvocationStreamEvent::VisualUpdate {
-            tool_call_id: "call".to_owned(),
-            sequence,
-            visual: bcode_session_models::PluginVisualDescriptor {
-                visual_id: None,
-                producer_plugin_id: Some("plugin".to_owned()),
-                schema: "plugin.visual".to_owned(),
-                schema_version: 1,
-                title: None,
-                subtitle: None,
-                payload: serde_json::json!({"sequence": sequence}),
-            },
-            streaming: true,
-        };
-        publisher.enqueue_visual_update(update(1));
-        publisher.enqueue_visual_update(update(2));
-        assert_eq!(publisher.pending_visuals.len(), 1);
-        assert!(matches!(
-            publisher.pending_visuals.values().next(),
-            Some(ToolInvocationStreamEvent::VisualUpdate { sequence: 2, .. })
-        ));
-    }
-
-    #[test]
-    #[ignore = "manual deterministic performance baseline"]
-    fn artifact_update_publisher_baseline_report() {
-        for raw_updates in [4_u64, 256, 4_096] {
-            let mut publisher = ToolOutputLivePublisher::new();
-            let metrics = MetricsRegistry::default();
-            let started = Instant::now();
-            for revision in 1..=raw_updates {
-                let event = ToolInvocationStreamEvent::ArtifactUpdate {
-                    tool_call_id: "call".to_owned(),
-                    sequence: revision,
-                    artifact_id: "artifact".to_owned(),
-                    reference_key: "recording".to_owned(),
-                    producer_plugin_id: "bcode.shell".to_owned(),
-                    schema: "bcode.shell.run".to_owned(),
-                    schema_version: 1,
-                    content_type: None,
-                    storage_uri: String::new(),
-                    committed_bytes: revision.saturating_mul(17),
-                    revision,
-                    availability: None,
-                    finalized: false,
-                };
-                let _ = publisher.enqueue_artifact_update(&metrics, event);
-            }
-            for pending in publisher.pending_artifacts.values() {
-                record_artifact_update_published(&metrics, pending);
-            }
-            let report = metrics.report();
-            let counter = |name: &str| report.snapshot.counters.get(name).copied().unwrap_or(0);
-            println!(
-                "BCODE_PERF_CASE {}",
-                serde_json::json!({
-                    "domain": "server_artifact_publisher",
-                    "raw_updates": counter("tool.artifact_update.received_total"),
-                    "coalesced_updates": counter("tool.artifact_update.coalesced_total"),
-                    "published_updates": counter("tool.artifact_update.published_total"),
-                    "committed_bytes": raw_updates.saturating_mul(17),
-                    "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn tool_output_publisher_coalesces_artifact_revisions_by_identity() {
-        let mut publisher = ToolOutputLivePublisher::new();
-        let update =
-            |revision, committed_bytes, finalized| ToolInvocationStreamEvent::ArtifactUpdate {
-                tool_call_id: "call".to_owned(),
-                sequence: revision,
-                artifact_id: "artifact".to_owned(),
-                reference_key: "recording".to_owned(),
-                producer_plugin_id: "plugin".to_owned(),
-                schema: "plugin.recording".to_owned(),
-                schema_version: 1,
-                content_type: None,
-                storage_uri: String::new(),
-                committed_bytes,
-                revision,
-                availability: None,
-                finalized,
-            };
-
-        let metrics = MetricsRegistry::default();
-        assert_eq!(
-            publisher.enqueue_artifact_update(&metrics, update(1, 10, false)),
-            (true, false)
-        );
-        assert_eq!(
-            publisher.enqueue_artifact_update(&metrics, update(2, 20, false)),
-            (false, false)
-        );
-        assert_eq!(publisher.pending_artifacts.len(), 1);
-        assert!(matches!(
-            publisher
-                .pending_artifacts
-                .values()
-                .next()
-                .map(|pending| &pending.event),
-            Some(ToolInvocationStreamEvent::ArtifactUpdate {
-                revision: 2,
-                committed_bytes: 20,
-                ..
-            })
-        ));
-        let report = metrics.report();
-        assert_eq!(
-            report
-                .snapshot
-                .counters
-                .get("tool.artifact_update.received_total"),
-            Some(&2)
-        );
-        assert_eq!(
-            report
-                .snapshot
-                .counters
-                .get("tool.artifact_update.coalesced_total"),
-            Some(&1)
-        );
-        assert_eq!(
-            publisher.enqueue_artifact_update(&metrics, update(3, 30, true)),
-            (false, true)
-        );
-    }
-
     #[tokio::test]
-    async fn tool_output_delta_is_transient_not_durable() {
+    #[allow(clippy::too_many_lines)] // One sink contract test covers ordering, persistence, flush, and closure.
+    async fn session_invocation_sink_flushes_accepted_events_in_order_and_then_closes() {
         let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
+        let session_id = sessions
+            .create_session(Some("sink test".to_owned()), test_working_directory())
             .await
-            .expect("session should be created");
-        let session_id = summary.id;
+            .expect("session should be created")
+            .id;
         let mut attachment = sessions
             .attach_session(session_id, ClientId::new())
             .await
             .expect("session should attach");
         let state = test_server_state(sessions);
-        let delta = ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id: "call-1".to_owned(),
-            stream: SessionToolOutputStream::Pty,
-            sequence: 1,
-            text: "live".to_owned(),
-            byte_len: 4,
+        let lifecycle = |sequence, stage| {
+            ScopedTurnEvent::InvocationLifecycle(
+                bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "sink-call".to_owned(),
+                    sequence,
+                    stage,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            )
         };
-
-        append_tool_stream_event(&state, session_id, delta.clone()).await;
-
-        let received = loop {
-            let event = attachment
-                .live_events
-                .recv()
-                .await
-                .expect("subscriber should receive live delta");
-            if matches!(event.kind, SessionLiveEventKind::ToolOutputDelta { .. }) {
-                break event;
-            }
+        let contribution = |sequence, persistence| {
+            ScopedTurnEvent::Contribution(bcode_session_models::ToolContributionEvent {
+                invocation_id: "sink-call".to_owned(),
+                contribution_id: format!("contribution-{sequence}"),
+                sequence,
+                producer_id: "test.plugin".to_owned(),
+                schema: "test.sink".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence,
+                artifact: None,
+                payload: serde_json::json!({"sequence": sequence}),
+            })
         };
-        assert_eq!(
-            received.kind,
-            SessionLiveEventKind::ToolOutputDelta { event: delta }
-        );
+        let (sink, receiver) = SessionInvocationSink::new(8);
+        assert!(sink.emit(lifecycle(
+            0,
+            bcode_session_models::ToolInvocationLifecycleStage::Started,
+        )));
+        assert!(sink.emit(contribution(
+            1,
+            bcode_session_models::ToolContributionPersistence::Transient,
+        )));
+        assert!(sink.emit(contribution(
+            2,
+            bcode_session_models::ToolContributionPersistence::Durable,
+        )));
+        assert!(sink.emit(lifecycle(
+            3,
+            bcode_session_models::ToolInvocationLifecycleStage::Completed,
+        )));
+
+        let flush = sink.flush();
+        let drain = drain_session_invocation_sink(&state, session_id, receiver);
+        let (flush, ()) = tokio::join!(flush, drain);
+        flush.expect("accepted sink events should flush");
+        assert!(!sink.emit(lifecycle(
+            4,
+            bcode_session_models::ToolInvocationLifecycleStage::Progress,
+        )));
+
         let history = state
             .sessions
             .session_history(session_id)
             .await
-            .expect("history should read");
-        assert!(!history.iter().any(|event| matches!(
-            event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta { .. }
+            .expect("sink history");
+        let persisted = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationLifecycle { event }
+                    if event.invocation_id == "sink-call" =>
+                {
+                    Some((event.sequence, "lifecycle"))
+                }
+                SessionEventKind::ToolContribution { event }
+                    if event.invocation_id == "sink-call" =>
+                {
+                    Some((event.sequence, "contribution"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted,
+            vec![(0, "lifecycle"), (2, "contribution"), (3, "lifecycle")]
+        );
+        assert_eq!(
+            attachment
+                .live_events
+                .recv()
+                .await
+                .expect("transient upsert")
+                .kind,
+            SessionLiveEventKind::ToolContribution {
+                event: match contribution(
+                    1,
+                    bcode_session_models::ToolContributionPersistence::Transient,
+                ) {
+                    ScopedTurnEvent::Contribution(event) => event,
+                    _ => unreachable!(),
+                },
             }
-        )));
+        );
+        assert!(matches!(
+            attachment
+                .live_events
+                .recv()
+                .await
+                .expect("terminal transient removal")
+                .kind,
+            SessionLiveEventKind::ToolContribution { event }
+                if event.invocation_id == "sink-call"
+                    && event.sequence == 2
+                    && event.operation
+                        == bcode_session_models::ToolContributionOperation::Remove
+        ));
+        assert!(attachment.live_events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -30514,7 +29754,7 @@ library = "test"
             payload: serde_json::json!({"live": true}),
         };
 
-        append_tool_contribution_event(
+        let _ = append_tool_contribution_event(
             &state,
             session_id,
             "call-1",
@@ -30553,7 +29793,7 @@ library = "test"
                 },
             }]
         );
-        append_tool_contribution_event(
+        let _ = append_tool_contribution_event(
             &state,
             session_id,
             "call-1",
@@ -30566,7 +29806,7 @@ library = "test"
         let mut updated = contribution.clone();
         updated.sequence = 2;
         updated.payload = serde_json::json!({"live": "updated"});
-        append_tool_contribution_event(
+        let _ = append_tool_contribution_event(
             &state,
             session_id,
             "call-1",
@@ -30575,7 +29815,7 @@ library = "test"
         )
         .await;
         assert!(attachment.live_events.try_recv().is_err());
-        append_tool_contribution_event(
+        let _ = append_tool_contribution_event(
             &state,
             session_id,
             "call-1",
@@ -30593,7 +29833,7 @@ library = "test"
             SessionLiveEventKind::ToolContribution { event: updated }
         );
 
-        append_tool_contribution_event(
+        let _ = append_tool_contribution_event(
             &state,
             session_id,
             "other-call",
@@ -30614,178 +29854,6 @@ library = "test"
                 if event.operation == bcode_session_models::ToolContributionOperation::Remove
                     && event.sequence == 3
         ));
-    }
-
-    #[tokio::test]
-    async fn tool_visual_update_is_live_only_and_available_to_reattach_snapshot() {
-        let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session should be created");
-        let session_id = summary.id;
-        let mut attachment = sessions
-            .attach_session(session_id, ClientId::new())
-            .await
-            .expect("session should attach");
-        let state = test_server_state(sessions);
-        let update = ToolInvocationStreamEvent::VisualUpdate {
-            tool_call_id: "call-1".to_owned(),
-            sequence: 1,
-            visual: bcode_session_models::PluginVisualDescriptor {
-                visual_id: None,
-                producer_plugin_id: Some("test.plugin".to_owned()),
-                schema: "test.visual".to_owned(),
-                schema_version: 1,
-                title: None,
-                subtitle: None,
-                payload: serde_json::json!({"replaceable": "state"}),
-            },
-            streaming: true,
-        };
-        append_tool_stream_event(&state, session_id, update.clone()).await;
-        let received = attachment.live_events.recv().await.expect("live visual");
-        assert_eq!(
-            received.kind,
-            SessionLiveEventKind::ToolOutputDelta {
-                event: update.clone()
-            }
-        );
-        let snapshots = active_artifact_snapshot_events(&state, session_id).expect("snapshots");
-        assert!(snapshots.iter().any(|snapshot| matches!(
-            &snapshot.kind,
-            SessionLiveEventKind::ToolOutputDelta { event } if event == &update
-        )));
-        let history = state
-            .sessions
-            .session_history(session_id)
-            .await
-            .expect("history");
-        assert!(!history.iter().any(|event| matches!(
-            event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::VisualUpdate { .. }
-            }
-        )));
-    }
-
-    #[tokio::test]
-    async fn legacy_tool_stream_lifecycle_events_are_not_newly_persisted() {
-        let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session should be created");
-        let session_id = summary.id;
-        let state = test_server_state(sessions);
-        let started = ToolInvocationStreamEvent::Started {
-            tool_call_id: "call-1".to_owned(),
-            tool_name: "test.tool".to_owned(),
-            sequence: 1,
-            terminal: false,
-            columns: None,
-            rows: None,
-            started_at_ms: Some(1),
-        };
-        let finished = ToolInvocationStreamEvent::Finished {
-            tool_call_id: "call-1".to_owned(),
-            sequence: 2,
-            is_error: false,
-            finished_at_ms: Some(2),
-        };
-
-        append_tool_stream_event(&state, session_id, started.clone()).await;
-        append_tool_stream_event(&state, session_id, finished.clone()).await;
-
-        let history = state
-            .sessions
-            .session_history(session_id)
-            .await
-            .expect("history should read");
-        assert!(!history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ToolInvocationStream { event } if event == &started
-        )));
-        assert!(!history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ToolInvocationStream { event } if event == &finished
-        )));
-    }
-
-    #[tokio::test]
-    async fn tool_stream_status_persists_only_generic_runtime_work_progress() {
-        let sessions = SessionManager::default();
-        let session_id = sessions
-            .create_session(Some("status".to_owned()), test_working_directory())
-            .await
-            .expect("session should be created")
-            .id;
-        let state = test_server_state(sessions);
-        append_tool_stream_event(
-            &state,
-            session_id,
-            ToolInvocationStreamEvent::Status {
-                tool_call_id: "call-1".to_owned(),
-                sequence: 1,
-                message: "working".to_owned(),
-            },
-        )
-        .await;
-
-        let history = state
-            .sessions
-            .session_history(session_id)
-            .await
-            .expect("status history");
-        assert!(
-            !history
-                .iter()
-                .any(|event| matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }))
-        );
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::RuntimeWorkProgress { work_id, message, .. }
-                if work_id.0 == "tool_call-1" && message == "working"
-        )));
-    }
-
-    #[tokio::test]
-    async fn tool_stream_presentation_events_are_not_persisted() {
-        let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session should be created");
-        let session_id = summary.id;
-        let state = test_server_state(sessions);
-
-        append_tool_stream_event(
-            &state,
-            session_id,
-            ToolInvocationStreamEvent::LegacyPresentation {
-                tool_call_id: "call-1".to_owned(),
-                sequence: 1,
-                presentation: LegacyToolPresentationEvent::Card(LegacyToolCardPresentation {
-                    target: LegacyToolPresentationTarget::Result,
-                    title: "legacy card".to_owned(),
-                    subtitle: None,
-                    sections: Vec::new(),
-                }),
-            },
-        )
-        .await;
-
-        let history = state
-            .sessions
-            .session_history(session_id)
-            .await
-            .expect("history should read");
-        assert!(!history.iter().any(|event| matches!(
-            event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation { .. }
-            }
-        )));
     }
 
     #[tokio::test]
@@ -32934,227 +32002,6 @@ library = "test"
             request_fields,
             Some((&Some("test.plugin".to_owned()), &None))
         );
-    }
-
-    #[tokio::test]
-    async fn tool_output_accumulator_coalesces_adjacent_deltas() {
-        let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session should be created");
-        let session_id = summary.id;
-        let mut attachment = sessions
-            .attach_session(session_id, ClientId::new())
-            .await
-            .expect("session should attach");
-        let state = test_server_state(sessions);
-        let mut pending_output = None;
-
-        push_tool_output_stream(
-            &state,
-            session_id,
-            &mut pending_output,
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-1".to_owned(),
-                stream: SessionToolOutputStream::Pty,
-                sequence: 1,
-                text: "hello ".to_owned(),
-                byte_len: 6,
-            },
-        )
-        .await;
-        push_tool_output_stream(
-            &state,
-            session_id,
-            &mut pending_output,
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-1".to_owned(),
-                stream: SessionToolOutputStream::Pty,
-                sequence: 2,
-                text: "world".to_owned(),
-                byte_len: 5,
-            },
-        )
-        .await;
-        flush_tool_output_stream(&state, session_id, &mut pending_output).await;
-
-        let received = attachment
-            .live_events
-            .recv()
-            .await
-            .expect("subscriber should receive coalesced live delta");
-        assert_eq!(
-            received.kind,
-            SessionLiveEventKind::ToolOutputDelta {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-1".to_owned(),
-                    stream: SessionToolOutputStream::Pty,
-                    sequence: 1,
-                    text: "hello world".to_owned(),
-                    byte_len: 11,
-                },
-            }
-        );
-        assert!(attachment.live_events.try_recv().is_err());
-        let history = state
-            .sessions
-            .session_history(session_id)
-            .await
-            .expect("history should read");
-        assert!(!history.iter().any(|event| matches!(
-            event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta { .. }
-            }
-        )));
-    }
-
-    #[tokio::test]
-    async fn tool_output_accumulator_flushes_on_stream_change() {
-        let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session should be created");
-        let session_id = summary.id;
-        let mut attachment = sessions
-            .attach_session(session_id, ClientId::new())
-            .await
-            .expect("session should attach");
-        let state = test_server_state(sessions);
-        let mut pending_output = None;
-
-        push_tool_output_stream(
-            &state,
-            session_id,
-            &mut pending_output,
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-1".to_owned(),
-                stream: SessionToolOutputStream::Stdout,
-                sequence: 1,
-                text: "out".to_owned(),
-                byte_len: 3,
-            },
-        )
-        .await;
-        push_tool_output_stream(
-            &state,
-            session_id,
-            &mut pending_output,
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-1".to_owned(),
-                stream: SessionToolOutputStream::Stderr,
-                sequence: 2,
-                text: "err".to_owned(),
-                byte_len: 3,
-            },
-        )
-        .await;
-        flush_tool_output_stream(&state, session_id, &mut pending_output).await;
-
-        let first = attachment
-            .live_events
-            .recv()
-            .await
-            .expect("subscriber should receive stdout delta");
-        let second = attachment
-            .live_events
-            .recv()
-            .await
-            .expect("subscriber should receive stderr delta");
-        assert_eq!(
-            first.kind,
-            SessionLiveEventKind::ToolOutputDelta {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-1".to_owned(),
-                    stream: SessionToolOutputStream::Stdout,
-                    sequence: 1,
-                    text: "out".to_owned(),
-                    byte_len: 3,
-                },
-            }
-        );
-        assert_eq!(
-            second.kind,
-            SessionLiveEventKind::ToolOutputDelta {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-1".to_owned(),
-                    stream: SessionToolOutputStream::Stderr,
-                    sequence: 2,
-                    text: "err".to_owned(),
-                    byte_len: 3,
-                },
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn tool_output_accumulator_flushes_at_byte_threshold() {
-        let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session should be created");
-        let session_id = summary.id;
-        let mut attachment = sessions
-            .attach_session(session_id, ClientId::new())
-            .await
-            .expect("session should attach");
-        let state = test_server_state(sessions);
-        let mut pending_output = None;
-
-        push_tool_output_stream(
-            &state,
-            session_id,
-            &mut pending_output,
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-1".to_owned(),
-                stream: SessionToolOutputStream::Pty,
-                sequence: 1,
-                text: "x".repeat(TOOL_OUTPUT_FLUSH_BYTES - 1),
-                byte_len: TOOL_OUTPUT_FLUSH_BYTES - 1,
-            },
-        )
-        .await;
-        assert!(attachment.live_events.try_recv().is_err());
-
-        push_tool_output_stream(
-            &state,
-            session_id,
-            &mut pending_output,
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-1".to_owned(),
-                stream: SessionToolOutputStream::Pty,
-                sequence: 2,
-                text: "y".to_owned(),
-                byte_len: 1,
-            },
-        )
-        .await;
-
-        let received = attachment
-            .live_events
-            .recv()
-            .await
-            .expect("subscriber should receive threshold flush");
-        let SessionLiveEventKind::ToolOutputDelta {
-            event:
-                ToolInvocationStreamEvent::OutputDelta {
-                    sequence,
-                    text,
-                    byte_len,
-                    ..
-                },
-        } = received.kind
-        else {
-            panic!("expected tool output delta");
-        };
-        assert_eq!(sequence, 1);
-        assert_eq!(text.len(), TOOL_OUTPUT_FLUSH_BYTES);
-        assert!(text.ends_with('y'));
-        assert_eq!(byte_len, TOOL_OUTPUT_FLUSH_BYTES);
-        assert!(pending_output.is_none());
     }
 
     #[tokio::test]

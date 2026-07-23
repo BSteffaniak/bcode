@@ -566,7 +566,8 @@ if ! grep -F 'orchestration_emits_exactly_one_started_and_terminal_lifecycle_per
    ! grep -F 'projection_history_pages_cross_real_ipc_bidirectionally' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'generic_lifecycle_drives_tui_activity_until_terminal_event' packages/tui/src/app.rs >/dev/null ||
    ! grep -F 'hyperchad_preserves_compact_single_tool_activity_until_terminal_event' packages/hyperchad/src/lib.rs >/dev/null ||
-   ! grep -F 'legacy_tool_stream_lifecycle_events_are_not_newly_persisted' packages/server/src/lib.rs >/dev/null; then
+   ! grep -F 'session_invocation_sink_flushes_accepted_events_in_order_and_then_closes' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'server_persists_filesystem_progress_as_neutral_lifecycle_only' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: orchestration-owned lifecycle coverage was removed." >&2
   violations=1
 fi
@@ -1023,17 +1024,29 @@ if ! grep -F 'direct_tool_receives_canonical_scope_and_all_capabilities' package
   violations=1
 fi
 
-if ! grep -F 'SessionEventKind::ToolInvocationStream { .. } => Some("tool_invocation_stream")' packages/session/src/lib.rs >/dev/null ||
-   rg -U 'append_event\([\s\S]{0,160}SessionEventKind::ToolInvocationStream' packages/server/src/lib.rs >/dev/null ||
-   ! grep -F 'tool_stream_status_persists_only_generic_runtime_work_progress' packages/server/src/lib.rs >/dev/null ||
-   ! grep -F 'durable_boundary_rejects_tool_stream_status_regardless_of_payload_size' packages/session/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: current production may persist legacy tool stream events." >&2
+if ! sed -n '/^fn execute_model_tool_batch/,/^}$/p' packages/server/src/lib.rs \
+     | rg -U 'collect_server_tool_catalog\(state\)[\s\S]{0,3600}AgentRuntime::new\(\)[\s\S]{0,600}execute_prepared_tool_batch_with_host_context\([\s\n]*&catalog' >/dev/null ||
+   sed -n '/^fn execute_model_tool_batch/,/^}$/p' packages/server/src/lib.rs \
+     | rg -q 'Semaphore|buffer_unordered|stream::iter|prepare_registered_server_tool|\.authorize_batch\('; then
+  echo "Runtime architecture violation: server-owned batch scheduling or preparation was reintroduced." >&2
+  violations=1
+fi
+
+if rg -n 'ServiceToolInvocationStreamEvent|ToolOutputLivePublisher|ToolOutputStreamAccumulator|normalize_tool_stream_event_sequence|convert_tool_stream_event|append_tool_stream_event|active_plugin_visuals|TOOL_OUTPUT_FLUSH_' packages/server/src/lib.rs >/tmp/bcode-server-legacy-tool-stream.txt ||
+   rg -n '\bToolInvocationStreamEvent\b|\bToolStreamEventSink\b' plugins --glob '*.rs' >/tmp/bcode-plugin-legacy-tool-stream.txt ||
+   ! grep -F 'session_invocation_sink_flushes_accepted_events_in_order_and_then_closes' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'server_persists_shell_owned_contribution_opaquely' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: terminal/tool stream conversion or accumulation was reintroduced into orchestration." >&2
+  cat /tmp/bcode-server-legacy-tool-stream.txt /tmp/bcode-plugin-legacy-tool-stream.txt 2>/dev/null >&2 || true
   violations=1
 fi
 
 if rg -n '\bfind_tool_provider\b' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'async fn collect_server_tool_catalog' packages/server/src/lib.rs >/dev/null ||
-   ! rg -U 'async fn execute_model_tool_batch\([\s\S]{0,2200}collect_server_tool_catalog\(state\)[\s\S]{0,2200}catalog\.find_tool\(&call\.name\)' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'let Some(tool) = catalog.find_tool(&call.name) else {' packages/agent-runtime/src/lib.rs >/dev/null ||
+   ! sed -n '/^fn execute_model_tool_batch/,/^}$/p' packages/server/src/lib.rs \
+     | rg -U 'collect_server_tool_catalog\(state\)[\s\S]{0,3600}execute_prepared_tool_batch_with_host_context\([\s\n]*&catalog' >/dev/null ||
+   sed -n '/^fn execute_model_tool_batch/,/^}$/p' packages/server/src/lib.rs | rg -q '\.find_tool\(' ||
    ! grep -F 'server_registry_unknown_call_preserves_registered_sibling_and_provider_order' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: production server calls are not resolved through the unified invoker registry." >&2
   violations=1
