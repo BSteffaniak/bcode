@@ -931,6 +931,24 @@ impl BcodeClient {
         }
     }
 
+    /// Submit a bounded client-side metrics batch to the daemon-owned registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the batch.
+    pub async fn ingest_client_metrics(
+        &self,
+        batch: bcode_metrics::ClientMetricBatch,
+    ) -> Result<usize, ClientError> {
+        match self
+            .send_request(Request::IngestClientMetrics { batch })
+            .await?
+        {
+            ResponsePayload::ClientMetricsIngested { accepted } => Ok(accepted),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Query local server status.
     ///
     /// # Errors

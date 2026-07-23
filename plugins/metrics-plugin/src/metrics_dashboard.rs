@@ -635,6 +635,7 @@ fn dashboard_tabs() -> Vec<TabItem<'static>> {
         TabItem::new("plugins", "Plugins"),
         TabItem::new("sessions", "Sessions"),
         TabItem::new("ipc", "IPC"),
+        TabItem::new("tui", "TUI"),
         TabItem::new("storage", "Storage"),
         TabItem::new("raw", "Raw"),
     ]
@@ -648,7 +649,8 @@ const fn domain_from_index(index: usize) -> MetricDomain {
         3 => MetricDomain::Plugin,
         4 => MetricDomain::Session,
         5 => MetricDomain::Ipc,
-        6 => MetricDomain::Storage,
+        6 => MetricDomain::Tui,
+        7 => MetricDomain::Storage,
         _ => MetricDomain::Raw,
     }
 }
@@ -661,6 +663,7 @@ const fn domain_title(domain: MetricDomain) -> &'static str {
         MetricDomain::Plugin => "Plugins",
         MetricDomain::Session => "Sessions",
         MetricDomain::Ipc => "IPC",
+        MetricDomain::Tui => "TUI",
         MetricDomain::Storage => "Metrics Storage",
         MetricDomain::Runtime => "Runtime",
         MetricDomain::Raw => "Raw Metrics",

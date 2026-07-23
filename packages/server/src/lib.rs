@@ -2307,6 +2307,7 @@ const fn request_kind(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
         Request::Ping => "ping",
+        Request::IngestClientMetrics { .. } => "ingest_client_metrics",
         Request::ServerStatus { .. } => "server_status",
         Request::ModelCatalogDiagnostics => "model_catalog_diagnostics",
         Request::ServerStop { .. } => "server_stop",
@@ -2447,6 +2448,9 @@ async fn handle_request_inner(
             .await
         }
         Request::Ping => handle_ping(request_id, writer).await,
+        Request::IngestClientMetrics { batch } => {
+            handle_ingest_client_metrics(request_id, state, writer, batch).await
+        }
         Request::ServerStatus { working_directory } => {
             handle_server_status(request_id, state, writer, working_directory.as_deref()).await
         }
@@ -3029,6 +3033,33 @@ async fn handle_update_client_runtime_context(
 
 async fn handle_ping(request_id: u64, writer: &SharedWriter) -> Result<(), ServerError> {
     send_response(writer, request_id, Response::Ok(ResponsePayload::Pong)).await
+}
+
+async fn handle_ingest_client_metrics(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    batch: bcode_metrics::ClientMetricBatch,
+) -> Result<(), ServerError> {
+    if let Err(error) = batch.validate_for_namespace("tui.") {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "invalid_client_metrics",
+                error.to_string(),
+            )),
+        )
+        .await;
+    }
+    let accepted = batch.observations.len();
+    state.metrics.record_client_batch(batch);
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::ClientMetricsIngested { accepted }),
+    )
+    .await
 }
 
 fn client_name_supports_message_accepted(client_name: &str) -> bool {

@@ -445,6 +445,11 @@ pub enum Request {
         batch_id: String,
         approved: bool,
     },
+    /// Submit bounded client-side TUI telemetry to the daemon-owned metrics registry.
+    IngestClientMetrics {
+        /// Validated-at-ingress metric observations.
+        batch: bcode_metrics::ClientMetricBatch,
+    },
 }
 
 /// Server stop request policy.
@@ -1241,6 +1246,11 @@ pub enum ResponsePayload {
     InvocationInputAccepted,
     PermissionBatchResolved {
         resolved: usize,
+    },
+    /// Acknowledges that a bounded client metrics batch was accepted.
+    ClientMetricsIngested {
+        /// Number of observations merged into the daemon registry.
+        accepted: usize,
     },
 }
 
@@ -2368,6 +2378,25 @@ mod tests {
         assert_eq!(
             decode_response(&envelope.payload).expect("response should decode"),
             response
+        );
+    }
+
+    #[test]
+    fn client_metrics_request_round_trips() {
+        let request = Request::IngestClientMetrics {
+            batch: bcode_metrics::ClientMetricBatch {
+                observations: vec![bcode_metrics::ClientMetricObservation::CounterDelta {
+                    name: "tui.frame.total".to_owned(),
+                    value: 16,
+                    labels: bcode_metrics::MetricLabels::new(),
+                }],
+            },
+        };
+        let encoded = encode_request(&request).expect("request should encode");
+
+        assert_eq!(
+            decode_request(&encoded).expect("request should decode"),
+            request
         );
     }
 

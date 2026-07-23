@@ -92,6 +92,9 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     agents.refresh_app_agent_metadata(&mut app);
     let launch_working_directory = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let mut settings = chat_loop::TuiRuntimeSettings::bootstrap(launch_working_directory.clone());
+    if let Ok(config) = &config {
+        settings.set_metrics_enabled(config.metrics.enabled);
+    }
     let mut chat = session_flow::ActiveChat {
         app,
         agents,

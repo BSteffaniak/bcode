@@ -21,6 +21,7 @@ bcode_config              = { workspace = true }
 bcode_daemon_lifecycle    = { workspace = true }
 bcode_ipc                 = { workspace = true }
 bcode_markdown_render     = { workspace = true }
+bcode_metrics             = { workspace = true }
 bcode_model               = { workspace = true }
 bcode_plugin              = { workspace = true }
 bcode_plugin_sdk          = { workspace = true, features = ["tui"] }

@@ -228,6 +228,186 @@ pub enum MetricKind {
     Event,
 }
 
+/// Maximum observations accepted in one client metrics batch.
+pub const MAX_CLIENT_METRIC_OBSERVATIONS: usize = 256;
+/// Maximum labels accepted on one client metric observation.
+pub const MAX_CLIENT_METRIC_LABELS: usize = 8;
+/// Maximum UTF-8 bytes accepted in a client metric name.
+pub const MAX_CLIENT_METRIC_NAME_BYTES: usize = 128;
+/// Maximum UTF-8 bytes accepted in a client metric label key.
+pub const MAX_CLIENT_METRIC_LABEL_KEY_BYTES: usize = 64;
+/// Maximum UTF-8 bytes accepted in a client metric label value.
+pub const MAX_CLIENT_METRIC_LABEL_VALUE_BYTES: usize = 128;
+/// Maximum serialized bytes accepted for one client metrics batch.
+pub const MAX_CLIENT_METRIC_BATCH_BYTES: usize = 64 * 1024;
+
+/// One bounded metric observation submitted by a client process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClientMetricObservation {
+    /// Add a non-negative delta to a monotonic counter.
+    CounterDelta {
+        /// Metric name.
+        name: String,
+        /// Counter delta.
+        value: u64,
+        /// Bounded low-cardinality labels.
+        #[serde(default)]
+        labels: MetricLabels,
+    },
+    /// Replace a gauge's current value.
+    Gauge {
+        /// Metric name.
+        name: String,
+        /// Gauge value.
+        value: i64,
+        /// Bounded low-cardinality labels.
+        #[serde(default)]
+        labels: MetricLabels,
+    },
+    /// Record one non-negative histogram sample.
+    Histogram {
+        /// Metric name.
+        name: String,
+        /// Histogram sample.
+        value: u64,
+        /// Bounded low-cardinality labels.
+        #[serde(default)]
+        labels: MetricLabels,
+    },
+}
+
+impl ClientMetricObservation {
+    /// Return the metric name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::CounterDelta { name, .. }
+            | Self::Gauge { name, .. }
+            | Self::Histogram { name, .. } => name,
+        }
+    }
+
+    /// Return the observation labels.
+    #[must_use]
+    pub const fn labels(&self) -> &MetricLabels {
+        match self {
+            Self::CounterDelta { labels, .. }
+            | Self::Gauge { labels, .. }
+            | Self::Histogram { labels, .. } => labels,
+        }
+    }
+}
+
+/// Bounded collection of metric observations submitted by one client.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientMetricBatch {
+    /// Observations to merge into the daemon-owned registry.
+    pub observations: Vec<ClientMetricObservation>,
+}
+
+/// Validation failure for an untrusted client metrics batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientMetricBatchError {
+    message: String,
+}
+
+impl std::fmt::Display for ClientMetricBatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClientMetricBatchError {}
+
+impl ClientMetricBatch {
+    /// Validate structural bounds and an approved metric namespace prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch is empty or exceeds its observation or serialized-size
+    /// bound, or when any metric name or label violates its namespace, syntax, or length bounds.
+    pub fn validate_for_namespace(
+        &self,
+        namespace_prefix: &str,
+    ) -> Result<(), ClientMetricBatchError> {
+        if self.observations.is_empty() {
+            return Err(client_metric_error("client metrics batch is empty"));
+        }
+        if self.observations.len() > MAX_CLIENT_METRIC_OBSERVATIONS {
+            return Err(client_metric_error(format!(
+                "client metrics batch has {} observations; maximum is {MAX_CLIENT_METRIC_OBSERVATIONS}",
+                self.observations.len()
+            )));
+        }
+        let encoded_bytes = serde_json::to_vec(self)
+            .map_err(|error| {
+                client_metric_error(format!("client metrics batch is invalid: {error}"))
+            })?
+            .len();
+        if encoded_bytes > MAX_CLIENT_METRIC_BATCH_BYTES {
+            return Err(client_metric_error(format!(
+                "client metrics batch is {encoded_bytes} bytes; maximum is {MAX_CLIENT_METRIC_BATCH_BYTES}"
+            )));
+        }
+        for observation in &self.observations {
+            validate_client_metric_name(observation.name(), namespace_prefix)?;
+            let labels = observation.labels();
+            if labels.len() > MAX_CLIENT_METRIC_LABELS {
+                return Err(client_metric_error(format!(
+                    "client metric '{}' has {} labels; maximum is {MAX_CLIENT_METRIC_LABELS}",
+                    observation.name(),
+                    labels.len()
+                )));
+            }
+            for (key, value) in labels {
+                if key.is_empty()
+                    || key.len() > MAX_CLIENT_METRIC_LABEL_KEY_BYTES
+                    || !key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    return Err(client_metric_error(format!(
+                        "client metric '{}' has invalid label key",
+                        observation.name()
+                    )));
+                }
+                if value.len() > MAX_CLIENT_METRIC_LABEL_VALUE_BYTES {
+                    return Err(client_metric_error(format!(
+                        "client metric '{}' has an oversized label value",
+                        observation.name()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_client_metric_name(
+    name: &str,
+    namespace_prefix: &str,
+) -> Result<(), ClientMetricBatchError> {
+    if name.len() > MAX_CLIENT_METRIC_NAME_BYTES
+        || !name.starts_with(namespace_prefix)
+        || name.len() == namespace_prefix.len()
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_')
+        })
+    {
+        return Err(client_metric_error(format!(
+            "client metric name '{name}' is not allowed"
+        )));
+    }
+    Ok(())
+}
+
+fn client_metric_error(message: impl Into<String>) -> ClientMetricBatchError {
+    ClientMetricBatchError {
+        message: message.into(),
+    }
+}
+
 /// One metric timeline event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetricEvent {
@@ -926,6 +1106,31 @@ impl MetricsRegistry {
             value,
             labels,
         });
+    }
+
+    /// Merge a validated client observation batch into this registry.
+    ///
+    /// Callers must validate the batch at their trust boundary before invoking this method.
+    pub fn record_client_batch(&self, batch: ClientMetricBatch) {
+        for observation in batch.observations {
+            match observation {
+                ClientMetricObservation::CounterDelta {
+                    name,
+                    value,
+                    labels,
+                } => self.add_counter_with_labels(name, value, labels),
+                ClientMetricObservation::Gauge {
+                    name,
+                    value,
+                    labels,
+                } => self.set_gauge_with_labels(name, value, labels),
+                ClientMetricObservation::Histogram {
+                    name,
+                    value,
+                    labels,
+                } => self.record_histogram_with_labels(name, value, labels),
+            }
+        }
     }
 
     /// Start a timer for later elapsed observation.
@@ -1817,6 +2022,84 @@ mod tests {
     use std::process::Command;
 
     const ABRUPT_CHILD_ENV: &str = "BCODE_METRICS_ABRUPT_CHILD_ROOT";
+
+    fn client_counter(name: &str) -> ClientMetricObservation {
+        ClientMetricObservation::CounterDelta {
+            name: name.to_owned(),
+            value: 2,
+            labels: MetricLabels::new(),
+        }
+    }
+
+    #[test]
+    fn client_metric_batches_enforce_namespace_and_bounds() {
+        let valid = ClientMetricBatch {
+            observations: vec![client_counter("tui.frame.total")],
+        };
+        valid
+            .validate_for_namespace("tui.")
+            .expect("valid TUI batch should pass");
+
+        let invalid_namespace = ClientMetricBatch {
+            observations: vec![client_counter("tool.shell.total")],
+        };
+        assert!(invalid_namespace.validate_for_namespace("tui.").is_err());
+
+        let too_many = ClientMetricBatch {
+            observations: (0..=MAX_CLIENT_METRIC_OBSERVATIONS)
+                .map(|_| client_counter("tui.frame.total"))
+                .collect(),
+        };
+        assert!(too_many.validate_for_namespace("tui.").is_err());
+
+        let mut labels = MetricLabels::new();
+        for index in 0..=MAX_CLIENT_METRIC_LABELS {
+            labels.insert(format!("label_{index}"), "value".to_owned());
+        }
+        let too_many_labels = ClientMetricBatch {
+            observations: vec![ClientMetricObservation::Gauge {
+                name: "tui.queue.depth".to_owned(),
+                value: 1,
+                labels,
+            }],
+        };
+        assert!(too_many_labels.validate_for_namespace("tui.").is_err());
+    }
+
+    #[test]
+    fn validated_client_metric_batches_merge_by_kind() {
+        let metrics = MetricsRegistry::default();
+        let batch = ClientMetricBatch {
+            observations: vec![
+                client_counter("tui.frame.total"),
+                ClientMetricObservation::Gauge {
+                    name: "tui.queue.depth".to_owned(),
+                    value: 3,
+                    labels: MetricLabels::new(),
+                },
+                ClientMetricObservation::Histogram {
+                    name: "tui.frame.total_ms".to_owned(),
+                    value: 17,
+                    labels: MetricLabels::new(),
+                },
+            ],
+        };
+        batch
+            .validate_for_namespace("tui.")
+            .expect("batch should validate");
+        metrics.record_client_batch(batch);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters.get("tui.frame.total"), Some(&2));
+        assert_eq!(snapshot.gauges.get("tui.queue.depth"), Some(&3));
+        assert_eq!(
+            snapshot
+                .histograms
+                .get("tui.frame.total_ms")
+                .map(|histogram| histogram.count),
+            Some(1)
+        );
+    }
 
     #[test]
     fn database_metrics_emit_only_stable_operation_metadata() {

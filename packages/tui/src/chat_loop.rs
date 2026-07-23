@@ -122,6 +122,8 @@ struct ChatLoopState {
     interactive_surface: Option<InteractiveSurfaceState>,
     plugin_runtime: Option<PluginRuntimeHost>,
     artifact_stream: ArtifactStreamCoordinator,
+    telemetry: super::telemetry::TuiTelemetry,
+    frame_index: u64,
 }
 
 impl ChatLoopState {
@@ -129,6 +131,7 @@ impl ChatLoopState {
         foreground_client: &BcodeClient,
         passive_client: &BcodeClient,
         daemon_host: TuiDaemonHost,
+        metrics_enabled: bool,
     ) -> Self {
         Self {
             palette: None,
@@ -141,6 +144,8 @@ impl ChatLoopState {
             interactive_surface: None,
             plugin_runtime: None,
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
+            telemetry: super::telemetry::TuiTelemetry::new(passive_client.clone(), metrics_enabled),
+            frame_index: 0,
         }
     }
 
@@ -208,6 +213,7 @@ impl DaemonConnectionMonitor {
 pub struct TuiRuntimeSettings {
     keymap: BmuxKeyMap,
     mouse_scroll_rows: usize,
+    metrics_enabled: bool,
     launch_working_directory: std::path::PathBuf,
 }
 
@@ -217,6 +223,7 @@ impl TuiRuntimeSettings {
         Self {
             keymap: BmuxKeyMap::from_config(&tui_config),
             mouse_scroll_rows: tui_config.mouse.effective_scroll_rows(),
+            metrics_enabled: false,
             launch_working_directory,
         }
     }
@@ -224,6 +231,10 @@ impl TuiRuntimeSettings {
     pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
         self.keymap = BmuxKeyMap::from_config(tui_config);
         self.mouse_scroll_rows = tui_config.mouse.effective_scroll_rows();
+    }
+
+    pub const fn set_metrics_enabled(&mut self, enabled: bool) {
+        self.metrics_enabled = enabled;
     }
 
     pub fn launch_working_directory(&self) -> &std::path::Path {
@@ -264,7 +275,12 @@ pub async fn run_with_client<W: Write>(
     let passive_client = client
         .clone()
         .with_daemon_availability(DaemonAvailability::RequireRunning);
-    let mut loop_state = ChatLoopState::new(client, &passive_client, daemon_host);
+    let mut loop_state = ChatLoopState::new(
+        client,
+        &passive_client,
+        daemon_host,
+        settings.metrics_enabled,
+    );
     let result = run_chat_loop(
         terminal,
         terminal_events,
@@ -312,6 +328,7 @@ async fn run_chat_loop<W: Write>(
 
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, &settings.keymap);
+        loop_state.telemetry.flush_if_due(Instant::now());
         if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
             needs_redraw = true;
         }
@@ -339,7 +356,8 @@ async fn run_chat_loop<W: Write>(
 
         let redraw_at = next_redraw_at(last_redraw);
         if needs_redraw && Instant::now() >= redraw_at {
-            draw_chat_frame(terminal, chat, loop_state)?;
+            let schedule_delay = Instant::now().saturating_duration_since(redraw_at);
+            draw_chat_frame(terminal, chat, loop_state, schedule_delay)?;
             if let Some(action) = startup_action.take()
                 && action == super::startup_action::StartupTuiAction::OpenRalphHome
             {
@@ -372,6 +390,7 @@ async fn run_chat_loop<W: Write>(
             &mut invalidation_queue,
             chat,
             &mut loop_state.artifact_stream,
+            loop_state.telemetry.next_flush_at(),
             needs_redraw.then_some(redraw_at),
             draft_autosave.next_save_at(),
         )
@@ -567,7 +586,7 @@ fn apply_effect_result(
             session_flow::complete_switch_session(chat, session_id, has_older_history, result);
         }
         TuiEffectResult::ConfigLoaded { config } => {
-            apply_config_result(settings, chat, *config);
+            apply_config_result(settings, chat, loop_state, *config);
         }
         TuiEffectResult::AuthSecurityReconciled { status } => {
             apply_auth_security_result(chat, status);
@@ -726,11 +745,14 @@ fn apply_effect_result(
 fn apply_config_result(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
     config: Result<bcode_config::BcodeConfig, String>,
 ) {
     match config {
         Ok(config) => {
             settings.apply_tui_config(&config.tui);
+            settings.set_metrics_enabled(config.metrics.enabled);
+            loop_state.telemetry.set_enabled(config.metrics.enabled);
             chat.app.apply_tui_config(config.tui.clone());
             chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
@@ -1461,13 +1483,18 @@ fn draw_chat_frame<W: Write>(
     terminal: &mut Terminal<&mut W>,
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
+    schedule_delay: Duration,
 ) -> Result<(), TuiError> {
+    let frame_started = Instant::now();
+    let prepare_started = frame_started;
     let layout = render::prepare_frame(&mut chat.app, terminal.area());
+    let prepare_ms = elapsed_millis(prepare_started);
     let theme = render::TuiTheme::for_app(&chat.app);
     let transcript_area = layout.map_or_else(
         || render::transcript_area_for_frame(&chat.app, terminal.area()),
         |layout| layout.transcript_area(&chat.app),
     );
+    let draw_started = Instant::now();
     terminal.draw(|frame| {
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);
@@ -1497,7 +1524,38 @@ fn draw_chat_frame<W: Write>(
             surface.render(surface_area, frame);
         }
     })?;
+    let draw_ms = elapsed_millis(draw_started);
+    let total_ms = elapsed_millis(frame_started);
+    loop_state.telemetry.add_counter("tui.frame.total", 1);
+    if total_ms >= u64::try_from(TARGET_FRAME_INTERVAL.as_millis()).unwrap_or(u64::MAX) {
+        loop_state
+            .telemetry
+            .add_counter("tui.frame.over_budget_total", 1);
+    }
+    let frame_index = loop_state.frame_index;
+    loop_state.frame_index = loop_state.frame_index.wrapping_add(1);
+    if frame_index.is_multiple_of(16)
+        || total_ms >= u64::try_from(TARGET_FRAME_INTERVAL.as_millis()).unwrap_or(u64::MAX)
+    {
+        loop_state
+            .telemetry
+            .record_histogram("tui.frame.prepare_ms", prepare_ms);
+        loop_state
+            .telemetry
+            .record_histogram("tui.frame.draw_ms", draw_ms);
+        loop_state
+            .telemetry
+            .record_histogram("tui.frame.total_ms", total_ms);
+        loop_state.telemetry.record_histogram(
+            "tui.frame.schedule_delay_ms",
+            u64::try_from(schedule_delay.as_millis()).unwrap_or(u64::MAX),
+        );
+    }
     Ok(())
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn interactive_surface_area(surface: &mut InteractiveSurfaceState, viewport: Rect) -> Rect {
@@ -1727,6 +1785,7 @@ async fn next_chat_loop_event(
     invalidation_queue: &mut InvalidationQueue,
     chat: &mut ActiveChat,
     artifact_stream: &mut ArtifactStreamCoordinator,
+    telemetry_flush_at: Option<Instant>,
     redraw_at: Option<Instant>,
     draft_save_at: Option<Instant>,
 ) -> Result<ChatLoopEvent, TuiError> {
@@ -1741,6 +1800,7 @@ async fn next_chat_loop_event(
     let next_timer_at = [
         invalidation_queue.next_at(),
         artifact_stream.next_retry_at(),
+        telemetry_flush_at,
         redraw_at,
         draft_save_at,
     ]

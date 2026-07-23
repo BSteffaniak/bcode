@@ -36,6 +36,8 @@ pub enum MetricDomain {
     Session,
     /// IPC request/response/event metrics.
     Ipc,
+    /// TUI rendering and client-side presentation metrics.
+    Tui,
     /// Metrics system storage/retention metrics.
     Storage,
     /// Runtime work and uncategorized runtime metrics.
@@ -349,6 +351,7 @@ pub fn dashboard_from_report(report: &MetricsReport) -> MetricsDashboardData {
         MetricDomain::Plugin,
         MetricDomain::Session,
         MetricDomain::Ipc,
+        MetricDomain::Tui,
         MetricDomain::Storage,
         MetricDomain::Runtime,
         MetricDomain::Raw,
@@ -675,6 +678,8 @@ pub fn metric_domain(name: &str) -> MetricDomain {
         MetricDomain::Session
     } else if name.starts_with("ipc.") {
         MetricDomain::Ipc
+    } else if name.starts_with("tui.") {
+        MetricDomain::Tui
     } else if name.starts_with("metrics.") {
         MetricDomain::Storage
     } else if name.starts_with("runtime") {
@@ -936,6 +941,28 @@ mod tests {
             Some(&"a".to_owned())
         );
         assert_eq!(rows.first().map(|row| row.count), Some(2));
+    }
+
+    #[test]
+    fn tui_metrics_have_a_first_class_dashboard_domain() {
+        assert_eq!(metric_domain("tui.frame.total_ms"), MetricDomain::Tui);
+        let report = MetricsReport {
+            events: vec![MetricEvent {
+                unix_ms: 1,
+                name: "tui.frame.total_ms".to_owned(),
+                kind: MetricKind::Histogram,
+                value: 17,
+                labels: MetricLabels::new(),
+            }],
+            ..MetricsReport::default()
+        };
+        let dashboard = dashboard_from_report(&report);
+        let tui = dashboard
+            .domains
+            .iter()
+            .find(|summary| summary.domain == MetricDomain::Tui)
+            .expect("TUI domain should be present");
+        assert_eq!(tui.rows.len(), 1);
     }
 
     #[test]
