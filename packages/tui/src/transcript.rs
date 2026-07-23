@@ -2,9 +2,7 @@
 
 #[cfg(test)]
 use bcode_session_models::{SessionEvent, SessionEventKind};
-use bcode_session_models::{
-    SessionTokenUsage, ToolArtifact, ToolInvocationProjection, ToolInvocationResult,
-};
+use bcode_session_models::{SessionTokenUsage, ToolArtifact, ToolInvocationResult};
 #[cfg(test)]
 use bcode_session_view::SessionView;
 use bcode_session_view_models::{
@@ -152,6 +150,7 @@ impl TranscriptItem {
         Self::with_identity(role, text, false, kind_for_role(role))
     }
 
+    #[cfg(test)]
     pub fn new_streaming(role: &'static str, text: String) -> Self {
         Self::with_identity(role, text, true, kind_for_role(role))
     }
@@ -290,6 +289,7 @@ impl TranscriptItem {
     }
 
     /// Append text to this transcript item.
+    #[cfg(test)]
     pub fn append_text(&mut self, text: &str) {
         self.text.push_str(text);
         if let TranscriptItemKind::ToolResult { result, .. } = &mut self.kind {
@@ -415,43 +415,6 @@ pub fn transcript_items_from_events_with_reasoning(
         })
         .map(terminal_item_from_shared)
         .collect()
-}
-
-/// Append streamed text to the currently open transcript stream for `role`.
-///
-/// Interleaved telemetry rows, such as token usage, may be appended while a model stream is open.
-/// The open stream is therefore the newest streaming row for the same role, not necessarily the
-/// final transcript row.
-/// Build a transcript item for a tool request.
-#[must_use]
-pub fn tool_request_item_from_projection(projection: &ToolInvocationProjection) -> TranscriptItem {
-    let tool_name = projection.tool_name.as_deref().unwrap_or("unknown tool");
-    let arguments_json = projection.arguments_json.as_deref().unwrap_or("{}");
-    tool_request_item(
-        &projection.tool_call_id,
-        projection.producer_plugin_id.as_deref(),
-        tool_name,
-        arguments_json,
-        projection.working_directory.clone(),
-        projection.request_visual.clone(),
-    )
-}
-
-/// Build a transcript item for a generic tool result from renderer-neutral projection state.
-#[must_use]
-pub fn generic_tool_result_item_from_projection(
-    projection: &ToolInvocationProjection,
-) -> Option<TranscriptItem> {
-    let mut item = tool_result_item(
-        &projection.tool_call_id,
-        projection.tool_name.as_deref(),
-        projection.arguments_json.as_deref(),
-        &display_tool_result_text(projection.result_text.as_deref()?),
-        projection.is_error.unwrap_or(false),
-    );
-    item.set_tool_started_at_ms(projection.started_at_ms);
-    item.set_tool_finished_at_ms(projection.finished_at_ms);
-    Some(item)
 }
 
 /// Build a transcript item for a tool request.
@@ -686,7 +649,8 @@ pub fn artifact_tool_result_item(
     )
 }
 
-/// Build a transcript item from a raw semantic tool result.
+/// Build a transcript item from a raw semantic tool result for isolated terminal adapter tests.
+#[cfg(test)]
 #[must_use]
 pub fn semantic_tool_result_item_from_raw(
     tool_call_id: &str,
@@ -1143,6 +1107,7 @@ pub fn truncate_block(value: &str, max_chars: usize) -> String {
     output
 }
 
+#[cfg(test)]
 pub fn push_streaming_transcript_item(
     items: &mut Vec<TranscriptItem>,
     role: &'static str,
@@ -1155,7 +1120,7 @@ pub fn push_streaming_transcript_item(
     items.push(TranscriptItem::new_streaming(role, text.to_owned()));
 }
 
-/// Finish the currently open transcript stream for `role`, or append a final item if none exists.
+#[cfg(test)]
 pub fn finish_streaming_transcript_item(
     items: &mut Vec<TranscriptItem>,
     role: &'static str,
@@ -1174,6 +1139,7 @@ pub fn finish_streaming_transcript_item(
     items.push(TranscriptItem::new(role, text.to_owned()));
 }
 
+#[cfg(test)]
 fn active_streaming_item_mut<'items>(
     items: &'items mut [TranscriptItem],
     role: &'static str,
@@ -1184,6 +1150,7 @@ fn active_streaming_item_mut<'items>(
     latest_streaming_item_mut(items, role)
 }
 
+#[cfg(test)]
 fn finish_boundary_streaming_transcript_item(
     items: &mut Vec<TranscriptItem>,
     role: &'static str,
@@ -1211,6 +1178,7 @@ fn finish_boundary_streaming_transcript_item(
     items.push(TranscriptItem::new(role, text.to_owned()));
 }
 
+#[cfg(test)]
 fn latest_item_mut_if_streaming_role<'items>(
     items: &'items mut [TranscriptItem],
     role: &'static str,
@@ -1223,6 +1191,7 @@ fn latest_item_mut_if_streaming_role<'items>(
     }
 }
 
+#[cfg(test)]
 fn latest_streaming_item_mut<'items>(
     items: &'items mut [TranscriptItem],
     role: &'static str,
@@ -1233,6 +1202,7 @@ fn latest_streaming_item_mut<'items>(
         .find(|item| item.role == role && item.streaming)
 }
 
+#[cfg(test)]
 fn role_requires_last_item_stream_boundary(role: &'static str) -> bool {
     role == "Reasoning summary"
 }

@@ -1467,7 +1467,7 @@ impl SessionView {
                 tool,
             );
         } else {
-            self.replace_tool_item(index, tool, tool_call_id);
+            self.replace_tool_item(index, tool, tool_call_id, sequence, timestamp_ms);
         }
     }
 
@@ -1499,11 +1499,20 @@ impl SessionView {
         );
     }
 
-    fn replace_tool_item(&mut self, index: usize, tool: ToolInvocationView, tool_call_id: &str) {
+    fn replace_tool_item(
+        &mut self,
+        index: usize,
+        tool: ToolInvocationView,
+        tool_call_id: &str,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+    ) {
         let item = &mut self.snapshot.transcript.items[index];
         item.kind = TranscriptViewItemKind::ToolInvocation {
             tool: Box::new(tool),
         };
+        item.sequence = (sequence != 0).then_some(sequence).or(item.sequence);
+        item.timestamp_ms = timestamp_ms.or(item.timestamp_ms);
         item.streaming = matches!(
             self.snapshot.tools[tool_call_id].status,
             ToolInvocationViewStatus::Running
@@ -2852,6 +2861,64 @@ mod tests {
         view.apply_event(&event);
 
         assert_eq!(view.snapshot(), &snapshot);
+    }
+
+    #[test]
+    fn durable_tool_request_adopts_source_metadata_after_live_preview() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolArgumentPreview {
+                turn_id: "turn-1".to_owned(),
+                tool_call_id: "tool-1".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                argument_bytes: 2,
+                preview: bcode_session_models::LiveToolArgumentPreview {
+                    visual: bcode_session_models::PluginVisualDescriptor {
+                        visual_id: Some("preview-1".to_owned()),
+                        producer_plugin_id: Some("shell".to_owned()),
+                        schema: "shell.preview".to_owned(),
+                        schema_version: 1,
+                        title: Some("preview".to_owned()),
+                        subtitle: None,
+                        payload: serde_json::json!({}),
+                    },
+                    streaming_status: None,
+                    argument_bytes: 2,
+                },
+            },
+        });
+
+        view.apply_event(&event(
+            session_id,
+            7,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "tool-1".to_owned(),
+                producer_plugin_id: Some("shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+                request_visual: None,
+                legacy_request_presentation: None,
+            },
+        ));
+
+        let request = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    TranscriptViewItemKind::ToolInvocation { tool }
+                        if tool.tool_call_id == "tool-1"
+                )
+            })
+            .expect("durable tool request");
+        assert_eq!(request.sequence, Some(7));
+        assert_eq!(request.timestamp_ms, Some(70));
     }
 
     #[test]

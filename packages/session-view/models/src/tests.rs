@@ -395,6 +395,77 @@ fn snapshot_patch_resets_when_non_transcript_state_changes() {
     assert_eq!(base, next);
 }
 
+#[test]
+fn patch_size_measurements_cover_incremental_and_reset_workloads() {
+    let mut base = SessionViewSnapshot::empty();
+    base.revision = 100;
+    base.transcript = transcript_document(
+        100,
+        std::array::from_fn::<_, 100, _>(|index| {
+            transcript_item(
+                &format!("item-{index}"),
+                u64::try_from(index).expect("index") + 1,
+                &"existing transcript content ".repeat(8),
+            )
+        }),
+    );
+
+    let mut appended = base.clone();
+    appended.revision = 101;
+    appended.transcript.revision = 101;
+    appended.transcript.items.push(transcript_item(
+        "item-100",
+        101,
+        &"new transcript content ".repeat(8),
+    ));
+    appended.transcript.refresh_source_bounds();
+    let append_patch = SessionViewPatch::between_snapshots(&base, &appended);
+    assert!(append_patch.reset.is_none());
+    assert_serialized_patch_smaller("append", &append_patch, &appended);
+
+    let mut replaced = appended.clone();
+    replaced.revision = 102;
+    replaced.transcript.revision = 102;
+    replaced.transcript.items[100] =
+        transcript_item("item-100", 101, &"streaming transcript content ".repeat(16));
+    replaced.transcript.items[100].revision = 102;
+    let replace_patch = SessionViewPatch::between_snapshots(&appended, &replaced);
+    assert!(replace_patch.reset.is_none());
+    assert_serialized_patch_smaller("replace", &replace_patch, &replaced);
+
+    let mut reset = replaced.clone();
+    reset.revision = 103;
+    reset.transcript.revision = 103;
+    reset.title = Some("renamed session".to_owned());
+    let reset_patch = SessionViewPatch::between_snapshots(&replaced, &reset);
+    assert!(reset_patch.reset.is_some());
+    let reset_patch_bytes = serde_json::to_vec(&reset_patch)
+        .expect("reset patch serializes")
+        .len();
+    let reset_snapshot_bytes = serde_json::to_vec(&reset)
+        .expect("reset snapshot serializes")
+        .len();
+    assert!(
+        reset_patch_bytes >= reset_snapshot_bytes,
+        "reset patch ({reset_patch_bytes}) should not be treated as a transport optimization over its snapshot ({reset_snapshot_bytes})"
+    );
+}
+
+fn assert_serialized_patch_smaller(
+    workload: &str,
+    patch: &SessionViewPatch,
+    snapshot: &SessionViewSnapshot,
+) {
+    let patch_bytes = serde_json::to_vec(patch).expect("patch serializes").len();
+    let snapshot_bytes = serde_json::to_vec(snapshot)
+        .expect("snapshot serializes")
+        .len();
+    assert!(
+        patch_bytes.saturating_mul(4) < snapshot_bytes,
+        "{workload} patch ({patch_bytes}) should be at least 4x smaller than snapshot ({snapshot_bytes})"
+    );
+}
+
 fn transcript_document<const N: usize>(
     revision: ViewRevision,
     items: [TranscriptViewItem; N],

@@ -50,6 +50,32 @@ const TERMINAL_PLUGIN_API_NEEDLES: &[&str] = &[
     "bmux_tui",
 ];
 
+const TUI_DIRECT_SESSION_MUTATION_NEEDLES: &[&str] = &[
+    ".rename_session(",
+    ".delete_session(",
+    ".fork_session(",
+    ".clone_session(",
+    ".set_composer_draft(",
+    ".set_session_model(",
+    ".set_session_reasoning(",
+    ".set_session_agent(",
+    ".activate_skill(",
+    ".deactivate_skill(",
+    ".cancel_runtime_work(",
+    ".compact_session(",
+    ".change_session_working_directory(",
+    ".cancel_turn(",
+    ".resolve_permission_with_remember(",
+    ".resolve_permission_batch(",
+    ".send_message_with_placement(",
+];
+
+const TUI_DUPLICATE_PROJECTION_NEEDLES: &[&str] = &[
+    "apply_tool_invocation_projection_event",
+    "build_tool_invocation_projections",
+    "tool_invocation_projections:",
+];
+
 const CORE_SCAN_ROOTS: &[&str] = &[
     "packages/server",
     "packages/config",
@@ -258,6 +284,38 @@ fn tui_runtime_never_writes_diagnostics_directly_to_the_terminal() {
     assert!(
         !cli.contains("with_writer(std::io::stderr)"),
         "the shared TUI tracing subscriber must not write to stderr"
+    );
+}
+
+#[test]
+fn tui_session_mutations_use_renderer_neutral_actions() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut offenders = Vec::new();
+    collect_literal_offenders(
+        &workspace_root.join("packages/tui/src"),
+        TUI_DIRECT_SESSION_MUTATION_NEEDLES,
+        &mut offenders,
+    );
+    assert!(
+        offenders.is_empty(),
+        "TUI session mutations must route through execute_session_view_action:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn tui_does_not_restore_duplicate_session_projection() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut offenders = Vec::new();
+    collect_literal_offenders(
+        &workspace_root.join("packages/tui/src"),
+        TUI_DUPLICATE_PROJECTION_NEEDLES,
+        &mut offenders,
+    );
+    assert!(
+        offenders.is_empty(),
+        "TUI must consume SessionView instead of restoring parallel projection state:\n{}",
+        offenders.join("\n")
     );
 }
 

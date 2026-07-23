@@ -20,7 +20,7 @@ use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionProjectionKind,
     SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
     SessionTracePhase, ToolArtifact, ToolArtifactRef, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream, WorkId, build_tool_invocation_projections,
+    ToolInvocationStreamEvent, ToolOutputStream, WorkId,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -4273,6 +4273,28 @@ fn semantic_text_result_renders_generic_tool_result() {
 }
 
 #[test]
+fn shared_streaming_updates_remain_one_resident_terminal_item() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+    for index in 0..2_000_u64 {
+        app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-stream".to_owned(),
+                text: format!("{index},"),
+            },
+        });
+    }
+
+    assert_eq!(app.transcript().len(), 1);
+    assert_eq!(app.session_view_snapshot().transcript.items.len(), 1);
+    assert!(app.transcript()[0].streaming());
+    assert!(app.transcript()[0].text().starts_with("0,1,2,"));
+    assert!(app.transcript()[0].text().ends_with("1999,"));
+}
+
+#[test]
 fn transcript_resident_window_trims_live_bottom_following_turns() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -5747,7 +5769,7 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
-    let before = app.tool_invocation_projections().clone();
+    let before = app.session_view_snapshot().tools.clone();
 
     let fallback_rendered = render_app_text(&mut app);
 
@@ -5765,7 +5787,7 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
     );
     assert!(!fallback_rendered.contains("before"), "{fallback_rendered}");
     assert!(!fallback_rendered.contains("after"), "{fallback_rendered}");
-    assert_eq!(&before, app.tool_invocation_projections());
+    assert_eq!(&before, &app.session_view_snapshot().tools);
 
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
     let rich_rendered = render_app_text(&mut app);
@@ -5777,7 +5799,7 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
         !rich_rendered.contains("bcode.filesystem.change"),
         "{rich_rendered}"
     );
-    assert_eq!(&before, app.tool_invocation_projections());
+    assert_eq!(&before, &app.session_view_snapshot().tools);
 }
 
 #[test]
@@ -5912,7 +5934,7 @@ fn generic_artifact_fallback_projection_is_repeatable_and_non_mutating() {
 }
 
 #[test]
-fn live_tool_invocation_projection_matches_replayed_projection() {
+fn live_shared_tool_projection_matches_replayed_projection() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -5970,19 +5992,15 @@ fn live_tool_invocation_projection_matches_replayed_projection() {
             },
         ),
     ];
-    let replay_projection = build_tool_invocation_projections(&events);
+    let mut replay = bcode_session_view::SessionView::new();
+    replay.apply_history(&events);
+    let replay_projection = replay.snapshot().tools.clone();
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
 
     for event in &events {
         app.absorb_session_event(event);
     }
-    let live_projection = app
-        .tool_invocation_projections()
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-
-    assert_eq!(live_projection, replay_projection);
+    assert_eq!(app.session_view_snapshot().tools, replay_projection);
 }
 
 fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {

@@ -52,6 +52,7 @@ impl TranscriptDocument {
     }
 
     /// Apply streaming text to the newest matching role and bump the collection revision.
+    #[cfg(test)]
     pub fn push_streaming_item(&mut self, role: &'static str, text: &str) {
         super::transcript::push_streaming_transcript_item(&mut self.items, role, text);
         self.bump_revision();
@@ -79,6 +80,7 @@ impl TranscriptDocument {
     }
 
     /// Finish streaming text for a role and bump the collection revision.
+    #[cfg(test)]
     pub fn finish_streaming_item(&mut self, role: &'static str, text: &str) {
         super::transcript::finish_streaming_transcript_item(&mut self.items, role, text);
         self.bump_revision();
