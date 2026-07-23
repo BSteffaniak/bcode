@@ -675,8 +675,7 @@ impl SessionCatalogWatcher {
                 | Event::Session(_)
                 | Event::SessionLive(_)
                 | Event::RuntimeWork(_)
-                | Event::SessionViewResyncRequired { .. }
-                | Event::SessionOpenProgress { .. } => {}
+                | Event::SessionViewResyncRequired { .. } => {}
             }
         }
     }
@@ -731,9 +730,7 @@ impl SessionWatcher {
                 } if required == self.initial_session_id() => {
                     return Ok(SessionWatchEvent::ResyncRequired);
                 }
-                Event::SessionCatalogUpdated { .. }
-                | Event::SessionViewResyncRequired { .. }
-                | Event::SessionOpenProgress { .. } => {}
+                Event::SessionCatalogUpdated { .. } | Event::SessionViewResyncRequired { .. } => {}
             }
         }
     }
@@ -758,8 +755,7 @@ impl RuntimeWorkWatcher {
                 Event::Session(_)
                 | Event::SessionLive(_)
                 | Event::SessionViewResyncRequired { .. }
-                | Event::SessionCatalogUpdated { .. }
-                | Event::SessionOpenProgress { .. } => {}
+                | Event::SessionCatalogUpdated { .. } => {}
             }
         }
     }

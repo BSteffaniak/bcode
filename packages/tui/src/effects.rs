@@ -304,6 +304,10 @@ impl DaemonObservation {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Session-open preparation progress emitted while the open effect is running.
+    SessionOpenProgress {
+        snapshot: bcode_session_models::SessionOpenOperationSnapshot,
+    },
     /// Session open completed.
     SessionOpened {
         /// Session that was opened.
@@ -510,6 +514,7 @@ impl TuiEffectResult {
     #[must_use]
     pub fn daemon_observation(&self) -> DaemonObservation {
         match self {
+            Self::SessionOpenProgress { .. } => DaemonObservation::Success,
             Self::SessionOpened { result, .. } => DaemonObservation::from_tui_result(result),
             Self::DraftStatusLoaded {
                 daemon_connected,
@@ -899,6 +904,8 @@ pub struct TuiEffectRunner {
     passive_client: BcodeClient,
     daemon_host: TuiDaemonHost,
     tasks: BTreeMap<EffectKey, tokio::task::JoinHandle<TuiEffectResult>>,
+    streaming_sender: mpsc::UnboundedSender<TuiEffectResult>,
+    streaming_receiver: mpsc::UnboundedReceiver<TuiEffectResult>,
     queued_latest: BTreeMap<EffectKey, TuiEffect>,
 }
 
@@ -910,11 +917,14 @@ impl TuiEffectRunner {
         passive_client: &BcodeClient,
         daemon_host: TuiDaemonHost,
     ) -> Self {
+        let (streaming_sender, streaming_receiver) = mpsc::unbounded_channel();
         Self {
             foreground_client: foreground_client.clone(),
             passive_client: passive_client.clone(),
             daemon_host,
             tasks: BTreeMap::new(),
+            streaming_sender,
+            streaming_receiver,
             queued_latest: BTreeMap::new(),
         }
     }
@@ -964,13 +974,14 @@ impl TuiEffectRunner {
             EffectDaemonIntent::Foreground => self.foreground_client.clone(),
         };
         let daemon_host = self.daemon_host.clone();
+        let streaming_sender = self.streaming_sender.clone();
         let task = tokio::spawn(async move {
             if daemon_intent == EffectDaemonIntent::Foreground
                 && let Err(error) = ensure_foreground_daemon(&client, &daemon_host).await
             {
                 return effect.daemon_start_failed(error);
             }
-            Box::pin(effect.run(client)).await
+            Box::pin(effect.run(client, streaming_sender)).await
         });
         self.tasks.insert(key, task);
     }
@@ -983,6 +994,10 @@ impl TuiEffectRunner {
             .filter_map(|(key, task)| task.is_finished().then_some(key.clone()))
             .collect::<Vec<_>>();
         let mut results = Vec::with_capacity(finished.len());
+        while let Ok(result) = self.streaming_receiver.try_recv() {
+            results.push(result);
+        }
+        results.reserve(finished.len());
         for key in finished {
             let Some(task) = self.tasks.remove(&key) else {
                 continue;
@@ -1089,7 +1104,11 @@ impl TuiEffect {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run(self, client: BcodeClient) -> TuiEffectResult {
+    async fn run(
+        self,
+        client: BcodeClient,
+        streaming_sender: mpsc::UnboundedSender<TuiEffectResult>,
+    ) -> TuiEffectResult {
         match self {
             Self::OpenSession {
                 session_id,
@@ -1104,6 +1123,11 @@ impl TuiEffect {
                     session_id,
                     event_sender,
                     initial_window_request,
+                    |snapshot| {
+                        let _ = streaming_sender.send(TuiEffectResult::SessionOpenProgress {
+                            snapshot: snapshot.clone(),
+                        });
+                    },
                 )
                 .await,
             },
@@ -1897,4 +1921,46 @@ async fn cycle_thinking_effort(
         visible,
         status: Some(status),
     })
+}
+
+#[cfg(test)]
+mod progress_routing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runner_drains_streaming_session_progress_through_effect_results() {
+        let client = BcodeClient::default_endpoint();
+        let mut runner = TuiEffectRunner::new(&client, &client, TuiDaemonHost::new(&[]));
+        let session_id = SessionId::new();
+        let snapshot = bcode_session_models::SessionOpenOperationSnapshot {
+            operation_id: bcode_session_models::SessionOpenOperationId::new(),
+            revision: 1,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: bcode_session_models::SessionMigrationProgress {
+                stage: bcode_session_models::SessionMigrationStage::CopyingBackup,
+                completed_units: Some(1),
+                total_units: Some(2),
+                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Files),
+                message: "Copying backup".to_owned(),
+            },
+            outcome: None,
+            backup_path: None,
+        };
+        runner
+            .streaming_sender
+            .send(TuiEffectResult::SessionOpenProgress {
+                snapshot: snapshot.clone(),
+            })
+            .expect("stream progress result");
+
+        let results = runner.poll_finished().await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0],
+            TuiEffectResult::SessionOpenProgress { snapshot: actual } if actual == &snapshot
+        ));
+    }
 }

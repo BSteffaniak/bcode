@@ -342,7 +342,6 @@ const fn client_event_kind(event: &Event) -> &'static str {
         Event::RuntimeWork(_) => "runtime_work",
         Event::SessionViewResyncRequired { .. } => "session_view_resync_required",
         Event::SessionCatalogUpdated { .. } => "session_catalog_updated",
-        Event::SessionOpenProgress { .. } => "session_open_progress",
     }
 }
 
@@ -28061,8 +28060,7 @@ library = "test"
                     | bcode_ipc::Event::SessionLive(_)
                     | bcode_ipc::Event::SessionViewResyncRequired { .. }) => break event,
                     bcode_ipc::Event::RuntimeWork(_)
-                    | bcode_ipc::Event::SessionCatalogUpdated { .. }
-                    | bcode_ipc::Event::SessionOpenProgress { .. } => {}
+                    | bcode_ipc::Event::SessionCatalogUpdated { .. } => {}
                 }
             }
         })

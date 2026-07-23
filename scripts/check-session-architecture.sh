@@ -498,6 +498,13 @@ if ! rg -q "maintenance: &'a lease::SessionMaintenanceGuard" packages/session/sr
   violations=1
 fi
 
+if ! rg -q 'runner_drains_streaming_session_progress_through_effect_results' packages/tui/src/effects.rs \
+  || ! rg -q 'TuiEffectResult::SessionOpenProgress' packages/tui/src/chat_loop.rs \
+  || sed -n '/pub enum Event {/,/^}/p' packages/ipc/src/lib.rs | grep -q 'SessionOpenProgress'; then
+  echo "Session TUI progress-routing violation: migration progress must stream through typed TUI effect results, not daemon IPC events." >&2
+  violations=1
+fi
+
 if ! rg -q 'preparation_recovers_retained_operation_after_transport_interruption' packages/client/src/lib.rs \
   || ! rg -q 'dropping_progress_receiver_stops_client_observation_cleanly' packages/client/src/lib.rs \
   || ! rg -q 'unrelated_events_remain_buffered_in_fifo_order_during_requests' packages/client/src/lib.rs \

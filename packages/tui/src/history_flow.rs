@@ -97,6 +97,7 @@ pub async fn attach_session_event_stream(
         session_id,
         event_sender,
         initial_transcript_window_request(bmux_tui::geometry::Rect::new(0, 0, 80, 24)),
+        |_| {},
     )
     .await
 }
@@ -184,14 +185,12 @@ pub async fn attach_session_event_stream_with_window_request(
     session_id: SessionId,
     event_sender: mpsc::UnboundedSender<BcodeEvent>,
     request: ProjectionWindowRequest,
+    mut on_progress: impl FnMut(&bcode_session_models::SessionOpenOperationSnapshot),
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
-    let progress_sender = event_sender.clone();
     let attached = match connection
         .prepare_then_attach_session_projection_window(session_id, request.clone(), |snapshot| {
-            let _ = progress_sender.send(BcodeEvent::SessionOpenProgress {
-                snapshot: snapshot.clone(),
-            });
+            on_progress(snapshot);
         })
         .await
     {

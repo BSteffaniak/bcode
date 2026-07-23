@@ -559,6 +559,9 @@ fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
+        TuiEffectResult::SessionOpenProgress { snapshot } => {
+            apply_session_open_progress(chat, &snapshot);
+        }
         TuiEffectResult::SessionOpened {
             session_id,
             has_older_history,
@@ -1848,9 +1851,6 @@ fn absorb_bcode_event(
             if Some(session_id) == chat.session_id =>
         {
             handle_session_view_resync(loop_state, session_id)
-        }
-        BcodeEvent::SessionOpenProgress { snapshot } => {
-            apply_session_open_progress(chat, &snapshot)
         }
         BcodeEvent::Session(_)
         | BcodeEvent::SessionLive(_)

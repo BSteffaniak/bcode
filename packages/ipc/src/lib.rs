@@ -1312,10 +1312,6 @@ pub enum Event {
         #[serde(default)]
         revision: u64,
     },
-    /// Session-open preparation progress forwarded to an observing UI.
-    SessionOpenProgress {
-        snapshot: SessionOpenOperationSnapshot,
-    },
 }
 
 /// Errors returned by Bcode IPC encoding/decoding.
