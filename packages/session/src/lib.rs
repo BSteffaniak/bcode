@@ -1977,16 +1977,15 @@ impl SessionManager {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        if let Some(store) = &self.store {
-            let db_path = db::session_db_path(&store.root_path(), session_id);
-            if db_path.exists() {
-                let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path())
-                    .await?;
-                return Ok(db.history_page(query).await?);
-            }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        let db_path = db::session_db_path(&store.root_path(), session_id);
+        if !db_path.exists() {
+            return Err(SessionError::NotFound(session_id));
         }
-        Err(SessionError::NotFound(session_id))
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.history_page(query).await?)
     }
 
     /// Return canonical plugin status-note events for one stable note identity.
@@ -3865,6 +3864,66 @@ mod tests {
                 expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
             }
         );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn bounded_history_does_not_require_runtime_lease_or_writer_compatibility() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("read-only incompatible history".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        let db = db::SessionDb::open_turso_in_root(session.id, &root)
+            .await
+            .expect("open session db");
+        let future_epoch = u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH).saturating_add(1);
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                switchy::database::DatabaseValue::Int64(
+                    i64::try_from(future_epoch).expect("epoch fits"),
+                ),
+            )
+            .execute(db.database())
+            .await
+            .expect("set future writer epoch");
+        manager
+            .inner
+            .lock()
+            .await
+            .sessions
+            .remove(&session.id)
+            .expect("remove cached actor handle");
+        manager.inner.lock().await.leases.remove(&session.id);
+
+        let page = manager
+            .session_history_page(
+                session.id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("bounded history should remain inspectable");
+        assert_eq!(page.events.len(), 1);
+        assert!(matches!(
+            page.events[0].kind,
+            SessionEventKind::SessionCreated { .. }
+        ));
+        assert!(matches!(
+            manager.ensure_session_loaded(session.id).await,
+            Err(SessionError::Db(
+                db::SessionDbError::WriterIncompatible { .. }
+            ))
+        ));
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

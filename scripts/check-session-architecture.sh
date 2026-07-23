@@ -3,6 +3,35 @@ set -euo pipefail
 
 violations=0
 
+retired_interactive_kinds=(
+  interactive_tool_request_created
+  interactive_tool_request_resolved
+)
+for kind in "${retired_interactive_kinds[@]}"; do
+  fixture="packages/session/fixtures/migrations/${kind//_/-}-v32.json"
+  if ! rg -q "\"${kind}\"" packages/session/src/persisted.rs \
+    || [[ ! -f "$fixture" ]] \
+    || ! rg -q "\"${kind}\"" "$fixture"; then
+    echo "Session persisted-compatibility violation: retired event ${kind} must retain its decode adapter and schema-32 fixture." >&2
+    violations=1
+  fi
+done
+if ! rg -q 'preserve_retired_event_kind_as_legacy' packages/session/src/persisted.rs \
+  || ! rg -q 'decodes_retired_interactive_tool_compatibility_fixtures' packages/session/src/persisted.rs \
+  || ! rg -q 'retired_interactive_request_preserves_missing_optional_and_unknown_fields' packages/session/src/persisted.rs \
+  || ! rg -q 'retired_interactive_event_reencodes_only_as_legacy_event' packages/session/src/persisted.rs; then
+  echo "Session persisted-compatibility violation: retired interactive events must preserve raw payloads, remain decode-only, and stay fixture-tested." >&2
+  violations=1
+fi
+
+if ! sed -n '/pub async fn session_history_page(/,/^    }/p' packages/session/src/lib.rs \
+  | grep -q 'open_existing_turso_in_root' \
+  || sed -n '/pub async fn session_history_page(/,/^    }/p' packages/session/src/lib.rs \
+    | grep -Eq 'ensure_session_loaded|session_handle|acquire_session_lease'; then
+  echo "Session bounded-history violation: read-only history must open the canonical DB directly without actor loading or runtime lease acquisition." >&2
+  violations=1
+fi
+
 if rg -n 'incompatible_storage_writer_records|ensure_daemon_storage_compatibility' packages/server/src/lib.rs \
   >/tmp/bcode-global-daemon-storage-fence-violations.txt; then
   echo "Session storage-domain violation: daemon startup must not globally fence other fingerprints or writer epochs." >&2

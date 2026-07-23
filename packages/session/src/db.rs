@@ -5410,6 +5410,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_reindex_accepts_retired_interactive_events_as_inert_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("legacy interaction".to_owned()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append session created");
+
+        for (sequence, fixture, event_type) in [
+            (
+                1,
+                include_str!("../fixtures/migrations/interactive-tool-request-created-v32.json"),
+                "interactive_tool_request_created",
+            ),
+            (
+                2,
+                include_str!("../fixtures/migrations/interactive-tool-request-resolved-v32.json"),
+                "interactive_tool_request_resolved",
+            ),
+        ] {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(fixture).expect("fixture JSON");
+            payload["sequence"] = sequence.into();
+            payload["session_id"] = serde_json::to_value(session_id).expect("session id JSON");
+            db.database()
+                .insert("events")
+                .value("event_seq", seq_to_value(sequence))
+                .value("event_type", event_type)
+                .value("schema_version", DatabaseValue::Int32(32))
+                .value("created_at_ms", seq_to_value(sequence))
+                .value("payload", payload.to_string())
+                .execute(db.database())
+                .await
+                .expect("insert retired event");
+        }
+        db.database()
+            .delete("model_context_entries")
+            .execute(db.database())
+            .await
+            .expect("clear model context entries");
+        db.database()
+            .delete("model_context_projection_state")
+            .execute(db.database())
+            .await
+            .expect("clear model context state");
+
+        assert_eq!(
+            reindex_model_context_for_test(&db, temp_dir.path(), session_id).await,
+            3
+        );
+        assert_eq!(
+            db.model_context_projection_status()
+                .await
+                .expect("projection status"),
+            ModelContextProjectionStatus::Fresh { checkpoint: 2 }
+        );
+        assert!(
+            db.model_context_events()
+                .await
+                .expect("model context")
+                .is_empty()
+        );
+        let events = db.all_events_strict().await.expect("strict legacy history");
+        assert_eq!(history_sequences(&events), vec![0, 1, 2]);
+        assert!(matches!(
+            &events[1].kind,
+            SessionEventKind::LegacyEvent { event_type, .. }
+                if event_type == "interactive_tool_request_created"
+        ));
+        assert!(matches!(
+            &events[2].kind,
+            SessionEventKind::LegacyEvent { event_type, .. }
+                if event_type == "interactive_tool_request_resolved"
+        ));
+        assert!(
+            db.active_runtime_work()
+                .await
+                .expect("runtime work")
+                .is_empty()
+        );
+        assert!(db.active_tool_runs().await.expect("tool runs").is_empty());
+    }
+
+    #[tokio::test]
     async fn fresh_model_context_projection_tracks_semantic_entries_and_compaction() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
