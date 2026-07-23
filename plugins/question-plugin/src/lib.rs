@@ -668,6 +668,70 @@ bcode_plugin_sdk::export_plugin!(QuestionPlugin, include_str!("../bcode-plugin.t
 mod tests {
     use super::*;
 
+    fn outcome_request() -> NormalizedQuestionRequest {
+        NormalizedQuestionRequest {
+            questions: vec![Question {
+                header: None,
+                text: "Proceed?".to_owned(),
+                options: vec![QuestionOption {
+                    label: "Yes".to_owned(),
+                    value: Some("yes".to_owned()),
+                    description: None,
+                }],
+                control: QuestionControl::Radio,
+                selection_mode: QuestionSelectionMode::Single,
+                custom: false,
+                custom_mode: QuestionCustomMode::Additional,
+                required: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn question_exchange_defines_optional_and_required_no_consumer_outcomes() {
+        let optional = outcome_request();
+        let optional_outcome =
+            question_outcome_from_exchange(&optional, ToolExchangeResolution::NoCompatibleConsumer)
+                .expect("optional question may continue unanswered");
+        assert_eq!(optional_outcome.status, QuestionRequestStatus::Unanswered);
+        assert!(
+            optional_outcome
+                .questions
+                .iter()
+                .all(|question| question.status == QuestionStatus::Unanswered)
+        );
+
+        let mut required = optional;
+        required.questions[0].required = true;
+        assert_eq!(
+            question_outcome_from_exchange(&required, ToolExchangeResolution::NoCompatibleConsumer,),
+            Err("required question has no compatible consumer".to_owned())
+        );
+    }
+
+    #[test]
+    fn question_exchange_preserves_cancellation_detach_and_failure_semantics() {
+        let request = outcome_request();
+        assert_eq!(
+            question_outcome_from_exchange(&request, ToolExchangeResolution::Cancelled),
+            Err("question exchange cancelled".to_owned())
+        );
+        assert_eq!(
+            question_outcome_from_exchange(&request, ToolExchangeResolution::ConsumerDetached),
+            Err("question exchange consumer detached".to_owned())
+        );
+        assert_eq!(
+            question_outcome_from_exchange(
+                &request,
+                ToolExchangeResolution::Failed {
+                    code: "route_failed".to_owned(),
+                    message: "consumer unavailable".to_owned(),
+                },
+            ),
+            Err("question exchange failed (route_failed): consumer unavailable".to_owned())
+        );
+    }
+
     #[test]
     fn parses_canonical_wrapped_schema() {
         let request = parse_question_request(json!({

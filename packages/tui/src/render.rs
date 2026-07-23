@@ -265,6 +265,42 @@ fn bottom_dock_never_overlaps_transcript_and_preserves_one_row() {
 
 #[cfg(test)]
 #[test]
+fn docked_frame_preserves_anchored_transcript_top_and_latest_indicator() {
+    let session_id = bcode_session_models::SessionId::new();
+    let history = (0..30)
+        .map(|sequence| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: format!("context line {sequence}"),
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let terminal = Rect::new(0, 0, 60, 16);
+    prepare_frame(&mut app, terminal).expect("normal frame");
+    assert!(app.scroll_transcript_up(8));
+    let normal_top = app.transcript_top_row(transcript_area_for_frame(&app, terminal).height);
+    let normal_has_newer = app.newer_transcript_content_below();
+
+    let (docked, dock) =
+        prepare_frame_with_bottom_dock(&mut app, terminal, 6).expect("docked frame");
+    let docked_top = app.transcript_top_row(docked.body.height);
+    assert_eq!(docked_top, normal_top);
+    assert!(normal_has_newer);
+    assert!(app.newer_transcript_content_below());
+    assert!(docked.body.bottom() <= dock.y);
+
+    prepare_frame_with_bottom_dock(&mut app, terminal, 0).expect("restored frame");
+    let restored_top = app.transcript_top_row(transcript_area_for_frame(&app, terminal).height);
+    assert_eq!(restored_top, normal_top);
+}
+
+#[cfg(test)]
+#[test]
 fn zero_height_bottom_dock_preserves_normal_layout() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     let terminal = Rect::new(0, 0, 80, 20);

@@ -1049,31 +1049,27 @@ fn terminal_runtime_work_item_from_shared(work: &RuntimeWorkView) -> TranscriptI
 }
 
 fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -> TranscriptItem {
-    let payload = if interaction.resolved {
-        interaction.resolution.as_ref()
-    } else {
-        interaction.snapshot.as_ref()
-    };
-    let payload = payload.map_or_else(
-        || "null".to_owned(),
-        |value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
-    );
     let state = if interaction.resolved {
         "resolved"
     } else if interaction.required {
         "response required"
     } else {
-        "optional"
+        "optional response pending"
     };
-    TranscriptItem::with_kind(
-        "Interaction",
-        format!(
-            "{} ({state})\n{payload}",
-            interaction.title.as_deref().unwrap_or(&interaction.kind)
-        ),
-        false,
-        TranscriptItemKind::Generic,
-    )
+    let label = interaction.title.as_deref().unwrap_or(&interaction.kind);
+    let text = if interaction.resolved {
+        interaction.resolution.as_ref().map_or_else(
+            || format!("{label} ({state})"),
+            |resolution| {
+                let resolution = serde_json::to_string_pretty(resolution)
+                    .unwrap_or_else(|_| resolution.to_string());
+                format!("{label} ({state})\n{resolution}")
+            },
+        )
+    } else {
+        format!("{label} ({state})\nAnswer in the active interaction panel.")
+    };
+    TranscriptItem::with_kind("Interaction", text, false, TranscriptItemKind::Generic)
 }
 
 /// Build a compact transcript item for model token usage.
@@ -1247,6 +1243,48 @@ fn kind_for_role(role: &str) -> TranscriptItemKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_interaction_summary_avoids_duplicate_raw_form_payload() {
+        let interaction = InteractionViewSummary {
+            interaction_id: "question-1".to_owned(),
+            kind: "bcode.question".to_owned(),
+            surface_kind: "bcode.question.inline".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            title: Some("Question".to_owned()),
+            required: true,
+            snapshot: Some(serde_json::json!({
+                "questions": [{"question": "Secret raw form payload"}]
+            })),
+            resolved: false,
+            resolution: None,
+        };
+
+        let item = terminal_interaction_item_from_shared(&interaction);
+        assert!(item.text().contains("response required"));
+        assert!(item.text().contains("active interaction panel"));
+        assert!(!item.text().contains("Secret raw form payload"));
+    }
+
+    #[test]
+    fn resolved_interaction_summary_keeps_durable_outcome() {
+        let interaction = InteractionViewSummary {
+            interaction_id: "question-1".to_owned(),
+            kind: "bcode.question".to_owned(),
+            surface_kind: "bcode.question.inline".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            title: Some("Question".to_owned()),
+            required: true,
+            snapshot: None,
+            resolved: true,
+            resolution: Some(serde_json::json!({"status": "answered", "selected": ["yes"]})),
+        };
+
+        let item = terminal_interaction_item_from_shared(&interaction);
+        assert!(item.text().contains("resolved"));
+        assert!(item.text().contains("answered"));
+        assert!(item.text().contains("yes"));
+    }
 
     #[test]
     fn shared_generic_items_adapt_without_renderer_types_crossing_the_boundary() {

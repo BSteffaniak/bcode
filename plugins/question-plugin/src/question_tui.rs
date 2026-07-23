@@ -16,7 +16,6 @@ use super::question_interaction::{
 };
 use super::{QUESTION_INLINE_SURFACE, QuestionSelectionMode};
 
-const OPTION_PREFIX_WIDTH: usize = 8;
 const DESCRIPTION_INDENT: &str = "        ";
 
 /// Terminal renderer for the question interaction.
@@ -142,9 +141,10 @@ impl QuestionTerminalRenderer {
             } else {
                 "( )"
             };
-            let number = option_index.saturating_add(1);
-            let prefix = format!("  {number}. {marker} ");
-            let continuation = " ".repeat(OPTION_PREFIX_WIDTH.max(prefix.len()));
+            let shortcut = option_shortcut_label(option_index);
+            let shortcut_width = shortcut.len();
+            let prefix = format!("  {shortcut}. {marker} ");
+            let continuation = " ".repeat(7_usize.saturating_add(shortcut_width));
             let focused = matches!(
                 snapshot.focus,
                 QuestionFocusTarget::Option {
@@ -301,7 +301,8 @@ impl QuestionTerminalRenderer {
             );
             height = height.saturating_add(wrapped_height(&prompt, width, width));
             for (option_index, option) in question.options.iter().enumerate() {
-                let prefix_width = OPTION_PREFIX_WIDTH.max(option_index.to_string().len() + 7);
+                let prefix_width =
+                    7_usize.saturating_add(option_shortcut_label(option_index).len());
                 let available = width.saturating_sub(prefix_width).max(1);
                 height = height.saturating_add(wrapped_height(&option.label, available, available));
                 if let Some(description) = option.description.as_deref() {
@@ -352,7 +353,8 @@ impl QuestionTerminalRenderer {
             y = y.saturating_add(wrapped_height(&prompt, width, width));
             for (option_index, option) in question.options.iter().enumerate() {
                 let start = y;
-                let prefix_width = OPTION_PREFIX_WIDTH.max(option_index.to_string().len() + 7);
+                let prefix_width =
+                    7_usize.saturating_add(option_shortcut_label(option_index).len());
                 let available = width.saturating_sub(prefix_width).max(1);
                 y = y.saturating_add(wrapped_height(&option.label, available, available));
                 if let Some(description) = option.description.as_deref() {
@@ -499,11 +501,8 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
                         custom_text_change(snapshot, |text| text.push(character))
                     } else if let QuestionFocusTarget::Option { question_index, .. } =
                         snapshot.focus
-                        && let Some(option_index) = character
-                            .to_digit(10)
-                            .and_then(|digit| usize::try_from(digit).ok())
-                            .and_then(|digit| digit.checked_sub(1))
-                            .filter(|option_index| {
+                        && let Some(option_index) =
+                            option_shortcut(character).filter(|option_index| {
                                 *option_index
                                     < snapshot.request.questions[question_index].options.len()
                             })
@@ -529,6 +528,25 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
                 None
             }
         }
+    }
+}
+
+fn option_shortcut_label(option_index: usize) -> String {
+    match option_index {
+        0..=8 => option_index.saturating_add(1).to_string(),
+        9 => "0".to_owned(),
+        _ => "-".to_owned(),
+    }
+}
+
+fn option_shortcut(character: char) -> Option<usize> {
+    match character {
+        '1'..='9' => character
+            .to_digit(10)
+            .and_then(|digit| usize::try_from(digit).ok())
+            .and_then(|digit| digit.checked_sub(1)),
+        '0' => Some(9),
+        _ => None,
     }
 }
 
@@ -576,5 +594,213 @@ const fn option_style(focused: bool, selected: bool) -> Style {
         style.add_modifier(Modifier::REVERSED)
     } else {
         style
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_plugin_sdk::interaction::PluginInteraction;
+    use bcode_tool::InteractionInput;
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::geometry::Point;
+
+    use crate::{
+        NormalizedQuestionRequest, Question, QuestionControl, QuestionCustomMode, QuestionOption,
+    };
+
+    fn question(
+        text: &str,
+        options: &[(&str, Option<&str>)],
+        custom: bool,
+        required: bool,
+    ) -> Question {
+        Question {
+            header: None,
+            text: text.to_owned(),
+            options: options
+                .iter()
+                .map(|(label, description)| QuestionOption {
+                    label: (*label).to_owned(),
+                    value: Some((*label).to_owned()),
+                    description: description.map(str::to_owned),
+                })
+                .collect(),
+            control: QuestionControl::Radio,
+            selection_mode: QuestionSelectionMode::Single,
+            custom,
+            custom_mode: QuestionCustomMode::Additional,
+            required,
+        }
+    }
+
+    fn render_snapshot(
+        renderer: &mut QuestionTerminalRenderer,
+        snapshot: &QuestionSnapshot,
+        area: Rect,
+    ) -> Buffer {
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        renderer.render(snapshot, area, &mut frame);
+        buffer
+    }
+
+    fn rendered_text(buffer: &Buffer) -> String {
+        (0..buffer.area().height)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn renderer_shows_focus_selection_descriptions_and_validation() {
+        let request = NormalizedQuestionRequest {
+            questions: vec![question(
+                "Choose carefully",
+                &[("Yes", Some("Continue with the operation")), ("No", None)],
+                false,
+                true,
+            )],
+        };
+        let mut controller = QuestionInteractionController::new(request);
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 0),
+        });
+        let selected = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        let buffer = render_snapshot(&mut renderer, &selected, Rect::new(0, 0, 48, 12));
+        let text = rendered_text(&buffer);
+
+        assert!(text.contains("Choose carefully *"));
+        assert!(text.contains("1. (*) Yes"));
+        assert!(text.contains("Continue with the operation"));
+        let selected_row = (0..buffer.area().height)
+            .find(|row| {
+                buffer
+                    .row_symbols(*row)
+                    .is_some_and(|line| line.contains("(*) Yes"))
+            })
+            .expect("selected option row");
+        assert_eq!(
+            buffer
+                .get(Point::new(9, selected_row))
+                .and_then(|cell| cell.style.fg),
+            Some(Color::Cyan)
+        );
+
+        let mut required = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question("Required", &[("Answer", None)], false, true)],
+        });
+        required.handle_input(InteractionInput::Submit);
+        let validation = render_snapshot(
+            &mut QuestionTerminalRenderer::default(),
+            &required.snapshot(),
+            Rect::new(0, 0, 32, 10),
+        );
+        assert!(rendered_text(&validation).contains("An answer is required."));
+    }
+
+    #[test]
+    fn renderer_wraps_content_and_remains_valid_at_tiny_widths() {
+        let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question(
+                "A deliberately long question that must wrap",
+                &[("A deliberately long option", Some("A long description too"))],
+                true,
+                false,
+            )],
+        });
+        let snapshot = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        let height = renderer.preferred_height(&snapshot, 12);
+        assert!(height > 8);
+        let buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 12, 8));
+        assert_eq!(buffer.area(), Rect::new(0, 0, 12, 8));
+        assert!(rendered_text(&buffer).contains("more"));
+        assert!(renderer.controls.iter().all(|control| {
+            control.area.width > 0
+                && control.area.height > 0
+                && control.area.x >= buffer.area().x
+                && control.area.right() <= buffer.area().right()
+                && control.area.y >= buffer.area().y
+                && control.area.bottom() <= buffer.area().bottom()
+        }));
+    }
+
+    #[test]
+    fn oversized_multi_question_form_keeps_focused_controls_visible() {
+        let request = NormalizedQuestionRequest {
+            questions: vec![
+                question(
+                    "First long question that wraps",
+                    &[("First", Some("First description")), ("Second", None)],
+                    true,
+                    true,
+                ),
+                question(
+                    "Second long question that wraps",
+                    &[("Third", Some("Third description")), ("Fourth", None)],
+                    true,
+                    true,
+                ),
+            ],
+        };
+        let mut controller = QuestionInteractionController::new(request);
+        let mut renderer = QuestionTerminalRenderer::default();
+        let area = Rect::new(0, 0, 24, 7);
+        let initial = render_snapshot(&mut renderer, &controller.snapshot(), area);
+        assert!(rendered_text(&initial).contains("↓ more"));
+
+        for _ in 0..6 {
+            controller.handle_input(InteractionInput::Navigate {
+                direction: InteractionNavigation::Next,
+            });
+        }
+        let focused = controller.snapshot();
+        assert_eq!(focused.focus, QuestionFocusTarget::Submit);
+        let scrolled = render_snapshot(&mut renderer, &focused, area);
+        assert!(renderer.viewport_offset > 0);
+        assert!(renderer.controls.iter().any(|control| {
+            control.control_id.as_str() == "submit"
+                && control.area.y >= area.y
+                && control.area.bottom() <= area.bottom()
+        }));
+        assert!(rendered_text(&scrolled).contains("↑ more"));
+    }
+
+    #[test]
+    fn clicking_a_visible_option_focuses_and_activates_it_once() {
+        let request = NormalizedQuestionRequest {
+            questions: vec![question(
+                "Choose",
+                &[("One", None), ("Two", None)],
+                false,
+                false,
+            )],
+        };
+        let mut controller = QuestionInteractionController::new(request);
+        let mut renderer = QuestionTerminalRenderer::default();
+        let snapshot = controller.snapshot();
+        let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 32, 10));
+        let second = renderer.controls[1].area;
+        let input = renderer
+            .input(
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(second.x, second.y),
+                )),
+                &snapshot,
+            )
+            .expect("visible option click");
+        controller.handle_input(input);
+        let clicked = controller.snapshot();
+        assert_eq!(clicked.answers[0].selected, ["Two"]);
+        assert_eq!(
+            clicked.focus,
+            QuestionFocusTarget::Option {
+                question_index: 0,
+                option_index: 1,
+            }
+        );
     }
 }

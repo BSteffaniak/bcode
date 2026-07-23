@@ -613,6 +613,52 @@ mod tests {
     }
 
     #[test]
+    fn text_only_question_starts_on_custom_and_submits_text() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[],
+            QuestionSelectionMode::Single,
+            true,
+            QuestionCustomMode::Additional,
+            true,
+        )));
+        assert_eq!(
+            controller.snapshot().focus,
+            QuestionFocusTarget::Custom { question_index: 0 }
+        );
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(0),
+            value: InteractionValue::String("because".to_owned()),
+        });
+        let InteractionOutput::Submitted { payload } =
+            controller.handle_input(InteractionInput::Submit)
+        else {
+            panic!("expected submitted output");
+        };
+        assert_eq!(payload["questions"][0]["custom"], "because");
+    }
+
+    #[test]
+    fn additional_custom_answer_preserves_selected_options() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("Yes", "yes")],
+            QuestionSelectionMode::Single,
+            true,
+            QuestionCustomMode::Additional,
+            false,
+        )));
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 0),
+        });
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(0),
+            value: InteractionValue::String("with caveats".to_owned()),
+        });
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.answers[0].selected, ["yes"]);
+        assert_eq!(snapshot.answers[0].custom.as_deref(), Some("with caveats"));
+    }
+
+    #[test]
     fn malformed_and_out_of_range_control_ids_are_ignored() {
         let mut controller = QuestionInteractionController::new(request(question(
             &[("Yes", "yes")],

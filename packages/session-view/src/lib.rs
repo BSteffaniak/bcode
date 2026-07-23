@@ -3271,6 +3271,80 @@ mod tests {
     }
 
     #[test]
+    fn assistant_context_precedes_pending_question_and_resolution_updates_same_item() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::AssistantMessage {
+                text: "Read this context before answering.".to_owned(),
+            },
+        ));
+        view.upsert_interaction(InteractionViewSummary {
+            interaction_id: "question-1".to_owned(),
+            kind: "bcode.question".to_owned(),
+            surface_kind: "bcode.question.inline".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            title: Some("Question".to_owned()),
+            required: true,
+            snapshot: Some(serde_json::json!({"questions": [{"question": "Proceed?"}]})),
+            resolved: false,
+            resolution: None,
+        });
+
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "Read this context before answering."
+        ));
+        let interaction_id = TranscriptViewItemId::interaction("question-1");
+        let pending_revision = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == interaction_id)
+            .expect("pending interaction item")
+            .revision;
+
+        view.upsert_interaction(InteractionViewSummary {
+            interaction_id: "question-1".to_owned(),
+            kind: "bcode.question".to_owned(),
+            surface_kind: "bcode.question.inline".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            title: Some("Question".to_owned()),
+            required: true,
+            snapshot: None,
+            resolved: true,
+            resolution: Some(serde_json::json!({"status": "answered"})),
+        });
+        let resolved = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == interaction_id)
+            .expect("resolved interaction item");
+        assert!(resolved.revision > pending_revision);
+        assert!(matches!(
+            &resolved.kind,
+            TranscriptViewItemKind::Interaction { interaction }
+                if interaction.resolved
+                    && interaction.resolution == Some(serde_json::json!({"status": "answered"}))
+        ));
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.id == interaction_id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn authoritative_interaction_hydration_removes_stale_pending_state() {
         let interaction = |id: &str| InteractionViewSummary {
             interaction_id: id.to_owned(),

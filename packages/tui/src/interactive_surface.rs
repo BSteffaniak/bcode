@@ -9,7 +9,132 @@ use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use serde_json::json;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+const SURFACE_OPEN_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Queued request to open one client-rendered interactive surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveSurfaceRequest {
+    interaction_id: String,
+    surface_kind: String,
+    request_json: String,
+    retry_at: Option<Instant>,
+}
+
+impl InteractiveSurfaceRequest {
+    /// Create a queued surface-open request.
+    #[must_use]
+    pub fn new(
+        interaction_id: impl Into<String>,
+        surface_kind: impl Into<String>,
+        request_json: impl Into<String>,
+    ) -> Self {
+        Self {
+            interaction_id: interaction_id.into(),
+            surface_kind: surface_kind.into(),
+            request_json: request_json.into(),
+            retry_at: None,
+        }
+    }
+
+    /// Return the interaction identifier.
+    #[must_use]
+    pub fn interaction_id(&self) -> &str {
+        &self.interaction_id
+    }
+
+    /// Return whether another open attempt may start now.
+    #[must_use]
+    pub fn ready(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|retry_at| now >= retry_at)
+    }
+
+    /// Defer another open attempt after a failed surface initialization.
+    pub fn defer_retry(&mut self, now: Instant) {
+        self.retry_at = now.checked_add(SURFACE_OPEN_RETRY_DELAY);
+    }
+}
+
+/// Deterministic, de-duplicated queue of pending interactive surfaces.
+#[derive(Debug, Default)]
+pub struct InteractiveSurfaceQueue {
+    pending: VecDeque<InteractiveSurfaceRequest>,
+}
+
+impl InteractiveSurfaceQueue {
+    /// Queue a request unless it is already active or pending.
+    pub fn enqueue(
+        &mut self,
+        request: InteractiveSurfaceRequest,
+        active_interaction_id: Option<&str>,
+    ) -> bool {
+        if active_interaction_id == Some(request.interaction_id())
+            || self
+                .pending
+                .iter()
+                .any(|pending| pending.interaction_id() == request.interaction_id())
+        {
+            return false;
+        }
+        self.pending.push_back(request);
+        true
+    }
+
+    /// Return the next request when its retry delay has elapsed.
+    #[must_use]
+    pub fn front_ready(&self, now: Instant) -> Option<&InteractiveSurfaceRequest> {
+        self.pending.front().filter(|request| request.ready(now))
+    }
+
+    /// Return the next deferred open retry time.
+    #[must_use]
+    pub fn next_retry_at(&self) -> Option<Instant> {
+        self.pending.front().and_then(|request| request.retry_at)
+    }
+
+    /// Remove and return the next request.
+    pub fn pop_front(&mut self) -> Option<InteractiveSurfaceRequest> {
+        self.pending.pop_front()
+    }
+
+    /// Defer the next request after a failed open attempt.
+    pub fn defer_front(&mut self, now: Instant) {
+        if let Some(request) = self.pending.front_mut() {
+            request.defer_retry(now);
+        }
+    }
+
+    /// Remove a resolved request from the queue.
+    pub fn remove(&mut self, interaction_id: &str) -> bool {
+        let original_len = self.pending.len();
+        self.pending
+            .retain(|request| request.interaction_id() != interaction_id);
+        self.pending.len() != original_len
+    }
+
+    /// Retain only interactions still reported pending by authoritative hydration.
+    pub fn retain(&mut self, interaction_ids: &std::collections::BTreeSet<String>) {
+        self.pending
+            .retain(|request| interaction_ids.contains(request.interaction_id()));
+    }
+
+    /// Clear queued requests when changing sessions.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Return queued interaction ids in deterministic presentation order.
+    #[cfg(test)]
+    pub(crate) fn interaction_ids(&self) -> Vec<&str> {
+        self.pending
+            .iter()
+            .map(InteractiveSurfaceRequest::interaction_id)
+            .collect()
+    }
+}
 
 /// Runtime state for one client-rendered interactive tool surface.
 pub struct InteractiveSurfaceState {
@@ -45,6 +170,24 @@ impl InteractiveSurfaceState {
             host,
             pending_resolution: None,
         })
+    }
+
+    /// Open one queued surface request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no plugin declares the surface kind or the factory fails.
+    pub async fn open_request(
+        runtime: &PluginRuntimeHost,
+        request: &InteractiveSurfaceRequest,
+    ) -> Result<Self, PluginLoadError> {
+        Self::open(
+            runtime,
+            request.interaction_id.clone(),
+            request.surface_kind.clone(),
+            &request.request_json,
+        )
+        .await
     }
 
     /// Return the interaction id associated with this surface.
@@ -181,6 +324,43 @@ mod tests {
         )
         .await
         .expect("open local question TUI surface")
+    }
+
+    #[test]
+    fn surface_queue_is_fifo_deduplicated_and_reconciles_resolved_requests() {
+        let mut queue = InteractiveSurfaceQueue::default();
+        let first = InteractiveSurfaceRequest::new("first", "surface", "{}");
+        let duplicate = first.clone();
+        let second = InteractiveSurfaceRequest::new("second", "surface", "{}");
+
+        assert!(queue.enqueue(first, None));
+        assert!(!queue.enqueue(duplicate, None));
+        assert!(!queue.enqueue(
+            InteractiveSurfaceRequest::new("active", "surface", "{}"),
+            Some("active")
+        ));
+        assert!(queue.enqueue(second, None));
+        assert_eq!(queue.interaction_ids(), ["first", "second"]);
+
+        assert!(queue.remove("first"));
+        assert_eq!(queue.interaction_ids(), ["second"]);
+        queue.retain(&std::collections::BTreeSet::new());
+        assert!(queue.interaction_ids().is_empty());
+    }
+
+    #[test]
+    fn surface_queue_defers_failed_open_attempts() {
+        let mut queue = InteractiveSurfaceQueue::default();
+        assert!(queue.enqueue(
+            InteractiveSurfaceRequest::new("first", "surface", "{}"),
+            None
+        ));
+        let now = Instant::now();
+        assert!(queue.front_ready(now).is_some());
+        queue.defer_front(now);
+        assert!(queue.front_ready(now).is_none());
+        assert_eq!(queue.next_retry_at(), Some(now + SURFACE_OPEN_RETRY_DELAY));
+        assert!(queue.front_ready(now + SURFACE_OPEN_RETRY_DELAY).is_some());
     }
 
     #[tokio::test]

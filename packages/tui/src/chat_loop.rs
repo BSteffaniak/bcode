@@ -1,6 +1,7 @@
 //! Main chat event loop for the TUI.
 
 use bcode_plugin_sdk::path::display_from_current_dir;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -10,7 +11,7 @@ use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_plugin::PluginRuntimeHost;
 use bcode_session_models::SessionEventKind;
 use bcode_session_view::execute_session_view_action;
-use bcode_session_view_models::SessionViewAction;
+use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
 use bmux_keyboard::KeyStroke;
 use bmux_tui::event::{Event, FocusEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
@@ -24,7 +25,9 @@ use super::daemon_host::TuiDaemonHost;
 use super::daemon_issue;
 use super::effects::{DaemonObservation, TuiEffect, TuiEffectResult, TuiEffectRunner};
 use super::helpers;
-use super::interactive_surface::InteractiveSurfaceState;
+use super::interactive_surface::{
+    InteractiveSurfaceQueue, InteractiveSurfaceRequest, InteractiveSurfaceState,
+};
 use super::invalidation::InvalidationQueue;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
@@ -120,6 +123,7 @@ struct ChatLoopState {
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     interactive_surface: Option<InteractiveSurfaceState>,
+    interactive_surface_queue: InteractiveSurfaceQueue,
     plugin_runtime: Option<PluginRuntimeHost>,
     artifact_stream: ArtifactStreamCoordinator,
     telemetry: super::telemetry::TuiTelemetry,
@@ -142,6 +146,7 @@ impl ChatLoopState {
             thinking_dialog: None,
             timeline_dialog: None,
             interactive_surface: None,
+            interactive_surface_queue: InteractiveSurfaceQueue::default(),
             plugin_runtime: None,
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
             telemetry: super::telemetry::TuiTelemetry::new(passive_client.clone(), metrics_enabled),
@@ -333,7 +338,7 @@ async fn run_chat_loop<W: Write>(
         if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
             needs_redraw = true;
         }
-        if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET).await {
+        if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET) {
             needs_redraw = true;
         }
         if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
@@ -391,9 +396,12 @@ async fn run_chat_loop<W: Write>(
             &mut invalidation_queue,
             chat,
             &mut loop_state.artifact_stream,
-            loop_state.telemetry.next_flush_at(),
-            needs_redraw.then_some(redraw_at),
-            draft_autosave.next_save_at(),
+            ChatLoopDeadlines {
+                interaction_retry: loop_state.interactive_surface_queue.next_retry_at(),
+                telemetry_flush: loop_state.telemetry.next_flush_at(),
+                redraw: needs_redraw.then_some(redraw_at),
+                draft_save: draft_autosave.next_save_at(),
+            },
         )
         .await?;
         let before_session_id = chat.session_id;
@@ -431,13 +439,12 @@ async fn run_chat_loop<W: Write>(
                 }
             }
             ChatLoopEvent::Bcode(event) => {
-                if absorb_bcode_event(chat, loop_state, *event).await
+                if absorb_bcode_event(chat, loop_state, *event)
                     || drain_bcode_events(
                         chat,
                         loop_state,
                         BCODE_EVENT_DRAIN_BUDGET.saturating_sub(1),
                     )
-                    .await
                 {
                     needs_redraw = true;
                 }
@@ -487,6 +494,7 @@ async fn handle_loop_housekeeping(
     let mut needs_redraw = false;
     needs_redraw |= poll_finished_effects(settings, chat, draft_autosave, loop_state).await;
     needs_redraw |= loop_state.drain_pending_effects(chat);
+    needs_redraw |= maybe_start_interactive_surface(chat, loop_state).await;
     loop_state.artifact_stream.start_due_fetches(Instant::now());
     needs_redraw |= maybe_start_older_history_load(chat, loop_state);
     needs_redraw |= maybe_start_newer_history_load(chat, loop_state);
@@ -585,6 +593,8 @@ fn apply_effect_result(
                 }
             }
             session_flow::complete_switch_session(chat, session_id, has_older_history, result);
+            loop_state.interactive_surface = None;
+            loop_state.interactive_surface_queue.clear();
         }
         TuiEffectResult::ConfigLoaded { config } => {
             apply_config_result(settings, chat, loop_state, *config);
@@ -605,7 +615,7 @@ fn apply_effect_result(
             session_id,
             hydration,
         } => {
-            apply_session_status_result(chat, session_id, *hydration);
+            apply_session_status_result(chat, loop_state, session_id, *hydration);
         }
         TuiEffectResult::SessionModelStatusLoaded { session_id, result } => {
             if chat.session_id == Some(session_id) {
@@ -800,6 +810,7 @@ fn apply_draft_status_result(
 
 fn apply_session_status_result(
     chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
     session_id: bcode_session_models::SessionId,
     hydration: super::effects::SessionStatusHydration,
 ) {
@@ -833,6 +844,7 @@ fn apply_session_status_result(
         chat.app.apply_runtime_work_snapshots(&work);
     }
     if let Some(interactions) = interactions {
+        reconcile_interactive_surfaces(loop_state, &interactions);
         chat.app.set_pending_interactions(interactions);
     }
     let skill_count = chat.app.active_skill_count();
@@ -1700,14 +1712,14 @@ fn take_bcode_events(
         .collect()
 }
 
-async fn drain_bcode_events(
+fn drain_bcode_events(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     budget: usize,
 ) -> bool {
     let mut needs_redraw = false;
     for event in take_bcode_events(&mut chat.event_receiver, budget) {
-        needs_redraw |= absorb_bcode_event(chat, loop_state, event).await;
+        needs_redraw |= absorb_bcode_event(chat, loop_state, event);
     }
     needs_redraw
 }
@@ -1743,7 +1755,7 @@ fn drain_artifact_completions(
     needs_redraw
 }
 
-async fn absorb_bcode_event(
+fn absorb_bcode_event(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     event: BcodeEvent,
@@ -1802,7 +1814,7 @@ async fn absorb_bcode_event(
                     loop_state.replace_effect(TuiEffect::ListPermissions);
                 }
                 chat.app.absorb_session_event(&event);
-                maybe_open_interactive_surface(chat, loop_state, &event.kind).await;
+                observe_interactive_surface_event(loop_state, &event.kind);
             }
             true
         }
@@ -1847,46 +1859,137 @@ async fn absorb_bcode_event(
     }
 }
 
-async fn maybe_open_interactive_surface(
+fn interaction_surface_request(
+    interaction: &bcode_session_view_models::InteractionViewSummary,
+) -> Option<InteractiveSurfaceRequest> {
+    (!interaction.resolved && !interaction.surface_kind.is_empty()).then(|| {
+        InteractiveSurfaceRequest::new(
+            interaction.interaction_id.clone(),
+            interaction.surface_kind.clone(),
+            interaction
+                .snapshot
+                .clone()
+                .unwrap_or(serde_json::Value::Null)
+                .to_string(),
+        )
+    })
+}
+
+fn tool_exchange_surface_request(
+    request: &bcode_session_models::ToolExchangeRequest,
+) -> Option<InteractiveSurfaceRequest> {
+    let adapter = bcode_bundled_plugins::interaction_adapter(
+        &request.producer_id,
+        &request.schema,
+        request.schema_version,
+        "tui",
+    )?;
+    let surface_kind = adapter.tui_surface_kind?;
+    Some(InteractiveSurfaceRequest::new(
+        request.exchange_id.clone(),
+        surface_kind,
+        request.payload.to_string(),
+    ))
+}
+
+fn reconcile_interactive_surfaces(
+    loop_state: &mut ChatLoopState,
+    interactions: &[bcode_session_view_models::InteractionViewSummary],
+) {
+    let pending_ids = interactions
+        .iter()
+        .filter(|interaction| !interaction.resolved)
+        .map(|interaction| interaction.interaction_id.clone())
+        .collect::<BTreeSet<_>>();
+    if loop_state
+        .interactive_surface
+        .as_ref()
+        .is_some_and(|surface| !pending_ids.contains(surface.interaction_id()))
+    {
+        loop_state.interactive_surface = None;
+    }
+    loop_state.interactive_surface_queue.retain(&pending_ids);
+    let active_id = loop_state
+        .interactive_surface
+        .as_ref()
+        .map(InteractiveSurfaceState::interaction_id);
+    for request in interactions.iter().filter_map(interaction_surface_request) {
+        loop_state
+            .interactive_surface_queue
+            .enqueue(request, active_id);
+    }
+}
+
+fn observe_interactive_surface_event(loop_state: &mut ChatLoopState, event: &SessionEventKind) {
+    match event {
+        SessionEventKind::ToolExchangeRequested { request } => {
+            if let Some(request) = tool_exchange_surface_request(request) {
+                let active_id = loop_state
+                    .interactive_surface
+                    .as_ref()
+                    .map(InteractiveSurfaceState::interaction_id);
+                loop_state
+                    .interactive_surface_queue
+                    .enqueue(request, active_id);
+            }
+        }
+        SessionEventKind::ToolExchangeResolved { event } => {
+            loop_state
+                .interactive_surface_queue
+                .remove(&event.exchange_id);
+            if loop_state
+                .interactive_surface
+                .as_ref()
+                .is_some_and(|surface| surface.interaction_id() == event.exchange_id)
+            {
+                loop_state.interactive_surface = None;
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn maybe_start_interactive_surface(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
-    event: &SessionEventKind,
-) {
-    let (interaction_id, surface_kind, request_json) = match event {
-        SessionEventKind::ToolExchangeRequested { request } => {
-            let Some(adapter) = bcode_bundled_plugins::interaction_adapter(
-                &request.producer_id,
-                &request.schema,
-                request.schema_version,
-                "tui",
-            ) else {
-                return;
-            };
-            let Some(surface_kind) = adapter.tui_surface_kind else {
-                return;
-            };
-            (
-                request.exchange_id.clone(),
-                surface_kind,
-                serde_json::Value::to_string(&request.payload),
-            )
-        }
-        _ => return,
-    };
+) -> bool {
+    if loop_state.interactive_surface.is_some()
+        || loop_state
+            .interactive_surface_queue
+            .front_ready(Instant::now())
+            .is_none()
+    {
+        return false;
+    }
     let runtime = loop_state.plugin_runtime.get_or_insert_with(|| {
         super::plugin_tui::load_default_runtime_with_static_bundled(
             &bcode_bundled_plugins::static_bundled_plugins(),
         )
         .expect("load plugin runtime for interactive TUI surfaces")
     });
-    let opened =
-        InteractiveSurfaceState::open(runtime, interaction_id, surface_kind, &request_json).await;
+    let opened = InteractiveSurfaceState::open_request(
+        runtime,
+        loop_state
+            .interactive_surface_queue
+            .front_ready(Instant::now())
+            .expect("ready request checked above"),
+    )
+    .await;
     match opened {
-        Ok(surface) => loop_state.interactive_surface = Some(surface),
+        Ok(surface) => {
+            loop_state.interactive_surface_queue.pop_front();
+            loop_state.interactive_surface = Some(surface);
+            true
+        }
         Err(error) => {
+            loop_state
+                .interactive_surface_queue
+                .defer_front(Instant::now());
             tracing::warn!(%error, "failed to open interactive TUI surface");
-            chat.app
-                .set_status(format!("Interactive request unavailable: {error}"));
+            chat.app.set_status(format!(
+                "Interactive request unavailable; retrying: {error}"
+            ));
+            true
         }
     }
 }
@@ -1908,14 +2011,19 @@ fn try_next_ready_artifact_event(
         .map(|completion| ChatLoopEvent::ArtifactFetchCompleted(Box::new(completion)))
 }
 
+struct ChatLoopDeadlines {
+    interaction_retry: Option<Instant>,
+    telemetry_flush: Option<Instant>,
+    redraw: Option<Instant>,
+    draft_save: Option<Instant>,
+}
+
 async fn next_chat_loop_event(
     terminal_events: &mut TuiInput,
     invalidation_queue: &mut InvalidationQueue,
     chat: &mut ActiveChat,
     artifact_stream: &mut ArtifactStreamCoordinator,
-    telemetry_flush_at: Option<Instant>,
-    redraw_at: Option<Instant>,
-    draft_save_at: Option<Instant>,
+    deadlines: ChatLoopDeadlines,
 ) -> Result<ChatLoopEvent, TuiError> {
     if let Some(event) = try_next_ready_artifact_event(artifact_stream) {
         return Ok(event);
@@ -1928,9 +2036,10 @@ async fn next_chat_loop_event(
     let next_timer_at = [
         invalidation_queue.next_at(),
         artifact_stream.next_retry_at(),
-        telemetry_flush_at,
-        redraw_at,
-        draft_save_at,
+        deadlines.interaction_retry,
+        deadlines.telemetry_flush,
+        deadlines.redraw,
+        deadlines.draft_save,
     ]
     .into_iter()
     .flatten()
@@ -2054,18 +2163,12 @@ async fn handle_event<W: Write>(
             }
             Ok(true)
         }
-        Event::Key(stroke)
-            if loop_state.interactive_surface.is_some()
-                && interactive_surface_host_key(context.services.keymap, stroke).is_some() =>
-        {
-            handle_interactive_surface_host_key(context, chat, loop_state, stroke).await
-        }
         Event::Mouse(mouse)
             if loop_state.interactive_surface.is_some()
-                && matches!(
-                    mouse.kind,
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                ) =>
+                && interactive_surface_event_route(
+                    context.services.keymap,
+                    &Event::Mouse(mouse),
+                ) == InteractiveSurfaceEventRoute::TranscriptMouse =>
         {
             let hit_id = mouse_flow::mouse_hit_id(context.terminal.hits(), mouse);
             mouse_flow::handle_mouse(
@@ -2078,10 +2181,20 @@ async fn handle_event<W: Write>(
             )
             .await
         }
-        event @ Event::Key(_) if loop_state.interactive_surface.is_some() => {
-            handle_interactive_surface_event(context, chat, loop_state, event).await
+        Event::Key(stroke)
+            if loop_state.interactive_surface.is_some()
+                && matches!(
+                    interactive_surface_event_route(context.services.keymap, &Event::Key(stroke)),
+                    InteractiveSurfaceEventRoute::Host(_)
+                ) =>
+        {
+            handle_interactive_surface_host_key(context, chat, loop_state, stroke).await
         }
-        event @ (Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::Mouse(_))
+        event @ (Event::Key(_)
+        | Event::Paste(_)
+        | Event::Focus(_)
+        | Event::Tick
+        | Event::Mouse(_))
             if loop_state.interactive_surface.is_some() =>
         {
             handle_interactive_surface_event(context, chat, loop_state, event).await
@@ -2133,6 +2246,39 @@ async fn handle_event<W: Write>(
             .await
         }
         Event::User(_) => Ok(false),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveSurfaceEventRoute {
+    Host(BmuxAction),
+    TranscriptMouse,
+    Surface,
+}
+
+fn interactive_surface_event_route(
+    keymap: &BmuxKeyMap,
+    event: &Event,
+) -> InteractiveSurfaceEventRoute {
+    match event {
+        Event::Key(stroke) => interactive_surface_host_key(keymap, *stroke).map_or(
+            InteractiveSurfaceEventRoute::Surface,
+            InteractiveSurfaceEventRoute::Host,
+        ),
+        Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            InteractiveSurfaceEventRoute::TranscriptMouse
+        }
+        Event::Paste(_)
+        | Event::Focus(_)
+        | Event::Tick
+        | Event::Mouse(_)
+        | Event::Resize(_)
+        | Event::User(_) => InteractiveSurfaceEventRoute::Surface,
     }
 }
 
@@ -2188,14 +2334,35 @@ async fn resolve_interactive_surface_dismissed<W: Write>(
         return Ok(());
     };
     let interaction_id = surface.interaction_id().to_owned();
-    execute_session_view_action(
+    let outcome = match execute_session_view_action(
         context.services.client,
         SessionViewAction::ResolveExchange {
             interaction_id,
             resolution: InteractiveSurfaceState::dismissed_resolution(),
         },
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            loop_state.interactive_surface = Some(surface);
+            chat.app
+                .set_status(format!("Interactive dismissal failed; retry: {error}"));
+            return Ok(());
+        }
+    };
+    if !matches!(
+        outcome,
+        SessionViewActionOutcome::InteractionResolved {
+            resolved: true | false
+        }
+    ) {
+        loop_state.interactive_surface = Some(surface);
+        chat.app.set_status(
+            "Interactive dismissal failed: unexpected daemon response; retry".to_owned(),
+        );
+        return Ok(());
+    }
     chat.app
         .set_status("interactive request dismissed".to_owned());
     Ok(())
@@ -2226,7 +2393,21 @@ async fn handle_interactive_surface_event<W: Write>(
         )
         .await
         {
-            Ok(_) => loop_state.interactive_surface = None,
+            Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }) => {
+                loop_state.interactive_surface = None;
+            }
+            Ok(SessionViewActionOutcome::InteractionResolved { resolved: false }) => {
+                loop_state.interactive_surface = None;
+                chat.app.set_status(
+                    "Interactive request was already resolved by another client".to_owned(),
+                );
+            }
+            Ok(_) => {
+                surface.clear_pending_resolution();
+                chat.app.set_status(
+                    "Interactive response failed: unexpected daemon response; retry".to_owned(),
+                );
+            }
             Err(error) => {
                 surface.clear_pending_resolution();
                 tracing::warn!(%error, "failed to resolve interactive request");
@@ -2454,6 +2635,7 @@ fn paste_clipboard_image(chat: &mut ActiveChat) {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+    use bmux_keyboard::KeyCode;
     fn test_chat() -> ActiveChat {
         let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
         ActiveChat {
@@ -2501,6 +2683,163 @@ mod scheduler_tests {
         }
     }
 
+    fn interaction(
+        id: &str,
+        surface_kind: &str,
+    ) -> bcode_session_view_models::InteractionViewSummary {
+        bcode_session_view_models::InteractionViewSummary {
+            interaction_id: id.to_owned(),
+            kind: "bcode.question".to_owned(),
+            surface_kind: surface_kind.to_owned(),
+            tool_call_id: Some(format!("call-{id}")),
+            title: Some("Question".to_owned()),
+            required: true,
+            snapshot: Some(serde_json::json!({"questions": []})),
+            resolved: false,
+            resolution: None,
+        }
+    }
+
+    fn install_question_runtime(state: &mut ChatLoopState) {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        );
+        state.plugin_runtime = Some(
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection::all_enabled(),
+                &[plugin],
+            )
+            .expect("question runtime"),
+        );
+    }
+
+    #[tokio::test]
+    async fn hydration_reconciles_pending_queue_idempotently_and_removes_stale_entries() {
+        let mut state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            TuiDaemonHost::new(&[]),
+            false,
+        );
+        let first = interaction("first", "bcode.question.inline");
+        let second = interaction("second", "bcode.question.inline");
+        reconcile_interactive_surfaces(&mut state, &[first.clone(), second.clone()]);
+        reconcile_interactive_surfaces(&mut state, &[first, second.clone()]);
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["first", "second"]
+        );
+
+        reconcile_interactive_surfaces(&mut state, &[second]);
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrated_requests_deduplicate_and_external_resolution_removes_matching_queue_entry() {
+        let mut state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            TuiDaemonHost::new(&[]),
+            false,
+        );
+        let request = interaction("question-1", "bcode.question.inline");
+        reconcile_interactive_surfaces(&mut state, std::slice::from_ref(&request));
+        reconcile_interactive_surfaces(&mut state, &[request]);
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["question-1"]
+        );
+
+        observe_interactive_surface_event(
+            &mut state,
+            &SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: "call-question-1".to_owned(),
+                    exchange_id: "question-1".to_owned(),
+                    resolution: bcode_session_models::ToolExchangeResolution::ConsumerDetached,
+                },
+            },
+        );
+        assert!(state.interactive_surface_queue.interaction_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_surface_open_is_retained_and_retried_after_delay() {
+        let mut state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            TuiDaemonHost::new(&[]),
+            false,
+        );
+        state.interactive_surface_queue.enqueue(
+            InteractiveSurfaceRequest::new("broken", "unknown.surface", "{}"),
+            None,
+        );
+        let mut chat = test_chat();
+        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["broken"]
+        );
+        assert!(state.interactive_surface_queue.next_retry_at().is_some());
+        assert!(chat.app.status().contains("retrying"));
+    }
+
+    #[tokio::test]
+    async fn hydrated_multiple_questions_open_in_fifo_order() {
+        let mut state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            TuiDaemonHost::new(&[]),
+            false,
+        );
+        install_question_runtime(&mut state);
+        let payload = serde_json::json!({
+            "questions": [{
+                "header": null,
+                "question": "Proceed?",
+                "options": [{"label": "Yes", "value": "yes", "description": null}],
+                "control": "radio",
+                "selection_mode": "single",
+                "custom": false,
+                "custom_mode": "additional",
+                "required": true
+            }]
+        });
+        let mut first = interaction("first", "bcode.question.inline");
+        first.snapshot = Some(payload.clone());
+        let mut second = interaction("second", "bcode.question.inline");
+        second.snapshot = Some(payload);
+        reconcile_interactive_surfaces(&mut state, &[first, second]);
+        let mut chat = test_chat();
+
+        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
+        assert_eq!(
+            state
+                .interactive_surface
+                .as_ref()
+                .map(InteractiveSurfaceState::interaction_id),
+            Some("first")
+        );
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["second"]
+        );
+        state.interactive_surface = None;
+        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
+        assert_eq!(
+            state
+                .interactive_surface
+                .as_ref()
+                .map(InteractiveSurfaceState::interaction_id),
+            Some("second")
+        );
+    }
+
     #[test]
     fn permission_hydration_preserves_batch_and_policy_semantics() {
         let session_id = bcode_session_models::SessionId::new();
@@ -2530,6 +2869,96 @@ mod scheduler_tests {
         assert_eq!(batch.batch_id, "batch-1");
         assert_eq!(batch.call_index, 1);
         assert_eq!(batch.call_count, 3);
+    }
+
+    #[test]
+    fn active_surface_routing_preserves_all_semantic_transcript_actions() {
+        let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+        for (key, expected) in [
+            (KeyCode::PageUp, BmuxAction::TranscriptPageUp),
+            (KeyCode::PageDown, BmuxAction::TranscriptPageDown),
+        ] {
+            assert_eq!(
+                interactive_surface_event_route(
+                    &keymap,
+                    &Event::Key(KeyStroke {
+                        key,
+                        modifiers: bmux_keyboard::Modifiers::NONE,
+                    }),
+                ),
+                InteractiveSurfaceEventRoute::Host(expected)
+            );
+        }
+        for (key, expected) in [
+            (KeyCode::Home, BmuxAction::TranscriptTop),
+            (KeyCode::End, BmuxAction::TranscriptBottom),
+            (KeyCode::Up, BmuxAction::TranscriptLineUp),
+            (KeyCode::Down, BmuxAction::TranscriptLineDown),
+        ] {
+            assert_eq!(
+                interactive_surface_event_route(
+                    &keymap,
+                    &Event::Key(KeyStroke {
+                        key,
+                        modifiers: bmux_keyboard::Modifiers {
+                            ctrl: true,
+                            ..bmux_keyboard::Modifiers::NONE
+                        },
+                    }),
+                ),
+                InteractiveSurfaceEventRoute::Host(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn active_surface_routing_honors_custom_transcript_bindings() {
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.chat = std::collections::BTreeMap::from([(
+            "alt+u".to_owned(),
+            "transcript.pageUp".to_owned(),
+        )]);
+        let keymap = BmuxKeyMap::from_config(&config);
+        assert_eq!(
+            interactive_surface_event_route(
+                &keymap,
+                &Event::Key(KeyStroke {
+                    key: KeyCode::Char('u'),
+                    modifiers: bmux_keyboard::Modifiers {
+                        alt: true,
+                        ..bmux_keyboard::Modifiers::NONE
+                    },
+                }),
+            ),
+            InteractiveSurfaceEventRoute::Host(BmuxAction::TranscriptPageUp)
+        );
+    }
+
+    #[test]
+    fn active_surface_routing_reserves_mouse_wheel_for_transcript() {
+        let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+            assert_eq!(
+                interactive_surface_event_route(
+                    &keymap,
+                    &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                        kind,
+                        bmux_tui::geometry::Point::new(4, 8),
+                    )),
+                ),
+                InteractiveSurfaceEventRoute::TranscriptMouse
+            );
+        }
+        assert_eq!(
+            interactive_surface_event_route(
+                &keymap,
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                    bmux_tui::geometry::Point::new(4, 8),
+                )),
+            ),
+            InteractiveSurfaceEventRoute::Surface
+        );
     }
 
     #[test]
