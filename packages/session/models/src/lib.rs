@@ -329,6 +329,188 @@ impl<'de> Deserialize<'de> for SessionId {
     }
 }
 
+/// Unique session-open preparation operation identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionOpenOperationId(pub Uuid);
+
+impl SessionOpenOperationId {
+    /// Generate a new operation identifier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for SessionOpenOperationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Display for SessionOpenOperationId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl Serialize for SessionOpenOperationId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            self.0.serialize(serializer)
+        } else {
+            serializer.serialize_str(&self.0.to_string())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionOpenOperationId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            Uuid::deserialize(deserializer).map(Self)
+        } else {
+            let value = String::deserialize(deserializer)?;
+            Uuid::parse_str(&value)
+                .map(Self)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Ordered stage of legacy storage preparation for session open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMigrationStage {
+    /// Waiting to acquire exclusive session maintenance ownership.
+    WaitingForOwnership,
+    /// Reading bounded storage-contract metadata.
+    InspectingStorage,
+    /// Enumerating files and bytes for a retained backup.
+    PlanningBackup,
+    /// Copying the retained backup.
+    CopyingBackup,
+    /// Verifying copied backup bytes.
+    VerifyingBackup,
+    /// Applying database schema migrations before projection replay.
+    PreparingSchema,
+    /// Reading and decoding canonical history.
+    ReadingCanonicalHistory,
+    /// Rebuilding all derived projections from canonical history.
+    RebuildingProjections,
+    /// Validating projection schemas and canonical-tail checkpoints.
+    ValidatingProjections,
+    /// Committing the atomic migration transaction.
+    Committing,
+    /// Validating post-commit write readiness.
+    ValidatingWriteReadiness,
+    /// Performing the final bounded session open.
+    OpeningSession,
+    /// Preparation completed successfully.
+    Complete,
+    /// Preparation terminated with a classified failure.
+    Failed,
+}
+
+/// Natural unit for one determinate migration stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMigrationProgressUnit {
+    /// Files discovered or processed.
+    Files,
+    /// File bytes copied or verified.
+    Bytes,
+    /// Canonical events decoded or projected.
+    Events,
+}
+
+/// Stable classification for a terminal session-open preparation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOpenFailureKind {
+    /// Another daemon owns the session.
+    OwnedByOtherDaemon,
+    /// The durable writer contract is incompatible with this build.
+    WriterIncompatible,
+    /// A required projection is stale or incompatible.
+    ProjectionStale,
+    /// Canonical or derived storage requires explicit repair.
+    RepairRequired,
+    /// A retained pre-migration backup could not be verified.
+    BackupFailed,
+    /// Migration failed after ownership and backup preconditions succeeded.
+    MigrationFailed,
+    /// Session storage disappeared before preparation completed.
+    NotFound,
+}
+
+/// Progress within the current session migration stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMigrationProgress {
+    /// Current ordered migration stage.
+    pub stage: SessionMigrationStage,
+    /// Completed natural units for a determinate stage.
+    #[serde(default)]
+    pub completed_units: Option<u64>,
+    /// Total natural units for a determinate stage.
+    #[serde(default)]
+    pub total_units: Option<u64>,
+    /// Natural unit associated with completed and total values.
+    #[serde(default)]
+    pub unit: Option<SessionMigrationProgressUnit>,
+    /// Stable user-facing description of the current work.
+    pub message: String,
+}
+
+/// Terminal outcome of a session-open preparation operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOpenTerminalOutcome {
+    /// Session storage is current and writable.
+    Ready,
+    /// Session is inspectable but contains unsupported semantic history.
+    DegradedReadOnly { issue_count: u64 },
+    /// Storage was written by an incompatible writer contract.
+    WriterIncompatible { actual: Option<u64>, expected: u64 },
+    /// Storage requires explicit repair before normal open.
+    RepairRequired { reason: String },
+    /// Preparation failed with a stable classification.
+    Failed {
+        kind: SessionOpenFailureKind,
+        message: String,
+        #[serde(default)]
+        backup_path: Option<PathBuf>,
+    },
+}
+
+/// Reconnectable point-in-time snapshot of one session-open operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOpenOperationSnapshot {
+    /// Stable operation identity.
+    pub operation_id: SessionOpenOperationId,
+    /// Monotonic operation-local revision.
+    pub revision: u64,
+    /// Session being prepared.
+    pub session_id: SessionId,
+    /// Legacy writer epoch being migrated, when migration is required.
+    #[serde(default)]
+    pub source_writer_epoch: Option<u64>,
+    /// Writer epoch expected by the current build.
+    pub target_writer_epoch: u64,
+    /// Latest stage-local progress.
+    pub progress: SessionMigrationProgress,
+    /// Terminal outcome, present only after operation completion.
+    #[serde(default)]
+    pub outcome: Option<SessionOpenTerminalOutcome>,
+    /// Verified retained backup path, present only after verification succeeds.
+    #[serde(default)]
+    pub backup_path: Option<PathBuf>,
+}
+
 /// Unique connected-client identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientId(pub Uuid);
@@ -2112,6 +2294,49 @@ pub enum SessionEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_open_operation_models_round_trip_and_preserve_semantics() {
+        let snapshot = SessionOpenOperationSnapshot {
+            operation_id: SessionOpenOperationId::new(),
+            revision: 7,
+            session_id: SessionId::new(),
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: SessionMigrationProgress {
+                stage: SessionMigrationStage::RebuildingProjections,
+                completed_units: Some(16_742),
+                total_units: Some(53_652),
+                unit: Some(SessionMigrationProgressUnit::Events),
+                message: "Rebuilding session indexes".to_owned(),
+            },
+            outcome: Some(SessionOpenTerminalOutcome::Failed {
+                kind: SessionOpenFailureKind::MigrationFailed,
+                message: "projection replay failed".to_owned(),
+                backup_path: Some(PathBuf::from("/tmp/backup")),
+            }),
+            backup_path: Some(PathBuf::from("/tmp/backup")),
+        };
+
+        let encoded = serde_json::to_vec(&snapshot).expect("snapshot should encode");
+        let decoded: SessionOpenOperationSnapshot =
+            serde_json::from_slice(&encoded).expect("snapshot should decode");
+
+        assert_eq!(decoded, snapshot);
+        assert!(
+            SessionMigrationStage::WaitingForOwnership
+                < SessionMigrationStage::RebuildingProjections
+        );
+        assert!(SessionMigrationStage::RebuildingProjections < SessionMigrationStage::Complete);
+        assert_eq!(
+            snapshot.progress.unit,
+            Some(SessionMigrationProgressUnit::Events)
+        );
+        assert!(
+            snapshot.progress.completed_units.expect("completed")
+                <= snapshot.progress.total_units.expect("total")
+        );
+    }
 
     #[test]
     fn generic_result_record_finishes_projection_and_late_stream_cannot_revive_it() {

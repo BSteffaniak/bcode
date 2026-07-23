@@ -24,6 +24,7 @@ mod actor;
 pub mod db;
 pub mod lease;
 pub mod legacy_stream_cleanup;
+mod migration_operation;
 pub mod persisted;
 mod persisted_legacy;
 pub mod projection;
@@ -38,17 +39,20 @@ use bcode_session_models::{
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
     SessionForkKind, SessionForkResult, SessionForkSummary, SessionHistoryDirection,
     SessionHistoryPage, SessionHistoryQuery, SessionId, SessionImportSummary,
-    SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind, SessionSummary,
-    SessionTitleSource, SessionTokenUsage, SessionTraceEvent,
+    SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind, SessionMigrationProgress,
+    SessionMigrationStage, SessionOpenFailureKind, SessionOpenOperationId,
+    SessionOpenOperationSnapshot, SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource,
+    SessionTokenUsage, SessionTraceEvent,
 };
 use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -157,16 +161,82 @@ fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &Sessio
     }
 }
 
+const MIGRATION_PROGRESS_BYTE_INTERVAL: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct MigrationProgressReporter {
+    operation: Arc<migration_operation::SessionMigrationOperation>,
+    last_reported: Arc<StdMutex<Option<(SessionMigrationStage, u64)>>>,
+}
+
+impl MigrationProgressReporter {
+    fn new(operation: Arc<migration_operation::SessionMigrationOperation>) -> Self {
+        Self {
+            operation,
+            last_reported: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    fn stage(&self, stage: SessionMigrationStage, message: impl Into<String>) {
+        self.operation.publish_progress(SessionMigrationProgress {
+            stage,
+            completed_units: None,
+            total_units: None,
+            unit: None,
+            message: message.into(),
+        });
+    }
+
+    fn determinate(
+        &self,
+        stage: SessionMigrationStage,
+        completed: u64,
+        total: u64,
+        unit: bcode_session_models::SessionMigrationProgressUnit,
+        message: impl Into<String>,
+        interval: u64,
+    ) {
+        let should_publish = completed == 0
+            || completed == total
+            || self.last_reported.lock().is_ok_and(|mut last| {
+                let publish = last.is_none_or(|(last_stage, last_completed)| {
+                    last_stage != stage || completed.saturating_sub(last_completed) >= interval
+                });
+                if publish {
+                    *last = Some((stage, completed));
+                }
+                publish
+            });
+        if should_publish {
+            self.operation.publish_progress(SessionMigrationProgress {
+                stage,
+                completed_units: Some(completed),
+                total_units: Some(total),
+                unit: Some(unit),
+                message: message.into(),
+            });
+        }
+    }
+
+    fn backup_verified(&self, path: PathBuf) {
+        self.operation.publish_backup_path(path);
+    }
+}
+
 fn ensure_loaded_metric_labels(result: &str) -> MetricLabels {
     let mut labels = MetricLabels::new();
     labels.insert("result".to_owned(), result.to_owned());
     labels
 }
 
-fn create_verified_migration_backup(
+const MIGRATION_BACKUP_BUFFER_BYTES: usize = 64 * 1024;
+
+async fn create_verified_migration_backup(
     root: &Path,
     session_id: SessionId,
     writer_epoch: u64,
+    metrics: &MetricsRegistry,
+    progress: Option<&MigrationProgressReporter>,
 ) -> Result<PathBuf, SessionError> {
     let source = root.join(session_id.to_string());
     let timestamp = SystemTime::now()
@@ -177,53 +247,374 @@ fn create_verified_migration_backup(
         .unwrap_or(root)
         .join("session-migration-backups")
         .join(format!("{timestamp}-{session_id}-epoch-{writer_epoch}"));
-    copy_and_verify_directory(&source, &destination).map_err(|error| {
-        SessionError::MigrationBackup {
-            session_id,
-            reason: error.to_string(),
-        }
-    })?;
-    let manifest = serde_json::json!({
+    let manifest = serde_json::to_vec_pretty(&serde_json::json!({
         "session_id": session_id,
         "source_writer_epoch": writer_epoch,
         "target_writer_epoch": db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
         "created_at_ms": u64::try_from(timestamp).unwrap_or(u64::MAX),
-    });
-    let manifest_path = destination.join("migration-backup.json");
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).map_err(|error| SessionError::MigrationBackup {
-            session_id,
-            reason: error.to_string(),
-        })?,
-    )
+    }))
     .map_err(|error| SessionError::MigrationBackup {
         session_id,
-        reason: format!("{}: {error}", manifest_path.display()),
+        reason: error.to_string(),
     })?;
+    let backup_destination = destination.clone();
+    let backup_progress = progress.cloned();
+    let result = spawn_blocking(move || {
+        create_verified_migration_backup_blocking(
+            &source,
+            &backup_destination,
+            &manifest,
+            MigrationBackupCopyFault::None,
+            backup_progress.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| SessionError::MigrationBackup {
+        session_id,
+        reason: format!("backup worker failed: {error}"),
+    })?
+    .map_err(|error| SessionError::MigrationBackup {
+        session_id,
+        reason: error.to_string(),
+    })?;
+    metrics.record_histogram(
+        "session.migration.backup.plan_duration_ms",
+        duration_millis(result.plan_duration),
+    );
+    metrics.record_histogram(
+        "session.migration.backup.copy_duration_ms",
+        duration_millis(result.copy_duration),
+    );
+    metrics.record_histogram(
+        "session.migration.backup.verify_duration_ms",
+        duration_millis(result.verify_duration),
+    );
+    metrics.add_counter("session.migration.backup.files_total", result.files);
+    metrics.add_counter("session.migration.backup.bytes_total", result.bytes);
     Ok(destination)
 }
 
-fn copy_and_verify_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(destination)?;
-    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+#[derive(Debug)]
+struct MigrationBackupResult {
+    files: u64,
+    bytes: u64,
+    plan_duration: std::time::Duration,
+    copy_duration: std::time::Duration,
+    verify_duration: std::time::Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrationBackupCopyFault {
+    None,
+    #[cfg(test)]
+    PermissionDenied,
+    #[cfg(test)]
+    ShortWriteAfter(u64),
+}
+
+fn create_verified_migration_backup_blocking(
+    source: &Path,
+    destination: &Path,
+    manifest: &[u8],
+    fault: MigrationBackupCopyFault,
+    progress: Option<&MigrationProgressReporter>,
+) -> std::io::Result<MigrationBackupResult> {
+    if destination.exists() {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "backup destination already exists: {}",
+                destination.display()
+            ),
+        ));
+    }
+    let result = (|| {
+        let started = Instant::now();
+        let files = migration_backup_files(source, source)?;
+        let plan_duration = started.elapsed();
+        let bytes = files
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.bytes));
+        if let Some(progress) = progress {
+            let file_count = u64::try_from(files.len()).unwrap_or(u64::MAX);
+            progress.determinate(
+                SessionMigrationStage::PlanningBackup,
+                file_count,
+                file_count,
+                bcode_session_models::SessionMigrationProgressUnit::Files,
+                "Planned retained backup",
+                1,
+            );
+            progress.determinate(
+                SessionMigrationStage::CopyingBackup,
+                0,
+                bytes,
+                bcode_session_models::SessionMigrationProgressUnit::Bytes,
+                "Copying retained backup",
+                MIGRATION_PROGRESS_BYTE_INTERVAL,
+            );
+        }
+        fs::create_dir_all(destination)?;
+        let started = Instant::now();
+        let source_hashes =
+            copy_and_hash_backup_files(source, destination, &files, fault, progress, bytes)?;
+        let copy_duration = started.elapsed();
+        if let Some(progress) = progress {
+            progress.determinate(
+                SessionMigrationStage::VerifyingBackup,
+                0,
+                bytes,
+                bcode_session_models::SessionMigrationProgressUnit::Bytes,
+                "Verifying retained backup",
+                MIGRATION_PROGRESS_BYTE_INTERVAL,
+            );
+        }
+        let started = Instant::now();
+        verify_backup_files(destination, &files, &source_hashes, progress, bytes)?;
+        let verify_duration = started.elapsed();
+        fs::write(destination.join("migration-backup.json"), manifest)?;
+        Ok(MigrationBackupResult {
+            files: u64::try_from(files.len()).unwrap_or(u64::MAX),
+            bytes,
+            plan_duration,
+            copy_duration,
+            verify_duration,
+        })
+    })();
+    if result.is_err() && destination.exists() {
+        let _ = fs::remove_dir_all(destination);
+    }
+    result
+}
+
+#[derive(Debug)]
+struct MigrationBackupFile {
+    relative_path: PathBuf,
+    bytes: u64,
+}
+
+fn migration_backup_files(
+    root: &Path,
+    directory: &Path,
+) -> std::io::Result<Vec<MigrationBackupFile>> {
+    let mut files = Vec::new();
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
+        let path = entry.path();
         if entry.file_type()?.is_dir() {
-            copy_and_verify_directory(&source_path, &destination_path)?;
+            files.extend(migration_backup_files(root, &path)?);
         } else {
-            fs::copy(&source_path, &destination_path)?;
-            if fs::read(&source_path)? != fs::read(&destination_path)? {
-                return Err(std::io::Error::other(format!(
-                    "backup verification failed for {}",
-                    source_path.display()
-                )));
+            files.push(MigrationBackupFile {
+                relative_path: path
+                    .strip_prefix(root)
+                    .map_err(std::io::Error::other)?
+                    .to_path_buf(),
+                bytes: entry.metadata()?.len(),
+            });
+        }
+    }
+    Ok(files)
+}
+
+fn copy_and_hash_backup_files(
+    source: &Path,
+    destination: &Path,
+    files: &[MigrationBackupFile],
+    fault: MigrationBackupCopyFault,
+    progress: Option<&MigrationProgressReporter>,
+    total_bytes: u64,
+) -> std::io::Result<BTreeMap<PathBuf, [u8; 32]>> {
+    #[cfg(not(test))]
+    let _ = fault;
+    #[cfg(test)]
+    if matches!(fault, MigrationBackupCopyFault::PermissionDenied) {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "injected backup permission failure",
+        ));
+    }
+    let mut total_written = 0_u64;
+    let mut source_digests = BTreeMap::new();
+    for file in files {
+        let source_path = source.join(&file.relative_path);
+        let destination_path = destination.join(&file.relative_path);
+        fs::create_dir_all(
+            destination_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("backup destination file has no parent"))?,
+        )?;
+        let mut reader =
+            BufReader::with_capacity(MIGRATION_BACKUP_BUFFER_BYTES, File::open(&source_path)?);
+        let destination_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination_path)?;
+        let mut writer = BufWriter::with_capacity(MIGRATION_BACKUP_BUFFER_BYTES, destination_file);
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; MIGRATION_BACKUP_BUFFER_BYTES];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
             }
+            #[cfg(test)]
+            if let MigrationBackupCopyFault::ShortWriteAfter(limit) = fault
+                && total_written.saturating_add(u64::try_from(read).unwrap_or(u64::MAX)) > limit
+            {
+                let allowed = usize::try_from(limit.saturating_sub(total_written))
+                    .unwrap_or(usize::MAX)
+                    .min(read);
+                if allowed > 0 {
+                    writer.write_all(&buffer[..allowed])?;
+                }
+                writer.flush()?;
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "injected short backup write",
+                ));
+            }
+            writer.write_all(&buffer[..read])?;
+            total_written = total_written.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if let Some(progress) = progress {
+                progress.determinate(
+                    SessionMigrationStage::CopyingBackup,
+                    total_written,
+                    total_bytes,
+                    bcode_session_models::SessionMigrationProgressUnit::Bytes,
+                    "Copying retained backup",
+                    MIGRATION_PROGRESS_BYTE_INTERVAL,
+                );
+            }
+            hasher.update(&buffer[..read]);
+        }
+        writer.flush()?;
+        fs::set_permissions(&destination_path, fs::metadata(&source_path)?.permissions())?;
+        source_digests.insert(file.relative_path.clone(), hasher.finalize().into());
+    }
+    Ok(source_digests)
+}
+
+fn verify_backup_files(
+    destination: &Path,
+    files: &[MigrationBackupFile],
+    source_hashes: &BTreeMap<PathBuf, [u8; 32]>,
+    progress: Option<&MigrationProgressReporter>,
+    total_bytes: u64,
+) -> std::io::Result<()> {
+    let mut verified_bytes = 0_u64;
+    for file in files {
+        let destination_path = destination.join(&file.relative_path);
+        if fs::metadata(&destination_path)?.len() != file.bytes {
+            return Err(std::io::Error::other(format!(
+                "backup length verification failed for {}",
+                file.relative_path.display()
+            )));
+        }
+        let actual = hash_file(&destination_path)?;
+        if source_hashes.get(&file.relative_path) != Some(&actual) {
+            return Err(std::io::Error::other(format!(
+                "backup hash verification failed for {}",
+                file.relative_path.display()
+            )));
+        }
+        verified_bytes = verified_bytes.saturating_add(file.bytes);
+        if let Some(progress) = progress {
+            progress.determinate(
+                SessionMigrationStage::VerifyingBackup,
+                verified_bytes,
+                total_bytes,
+                bcode_session_models::SessionMigrationProgressUnit::Bytes,
+                "Verifying retained backup",
+                MIGRATION_PROGRESS_BYTE_INTERVAL,
+            );
         }
     }
     Ok(())
+}
+
+fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut reader = BufReader::with_capacity(MIGRATION_BACKUP_BUFFER_BYTES, File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; MIGRATION_BACKUP_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn ready_session_open_snapshot(session_id: SessionId) -> SessionOpenOperationSnapshot {
+    SessionOpenOperationSnapshot {
+        operation_id: SessionOpenOperationId::new(),
+        revision: 0,
+        session_id,
+        source_writer_epoch: None,
+        target_writer_epoch: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+        progress: SessionMigrationProgress {
+            stage: SessionMigrationStage::Complete,
+            completed_units: None,
+            total_units: None,
+            unit: None,
+            message: "Session storage is ready".to_owned(),
+        },
+        outcome: Some(SessionOpenTerminalOutcome::Ready),
+        backup_path: None,
+    }
+}
+
+fn migrating_session_open_snapshot(
+    session_id: SessionId,
+    writer_epoch: u64,
+) -> SessionOpenOperationSnapshot {
+    SessionOpenOperationSnapshot {
+        operation_id: SessionOpenOperationId::new(),
+        revision: 0,
+        session_id,
+        source_writer_epoch: Some(writer_epoch),
+        target_writer_epoch: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+        progress: SessionMigrationProgress {
+            stage: SessionMigrationStage::WaitingForOwnership,
+            completed_units: None,
+            total_units: None,
+            unit: None,
+            message: "Waiting for exclusive session ownership".to_owned(),
+        },
+        outcome: None,
+        backup_path: None,
+    }
+}
+
+fn session_open_failure_outcome(error: &SessionError) -> SessionOpenTerminalOutcome {
+    let kind = match error {
+        SessionError::NotFound(_) => SessionOpenFailureKind::NotFound,
+        SessionError::MigrationBackup { .. } => SessionOpenFailureKind::BackupFailed,
+        SessionError::ProjectionStale { .. } => SessionOpenFailureKind::ProjectionStale,
+        SessionError::Db(db::SessionDbError::WriterIncompatible { .. }) => {
+            SessionOpenFailureKind::WriterIncompatible
+        }
+        SessionError::Lease(lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
+            SessionOpenFailureKind::OwnedByOtherDaemon
+        }
+        SessionError::Db(
+            db::SessionDbError::InvalidCanonicalSequence { .. }
+            | db::SessionDbError::InvalidRow { .. }
+            | db::SessionDbError::PersistedEvent(_),
+        ) => SessionOpenFailureKind::RepairRequired,
+        _ => SessionOpenFailureKind::MigrationFailed,
+    };
+    SessionOpenTerminalOutcome::Failed {
+        kind,
+        message: error.to_string(),
+        backup_path: None,
+    }
 }
 
 fn record_ensure_loaded_duration(metrics: &MetricsRegistry, result: &str, elapsed_ms: u64) {
@@ -747,14 +1138,15 @@ pub struct AppendToolCallRequestedInput {
 }
 
 /// In-memory session manager with optional DB-backed persistence.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionManager {
     inner: Arc<Mutex<SessionManagerInner>>,
     store: Option<SessionStoreExecutor>,
-    activity_clock_ms: AtomicU64,
+    activity_clock_ms: Arc<AtomicU64>,
     catalog_status_tx: watch::Sender<CatalogLoadStatus>,
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
     mutation_tx: broadcast::Sender<SessionMutationCommitted>,
+    migration_operations: migration_operation::SessionMigrationOperations,
     metrics: MetricsRegistry,
 }
 
@@ -959,13 +1351,24 @@ impl Default for SessionManager {
         Self {
             inner: Arc::new(Mutex::new(SessionManagerInner::default())),
             store: None,
-            activity_clock_ms: AtomicU64::new(current_unix_millis()),
+            activity_clock_ms: Arc::new(AtomicU64::new(current_unix_millis())),
             catalog_status_tx,
             catalog_status_rx,
             mutation_tx: broadcast::channel(1024).0,
+            migration_operations: migration_operation::SessionMigrationOperations::default(),
             metrics: MetricsRegistry::default(),
         }
     }
+}
+
+struct OwnedLegacyMigration<'a> {
+    session_id: SessionId,
+    root: &'a Path,
+    writer_epoch: u64,
+    maintenance: &'a lease::SessionMaintenanceGuard,
+    write: &'a lease::SessionWriteGuard,
+    started: &'a bcode_metrics::MetricsTimer,
+    progress: Option<&'a MigrationProgressReporter>,
 }
 
 impl SessionManager {
@@ -1063,12 +1466,102 @@ impl SessionManager {
                 load_gates: BTreeMap::new(),
             })),
             store: Some(executor),
-            activity_clock_ms: AtomicU64::new(current_unix_millis()),
+            activity_clock_ms: Arc::new(AtomicU64::new(current_unix_millis())),
             catalog_status_tx,
             catalog_status_rx,
             mutation_tx,
+            migration_operations: migration_operation::SessionMigrationOperations::default(),
             metrics,
         }
+    }
+
+    /// Start or join server-owned preparation for opening one persistent session.
+    ///
+    /// Current storage returns a terminal ready snapshot without spawning work. Known legacy
+    /// storage starts one detached, per-session migration operation that survives observer loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if bounded storage classification fails or the session does not exist.
+    pub async fn prepare_session_open(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionOpenOperationSnapshot, SessionError> {
+        let Some(store) = &self.store else {
+            return if self.inner.lock().await.sessions.contains_key(&session_id) {
+                Ok(ready_session_open_snapshot(session_id))
+            } else {
+                Err(SessionError::NotFound(session_id))
+            };
+        };
+        let root = store.root_path();
+        if !db::session_db_path(&root, session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let compatibility = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await?
+            .storage_compatibility()
+            .await?;
+        let db::SessionStorageCompatibility::KnownLegacy { writer_epoch } = compatibility else {
+            return Ok(ready_session_open_snapshot(session_id));
+        };
+        let initial = migrating_session_open_snapshot(session_id, writer_epoch);
+        let manager = self.clone();
+        let operation = self
+            .migration_operations
+            .start_or_join(initial, move |operation| async move {
+                let reporter = MigrationProgressReporter::new(operation);
+                match manager
+                    .ensure_session_loaded_with_progress(session_id, Some(&reporter))
+                    .await
+                {
+                    Ok(()) => SessionOpenTerminalOutcome::Ready,
+                    Err(error) => session_open_failure_outcome(&error),
+                }
+            })
+            .await;
+        Ok(operation.snapshot())
+    }
+
+    /// Return one operation snapshot when both session and operation identities match.
+    pub async fn session_open_operation(
+        &self,
+        session_id: SessionId,
+        operation_id: SessionOpenOperationId,
+    ) -> Option<SessionOpenOperationSnapshot> {
+        self.migration_operations
+            .get(session_id, operation_id)
+            .await
+            .map(|operation| operation.snapshot())
+    }
+
+    /// Subscribe to one matching session-open operation.
+    pub async fn subscribe_session_open_operation(
+        &self,
+        session_id: SessionId,
+        operation_id: SessionOpenOperationId,
+    ) -> Option<watch::Receiver<SessionOpenOperationSnapshot>> {
+        self.migration_operations
+            .get(session_id, operation_id)
+            .await
+            .map(|operation| operation.subscribe())
+    }
+
+    #[cfg(test)]
+    async fn session_open_operation_history(
+        &self,
+        session_id: SessionId,
+        operation_id: SessionOpenOperationId,
+    ) -> Vec<SessionOpenOperationSnapshot> {
+        self.migration_operations
+            .get(session_id, operation_id)
+            .await
+            .map_or_else(Vec::new, |operation| operation.history())
+    }
+
+    /// Return the number of migrations currently running.
+    pub async fn active_session_migration_count(&self) -> usize {
+        self.migration_operations.active_count().await
     }
 
     /// Subscribe to committed durable session mutations.
@@ -1155,17 +1648,30 @@ impl SessionManager {
     }
 
     async fn ensure_session_loaded(&self, session_id: SessionId) -> Result<(), SessionError> {
-        let gate = self.session_load_gate(session_id).await;
-        let _guard = gate.lock().await;
-        self.ensure_session_loaded_inner(session_id).await
+        self.ensure_session_loaded_with_progress(session_id, None)
+            .await
     }
 
-    async fn ensure_session_loaded_inner(&self, session_id: SessionId) -> Result<(), SessionError> {
+    async fn ensure_session_loaded_with_progress(
+        &self,
+        session_id: SessionId,
+        progress: Option<&MigrationProgressReporter>,
+    ) -> Result<(), SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        self.ensure_session_loaded_inner(session_id, progress).await
+    }
+
+    async fn ensure_session_loaded_inner(
+        &self,
+        session_id: SessionId,
+        progress: Option<&MigrationProgressReporter>,
+    ) -> Result<(), SessionError> {
         let total_timer = self.metrics.timer();
         let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
         if let Some(handle) = cached_handle {
             return self
-                .ensure_cached_session_loaded(session_id, handle, total_timer)
+                .ensure_cached_session_loaded(session_id, handle, total_timer, progress)
                 .await;
         }
         let Some(store) = &self.store else {
@@ -1173,7 +1679,7 @@ impl SessionManager {
             return Err(SessionError::NotFound(session_id));
         };
         if db::session_db_path(&store.root_path(), session_id).exists() {
-            self.load_persistent_session(session_id, store, total_timer)
+            self.load_persistent_session(session_id, store, total_timer, progress)
                 .await?;
             return Ok(());
         }
@@ -1186,6 +1692,7 @@ impl SessionManager {
         session_id: SessionId,
         handle: SessionHandle,
         total_timer: bcode_metrics::MetricsTimer,
+        progress: Option<&MigrationProgressReporter>,
     ) -> Result<(), SessionError> {
         let Some(store) = &self.store else {
             record_ensure_loaded_duration(&self.metrics, "cached", total_timer.elapsed_ms());
@@ -1197,7 +1704,7 @@ impl SessionManager {
         }
         let snapshot = handle.snapshot();
         let inserted_lease = self
-            .acquire_missing_session_lease(session_id, store)
+            .acquire_missing_session_lease(session_id, store, progress)
             .await?;
         let refreshed_summary = snapshot.load_status == SessionLoadStatusKind::SummaryOnly;
         if refreshed_summary {
@@ -1225,12 +1732,19 @@ impl SessionManager {
         &self,
         session_id: SessionId,
         store: &SessionStoreExecutor,
+        progress: Option<&MigrationProgressReporter>,
     ) -> Result<SessionLeaseGuard, SessionError> {
         use db::SessionStorageCompatibility::{Current, KnownLegacy};
 
         let root = store.root_path();
         for attempt in 0..3_u8 {
             let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+            if let Some(progress) = progress {
+                progress.stage(
+                    SessionMigrationStage::InspectingStorage,
+                    "Inspecting session storage",
+                );
+            }
             let compatibility = db.storage_compatibility().await?;
             drop(db);
             let outcome = match compatibility {
@@ -1245,6 +1759,7 @@ impl SessionManager {
                         &root,
                         writer_epoch,
                         attempt,
+                        progress,
                     )
                     .await?
                 }
@@ -1290,6 +1805,7 @@ impl SessionManager {
         root: &Path,
         writer_epoch: u64,
         attempt: u8,
+        progress: Option<&MigrationProgressReporter>,
     ) -> Result<SessionLeaseLoadOutcome, SessionError> {
         use db::SessionStorageCompatibility::{Current, KnownLegacy};
 
@@ -1303,6 +1819,13 @@ impl SessionManager {
             target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
             "attempting automatic legacy session migration"
         );
+        let ownership_timer = self.metrics.timer();
+        if let Some(progress) = progress {
+            progress.stage(
+                SessionMigrationStage::WaitingForOwnership,
+                "Waiting for exclusive session ownership",
+            );
+        }
         let maintenance = match lease::acquire_session_maintenance_guard(root, session_id) {
             Ok(maintenance) => maintenance,
             Err(error @ lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
@@ -1321,52 +1844,26 @@ impl SessionManager {
             }
             Err(error) => return Err(error.into()),
         };
+        self.metrics.record_histogram(
+            "session.migration.ownership_duration_ms",
+            ownership_timer.elapsed_ms(),
+        );
         let write = lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)?;
         let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
             .await?
             .storage_compatibility()
             .await?;
         if matches!(rechecked, KnownLegacy { .. }) {
-            let backup_path = create_verified_migration_backup(root, session_id, writer_epoch)?;
-            tracing::info!(
-                target: "bcode_session::migration",
-                %session_id,
-                backup_path = %backup_path.display(),
-                "verified pre-migration session backup"
-            );
-            let migrated =
-                match db::SessionDb::migrate_turso_in_root(session_id, root, &maintenance, &write)
-                    .await
-                {
-                    Ok(migrated) => migrated,
-                    Err(error) => {
-                        self.metrics
-                            .increment_counter("session.manager.storage_migration.failed_total");
-                        tracing::warn!(
-                            target: "bcode_session::migration",
-                            %session_id,
-                            %error,
-                            "automatic legacy session migration failed"
-                        );
-                        return Err(error.into());
-                    }
-                };
-            migrated.validate_write_readiness().await?;
-            drop(migrated);
-            self.metrics
-                .increment_counter("session.manager.storage_migration.completed_total");
-            self.metrics.record_histogram(
-                "session.manager.storage_migration.duration_ms",
-                started.elapsed_ms(),
-            );
-            tracing::info!(
-                target: "bcode_session::migration",
-                %session_id,
+            self.migrate_owned_legacy_storage(OwnedLegacyMigration {
+                session_id,
+                root,
                 writer_epoch,
-                target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-                duration_ms = started.elapsed_ms(),
-                "automatic legacy session migration completed"
-            );
+                maintenance: &maintenance,
+                write: &write,
+                started: &started,
+                progress,
+            })
+            .await?;
         }
         drop(write);
         Ok(SessionLeaseLoadOutcome::Acquired(Box::new(
@@ -1379,16 +1876,105 @@ impl SessionManager {
         )))
     }
 
+    async fn migrate_owned_legacy_storage(
+        &self,
+        migration: OwnedLegacyMigration<'_>,
+    ) -> Result<(), SessionError> {
+        let OwnedLegacyMigration {
+            session_id,
+            root,
+            writer_epoch,
+            maintenance,
+            write,
+            started,
+            progress,
+        } = migration;
+        let backup_path = create_verified_migration_backup(
+            root,
+            session_id,
+            writer_epoch,
+            &self.metrics,
+            progress,
+        )
+        .await?;
+        if let Some(progress) = progress {
+            progress.backup_verified(backup_path.clone());
+            progress.stage(
+                SessionMigrationStage::PreparingSchema,
+                "Preparing session storage schema",
+            );
+        }
+        tracing::info!(
+            target: "bcode_session::migration",
+            %session_id,
+            backup_path = %backup_path.display(),
+            "verified pre-migration session backup"
+        );
+        let db_progress = progress.map(|progress| {
+            let progress = progress.clone();
+            Arc::new(move |update| progress.operation.publish_progress(update))
+                as db::SessionMigrationProgressCallback
+        });
+        let migrated = db::SessionDb::migrate_turso_in_root_observed(
+            session_id,
+            root,
+            maintenance,
+            write,
+            self.metrics.clone(),
+            db_progress,
+        )
+        .await
+        .inspect_err(|error| {
+            self.metrics
+                .increment_counter("session.manager.storage_migration.failed_total");
+            tracing::warn!(
+                target: "bcode_session::migration",
+                %session_id,
+                %error,
+                "automatic legacy session migration failed"
+            );
+        })?;
+        let readiness_timer = self.metrics.timer();
+        if let Some(progress) = progress {
+            progress.stage(
+                SessionMigrationStage::ValidatingWriteReadiness,
+                "Validating session write readiness",
+            );
+        }
+        migrated.validate_write_readiness().await?;
+        self.metrics.record_histogram(
+            "session.migration.write_readiness_duration_ms",
+            readiness_timer.elapsed_ms(),
+        );
+        drop(migrated);
+        self.metrics
+            .increment_counter("session.manager.storage_migration.completed_total");
+        self.metrics.record_histogram(
+            "session.manager.storage_migration.duration_ms",
+            started.elapsed_ms(),
+        );
+        tracing::info!(
+            target: "bcode_session::migration",
+            %session_id,
+            writer_epoch,
+            target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            duration_ms = started.elapsed_ms(),
+            "automatic legacy session migration completed"
+        );
+        Ok(())
+    }
+
     async fn acquire_missing_session_lease(
         &self,
         session_id: SessionId,
         store: &SessionStoreExecutor,
+        progress: Option<&MigrationProgressReporter>,
     ) -> Result<bool, SessionError> {
         if self.inner.lock().await.leases.contains_key(&session_id) {
             return Ok(false);
         }
         let lease = self
-            .acquire_session_lease_for_load(session_id, store)
+            .acquire_session_lease_for_load(session_id, store, progress)
             .await?;
         let mut inner = self.inner.lock().await;
         if let std::collections::btree_map::Entry::Vacant(entry) = inner.leases.entry(session_id) {
@@ -1436,11 +2022,12 @@ impl SessionManager {
         session_id: SessionId,
         store: &SessionStoreExecutor,
         total_timer: bcode_metrics::MetricsTimer,
+        progress: Option<&MigrationProgressReporter>,
     ) -> Result<(), SessionError> {
         let load_timer = self.metrics.timer();
         let lease_timer = self.metrics.timer();
         let lease = self
-            .acquire_session_lease_for_load(session_id, store)
+            .acquire_session_lease_for_load(session_id, store, progress)
             .await?;
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.lease_acquire_duration_ms",
@@ -1494,6 +2081,7 @@ impl SessionManager {
     }
 
     /// Subscribe to persistent catalog status changes.
+    #[must_use]
     pub fn subscribe_catalog_status(&self) -> watch::Receiver<CatalogLoadStatus> {
         self.catalog_status_rx.clone()
     }
@@ -1884,6 +2472,7 @@ impl SessionManager {
     }
 
     /// Return true once the persistent session catalog has been discovered.
+    #[must_use]
     pub fn catalog_loaded(&self) -> bool {
         matches!(self.catalog_status(), CatalogLoadStatus::Loaded)
     }
@@ -3890,9 +4479,13 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         AppendToolCallRequestedInput, CURRENT_SESSION_FORMAT_EPOCH,
-        MAX_DURABLE_GENERIC_EVENT_BYTES, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
-        SessionCatalogLoadStatus, SessionError, SessionHealth, SessionLeaseOwnerContext,
-        SessionLoadStatusKind, SessionManager, SessionStore, db, lease,
+        MAX_DURABLE_GENERIC_EVENT_BYTES, MIGRATION_BACKUP_BUFFER_BYTES, MigrationBackupCopyFault,
+        SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION, SessionCatalogLoadStatus,
+        SessionError, SessionHealth, SessionLeaseOwnerContext, SessionLoadStatusKind,
+        SessionManager, SessionMigrationStage, SessionOpenFailureKind, SessionOpenOperationId,
+        SessionOpenTerminalOutcome, SessionStore, copy_and_hash_backup_files,
+        create_verified_migration_backup_blocking, db, lease, migration_backup_files, persisted,
+        verify_backup_files,
     };
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
@@ -5704,6 +6297,584 @@ mod tests {
         std::fs::remove_dir_all(state_root).expect("state root should clean up");
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum MigrationBenchmarkProfile {
+        Small,
+        Medium,
+        Large,
+    }
+
+    impl MigrationBenchmarkProfile {
+        const fn event_count(self) -> usize {
+            match self {
+                Self::Small => 100,
+                Self::Medium => 5_000,
+                Self::Large => 50_000,
+            }
+        }
+
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Small => "small",
+                Self::Medium => "medium",
+                Self::Large => "large-50k",
+            }
+        }
+    }
+
+    async fn generate_legacy_migration_benchmark_store(
+        root: &std::path::Path,
+        profile: MigrationBenchmarkProfile,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        let db = db::SessionDb::open_turso_in_root(session_id, root)
+            .await
+            .expect("benchmark DB");
+        let tx = db
+            .database()
+            .begin_transaction()
+            .await
+            .expect("benchmark transaction");
+        for sequence in 0..profile.event_count() {
+            let sequence = u64::try_from(sequence).expect("benchmark sequence fits");
+            let kind = if sequence == 0 {
+                SessionEventKind::SessionCreated {
+                    name: Some(format!("migration benchmark {}", profile.name())),
+                    working_directory: test_working_directory(),
+                }
+            } else if sequence % 2 == 0 {
+                SessionEventKind::AssistantMessage {
+                    text: format!("synthetic assistant message {sequence}"),
+                }
+            } else {
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: format!("synthetic user message {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                }
+            };
+            let event = SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: sequence,
+                session_id,
+                provenance: None,
+                kind,
+            };
+            let payload = persisted::encode_session_event(&event).expect("benchmark event encode");
+            let event_type = match event.kind {
+                SessionEventKind::SessionCreated { .. } => "session_created",
+                SessionEventKind::UserMessage { .. } => "user_message",
+                SessionEventKind::AssistantMessage { .. } => "assistant_message",
+                _ => unreachable!("benchmark generator uses three event kinds"),
+            };
+            tx.insert("events")
+                .value(
+                    "event_seq",
+                    switchy::database::DatabaseValue::Int64(
+                        i64::try_from(sequence).expect("benchmark sequence fits i64"),
+                    ),
+                )
+                .value("event_type", event_type)
+                .value(
+                    "schema_version",
+                    switchy::database::DatabaseValue::Int32(i32::from(
+                        CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    )),
+                )
+                .value(
+                    "created_at_ms",
+                    switchy::database::DatabaseValue::Int64(
+                        i64::try_from(sequence).expect("benchmark timestamp fits i64"),
+                    ),
+                )
+                .value("payload", payload)
+                .execute(&*tx)
+                .await
+                .expect("benchmark canonical insert");
+        }
+        tx.update("session_storage_contract")
+            .value("writer_epoch", switchy::database::DatabaseValue::Int64(3))
+            .where_eq("contract_id", switchy::database::DatabaseValue::Int32(1))
+            .execute(&*tx)
+            .await
+            .expect("legacy writer epoch");
+        tx.commit().await.expect("benchmark transaction commit");
+        drop(db);
+        session_id
+    }
+
+    #[tokio::test]
+    async fn current_session_preparation_is_immediately_ready_without_operation() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(Some("current".to_owned()), test_working_directory())
+            .await
+            .expect("current session");
+
+        let snapshot = manager
+            .prepare_session_open(session.id)
+            .await
+            .expect("prepare current session");
+
+        assert_eq!(snapshot.outcome, Some(SessionOpenTerminalOutcome::Ready));
+        assert_eq!(snapshot.progress.stage, SessionMigrationStage::Complete);
+        assert_eq!(manager.active_session_migration_count().await, 0);
+        assert!(
+            manager
+                .session_open_operation(session.id, snapshot.operation_id)
+                .await
+                .is_none(),
+            "current storage must not allocate a migration operation"
+        );
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    fn assert_successful_migration_progress(
+        snapshots: &[bcode_session_models::SessionOpenOperationSnapshot],
+        terminal: &bcode_session_models::SessionOpenOperationSnapshot,
+        expected_backup_bytes: u64,
+    ) {
+        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
+        assert_eq!(terminal.source_writer_epoch, Some(3));
+        assert_eq!(
+            terminal.target_writer_epoch,
+            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        assert!(
+            terminal.backup_path.is_some(),
+            "terminal snapshot lost backup path: {terminal:?}"
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .filter(|snapshot| snapshot.outcome.is_some())
+                .count(),
+            1
+        );
+        assert!(
+            snapshots.len() < 30,
+            "progress updates must remain throttled"
+        );
+        for pair in snapshots.windows(2) {
+            assert!(pair[0].revision < pair[1].revision);
+            assert!(pair[0].progress.stage <= pair[1].progress.stage);
+            if pair[0].progress.stage == pair[1].progress.stage {
+                assert!(pair[0].progress.completed_units <= pair[1].progress.completed_units);
+            }
+        }
+        for snapshot in snapshots {
+            assert!(
+                snapshot
+                    .progress
+                    .completed_units
+                    .zip(snapshot.progress.total_units)
+                    .is_none_or(|(completed, total)| completed <= total)
+            );
+            if snapshot.backup_path.is_some() {
+                assert!(
+                    snapshot.progress.stage > SessionMigrationStage::VerifyingBackup
+                        || (snapshot.progress.stage == SessionMigrationStage::VerifyingBackup
+                            && snapshot.progress.completed_units == snapshot.progress.total_units)
+                );
+            }
+        }
+        for stage in [
+            SessionMigrationStage::PlanningBackup,
+            SessionMigrationStage::CopyingBackup,
+            SessionMigrationStage::VerifyingBackup,
+            SessionMigrationStage::ReadingCanonicalHistory,
+            SessionMigrationStage::RebuildingProjections,
+            SessionMigrationStage::ValidatingProjections,
+            SessionMigrationStage::Committing,
+            SessionMigrationStage::ValidatingWriteReadiness,
+            SessionMigrationStage::Complete,
+        ] {
+            assert!(
+                snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.progress.stage == stage),
+                "missing migration progress stage {stage:?}"
+            );
+        }
+        for stage in [
+            SessionMigrationStage::CopyingBackup,
+            SessionMigrationStage::VerifyingBackup,
+        ] {
+            assert!(snapshots.iter().any(|snapshot| {
+                snapshot.progress.stage == stage
+                    && snapshot.progress.completed_units == Some(expected_backup_bytes)
+                    && snapshot.progress.total_units == Some(expected_backup_bytes)
+            }));
+        }
+        for stage in [
+            SessionMigrationStage::ReadingCanonicalHistory,
+            SessionMigrationStage::RebuildingProjections,
+        ] {
+            assert!(snapshots.iter().any(|snapshot| {
+                snapshot.progress.stage == stage
+                    && snapshot.progress.completed_units == Some(100)
+                    && snapshot.progress.total_units == Some(100)
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_preparation_joins_one_detached_legacy_migration() {
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let expected_backup_bytes =
+            session_database_files(&root, session_id)
+                .iter()
+                .fold(0_u64, |total, (_, bytes)| {
+                    total.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                });
+        let manager = SessionManager::persistent(&root).expect("manager");
+
+        let (first, second) = tokio::join!(
+            manager.prepare_session_open(session_id),
+            manager.prepare_session_open(session_id),
+        );
+        let first = first.expect("first preparation");
+        let second = second.expect("second preparation");
+        assert_eq!(first.operation_id, second.operation_id);
+        assert_eq!(manager.active_session_migration_count().await, 1);
+        let operation_id = first.operation_id;
+        drop(first);
+        drop(second);
+
+        let mut receiver = manager
+            .subscribe_session_open_operation(session_id, operation_id)
+            .await
+            .expect("operation subscription");
+        let terminal = receiver
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("terminal migration snapshot")
+            .clone();
+        let snapshots = manager
+            .session_open_operation_history(session_id, operation_id)
+            .await;
+        assert_successful_migration_progress(&snapshots, &terminal, expected_backup_bytes);
+        assert_eq!(manager.active_session_migration_count().await, 0);
+        assert_eq!(
+            manager
+                .session_open_operation(session_id, operation_id)
+                .await
+                .expect("terminal snapshot retained"),
+            terminal
+        );
+        assert!(
+            manager
+                .session_open_operation(session_id, SessionOpenOperationId::new())
+                .await
+                .is_none()
+        );
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("migrated DB");
+        assert_eq!(
+            db.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        std::fs::remove_dir_all(state_root).expect("state root cleanup");
+    }
+
+    #[tokio::test]
+    async fn detached_preparation_reports_structured_backup_failure_without_mutation() {
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let backup_root = state_root.join("session-migration-backups");
+        std::fs::write(&backup_root, b"block backup directory").expect("backup blocker");
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let initial = manager
+            .prepare_session_open(session_id)
+            .await
+            .expect("prepare legacy session");
+        let mut receiver = manager
+            .subscribe_session_open_operation(session_id, initial.operation_id)
+            .await
+            .expect("operation subscription");
+        let terminal = receiver
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("terminal failure snapshot")
+            .clone();
+
+        assert!(matches!(
+            terminal.outcome,
+            Some(SessionOpenTerminalOutcome::Failed {
+                kind: SessionOpenFailureKind::BackupFailed,
+                backup_path: None,
+                ..
+            })
+        ));
+        assert_eq!(terminal.progress.stage, SessionMigrationStage::Failed);
+        assert!(terminal.backup_path.is_none());
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("legacy DB");
+        assert_eq!(db.storage_writer_epoch().await.expect("writer epoch"), 3);
+        std::fs::remove_file(backup_root).expect("backup blocker cleanup");
+        std::fs::remove_dir_all(state_root).expect("state root cleanup");
+    }
+
+    #[tokio::test]
+    async fn generated_migration_benchmark_store_is_contiguous_and_legacy() {
+        let root = unique_temp_dir();
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("generated DB");
+        assert_eq!(db.last_event_sequence().await.expect("tail"), Some(99));
+        assert_eq!(db.storage_writer_epoch().await.expect("epoch"), 3);
+        assert_eq!(db.all_events_strict().await.expect("history").len(), 100);
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual generated legacy-session migration benchmark"]
+    async fn benchmark_generated_legacy_session_migrations() {
+        let profiles = match std::env::var("BCODE_MIGRATION_BENCHMARK_PROFILE").as_deref() {
+            Ok("small") => vec![MigrationBenchmarkProfile::Small],
+            Ok("medium") => vec![MigrationBenchmarkProfile::Medium],
+            Ok("large") => vec![MigrationBenchmarkProfile::Large],
+            Ok(other) => panic!("unknown BCODE_MIGRATION_BENCHMARK_PROFILE {other}"),
+            Err(std::env::VarError::NotPresent) => vec![
+                MigrationBenchmarkProfile::Small,
+                MigrationBenchmarkProfile::Medium,
+                MigrationBenchmarkProfile::Large,
+            ],
+            Err(error) => panic!("invalid BCODE_MIGRATION_BENCHMARK_PROFILE: {error}"),
+        };
+        for profile in profiles {
+            let state_root = unique_temp_dir();
+            let root = state_root.join("sessions");
+            let session_id = generate_legacy_migration_benchmark_store(&root, profile).await;
+            let metrics = MetricsRegistry::in_memory();
+            let started = std::time::Instant::now();
+            let manager = SessionManager::persistent_with_metrics(&root, metrics.clone())
+                .expect("benchmark manager");
+            manager
+                .require_write_readiness(session_id)
+                .await
+                .expect("benchmark migration");
+            let elapsed = started.elapsed();
+            let storage_bytes = session_database_files(&root, session_id).iter().fold(
+                0_u64,
+                |total, (_, bytes)| {
+                    total.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                },
+            );
+            let report = metrics.report();
+            let histogram_sum = |name: &str| {
+                report
+                    .snapshot
+                    .histograms
+                    .get(name)
+                    .map_or(0, |histogram| histogram.sum)
+            };
+            eprintln!(
+                "migration_benchmark profile={} events={} storage_bytes={} total_ms={} backup_plan_ms={} backup_copy_ms={} backup_verify_ms={} schema_ms={} decode_ms={} reproject_ms={} projector_materialized_ms={} projector_model_context_ms={} projector_occupancy_ms={} projector_receipt_ms={} projector_compatibility_ms={} validate_ms={} commit_ms={} readiness_ms={}",
+                profile.name(),
+                profile.event_count(),
+                storage_bytes,
+                elapsed.as_millis(),
+                histogram_sum("session.migration.backup.plan_duration_ms"),
+                histogram_sum("session.migration.backup.copy_duration_ms"),
+                histogram_sum("session.migration.backup.verify_duration_ms"),
+                histogram_sum("session.migration.schema_duration_ms"),
+                histogram_sum("session.migration.canonical_decode_duration_ms"),
+                histogram_sum("session.migration.projection_rebuild_duration_ms"),
+                histogram_sum("session.migration.projector.materialized_duration_ms"),
+                histogram_sum("session.migration.projector.model_context_duration_ms"),
+                histogram_sum("session.migration.projector.context_occupancy_duration_ms"),
+                histogram_sum("session.migration.projector.turn_receipt_duration_ms"),
+                histogram_sum("session.migration.projector.compatibility_duration_ms"),
+                histogram_sum("session.migration.validation_duration_ms"),
+                histogram_sum("session.migration.commit_duration_ms"),
+                histogram_sum("session.migration.write_readiness_duration_ms"),
+            );
+            drop(manager);
+            std::fs::remove_dir_all(state_root).expect("benchmark cleanup");
+        }
+    }
+
+    #[test]
+    fn streaming_migration_backup_handles_nested_empty_and_large_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source = temp_dir.path().join("source");
+        let destination = temp_dir.path().join("backup");
+        std::fs::create_dir_all(source.join("nested")).expect("nested source");
+        std::fs::write(source.join("empty"), []).expect("empty file");
+        std::fs::write(source.join("nested/small"), b"small").expect("small file");
+        let large = vec![0x5a; MIGRATION_BACKUP_BUFFER_BYTES * 3 + 17];
+        std::fs::write(source.join("large"), &large).expect("large file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                source.join("nested/small"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .expect("source permissions");
+        }
+
+        let result = create_verified_migration_backup_blocking(
+            &source,
+            &destination,
+            br#"{"manifest":true}"#,
+            MigrationBackupCopyFault::None,
+            None,
+        )
+        .expect("backup should succeed");
+
+        assert_eq!(result.files, 3);
+        assert_eq!(
+            result.bytes,
+            u64::try_from(large.len() + b"small".len()).expect("fixture bytes fit")
+        );
+        assert_eq!(
+            std::fs::read(destination.join("large")).expect("large backup"),
+            large
+        );
+        assert_eq!(
+            std::fs::read(destination.join("nested/small")).expect("small backup"),
+            b"small"
+        );
+        assert!(
+            std::fs::read(destination.join("empty"))
+                .expect("empty backup")
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read(destination.join("migration-backup.json")).expect("manifest"),
+            br#"{"manifest":true}"#
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(destination.join("nested/small"))
+                    .expect("backup metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_migration_backup_refuses_conflicts_and_cleans_failed_copy() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source = temp_dir.path().join("source");
+        let destination = temp_dir.path().join("backup");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(source.join("file"), b"content").expect("source file");
+        std::fs::create_dir_all(&destination).expect("destination conflict");
+        assert_eq!(
+            create_verified_migration_backup_blocking(
+                &source,
+                &destination,
+                b"manifest",
+                MigrationBackupCopyFault::None,
+                None,
+            )
+            .expect_err("existing destination must fail")
+            .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+
+        std::fs::remove_dir_all(&destination).expect("remove conflict");
+        let files = migration_backup_files(&source, &source).expect("backup plan");
+        std::fs::create_dir_all(&destination).expect("destination");
+        let source_hashes = copy_and_hash_backup_files(
+            &source,
+            &destination,
+            &files,
+            MigrationBackupCopyFault::None,
+            None,
+            7,
+        )
+        .expect("copy");
+        std::fs::write(destination.join("file"), b"corrupt").expect("corrupt backup");
+        assert!(
+            verify_backup_files(&destination, &files, &source_hashes, None, 7)
+                .expect_err("hash mismatch must fail")
+                .to_string()
+                .contains("verification failed")
+        );
+
+        std::fs::remove_dir_all(&destination).expect("remove corrupt backup");
+        std::fs::create_dir(source.join("migration-backup.json")).expect("manifest-path directory");
+        std::fs::write(source.join("migration-backup.json/child"), b"child")
+            .expect("manifest-path child");
+        assert!(
+            create_verified_migration_backup_blocking(
+                &source,
+                &destination,
+                b"manifest",
+                MigrationBackupCopyFault::None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            !destination.exists(),
+            "failed backup must clean its incomplete destination"
+        );
+    }
+
+    #[test]
+    fn migration_backup_faults_are_deterministic_and_cleanup_partial_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(
+            source.join("large"),
+            vec![0x7f; MIGRATION_BACKUP_BUFFER_BYTES * 2],
+        )
+        .expect("source file");
+
+        for (index, fault, expected_kind) in [
+            (
+                0,
+                MigrationBackupCopyFault::PermissionDenied,
+                std::io::ErrorKind::PermissionDenied,
+            ),
+            (
+                1,
+                MigrationBackupCopyFault::ShortWriteAfter(17),
+                std::io::ErrorKind::WriteZero,
+            ),
+        ] {
+            let destination = temp_dir.path().join(format!("backup-{index}"));
+            let error = create_verified_migration_backup_blocking(
+                &source,
+                &destination,
+                b"manifest",
+                fault,
+                None,
+            )
+            .expect_err("injected backup failure");
+            assert_eq!(error.kind(), expected_kind);
+            assert!(
+                !destination.exists(),
+                "injected failure must clean incomplete destination"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn legacy_storage_migration_replays_presentation_diff_sections() {
         let root = unique_temp_dir();
@@ -7027,7 +8198,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let before_discovery = session_database_files(&root, session_id);
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let metrics = MetricsRegistry::in_memory();
+        let manager = SessionManager::persistent_with_metrics(&root, metrics.clone())
+            .expect("manager should initialize");
         let entry = manager
             .all_session_catalog_entries()
             .await
@@ -7122,6 +8295,57 @@ mod tests {
                 .await
                 .expect("tool projection")
                 .is_empty()
+        );
+        let report = metrics.report();
+        for metric in [
+            "session.migration.ownership_duration_ms",
+            "session.migration.backup.plan_duration_ms",
+            "session.migration.backup.copy_duration_ms",
+            "session.migration.backup.verify_duration_ms",
+            "session.migration.schema_duration_ms",
+            "session.migration.canonical_decode_duration_ms",
+            "session.migration.projection_rebuild_duration_ms",
+            "session.migration.projector.materialized_duration_ms",
+            "session.migration.projector.model_context_duration_ms",
+            "session.migration.projector.context_occupancy_duration_ms",
+            "session.migration.projector.turn_receipt_duration_ms",
+            "session.migration.projector.compatibility_duration_ms",
+            "session.migration.validation_duration_ms",
+            "session.migration.commit_duration_ms",
+            "session.migration.write_readiness_duration_ms",
+        ] {
+            assert!(
+                report.snapshot.histograms.contains_key(metric),
+                "missing migration stage metric {metric}"
+            );
+        }
+        assert_eq!(
+            report
+                .snapshot
+                .counters
+                .get("session.migration.canonical_events_total"),
+            Some(&4)
+        );
+        assert_eq!(
+            report
+                .snapshot
+                .counters
+                .get("session.migration.projected_events_total"),
+            Some(&4)
+        );
+        assert!(
+            report
+                .snapshot
+                .counters
+                .get("session.migration.backup.files_total")
+                .is_some_and(|files| *files > 0)
+        );
+        assert!(
+            report
+                .snapshot
+                .counters
+                .get("session.migration.backup.bytes_total")
+                .is_some_and(|bytes| *bytes > 0)
         );
         drop(migrated);
         drop(manager);

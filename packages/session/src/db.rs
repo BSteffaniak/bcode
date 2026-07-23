@@ -686,6 +686,9 @@ impl GlobalSessionDb {
     }
 }
 
+pub type SessionMigrationProgressCallback =
+    Arc<dyn Fn(bcode_session_models::SessionMigrationProgress) + Send + Sync>;
+
 /// Backend-agnostic handle for one isolated session database.
 #[derive(Debug, Clone)]
 pub struct SessionDb {
@@ -783,16 +786,59 @@ impl SessionDb {
     pub async fn migrate_turso_in_root(
         session_id: SessionId,
         root: &Path,
+        maintenance: &crate::lease::SessionMaintenanceGuard,
+        write: &crate::lease::SessionWriteGuard,
+    ) -> SessionDbResult<Self> {
+        Self::migrate_turso_in_root_observed(
+            session_id,
+            root,
+            maintenance,
+            write,
+            MetricsRegistry::disabled(),
+            None,
+        )
+        .await
+    }
+
+    /// Explicitly migrate an existing database with observability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened, migrated, or reprojected.
+    pub async fn migrate_turso_in_root_observed(
+        session_id: SessionId,
+        root: &Path,
         _maintenance: &crate::lease::SessionMaintenanceGuard,
         _write: &crate::lease::SessionWriteGuard,
+        metrics: MetricsRegistry,
+        progress: Option<SessionMigrationProgressCallback>,
     ) -> SessionDbResult<Self> {
         let path = session_db_path(root, session_id);
-        let db = Self::open_existing_turso_observed(session_id, &path, MetricsRegistry::disabled())
-            .await?;
+        let db = Self::open_existing_turso_observed(session_id, &path, metrics.clone()).await?;
         let tx = db.db.begin_transaction().await?;
+        report_migration_stage(
+            progress.as_ref(),
+            bcode_session_models::SessionMigrationStage::PreparingSchema,
+            "Preparing session storage schema",
+        );
+        let schema_timer = metrics.timer();
         run_session_migrations(&*tx).await?;
-        migrate_session_storage(&*tx, session_id).await?;
+        metrics.record_histogram(
+            "session.migration.schema_duration_ms",
+            schema_timer.elapsed_ms(),
+        );
+        migrate_session_storage(&*tx, session_id, &metrics, progress.as_ref()).await?;
+        report_migration_stage(
+            progress.as_ref(),
+            bcode_session_models::SessionMigrationStage::Committing,
+            "Committing session migration",
+        );
+        let commit_timer = metrics.timer();
         tx.commit().await?;
+        metrics.record_histogram(
+            "session.migration.commit_duration_ms",
+            commit_timer.elapsed_ms(),
+        );
         Ok(db)
     }
 
@@ -2289,8 +2335,36 @@ async fn validate_all_projection_checkpoints_at_tail(
     validate_projection_checkpoint_snapshot(&snapshot, expected)
 }
 
-async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> SessionDbResult<()> {
-    let events = compatible_events_from_database(db).await?;
+async fn migrate_session_storage(
+    db: &dyn Database,
+    session_id: SessionId,
+    metrics: &MetricsRegistry,
+    progress: Option<&SessionMigrationProgressCallback>,
+) -> SessionDbResult<()> {
+    report_migration_stage(
+        progress,
+        bcode_session_models::SessionMigrationStage::ReadingCanonicalHistory,
+        "Reading canonical session history",
+    );
+    let decode_timer = metrics.timer();
+    let events = compatible_events_from_database(db, progress).await?;
+    metrics.record_histogram(
+        "session.migration.canonical_decode_duration_ms",
+        decode_timer.elapsed_ms(),
+    );
+    metrics.add_counter(
+        "session.migration.canonical_events_total",
+        u64::try_from(events.len()).unwrap_or(u64::MAX),
+    );
+    validate_migration_event_identity(&events, session_id)?;
+    rebuild_migration_projections(db, &events, metrics, progress).await?;
+    validate_migrated_storage(db, &events, metrics, progress).await
+}
+
+fn validate_migration_event_identity(
+    events: &[(SessionEvent, Option<SessionEventCompatibilityIssue>)],
+    session_id: SessionId,
+) -> SessionDbResult<()> {
     for (index, (event, _)) in events.iter().enumerate() {
         let expected = u64::try_from(index).unwrap_or(u64::MAX);
         if event.sequence != expected {
@@ -2305,7 +2379,15 @@ async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> Se
             });
         }
     }
+    Ok(())
+}
 
+async fn rebuild_migration_projections(
+    db: &dyn Database,
+    events: &[(SessionEvent, Option<SessionEventCompatibilityIssue>)],
+    metrics: &MetricsRegistry,
+    progress: Option<&SessionMigrationProgressCallback>,
+) -> SessionDbResult<()> {
     for table in [
         "session_compatibility_issues",
         "session_compatibility_state",
@@ -2323,14 +2405,54 @@ async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> Se
     ] {
         db.delete(table).execute(db).await?;
     }
-    for (event, issue) in &events {
-        project_materialized_event(db, event).await?;
-        project_model_context_event(db, event).await?;
-        project_context_occupancy_event(db, event).await?;
-        project_turn_receipt(db, event).await?;
-        project_session_compatibility(db, event, issue.as_ref()).await?;
+    let replay_timer = metrics.timer();
+    let event_total = u64::try_from(events.len()).unwrap_or(u64::MAX);
+    report_migration_progress(
+        progress,
+        bcode_session_models::SessionMigrationStage::RebuildingProjections,
+        0,
+        event_total,
+        "Rebuilding session indexes",
+    );
+    for (index, (event, issue)) in events.iter().enumerate() {
+        project_migration_event(db, event, issue.as_ref(), metrics).await?;
+        let completed = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        if completed == event_total || completed % 100 == 0 {
+            report_migration_progress(
+                progress,
+                bcode_session_models::SessionMigrationStage::RebuildingProjections,
+                completed,
+                event_total,
+                "Rebuilding session indexes",
+            );
+        }
     }
+    metrics.record_histogram(
+        "session.migration.projection_rebuild_duration_ms",
+        replay_timer.elapsed_ms(),
+    );
+    metrics.add_counter(
+        "session.migration.projected_events_total",
+        u64::try_from(events.len()).unwrap_or(u64::MAX),
+    );
+    Ok(())
+}
 
+async fn validate_migrated_storage(
+    db: &dyn Database,
+    events: &[(SessionEvent, Option<SessionEventCompatibilityIssue>)],
+    metrics: &MetricsRegistry,
+    progress: Option<&SessionMigrationProgressCallback>,
+) -> SessionDbResult<()> {
+    let validation_timer = metrics.timer();
+    report_migration_stage(
+        progress,
+        bcode_session_models::SessionMigrationStage::ValidatingProjections,
+        "Validating rebuilt session indexes",
+    );
+    if let Some((tail, _)) = events.last() {
+        project_materialized_checkpoints_at_tail(db, tail).await?;
+    }
     let canonical_tail = events.last().map(|(event, _)| event.sequence);
     validate_all_projection_checkpoints_at_tail(db, canonical_tail).await?;
     if let Some(expected) = canonical_tail {
@@ -2361,11 +2483,90 @@ async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> Se
         }
     }
     set_storage_writer_contract(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
-    validate_storage_writer_contract(db).await
+    validate_storage_writer_contract(db).await?;
+    metrics.record_histogram(
+        "session.migration.validation_duration_ms",
+        validation_timer.elapsed_ms(),
+    );
+    Ok(())
+}
+
+async fn project_migration_event(
+    db: &dyn Database,
+    event: &SessionEvent,
+    issue: Option<&SessionEventCompatibilityIssue>,
+    metrics: &MetricsRegistry,
+) -> SessionDbResult<()> {
+    let timer = metrics.timer();
+    project_materialized_event_without_checkpoints(db, event).await?;
+    metrics.record_histogram(
+        "session.migration.projector.materialized_duration_ms",
+        timer.elapsed_ms(),
+    );
+    let timer = metrics.timer();
+    project_model_context_event(db, event).await?;
+    metrics.record_histogram(
+        "session.migration.projector.model_context_duration_ms",
+        timer.elapsed_ms(),
+    );
+    let timer = metrics.timer();
+    project_context_occupancy_event(db, event).await?;
+    metrics.record_histogram(
+        "session.migration.projector.context_occupancy_duration_ms",
+        timer.elapsed_ms(),
+    );
+    let timer = metrics.timer();
+    project_turn_receipt(db, event).await?;
+    metrics.record_histogram(
+        "session.migration.projector.turn_receipt_duration_ms",
+        timer.elapsed_ms(),
+    );
+    let timer = metrics.timer();
+    project_session_compatibility(db, event, issue).await?;
+    metrics.record_histogram(
+        "session.migration.projector.compatibility_duration_ms",
+        timer.elapsed_ms(),
+    );
+    Ok(())
+}
+
+fn report_migration_stage(
+    progress: Option<&SessionMigrationProgressCallback>,
+    stage: bcode_session_models::SessionMigrationStage,
+    message: &str,
+) {
+    if let Some(progress) = progress {
+        progress(bcode_session_models::SessionMigrationProgress {
+            stage,
+            completed_units: None,
+            total_units: None,
+            unit: None,
+            message: message.to_owned(),
+        });
+    }
+}
+
+fn report_migration_progress(
+    progress: Option<&SessionMigrationProgressCallback>,
+    stage: bcode_session_models::SessionMigrationStage,
+    completed: u64,
+    total: u64,
+    message: &str,
+) {
+    if let Some(progress) = progress {
+        progress(bcode_session_models::SessionMigrationProgress {
+            stage,
+            completed_units: Some(completed),
+            total_units: Some(total),
+            unit: Some(bcode_session_models::SessionMigrationProgressUnit::Events),
+            message: message.to_owned(),
+        });
+    }
 }
 
 async fn compatible_events_from_database(
     db: &dyn Database,
+    progress: Option<&SessionMigrationProgressCallback>,
 ) -> SessionDbResult<Vec<(SessionEvent, Option<SessionEventCompatibilityIssue>)>> {
     let rows = db
         .select("events")
@@ -2373,8 +2574,23 @@ async fn compatible_events_from_database(
         .sort("event_seq", SortDirection::Asc)
         .execute(db)
         .await?;
+    let (total, tail) = canonical_row_count_and_tail(&rows)?;
+    if total > 0 && tail != total.saturating_sub(1) {
+        return Err(SessionDbError::InvalidCanonicalSequence {
+            expected: total.saturating_sub(1),
+            actual: tail,
+        });
+    }
+    report_migration_progress(
+        progress,
+        bcode_session_models::SessionMigrationStage::ReadingCanonicalHistory,
+        0,
+        total,
+        "Reading canonical session history",
+    );
     rows.iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(index, row)| {
             let event_seq = required_non_negative_u64(row, "event_seq")?;
             let payload = required_string(row, "payload")?;
             let decoded = decode_session_event_compatible(&payload)?;
@@ -2385,9 +2601,30 @@ async fn compatible_events_from_database(
                 });
             }
             let issue = decoded.issue().cloned();
-            Ok((decoded.into_event(), issue))
+            let event = decoded.into_event();
+            let completed = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            if completed == total || completed % 100 == 0 {
+                report_migration_progress(
+                    progress,
+                    bcode_session_models::SessionMigrationStage::ReadingCanonicalHistory,
+                    completed,
+                    total,
+                    "Reading canonical session history",
+                );
+            }
+            Ok((event, issue))
         })
         .collect()
+}
+
+fn canonical_row_count_and_tail(rows: &[switchy::database::Row]) -> SessionDbResult<(u64, u64)> {
+    let count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+    let tail = rows
+        .last()
+        .map(|row| required_non_negative_u64(row, "event_seq"))
+        .transpose()?
+        .unwrap_or(0);
+    Ok((count, tail))
 }
 
 async fn strict_events_from_database(db: &dyn Database) -> SessionDbResult<Vec<SessionEvent>> {
@@ -3158,15 +3395,29 @@ async fn project_session_compatibility(
     Ok(())
 }
 
-async fn project_materialized_event(
+async fn project_materialized_event_without_checkpoints(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    project_event(db, event).await?;
+    project_event(db, event).await
+}
+
+async fn project_materialized_checkpoints_at_tail(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
     for projection in BASE_MATERIALIZED_PROJECTIONS {
         update_projection_checkpoint(db, projection, event).await?;
     }
     Ok(())
+}
+
+async fn project_materialized_event(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    project_materialized_event_without_checkpoints(db, event).await?;
+    project_materialized_checkpoints_at_tail(db, event).await
 }
 
 #[allow(clippy::too_many_lines)]

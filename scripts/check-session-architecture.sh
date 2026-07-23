@@ -308,7 +308,7 @@ fi
 
 if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/db.rs \
   || ! rg -q 'run_session_migrations\(&\*tx\)' packages/session/src/db.rs \
-  || ! rg -q 'migrate_session_storage\(&\*tx, session_id\)' packages/session/src/db.rs \
+  || ! rg -q 'migrate_session_storage\(&\*tx, session_id, &metrics, progress\.as_ref\(\)\)' packages/session/src/db.rs \
   || ! rg -q 'set_storage_writer_contract\(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs; then
   echo "Session migration violation: schema migration, projection replay, and writer-epoch update must share explicit migration transaction." >&2
   violations=1
@@ -344,6 +344,103 @@ if ! rg -q 'explicit_reindex_accepts_retired_interactive_events_as_inert_history
   || ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' packages/session/src/db.rs \
   || ! sed -n '/async fn failed_explicit_migration_preserves_projection_and_writer_contract(/,/^    }/p' packages/session/src/db.rs | grep -q 'failed migration must preserve every session storage file byte-for-byte'; then
   echo "Session migration regression violation: known-legacy reindex must reach the queried canonical tail and failed migration must preserve complete storage bytes." >&2
+  violations=1
+fi
+
+if ! rg -q 'canonical_row_count_and_tail' packages/session/src/db.rs \
+  || ! rg -q 'expected_backup_bytes' packages/session/src/lib.rs \
+  || ! rg -q 'assert_successful_migration_progress' packages/session/src/lib.rs \
+  || ! rg -q 'detached_preparation_reports_structured_backup_failure_without_mutation' packages/session/src/lib.rs \
+  || ! rg -q 'publish_backup_path' packages/session/src/migration_operation.rs \
+  || ! rg -q 'completed % 100 == 0' packages/session/src/db.rs \
+  || ! rg -q 'MIGRATION_PROGRESS_BYTE_INTERVAL' packages/session/src/lib.rs; then
+  echo "Session migration progress violation: ordered/throttled success, failure, backup, byte, decode, and replay progress coverage must remain intact." >&2
+  violations=1
+fi
+
+if ! rg -q 'pub async fn prepare_session_open' packages/session/src/lib.rs \
+  || ! rg -q 'migration_operations: migration_operation::SessionMigrationOperations' packages/session/src/lib.rs \
+  || ! rg -q 'concurrent_preparation_joins_one_detached_legacy_migration' packages/session/src/lib.rs \
+  || ! rg -q 'current_session_preparation_is_immediately_ready_without_operation' packages/session/src/lib.rs \
+  || ! rg -q 'concurrent_starts_join_one_running_operation' packages/session/src/migration_operation.rs \
+  || ! rg -q 'pruning_is_bounded_and_never_removes_running_operations' packages/session/src/migration_operation.rs; then
+  echo "Session migration operation violation: production preparation, one-per-session joining, reconnectable snapshots, bounded retention, and current-session bypass must remain covered." >&2
+  violations=1
+fi
+
+if ! rg -q 'project_materialized_event_without_checkpoints\(db, event\)' packages/session/src/db.rs \
+  || ! rg -q 'project_materialized_checkpoints_at_tail\(db, tail\)' packages/session/src/db.rs \
+  || ! rg -q 'BCODE_MIGRATION_BENCHMARK_PROFILE' packages/session/src/lib.rs; then
+  echo "Session migration replay violation: migration must retain tail-only base checkpoint writes and focused generated profiling." >&2
+  violations=1
+fi
+
+if ! rg -q 'benchmark_generated_legacy_session_migrations' packages/session/src/lib.rs \
+  || ! rg -q 'generated_migration_benchmark_store_is_contiguous_and_legacy' packages/session/src/lib.rs \
+  || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '50_000' \
+  || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '5_000' \
+  || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '100'; then
+  echo "Session migration benchmark violation: deterministic small, medium, and 50k generated legacy stores must remain available without private content." >&2
+  violations=1
+fi
+
+backup_source="$(sed -n '/const MIGRATION_BACKUP_BUFFER_BYTES/,/fn record_ensure_loaded_duration/p' packages/session/src/lib.rs)"
+if grep -Eq 'fs::read\(&source|fs::read\(&destination' <<<"$backup_source" \
+  || ! grep -q 'spawn_blocking' <<<"$backup_source" \
+  || ! grep -q 'BufReader::with_capacity' <<<"$backup_source" \
+  || ! grep -q 'BufWriter::with_capacity' <<<"$backup_source" \
+  || ! grep -q 'Sha256::new' <<<"$backup_source" \
+  || ! grep -q 'create_new(true)' <<<"$backup_source" \
+  || ! grep -q 'remove_dir_all(destination)' <<<"$backup_source"; then
+  echo "Session migration backup violation: backups must remain streaming, bounded, hash-verified, conflict-safe, cleanup-safe, and off Tokio workers." >&2
+  violations=1
+fi
+if ! rg -q 'streaming_migration_backup_handles_nested_empty_and_large_files' packages/session/src/lib.rs \
+  || ! rg -q 'streaming_migration_backup_refuses_conflicts_and_cleans_failed_copy' packages/session/src/lib.rs \
+  || ! rg -q 'migration_backup_faults_are_deterministic_and_cleanup_partial_output' packages/session/src/lib.rs \
+  || ! rg -q 'exclusive_load_automatically_migrates_legacy_storage' packages/session/src/lib.rs \
+  || ! rg -q 'failed_migration_backup_prevents_every_storage_mutation' packages/session/src/lib.rs; then
+  echo "Session migration backup violation: streaming, retained-success, conflict, cleanup, and mutation-fence regressions must remain covered." >&2
+  violations=1
+fi
+
+migration_metric_sources="$(sed -n '/fn create_verified_migration_backup(/,/^}/p; /async fn migrate_legacy_session_for_load(/,/^    }/p; /async fn migrate_owned_legacy_storage(/,/^    }/p' packages/session/src/lib.rs; sed -n '/pub async fn migrate_turso_in_root_observed(/,/^    }/p; /async fn migrate_session_storage(/,/^}/p; /async fn rebuild_migration_projections(/,/^}/p; /async fn validate_migrated_storage(/,/^}/p; /async fn project_migration_event(/,/^}/p' packages/session/src/db.rs)"
+for metric in \
+  session.migration.ownership_duration_ms \
+  session.migration.backup.plan_duration_ms \
+  session.migration.backup.copy_duration_ms \
+  session.migration.backup.verify_duration_ms \
+  session.migration.schema_duration_ms \
+  session.migration.canonical_decode_duration_ms \
+  session.migration.projection_rebuild_duration_ms \
+  session.migration.validation_duration_ms \
+  session.migration.commit_duration_ms \
+  session.migration.write_readiness_duration_ms \
+  session.migration.canonical_events_total \
+  session.migration.projected_events_total; do
+  if ! grep -Fq "$metric" <<<"$migration_metric_sources"; then
+    echo "Session migration observability violation: required fixed metric $metric is missing." >&2
+    violations=1
+  fi
+done
+if grep -Eq 'record_histogram_with_labels|add_counter_with_labels|increment_counter_with_labels' <<<"$migration_metric_sources"; then
+  echo "Session migration observability violation: migration stage metrics must use fixed unlabeled names to keep cardinality bounded." >&2
+  violations=1
+fi
+if ! sed -n '/async fn mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_history(/,/^    }/p' packages/session/src/lib.rs \
+  | grep -q 'missing migration stage metric'; then
+  echo "Session migration observability violation: production migration regression must assert every stage metric." >&2
+  violations=1
+fi
+
+if ! rg -q 'pub struct SessionOpenOperationId' packages/session/models/src/lib.rs \
+  || ! rg -q 'pub enum SessionMigrationStage' packages/session/models/src/lib.rs \
+  || ! rg -q 'pub enum SessionMigrationProgressUnit' packages/session/models/src/lib.rs \
+  || ! rg -q 'pub enum SessionOpenFailureKind' packages/session/models/src/lib.rs \
+  || ! rg -q 'pub enum SessionOpenTerminalOutcome' packages/session/models/src/lib.rs \
+  || ! rg -q 'pub struct SessionOpenOperationSnapshot' packages/session/models/src/lib.rs \
+  || ! rg -q 'session_open_operation_models_round_trip_and_preserve_semantics' packages/session/models/src/lib.rs; then
+  echo "Session migration progress violation: operation identity, ordered stages, natural units, structured failures, terminal outcomes, snapshots, and model tests must remain explicit." >&2
   violations=1
 fi
 
