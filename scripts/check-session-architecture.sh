@@ -3,6 +3,13 @@ set -euo pipefail
 
 violations=0
 
+current_event_schema="$(sed -n 's/.*CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = \([0-9][0-9]*\).*/\1/p' packages/session/models/src/lib.rs)"
+fixture_baseline_schema="$(sed -n 's/Current fixture baseline schema: \*\*\([0-9][0-9]*\)\*\*.*/\1/p' packages/session/fixtures/migrations/README.md)"
+if [[ -z "$current_event_schema" || "$current_event_schema" != "$fixture_baseline_schema" ]]; then
+  echo "Session fixture-baseline violation: CURRENT_SESSION_EVENT_SCHEMA_VERSION ($current_event_schema) must match the documented fixture baseline ($fixture_baseline_schema)." >&2
+  violations=1
+fi
+
 retired_interactive_kinds=(
   interactive_tool_request_created
   interactive_tool_request_resolved
@@ -16,11 +23,97 @@ for kind in "${retired_interactive_kinds[@]}"; do
     violations=1
   fi
 done
+for fixture in \
+  packages/session/fixtures/migrations/interactive-tool-request-unresolved-v32.json \
+  packages/session/fixtures/migrations/mixed-interactive-history-v32-v35.jsonl \
+  packages/session/fixtures/migrations/unknown-old-event-kind-v32.json \
+  packages/session/fixtures/migrations/unknown-future-event-kind-v38.json \
+  packages/session/fixtures/migrations/future-schema-v39.json \
+  packages/session/fixtures/migrations/malformed-json-v38.json \
+  packages/session/fixtures/migrations/mismatched-session-id-v38.json \
+  packages/session/fixtures/migrations/sequence-gap-v38.jsonl \
+  packages/session/fixtures/migrations/tool-presentation-diff-v25.json; do
+  if [[ ! -f "$fixture" ]]; then
+    echo "Session persisted-compatibility violation: required historical fixture $fixture is missing." >&2
+    violations=1
+  fi
+done
+if ! rg -q 'mixed_schema_32_35_fixture_decodes_contiguously_without_reviving_interactions' packages/session/src/persisted.rs \
+  || ! rg -q 'compatibility_failure_fixtures_have_exact_strict_and_degraded_outcomes' packages/session/src/persisted.rs; then
+  echo "Session persisted-compatibility violation: mixed and failure-classification fixtures must remain regression-tested." >&2
+  violations=1
+fi
 if ! rg -q 'preserve_retired_event_kind_as_legacy' packages/session/src/persisted.rs \
   || ! rg -q 'decodes_retired_interactive_tool_compatibility_fixtures' packages/session/src/persisted.rs \
   || ! rg -q 'retired_interactive_request_preserves_missing_optional_and_unknown_fields' packages/session/src/persisted.rs \
   || ! rg -q 'retired_interactive_event_reencodes_only_as_legacy_event' packages/session/src/persisted.rs; then
   echo "Session persisted-compatibility violation: retired interactive events must preserve raw payloads, remain decode-only, and stay fixture-tested." >&2
+  violations=1
+fi
+
+if ! rg -q 'session_format_incompatible' packages/server/src/lib.rs \
+  || ! rg -q 'persisted_format_errors_are_actionable_and_not_reported_as_corruption' packages/server/src/lib.rs \
+  || ! rg -q 'SessionFormatIncompatible' packages/tui/src/daemon_issue.rs \
+  || ! rg -q 'session_format_incompatibility_recommends_upgrade_not_repair' packages/tui/src/daemon_issue.rs; then
+  echo "Session format-diagnostic violation: unsupported persisted schemas/kinds must request upgrade/restart and must not be reported as corruption." >&2
+  violations=1
+fi
+
+if ! rg -q 'format_session_compatibility_issue' packages/cli/src/lib.rs \
+  || ! sed -n '/async fn paged_session_history(/,/^}/p' packages/cli/src/lib.rs \
+    | grep -q 'compatibility_issues' \
+  || ! rg -q 'compatibility_issue_format_is_actionable_and_specific' packages/cli/src/lib.rs; then
+  echo "Session CLI compatibility violation: history and timeline must render actionable opaque-event diagnostics returned by bounded pages." >&2
+  violations=1
+fi
+
+if ! rg -q 'pub session_event_schema_version: Option<u16>' packages/ipc/src/lib.rs \
+  || ! rg -q 'daemon_identity_matrix_rejects_every_incompatible_capability' packages/client/src/lib.rs \
+  || ! sed -n '/fn verify_daemon_identity/,/^    }/p' packages/client/src/lib.rs \
+    | grep -q 'session_event_schema_version' \
+  || ! sed -n '/fn verify_daemon_identity/,/^    }/p' packages/client/src/lib.rs \
+    | grep -q 'storage_writer_epoch'; then
+  echo "Daemon capability violation: Hello identity must advertise and reject mismatched event schema and storage writer epoch before requests." >&2
+  violations=1
+fi
+
+if ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' packages/session/src/db.rs \
+  || ! rg -q 'doctor_session_reports_future_and_corrupt_persisted_events_without_mutation' packages/session/src/repair.rs \
+  || ! sed -n '/async fn repair_db_files/,/^}/p' packages/session/src/repair.rs \
+    | grep -q 'initial error is not a recognized WAL short-read repair case'; then
+  echo "Session maintenance-safety violation: failed migration must preserve state, and doctor/repair must not mutate unsupported semantic events." >&2
+  violations=1
+fi
+
+if ! rg -q 'create_verified_migration_backup' packages/session/src/lib.rs \
+  || ! rg -q 'failed_migration_backup_prevents_every_storage_mutation' packages/session/src/lib.rs \
+  || ! rg -q 'migration-backup.json' packages/session/src/lib.rs; then
+  echo "Session migration-backup violation: automatic legacy migration must create and verify a retained backup before changing storage." >&2
+  violations=1
+fi
+
+if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4' packages/session/src/lease.rs \
+  || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4' packages/ipc/src/lib.rs \
+  || ! rg -q 'session_event_schema_version' packages/ipc/src/lib.rs \
+  || ! rg -q 'session_compatibility_state' packages/session/src/db.rs \
+  || ! rg -q 'CompatibilityDegraded' packages/session/src/db.rs \
+  || ! rg -q 'epoch_three_opaque_history_migrates_to_bounded_read_only_state' packages/session/src/db.rs \
+  || ! rg -q 'migrated_opaque_session_health_is_degraded_and_attach_fails_closed' packages/session/src/lib.rs; then
+  echo "Session compatibility-projection violation: epoch-4 writers must maintain bounded compatibility state and keep opaque sessions read-only." >&2
+  violations=1
+fi
+
+if rg -n 'decode_session_event_degraded' packages/session/src/db.rs \
+  >/tmp/bcode-lossy-session-read-violations.txt; then
+  echo "Session history violation: DB-backed canonical/indexed reads must not silently discard undecodable rows." >&2
+  cat /tmp/bcode-lossy-session-read-violations.txt >&2
+  violations=1
+fi
+
+if ! rg -q 'pub enum CompatibleSessionEvent' packages/session/src/persisted.rs \
+  || ! rg -q 'pub compatibility_issues: Vec<SessionEventCompatibilityIssue>' packages/session/models/src/lib.rs \
+  || ! rg -q 'filter_map\(\|event\| event.issue\(\).cloned\(\)\)' packages/session/src/db.rs; then
+  echo "Session compatibility-reporting violation: bounded history must distinguish known and opaque events and return structured compatibility issues." >&2
   violations=1
 fi
 
@@ -243,6 +336,48 @@ fi
 
 if rg -q 'KnownLegacy \{ writer_epoch \} => Err\(SessionError::StorageMigrationRequired' packages/session/src/lib.rs; then
   echo "Session normal-load violation: recognized legacy storage must attempt guarded migration rather than fail before ownership acquisition." >&2
+  violations=1
+fi
+
+if ! rg -q 'explicit_reindex_accepts_retired_interactive_events_as_inert_history' packages/session/src/db.rs \
+  || ! sed -n '/async fn explicit_reindex_accepts_retired_interactive_events_as_inert_history(/,/^    }/p' packages/session/src/db.rs | grep -q 'checkpoint: canonical_tail' \
+  || ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' packages/session/src/db.rs \
+  || ! sed -n '/async fn failed_explicit_migration_preserves_projection_and_writer_contract(/,/^    }/p' packages/session/src/db.rs | grep -q 'failed migration must preserve every session storage file byte-for-byte'; then
+  echo "Session migration regression violation: known-legacy reindex must reach the queried canonical tail and failed migration must preserve complete storage bytes." >&2
+  violations=1
+fi
+
+fixture_history_test="$(sed -n '/async fn bounded_history_has_exact_outcomes_for_every_migration_fixture(/,/^    }/p' packages/session/src/db.rs)"
+for fixture in packages/session/fixtures/migrations/*.json packages/session/fixtures/migrations/*.jsonl; do
+  fixture_name="$(basename "$fixture")"
+  if ! grep -Fq "$fixture_name" <<<"$fixture_history_test"; then
+    echo "Session fixture-corpus violation: $fixture_name must retain exact bounded-history classification coverage." >&2
+    violations=1
+  fi
+done
+
+fixture_discovery_test="$(sed -n '/async fn catalog_discovers_every_migration_fixture_without_mutation(/,/^    }/p' packages/session/src/lib.rs)"
+for fixture in packages/session/fixtures/migrations/*.json packages/session/fixtures/migrations/*.jsonl; do
+  fixture_name="$(basename "$fixture")"
+  if ! grep -Fq "$fixture_name" <<<"$fixture_discovery_test"; then
+    echo "Session fixture-corpus violation: $fixture_name must participate in byte-preserving catalog discovery coverage." >&2
+    violations=1
+  fi
+done
+
+if ! rg -q 'mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_history' packages/session/src/lib.rs; then
+  echo "Session fixture-corpus violation: mixed schema-32/schema-35 history must retain store-level discovery, migration, bounded-history, and inert-runtime coverage." >&2
+  violations=1
+fi
+
+if ! rg -q 'normal_open_does_not_decode_canonical_events' packages/session/src/lib.rs \
+  || ! rg -q 'migrated_opaque_session_health_is_degraded_and_attach_fails_closed' packages/session/src/lib.rs; then
+  echo "Session normal-load violation: healthy and degraded manager opens must retain decode-free regression coverage." >&2
+  violations=1
+fi
+
+if rg -q 'all_events(_strict|_degraded)?\(' <<<"$(sed -n '/async fn load_db_session_state(/,/^    }/p; /async fn load_persistent_session(/,/^    }/p' packages/session/src/lib.rs)"; then
+  echo "Session normal-load violation: manager loading must not full-read or decode canonical event history." >&2
   violations=1
 fi
 

@@ -873,6 +873,7 @@ mod tests {
             db::SessionDbError::PersistedEvent(_)
         ));
 
+        let before = session_storage_files(temp_dir.path(), session_id);
         let report = doctor_session(temp_dir.path(), session_id)
             .await
             .expect("doctor should report");
@@ -888,6 +889,25 @@ mod tests {
         );
         assert_eq!(report.backup_path, None);
         assert!(report.actions.is_empty());
+        assert_eq!(session_storage_files(temp_dir.path(), session_id), before);
+
+        let repair_report = repair_session(
+            temp_dir.path(),
+            session_id,
+            RepairOptions { dry_run: false },
+        )
+        .await
+        .expect("unsupported event repair should report");
+        assert_eq!(repair_report.status, RepairStatus::ManualRequired);
+        assert_eq!(repair_report.backup_path, None);
+        assert!(repair_report.actions.is_empty());
+        assert!(
+            repair_report
+                .final_error
+                .as_deref()
+                .is_some_and(|error| error.contains("future_event_kind"))
+        );
+        assert_eq!(session_storage_files(temp_dir.path(), session_id), before);
 
         let raw_rows = session_db
             .database()

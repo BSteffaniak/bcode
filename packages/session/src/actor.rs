@@ -31,6 +31,9 @@ const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
         | SessionDbError::InvalidCanonicalSequence { .. } => {
             "session.actor.append_event.rejected.canonical_sequence_total"
         }
+        SessionDbError::CompatibilityDegraded { .. } => {
+            "session.actor.append_event.rejected.compatibility_degraded_total"
+        }
         SessionDbError::TransientContribution { .. } => {
             "session.actor.append_event.rejected.transient_contribution_total"
         }

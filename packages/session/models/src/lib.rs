@@ -506,11 +506,40 @@ pub struct SessionHistoryQuery {
     pub direction: SessionHistoryDirection,
 }
 
+/// Compatibility classification for a canonical event that remains inspectable
+/// but is not semantically understood by the current build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEventCompatibilityKind {
+    /// The event kind is not known to the current build.
+    UnknownEventKind,
+    /// The event schema is newer than the current build supports.
+    FutureSchema,
+}
+
+/// Structured compatibility diagnostic for one opaque canonical history event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventCompatibilityIssue {
+    /// Canonical sequence occupied by the opaque event.
+    pub sequence: u64,
+    /// Persisted event-kind name retained from the canonical payload.
+    pub event_kind: String,
+    /// Persisted event schema version.
+    pub schema_version: u16,
+    /// Why the event is opaque to the current build.
+    pub compatibility: SessionEventCompatibilityKind,
+    /// Actionable user-facing remediation.
+    pub remediation: String,
+}
+
 /// Bounded page of replayable session history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionHistoryPage {
     pub session_id: SessionId,
     pub events: Vec<SessionEvent>,
+    /// Opaque-event diagnostics for events present in this page.
+    #[serde(default)]
+    pub compatibility_issues: Vec<SessionEventCompatibilityIssue>,
     #[serde(default)]
     pub next_cursor: Option<SessionHistoryCursor>,
     pub has_more: bool,

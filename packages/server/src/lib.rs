@@ -1749,6 +1749,9 @@ fn daemon_status_from_record(record: &bcode_daemon_lifecycle::DaemonRecord) -> D
         build_fingerprint: record.build_fingerprint.clone(),
         executable_digest: record.executable_digest.clone(),
         storage_writer_epoch: record.storage_writer_epoch,
+        session_event_schema_version: Some(
+            bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        ),
         pid: record.pid,
         instance_id: record.instance_id.clone(),
         started_at_unix_ms: record.started_at_unix_ms,
@@ -6147,6 +6150,33 @@ fn session_error_response(error: &bcode_session::SessionError) -> ErrorResponse 
 
 fn session_db_error_response(error: &bcode_session::db::SessionDbError) -> ErrorResponse {
     match error {
+        bcode_session::db::SessionDbError::PersistedEvent(
+            bcode_session::persisted::PersistedSessionEventError::UnsupportedSchemaVersion {
+                actual,
+                current,
+            },
+        ) => ErrorResponse::new(
+            "session_format_incompatible",
+            format!(
+                "session history uses event schema {actual}, but this Bcode build supports through schema {current}; upgrade Bcode and restart the daemon, then reopen the session"
+            ),
+        ),
+        bcode_session::db::SessionDbError::PersistedEvent(
+            bcode_session::persisted::PersistedSessionEventError::UnsupportedEventKind { kind },
+        ) => ErrorResponse::new(
+            "session_format_incompatible",
+            format!(
+                "session history contains unsupported persisted event kind {kind}; upgrade Bcode and restart the daemon, then reopen the session"
+            ),
+        ),
+        bcode_session::db::SessionDbError::CompatibilityDegraded { issue_count } => {
+            ErrorResponse::new(
+                "session_degraded_read_only",
+                format!(
+                    "session contains {issue_count} opaque compatibility event(s); bounded history remains available, but attach and writes are disabled; run `bcode session diagnose <session-id>` and use a compatible Bcode build"
+                ),
+            )
+        }
         bcode_session::db::SessionDbError::WriterIncompatible { .. } => {
             ErrorResponse::new("session_writer_incompatible", error.to_string())
         }
@@ -19983,6 +20013,36 @@ mod tests {
     };
     use switchy::database::{DatabaseValue, query::FilterableQuery};
 
+    #[test]
+    fn persisted_format_errors_are_actionable_and_not_reported_as_corruption() {
+        let cases = [
+            (
+                bcode_session::persisted::PersistedSessionEventError::UnsupportedSchemaVersion {
+                    actual: 39,
+                    current: 38,
+                },
+                "event schema 39",
+            ),
+            (
+                bcode_session::persisted::PersistedSessionEventError::UnsupportedEventKind {
+                    kind: "future_event_kind".to_owned(),
+                },
+                "future_event_kind",
+            ),
+        ];
+
+        for (error, expected_detail) in cases {
+            let response = session_db_error_response(
+                &bcode_session::db::SessionDbError::PersistedEvent(error),
+            );
+            assert_eq!(response.code, "session_format_incompatible");
+            assert!(response.message.contains(expected_detail));
+            assert!(response.message.contains("upgrade Bcode"));
+            assert!(response.message.contains("restart the daemon"));
+            assert!(!response.message.contains("repair"));
+        }
+    }
+
     #[derive(Default)]
     struct NonReturningCancelProvider;
 
@@ -27117,6 +27177,8 @@ library = "test"
                     vec![
                         DatabaseValue::String("026_session_storage_contract_table".to_owned()),
                         DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
+                        DatabaseValue::String("028_session_compatibility_state".to_owned()),
+                        DatabaseValue::String("029_session_compatibility_issues".to_owned()),
                     ],
                 )
                 .execute(db.database())
@@ -28487,6 +28549,12 @@ library = "test"
                     executable_digest: bcode_daemon_lifecycle::current_executable_identity()
                         .ok()
                         .map(|(_path, digest)| digest),
+                    storage_writer_epoch: Some(
+                        bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                    ),
+                    session_event_schema_version: Some(
+                        bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    ),
                     ..DaemonStatus::default()
                 },
                 daemon_record_path: None,

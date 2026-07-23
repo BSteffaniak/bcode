@@ -8,7 +8,8 @@
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacyToolRequestPresentationMetadata,
     ModelRequestIdentity, ModelTurnOutcome, ProviderContextSnapshot, RequestContextObservation,
-    RequestContextTokenCount, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    RequestContextTokenCount, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
+    SessionEventCompatibilityIssue, SessionEventCompatibilityKind, SessionEventKind,
     SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
     ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
     TurnAdmissionMetadata, WorkId, current_unix_timestamp_ms,
@@ -157,13 +158,54 @@ fn validate_retired_event_kind(
     Ok(())
 }
 
+/// Result of compatibility decoding one persisted canonical event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompatibleSessionEvent {
+    /// Event semantics are understood by the current persistence layer.
+    Known(SessionEvent),
+    /// The stable envelope is trustworthy, but event semantics are unsupported.
+    Opaque {
+        /// Inert history representation retaining the canonical sequence and payload.
+        event: SessionEvent,
+        /// Structured reason this event is opaque.
+        issue: SessionEventCompatibilityIssue,
+    },
+}
+
+impl CompatibleSessionEvent {
+    /// Return the replayable event representation.
+    #[must_use]
+    pub const fn event(&self) -> &SessionEvent {
+        match self {
+            Self::Known(event) | Self::Opaque { event, .. } => event,
+        }
+    }
+
+    /// Consume the outcome and return its replayable event representation.
+    #[must_use]
+    pub fn into_event(self) -> SessionEvent {
+        match self {
+            Self::Known(event) | Self::Opaque { event, .. } => event,
+        }
+    }
+
+    /// Return the compatibility issue when this event is opaque.
+    #[must_use]
+    pub const fn issue(&self) -> Option<&SessionEventCompatibilityIssue> {
+        match self {
+            Self::Known(_) => None,
+            Self::Opaque { issue, .. } => Some(issue),
+        }
+    }
+}
+
 /// Decode a persisted session event for normal user-facing reads.
 ///
 /// Unknown event kinds and future-schema events with trustworthy envelopes are
-/// represented as inert [`SessionEventKind::LegacyEvent`] values so their
-/// canonical sequence remains visible. Structurally malformed records return an
-/// error. This must not be used by repair, doctor, reindex, or migration code,
-/// which requires strict semantic compatibility as well as envelope validity.
+/// returned explicitly as [`CompatibleSessionEvent::Opaque`]. Structurally
+/// malformed records return an error. This must not be used by repair, doctor,
+/// reindex, or migration code, which requires strict semantic compatibility as
+/// well as envelope validity.
 ///
 /// # Errors
 ///
@@ -171,14 +213,55 @@ fn validate_retired_event_kind(
 /// trusted.
 pub fn decode_session_event_compatible(
     payload: &str,
-) -> Result<SessionEvent, PersistedSessionEventError> {
+) -> Result<CompatibleSessionEvent, PersistedSessionEventError> {
     match decode_session_event(payload) {
-        Ok(event) => Ok(event),
-        Err(
-            PersistedSessionEventError::UnsupportedSchemaVersion { .. }
-            | PersistedSessionEventError::UnsupportedEventKind { .. },
-        ) => decode_opaque_session_event(payload),
+        Ok(event) => Ok(CompatibleSessionEvent::Known(event)),
+        Err(PersistedSessionEventError::UnsupportedSchemaVersion { actual, .. }) => {
+            decode_opaque_session_event(payload).map(|(event, event_kind)| {
+                CompatibleSessionEvent::Opaque {
+                    issue: compatibility_issue(
+                        &event,
+                        event_kind,
+                        SessionEventCompatibilityKind::FutureSchema,
+                        format!(
+                            "open this session with a Bcode build supporting event schema {actual}"
+                        ),
+                    ),
+                    event,
+                }
+            })
+        }
+        Err(PersistedSessionEventError::UnsupportedEventKind { kind }) => {
+            decode_opaque_session_event(payload).map(|(event, event_kind)| {
+                CompatibleSessionEvent::Opaque {
+                    issue: compatibility_issue(
+                        &event,
+                        event_kind,
+                        SessionEventCompatibilityKind::UnknownEventKind,
+                        format!(
+                            "open this session with a Bcode build supporting event kind {kind}"
+                        ),
+                    ),
+                    event,
+                }
+            })
+        }
         Err(error) => Err(error),
+    }
+}
+
+const fn compatibility_issue(
+    event: &SessionEvent,
+    event_kind: String,
+    compatibility: SessionEventCompatibilityKind,
+    remediation: String,
+) -> SessionEventCompatibilityIssue {
+    SessionEventCompatibilityIssue {
+        sequence: event.sequence,
+        event_kind,
+        schema_version: event.schema_version,
+        compatibility,
+        remediation,
     }
 }
 
@@ -189,10 +272,14 @@ pub fn decode_session_event_compatible(
 /// damaged row must not hide the canonical session directory.
 #[must_use]
 pub fn decode_session_event_degraded(payload: &str) -> Option<SessionEvent> {
-    decode_session_event_compatible(payload).ok()
+    decode_session_event_compatible(payload)
+        .ok()
+        .map(CompatibleSessionEvent::into_event)
 }
 
-fn decode_opaque_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
+fn decode_opaque_session_event(
+    payload: &str,
+) -> Result<(SessionEvent, String), PersistedSessionEventError> {
     let persisted = serde_json::from_str::<OpaquePersistedSessionEvent>(payload)?;
     let Some(kind) = persisted.kind.as_object() else {
         return Err(PersistedSessionEventError::InvalidOpaqueEvent {
@@ -205,17 +292,21 @@ fn decode_opaque_session_event(payload: &str) -> Result<SessionEvent, PersistedS
         });
     }
     let (event_type, payload) = kind.iter().next().expect("kind length was validated");
-    Ok(SessionEvent {
-        schema_version: persisted.schema_version,
-        sequence: persisted.sequence,
-        timestamp_ms: persisted.timestamp_ms,
-        session_id: persisted.session_id,
-        provenance: persisted.provenance,
-        kind: SessionEventKind::LegacyEvent {
-            event_type: event_type.clone(),
-            payload: payload.clone(),
+    let event_type = event_type.clone();
+    Ok((
+        SessionEvent {
+            schema_version: persisted.schema_version,
+            sequence: persisted.sequence,
+            timestamp_ms: persisted.timestamp_ms,
+            session_id: persisted.session_id,
+            provenance: persisted.provenance,
+            kind: SessionEventKind::LegacyEvent {
+                event_type: event_type.clone(),
+                payload: payload.clone(),
+            },
         },
-    })
+        event_type,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1749,6 +1840,10 @@ mod tests {
                 include_str!("../fixtures/migrations/interactive-tool-request-resolved-v32.json"),
                 "interactive_tool_request_resolved",
             ),
+            (
+                include_str!("../fixtures/migrations/interactive-tool-request-unresolved-v32.json"),
+                "interactive_tool_request_created",
+            ),
         ];
 
         for (payload, expected_kind) in cases {
@@ -1758,6 +1853,89 @@ mod tests {
             };
             assert_eq!(event_type, expected_kind);
         }
+    }
+
+    #[test]
+    fn compatibility_failure_fixtures_have_exact_strict_and_degraded_outcomes() {
+        let opaque_cases = [
+            (
+                include_str!("../fixtures/migrations/unknown-old-event-kind-v32.json"),
+                SessionEventCompatibilityKind::UnknownEventKind,
+                "removed_unknown_event",
+            ),
+            (
+                include_str!("../fixtures/migrations/unknown-future-event-kind-v38.json"),
+                SessionEventCompatibilityKind::UnknownEventKind,
+                "future_event_kind",
+            ),
+            (
+                include_str!("../fixtures/migrations/future-schema-v39.json"),
+                SessionEventCompatibilityKind::FutureSchema,
+                "assistant_message",
+            ),
+        ];
+        for (payload, expected_compatibility, expected_kind) in opaque_cases {
+            assert!(decode_session_event(payload).is_err());
+            let CompatibleSessionEvent::Opaque { event, issue } =
+                decode_session_event_compatible(payload).expect("trustworthy envelope")
+            else {
+                panic!("fixture should decode opaquely");
+            };
+            assert_eq!(event.sequence, 0);
+            assert_eq!(issue.event_kind, expected_kind);
+            assert_eq!(issue.compatibility, expected_compatibility);
+        }
+
+        let malformed = include_str!("../fixtures/migrations/malformed-json-v38.json");
+        assert!(matches!(
+            decode_session_event_compatible(malformed),
+            Err(PersistedSessionEventError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn mixed_schema_32_35_fixture_decodes_contiguously_without_reviving_interactions() {
+        let events = include_str!("../fixtures/migrations/mixed-interactive-history-v32-v35.jsonl")
+            .lines()
+            .map(|payload| {
+                decode_session_event(payload).expect("mixed fixture event should decode")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.schema_version)
+                .collect::<Vec<_>>(),
+            vec![32, 32, 35]
+        );
+        assert!(matches!(
+            &events[0].kind,
+            SessionEventKind::LegacyEvent { event_type, .. }
+                if event_type == "interactive_tool_request_created"
+        ));
+        assert!(matches!(
+            &events[1].kind,
+            SessionEventKind::LegacyEvent { event_type, .. }
+                if event_type == "interactive_tool_request_resolved"
+        ));
+        assert!(matches!(
+            &events[2].kind,
+            SessionEventKind::AssistantMessage { text }
+                if text == "history continued under schema 35"
+        ));
+        assert!(events.iter().all(|event| !matches!(
+            event.kind,
+            SessionEventKind::ToolExchangeRequested { .. }
+                | SessionEventKind::ToolExchangeResolved { .. }
+        )));
     }
 
     #[test]
@@ -2120,12 +2298,27 @@ mod tests {
             })
             .to_string();
 
-            let event = decode_session_event_degraded(&payload)
+            let decoded = decode_session_event_compatible(&payload)
                 .expect("trustworthy future envelope should remain inspectable");
+            let CompatibleSessionEvent::Opaque { event, issue } = decoded else {
+                panic!("unsupported event should have an explicit opaque outcome");
+            };
             assert_eq!(event.schema_version, schema_version);
             assert_eq!(event.sequence, 17);
             assert_eq!(event.timestamp_ms, 23);
             assert!(event.provenance.is_some());
+            assert_eq!(issue.sequence, 17);
+            assert_eq!(issue.event_kind, "future_event_kind");
+            assert_eq!(issue.schema_version, schema_version);
+            assert_eq!(
+                issue.compatibility,
+                if schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+                    SessionEventCompatibilityKind::UnknownEventKind
+                } else {
+                    SessionEventCompatibilityKind::FutureSchema
+                }
+            );
+            assert!(!issue.remediation.is_empty());
             let SessionEventKind::LegacyEvent {
                 event_type,
                 payload,
@@ -2153,38 +2346,8 @@ mod tests {
 
     #[test]
     fn decodes_legacy_tool_presentation_diff_section() {
-        let payload = serde_json::json!({
-            "schema_version": 25,
-            "sequence": 14_260,
-            "timestamp_ms": 1,
-            "session_id": SessionId::new(),
-            "kind": {
-                "tool_invocation_stream": {
-                    "event": {
-                        "presentation": {
-                            "tool_call_id": "call-1",
-                            "sequence": 2,
-                            "presentation": {
-                                "card": {
-                                    "target": "preview",
-                                    "title": "Edit preview",
-                                    "subtitle": "Applying",
-                                    "sections": [{
-                                        "type": "diff",
-                                        "path": "/tmp/file.rs",
-                                        "old_text": "before",
-                                        "new_text": "after"
-                                    }]
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .to_string();
-
-        let event = decode_session_event(&payload).expect("legacy diff section should decode");
+        let payload = include_str!("../fixtures/migrations/tool-presentation-diff-v25.json");
+        let event = decode_session_event(payload).expect("legacy diff section should decode");
         let SessionEventKind::ToolInvocationStream {
             event:
                 ToolInvocationStreamEvent::LegacyPresentation {

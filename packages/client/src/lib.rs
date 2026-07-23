@@ -951,19 +951,33 @@ impl BcodeClient {
     fn verify_daemon_identity(status: &bcode_ipc::DaemonStatus) -> Result<(), ClientError> {
         let (_path, digest) = bcode_daemon_lifecycle::current_executable_identity()
             .map_err(DaemonStartError::from)?;
-        if status.namespace == bcode_ipc::daemon_namespace()
-            && status.protocol_version == u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION)
+        let expected_namespace = bcode_ipc::daemon_namespace();
+        let expected_protocol = u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION);
+        let expected_writer_epoch = bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
+        let expected_event_schema = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
+        if status.namespace == expected_namespace
+            && status.protocol_version == expected_protocol
             && status.build_fingerprint == bcode_ipc::BUILD_FINGERPRINT
             && status.executable_digest.as_deref() == Some(digest.as_str())
+            && status.storage_writer_epoch == Some(expected_writer_epoch)
+            && status.session_event_schema_version == Some(expected_event_schema)
         {
             return Ok(());
         }
         Err(ClientError::IncompatibleDaemon {
             message: format!(
-                "expected namespace {} and executable {digest}, received namespace {} and executable {}",
-                bcode_ipc::daemon_namespace(),
+                "client expects namespace={expected_namespace} protocol={expected_protocol} build={} executable={digest} session_event_schema={expected_event_schema} storage_writer_epoch={expected_writer_epoch}; daemon reported namespace={} protocol={} build={} executable={} session_event_schema={} storage_writer_epoch={}",
+                bcode_ipc::BUILD_FINGERPRINT,
                 status.namespace,
-                status.executable_digest.as_deref().unwrap_or("<unknown>")
+                status.protocol_version,
+                status.build_fingerprint,
+                status.executable_digest.as_deref().unwrap_or("<unknown>"),
+                status
+                    .session_event_schema_version
+                    .map_or_else(|| "<unknown>".to_owned(), |value| value.to_string()),
+                status
+                    .storage_writer_epoch
+                    .map_or_else(|| "<unknown>".to_owned(), |value| value.to_string()),
             ),
         })
     }
@@ -2729,9 +2743,72 @@ impl ClientConnection {
 
 #[cfg(test)]
 mod client_timeout_tests {
-    use super::{BcodeClient, resolve_path_from};
+    use super::{BcodeClient, ClientError, resolve_path_from};
     use std::path::Path;
     use std::time::Duration;
+
+    fn matching_daemon_status() -> bcode_ipc::DaemonStatus {
+        let (_path, digest) = bcode_daemon_lifecycle::current_executable_identity()
+            .expect("current executable identity");
+        bcode_ipc::DaemonStatus {
+            namespace: bcode_ipc::daemon_namespace(),
+            protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+            build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+            executable_digest: Some(digest),
+            storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            session_event_schema_version: Some(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            ),
+            ..bcode_ipc::DaemonStatus::default()
+        }
+    }
+
+    #[test]
+    fn daemon_identity_matrix_rejects_every_incompatible_capability() {
+        let matching = matching_daemon_status();
+        BcodeClient::verify_daemon_identity(&matching).expect("matching daemon");
+
+        let cases = [
+            bcode_ipc::DaemonStatus {
+                protocol_version: matching.protocol_version.saturating_add(1),
+                ..matching.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                build_fingerprint: "other-build".to_owned(),
+                ..matching.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                executable_digest: Some("other-digest".to_owned()),
+                ..matching.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                storage_writer_epoch: matching.storage_writer_epoch.map(|value| value + 1),
+                ..matching.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                session_event_schema_version: matching
+                    .session_event_schema_version
+                    .map(|value| value + 1),
+                ..matching.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                storage_writer_epoch: None,
+                session_event_schema_version: None,
+                ..matching
+            },
+        ];
+        for daemon in cases {
+            let error = BcodeClient::verify_daemon_identity(&daemon)
+                .expect_err("incompatible capability must fail before requests");
+            let ClientError::IncompatibleDaemon { message } = error else {
+                panic!("expected incompatible daemon");
+            };
+            assert!(message.contains("session_event_schema="));
+            assert!(message.contains("storage_writer_epoch="));
+            assert!(message.contains("protocol="));
+            assert!(message.contains("build="));
+        }
+    }
 
     #[test]
     fn caller_paths_are_absolute_and_relative_paths_use_the_caller_cwd() {

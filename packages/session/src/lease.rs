@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Durable session-storage writer contract supported by this Bcode build.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 3;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4;
 
 /// Serializable metadata describing one process currently accessing a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

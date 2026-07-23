@@ -163,6 +163,69 @@ fn ensure_loaded_metric_labels(result: &str) -> MetricLabels {
     labels
 }
 
+fn create_verified_migration_backup(
+    root: &Path,
+    session_id: SessionId,
+    writer_epoch: u64,
+) -> Result<PathBuf, SessionError> {
+    let source = root.join(session_id.to_string());
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let destination = root
+        .parent()
+        .unwrap_or(root)
+        .join("session-migration-backups")
+        .join(format!("{timestamp}-{session_id}-epoch-{writer_epoch}"));
+    copy_and_verify_directory(&source, &destination).map_err(|error| {
+        SessionError::MigrationBackup {
+            session_id,
+            reason: error.to_string(),
+        }
+    })?;
+    let manifest = serde_json::json!({
+        "session_id": session_id,
+        "source_writer_epoch": writer_epoch,
+        "target_writer_epoch": db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+        "created_at_ms": u64::try_from(timestamp).unwrap_or(u64::MAX),
+    });
+    let manifest_path = destination.join("migration-backup.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).map_err(|error| SessionError::MigrationBackup {
+            session_id,
+            reason: error.to_string(),
+        })?,
+    )
+    .map_err(|error| SessionError::MigrationBackup {
+        session_id,
+        reason: format!("{}: {error}", manifest_path.display()),
+    })?;
+    Ok(destination)
+}
+
+fn copy_and_verify_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_and_verify_directory(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path)?;
+            if fs::read(&source_path)? != fs::read(&destination_path)? {
+                return Err(std::io::Error::other(format!(
+                    "backup verification failed for {}",
+                    source_path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn record_ensure_loaded_duration(metrics: &MetricsRegistry, result: &str, elapsed_ms: u64) {
     metrics.record_histogram_with_labels(
         "session.manager.ensure_loaded.duration_ms",
@@ -231,6 +294,12 @@ pub enum SessionError {
         "session storage migration required: writer epoch {actual}, expected {expected}; run an explicit session migration/reindex command"
     )]
     StorageMigrationRequired { actual: u64, expected: u64 },
+    /// A verified pre-migration backup could not be created.
+    #[error("session migration backup failed for {session_id}: {reason}")]
+    MigrationBackup {
+        session_id: SessionId,
+        reason: String,
+    },
     /// Session database error: {0}
     #[error("session database error: {0}")]
     Db(#[from] db::SessionDbError),
@@ -350,10 +419,10 @@ impl SessionStore {
                 Ok(None) => summary,
                 Err(error) => {
                     eprintln!(
-                        "skipping session {} with unsupported manifest metadata: {error}",
+                        "using canonical fallback for session {} with unreadable manifest metadata: {error}",
                         summary.id
                     );
-                    continue;
+                    summary
                 }
             };
             sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
@@ -395,9 +464,7 @@ impl SessionStore {
             let Some(session_id) = canonical_session_id_from_dir(&path) else {
                 continue;
             };
-            if self.session_manifest_path(session_id).exists()
-                || !db::session_db_path(&self.root, session_id).exists()
-            {
+            if !db::session_db_path(&self.root, session_id).exists() {
                 continue;
             }
             summaries.push(SessionSummary {
@@ -724,6 +791,8 @@ pub enum CatalogLoadStatus {
 pub enum SessionHealth {
     /// DB-backed session is ready for normal runtime access.
     Ready,
+    /// Session is inspectable but contains semantically opaque history and is read-only.
+    DegradedReadOnly { issue_count: u64 },
     /// Session storage requires a different writer epoch.
     WriterIncompatible { actual: Option<u64>, expected: u64 },
     /// A DB read model is missing or stale.
@@ -736,6 +805,38 @@ pub enum SessionHealth {
     RepairRequired { reason: String },
     /// No DB-backed session exists for the id.
     NotFound,
+}
+
+async fn compatibility_health(db: &db::SessionDb, expected: u64) -> Option<SessionHealth> {
+    match db.session_compatibility_status().await {
+        Ok(db::SessionCompatibilityStatus::Compatible { .. }) => None,
+        Ok(db::SessionCompatibilityStatus::Degraded { issue_count, .. }) => {
+            Some(SessionHealth::DegradedReadOnly { issue_count })
+        }
+        Ok(db::SessionCompatibilityStatus::Missing) => Some(SessionHealth::ProjectionStale {
+            projection: "session_compatibility",
+            checkpoint: None,
+            expected,
+        }),
+        Ok(db::SessionCompatibilityStatus::Stale {
+            checkpoint,
+            expected,
+        }) => Some(SessionHealth::ProjectionStale {
+            projection: "session_compatibility",
+            checkpoint: Some(checkpoint),
+            expected,
+        }),
+        Ok(db::SessionCompatibilityStatus::Incompatible { actual, expected }) => {
+            Some(SessionHealth::RepairRequired {
+                reason: format!(
+                    "unsupported session compatibility projection schema {actual}; expected {expected}"
+                ),
+            })
+        }
+        Err(error) => Some(SessionHealth::RepairRequired {
+            reason: error.to_string(),
+        }),
+    }
 }
 
 #[derive(Debug)]
@@ -1226,6 +1327,13 @@ impl SessionManager {
             .storage_compatibility()
             .await?;
         if matches!(rechecked, KnownLegacy { .. }) {
+            let backup_path = create_verified_migration_backup(root, session_id, writer_epoch)?;
+            tracing::info!(
+                target: "bcode_session::migration",
+                %session_id,
+                backup_path = %backup_path.display(),
+                "verified pre-migration session backup"
+            );
             let migrated =
                 match db::SessionDb::migrate_turso_in_root(session_id, root, &maintenance, &write)
                     .await
@@ -1299,6 +1407,11 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         let db_open_timer = self.metrics.timer();
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        if let db::SessionCompatibilityStatus::Degraded { issue_count, .. } =
+            db.session_compatibility_status().await?
+        {
+            return Err(db::SessionDbError::CompatibilityDegraded { issue_count }.into());
+        }
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.summary_refresh_db_open_duration_ms",
             db_open_timer.elapsed_ms(),
@@ -1335,6 +1448,11 @@ impl SessionManager {
         );
         let db_open_timer = self.metrics.timer();
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        if let db::SessionCompatibilityStatus::Degraded { issue_count, .. } =
+            db.session_compatibility_status().await?
+        {
+            return Err(db::SessionDbError::CompatibilityDegraded { issue_count }.into());
+        }
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.db_open_duration_ms",
             db_open_timer.elapsed_ms(),
@@ -1514,6 +1632,9 @@ impl SessionManager {
                 };
             }
         };
+        if let Some(health) = compatibility_health(&db, expected).await {
+            return health;
+        }
         let session_state = match db.session_state().await {
             Ok(Some(state)) if state.last_event_seq >= expected => state,
             Ok(Some(state)) => {
@@ -3771,7 +3892,7 @@ mod tests {
         AppendToolCallRequestedInput, CURRENT_SESSION_FORMAT_EPOCH,
         MAX_DURABLE_GENERIC_EVENT_BYTES, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
         SessionCatalogLoadStatus, SessionError, SessionHealth, SessionLeaseOwnerContext,
-        SessionManager, SessionStore, db, lease,
+        SessionLoadStatusKind, SessionManager, SessionStore, db, lease,
     };
     use bcode_metrics::MetricsRegistry;
     use std::time::Duration;
@@ -3924,6 +4045,145 @@ mod tests {
                 db::SessionDbError::WriterIncompatible { .. }
             ))
         ));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migrated_opaque_session_health_is_degraded_and_attach_fails_closed() {
+        let root = unique_temp_dir();
+        let session_id = SessionId::new();
+        let db = db::SessionDb::open_turso_in_root(session_id, &root)
+            .await
+            .expect("open session DB");
+        db.append_event(&bcode_session_models::SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 0,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::SessionCreated {
+                name: Some("opaque health".to_owned()),
+                working_directory: test_working_directory(),
+            },
+        })
+        .await
+        .expect("append session created");
+        db.database()
+            .insert("events")
+            .value("event_seq", switchy::database::DatabaseValue::Int64(1))
+            .value("event_type", "future_event_kind")
+            .value(
+                "schema_version",
+                switchy::database::DatabaseValue::Int32(i32::from(
+                    CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                )),
+            )
+            .value("created_at_ms", switchy::database::DatabaseValue::Int64(2))
+            .value(
+                "payload",
+                serde_json::json!({
+                    "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    "sequence": 1,
+                    "timestamp_ms": 2,
+                    "session_id": session_id,
+                    "kind": { "future_event_kind": { "value": true } }
+                })
+                .to_string(),
+            )
+            .execute(db.database())
+            .await
+            .expect("insert opaque event");
+        db.database()
+            .update("session_storage_contract")
+            .value("writer_epoch", switchy::database::DatabaseValue::Int64(3))
+            .where_eq("contract_id", switchy::database::DatabaseValue::Int32(1))
+            .execute(db.database())
+            .await
+            .expect("mark epoch three");
+        db.database()
+            .delete("__bcode_session_migrations")
+            .where_in(
+                "id",
+                vec![
+                    switchy::database::DatabaseValue::String(
+                        "028_session_compatibility_state".to_owned(),
+                    ),
+                    switchy::database::DatabaseValue::String(
+                        "029_session_compatibility_issues".to_owned(),
+                    ),
+                ],
+            )
+            .execute(db.database())
+            .await
+            .expect("remove epoch four migrations");
+        db.database()
+            .exec_raw("DROP TABLE session_compatibility_issues")
+            .await
+            .expect("drop issues");
+        db.database()
+            .exec_raw("DROP TABLE session_compatibility_state")
+            .await
+            .expect("drop state");
+        drop(db);
+
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        assert!(matches!(
+            manager
+                .attach_session_recent(session_id, ClientId::new(), 10)
+                .await,
+            Err(SessionError::Db(
+                db::SessionDbError::CompatibilityDegraded { issue_count: 1 }
+            ))
+        ));
+        assert_eq!(
+            manager.session_health(session_id).await,
+            SessionHealth::DegradedReadOnly { issue_count: 1 }
+        );
+        let page = manager
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("bounded history should remain available");
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.compatibility_issues.len(), 1);
+
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("migrated session DB should open");
+        db.database()
+            .update("events")
+            .value("payload", "not valid JSON")
+            .where_eq("event_seq", switchy::database::DatabaseValue::Int64(1))
+            .execute(db.database())
+            .await
+            .expect("opaque canonical payload should corrupt");
+        drop(db);
+        drop(manager);
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let attach = restored
+            .attach_session_recent(session_id, ClientId::new(), 10)
+            .await;
+        assert!(
+            matches!(
+                attach,
+                Err(SessionError::Db(
+                    db::SessionDbError::CompatibilityDegraded { issue_count: 1 }
+                ))
+            ),
+            "unexpected degraded attach result: {attach:?}"
+        );
+        assert_eq!(
+            restored.session_health(session_id).await,
+            SessionHealth::DegradedReadOnly { issue_count: 1 }
+        );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
@@ -4387,10 +4647,10 @@ mod tests {
         ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
         ProjectionWindowTarget, ProviderContextSnapshot, ProviderContextSnapshotOrigin,
         ProviderStreamEvent, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-        SessionEventProvenance, SessionForkKind, SessionHistoryQuery, SessionId, SessionLiveEvent,
-        SessionLiveEventKind, SessionProjectionKind, SessionTraceEvent, SessionTracePayload,
-        SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
-        TraceBlobRef, WorkId,
+        SessionEventProvenance, SessionForkKind, SessionHistoryDirection, SessionHistoryQuery,
+        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionProjectionKind,
+        SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationResult,
+        ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef, WorkId,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -5317,7 +5577,8 @@ mod tests {
 
     #[tokio::test]
     async fn exclusive_load_automatically_migrates_legacy_storage() {
-        let root = unique_temp_dir();
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
         let session_id = {
             let manager = SessionManager::persistent(&root).expect("manager should initialize");
             let session = manager
@@ -5372,7 +5633,75 @@ mod tests {
             migrated.storage_writer_epoch().await.expect("writer epoch"),
             u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
         );
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+        let backup_root = root
+            .parent()
+            .expect("session root parent")
+            .join("session-migration-backups");
+        let backups = std::fs::read_dir(&backup_root)
+            .expect("migration backup directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("migration backup entries");
+        assert_eq!(backups.len(), 1);
+        let backup = backups[0].path();
+        assert!(backup.join("session.db").is_file());
+        assert!(backup.join("migration-backup.json").is_file());
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(backup.join("migration-backup.json")).expect("backup manifest"),
+        )
+        .expect("manifest JSON");
+        assert_eq!(manifest["session_id"], session_id.to_string());
+        assert_eq!(
+            manifest["target_writer_epoch"],
+            db::CURRENT_SESSION_STORAGE_WRITER_EPOCH
+        );
+        std::fs::remove_dir_all(state_root).expect("state root should clean up");
+    }
+
+    #[tokio::test]
+    async fn failed_migration_backup_prevents_every_storage_mutation() {
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should initialize");
+            let session = manager
+                .create_session(Some("blocked backup".to_owned()), test_working_directory())
+                .await
+                .expect("session should create");
+            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+                .await
+                .expect("fixture database should open");
+            db.database()
+                .update("session_storage_contract")
+                .value("writer_epoch", switchy::database::DatabaseValue::Int64(3))
+                .execute(db.database())
+                .await
+                .expect("mark epoch three");
+            session.id
+        };
+        let backup_root = root
+            .parent()
+            .expect("session root parent")
+            .join("session-migration-backups");
+        std::fs::write(&backup_root, b"block backup directory").expect("create backup blocker");
+
+        let manager = SessionManager::persistent(&root).expect("manager should reopen");
+        assert!(matches!(
+            manager.require_write_readiness(session_id).await,
+            Err(SessionError::MigrationBackup { .. })
+        ));
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("database should reopen");
+        assert_eq!(db.storage_writer_epoch().await.expect("writer epoch"), 3);
+        assert_eq!(db.last_event_sequence().await.expect("tail"), Some(0));
+        assert_eq!(
+            db.session_compatibility_status()
+                .await
+                .expect("compatibility status"),
+            db::SessionCompatibilityStatus::Compatible { checkpoint: 0 }
+        );
+        std::fs::remove_file(backup_root).expect("backup blocker should clean up");
+        std::fs::remove_dir_all(state_root).expect("state root should clean up");
     }
 
     #[tokio::test]
@@ -5501,6 +5830,12 @@ mod tests {
                         ),
                         switchy::database::DatabaseValue::String(
                             "027_initialize_session_storage_contract".to_owned(),
+                        ),
+                        switchy::database::DatabaseValue::String(
+                            "028_session_compatibility_state".to_owned(),
+                        ),
+                        switchy::database::DatabaseValue::String(
+                            "029_session_compatibility_issues".to_owned(),
                         ),
                     ],
                 )
@@ -6451,6 +6786,395 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn catalog_discovers_every_migration_fixture_without_mutation() {
+        let root = unique_temp_dir();
+        let fixtures = [
+            (
+                "future-schema-v39.json",
+                include_str!("../fixtures/migrations/future-schema-v39.json"),
+            ),
+            (
+                "interactive-tool-request-created-v32.json",
+                include_str!("../fixtures/migrations/interactive-tool-request-created-v32.json"),
+            ),
+            (
+                "interactive-tool-request-resolved-v32.json",
+                include_str!("../fixtures/migrations/interactive-tool-request-resolved-v32.json"),
+            ),
+            (
+                "interactive-tool-request-unresolved-v32.json",
+                include_str!("../fixtures/migrations/interactive-tool-request-unresolved-v32.json"),
+            ),
+            (
+                "malformed-json-v38.json",
+                include_str!("../fixtures/migrations/malformed-json-v38.json"),
+            ),
+            (
+                "mismatched-session-id-v38.json",
+                include_str!("../fixtures/migrations/mismatched-session-id-v38.json"),
+            ),
+            (
+                "plugin-automation-turn-finished-v29.json",
+                include_str!("../fixtures/migrations/plugin-automation-turn-finished-v29.json"),
+            ),
+            (
+                "plugin-automation-turn-started-v29.json",
+                include_str!("../fixtures/migrations/plugin-automation-turn-started-v29.json"),
+            ),
+            (
+                "plugin-status-note-v29.json",
+                include_str!("../fixtures/migrations/plugin-status-note-v29.json"),
+            ),
+            (
+                "tool-presentation-diff-v25.json",
+                include_str!("../fixtures/migrations/tool-presentation-diff-v25.json"),
+            ),
+            (
+                "unknown-future-event-kind-v38.json",
+                include_str!("../fixtures/migrations/unknown-future-event-kind-v38.json"),
+            ),
+            (
+                "unknown-old-event-kind-v32.json",
+                include_str!("../fixtures/migrations/unknown-old-event-kind-v32.json"),
+            ),
+            (
+                "mixed-interactive-history-v32-v35.jsonl",
+                include_str!("../fixtures/migrations/mixed-interactive-history-v32-v35.jsonl"),
+            ),
+            (
+                "sequence-gap-v38.jsonl",
+                include_str!("../fixtures/migrations/sequence-gap-v38.jsonl"),
+            ),
+        ];
+        let mut expected = BTreeMap::new();
+
+        for (fixture_name, fixture) in fixtures {
+            let session_id = SessionId::new();
+            let db = db::SessionDb::open_turso_in_root(session_id, &root)
+                .await
+                .expect("fixture session DB should initialize");
+            for (line_index, payload) in fixture.lines().enumerate() {
+                let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
+                let sequence = parsed
+                    .as_ref()
+                    .and_then(|value| value["sequence"].as_u64())
+                    .unwrap_or_else(|| u64::try_from(line_index).expect("line index should fit"));
+                let event_type = parsed
+                    .as_ref()
+                    .and_then(|value| value["kind"].as_object())
+                    .and_then(|kind| kind.keys().next())
+                    .map_or_else(|| "malformed_fixture".to_owned(), Clone::clone);
+                let schema_version = parsed
+                    .as_ref()
+                    .and_then(|value| value["schema_version"].as_i64())
+                    .and_then(|version| i32::try_from(version).ok())
+                    .unwrap_or_else(|| i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION));
+                let created_at_ms = parsed
+                    .as_ref()
+                    .and_then(|value| value["timestamp_ms"].as_i64())
+                    .unwrap_or(0);
+                db.database()
+                    .insert("events")
+                    .value(
+                        "event_seq",
+                        switchy::database::DatabaseValue::Int64(
+                            i64::try_from(sequence).expect("sequence should fit"),
+                        ),
+                    )
+                    .value("event_type", event_type)
+                    .value(
+                        "schema_version",
+                        switchy::database::DatabaseValue::Int32(schema_version),
+                    )
+                    .value(
+                        "created_at_ms",
+                        switchy::database::DatabaseValue::Int64(created_at_ms),
+                    )
+                    .value("payload", payload)
+                    .execute(db.database())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("fixture {fixture_name} row should insert: {error}")
+                    });
+            }
+            drop(db);
+            std::thread::sleep(Duration::from_millis(20));
+            expected.insert(
+                session_id,
+                (fixture_name, session_database_files(&root, session_id)),
+            );
+        }
+
+        let catalog = SessionStore::new(&root)
+            .load_catalog()
+            .expect("fixture catalog should load");
+        assert_eq!(catalog.len(), expected.len());
+        for (session_id, (fixture_name, before)) in expected {
+            let state = catalog
+                .get(&session_id)
+                .unwrap_or_else(|| panic!("fixture {fixture_name} should be discoverable"));
+            assert_eq!(state.load_status, SessionLoadStatusKind::SummaryOnly);
+            assert_eq!(
+                session_database_files(&root, session_id),
+                before,
+                "catalog discovery must not mutate fixture {fixture_name}"
+            );
+        }
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_history() {
+        let root = unique_temp_dir();
+        let session_id = SessionId::new();
+        let db = db::SessionDb::open_turso_in_root(session_id, &root)
+            .await
+            .expect("session DB should initialize");
+        db.append_event(&bcode_session_models::SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 0,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::SessionCreated {
+                name: Some("mixed fixture".to_owned()),
+                working_directory: test_working_directory(),
+            },
+        })
+        .await
+        .expect("session-created event should append");
+
+        for (offset, fixture) in
+            include_str!("../fixtures/migrations/mixed-interactive-history-v32-v35.jsonl")
+                .lines()
+                .enumerate()
+        {
+            let sequence = u64::try_from(offset).expect("fixture offset should fit") + 1;
+            let mut payload: serde_json::Value =
+                serde_json::from_str(fixture).expect("fixture should be valid JSON");
+            let schema_version = payload["schema_version"]
+                .as_u64()
+                .and_then(|version| i32::try_from(version).ok())
+                .expect("fixture schema should fit");
+            let event_type = payload["kind"]
+                .as_object()
+                .and_then(|kind| kind.keys().next())
+                .expect("fixture should have one event kind")
+                .clone();
+            payload["sequence"] = sequence.into();
+            payload["session_id"] = serde_json::to_value(session_id).expect("session ID JSON");
+            db.database()
+                .insert("events")
+                .value(
+                    "event_seq",
+                    switchy::database::DatabaseValue::Int64(
+                        i64::try_from(sequence).expect("sequence should fit"),
+                    ),
+                )
+                .value("event_type", event_type)
+                .value(
+                    "schema_version",
+                    switchy::database::DatabaseValue::Int32(schema_version),
+                )
+                .value(
+                    "created_at_ms",
+                    switchy::database::DatabaseValue::Int64(
+                        payload["timestamp_ms"]
+                            .as_i64()
+                            .expect("fixture timestamp should fit"),
+                    ),
+                )
+                .value("payload", payload.to_string())
+                .execute(db.database())
+                .await
+                .expect("fixture event should insert");
+        }
+        db.database()
+            .update("session_storage_contract")
+            .value("writer_epoch", switchy::database::DatabaseValue::Int64(3))
+            .where_eq("contract_id", switchy::database::DatabaseValue::Int32(1))
+            .execute(db.database())
+            .await
+            .expect("fixture store should represent epoch three");
+        db.database()
+            .delete("__bcode_session_migrations")
+            .where_in(
+                "id",
+                vec![
+                    switchy::database::DatabaseValue::String(
+                        "028_session_compatibility_state".to_owned(),
+                    ),
+                    switchy::database::DatabaseValue::String(
+                        "029_session_compatibility_issues".to_owned(),
+                    ),
+                ],
+            )
+            .execute(db.database())
+            .await
+            .expect("epoch-four migration ledger should clear");
+        db.database()
+            .exec_raw("DROP TABLE session_compatibility_issues")
+            .await
+            .expect("compatibility issues should drop");
+        db.database()
+            .exec_raw("DROP TABLE session_compatibility_state")
+            .await
+            .expect("compatibility state should drop");
+        drop(db);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before_discovery = session_database_files(&root, session_id);
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let entry = manager
+            .all_session_catalog_entries()
+            .await
+            .into_iter()
+            .find(|entry| entry.summary.id == session_id)
+            .expect("fixture session should be discovered");
+        assert_eq!(entry.load_status, SessionCatalogLoadStatus::SummaryOnly);
+        assert_eq!(
+            manager.session_health(session_id).await,
+            SessionHealth::WriterIncompatible {
+                actual: Some(3),
+                expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            }
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            session_database_files(&root, session_id),
+            before_discovery,
+            "catalog discovery and health classification must not mutate fixture storage"
+        );
+
+        let attachment = manager
+            .attach_session_recent(session_id, ClientId::new(), 10)
+            .await
+            .expect("known-legacy fixture should migrate and attach");
+        assert_eq!(
+            attachment
+                .history
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "inert legacy events must not be fabricated as transcript entries"
+        );
+        let page = manager
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    direction: SessionHistoryDirection::Forward,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("bounded canonical history should load");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert!(matches!(
+            &page.events[1].kind,
+            SessionEventKind::LegacyEvent { event_type, .. }
+                if event_type == "interactive_tool_request_created"
+        ));
+        assert!(matches!(
+            &page.events[2].kind,
+            SessionEventKind::LegacyEvent { event_type, .. }
+                if event_type == "interactive_tool_request_resolved"
+        ));
+        assert!(matches!(
+            &page.events[3].kind,
+            SessionEventKind::AssistantMessage { text }
+                if text == "history continued under schema 35"
+        ));
+        assert_eq!(
+            manager.session_health(session_id).await,
+            SessionHealth::Ready
+        );
+        let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("migrated fixture DB should open");
+        assert_eq!(
+            migrated
+                .last_event_sequence()
+                .await
+                .expect("canonical tail"),
+            Some(3)
+        );
+        assert!(
+            migrated
+                .active_runtime_work()
+                .await
+                .expect("runtime projection")
+                .is_empty()
+        );
+        assert!(
+            migrated
+                .active_tool_runs()
+                .await
+                .expect("tool projection")
+                .is_empty()
+        );
+        drop(migrated);
+        drop(manager);
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn normal_open_does_not_decode_canonical_events() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("decode free open".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "canonical payload".to_owned())
+            .await
+            .expect("message should append");
+
+        let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("session DB should open");
+        db.database()
+            .update("events")
+            .value("payload", "not valid JSON")
+            .where_eq("event_seq", switchy::database::DatabaseValue::Int64(1))
+            .execute(db.database())
+            .await
+            .expect("canonical payload should corrupt");
+        drop(db);
+        manager
+            .inner
+            .lock()
+            .await
+            .sessions
+            .remove(&session.id)
+            .expect("cached actor should exist");
+        manager.inner.lock().await.leases.remove(&session.id);
+
+        let summary = manager
+            .session_summary(session.id)
+            .await
+            .expect("normal open must use derived state without decoding canonical events");
+        assert_eq!(summary.name.as_deref(), Some("decode free open"));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn concurrent_same_session_appends_have_contiguous_sequences() {
         let root = unique_temp_dir();
         let manager = std::sync::Arc::new(
@@ -6978,7 +7702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_catalog_cache_does_not_hide_canonical_database() {
+    async fn unreadable_manifest_and_catalog_cache_do_not_hide_canonical_database() {
         let root = unique_temp_dir();
         let session_id = {
             let manager = SessionManager::persistent_with_metrics_and_lease_owner(
@@ -6996,8 +7720,11 @@ mod tests {
                 .expect("session")
                 .id
         };
-        std::fs::remove_file(db::session_dir_path(&root, session_id).join("manifest.json"))
-            .expect("remove manifest");
+        std::fs::write(
+            db::session_dir_path(&root, session_id).join("manifest.json"),
+            b"not valid JSON",
+        )
+        .expect("corrupt manifest");
         let catalogs = root.join("catalogs");
         std::fs::remove_dir_all(&catalogs).expect("remove catalogs");
         let catalog = db::namespaced_catalog_db_path(&root, "corrupt-cache");
@@ -7014,13 +7741,13 @@ mod tests {
             },
         )
         .expect("derived catalog damage must not fail discovery");
-        assert!(
-            restored
-                .all_session_summaries()
-                .await
-                .iter()
-                .any(|session| session.id == session_id)
-        );
+        let entry = restored
+            .all_session_catalog_entries()
+            .await
+            .into_iter()
+            .find(|entry| entry.summary.id == session_id)
+            .expect("canonical session should remain visible");
+        assert_eq!(entry.load_status, SessionCatalogLoadStatus::SummaryOnly);
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
@@ -7183,12 +7910,16 @@ mod tests {
                 .to_string()
                 .contains("session manifest id mismatch")
         );
-        assert!(
-            store
-                .load_catalog()
-                .expect("bounded catalog load")
-                .is_empty()
-        );
+        let catalog = store.load_catalog().expect("bounded catalog load");
+        assert_eq!(catalog.len(), 2);
+        for session_id in [future_session_id, mismatched_session_id] {
+            let state = catalog
+                .get(&session_id)
+                .expect("canonical fallback should remain visible");
+            assert_eq!(state.load_status, SessionLoadStatusKind::SummaryOnly);
+            assert_eq!(state.summary.id, session_id);
+            assert_eq!(state.summary.name, None);
+        }
         assert_eq!(
             std::fs::read(&future_db_path).expect("future database sentinel"),
             b"future database sentinel"

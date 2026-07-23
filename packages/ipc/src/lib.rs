@@ -83,6 +83,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// interpreting payloads with mismatched positional layouts.
 pub const CURRENT_PROTOCOL_VERSION: u16 = 12;
 
+/// Durable session-storage writer epoch expected by this IPC build.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4;
+
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
 
@@ -553,6 +556,9 @@ pub struct DaemonStatus {
     /// Durable session-storage writer epoch supported by this daemon.
     #[serde(default)]
     pub storage_writer_epoch: Option<u32>,
+    /// Highest persisted session-event schema version understood by this daemon.
+    #[serde(default)]
+    pub session_event_schema_version: Option<u16>,
     /// Process identifier, when available.
     #[serde(default)]
     pub pid: Option<u32>,
@@ -2549,6 +2555,7 @@ mod tests {
                         build_fingerprint: "test-build".to_string(),
                         executable_digest: Some("digest".to_string()),
                         storage_writer_epoch: Some(2),
+                        session_event_schema_version: Some(38),
                         pid: Some(123),
                         instance_id: "instance".to_string(),
                         started_at_unix_ms: 456,
@@ -2995,6 +3002,15 @@ mod tests {
                     page: bcode_session_models::SessionHistoryPage {
                         session_id,
                         events: vec![event.clone()],
+                        compatibility_issues: vec![
+                            bcode_session_models::SessionEventCompatibilityIssue {
+                                sequence: event.sequence,
+                                event_kind: "future_event_kind".to_owned(),
+                                schema_version: event.schema_version,
+                                compatibility: bcode_session_models::SessionEventCompatibilityKind::UnknownEventKind,
+                                remediation: "upgrade Bcode".to_owned(),
+                            },
+                        ],
                         next_cursor: None,
                         has_more: false,
                     },
@@ -3057,6 +3073,7 @@ mod tests {
                 page: bcode_session_models::SessionHistoryPage {
                     session_id,
                     events: vec![event.clone()],
+                    compatibility_issues: Vec::new(),
                     next_cursor: None,
                     has_more: false,
                 },

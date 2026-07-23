@@ -4935,6 +4935,12 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
                             protocol_version: u32::from(bcode_ipc::ProtocolVersion::current().0),
                             build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
                             executable_digest: executable_digest.clone(),
+                            storage_writer_epoch: Some(
+                                bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                            ),
+                            session_event_schema_version: Some(
+                                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                            ),
                             ..bcode_ipc::DaemonStatus::default()
                         },
                     })

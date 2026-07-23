@@ -15,17 +15,17 @@ use std::{
 };
 
 use crate::persisted::{
-    PersistedSessionEventError, decode_session_event, decode_session_event_compatible,
-    decode_session_event_degraded, encode_session_event,
+    CompatibleSessionEvent, PersistedSessionEventError, decode_session_event,
+    decode_session_event_compatible, encode_session_event,
 };
 
 use bcode_database_observability::ObservedDatabase;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation, MetricsRegistry};
 use bcode_session_models::{
-    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryCursor,
-    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionInputHistoryEntry, SessionSummary, SessionTitleSource, ToolInvocationResult,
-    ToolInvocationStreamEvent, WorkId,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventCompatibilityIssue,
+    SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
+    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
+    ToolInvocationResult, ToolInvocationStreamEvent, WorkId,
 };
 use switchy::{
     database::{
@@ -51,6 +51,8 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
     crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
 pub(crate) const LEGACY_SESSION_STORAGE_WRITER_EPOCH: u32 = 2;
+const PREVIOUS_SESSION_STORAGE_WRITER_EPOCH: u32 = 3;
+const SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION: u32 = 1;
 const SESSION_STORAGE_CONTRACT_ID: i32 = 1;
 const SESSION_STORAGE_CONTRACT_SCHEMA_VERSION: u32 = 1;
 const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 2;
@@ -82,6 +84,11 @@ pub enum SessionDbError {
     /// Strict persisted event decode failed.
     #[error(transparent)]
     PersistedEvent(#[from] PersistedSessionEventError),
+    /// Canonical history contains semantically opaque events and is read-only.
+    #[error(
+        "session contains {issue_count} opaque compatibility event(s); writes require a compatible Bcode build"
+    )]
+    CompatibilityDegraded { issue_count: u64 },
     /// Transient contribution envelopes cannot enter durable session storage.
     #[error("transient tool contribution {contribution_id} cannot be persisted")]
     TransientContribution { contribution_id: String },
@@ -144,6 +151,21 @@ pub enum SessionStorageCompatibility {
 
 /// Result type for session DB operations.
 pub type SessionDbResult<T> = Result<T, SessionDbError>;
+
+/// Diagnostic state for the durable session-compatibility projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCompatibilityStatus {
+    /// No compatibility projection state exists.
+    Missing,
+    /// Projection is current and all canonical event semantics are understood.
+    Compatible { checkpoint: u64 },
+    /// Projection is current but canonical history contains opaque events.
+    Degraded { checkpoint: u64, issue_count: u64 },
+    /// Projection trails or exceeds canonical history.
+    Stale { checkpoint: u64, expected: u64 },
+    /// Projection uses an unsupported schema.
+    Incompatible { actual: u64, expected: u64 },
+}
 
 /// Diagnostic state for the durable model-context projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1094,7 +1116,7 @@ impl SessionDb {
         let row = self
             .db
             .select("events")
-            .columns(&["payload"])
+            .columns(&["event_seq", "payload"])
             .where_eq("event_type", "agent_changed")
             .sort("event_seq", SortDirection::Desc)
             .limit(1)
@@ -1103,13 +1125,11 @@ impl SessionDb {
         let Some(row) = row else {
             return Ok(None);
         };
-        let payload = required_string(&row, "payload")?;
-        Ok(
-            decode_session_event_degraded(&payload).and_then(|event| match event.kind {
-                SessionEventKind::AgentChanged { agent_id } => Some(agent_id),
-                _ => None,
-            }),
-        )
+        let event = compatible_event_from_row(&row, self.session_id)?.into_event();
+        Ok(match event.kind {
+            SessionEventKind::AgentChanged { agent_id } => Some(agent_id),
+            _ => None,
+        })
     }
 
     async fn input_message_count(&self) -> SessionDbResult<usize> {
@@ -1244,7 +1264,11 @@ impl SessionDb {
             }
             return Ok(SessionStorageCompatibility::Current { writer_epoch });
         }
-        if writer_epoch == u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH) {
+        if matches!(
+            writer_epoch,
+            epoch if epoch == u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+                || epoch == u64::from(PREVIOUS_SESSION_STORAGE_WRITER_EPOCH)
+        ) {
             return Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch });
         }
         Err(SessionDbError::WriterIncompatible {
@@ -1334,6 +1358,7 @@ impl SessionDb {
         project_model_context_event(&*tx, event).await?;
         project_context_occupancy_event(&*tx, event).await?;
         project_turn_receipt(&*tx, event).await?;
+        project_session_compatibility(&*tx, event, None).await?;
         validate_append_postconditions(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
@@ -1377,6 +1402,57 @@ impl SessionDb {
             kind: SessionEventKind::SessionRenamed { name: None },
         };
         validate_append_preconditions_without_writer(&**self.db, &probe).await
+    }
+
+    /// Return bounded compatibility status without replaying canonical history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compatibility state or issue rows are malformed.
+    pub async fn session_compatibility_status(
+        &self,
+    ) -> SessionDbResult<SessionCompatibilityStatus> {
+        let row = self
+            .db
+            .select("session_compatibility_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", DatabaseValue::Int32(1))
+            .execute_first(&**self.db)
+            .await?;
+        let Some(row) = row.as_ref() else {
+            return Ok(SessionCompatibilityStatus::Missing);
+        };
+        let actual = required_non_negative_u64(row, "schema_version")?;
+        let expected_schema = u64::from(SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION);
+        if actual != expected_schema {
+            return Ok(SessionCompatibilityStatus::Incompatible {
+                actual,
+                expected: expected_schema,
+            });
+        }
+        let checkpoint = required_non_negative_u64(row, "last_event_seq")?;
+        let expected = self.last_event_sequence().await?.unwrap_or_default();
+        if checkpoint != expected {
+            return Ok(SessionCompatibilityStatus::Stale {
+                checkpoint,
+                expected,
+            });
+        }
+        let issue_count = self
+            .db
+            .select("session_compatibility_issues")
+            .columns(&["event_seq"])
+            .execute(&**self.db)
+            .await?
+            .len();
+        if issue_count == 0 {
+            Ok(SessionCompatibilityStatus::Compatible { checkpoint })
+        } else {
+            Ok(SessionCompatibilityStatus::Degraded {
+                checkpoint,
+                issue_count: u64::try_from(issue_count).unwrap_or(u64::MAX),
+            })
+        }
     }
 
     /// Return a materialized projection's stored schema version, if present.
@@ -1488,7 +1564,10 @@ impl SessionDb {
             .await?;
 
         rows.iter()
-            .map(|row| compatible_event_from_row(row, self.session_id))
+            .map(|row| {
+                compatible_event_from_row(row, self.session_id)
+                    .map(CompatibleSessionEvent::into_event)
+            })
             .collect()
     }
 
@@ -1550,11 +1629,20 @@ impl SessionDb {
                 })
             })
             .transpose()?;
-        let events = rows
+        let decoded = rows
             .iter()
             .take(limit)
             .map(|row| compatible_event_from_row(row, self.session_id))
             .collect::<SessionDbResult<Vec<_>>>()?;
+        let mut compatibility_issues = decoded
+            .iter()
+            .filter_map(|event| event.issue().cloned())
+            .collect::<Vec<SessionEventCompatibilityIssue>>();
+        compatibility_issues.sort_by_key(|issue| issue.sequence);
+        let events = decoded
+            .into_iter()
+            .map(CompatibleSessionEvent::into_event)
+            .collect::<Vec<_>>();
         let events = if matches!(query.direction, SessionHistoryDirection::Backward) {
             events.into_iter().rev().collect()
         } else {
@@ -1563,6 +1651,7 @@ impl SessionDb {
         Ok(SessionHistoryPage {
             session_id: self.session_id,
             events,
+            compatibility_issues,
             next_cursor,
             has_more,
         })
@@ -1591,10 +1680,7 @@ impl SessionDb {
             .await?;
         let mut events = Vec::new();
         for row in rows {
-            let payload = required_string(&row, "payload")?;
-            let Some(event) = decode_session_event_degraded(&payload) else {
-                continue;
-            };
+            let event = compatible_event_from_row(&row, self.session_id)?.into_event();
             if matches!(
                 &event.kind,
                 SessionEventKind::PluginStatusNote {
@@ -1881,7 +1967,10 @@ impl SessionDb {
             .await?;
 
         rows.iter()
-            .map(|row| compatible_event_from_row(row, self.session_id))
+            .map(|row| {
+                compatible_event_from_row(row, self.session_id)
+                    .map(CompatibleSessionEvent::into_event)
+            })
             .collect()
     }
 
@@ -2201,8 +2290,8 @@ async fn validate_all_projection_checkpoints_at_tail(
 }
 
 async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> SessionDbResult<()> {
-    let events = strict_events_from_database(db).await?;
-    for (index, event) in events.iter().enumerate() {
+    let events = compatible_events_from_database(db).await?;
+    for (index, (event, _)) in events.iter().enumerate() {
         let expected = u64::try_from(index).unwrap_or(u64::MAX);
         if event.sequence != expected {
             return Err(SessionDbError::InvalidCanonicalSequence {
@@ -2218,6 +2307,8 @@ async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> Se
     }
 
     for table in [
+        "session_compatibility_issues",
+        "session_compatibility_state",
         "turn_receipts",
         "model_context_entries",
         "model_context_projection_state",
@@ -2232,14 +2323,15 @@ async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> Se
     ] {
         db.delete(table).execute(db).await?;
     }
-    for event in &events {
+    for (event, issue) in &events {
         project_materialized_event(db, event).await?;
         project_model_context_event(db, event).await?;
         project_context_occupancy_event(db, event).await?;
         project_turn_receipt(db, event).await?;
+        project_session_compatibility(db, event, issue.as_ref()).await?;
     }
 
-    let canonical_tail = events.last().map(|event| event.sequence);
+    let canonical_tail = events.last().map(|(event, _)| event.sequence);
     validate_all_projection_checkpoints_at_tail(db, canonical_tail).await?;
     if let Some(expected) = canonical_tail {
         let model_state = db
@@ -2270,6 +2362,32 @@ async fn migrate_session_storage(db: &dyn Database, session_id: SessionId) -> Se
     }
     set_storage_writer_contract(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
     validate_storage_writer_contract(db).await
+}
+
+async fn compatible_events_from_database(
+    db: &dyn Database,
+) -> SessionDbResult<Vec<(SessionEvent, Option<SessionEventCompatibilityIssue>)>> {
+    let rows = db
+        .select("events")
+        .columns(&["event_seq", "payload"])
+        .sort("event_seq", SortDirection::Asc)
+        .execute(db)
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let event_seq = required_non_negative_u64(row, "event_seq")?;
+            let payload = required_string(row, "payload")?;
+            let decoded = decode_session_event_compatible(&payload)?;
+            if decoded.event().sequence != event_seq {
+                return Err(SessionDbError::InvalidCanonicalSequence {
+                    expected: event_seq,
+                    actual: decoded.event().sequence,
+                });
+            }
+            let issue = decoded.issue().cloned();
+            Ok((decoded.into_event(), issue))
+        })
+        .collect()
 }
 
 async fn strict_events_from_database(db: &dyn Database) -> SessionDbResult<Vec<SessionEvent>> {
@@ -2505,6 +2623,22 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "INSERT OR IGNORE INTO session_storage_contract (contract_id, schema_version, writer_epoch, updated_by_build) VALUES (1, 1, 1, NULL)",
         "DELETE FROM session_storage_contract WHERE contract_id = 1",
     );
+    add_session_compatibility_migrations(source);
+}
+
+fn add_session_compatibility_migrations(source: &mut CodeMigrationSource<'static>) {
+    add_sql_migration(
+        source,
+        "028_session_compatibility_state",
+        "CREATE TABLE IF NOT EXISTS session_compatibility_state (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    last_event_seq INTEGER NOT NULL\n)",
+        "DROP TABLE IF EXISTS session_compatibility_state",
+    );
+    add_sql_migration(
+        source,
+        "029_session_compatibility_issues",
+        "CREATE TABLE IF NOT EXISTS session_compatibility_issues (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_kind TEXT NOT NULL,\n    event_schema_version INTEGER NOT NULL,\n    compatibility TEXT NOT NULL,\n    remediation TEXT NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS session_compatibility_issues",
+    );
 }
 
 fn add_sql_migration(
@@ -2642,6 +2776,57 @@ async fn validate_context_occupancy_precondition(
     Ok(())
 }
 
+async fn validate_session_compatibility_precondition(
+    db: &dyn Database,
+    canonical_tail: Option<u64>,
+) -> SessionDbResult<()> {
+    let row = db
+        .select("session_compatibility_state")
+        .columns(&["schema_version", "last_event_seq"])
+        .where_eq("projection_id", DatabaseValue::Int32(1))
+        .execute_first(db)
+        .await?;
+    let Some(row) = row.as_ref() else {
+        if canonical_tail.is_none() {
+            return Ok(());
+        }
+        return Err(SessionDbError::ProjectionStale {
+            projection: "session_compatibility",
+            checkpoint: None,
+            expected: canonical_tail.unwrap_or_default(),
+        });
+    };
+    let actual = required_non_negative_u64(row, "schema_version")?;
+    let expected = u64::from(SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION);
+    if actual != expected {
+        return Err(SessionDbError::ProjectionIncompatible {
+            projection: "session_compatibility",
+            actual,
+            expected,
+        });
+    }
+    let checkpoint = required_non_negative_u64(row, "last_event_seq")?;
+    if Some(checkpoint) != canonical_tail {
+        return Err(SessionDbError::ProjectionStale {
+            projection: "session_compatibility",
+            checkpoint: Some(checkpoint),
+            expected: canonical_tail.unwrap_or_default(),
+        });
+    }
+    let issue_count = db
+        .select("session_compatibility_issues")
+        .columns(&["event_seq"])
+        .execute(db)
+        .await?
+        .len();
+    if issue_count > 0 {
+        return Err(SessionDbError::CompatibilityDegraded {
+            issue_count: u64::try_from(issue_count).unwrap_or(u64::MAX),
+        });
+    }
+    Ok(())
+}
+
 async fn validate_append_preconditions_without_writer(
     db: &dyn Database,
     event: &SessionEvent,
@@ -2663,6 +2848,7 @@ async fn validate_append_preconditions_without_writer(
     }
     validate_model_context_precondition(db, event).await?;
     validate_context_occupancy_precondition(db, event).await?;
+    validate_session_compatibility_precondition(db, canonical_tail).await?;
     if let Some(expected) = canonical_tail {
         let snapshot = projection_checkpoint_snapshot(db).await?;
         validate_projection_checkpoint_snapshot(&snapshot, expected)?;
@@ -2927,6 +3113,50 @@ const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 6] = [
     MaterializedProjection::ArtifactReferences,
     MaterializedProjection::RuntimeWork,
 ];
+
+async fn project_session_compatibility(
+    db: &dyn Database,
+    event: &SessionEvent,
+    issue: Option<&SessionEventCompatibilityIssue>,
+) -> SessionDbResult<()> {
+    if let Some(issue) = issue {
+        db.upsert("session_compatibility_issues")
+            .unique(&["event_seq"])
+            .value("event_seq", seq_to_value(issue.sequence))
+            .value("event_kind", issue.event_kind.clone())
+            .value(
+                "event_schema_version",
+                DatabaseValue::Int32(i32::from(issue.schema_version)),
+            )
+            .value(
+                "compatibility",
+                match issue.compatibility {
+                    bcode_session_models::SessionEventCompatibilityKind::UnknownEventKind => {
+                        "unknown_event_kind"
+                    }
+                    bcode_session_models::SessionEventCompatibilityKind::FutureSchema => {
+                        "future_schema"
+                    }
+                },
+            )
+            .value("remediation", issue.remediation.clone())
+            .execute(db)
+            .await?;
+    }
+    db.upsert("session_compatibility_state")
+        .unique(&["projection_id"])
+        .value("projection_id", DatabaseValue::Int32(1))
+        .value(
+            "schema_version",
+            DatabaseValue::Int32(
+                i32::try_from(SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION).unwrap_or(i32::MAX),
+            ),
+        )
+        .value("last_event_seq", seq_to_value(event.sequence))
+        .execute(db)
+        .await?;
+    Ok(())
+}
 
 async fn project_materialized_event(
     db: &dyn Database,
@@ -3748,10 +3978,11 @@ fn required_i64(row: &switchy::database::Row, column: &str) -> SessionDbResult<i
 fn compatible_event_from_row(
     row: &switchy::database::Row,
     session_id: SessionId,
-) -> SessionDbResult<SessionEvent> {
+) -> SessionDbResult<CompatibleSessionEvent> {
     let event_seq = required_non_negative_u64(row, "event_seq")?;
     let payload = required_string(row, "payload")?;
-    let event = decode_session_event_compatible(&payload)?;
+    let decoded = decode_session_event_compatible(&payload)?;
+    let event = decoded.event();
     if event.sequence != event_seq {
         return Err(SessionDbError::InvalidCanonicalSequence {
             expected: event_seq,
@@ -3763,7 +3994,7 @@ fn compatible_event_from_row(
             column: "events.session_id".to_owned(),
         });
     }
-    Ok(event)
+    Ok(decoded)
 }
 
 fn required_non_negative_u64(row: &switchy::database::Row, column: &str) -> SessionDbResult<u64> {
@@ -4001,6 +4232,8 @@ mod tests {
                 vec![
                     DatabaseValue::String("026_session_storage_contract_table".to_owned()),
                     DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
+                    DatabaseValue::String("028_session_compatibility_state".to_owned()),
+                    DatabaseValue::String("029_session_compatibility_issues".to_owned()),
                 ],
             )
             .execute(db.database())
@@ -4233,7 +4466,9 @@ mod tests {
             "schema_version": 1, "sequence": 3, "timestamp_ms": 1, "session_id": id,
             "kind": {"context_compacted": {"summary": "legacy", "compacted_through_sequence": 2}}
         });
-        let decoded = decode_session_event_degraded(&payload.to_string()).expect("legacy local");
+        let decoded = decode_session_event_compatible(&payload.to_string())
+            .expect("legacy local")
+            .into_event();
         assert!(matches!(
             decoded.kind,
             SessionEventKind::ContextCompacted { .. }
@@ -4250,7 +4485,9 @@ mod tests {
                 "compacted_through_sequence": 2
             }}
         });
-        let decoded = decode_session_event_degraded(&payload.to_string()).expect("legacy provider");
+        let decoded = decode_session_event_compatible(&payload.to_string())
+            .expect("legacy provider")
+            .into_event();
         let SessionEventKind::ProviderContextCompacted { snapshot, .. } = decoded.kind else {
             panic!("provider marker")
         };
@@ -4302,6 +4539,18 @@ mod tests {
         assert!(!is_database_lock_error_message("permission denied"));
     }
 
+    fn assert_opaque_history_issue(page: &SessionHistoryPage) {
+        assert_eq!(page.compatibility_issues.len(), 1);
+        let issue = &page.compatibility_issues[0];
+        assert_eq!(issue.sequence, 1);
+        assert_eq!(issue.event_kind, "future_event_kind");
+        assert_eq!(
+            issue.compatibility,
+            bcode_session_models::SessionEventCompatibilityKind::UnknownEventKind
+        );
+        assert!(!issue.remediation.is_empty());
+    }
+
     fn history_sequences(events: &[SessionEvent]) -> Vec<u64> {
         events.iter().map(|event| event.sequence).collect()
     }
@@ -4335,6 +4584,197 @@ mod tests {
             .execute(db.database())
             .await
             .expect("insert raw history event");
+    }
+
+    #[tokio::test]
+    async fn structural_identity_and_sequence_gap_fixtures_fail_closed() {
+        let identity_root = tempfile::tempdir().expect("identity temp dir");
+        let identity_session = SessionId::new();
+        let identity_db = SessionDb::open_turso_in_root(identity_session, identity_root.path())
+            .await
+            .expect("open identity DB");
+        let identity_payload =
+            include_str!("../fixtures/migrations/mismatched-session-id-v38.json");
+        identity_db
+            .database()
+            .insert("events")
+            .value("event_seq", seq_to_value(0))
+            .value("event_type", "assistant_message")
+            .value("schema_version", DatabaseValue::Int32(38))
+            .value("created_at_ms", seq_to_value(0))
+            .value("payload", identity_payload)
+            .execute(identity_db.database())
+            .await
+            .expect("insert identity fixture");
+        assert!(matches!(
+            identity_db.all_events().await,
+            Err(SessionDbError::InvalidRow { column }) if column == "events.session_id"
+        ));
+
+        let gap_root = tempfile::tempdir().expect("gap temp dir");
+        let fixture_session: SessionId = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("fixture session id");
+        let gap_db = SessionDb::open_turso_in_root(fixture_session, gap_root.path())
+            .await
+            .expect("open gap DB");
+        for payload in include_str!("../fixtures/migrations/sequence-gap-v38.jsonl").lines() {
+            let value: serde_json::Value = serde_json::from_str(payload).expect("gap fixture JSON");
+            let sequence = value["sequence"].as_u64().expect("fixture sequence");
+            let event_type = value["kind"]
+                .as_object()
+                .and_then(|kind| kind.keys().next())
+                .expect("fixture event kind")
+                .clone();
+            gap_db
+                .database()
+                .insert("events")
+                .value("event_seq", seq_to_value(sequence))
+                .value("event_type", event_type)
+                .value("schema_version", DatabaseValue::Int32(38))
+                .value("created_at_ms", seq_to_value(sequence))
+                .value("payload", payload)
+                .execute(gap_db.database())
+                .await
+                .expect("insert gap fixture");
+        }
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(gap_root.path(), fixture_session)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            gap_root.path(),
+            fixture_session,
+        )
+        .expect("write guard");
+        assert!(matches!(
+            gap_db
+                .reindex_model_context(&maintenance, &write)
+                .await
+                .expect_err("sequence gap must fail closed"),
+            SessionDbError::InvalidCanonicalSequence {
+                expected: 1,
+                actual: 2
+            }
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn epoch_three_opaque_history_migrates_to_bounded_read_only_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("opaque migration".to_owned()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append session created");
+        insert_raw_history_event(
+            &db,
+            session_id,
+            1,
+            "future_event_kind",
+            serde_json::json!({ "future_event_kind": { "value": true } }),
+        )
+        .await;
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(PREVIOUS_SESSION_STORAGE_WRITER_EPOCH)),
+            )
+            .where_eq(
+                "contract_id",
+                DatabaseValue::Int32(SESSION_STORAGE_CONTRACT_ID),
+            )
+            .execute(db.database())
+            .await
+            .expect("mark epoch three");
+        db.database()
+            .delete(SESSION_MIGRATIONS_TABLE)
+            .where_in(
+                "id",
+                vec![
+                    DatabaseValue::String("028_session_compatibility_state".to_owned()),
+                    DatabaseValue::String("029_session_compatibility_issues".to_owned()),
+                ],
+            )
+            .execute(db.database())
+            .await
+            .expect("remove epoch four migrations");
+        db.database()
+            .exec_raw("DROP TABLE session_compatibility_issues")
+            .await
+            .expect("drop compatibility issues");
+        db.database()
+            .exec_raw("DROP TABLE session_compatibility_state")
+            .await
+            .expect("drop compatibility state");
+        drop(db);
+
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
+        let migrated =
+            SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                .await
+                .expect("epoch three should migrate");
+
+        assert_eq!(
+            migrated.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        assert_eq!(
+            migrated
+                .session_compatibility_status()
+                .await
+                .expect("compatibility status"),
+            SessionCompatibilityStatus::Degraded {
+                checkpoint: 1,
+                issue_count: 1,
+            }
+        );
+        let page = migrated
+            .history_page(SessionHistoryQuery {
+                cursor: None,
+                direction: SessionHistoryDirection::Forward,
+                limit: 10,
+            })
+            .await
+            .expect("bounded history");
+        assert_eq!(history_sequences(&page.events), vec![0, 1]);
+        assert_eq!(page.compatibility_issues.len(), 1);
+        assert!(matches!(
+            migrated.validate_write_readiness().await,
+            Err(SessionDbError::CompatibilityDegraded { issue_count: 1 })
+        ));
+        assert!(matches!(
+            migrated
+                .append_event(&event(
+                    session_id,
+                    2,
+                    SessionEventKind::AssistantMessage {
+                        text: "must not append".to_owned(),
+                    },
+                ))
+                .await,
+            Err(SessionDbError::CompatibilityDegraded { issue_count: 1 })
+        ));
+        assert_eq!(migrated.last_event_sequence().await.expect("tail"), Some(1));
     }
 
     #[tokio::test]
@@ -4433,6 +4873,7 @@ mod tests {
             .await
             .expect("future page should remain visible");
         assert_eq!(history_sequences(&page.events), vec![0, 1, 3]);
+        assert_opaque_history_issue(&page);
 
         let raw_rows = db
             .database()
@@ -5339,6 +5780,183 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn bounded_history_has_exact_outcomes_for_every_migration_fixture() {
+        enum ExpectedHistory<'a> {
+            Sequences(&'a [u64]),
+            PersistedEventError,
+            SessionIdentityError,
+        }
+
+        let cases = [
+            (
+                "future-schema-v39.json",
+                include_str!("../fixtures/migrations/future-schema-v39.json"),
+                ExpectedHistory::Sequences(&[0]),
+            ),
+            (
+                "interactive-tool-request-created-v32.json",
+                include_str!("../fixtures/migrations/interactive-tool-request-created-v32.json"),
+                ExpectedHistory::Sequences(&[1158]),
+            ),
+            (
+                "interactive-tool-request-resolved-v32.json",
+                include_str!("../fixtures/migrations/interactive-tool-request-resolved-v32.json"),
+                ExpectedHistory::Sequences(&[1159]),
+            ),
+            (
+                "interactive-tool-request-unresolved-v32.json",
+                include_str!("../fixtures/migrations/interactive-tool-request-unresolved-v32.json"),
+                ExpectedHistory::Sequences(&[1]),
+            ),
+            (
+                "malformed-json-v38.json",
+                include_str!("../fixtures/migrations/malformed-json-v38.json"),
+                ExpectedHistory::PersistedEventError,
+            ),
+            (
+                "mismatched-session-id-v38.json",
+                include_str!("../fixtures/migrations/mismatched-session-id-v38.json"),
+                ExpectedHistory::SessionIdentityError,
+            ),
+            (
+                "plugin-automation-turn-finished-v29.json",
+                include_str!("../fixtures/migrations/plugin-automation-turn-finished-v29.json"),
+                ExpectedHistory::Sequences(&[42]),
+            ),
+            (
+                "plugin-automation-turn-started-v29.json",
+                include_str!("../fixtures/migrations/plugin-automation-turn-started-v29.json"),
+                ExpectedHistory::Sequences(&[41]),
+            ),
+            (
+                "plugin-status-note-v29.json",
+                include_str!("../fixtures/migrations/plugin-status-note-v29.json"),
+                ExpectedHistory::Sequences(&[43]),
+            ),
+            (
+                "tool-presentation-diff-v25.json",
+                include_str!("../fixtures/migrations/tool-presentation-diff-v25.json"),
+                ExpectedHistory::Sequences(&[14260]),
+            ),
+            (
+                "unknown-future-event-kind-v38.json",
+                include_str!("../fixtures/migrations/unknown-future-event-kind-v38.json"),
+                ExpectedHistory::Sequences(&[0]),
+            ),
+            (
+                "unknown-old-event-kind-v32.json",
+                include_str!("../fixtures/migrations/unknown-old-event-kind-v32.json"),
+                ExpectedHistory::Sequences(&[0]),
+            ),
+            (
+                "mixed-interactive-history-v32-v35.jsonl",
+                include_str!("../fixtures/migrations/mixed-interactive-history-v32-v35.jsonl"),
+                ExpectedHistory::Sequences(&[0, 1, 2]),
+            ),
+            (
+                "sequence-gap-v38.jsonl",
+                include_str!("../fixtures/migrations/sequence-gap-v38.jsonl"),
+                ExpectedHistory::Sequences(&[0, 2]),
+            ),
+        ];
+        let fixture_session: SessionId = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("fixture session ID");
+
+        for (fixture_name, fixture, expected) in cases {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let db = SessionDb::open_turso_in_root(fixture_session, temp_dir.path())
+                .await
+                .expect("fixture DB should initialize");
+            let expected_sequences = match &expected {
+                ExpectedHistory::Sequences(sequences) => *sequences,
+                ExpectedHistory::PersistedEventError | ExpectedHistory::SessionIdentityError => {
+                    &[0]
+                }
+            };
+            for (payload, sequence) in fixture.lines().zip(expected_sequences.iter().copied()) {
+                let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
+                let event_type = parsed
+                    .as_ref()
+                    .and_then(|value| value["kind"].as_object())
+                    .and_then(|kind| kind.keys().next())
+                    .map_or_else(|| "malformed_fixture".to_owned(), Clone::clone);
+                let schema_version = parsed
+                    .as_ref()
+                    .and_then(|value| value["schema_version"].as_i64())
+                    .and_then(|version| i32::try_from(version).ok())
+                    .unwrap_or_else(|| i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION));
+                db.database()
+                    .insert("events")
+                    .value("event_seq", seq_to_value(sequence))
+                    .value("event_type", event_type)
+                    .value("schema_version", DatabaseValue::Int32(schema_version))
+                    .value("created_at_ms", seq_to_value(sequence))
+                    .value("payload", payload)
+                    .execute(db.database())
+                    .await
+                    .unwrap_or_else(|error| panic!("insert {fixture_name}: {error}"));
+            }
+
+            match expected {
+                ExpectedHistory::Sequences(expected_sequences) => {
+                    let mut actual = Vec::new();
+                    let mut cursor = None;
+                    loop {
+                        let page = db
+                            .history_page(SessionHistoryQuery {
+                                cursor,
+                                direction: SessionHistoryDirection::Forward,
+                                limit: 1,
+                            })
+                            .await
+                            .unwrap_or_else(|error| panic!("history {fixture_name}: {error}"));
+                        actual.extend(page.events.iter().map(|event| event.sequence));
+                        if !page.has_more {
+                            assert!(page.next_cursor.is_none());
+                            break;
+                        }
+                        cursor = page.next_cursor;
+                        assert!(cursor.is_some(), "{fixture_name} must provide continuation");
+                    }
+                    assert_eq!(actual, expected_sequences, "fixture {fixture_name}");
+                }
+                ExpectedHistory::PersistedEventError => {
+                    let result = db
+                        .history_page(SessionHistoryQuery {
+                            cursor: None,
+                            direction: SessionHistoryDirection::Forward,
+                            limit: 1,
+                        })
+                        .await;
+                    assert!(
+                        matches!(result, Err(SessionDbError::PersistedEvent(_))),
+                        "fixture {fixture_name} returned {result:?}"
+                    );
+                }
+                ExpectedHistory::SessionIdentityError => {
+                    let result = db
+                        .history_page(SessionHistoryQuery {
+                            cursor: None,
+                            direction: SessionHistoryDirection::Forward,
+                            limit: 1,
+                        })
+                        .await;
+                    assert!(
+                        matches!(
+                            result,
+                            Err(SessionDbError::InvalidRow { ref column })
+                                if column == "events.session_id"
+                        ),
+                        "fixture {fixture_name} returned {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_reindex_builds_missing_projection_from_canonical_history() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -5465,6 +6083,12 @@ mod tests {
             .await
             .expect("clear model context state");
 
+        let canonical_tail = db
+            .last_event_sequence()
+            .await
+            .expect("canonical tail query")
+            .expect("canonical tail");
+        assert_eq!(canonical_tail, 2);
         assert_eq!(
             reindex_model_context_for_test(&db, temp_dir.path(), session_id).await,
             3
@@ -5473,7 +6097,9 @@ mod tests {
             db.model_context_projection_status()
                 .await
                 .expect("projection status"),
-            ModelContextProjectionStatus::Fresh { checkpoint: 2 }
+            ModelContextProjectionStatus::Fresh {
+                checkpoint: canonical_tail,
+            }
         );
         assert!(
             db.model_context_events()
@@ -6533,6 +7159,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn failed_explicit_migration_preserves_projection_and_writer_contract() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -6580,6 +7207,8 @@ mod tests {
         .await
         .expect("insert gapped canonical tail");
         drop(db);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let storage_before = session_storage_files(temp_dir.path(), session_id);
 
         let maintenance =
             crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
@@ -6599,6 +7228,14 @@ mod tests {
                 actual: 2
             }
         ));
+        drop(write);
+        drop(maintenance);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            session_storage_files(temp_dir.path(), session_id),
+            storage_before,
+            "failed migration must preserve every session storage file byte-for-byte"
+        );
 
         let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
             .await
@@ -6618,6 +7255,38 @@ mod tests {
             .expect("projection state");
         assert_eq!(required_i64(&state, "schema_version").expect("schema"), 1);
         assert_eq!(required_i64(&state, "last_event_seq").expect("tail"), 0);
+        assert_eq!(
+            reopened
+                .session_compatibility_status()
+                .await
+                .expect("compatibility status"),
+            SessionCompatibilityStatus::Stale {
+                checkpoint: 0,
+                expected: 2,
+            }
+        );
+        assert_eq!(
+            reopened
+                .all_events_strict()
+                .await
+                .expect("canonical history")
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!(
+            reopened
+                .database()
+                .select(SESSION_MIGRATIONS_TABLE)
+                .columns(&["id"])
+                .where_eq("id", "029_session_compatibility_issues")
+                .execute_first(reopened.database())
+                .await
+                .expect("migration ledger query")
+                .is_some(),
+            "failed migration must preserve the prior migration ledger"
+        );
     }
 
     #[tokio::test]

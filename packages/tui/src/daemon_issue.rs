@@ -19,6 +19,10 @@ pub enum TuiDaemonIssue {
     InvalidDaemonResponse(String),
     /// Another daemon owns the session, so migration or access must wait.
     SessionActiveElsewhere { message: String },
+    /// The session contains opaque history and is restricted to read-only inspection.
+    SessionDegradedReadOnly { message: String },
+    /// The session event format is newer than this build understands.
+    SessionFormatIncompatible { message: String },
     /// The session storage writer generation is unsupported by this build.
     SessionWriterIncompatible { message: String },
     /// The requested session is unavailable.
@@ -78,6 +82,18 @@ impl TuiDaemonIssue {
                 status: format!("{label}: session is active in another daemon"),
                 detail: Some(format!(
                     "Another daemon currently owns this session. Close clients using that daemon or stop it, then retry. Bcode will migrate known legacy storage automatically once exclusive ownership is available.\n\nDaemon error: {message}"
+                )),
+            },
+            Self::SessionDegradedReadOnly { message } => TuiDaemonIssueMessage {
+                status: format!("{label}: session opened read-only"),
+                detail: Some(format!(
+                    "This session contains opaque historical events. Bounded history remains available, but attach and writes are disabled. Run `bcode session diagnose <session-id>` and reopen with a compatible Bcode build.\n\nDaemon error: {message}"
+                )),
+            },
+            Self::SessionFormatIncompatible { message } => TuiDaemonIssueMessage {
+                status: format!("{label}: session requires a newer Bcode build"),
+                detail: Some(format!(
+                    "This session contains a persisted event schema or event kind that this Bcode build cannot interpret. Upgrade Bcode, restart the daemon, and reopen the session. Do not run repair or delete canonical events for a format incompatibility.\n\nDaemon error: {message}"
                 )),
             },
             Self::SessionWriterIncompatible { message } => TuiDaemonIssueMessage {
@@ -157,6 +173,12 @@ fn classify_server_error(code: &str, message: &str) -> TuiDaemonIssue {
                 message: message.to_owned(),
             }
         }
+        "session_degraded_read_only" => TuiDaemonIssue::SessionDegradedReadOnly {
+            message: message.to_owned(),
+        },
+        "session_format_incompatible" => TuiDaemonIssue::SessionFormatIncompatible {
+            message: message.to_owned(),
+        },
         "session_writer_incompatible" => TuiDaemonIssue::SessionWriterIncompatible {
             message: message.to_owned(),
         },
@@ -313,6 +335,47 @@ mod tests {
         let detail = issue.message("send failed").detail.expect("detail");
         assert!(detail.contains("migrate known legacy storage automatically"));
         assert!(!detail.contains("Refresh the session catalog"));
+    }
+
+    #[test]
+    fn degraded_read_only_server_error_is_classified_with_diagnosis_guidance() {
+        let error = bcode_client::ClientError::Server {
+            code: "session_degraded_read_only".to_owned(),
+            message: "one opaque event".to_owned(),
+        };
+        let issue = classify_client_error(&error);
+        assert_eq!(
+            issue,
+            TuiDaemonIssue::SessionDegradedReadOnly {
+                message: "one opaque event".to_owned(),
+            }
+        );
+        let message = issue.message("attach failed");
+        assert!(message.status.contains("read-only"));
+        let detail = message.detail.expect("detail");
+        assert!(detail.contains("Bounded history remains available"));
+        assert!(detail.contains("bcode session diagnose"));
+    }
+
+    #[test]
+    fn session_format_incompatibility_recommends_upgrade_not_repair() {
+        let error = bcode_client::ClientError::Server {
+            code: "session_format_incompatible".to_owned(),
+            message: "event schema 39 is unsupported".to_owned(),
+        };
+        let issue = classify_client_error(&error);
+        assert_eq!(
+            issue,
+            TuiDaemonIssue::SessionFormatIncompatible {
+                message: "event schema 39 is unsupported".to_owned(),
+            }
+        );
+        let message = issue.message("attach failed");
+        assert!(message.status.contains("newer Bcode build"));
+        let detail = message.detail.expect("detail");
+        assert!(detail.contains("Upgrade Bcode"));
+        assert!(detail.contains("restart the daemon"));
+        assert!(detail.contains("Do not run repair"));
     }
 
     #[test]

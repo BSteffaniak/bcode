@@ -1,0 +1,2 @@
+{"schema_version":38,"sequence":0,"timestamp_ms":1700000000000,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"session_created":{"name":"gap fixture","working_directory":"/tmp"}}}
+{"schema_version":38,"sequence":2,"timestamp_ms":1700000000002,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"assistant_message":{"text":"sequence one is missing"}}}

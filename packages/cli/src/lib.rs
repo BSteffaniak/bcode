@@ -22,8 +22,9 @@ use bcode_session_import::{
     SESSION_IMPORT_INTERFACE_ID,
 };
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
-    SessionHistoryQuery, SessionId, SessionLiveEvent, SessionLiveEventKind,
+    SessionEvent, SessionEventCompatibilityIssue, SessionEventCompatibilityKind, SessionEventKind,
+    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryQuery, SessionId,
+    SessionLiveEvent, SessionLiveEventKind,
 };
 use bcode_worktree_models::WorktreeCreateRequest;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -6461,8 +6462,18 @@ async fn delete_session(session_id: SessionId) -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct PagedSessionHistory {
+    events: Vec<SessionEvent>,
+    compatibility_issues: Vec<SessionEventCompatibilityIssue>,
+}
+
 async fn session_history(session_id: SessionId) -> Result<(), CliError> {
-    for event in paged_session_history(session_id).await? {
+    let history = paged_session_history(session_id).await?;
+    for issue in &history.compatibility_issues {
+        eprintln!("{}", format_session_compatibility_issue(issue));
+    }
+    for event in history.events {
         print_session_event(&event);
     }
     Ok(())
@@ -6494,20 +6505,23 @@ async fn session_export_events_from_root(
 
 async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
     let history = paged_session_history(session_id).await?;
-    let first_trace_time = history.iter().find_map(|event| match &event.kind {
+    for issue in &history.compatibility_issues {
+        eprintln!("{}", format_session_compatibility_issue(issue));
+    }
+    let first_trace_time = history.events.iter().find_map(|event| match &event.kind {
         SessionEventKind::TraceEvent { trace } => Some(trace.timestamp_ms),
         _ => None,
     });
-    for event in history {
+    for event in history.events {
         print_timeline_event(&event, first_trace_time);
     }
     Ok(())
 }
 
-async fn paged_session_history(session_id: SessionId) -> Result<Vec<SessionEvent>, CliError> {
+async fn paged_session_history(session_id: SessionId) -> Result<PagedSessionHistory, CliError> {
     let client = BcodeClient::default_endpoint();
     let mut cursor = Some(SessionHistoryCursor { sequence: 0 });
-    let mut history = Vec::new();
+    let mut history = PagedSessionHistory::default();
     while let Some(page_cursor) = cursor {
         let page = client
             .session_history_page(
@@ -6519,12 +6533,21 @@ async fn paged_session_history(session_id: SessionId) -> Result<Vec<SessionEvent
                 },
             )
             .await?;
-        history.extend(page.events);
+        history.events.extend(page.events);
+        history
+            .compatibility_issues
+            .extend(page.compatibility_issues);
         cursor = page.next_cursor;
         if !page.has_more {
             break;
         }
     }
+    history
+        .compatibility_issues
+        .sort_by_key(|issue| issue.sequence);
+    history
+        .compatibility_issues
+        .dedup_by_key(|issue| issue.sequence);
     Ok(history)
 }
 
@@ -8037,6 +8060,17 @@ fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) ->
     }
 }
 
+fn format_session_compatibility_issue(issue: &SessionEventCompatibilityIssue) -> String {
+    let classification = match issue.compatibility {
+        SessionEventCompatibilityKind::UnknownEventKind => "unsupported event kind",
+        SessionEventCompatibilityKind::FutureSchema => "future event schema",
+    };
+    format!(
+        "warning: session opened with opaque history at event #{}: {classification} {} (schema {}); {}",
+        issue.sequence, issue.event_kind, issue.schema_version, issue.remediation
+    )
+}
+
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -8060,6 +8094,33 @@ fn print_model_usage_event(
 #[cfg(test)]
 mod web_command_tests {
     use super::*;
+
+    #[test]
+    fn compatibility_issue_format_is_actionable_and_specific() {
+        for (compatibility, expected_classification) in [
+            (
+                SessionEventCompatibilityKind::UnknownEventKind,
+                "unsupported event kind",
+            ),
+            (
+                SessionEventCompatibilityKind::FutureSchema,
+                "future event schema",
+            ),
+        ] {
+            let rendered = format_session_compatibility_issue(&SessionEventCompatibilityIssue {
+                sequence: 1158,
+                event_kind: "future_event_kind".to_owned(),
+                schema_version: 39,
+                compatibility,
+                remediation: "upgrade Bcode".to_owned(),
+            });
+            assert!(rendered.contains("event #1158"));
+            assert!(rendered.contains(expected_classification));
+            assert!(rendered.contains("future_event_kind"));
+            assert!(rendered.contains("schema 39"));
+            assert!(rendered.contains("upgrade Bcode"));
+        }
+    }
 
     #[test]
     fn retire_incompatible_server_command_parses() {
@@ -8098,6 +8159,7 @@ mod web_command_tests {
             build_fingerprint: "build".to_string(),
             executable_digest: Some("digest".to_string()),
             storage_writer_epoch: Some(2),
+            session_event_schema_version: Some(38),
             pid: Some(1),
             instance_id: "instance".to_string(),
             started_at_unix_ms: 0,

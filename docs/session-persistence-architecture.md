@@ -101,7 +101,8 @@ storage contract without mutation, then follows one of these paths:
   without mutation.
 
 Automatic known-legacy migration acquires exclusive maintenance ownership and the maintenance write
-lock before calling `migrate_turso_in_root`. Migration strictly validates contiguous canonical
+lock, creates and byte-verifies a retained copy of the complete session directory, and only then
+calls `migrate_turso_in_root`. Migration strictly validates contiguous canonical
 sequences and session identity, preserves canonical events and drafts, rebuilds all required derived
 projections through the same projector functions used by normal append, verifies checkpoints at the
 canonical tail, and updates the writer contract only when validation succeeds. Any live session
@@ -111,7 +112,10 @@ owner blocks migration. Unknown, future, dirty, ambiguous, or corrupt storage st
 
 `session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
 advertise their epoch in session leases and validate the durable row before mutation. The current
-contract-aware baseline is epoch `2`.
+contract-aware baseline is epoch `4`. Epoch `3` is recognized legacy storage and migrates under
+exclusive maintenance ownership by rebuilding the required session-compatibility projection. This
+projection records its canonical-tail checkpoint and any opaque event sequence/kind/schema issues;
+a current projection with issues is inspectable but read-only.
 
 A known pre-contract migration prefix with no contract table/row is legacy epoch `1`. A missing
 contract after the migration ledger says contract initialization completed is inconsistent and
