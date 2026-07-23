@@ -1324,6 +1324,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_shell_plugin",
  "bcode_tool",
+ "bcode_workflow",
  "futures 0.3.32",
  "jsonschema",
  "partial-json-fixer",
@@ -2557,6 +2558,18 @@ dependencies = [
  "bcode_tui_components",
  "bmux_tui",
  "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_workflow"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "jsonschema",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

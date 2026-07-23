@@ -25,11 +25,13 @@ use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
 pub use bcode_session_models::SessionId;
 /// Optional OpenTelemetry and in-process metrics adapters.
 pub mod telemetry;
+/// Typed workflow composition and Bcode agent-step adapters.
+pub mod workflow;
 use futures::Stream;
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -6062,6 +6064,8 @@ pub struct Agent {
     middleware: ModelMiddlewareStack,
     response_cache: Option<Arc<dyn ModelResponseCache>>,
     policy_config: AgentConfig,
+    tool_restriction: Option<BTreeSet<String>>,
+    read_only_tools: bool,
     permission_policy: Arc<dyn PermissionPolicy>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
@@ -6118,6 +6122,8 @@ impl fmt::Debug for Agent {
             .field("middleware", &self.middleware)
             .field("response_cache", &self.response_cache.is_some())
             .field("policy_config", &self.policy_config)
+            .field("tool_restriction", &self.tool_restriction)
+            .field("read_only_tools", &self.read_only_tools)
             .field("permission_policy", &"<policy>");
         #[cfg(feature = "embedded-plugins")]
         debug
@@ -6367,7 +6373,7 @@ impl Agent {
         .await
     }
 
-    async fn generate_object_with_provider_and_request_options<T, P>(
+    pub(crate) async fn generate_object_with_provider_and_request_options<T, P>(
         &self,
         provider: &mut P,
         prompt: impl Into<String>,
@@ -7000,12 +7006,13 @@ impl Agent {
             .as_deref()
             .unwrap_or(&policy_authorization);
         let observer = SdkToolRoundObserver::new(self);
+        let effective_tool_catalog = self.effective_tool_catalog();
         let result = self
             .runtime
             .run_provider_tool_loop(
                 provider,
                 request,
-                &self.tool_catalog,
+                &effective_tool_catalog,
                 authorization,
                 invoker,
                 &self.permission_context(),
@@ -7030,12 +7037,35 @@ impl Agent {
         }
     }
 
+    fn effective_tool_catalog(&self) -> UnifiedToolCatalog {
+        let enabled = self
+            .enabled_tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<BTreeSet<_>>();
+        let mut catalog = UnifiedToolCatalog::new();
+        for tool in self.tool_catalog.tools() {
+            if enabled.contains(&tool.definition.name) {
+                catalog.insert(tool);
+            }
+        }
+        catalog
+    }
+
     fn enabled_tool_definitions(&self) -> Vec<ToolDefinition> {
         let active_tools = active_tools_for(&self.policy_config);
         self.tool_catalog
             .definitions()
             .into_iter()
             .filter(|definition| active_tools.is_empty() || active_tools.contains(&definition.name))
+            .filter(|definition| {
+                self.tool_restriction
+                    .as_ref()
+                    .is_none_or(|tools| tools.contains(&definition.name))
+            })
+            .filter(|definition| {
+                !self.read_only_tools || definition.side_effect == ToolSideEffect::ReadOnly
+            })
             .collect()
     }
 
@@ -7137,6 +7167,12 @@ impl Agent {
         self.session_with_persistence(Arc::new(store))
     }
 
+    /// Return the active agent/profile ID used by shared policy evaluation.
+    #[must_use]
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
     /// Return the configured agent name.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
@@ -7232,6 +7268,8 @@ pub struct AgentBuilder {
     middleware: ModelMiddlewareStack,
     response_cache: Option<Arc<dyn ModelResponseCache>>,
     policy_config: AgentConfig,
+    tool_restriction: Option<BTreeSet<String>>,
+    read_only_tools: bool,
     permission_ask_callback: Option<PermissionAskCallback>,
     custom_permission_policy: Option<Arc<dyn PermissionPolicy>>,
     #[cfg(feature = "embedded-plugins")]
@@ -7291,6 +7329,8 @@ impl fmt::Debug for AgentBuilder {
             .field("middleware", &self.middleware)
             .field("response_cache", &self.response_cache.is_some())
             .field("policy_config", &self.policy_config)
+            .field("tool_restriction", &self.tool_restriction)
+            .field("read_only_tools", &self.read_only_tools)
             .field(
                 "permission_ask_callback",
                 &self.permission_ask_callback.is_some(),
@@ -7354,6 +7394,8 @@ impl Default for AgentBuilder {
                 &bcode_agent_policy::default_config(),
                 bcode_agent_policy::BUILD_AGENT,
             ),
+            tool_restriction: None,
+            read_only_tools: false,
             permission_ask_callback: None,
             custom_permission_policy: None,
             #[cfg(feature = "embedded-plugins")]
@@ -7895,6 +7937,23 @@ impl AgentBuilder {
         self
     }
 
+    /// Restrict this agent to an exact set of tool names.
+    ///
+    /// This only narrows the tools enabled by the active agent profile; it cannot expose a tool
+    /// disabled by that profile.
+    #[must_use]
+    pub fn restrict_tools(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.tool_restriction = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Restrict this agent to tools declared read-only by their owners.
+    #[must_use]
+    pub const fn read_only_tools(mut self) -> Self {
+        self.read_only_tools = true;
+        self
+    }
+
     /// Configure the active agent/profile ID used by shared policy evaluation.
     #[must_use]
     pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
@@ -8092,6 +8151,8 @@ impl AgentBuilder {
             middleware: self.middleware,
             response_cache: self.response_cache,
             policy_config: self.policy_config,
+            tool_restriction: self.tool_restriction,
+            read_only_tools: self.read_only_tools,
             permission_policy,
             #[cfg(feature = "embedded-plugins")]
             provider: self.provider,

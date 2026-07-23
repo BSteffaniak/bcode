@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail/workflow_incompatible_steps.rs:17:64
+   |
+17 |     let _workflow = WorkflowBuilder::new("bad", implement.then(review));
+   |                                                           ---- ^^^^^^ expected `Step<ChangeSet, _>`, found `Step<Review, Review>`
+   |                                                           |
+   |                                                           arguments to this method are incorrect
+   |
+   = note: expected struct `bcode::workflow::Step<ChangeSet, _>`
+              found struct `bcode::workflow::Step<Review, Review>`
+note: method defined here
+  --> $WORKSPACE/packages/workflow/src/lib.rs
+   |
+   |     pub fn then<N>(self, next: Step<O, N>) -> Step<I, N>
+   |            ^^^^

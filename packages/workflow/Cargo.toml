@@ -1,0 +1,26 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Typed workflow composition and in-process execution for bcode"
+edition     = { workspace = true }
+keywords    = ["ai", "bcode", "workflow"]
+license     = { workspace = true }
+name        = "bcode_workflow"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+jsonschema = { workspace = true }
+schemars   = { workspace = true }
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror  = { workspace = true }
+tokio      = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -1,0 +1,24 @@
+warning: unused import: `WorkflowBuilder`
+ --> tests/ui/fail/workflow_branch_outputs_must_match.rs:1:29
+  |
+1 | use bcode::workflow::{Step, WorkflowBuilder, field};
+  |                             ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+  --> tests/ui/fail/workflow_branch_outputs_must_match.rs:24:9
+   |
+20 |     let _flow = inspect.branch(
+   |                         ------ arguments to this method are incorrect
+...
+24 |         right,
+   |         ^^^^^ expected `Step<Input, Left>`, found `Step<Input, Right>`
+   |
+   = note: expected struct `bcode::workflow::Step<Input, Left>`
+              found struct `bcode::workflow::Step<Input, Right>`
+note: method defined here
+  --> $WORKSPACE/packages/workflow/src/lib.rs
+   |
+   |     pub fn branch<N>(
+   |            ^^^^^^

@@ -1,0 +1,23 @@
+error[E0061]: this method takes 3 arguments but 2 arguments were supplied
+  --> tests/ui/fail/workflow_repeat_requires_bound.rs:11:60
+   |
+11 |       let step = Step::map("work", |state: State| Ok(state)).repeat_while(
+   |  ____________________________________________________________^^^^^^^^^^^^-
+12 | |         "unbounded",
+13 | |         field::<State>("repeat").eq(true),
+14 | |     );
+   | |_____- argument #3 of type `u32` is missing
+   |
+note: method defined here
+  --> $WORKSPACE/packages/workflow/src/lib.rs
+   |
+   |     pub fn repeat_while(
+   |            ^^^^^^^^^^^^
+help: provide the argument
+   |
+11 |     let step = Step::map("work", |state: State| Ok(state)).repeat_while(
+12 |         "unbounded",
+13 |         field::<State>("repeat").eq(true),
+14 ~         /* u32 */,
+15 ~     );
+   |

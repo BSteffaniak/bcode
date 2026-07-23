@@ -20,6 +20,9 @@ done
 echo "running bcode SDK example: scripted_provider"
 cargo run -p bcode --features testing --example scripted_provider
 
+echo "running bcode SDK example: typed_workflow"
+cargo run -p bcode --features testing --example typed_workflow
+
 echo "running bcode SDK example: provider_extension"
 cargo run -p bcode --features openai-compatible-provider --example provider_extension
 

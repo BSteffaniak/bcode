@@ -27,6 +27,10 @@ required-features = ["daemon-client"]
 name              = "scripted_provider"
 required-features = ["testing"]
 
+[[example]]
+name              = "typed_workflow"
+required-features = ["testing"]
+
 [dependencies]
 bcode_agent_permissions                 = { workspace = true }
 bcode_agent_policy                      = { workspace = true }
@@ -45,6 +49,7 @@ bcode_plugin                            = { workspace = true, optional = true }
 bcode_plugin_sdk                        = { workspace = true }
 bcode_session_models                    = { workspace = true }
 bcode_tool                              = { workspace = true }
+bcode_workflow                          = { workspace = true }
 futures                                 = { workspace = true }
 jsonschema                              = { workspace = true }
 partial-json-fixer                      = { workspace = true }
