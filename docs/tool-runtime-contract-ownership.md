@@ -66,7 +66,9 @@ invocation identity, transports transient envelopes live-only, and persists dura
 the append-only placed-contribution session event. Legacy unplaced contributions remain accepted for
 compatibility but default to hidden presentation.
 
-Placement selects semantic composition only; it never selects a renderer. Plugins continue to own
+Placement selects semantic composition only; it never selects a renderer. Request, progress, and
+result contribution slots coexist; result placement does not replace request context or supersede the
+canonical semantic `ToolInvocationResultRecorded` result card. Plugins continue to own
 payload schemas and adapters, `SessionView` owns stable slot identity and ordering, and each renderer
 owns native styling. Renderers may expose raw contribution payloads only on an explicit diagnostic or
 developer surface, never as a normal transcript fallback.

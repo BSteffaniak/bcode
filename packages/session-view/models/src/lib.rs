@@ -335,10 +335,9 @@ impl SessionViewPatch {
 
     /// Build a correctness-preserving patch between two snapshots.
     ///
-    /// The current implementation emits item-level transcript operations only when all
-    /// non-transcript snapshot fields are unchanged. Any broader state change falls back to a full
-    /// snapshot reset so patch consumers never have to infer missing field-clears from absent patch
-    /// data.
+    /// Transcript item operations remain incremental when collection changes are additive or
+    /// replace existing keyed entries. Changes that require deletion, reordering, or replacement of
+    /// non-keyed collections fall back to a complete snapshot reset.
     #[must_use]
     pub fn between_snapshots(base: &SessionViewSnapshot, next: &SessionViewSnapshot) -> Self {
         let mut patch = Self::transcript_between(
@@ -348,10 +347,18 @@ impl SessionViewPatch {
             &base.transcript,
             &next.transcript,
         );
-        if !snapshots_match_outside_transcript(base, next) {
+        if snapshot_requires_reset(base, next) {
             patch.transcript.clear();
             patch.reset = Some(Box::new(next.clone()));
+            return patch;
         }
+        patch.contributions = changed_map_entries(&base.contributions, &next.contributions);
+        patch.active_exchanges =
+            changed_map_entries(&base.active_exchanges, &next.active_exchanges);
+        patch.active_invocations =
+            changed_map_entries(&base.active_invocations, &next.active_invocations);
+        patch.tools = changed_map_entries(&base.tools, &next.tools);
+        patch.plugin_status = changed_map_entries(&base.plugin_status, &next.plugin_status);
         patch
     }
 }
@@ -515,28 +522,43 @@ impl TranscriptViewDocument {
     }
 }
 
-fn snapshots_match_outside_transcript(
-    base: &SessionViewSnapshot,
-    next: &SessionViewSnapshot,
-) -> bool {
-    base.schema_version == next.schema_version
-        && base.session_id == next.session_id
-        && base.title == next.title
-        && base.working_directory == next.working_directory
-        && base.latest_sequence == next.latest_sequence
-        && base.contributions == next.contributions
-        && base.active_exchanges == next.active_exchanges
-        && base.active_invocations == next.active_invocations
-        && base.tools == next.tools
-        && base.permissions == next.permissions
-        && base.runtime_work == next.runtime_work
-        && base.active_skills == next.active_skills
-        && base.plugin_status == next.plugin_status
-        && base.composer == next.composer
-        && base.thinking == next.thinking
-        && base.runtime == next.runtime
-        && base.interactions == next.interactions
-        && base.session_summary == next.session_summary
+fn changed_map_entries<K, V>(base: &BTreeMap<K, V>, next: &BTreeMap<K, V>) -> BTreeMap<K, V>
+where
+    K: Clone + Ord,
+    V: Clone + PartialEq,
+{
+    next.iter()
+        .filter(|(key, value)| base.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn map_has_removals<K, V>(base: &BTreeMap<K, V>, next: &BTreeMap<K, V>) -> bool
+where
+    K: Ord,
+{
+    base.keys().any(|key| !next.contains_key(key))
+}
+
+fn snapshot_requires_reset(base: &SessionViewSnapshot, next: &SessionViewSnapshot) -> bool {
+    base.schema_version != next.schema_version
+        || base.session_id != next.session_id
+        || base.title != next.title
+        || base.working_directory != next.working_directory
+        || base.latest_sequence != next.latest_sequence
+        || map_has_removals(&base.contributions, &next.contributions)
+        || map_has_removals(&base.active_exchanges, &next.active_exchanges)
+        || map_has_removals(&base.active_invocations, &next.active_invocations)
+        || map_has_removals(&base.tools, &next.tools)
+        || base.permissions != next.permissions
+        || base.runtime_work != next.runtime_work
+        || base.active_skills != next.active_skills
+        || map_has_removals(&base.plugin_status, &next.plugin_status)
+        || base.composer != next.composer
+        || base.thinking != next.thinking
+        || base.runtime != next.runtime
+        || base.interactions != next.interactions
+        || base.session_summary != next.session_summary
 }
 
 fn upsert_permissions(target: &mut Vec<PermissionView>, updates: &[PermissionView]) {

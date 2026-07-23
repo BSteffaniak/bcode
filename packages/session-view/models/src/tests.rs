@@ -320,6 +320,63 @@ fn snapshot_patch_applies_transcript_only_incrementally() {
 }
 
 #[test]
+fn snapshot_patch_keeps_slot_replacement_incremental_with_contribution_update() {
+    let contribution = |sequence, label: &str| bcode_session_models::ToolContributionEvent {
+        invocation_id: "call-1".to_owned(),
+        contribution_id: "request".to_owned(),
+        sequence,
+        producer_id: "test.plugin".to_owned(),
+        schema: "test.request".to_owned(),
+        schema_version: 1,
+        operation: bcode_session_models::ToolContributionOperation::Upsert,
+        persistence: bcode_session_models::ToolContributionPersistence::Durable,
+        artifact: None,
+        payload: serde_json::json!({"label": label}),
+    };
+    let mut base = SessionViewSnapshot::empty();
+    base.revision = 1;
+    let unchanged = transcript_item("unchanged", 2, "other");
+    base.transcript = transcript_document(
+        1,
+        [
+            transcript_item("tool-slot:call-1:request", 1, "compact"),
+            unchanged.clone(),
+        ],
+    );
+    base.contributions
+        .insert("call-1:request".to_owned(), contribution(1, "compact"));
+
+    let mut next = base.clone();
+    next.revision = 2;
+    next.transcript = transcript_document(
+        2,
+        [
+            transcript_item("tool-slot:call-1:request", 1, "rich"),
+            unchanged,
+        ],
+    );
+    next.contributions
+        .insert("call-1:request".to_owned(), contribution(2, "rich"));
+
+    let patch = SessionViewPatch::between_snapshots(&base, &next);
+    assert!(patch.reset.is_none());
+    assert!(matches!(
+        patch.transcript.as_slice(),
+        [TranscriptViewPatchOp::Replace { item }]
+            if item.id == TranscriptViewItemId::new("tool-slot:call-1:request")
+    ));
+    assert_eq!(patch.contributions.len(), 1);
+    assert_eq!(
+        patch.transcript.len(),
+        1,
+        "unchanged sibling emits no patch operation"
+    );
+    base.apply_patch(&patch)
+        .expect("incremental slot patch applies");
+    assert_eq!(base, next);
+}
+
+#[test]
 fn snapshot_patch_resets_when_non_transcript_state_changes() {
     let mut base = SessionViewSnapshot::empty();
     base.revision = 1;

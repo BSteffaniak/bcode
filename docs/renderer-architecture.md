@@ -85,7 +85,9 @@ transcript presentation.
 
 `SessionView` owns stable slot identity:
 
-* Request, progress, and result each have one replaceable slot per invocation.
+* Request, progress, and result each have one replaceable slot per invocation. They coexist; a
+  result does not erase request context, and canonical semantic `ToolInvocationResultRecorded`
+  remains the authoritative invocation result card.
 * Supplemental slots are independently keyed by contribution identity and retain event order.
 * Hidden contributions have no transcript item.
 * Renderers route visible payloads by producer, schema, and version. Unsupported payloads must not be
