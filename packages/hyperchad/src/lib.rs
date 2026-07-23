@@ -1727,6 +1727,65 @@ mod tests {
     }
 
     #[test]
+    fn interaction_forms_cover_all_renderer_neutral_input_kinds() {
+        use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation};
+
+        let form = |kind, control_id: Option<&str>, direction: Option<&str>| InteractionForm {
+            session_id: SessionId::new().to_string(),
+            interaction_id: "interaction-1".to_owned(),
+            kind,
+            control_id: control_id.map(str::to_owned),
+            value: None,
+            value_is_json: false,
+            direction: direction.map(str::to_owned),
+        };
+        let cases = [
+            (
+                form(InteractionInputKind::Activate, Some("control"), None),
+                InteractionInput::Activate {
+                    control_id: InteractionControlId::new("control"),
+                },
+            ),
+            (
+                form(InteractionInputKind::Focus, Some("control"), None),
+                InteractionInput::Focus {
+                    control_id: InteractionControlId::new("control"),
+                },
+            ),
+            (
+                form(InteractionInputKind::Blur, Some("control"), None),
+                InteractionInput::Blur {
+                    control_id: InteractionControlId::new("control"),
+                },
+            ),
+            (
+                form(InteractionInputKind::Navigate, None, Some("next")),
+                InteractionInput::Navigate {
+                    direction: InteractionNavigation::Next,
+                },
+            ),
+            (
+                form(InteractionInputKind::Navigate, None, Some("previous")),
+                InteractionInput::Navigate {
+                    direction: InteractionNavigation::Previous,
+                },
+            ),
+            (
+                form(InteractionInputKind::Submit, None, None),
+                InteractionInput::Submit,
+            ),
+            (
+                form(InteractionInputKind::Cancel, None, None),
+                InteractionInput::Cancel,
+            ),
+        ];
+
+        for (form, expected) in cases {
+            assert_eq!(interaction_input_from_form(&form), Ok(expected));
+        }
+    }
+
+    #[test]
     fn interaction_change_form_preserves_plain_text_that_looks_like_json() {
         let form = InteractionForm {
             session_id: SessionId::new().to_string(),

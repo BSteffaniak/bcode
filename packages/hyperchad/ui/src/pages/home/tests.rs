@@ -687,6 +687,18 @@ fn question_snapshot_renders_polished_controls_and_generic_fallback() {
     assert!(rendered.contains("question-0.option-0"));
     assert!(rendered.contains("submit answers"));
     assert!(rendered.contains("generic semantic controls"));
+    for label in [
+        "activate control",
+        "change control value",
+        "focus control",
+        "blur control",
+        "navigate focus",
+        "submit interaction",
+        "cancel interaction",
+    ] {
+        assert!(rendered.contains(label));
+    }
+    assert!(rendered.contains("/actions/interaction?"));
 }
 
 #[test]
@@ -738,6 +750,184 @@ fn question_snapshot_renders_multiple_checkbox_and_exclusive_custom_semantics() 
     assert!(text.contains("☐ Beta"));
     assert!(text.contains("Second option"));
     assert!(rendered.contains("other"));
+}
+
+#[test]
+fn filesystem_query_adapters_cover_empty_structured_metadata_and_bounded_snippets() {
+    let result = |schema: &str, title: &str, metadata| {
+        render_tool_result(&ToolResultView::Artifact {
+            artifact: ToolArtifactView::from(ToolArtifact {
+                artifact_id: format!("query-{schema}"),
+                producer_plugin_id: "bcode.filesystem".to_owned(),
+                schema: schema.to_owned(),
+                schema_version: 1,
+                tool_call_id: Some("call-query".to_owned()),
+                title: Some(title.to_owned()),
+                metadata,
+                refs: Vec::new(),
+            }),
+        })
+    };
+    let exists = format!(
+        "{:?}",
+        result(
+            "bcode.filesystem.exists",
+            "Path exists",
+            serde_json::json!({"path": "/tmp/missing", "exists": false}),
+        )
+    );
+    let list = format!(
+        "{:?}",
+        result(
+            "bcode.filesystem.list",
+            "Directory entries",
+            serde_json::json!({
+                "entries": [], "backend": "rust", "partial": false,
+                "timed_out": false, "visited_entries": 0
+            }),
+        )
+    );
+    let find = format!(
+        "{:?}",
+        result(
+            "bcode.filesystem.find",
+            "Path matches",
+            serde_json::json!({
+                "paths": [], "backend": "rust", "partial": true,
+                "timed_out": false, "visited_entries": 42,
+                "message": "result limit reached"
+            }),
+        )
+    );
+    let grep = format!(
+        "{:?}",
+        result(
+            "bcode.filesystem.grep",
+            "Text matches",
+            serde_json::json!({
+                "matches": [{
+                    "path": "/tmp/example.rs",
+                    "line_number": 77,
+                    "line": "g".repeat(2_100)
+                }],
+                "backend": "ripgrep", "partial": true,
+                "timed_out": true, "visited_entries": 100
+            }),
+        )
+    );
+    let stat = format!(
+        "{:?}",
+        result(
+            "bcode.filesystem.stat",
+            "Path metadata",
+            serde_json::json!({
+                "path": "/tmp/example.rs", "exists": true,
+                "kind": "file", "len": 1234
+            }),
+        )
+    );
+
+    assert!(exists.contains("Path does not exist"));
+    assert!(exists.contains("/tmp/missing"));
+    assert!(list.contains("No directory entries."));
+    assert!(list.contains("visited entries"));
+    assert!(find.contains("No matching paths."));
+    assert!(find.contains("result limit reached"));
+    assert!(grep.contains("/tmp/example.rs"));
+    assert!(grep.contains("77"));
+    assert!(grep.contains('…'));
+    assert!(grep.contains("timed out"));
+    assert!(stat.contains("Path exists"));
+    assert!(stat.contains("file"));
+    assert!(stat.contains("1234"));
+}
+
+#[test]
+fn filesystem_change_adapter_renders_bounded_split_diff_and_line_context() {
+    let result = ToolResultView::Artifact {
+        artifact: ToolArtifactView::from(ToolArtifact {
+            artifact_id: "filesystem-change-edge".to_owned(),
+            producer_plugin_id: "bcode.filesystem".to_owned(),
+            schema: "bcode.filesystem.change".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some("call-change".to_owned()),
+            title: Some("File change".to_owned()),
+            metadata: serde_json::json!({
+                "tool_name": "filesystem.edit",
+                "summary": "updated configuration",
+                "path": "/tmp/config.rs",
+                "old_text": format!("old_one{}\nold_two", "o".repeat(17_000)),
+                "new_text": format!("new_one{}\nnew_two", "n".repeat(17_000)),
+                "old_start_line": 10,
+                "new_start_line": 12
+            }),
+            refs: Vec::new(),
+        }),
+    };
+    let containers = render_tool_result(&result);
+    let mut text = String::new();
+    for container in &containers {
+        container_text(container, &mut text);
+    }
+
+    assert!(text.contains("/tmp/config.rs"));
+    assert!(text.contains("updated configuration"));
+    assert!(text.contains("operation: filesystem.edit"));
+    assert!(text.contains("removed · lines 10–11"));
+    assert!(text.contains("added · lines 12–13"));
+    assert!(text.contains("old_one"));
+    assert!(text.contains("new_one"));
+    assert!(text.contains("Removed text truncated for display."));
+    assert!(text.contains("Added text truncated for display."));
+}
+
+#[test]
+fn filesystem_read_adapter_renders_path_range_language_truncation_and_continuation() {
+    let result = ToolResultView::Artifact {
+        artifact: ToolArtifactView::from(ToolArtifact {
+            artifact_id: "filesystem-read-edge".to_owned(),
+            producer_plugin_id: "bcode.filesystem".to_owned(),
+            schema: "bcode.filesystem.read".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some("call-read".to_owned()),
+            title: Some("File contents".to_owned()),
+            metadata: serde_json::json!({
+                "path": "/tmp/example.rs",
+                "start_line": 11,
+                "end_line": 20,
+                "total_lines": 100,
+                "returned_bytes": 33_000,
+                "total_bytes": 50_000,
+                "truncated": true,
+                "contents": format!("fn main() {{}}\n{}", "x".repeat(33_000))
+            }),
+            refs: vec![bcode_session_models::ToolArtifactRef {
+                key: "full-file".to_owned(),
+                content_type: Some("text/x-rust".to_owned()),
+                storage_uri: Some("file:///tmp/example.rs".to_owned()),
+                byte_len: Some(50_000),
+                metadata: None,
+            }],
+        }),
+    };
+    let containers = render_tool_result(&result);
+    let mut text = String::new();
+    for container in &containers {
+        container_text(container, &mut text);
+    }
+    let rendered = format!("{containers:?}");
+
+    assert!(text.contains("/tmp/example.rs"));
+    assert!(text.contains("lines 11–20 of 100"));
+    assert!(text.contains("33000 of 50000 bytes"));
+    assert!(text.contains("rust"));
+    assert!(text.contains("fn main() {}"));
+    assert!(text.contains("File contents truncated for display."));
+    assert!(text.contains("More file content is available."));
+    assert!(text.contains("Continue at offset 21."));
+    assert!(text.contains("artifact references"));
+    assert!(text.contains("full-file"));
+    assert!(rendered.contains("markdown"));
 }
 
 #[test]
@@ -1102,6 +1292,13 @@ fn document_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
 fn filesystem_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
     match schema {
         "bcode.filesystem.read" => Some(serde_json::json!({
+            "path": "/tmp/fixture.rs",
+            "start_line": 1,
+            "end_line": 1,
+            "total_lines": 1,
+            "returned_bytes": 21,
+            "total_bytes": 21,
+            "truncated": false,
             "contents": "fixture file contents"
         })),
         "bcode.filesystem.image" => Some(serde_json::json!({
@@ -1262,6 +1459,29 @@ fn web_and_worktree_artifact_fixture(schema: &str) -> Option<serde_json::Value> 
             "truncated": false,
             "markdown": "fixture body"
         })),
+        "bcode.question.outcome" => Some(serde_json::json!({
+            "status": "answered",
+            "questions": [{
+                "question_index": 0,
+                "header": "Choice",
+                "question": "Choose one",
+                "status": "answered",
+                "selected": [{"label": "Fixture", "value": "fixture"}],
+                "custom": null,
+                "required": true
+            }]
+        })),
+        "bcode.web-search.status" => Some(serde_json::json!({
+            "search": {"available": true, "provider": "fixture", "quality": "native"},
+            "fetch": {"available": true, "rendered_fetch": true, "max_bytes": 1024}
+        })),
+        "bcode.web-search.inspect_result" => Some(serde_json::json!({
+            "url": "https://example.com",
+            "kind": "web_page",
+            "recommended_tool": "web_fetch",
+            "recommended_action": "Fetch the page",
+            "notes": ["Fixture note"]
+        })),
         _ => worktree_artifact_fixture(schema),
     }
 }
@@ -1324,6 +1544,30 @@ fn visual_adapter_fixture_payload(schema: &str) -> serde_json::Value {
                 "branch": "fixture-branch",
                 "base_ref": "head"
             }
+        }),
+        "bcode.vim-edit.live" => serde_json::json!({
+            "phase": "running",
+            "path": "/tmp/fixture.rs",
+            "file_index": 0,
+            "file_total": 1,
+            "step_index": 0,
+            "step_total": 1,
+            "cursor": {"line": 1, "column": 1},
+            "changed": true,
+            "message": "fixture live edit",
+            "error": null
+        }),
+        "bcode.vim-edit.playback" => serde_json::json!({
+            "success": true,
+            "error": null,
+            "tool_mode": "preview",
+            "summary": "fixture playback",
+            "path": "/tmp/fixture.rs",
+            "changed": true,
+            "diff": "-old\n+fixture",
+            "diff_truncated": false,
+            "frame_count": 1,
+            "frames_truncated": false
         }),
         "bcode.vim-edit.request.preview" | "bcode.vim-edit.request.apply" => {
             serde_json::json!({
@@ -1683,6 +1927,245 @@ fn unknown_artifact_and_text_json_results_keep_readable_fallbacks() {
     assert!(json.contains("result details"));
     assert!(json.contains("answer"));
     assert!(malformed.contains("{malformed"));
+}
+
+fn git_worktree_result(schema: &str, title: &str, metadata: serde_json::Value) -> ToolResultView {
+    ToolResultView::Artifact {
+        artifact: ToolArtifactView::from(ToolArtifact {
+            artifact_id: format!("fixture-{schema}"),
+            producer_plugin_id: if schema.starts_with("bcode.git") {
+                "bcode.git".to_owned()
+            } else {
+                "bcode.worktree".to_owned()
+            },
+            schema: schema.to_owned(),
+            schema_version: 1,
+            tool_call_id: Some("call-git-worktree".to_owned()),
+            title: Some(title.to_owned()),
+            metadata,
+            refs: Vec::new(),
+        }),
+    }
+}
+
+#[test]
+fn vim_edit_adapters_cover_request_live_preview_apply_result_and_failure() {
+    let visual = |schema: &str, payload| {
+        PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: Some(format!("fixture-{schema}")),
+            producer_plugin_id: Some("bcode.vim-edit".to_owned()),
+            schema: schema.to_owned(),
+            schema_version: 1,
+            title: Some("Vim edit".to_owned()),
+            subtitle: None,
+            payload,
+        })
+    };
+    let request = visual(
+        "bcode.vim-edit.request.preview",
+        serde_json::json!({
+            "path": "/tmp/example.rs",
+            "steps": [{"keys": "gg"}, {"insert": "hello"}],
+            "sandbox": "default",
+            "timeout_ms": 1000
+        }),
+    );
+    let live = visual(
+        "bcode.vim-edit.live",
+        serde_json::json!({
+            "phase": "running",
+            "path": "/tmp/example.rs",
+            "file_index": 0,
+            "file_total": 2,
+            "step_index": 1,
+            "step_total": 3,
+            "cursor": {"line": 4, "column": 2},
+            "changed": true,
+            "message": "applying step",
+            "error": null
+        }),
+    );
+    let playback = visual(
+        "bcode.vim-edit.playback",
+        serde_json::json!({
+            "success": true,
+            "error": null,
+            "tool_mode": "preview",
+            "summary": "vim edit changed file",
+            "path": "/tmp/example.rs",
+            "changed": true,
+            "diff": format!("-old\n+new\n{}", "d".repeat(33_000)),
+            "diff_truncated": true,
+            "frame_count": 20,
+            "frames_truncated": true
+        }),
+    );
+    let failure = visual(
+        "bcode.vim-edit.playback",
+        serde_json::json!({
+            "success": false,
+            "error": "Neovim command failed",
+            "tool_mode": "apply",
+            "summary": "vim edit failed",
+            "path": "/tmp/example.rs",
+            "changed": false,
+            "diff": "",
+            "diff_truncated": false,
+            "frame_count": 0,
+            "frames_truncated": false
+        }),
+    );
+
+    let request = render_plugin_visual("request", &request);
+    let live = render_plugin_visual("live", &live);
+    let playback = render_plugin_visual("result", &playback);
+    let failure = render_plugin_visual("result", &failure);
+    let text = |containers: &hyperchad::template::Containers| {
+        let mut text = String::new();
+        for container in containers {
+            container_text(container, &mut text);
+        }
+        text
+    };
+    let request = text(&request);
+    let live = text(&live);
+    let playback = text(&playback);
+    let failure = text(&failure);
+    assert!(request.contains("/tmp/example.rs"));
+    assert!(request.contains("steps: 2"));
+    assert!(request.contains("sandbox: default"));
+    assert!(live.contains("running"));
+    assert!(live.contains("file 1 of 2"));
+    assert!(live.contains("step 2 of 3"));
+    assert!(live.contains("cursor 4:2"));
+    assert!(playback.contains("preview"));
+    assert!(playback.contains("changed"));
+    assert!(playback.contains("20 playback frames"));
+    assert!(playback.contains("Diff was truncated by the producer."));
+    assert!(playback.contains("Diff truncated for display."));
+    assert!(playback.contains("Playback frames were truncated."));
+    assert!(failure.contains("failed"));
+    assert!(failure.contains("Neovim command failed"));
+    assert!(failure.contains("apply"));
+}
+
+#[test]
+fn git_clone_adapter_covers_request_result_ref_path_and_status() {
+    let request = PluginVisualView::from(PluginVisualDescriptor {
+        visual_id: Some("git-request".to_owned()),
+        producer_plugin_id: Some("bcode.git".to_owned()),
+        schema: "bcode.git.clone_request".to_owned(),
+        schema_version: 1,
+        title: Some("Clone".to_owned()),
+        subtitle: None,
+        payload: serde_json::json!({
+            "url": "https://github.com/example/repo.git",
+            "ref": "feature/ref",
+            "destination": "/tmp/repo"
+        }),
+    });
+    let result = git_worktree_result(
+        "bcode.git.clone_result",
+        "Repository cloned",
+        serde_json::json!({
+            "host": "github.com",
+            "owner": "example",
+            "repo": "repo",
+            "clone_url": "https://github.com/example/repo.git",
+            "git_ref": "feature/ref",
+            "path": "/tmp/repo",
+            "already_exists": false
+        }),
+    );
+    let request = format!("{:?}", render_plugin_visual("request", &request));
+    let result = format!("{:?}", render_tool_result(&result));
+
+    for expected in [
+        "https://github.com/example/repo.git",
+        "feature/ref",
+        "/tmp/repo",
+    ] {
+        assert!(request.contains(expected));
+        assert!(result.contains(expected));
+    }
+    assert!(result.contains("repository cloned"));
+}
+
+#[test]
+fn worktree_adapters_cover_request_results_empty_state_and_error_context() {
+    let request = PluginVisualView::from(PluginVisualDescriptor {
+        visual_id: Some("worktree-request".to_owned()),
+        producer_plugin_id: Some("bcode.worktree".to_owned()),
+        schema: "bcode.worktree.request".to_owned(),
+        schema_version: 1,
+        title: Some("Create worktree".to_owned()),
+        subtitle: None,
+        payload: serde_json::json!({
+            "operation": "create",
+            "name": "renderer",
+            "cwd": "/tmp/repo",
+            "new_branch": "feature/renderer",
+            "base_ref": "head",
+            "force": true
+        }),
+    });
+    let empty_list = git_worktree_result(
+        "bcode.worktree.list",
+        "Worktrees",
+        serde_json::json!({
+            "repo_root": "/tmp/repo",
+            "current_worktree": "/tmp/repo",
+            "worktrees": []
+        }),
+    );
+    let create_result = git_worktree_result(
+        "bcode.worktree.create_result",
+        "Worktree created",
+        serde_json::json!({
+            "repo_root": "/tmp/repo",
+            "path": "/tmp/worktrees/renderer",
+            "branch": "feature/renderer",
+            "created_branch": true,
+            "setup_applied": true,
+            "session": {"name": "Renderer session"}
+        }),
+    );
+    let remove_result = git_worktree_result(
+        "bcode.worktree.remove_result",
+        "Worktree removed",
+        serde_json::json!({"path": "/tmp/worktrees/renderer"}),
+    );
+    let failed = ToolInvocationView {
+        tool_call_id: "call-worktree-failed".to_owned(),
+        producer_plugin_id: Some("bcode.worktree".to_owned()),
+        tool_name: Some("worktree.create".to_owned()),
+        arguments_json: None,
+        working_directory: Some("/tmp/repo".into()),
+        request_visual: Some(request.clone()),
+        status: ToolInvocationViewStatus::Failed,
+        result_text: Some("git worktree add failed".to_owned()),
+        is_error: Some(true),
+        result: None,
+        output: None,
+        timing: ToolTimingView::default(),
+    };
+    let request = format!("{:?}", render_plugin_visual("request", &request));
+    let empty_list = format!("{:?}", render_tool_result(&empty_list));
+    let create_result = format!("{:?}", render_tool_result(&create_result));
+    let remove_result = format!("{:?}", render_tool_result(&remove_result));
+    let failed = format!("{:?}", render_tool_lifecycle(&failed));
+
+    for expected in ["create", "renderer", "feature/renderer", "base ref", "head"] {
+        assert!(request.contains(expected));
+    }
+    for expected in ["repository: ", "current: ", "No worktrees found."] {
+        assert!(empty_list.contains(expected));
+    }
+    assert!(create_result.contains("worktree created"));
+    assert!(create_result.contains("Renderer session"));
+    assert!(remove_result.contains("worktree removed"));
+    assert!(failed.contains("failed"));
+    assert!(failed.contains("git worktree add failed"));
 }
 
 #[test]
