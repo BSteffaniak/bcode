@@ -36,6 +36,7 @@ pub struct ActiveChat {
     pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
     pub event_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
+    pub opening_session_progress: Option<bcode_session_models::SessionOpenOperationSnapshot>,
     pub pending_effects: super::effects::TuiEffectQueue,
 }
 
@@ -146,6 +147,7 @@ pub fn start_switch_session(
     while chat.event_receiver.try_recv().is_ok() {}
     let draft_text = chat.app.composer().text().to_owned();
     chat.opening_session_id = Some(next_session_id);
+    chat.opening_session_progress = None;
     chat.session_id = None;
     let previous_app = std::mem::replace(
         &mut chat.app,
@@ -179,6 +181,7 @@ pub fn complete_switch_session(
         return;
     }
     chat.opening_session_id = None;
+    chat.opening_session_progress = None;
     match result {
         Ok((attached, next_task)) => {
             let draft_text = chat.app.composer().text().to_owned();
@@ -310,6 +313,7 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     }
     while chat.event_receiver.try_recv().is_ok() {}
     chat.opening_session_id = None;
+    chat.opening_session_progress = None;
     chat.session_id = None;
     let current_agent_id = chat.app.current_agent_id().to_owned();
     let previous_app = std::mem::replace(

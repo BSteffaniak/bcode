@@ -10,7 +10,7 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
     SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
-    SessionSummary, WorkId,
+    SessionOpenOperationId, SessionOpenOperationSnapshot, SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 12;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 13;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4;
@@ -372,6 +372,17 @@ pub enum Request {
     ApproveRalphRun(RalphApproveRequest),
     RalphRunStatus(RalphRunStatusRequest),
     RecordRalphLifecycle(RalphLifecycleRequest),
+    /// Classify a session for open and start or join required legacy migration.
+    PrepareSessionOpen {
+        session_id: SessionId,
+    },
+    /// Wait for a newer session-open operation snapshot or a bounded timeout.
+    WaitSessionOpenProgress {
+        session_id: SessionId,
+        operation_id: SessionOpenOperationId,
+        after_revision: u64,
+        timeout_ms: u64,
+    },
     ImportExternalSession {
         source_id: String,
         external_session_id: String,
@@ -1252,6 +1263,10 @@ pub enum ResponsePayload {
         /// Number of observations merged into the daemon registry.
         accepted: usize,
     },
+    /// Current snapshot after preparing or waiting for session open.
+    SessionOpenPrepared {
+        snapshot: SessionOpenOperationSnapshot,
+    },
 }
 
 /// Structured error response.
@@ -1296,6 +1311,10 @@ pub enum Event {
     SessionCatalogUpdated {
         #[serde(default)]
         revision: u64,
+    },
+    /// Session-open preparation progress forwarded to an observing UI.
+    SessionOpenProgress {
+        snapshot: SessionOpenOperationSnapshot,
     },
 }
 
@@ -2989,6 +3008,169 @@ mod tests {
             let decoded = decode_event(&received.payload).expect("event should decode");
             assert_eq!(decoded, event);
         }
+    }
+
+    #[tokio::test]
+    async fn session_open_preparation_requests_and_response_round_trip() {
+        let session_id = SessionId::new();
+        let operation_id = bcode_session_models::SessionOpenOperationId::new();
+        let snapshot = bcode_session_models::SessionOpenOperationSnapshot {
+            operation_id,
+            revision: 7,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: bcode_session_models::SessionMigrationProgress {
+                stage: bcode_session_models::SessionMigrationStage::RebuildingProjections,
+                completed_units: Some(100),
+                total_units: Some(500),
+                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Events),
+                message: "Rebuilding session indexes".to_owned(),
+            },
+            outcome: None,
+            backup_path: Some(PathBuf::from("/tmp/backup")),
+        };
+        for request in [
+            Request::PrepareSessionOpen { session_id },
+            Request::WaitSessionOpenProgress {
+                session_id,
+                operation_id,
+                after_revision: 6,
+                timeout_ms: 1_000,
+            },
+        ] {
+            let envelope = request_envelope(41, &request).expect("request encode");
+            let received = round_trip_envelope(envelope).await;
+            assert_eq!(
+                decode_request(&received.payload).expect("request decode"),
+                request
+            );
+        }
+        let response = Response::Ok(ResponsePayload::SessionOpenPrepared { snapshot });
+        let envelope = response_envelope(42, &response).expect("response encode");
+        let received = round_trip_envelope(envelope).await;
+        assert_eq!(
+            decode_response(&received.payload).expect("response decode"),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn every_session_open_stage_unit_and_terminal_outcome_round_trips() {
+        use bcode_session_models::{
+            SessionMigrationProgress, SessionMigrationProgressUnit, SessionMigrationStage,
+            SessionOpenFailureKind, SessionOpenOperationId, SessionOpenOperationSnapshot,
+            SessionOpenTerminalOutcome,
+        };
+
+        let session_id = SessionId::new();
+        let operation_id = SessionOpenOperationId::new();
+        let stages = [
+            SessionMigrationStage::WaitingForOwnership,
+            SessionMigrationStage::InspectingStorage,
+            SessionMigrationStage::PlanningBackup,
+            SessionMigrationStage::CopyingBackup,
+            SessionMigrationStage::VerifyingBackup,
+            SessionMigrationStage::PreparingSchema,
+            SessionMigrationStage::ReadingCanonicalHistory,
+            SessionMigrationStage::RebuildingProjections,
+            SessionMigrationStage::ValidatingProjections,
+            SessionMigrationStage::Committing,
+            SessionMigrationStage::ValidatingWriteReadiness,
+            SessionMigrationStage::OpeningSession,
+            SessionMigrationStage::Complete,
+            SessionMigrationStage::Failed,
+        ];
+        let units = [
+            SessionMigrationProgressUnit::Files,
+            SessionMigrationProgressUnit::Bytes,
+            SessionMigrationProgressUnit::Events,
+        ];
+        let failure_kinds = [
+            SessionOpenFailureKind::OwnedByOtherDaemon,
+            SessionOpenFailureKind::WriterIncompatible,
+            SessionOpenFailureKind::ProjectionStale,
+            SessionOpenFailureKind::RepairRequired,
+            SessionOpenFailureKind::BackupFailed,
+            SessionOpenFailureKind::MigrationFailed,
+            SessionOpenFailureKind::NotFound,
+        ];
+        let mut outcomes = vec![
+            SessionOpenTerminalOutcome::Ready,
+            SessionOpenTerminalOutcome::DegradedReadOnly { issue_count: 2 },
+            SessionOpenTerminalOutcome::WriterIncompatible {
+                actual: Some(5),
+                expected: 4,
+            },
+            SessionOpenTerminalOutcome::WriterIncompatible {
+                actual: None,
+                expected: 4,
+            },
+            SessionOpenTerminalOutcome::RepairRequired {
+                reason: "damaged tail".to_owned(),
+            },
+        ];
+        outcomes.extend(
+            failure_kinds
+                .into_iter()
+                .map(|kind| SessionOpenTerminalOutcome::Failed {
+                    kind,
+                    message: "classified failure".to_owned(),
+                    backup_path: Some(PathBuf::from("/tmp/retained-backup")),
+                }),
+        );
+
+        for (index, stage) in stages.into_iter().enumerate() {
+            let unit = units[index % units.len()];
+            let snapshot = SessionOpenOperationSnapshot {
+                operation_id,
+                revision: u64::try_from(index).expect("stage index"),
+                session_id,
+                source_writer_epoch: Some(3),
+                target_writer_epoch: 4,
+                progress: SessionMigrationProgress {
+                    stage,
+                    completed_units: Some(2),
+                    total_units: Some(3),
+                    unit: Some(unit),
+                    message: format!("stage {index}"),
+                },
+                outcome: None,
+                backup_path: Some(PathBuf::from("/tmp/backup")),
+            };
+            assert_session_open_snapshot_frame_round_trip(snapshot).await;
+        }
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let snapshot = SessionOpenOperationSnapshot {
+                operation_id,
+                revision: u64::try_from(index).expect("outcome index"),
+                session_id,
+                source_writer_epoch: Some(3),
+                target_writer_epoch: 4,
+                progress: SessionMigrationProgress {
+                    stage: SessionMigrationStage::Complete,
+                    completed_units: None,
+                    total_units: None,
+                    unit: None,
+                    message: "terminal".to_owned(),
+                },
+                outcome: Some(outcome),
+                backup_path: Some(PathBuf::from("/tmp/backup")),
+            };
+            assert_session_open_snapshot_frame_round_trip(snapshot).await;
+        }
+    }
+
+    async fn assert_session_open_snapshot_frame_round_trip(
+        snapshot: bcode_session_models::SessionOpenOperationSnapshot,
+    ) {
+        let response = Response::Ok(ResponsePayload::SessionOpenPrepared { snapshot });
+        let envelope = response_envelope(43, &response).expect("response encode");
+        let received = round_trip_envelope(envelope).await;
+        assert_eq!(
+            decode_response(&received.payload).expect("response decode"),
+            response
+        );
     }
 
     #[tokio::test]

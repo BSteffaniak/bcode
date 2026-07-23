@@ -4336,6 +4336,7 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, RequestContextObservation,
         RequestContextTokenCount,
     };
+    use sha2::Digest;
 
     fn session_storage_files(root: &Path, session_id: SessionId) -> BTreeMap<String, Vec<u8>> {
         let session_dir = root.join(session_id.to_string());
@@ -7282,6 +7283,29 @@ mod tests {
         project_context_occupancy_event(db.database(), &tail_event)
             .await
             .expect("project occupancy read model");
+        let canonical_columns = [
+            "event_seq",
+            "event_type",
+            "schema_version",
+            "created_at_ms",
+            "causation_id",
+            "correlation_id",
+            "payload",
+        ];
+        let canonical_before = db
+            .database()
+            .select("events")
+            .columns(&canonical_columns)
+            .execute(db.database())
+            .await
+            .expect("canonical rows before migration");
+        let payload_hashes_before = canonical_before
+            .iter()
+            .map(|row| {
+                let payload = required_string(row, "payload").expect("canonical payload");
+                format!("{:x}", sha2::Sha256::digest(payload.as_bytes()))
+            })
+            .collect::<Vec<_>>();
         drop(db);
 
         let maintenance =
@@ -7317,6 +7341,25 @@ mod tests {
             .expect("migrated context");
         assert_eq!(context.len(), 2);
         assert_eq!(context[1].sequence, 1);
+        let canonical_after = migrated
+            .database()
+            .select("events")
+            .columns(&canonical_columns)
+            .execute(migrated.database())
+            .await
+            .expect("canonical rows after migration");
+        assert_eq!(canonical_after, canonical_before);
+        let payload_hashes_after = canonical_after
+            .iter()
+            .map(|row| {
+                let payload = required_string(row, "payload").expect("canonical payload");
+                format!("{:x}", sha2::Sha256::digest(payload.as_bytes()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(payload_hashes_after, payload_hashes_before);
+        validate_all_projection_checkpoints_at_tail(migrated.database(), Some(1))
+            .await
+            .expect("all projection checkpoints at canonical tail");
 
         drop(migrated);
         let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())

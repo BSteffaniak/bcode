@@ -360,6 +360,15 @@ async fn handle_slash_command<W: Write>(
     Ok(None)
 }
 
+fn defer_submission_while_session_opens(chat: &mut ActiveChat) -> bool {
+    if chat.opening_session_id.is_none() {
+        return false;
+    }
+    chat.app
+        .set_status("Session is still opening; message kept in composer".to_owned());
+    true
+}
+
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
@@ -367,6 +376,9 @@ pub async fn submit_composer<W: Write>(
     chat: &mut ActiveChat,
     placement: bcode_ipc::PromptPlacement,
 ) -> Result<SubmitComposerOutcome, TuiError> {
+    if defer_submission_while_session_opens(chat) {
+        return Ok(None);
+    }
     let session_id = chat.app.session_id();
     let message = chat.app.take_pending_submission();
     if message.trim().is_empty() {
@@ -456,6 +468,32 @@ mod tests {
                 command_id: "loop".to_owned(),
             },
         })
+    }
+
+    #[test]
+    fn opening_session_defers_message_without_consuming_composer_text() {
+        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let session_id = bcode_session_models::SessionId::new();
+        let mut chat = super::super::session_flow::ActiveChat {
+            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            agents: super::super::session_flow::AgentCatalog::default(),
+            session_id: None,
+            event_sender,
+            event_receiver,
+            event_task: None,
+            opening_session_id: Some(session_id),
+            opening_session_progress: None,
+            pending_effects: super::super::effects::TuiEffectQueue::default(),
+        };
+        chat.app.replace_composer_with("message after migration");
+        chat.app.stage_submission();
+
+        assert!(defer_submission_while_session_opens(&mut chat));
+        assert_eq!(
+            chat.app.take_pending_submission(),
+            "message after migration"
+        );
+        assert!(chat.app.status().contains("still opening"));
     }
 
     #[test]

@@ -132,7 +132,7 @@ impl Default for SessionMigrationOperations {
 }
 
 impl SessionMigrationOperations {
-    fn new(terminal_retention: Duration, max_terminal_operations: usize) -> Self {
+    pub(super) fn new(terminal_retention: Duration, max_terminal_operations: usize) -> Self {
         Self {
             entries: Arc::new(Mutex::new(BTreeMap::new())),
             terminal_retention,

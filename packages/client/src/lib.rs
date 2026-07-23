@@ -225,6 +225,15 @@ impl ClientError {
     }
 }
 
+/// Receiver and task for cancellable client-side observation of detached session preparation.
+pub struct SessionOpenProgressObserver {
+    /// Progress snapshots in operation revision order.
+    pub receiver:
+        tokio::sync::mpsc::UnboundedReceiver<bcode_session_models::SessionOpenOperationSnapshot>,
+    /// Client observation task. Dropping the receiver ends this task but not server migration.
+    pub task: tokio::task::JoinHandle<Result<(), ClientError>>,
+}
+
 /// Session list response with persistent catalog status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionList {
@@ -666,7 +675,8 @@ impl SessionCatalogWatcher {
                 | Event::Session(_)
                 | Event::SessionLive(_)
                 | Event::RuntimeWork(_)
-                | Event::SessionViewResyncRequired { .. } => {}
+                | Event::SessionViewResyncRequired { .. }
+                | Event::SessionOpenProgress { .. } => {}
             }
         }
     }
@@ -721,7 +731,9 @@ impl SessionWatcher {
                 } if required == self.initial_session_id() => {
                     return Ok(SessionWatchEvent::ResyncRequired);
                 }
-                Event::SessionCatalogUpdated { .. } | Event::SessionViewResyncRequired { .. } => {}
+                Event::SessionCatalogUpdated { .. }
+                | Event::SessionViewResyncRequired { .. }
+                | Event::SessionOpenProgress { .. } => {}
             }
         }
     }
@@ -746,7 +758,8 @@ impl RuntimeWorkWatcher {
                 Event::Session(_)
                 | Event::SessionLive(_)
                 | Event::SessionViewResyncRequired { .. }
-                | Event::SessionCatalogUpdated { .. } => {}
+                | Event::SessionCatalogUpdated { .. }
+                | Event::SessionOpenProgress { .. } => {}
             }
         }
     }
@@ -2400,6 +2413,32 @@ impl BcodeClient {
         Err(last_error.unwrap_or(ClientError::UnexpectedResponse))
     }
 
+    /// Observe detached session-open preparation until terminal state or receiver drop.
+    ///
+    /// Dropping the returned receiver stops only this client observer. The server-owned migration
+    /// continues independently.
+    #[must_use]
+    pub fn observe_session_open(&self, session_id: SessionId) -> SessionOpenProgressObserver {
+        let client = self.clone();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut connection = client.connect("bcode-session-open-observer").await?;
+            let close_sender = sender.clone();
+            let observation = connection.prepare_session_open_while(session_id, |snapshot| {
+                sender.send(snapshot.clone()).is_ok()
+            });
+            tokio::pin!(observation);
+            tokio::select! {
+                result = &mut observation => {
+                    result?;
+                }
+                () = close_sender.closed() => {}
+            }
+            Ok(())
+        });
+        SessionOpenProgressObserver { receiver, task }
+    }
+
     async fn connect_once(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
         let stream = LocalIpcStream::connect(&self.endpoint).await?;
         let mut connection = ClientConnection {
@@ -2408,6 +2447,8 @@ impl BcodeClient {
             client_id: None,
             pending_events: VecDeque::new(),
             request_timeout: self.request_timeout,
+            reconnect_client: Some(std::sync::Arc::new(self.clone())),
+            reconnect_name: std::sync::Arc::from(client_name),
         };
         match connection
             .send_request(Request::Hello {
@@ -2437,6 +2478,8 @@ pub struct ClientConnection {
     client_id: Option<ClientId>,
     pending_events: VecDeque<Event>,
     request_timeout: Duration,
+    reconnect_client: Option<std::sync::Arc<BcodeClient>>,
+    reconnect_name: std::sync::Arc<str>,
 }
 
 impl ClientConnection {
@@ -2580,6 +2623,149 @@ impl ClientConnection {
         }
     }
 
+    /// Classify session storage and start or join legacy migration when required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects preparation.
+    pub async fn prepare_session_open(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<bcode_session_models::SessionOpenOperationSnapshot, ClientError> {
+        match self
+            .send_request(Request::PrepareSessionOpen { session_id })
+            .await?
+        {
+            ResponsePayload::SessionOpenPrepared { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Wait for a newer session-open snapshot or a bounded server timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, the operation identity is stale, or
+    /// the request is rejected.
+    pub async fn wait_session_open_progress(
+        &mut self,
+        session_id: SessionId,
+        operation_id: bcode_session_models::SessionOpenOperationId,
+        after_revision: u64,
+        timeout: Duration,
+    ) -> Result<bcode_session_models::SessionOpenOperationSnapshot, ClientError> {
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        match self
+            .send_request(Request::WaitSessionOpenProgress {
+                session_id,
+                operation_id,
+                after_revision,
+                timeout_ms,
+            })
+            .await?
+        {
+            ResponsePayload::SessionOpenPrepared { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Prepare a session until it reaches a terminal state, invoking `on_progress` for every
+    /// observed snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when preparation or progress observation fails.
+    pub async fn prepare_session_open_until_terminal<F>(
+        &mut self,
+        session_id: SessionId,
+        mut on_progress: F,
+    ) -> Result<bcode_session_models::SessionOpenOperationSnapshot, ClientError>
+    where
+        F: FnMut(&bcode_session_models::SessionOpenOperationSnapshot),
+    {
+        self.prepare_session_open_while(session_id, |snapshot| {
+            on_progress(snapshot);
+            true
+        })
+        .await
+    }
+
+    async fn prepare_session_open_while<F>(
+        &mut self,
+        session_id: SessionId,
+        mut on_progress: F,
+    ) -> Result<bcode_session_models::SessionOpenOperationSnapshot, ClientError>
+    where
+        F: FnMut(&bcode_session_models::SessionOpenOperationSnapshot) -> bool,
+    {
+        let mut snapshot = self.prepare_session_open(session_id).await?;
+        if !on_progress(&snapshot) {
+            return Ok(snapshot);
+        }
+        let mut reconnect_attempts = 0_u8;
+        while snapshot.outcome.is_none() {
+            match self
+                .wait_session_open_progress(
+                    session_id,
+                    snapshot.operation_id,
+                    snapshot.revision,
+                    Duration::from_secs(5),
+                )
+                .await
+            {
+                Ok(next) => {
+                    snapshot = next;
+                    if !on_progress(&snapshot) {
+                        return Ok(snapshot);
+                    }
+                }
+                Err(error)
+                    if error.is_daemon_unavailable()
+                        && reconnect_attempts < 3
+                        && self.reconnect_client.is_some() =>
+                {
+                    reconnect_attempts = reconnect_attempts.saturating_add(1);
+                    self.reconnect_for_session_open().await?;
+                    snapshot = match self
+                        .wait_session_open_progress(
+                            session_id,
+                            snapshot.operation_id,
+                            snapshot.revision,
+                            Duration::ZERO,
+                        )
+                        .await
+                    {
+                        Ok(recovered) => recovered,
+                        Err(ClientError::Server { code, .. })
+                            if code == "session_open_operation_not_found" =>
+                        {
+                            self.prepare_session_open(session_id).await?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if !on_progress(&snapshot) {
+                        return Ok(snapshot);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(snapshot)
+    }
+
+    async fn reconnect_for_session_open(&mut self) -> Result<(), ClientError> {
+        let client = self
+            .reconnect_client
+            .clone()
+            .ok_or(ClientError::UnexpectedResponse)?;
+        let mut replacement = client.connect(&self.reconnect_name).await?;
+        let mut pending_events = std::mem::take(&mut self.pending_events);
+        pending_events.append(&mut replacement.pending_events);
+        replacement.pending_events = pending_events;
+        *self = replacement;
+        Ok(())
+    }
+
     /// Attach to a session and return a recent history window.
     ///
     /// # Errors
@@ -2629,6 +2815,30 @@ impl ClientConnection {
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    /// Prepare a session to a terminal state, then attach with a bounded projection window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when preparation fails, reaches a terminal state that cannot be attached,
+    /// or attach fails. Ready states use the bounded attach path; degraded/read-only and all other
+    /// non-ready terminal states return without attaching.
+    pub async fn prepare_then_attach_session_projection_window<F>(
+        &mut self,
+        session_id: SessionId,
+        request: bcode_session_models::ProjectionWindowRequest,
+        on_progress: F,
+    ) -> Result<AttachedSessionHistory, ClientError>
+    where
+        F: FnMut(&bcode_session_models::SessionOpenOperationSnapshot),
+    {
+        let snapshot = self
+            .prepare_session_open_until_terminal(session_id, on_progress)
+            .await?;
+        session_open_attach_readiness(&snapshot)?;
+        self.attach_session_projection_window_with_input_history(session_id, request)
+            .await
     }
 
     /// Attach to a session and return a projection-sized history window plus input-history entries.
@@ -2759,9 +2969,108 @@ impl ClientConnection {
     }
 }
 
+fn session_open_attach_readiness(
+    snapshot: &bcode_session_models::SessionOpenOperationSnapshot,
+) -> Result<(), ClientError> {
+    let session_id = snapshot.session_id;
+    let stage_message = &snapshot.progress.message;
+    let verified_backup_path = snapshot.backup_path.as_deref();
+    match &snapshot.outcome {
+        Some(bcode_session_models::SessionOpenTerminalOutcome::Ready) => Ok(()),
+        Some(bcode_session_models::SessionOpenTerminalOutcome::DegradedReadOnly {
+            issue_count,
+        }) => Err(ClientError::Server {
+            code: "session_degraded_read_only".to_owned(),
+            message: format!(
+                "session contains {issue_count} unsupported persisted event(s); bounded history remains inspectable but writable attach is disabled"
+            ),
+        }),
+        Some(bcode_session_models::SessionOpenTerminalOutcome::WriterIncompatible {
+            actual,
+            expected,
+        }) => Err(ClientError::Server {
+            code: "session_writer_incompatible".to_owned(),
+            message: terminal_session_open_error_message(
+                session_id,
+                stage_message,
+                &format!(
+                    "session writer epoch {actual:?} is incompatible with expected epoch {expected}"
+                ),
+                verified_backup_path,
+            ),
+        }),
+        Some(bcode_session_models::SessionOpenTerminalOutcome::RepairRequired { reason }) => {
+            Err(ClientError::Server {
+                code: "session_repair_required".to_owned(),
+                message: terminal_session_open_error_message(
+                    session_id,
+                    stage_message,
+                    reason,
+                    verified_backup_path,
+                ),
+            })
+        }
+        Some(bcode_session_models::SessionOpenTerminalOutcome::Failed {
+            kind,
+            message,
+            backup_path,
+        }) => Err(ClientError::Server {
+            code: session_open_failure_code(*kind).to_owned(),
+            message: terminal_session_open_error_message(
+                session_id,
+                stage_message,
+                message,
+                backup_path.as_deref().or(verified_backup_path),
+            ),
+        }),
+        None => Err(ClientError::UnexpectedResponse),
+    }
+}
+
+fn terminal_session_open_error_message(
+    session_id: SessionId,
+    stage_message: &str,
+    reason: &str,
+    backup_path: Option<&std::path::Path>,
+) -> String {
+    let backup = backup_path.map_or_else(String::new, |path| {
+        format!(" Retained backup: {}.", path.display())
+    });
+    format!(
+        "session preparation failed during {stage_message}: {reason}.{backup} Diagnose with `bcode session diagnose {session_id}`."
+    )
+}
+
+const fn session_open_failure_code(
+    kind: bcode_session_models::SessionOpenFailureKind,
+) -> &'static str {
+    match kind {
+        bcode_session_models::SessionOpenFailureKind::OwnedByOtherDaemon => {
+            "session_active_elsewhere"
+        }
+        bcode_session_models::SessionOpenFailureKind::WriterIncompatible => {
+            "session_writer_incompatible"
+        }
+        bcode_session_models::SessionOpenFailureKind::ProjectionStale => "projection_stale",
+        bcode_session_models::SessionOpenFailureKind::RepairRequired => "session_repair_required",
+        bcode_session_models::SessionOpenFailureKind::BackupFailed => {
+            "session_migration_backup_failed"
+        }
+        bcode_session_models::SessionOpenFailureKind::MigrationFailed => "session_migration_failed",
+        bcode_session_models::SessionOpenFailureKind::NotFound => "session_not_found",
+    }
+}
+
 #[cfg(test)]
 mod client_timeout_tests {
-    use super::{BcodeClient, ClientError, resolve_path_from};
+    use super::{
+        BcodeClient, ClientError, resolve_path_from, session_open_attach_readiness,
+        terminal_session_open_error_message,
+    };
+    use bcode_session_models::{
+        SessionId, SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
+        SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
+    };
     use std::path::Path;
     use std::time::Duration;
 
@@ -2826,6 +3135,345 @@ mod client_timeout_tests {
             assert!(message.contains("protocol="));
             assert!(message.contains("build="));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrelated_events_remain_buffered_in_fifo_order_during_requests() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bce-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("client.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let request = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("request envelope");
+            for revision in [11, 12] {
+                let event = bcode_ipc::Event::SessionCatalogUpdated { revision };
+                let envelope = bcode_ipc::event_envelope(&event).expect("event envelope");
+                bcode_ipc::send_envelope(&mut stream, &envelope)
+                    .await
+                    .expect("send event");
+            }
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Pong);
+            let envelope = bcode_ipc::response_envelope(request.request_id, &response)
+                .expect("response envelope");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send response");
+        });
+        let stream = bcode_ipc::LocalIpcStream::connect(&endpoint)
+            .await
+            .expect("connect");
+        let mut connection = super::ClientConnection {
+            stream,
+            next_request_id: 1,
+            client_id: None,
+            pending_events: std::collections::VecDeque::new(),
+            request_timeout: Duration::from_secs(1),
+            reconnect_client: None,
+            reconnect_name: std::sync::Arc::from(""),
+        };
+
+        assert!(matches!(
+            connection.send_request(bcode_ipc::Request::Ping).await,
+            Ok(bcode_ipc::ResponsePayload::Pong)
+        ));
+        for expected in [11, 12] {
+            assert_eq!(
+                connection.recv_event().await.expect("buffered event"),
+                bcode_ipc::Event::SessionCatalogUpdated { revision: expected }
+            );
+        }
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("event socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_poll_transport_timeout_is_distinct_from_operation_failure() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bct-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("timeout.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let _request = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("wait request");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let stream = bcode_ipc::LocalIpcStream::connect(&endpoint)
+            .await
+            .expect("connect");
+        let mut connection = super::ClientConnection {
+            stream,
+            next_request_id: 1,
+            client_id: None,
+            pending_events: std::collections::VecDeque::new(),
+            request_timeout: Duration::from_millis(10),
+            reconnect_client: None,
+            reconnect_name: std::sync::Arc::from(""),
+        };
+        let session_id = SessionId::new();
+
+        assert!(matches!(
+            connection
+                .wait_session_open_progress(
+                    session_id,
+                    SessionOpenOperationId::new(),
+                    0,
+                    Duration::from_secs(5),
+                )
+                .await,
+            Err(ClientError::RequestTimeout { timeout })
+                if timeout == Duration::from_millis(10)
+        ));
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("timeout socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preparation_recovers_retained_operation_after_transport_interruption() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcr-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("reconnect.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let session_id = SessionId::new();
+        let operation_id = SessionOpenOperationId::new();
+        let snapshot = |revision, terminal| SessionOpenOperationSnapshot {
+            operation_id,
+            revision,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: SessionMigrationProgress {
+                stage: if terminal {
+                    SessionMigrationStage::Complete
+                } else {
+                    SessionMigrationStage::CopyingBackup
+                },
+                completed_units: Some(revision),
+                total_units: Some(2),
+                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Files),
+                message: "migration".to_owned(),
+            },
+            outcome: terminal.then_some(SessionOpenTerminalOutcome::Ready),
+            backup_path: None,
+        };
+        let initial = snapshot(1, false);
+        let terminal = snapshot(2, true);
+        let server_terminal = terminal.clone();
+        let daemon = matching_daemon_status();
+        let server = tokio::spawn(async move {
+            for (connection_index, prepared) in [initial, server_terminal].into_iter().enumerate() {
+                let mut stream = listener.accept().await.expect("accept client");
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion(
+                        bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                    ),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: daemon.clone(),
+                });
+                let envelope = bcode_ipc::response_envelope(hello.request_id, &response)
+                    .expect("hello response");
+                bcode_ipc::send_envelope(&mut stream, &envelope)
+                    .await
+                    .expect("send hello");
+
+                let request = bcode_ipc::recv_envelope(&mut stream)
+                    .await
+                    .expect("preparation request");
+                let response =
+                    bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionOpenPrepared {
+                        snapshot: prepared,
+                    });
+                let envelope = bcode_ipc::response_envelope(request.request_id, &response)
+                    .expect("preparation response");
+                bcode_ipc::send_envelope(&mut stream, &envelope)
+                    .await
+                    .expect("send preparation");
+                if connection_index == 0 {
+                    let _wait = bcode_ipc::recv_envelope(&mut stream)
+                        .await
+                        .expect("wait request before disconnect");
+                }
+            }
+        });
+        let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_secs(1));
+        let mut connection = client.connect("reconnect-test").await.expect("connect");
+        let mut revisions = Vec::new();
+
+        let recovered = connection
+            .prepare_session_open_until_terminal(session_id, |snapshot| {
+                revisions.push(snapshot.revision);
+            })
+            .await
+            .expect("recover preparation");
+
+        assert_eq!(recovered, terminal);
+        assert_eq!(revisions, vec![1, 2]);
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_progress_receiver_stops_client_observation_cleanly() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcd-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("drop.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let session_id = SessionId::new();
+        let snapshot = SessionOpenOperationSnapshot {
+            operation_id: SessionOpenOperationId::new(),
+            revision: 1,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: SessionMigrationProgress {
+                stage: SessionMigrationStage::CopyingBackup,
+                completed_units: Some(1),
+                total_units: Some(2),
+                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Files),
+                message: "migration".to_owned(),
+            },
+            outcome: None,
+            backup_path: None,
+        };
+        let daemon = matching_daemon_status();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon,
+            });
+            let envelope =
+                bcode_ipc::response_envelope(hello.request_id, &response).expect("hello response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send hello");
+            let request = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("prepare request");
+            let response =
+                bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionOpenPrepared {
+                    snapshot,
+                });
+            let envelope = bcode_ipc::response_envelope(request.request_id, &response)
+                .expect("prepare response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send prepare");
+            let first = tokio::time::timeout(
+                Duration::from_millis(250),
+                bcode_ipc::recv_envelope(&mut stream),
+            )
+            .await;
+            if first.as_ref().is_ok_and(Result::is_ok) {
+                tokio::time::timeout(
+                    Duration::from_millis(250),
+                    bcode_ipc::recv_envelope(&mut stream),
+                )
+                .await
+            } else {
+                first
+            }
+        });
+        let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_secs(1));
+        let mut observer = client.observe_session_open(session_id);
+        let first = observer.receiver.recv().await.expect("initial progress");
+        assert_eq!(first.revision, 1);
+        drop(observer.receiver);
+        assert!(observer.task.await.expect("observer task").is_ok());
+        let next_request = server.await.expect("server task");
+        assert!(
+            next_request.is_ok_and(|request| request.is_err()),
+            "observer sent another wait request after receiver drop"
+        );
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[test]
+    fn only_ready_terminal_outcome_allows_writable_attach() {
+        let session_id = SessionId::new();
+        let snapshot = |outcome| SessionOpenOperationSnapshot {
+            operation_id: SessionOpenOperationId::new(),
+            revision: 1,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: SessionMigrationProgress {
+                stage: SessionMigrationStage::Failed,
+                completed_units: None,
+                total_units: None,
+                unit: None,
+                message: "Classifying session".to_owned(),
+            },
+            outcome: Some(outcome),
+            backup_path: Some("/tmp/backup".into()),
+        };
+
+        assert!(
+            session_open_attach_readiness(&snapshot(SessionOpenTerminalOutcome::Ready)).is_ok()
+        );
+        for (outcome, expected_code) in [
+            (
+                SessionOpenTerminalOutcome::DegradedReadOnly { issue_count: 1 },
+                "session_degraded_read_only",
+            ),
+            (
+                SessionOpenTerminalOutcome::WriterIncompatible {
+                    actual: Some(5),
+                    expected: 4,
+                },
+                "session_writer_incompatible",
+            ),
+            (
+                SessionOpenTerminalOutcome::RepairRequired {
+                    reason: "damaged tail".to_owned(),
+                },
+                "session_repair_required",
+            ),
+            (
+                SessionOpenTerminalOutcome::Failed {
+                    kind: bcode_session_models::SessionOpenFailureKind::BackupFailed,
+                    message: "backup failed".to_owned(),
+                    backup_path: Some("/tmp/failed-backup".into()),
+                },
+                "session_migration_backup_failed",
+            ),
+        ] {
+            assert!(matches!(
+                session_open_attach_readiness(&snapshot(outcome)),
+                Err(ClientError::Server { code, .. }) if code == expected_code
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_session_open_error_preserves_recovery_context() {
+        let session_id = SessionId::new();
+        let message = terminal_session_open_error_message(
+            session_id,
+            "Verifying retained backup",
+            "hash mismatch",
+            Some(std::path::Path::new("/tmp/session-backup")),
+        );
+
+        assert!(message.contains("Verifying retained backup"));
+        assert!(message.contains("hash mismatch"));
+        assert!(message.contains("/tmp/session-backup"));
+        assert!(message.contains(&format!("bcode session diagnose {session_id}")));
     }
 
     #[test]

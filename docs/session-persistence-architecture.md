@@ -204,6 +204,40 @@ Maintenance commands are explicit:
 Repair uses Bcode's native Turso stack. Stock SQLite checkpoint/repair is not the primary recovery
 path. Catalog listing, picker display, normal attach, and paged history must never invoke repair.
 
+### Migration troubleshooting
+
+Start every investigation with the full session UUID:
+
+```text
+bcode session diagnose <session-id>
+bcode server status --verbose
+```
+
+The diagnosis command is read-only. Preserve the complete session directory and every reported
+retained backup before running maintenance.
+
+* **Waiting for ownership:** Another daemon or client may still own the session. Inspect the verbose
+  server status, close the owning client normally, and wait for ownership to clear. Do not delete
+  lease files or terminate a process solely to bypass ownership checks. If ownership remains after
+  all owners have exited, run `bcode session doctor <session-id>` before considering repair.
+* **Backup failure:** Migration does not begin mutation until backup verification succeeds. Check
+  the reported filesystem error, free space, destination permissions, and destination conflicts,
+  then retry normal open. Keep any retained backup path reported by Bcode. Do not replace the
+  session database with a partial backup.
+* **Structural corruption or repair-required:** Malformed canonical JSON, sequence gaps, session-id
+  mismatches, dirty migration history, and stale/incompatible projections fail closed. Capture
+  `bcode session diagnose <session-id> --json`, then use `bcode session doctor <session-id>` and a
+  supported `repair` or `reindex` command when its diagnosis recommends one. Never edit the
+  database or WAL directly.
+* **Degraded/read-only completion:** Trustworthy but unsupported event semantics remain visible
+  through bounded history while writable attach is disabled. Preserve the backup and diagnosis
+  output, then upgrade to a Bcode build that understands the reported event/schema. Repair must not
+  discard or reinterpret opaque events merely to make the session writable.
+
+A stalled or failed migration must remain visible as a classified terminal state. Retrying,
+leaving the picker, or disconnecting an observer must never silently downgrade the failure or
+remove its retained backup path.
+
 ## Finalized artifact references
 
 Finalized plugin artifacts are resolved through the `artifact_references` projection, keyed by

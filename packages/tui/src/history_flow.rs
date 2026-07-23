@@ -186,7 +186,26 @@ pub async fn attach_session_event_stream_with_window_request(
     request: ProjectionWindowRequest,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
-    let attached = attach_projection_window(&mut connection, session_id, request.clone()).await?;
+    let progress_sender = event_sender.clone();
+    let attached = match connection
+        .prepare_then_attach_session_projection_window(session_id, request.clone(), |snapshot| {
+            let _ = progress_sender.send(BcodeEvent::SessionOpenProgress {
+                snapshot: snapshot.clone(),
+            });
+        })
+        .await
+    {
+        Ok(attached) => attached,
+        Err(bcode_client::ClientError::Server { code, message })
+            if code == "projection_stale" || code == "session_repair_required" =>
+        {
+            return Err(TuiError::SessionUnavailable {
+                session_id,
+                reason: message,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
     let reconnect_client = client.clone();
     let event_task = spawn_reconnecting_window_event_stream(
         reconnect_client,

@@ -873,6 +873,20 @@ impl TuiEffectQueue {
         self.effects.insert(effect.key(), (schedule, effect));
     }
 
+    /// Return whether an open-session effect is queued for the given session.
+    #[cfg(test)]
+    pub fn has_open_session(&self, session_id: SessionId) -> bool {
+        self.effects.values().any(|(_, effect)| {
+            matches!(
+                effect,
+                TuiEffect::OpenSession {
+                    session_id: queued,
+                    ..
+                } if *queued == session_id
+            )
+        })
+    }
+
     /// Drain queued effects.
     fn drain(&mut self) -> Vec<(EffectSchedule, TuiEffect)> {
         std::mem::take(&mut self.effects).into_values().collect()

@@ -103,6 +103,7 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
         event_receiver,
         event_task: None,
         opening_session_id: None,
+        opening_session_progress: None,
         pending_effects: TuiEffectQueue::default(),
     };
     match config {

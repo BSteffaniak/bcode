@@ -1692,6 +1692,7 @@ fn new_draft_preserves_selected_agent() {
         event_receiver: receiver,
         event_task: None,
         opening_session_id: None,
+        opening_session_progress: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_current_agent_id("plan");
@@ -1699,6 +1700,168 @@ fn new_draft_preserves_selected_agent() {
     super::session_flow::switch_to_draft_session(&mut chat);
 
     assert_eq!(chat.app.current_agent_id(), "plan");
+}
+
+#[test]
+fn migration_stage_families_and_terminal_failure_render_through_status_chrome() {
+    use bcode_session_models::{
+        SessionMigrationProgress, SessionMigrationProgressUnit, SessionMigrationStage,
+        SessionOpenOperationId, SessionOpenOperationSnapshot,
+    };
+
+    let session_id = SessionId::new();
+    let render_status = |snapshot: SessionOpenOperationSnapshot| {
+        let status = super::chat_loop::test_session_open_progress_status(&snapshot);
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_status(status.clone());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 12));
+        let mut frame = Frame::new(&mut buffer);
+        render::render(&mut app, &mut frame);
+        let output = rendered_text(&buffer);
+        assert!(
+            output.contains(&status),
+            "missing rendered status {status:?}: {output}"
+        );
+        status
+    };
+    let snapshot =
+        |stage, completed_units, total_units, unit, message: &str| SessionOpenOperationSnapshot {
+            operation_id: SessionOpenOperationId::new(),
+            revision: 1,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: SessionMigrationProgress {
+                stage,
+                completed_units,
+                total_units,
+                unit,
+                message: message.to_owned(),
+            },
+            outcome: None,
+            backup_path: None,
+        };
+
+    for (unit, completed, total, expected) in [
+        (SessionMigrationProgressUnit::Files, 2, 4, "2 / 4 files"),
+        (
+            SessionMigrationProgressUnit::Bytes,
+            1024,
+            2048,
+            "1.0 KiB / 2.0 KiB",
+        ),
+        (
+            SessionMigrationProgressUnit::Events,
+            25,
+            100,
+            "25 / 100 events",
+        ),
+    ] {
+        let status = render_status(snapshot(
+            SessionMigrationStage::RebuildingProjections,
+            Some(completed),
+            Some(total),
+            Some(unit),
+            "Rebuilding projections",
+        ));
+        assert!(status.contains(expected));
+        assert!(status.contains("epoch 3 → 4"));
+    }
+
+    for stage in [
+        SessionMigrationStage::WaitingForOwnership,
+        SessionMigrationStage::InspectingStorage,
+        SessionMigrationStage::PlanningBackup,
+        SessionMigrationStage::CopyingBackup,
+        SessionMigrationStage::VerifyingBackup,
+        SessionMigrationStage::PreparingSchema,
+        SessionMigrationStage::ReadingCanonicalHistory,
+        SessionMigrationStage::RebuildingProjections,
+        SessionMigrationStage::ValidatingProjections,
+        SessionMigrationStage::Committing,
+        SessionMigrationStage::ValidatingWriteReadiness,
+        SessionMigrationStage::OpeningSession,
+        SessionMigrationStage::Complete,
+        SessionMigrationStage::Failed,
+    ] {
+        let message = format!("Stage {stage:?}");
+        let status = render_status(snapshot(stage, None, None, None, &message));
+        assert!(status.contains(&message));
+    }
+
+    let mut failed = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    failed.set_status(
+        "session open failed during Verifying retained backup: hash mismatch; retained backup /tmp/backup; bcode session diagnose"
+            .to_owned(),
+    );
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut failed, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(output.contains("Verifying retained backup"));
+    assert!(output.contains("hash mismatch"));
+    assert!(output.contains("/tmp/backup"));
+    assert!(output.contains("bcode session diagnose"));
+}
+
+#[test]
+fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_id: Some(session_id),
+        opening_session_progress: Some(bcode_session_models::SessionOpenOperationSnapshot {
+            operation_id: bcode_session_models::SessionOpenOperationId::new(),
+            revision: 2,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: bcode_session_models::SessionMigrationProgress {
+                stage: bcode_session_models::SessionMigrationStage::CopyingBackup,
+                completed_units: Some(1),
+                total_units: Some(2),
+                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Files),
+                message: "Copying backup".to_owned(),
+            },
+            outcome: None,
+            backup_path: None,
+        }),
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+    let request = super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24));
+    chat.replace_effect(super::effects::TuiEffect::OpenSession {
+        session_id,
+        initial_window_request: request.clone(),
+        event_sender: chat.event_sender.clone(),
+        allow_daemon_start: true,
+    });
+
+    super::session_flow::switch_to_draft_session(&mut chat);
+
+    assert_eq!(chat.opening_session_id, None);
+    assert_eq!(chat.opening_session_progress, None);
+    assert!(chat.pending_effects.has_open_session(session_id));
+    super::session_flow::complete_switch_session(
+        &mut chat,
+        session_id,
+        false,
+        Err(super::TuiError::SessionUnavailable {
+            session_id,
+            reason: "stale completion".to_owned(),
+        }),
+    );
+    assert_eq!(chat.session_id, None);
+    assert_eq!(chat.app.status(), "New draft");
+
+    super::session_flow::start_switch_session(&mut chat, session_id, request);
+    assert_eq!(chat.opening_session_id, Some(session_id));
+    assert!(chat.pending_effects.has_open_session(session_id));
 }
 
 #[tokio::test]
@@ -1713,6 +1876,7 @@ async fn async_session_open_preserves_typed_draft() {
         event_receiver: receiver,
         event_task: None,
         opening_session_id: Some(session_id),
+        opening_session_progress: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.replace_composer_with("draft while opening");
@@ -1764,6 +1928,7 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
         event_receiver: receiver,
         event_task: None,
         opening_session_id: None,
+        opening_session_progress: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.replace_composer_with("draft before opening");
@@ -1778,6 +1943,52 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
 }
 
 #[tokio::test]
+async fn async_session_open_failure_clears_progress_and_remains_visible() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_id: Some(session_id),
+        opening_session_progress: Some(bcode_session_models::SessionOpenOperationSnapshot {
+            operation_id: bcode_session_models::SessionOpenOperationId::new(),
+            revision: 1,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: bcode_session_models::SessionMigrationProgress {
+                stage: bcode_session_models::SessionMigrationStage::CopyingBackup,
+                completed_units: Some(1),
+                total_units: Some(2),
+                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Files),
+                message: "Copying backup".to_owned(),
+            },
+            outcome: None,
+            backup_path: None,
+        }),
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+
+    super::session_flow::complete_switch_session(
+        &mut chat,
+        session_id,
+        false,
+        Err(super::TuiError::SessionUnavailable {
+            session_id,
+            reason: "backup verification failed".to_owned(),
+        }),
+    );
+
+    assert_eq!(chat.opening_session_id, None);
+    assert_eq!(chat.opening_session_progress, None);
+    assert!(chat.app.status().contains("backup verification failed"));
+}
+
+#[tokio::test]
 async fn async_session_open_initial_state_preserves_plugin_host() {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let session_id = SessionId::new();
@@ -1789,6 +2000,7 @@ async fn async_session_open_initial_state_preserves_plugin_host() {
         event_receiver: receiver,
         event_task: None,
         opening_session_id: None,
+        opening_session_progress: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -1814,6 +2026,7 @@ async fn async_session_open_completion_preserves_plugin_host() {
         event_receiver: receiver,
         event_task: None,
         opening_session_id: Some(session_id),
+        opening_session_progress: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -1855,6 +2068,7 @@ fn switch_to_draft_session_preserves_plugin_host() {
         event_receiver: receiver,
         event_task: None,
         opening_session_id: None,
+        opening_session_progress: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -1876,6 +2090,7 @@ async fn session_open_preserved_plugin_host_renders_live_file_preview() {
         event_receiver: receiver,
         event_task: None,
         opening_session_id: None,
+        opening_session_progress: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));

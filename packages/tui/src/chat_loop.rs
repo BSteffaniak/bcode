@@ -1847,9 +1847,10 @@ fn absorb_bcode_event(
         BcodeEvent::SessionViewResyncRequired { session_id }
             if Some(session_id) == chat.session_id =>
         {
-            loop_state.replace_effect(TuiEffect::LoadSessionStatus { session_id });
-            loop_state.replace_effect(TuiEffect::ListPermissions);
-            true
+            handle_session_view_resync(loop_state, session_id)
+        }
+        BcodeEvent::SessionOpenProgress { snapshot } => {
+            apply_session_open_progress(chat, &snapshot)
         }
         BcodeEvent::Session(_)
         | BcodeEvent::SessionLive(_)
@@ -1890,6 +1891,111 @@ fn tool_exchange_surface_request(
         surface_kind,
         request.payload.to_string(),
     ))
+}
+
+fn handle_session_view_resync(
+    loop_state: &mut ChatLoopState,
+    session_id: bcode_session_models::SessionId,
+) -> bool {
+    loop_state.replace_effect(TuiEffect::LoadSessionStatus { session_id });
+    loop_state.replace_effect(TuiEffect::ListPermissions);
+    true
+}
+
+fn apply_session_open_progress(
+    chat: &mut ActiveChat,
+    snapshot: &bcode_session_models::SessionOpenOperationSnapshot,
+) -> bool {
+    if chat.opening_session_id != Some(snapshot.session_id) {
+        return false;
+    }
+    if chat
+        .opening_session_progress
+        .as_ref()
+        .is_some_and(|current| {
+            current.operation_id == snapshot.operation_id && current.revision >= snapshot.revision
+        })
+    {
+        return false;
+    }
+    chat.opening_session_progress = Some(snapshot.clone());
+    chat.app.set_status(session_open_progress_status(snapshot));
+    true
+}
+
+fn session_open_progress_status(
+    snapshot: &bcode_session_models::SessionOpenOperationSnapshot,
+) -> String {
+    let epoch = snapshot.source_writer_epoch.map_or_else(
+        || format!("epoch {}", snapshot.target_writer_epoch),
+        |source| format!("epoch {source} → {}", snapshot.target_writer_epoch),
+    );
+    match (
+        snapshot.progress.completed_units,
+        snapshot.progress.total_units,
+        snapshot.progress.unit,
+    ) {
+        (Some(completed), Some(total), Some(unit)) if total > 0 => {
+            let filled = usize::try_from(completed.saturating_mul(12) / total)
+                .unwrap_or(12)
+                .min(12);
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(12 - filled));
+            let units = match unit {
+                bcode_session_models::SessionMigrationProgressUnit::Bytes => {
+                    format!("{} / {}", readable_bytes(completed), readable_bytes(total))
+                }
+                bcode_session_models::SessionMigrationProgressUnit::Files => {
+                    format!("{completed} / {total} files")
+                }
+                bcode_session_models::SessionMigrationProgressUnit::Events => {
+                    format!("{completed} / {total} events")
+                }
+            };
+            format!(
+                "Upgrading session ({epoch}) · {} · {bar} {units}",
+                snapshot.progress.message
+            )
+        }
+        _ => format!(
+            "{} Upgrading session ({epoch}) · {}",
+            migration_spinner_frame(),
+            snapshot.progress.message
+        ),
+    }
+}
+
+#[cfg(test)]
+pub fn test_session_open_progress_status(
+    snapshot: &bcode_session_models::SessionOpenOperationSnapshot,
+) -> String {
+    session_open_progress_status(snapshot)
+}
+
+fn readable_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB {
+        format_decimal_unit(bytes, MIB, "MiB")
+    } else if bytes >= KIB {
+        format_decimal_unit(bytes, KIB, "KiB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_decimal_unit(value: u64, divisor: u64, suffix: &str) -> String {
+    let whole = value / divisor;
+    let tenth = value % divisor * 10 / divisor;
+    format!("{whole}.{tenth} {suffix}")
+}
+
+fn migration_spinner_frame() -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let index = usize::try_from((elapsed / 100) % FRAMES.len() as u128).unwrap_or(0);
+    FRAMES[index]
 }
 
 fn reconcile_interactive_surfaces(
@@ -2646,6 +2752,7 @@ mod scheduler_tests {
             event_receiver,
             event_task: None,
             opening_session_id: None,
+            opening_session_progress: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         }
     }
@@ -3022,5 +3129,95 @@ mod scheduler_tests {
         ));
         assert!(chat.event_receiver.try_recv().is_ok());
         assert!(chat.event_receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn session_open_progress_formats_determinate_bytes() {
+        let snapshot = progress_snapshot(
+            bcode_session_models::SessionId::new(),
+            Some(512),
+            Some(1024),
+            Some(bcode_session_models::SessionMigrationProgressUnit::Bytes),
+        );
+        let status = session_open_progress_status(&snapshot);
+        assert!(status.contains("epoch 3 → 4"));
+        assert!(status.contains("██████░░░░░░"));
+        assert!(status.contains("512 B / 1.0 KiB"));
+    }
+
+    #[test]
+    fn session_open_progress_formats_indeterminate_stage() {
+        let snapshot = progress_snapshot(bcode_session_models::SessionId::new(), None, None, None);
+        let status = session_open_progress_status(&snapshot);
+        assert!(status.contains("Upgrading session (epoch 3 → 4)"));
+        assert!(status.contains("Preparing session backup"));
+    }
+
+    #[test]
+    fn session_open_progress_ignores_stale_session_updates() {
+        let mut chat = test_chat();
+        let opening = bcode_session_models::SessionId::new();
+        chat.opening_session_id = Some(opening);
+        chat.app.set_status("opening session".to_owned());
+        let stale = progress_snapshot(
+            bcode_session_models::SessionId::new(),
+            Some(1),
+            Some(2),
+            Some(bcode_session_models::SessionMigrationProgressUnit::Files),
+        );
+        assert!(!apply_session_open_progress(&mut chat, &stale));
+        assert_eq!(chat.app.status(), "opening session");
+
+        let current = progress_snapshot(
+            opening,
+            Some(1),
+            Some(2),
+            Some(bcode_session_models::SessionMigrationProgressUnit::Files),
+        );
+        assert!(apply_session_open_progress(&mut chat, &current));
+        assert_eq!(chat.opening_session_progress.as_ref(), Some(&current));
+        assert!(chat.app.status().contains("1 / 2 files"));
+        assert!(!apply_session_open_progress(&mut chat, &current));
+
+        let mut older = current.clone();
+        older.revision = 0;
+        assert!(!apply_session_open_progress(&mut chat, &older));
+
+        let mut newer = current.clone();
+        newer.revision = 2;
+        newer.progress.completed_units = Some(2);
+        assert!(apply_session_open_progress(&mut chat, &newer));
+        assert!(chat.app.status().contains("2 / 2 files"));
+
+        let mut replacement = newer.clone();
+        replacement.operation_id = bcode_session_models::SessionOpenOperationId::new();
+        replacement.revision = 0;
+        replacement.progress.message = "Reclassified after reconnect".to_owned();
+        assert!(apply_session_open_progress(&mut chat, &replacement));
+        assert_eq!(chat.opening_session_progress.as_ref(), Some(&replacement));
+    }
+
+    fn progress_snapshot(
+        session_id: bcode_session_models::SessionId,
+        completed_units: Option<u64>,
+        total_units: Option<u64>,
+        unit: Option<bcode_session_models::SessionMigrationProgressUnit>,
+    ) -> bcode_session_models::SessionOpenOperationSnapshot {
+        bcode_session_models::SessionOpenOperationSnapshot {
+            operation_id: bcode_session_models::SessionOpenOperationId::new(),
+            revision: 1,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: bcode_session_models::SessionMigrationProgress {
+                stage: bcode_session_models::SessionMigrationStage::PlanningBackup,
+                completed_units,
+                total_units,
+                unit,
+                message: "Preparing session backup".to_owned(),
+            },
+            outcome: None,
+            backup_path: None,
+        }
     }
 }

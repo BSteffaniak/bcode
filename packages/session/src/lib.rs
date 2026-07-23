@@ -542,7 +542,11 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn ready_session_open_snapshot(session_id: SessionId) -> SessionOpenOperationSnapshot {
+fn terminal_session_open_snapshot(
+    session_id: SessionId,
+    outcome: SessionOpenTerminalOutcome,
+    message: String,
+) -> SessionOpenOperationSnapshot {
     SessionOpenOperationSnapshot {
         operation_id: SessionOpenOperationId::new(),
         revision: 0,
@@ -550,15 +554,27 @@ fn ready_session_open_snapshot(session_id: SessionId) -> SessionOpenOperationSna
         source_writer_epoch: None,
         target_writer_epoch: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
         progress: SessionMigrationProgress {
-            stage: SessionMigrationStage::Complete,
+            stage: if matches!(outcome, SessionOpenTerminalOutcome::Ready) {
+                SessionMigrationStage::Complete
+            } else {
+                SessionMigrationStage::Failed
+            },
             completed_units: None,
             total_units: None,
             unit: None,
-            message: "Session storage is ready".to_owned(),
+            message,
         },
-        outcome: Some(SessionOpenTerminalOutcome::Ready),
+        outcome: Some(outcome),
         backup_path: None,
     }
+}
+
+fn ready_session_open_snapshot(session_id: SessionId) -> SessionOpenOperationSnapshot {
+    terminal_session_open_snapshot(
+        session_id,
+        SessionOpenTerminalOutcome::Ready,
+        "Session storage is ready".to_owned(),
+    )
 }
 
 fn migrating_session_open_snapshot(
@@ -584,21 +600,36 @@ fn migrating_session_open_snapshot(
 }
 
 fn session_open_failure_outcome(error: &SessionError) -> SessionOpenTerminalOutcome {
-    let kind = match error {
-        SessionError::NotFound(_) => SessionOpenFailureKind::NotFound,
-        SessionError::MigrationBackup { .. } => SessionOpenFailureKind::BackupFailed,
-        SessionError::ProjectionStale { .. } => SessionOpenFailureKind::ProjectionStale,
-        SessionError::Db(db::SessionDbError::WriterIncompatible { .. }) => {
-            SessionOpenFailureKind::WriterIncompatible
+    match error {
+        SessionError::Db(db::SessionDbError::CompatibilityDegraded { issue_count }) => {
+            return SessionOpenTerminalOutcome::DegradedReadOnly {
+                issue_count: *issue_count,
+            };
         }
-        SessionError::Lease(lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
-            SessionOpenFailureKind::OwnedByOtherDaemon
+        SessionError::Db(db::SessionDbError::WriterIncompatible { actual, expected }) => {
+            return SessionOpenTerminalOutcome::WriterIncompatible {
+                actual: *actual,
+                expected: *expected,
+            };
         }
-        SessionError::Db(
+        SessionError::ProjectionStale { .. }
+        | SessionError::Db(
             db::SessionDbError::InvalidCanonicalSequence { .. }
             | db::SessionDbError::InvalidRow { .. }
             | db::SessionDbError::PersistedEvent(_),
-        ) => SessionOpenFailureKind::RepairRequired,
+        ) => {
+            return SessionOpenTerminalOutcome::RepairRequired {
+                reason: error.to_string(),
+            };
+        }
+        _ => {}
+    }
+    let kind = match error {
+        SessionError::NotFound(_) => SessionOpenFailureKind::NotFound,
+        SessionError::MigrationBackup { .. } => SessionOpenFailureKind::BackupFailed,
+        SessionError::Lease(lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
+            SessionOpenFailureKind::OwnedByOtherDaemon
+        }
         _ => SessionOpenFailureKind::MigrationFailed,
     };
     SessionOpenTerminalOutcome::Failed {
@@ -1489,12 +1520,72 @@ impl SessionManager {
         if !db::session_db_path(&root, session_id).exists() {
             return Err(SessionError::NotFound(session_id));
         }
-        let compatibility = db::SessionDb::open_existing_turso_in_root(session_id, &root)
-            .await?
-            .storage_compatibility()
-            .await?;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+        let compatibility = match db.storage_compatibility().await {
+            Ok(compatibility) => compatibility,
+            Err(db::SessionDbError::WriterIncompatible { actual, expected }) => {
+                return Ok(terminal_session_open_snapshot(
+                    session_id,
+                    SessionOpenTerminalOutcome::WriterIncompatible { actual, expected },
+                    format!(
+                        "Session writer epoch {actual:?} is incompatible with expected epoch {expected}"
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Ok(terminal_session_open_snapshot(
+                    session_id,
+                    SessionOpenTerminalOutcome::RepairRequired {
+                        reason: error.to_string(),
+                    },
+                    "Session storage requires repair".to_owned(),
+                ));
+            }
+        };
+        if matches!(
+            compatibility,
+            db::SessionStorageCompatibility::Current { .. }
+        ) {
+            let (outcome, message) = match db.session_compatibility_status().await? {
+                db::SessionCompatibilityStatus::Compatible { .. } => {
+                    return Ok(ready_session_open_snapshot(session_id));
+                }
+                db::SessionCompatibilityStatus::Degraded { issue_count, .. } => (
+                    SessionOpenTerminalOutcome::DegradedReadOnly { issue_count },
+                    format!(
+                        "Session history contains {issue_count} unsupported event(s) and is read-only"
+                    ),
+                ),
+                db::SessionCompatibilityStatus::Missing => (
+                    SessionOpenTerminalOutcome::RepairRequired {
+                        reason: "session compatibility projection is missing".to_owned(),
+                    },
+                    "Session compatibility projection is missing".to_owned(),
+                ),
+                db::SessionCompatibilityStatus::Stale {
+                    checkpoint,
+                    expected,
+                } => (
+                    SessionOpenTerminalOutcome::RepairRequired {
+                        reason: format!(
+                            "session compatibility projection is stale: checkpoint {checkpoint}, expected {expected}"
+                        ),
+                    },
+                    "Session compatibility projection is stale".to_owned(),
+                ),
+                db::SessionCompatibilityStatus::Incompatible { actual, expected } => (
+                    SessionOpenTerminalOutcome::RepairRequired {
+                        reason: format!(
+                            "session compatibility projection schema {actual} is incompatible with expected schema {expected}"
+                        ),
+                    },
+                    "Session compatibility projection is incompatible".to_owned(),
+                ),
+            };
+            return Ok(terminal_session_open_snapshot(session_id, outcome, message));
+        }
         let db::SessionStorageCompatibility::KnownLegacy { writer_epoch } = compatibility else {
-            return Ok(ready_session_open_snapshot(session_id));
+            unreachable!("current compatibility returned above")
         };
         let initial = migrating_session_open_snapshot(session_id, writer_epoch);
         let manager = self.clone();
@@ -1744,6 +1835,12 @@ impl SessionManager {
                         .await?
                 }
                 KnownLegacy { writer_epoch } => {
+                    if progress.is_none() {
+                        return Err(SessionError::StorageMigrationRequired {
+                            actual: writer_epoch,
+                            expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+                        });
+                    }
                     self.migrate_legacy_session_for_load(
                         session_id,
                         store,
@@ -4712,6 +4809,24 @@ mod tests {
         drop(db);
 
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let prepared = manager
+            .prepare_session_open(session_id)
+            .await
+            .expect("degraded preparation should start");
+        let mut preparation = manager
+            .subscribe_session_open_operation(session_id, prepared.operation_id)
+            .await
+            .expect("degraded preparation subscription");
+        let prepared = preparation
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("terminal degraded preparation")
+            .clone();
+        assert_eq!(
+            prepared.outcome,
+            Some(SessionOpenTerminalOutcome::DegradedReadOnly { issue_count: 1 })
+        );
+        assert_eq!(manager.active_session_migration_count().await, 0);
         assert!(matches!(
             manager
                 .attach_session_recent(session_id, ClientId::new(), 10)
@@ -6184,7 +6299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exclusive_load_automatically_migrates_legacy_storage() {
+    async fn detached_preparation_migrates_legacy_storage_before_exclusive_load() {
         let state_root = unique_temp_dir();
         let root = state_root.join("sessions");
         let session_id = {
@@ -6211,10 +6326,21 @@ mod tests {
         };
 
         let manager = SessionManager::persistent(&root).expect("manager should reopen");
+        let before_preparation = manager.require_write_readiness(session_id).await;
+        assert!(
+            matches!(
+                before_preparation,
+                Err(SessionError::StorageMigrationRequired { .. }
+                    | SessionError::Db(db::SessionDbError::WriterIncompatible { .. }))
+            ),
+            "unexpected pre-preparation write result: {before_preparation:?}"
+        );
+        let terminal = prepare_session_until_terminal(&manager, session_id).await;
+        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
         manager
             .require_write_readiness(session_id)
             .await
-            .expect("exclusive legacy session should migrate automatically");
+            .expect("prepared legacy session should be writable");
         manager
             .attach_session_recent(session_id, ClientId::new(), 16)
             .await
@@ -6293,9 +6419,13 @@ mod tests {
         std::fs::write(&backup_root, b"block backup directory").expect("create backup blocker");
 
         let manager = SessionManager::persistent(&root).expect("manager should reopen");
+        let terminal = prepare_session_until_terminal(&manager, session_id).await;
         assert!(matches!(
-            manager.require_write_readiness(session_id).await,
-            Err(SessionError::MigrationBackup { .. })
+            terminal.outcome,
+            Some(SessionOpenTerminalOutcome::Failed {
+                kind: SessionOpenFailureKind::BackupFailed,
+                ..
+            })
         ));
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
             .await
@@ -6417,6 +6547,367 @@ mod tests {
         tx.commit().await.expect("benchmark transaction commit");
         drop(db);
         session_id
+    }
+
+    async fn prepare_session_until_terminal(
+        manager: &SessionManager,
+        session_id: SessionId,
+    ) -> bcode_session_models::SessionOpenOperationSnapshot {
+        let initial = manager
+            .prepare_session_open(session_id)
+            .await
+            .expect("start session preparation");
+        if initial.outcome.is_some() {
+            return initial;
+        }
+        let mut receiver = manager
+            .subscribe_session_open_operation(session_id, initial.operation_id)
+            .await
+            .expect("preparation subscription");
+        receiver
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("terminal preparation")
+            .clone()
+    }
+
+    async fn assert_legacy_preparation_repair_required(
+        manager: &SessionManager,
+        session_id: SessionId,
+        expected_reason: &str,
+    ) -> bcode_session_models::SessionOpenOperationSnapshot {
+        let initial = manager
+            .prepare_session_open(session_id)
+            .await
+            .expect("start legacy preparation");
+        let mut receiver = manager
+            .subscribe_session_open_operation(session_id, initial.operation_id)
+            .await
+            .expect("preparation subscription");
+        let terminal = receiver
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("terminal preparation")
+            .clone();
+        assert!(
+            matches!(
+                terminal.outcome,
+                Some(SessionOpenTerminalOutcome::RepairRequired { ref reason })
+                    if reason.contains(expected_reason)
+            ),
+            "unexpected repair outcome: {:?}",
+            terminal.outcome
+        );
+        let history = manager
+            .session_open_operation_history(session_id, initial.operation_id)
+            .await;
+        assert!(history.iter().any(|snapshot| {
+            snapshot.progress.stage == SessionMigrationStage::ReadingCanonicalHistory
+        }));
+        assert!(terminal.backup_path.is_some());
+        terminal
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_json_preparation_requires_repair_at_canonical_read() {
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("legacy DB");
+        db.database()
+            .update("events")
+            .value("payload", "not valid JSON")
+            .where_eq("event_seq", switchy::database::DatabaseValue::Int64(50))
+            .execute(db.database())
+            .await
+            .expect("corrupt canonical payload");
+        drop(db);
+        let manager = SessionManager::persistent(&root).expect("manager");
+
+        assert_legacy_preparation_repair_required(&manager, session_id, "expected ident at line 1")
+            .await;
+        std::fs::remove_dir_all(state_root).expect("state root cleanup");
+    }
+
+    #[tokio::test]
+    async fn mismatched_session_identity_preparation_requires_repair_at_canonical_read() {
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("legacy DB");
+        let row = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", switchy::database::DatabaseValue::Int64(50))
+            .execute_first(db.database())
+            .await
+            .expect("canonical row")
+            .expect("canonical event");
+        let payload = row
+            .get("payload")
+            .expect("canonical payload")
+            .as_str()
+            .expect("canonical payload string")
+            .to_owned();
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&payload).expect("canonical payload JSON");
+        payload["session_id"] =
+            serde_json::to_value(SessionId::new()).expect("mismatched session id JSON");
+        db.database()
+            .update("events")
+            .value("payload", payload.to_string())
+            .where_eq("event_seq", switchy::database::DatabaseValue::Int64(50))
+            .execute(db.database())
+            .await
+            .expect("replace canonical identity");
+        drop(db);
+        let manager = SessionManager::persistent(&root).expect("manager");
+
+        assert_legacy_preparation_repair_required(&manager, session_id, "events.session_id").await;
+        std::fs::remove_dir_all(state_root).expect("state root cleanup");
+    }
+
+    #[tokio::test]
+    async fn legacy_sequence_gap_preparation_requires_repair_at_canonical_read() {
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("legacy DB");
+        db.database()
+            .delete("events")
+            .where_eq("event_seq", switchy::database::DatabaseValue::Int64(50))
+            .execute(db.database())
+            .await
+            .expect("delete canonical event");
+        drop(db);
+        let manager = SessionManager::persistent(&root).expect("manager");
+
+        assert_legacy_preparation_repair_required(&manager, session_id, "canonical event sequence")
+            .await;
+        std::fs::remove_dir_all(state_root).expect("state root cleanup");
+    }
+
+    #[tokio::test]
+    async fn terminal_operation_cleanup_preserves_migrated_durable_state() {
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let mut manager = SessionManager::persistent(&root).expect("manager");
+        manager.migration_operations =
+            crate::migration_operation::SessionMigrationOperations::new(Duration::ZERO, 1);
+
+        let terminal = prepare_session_until_terminal(&manager, session_id).await;
+        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
+        assert!(
+            manager
+                .session_open_operation(session_id, terminal.operation_id)
+                .await
+                .is_none(),
+            "zero-retention cleanup should remove terminal observer metadata"
+        );
+
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("migrated DB after operation cleanup");
+        assert_eq!(
+            db.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        drop(db);
+        let page = manager
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    direction: SessionHistoryDirection::Forward,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("bounded history after operation cleanup");
+        assert_eq!(page.events.len(), 10);
+        std::fs::remove_dir_all(state_root).expect("state root cleanup");
+    }
+
+    #[tokio::test]
+    async fn direct_attach_cannot_own_legacy_migration_lifetime() {
+        let state_root = unique_temp_dir();
+        let root = state_root.join("sessions");
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let manager = SessionManager::persistent(&root).expect("manager");
+
+        let attach = manager
+            .attach_session_recent(session_id, ClientId::new(), 16)
+            .await;
+
+        assert!(matches!(
+            attach,
+            Err(SessionError::StorageMigrationRequired {
+                actual: 3,
+                expected: 4,
+            })
+        ));
+        assert_eq!(manager.active_session_migration_count().await, 0);
+        let durable_epoch = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+            .await
+            .expect("unchanged legacy DB")
+            .storage_writer_epoch()
+            .await
+            .expect("legacy writer epoch");
+        assert_eq!(durable_epoch, 3);
+        std::fs::remove_dir_all(state_root).expect("state root cleanup");
+    }
+
+    #[tokio::test]
+    async fn current_session_with_compatibility_issues_prepares_degraded_read_only() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(Some("degraded".to_owned()), test_working_directory())
+            .await
+            .expect("current session");
+        let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("session DB");
+        let sequence = db
+            .last_event_sequence()
+            .await
+            .expect("canonical tail")
+            .expect("created session event");
+        db.database()
+            .insert("session_compatibility_issues")
+            .value(
+                "event_seq",
+                switchy::database::DatabaseValue::Int64(i64::try_from(sequence).expect("sequence")),
+            )
+            .value("event_kind", "unknown_fixture_event")
+            .value(
+                "event_schema_version",
+                switchy::database::DatabaseValue::Int32(1),
+            )
+            .value("compatibility", "unknown_event_kind")
+            .value("remediation", "upgrade Bcode")
+            .execute(db.database())
+            .await
+            .expect("compatibility issue");
+        drop(db);
+
+        let snapshot = manager
+            .prepare_session_open(session.id)
+            .await
+            .expect("prepare degraded session");
+
+        assert_eq!(
+            snapshot.outcome,
+            Some(SessionOpenTerminalOutcome::DegradedReadOnly { issue_count: 1 })
+        );
+        assert_eq!(manager.active_session_migration_count().await, 0);
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    #[tokio::test]
+    async fn future_writer_preparation_is_incompatible_without_migration() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(Some("future".to_owned()), test_working_directory())
+            .await
+            .expect("current session");
+        let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("session DB");
+        db.database()
+            .update("session_storage_contract")
+            .value("writer_epoch", switchy::database::DatabaseValue::Int64(99))
+            .where_eq("contract_id", switchy::database::DatabaseValue::Int32(1))
+            .execute(db.database())
+            .await
+            .expect("future writer epoch");
+        drop(db);
+
+        let snapshot = manager
+            .prepare_session_open(session.id)
+            .await
+            .expect("classify future writer");
+
+        assert_eq!(
+            snapshot.outcome,
+            Some(SessionOpenTerminalOutcome::WriterIncompatible {
+                actual: Some(99),
+                expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            })
+        );
+        assert_eq!(manager.active_session_migration_count().await, 0);
+        let durable_epoch = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("unchanged future session DB")
+            .storage_writer_epoch()
+            .await
+            .expect("future writer epoch after classification");
+        assert_eq!(durable_epoch, 99);
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    #[tokio::test]
+    async fn stale_compatibility_projection_prepares_repair_required() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(Some("stale".to_owned()), test_working_directory())
+            .await
+            .expect("current session");
+        let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("session DB");
+        let stale_checkpoint = db
+            .last_event_sequence()
+            .await
+            .expect("canonical tail")
+            .expect("created session event")
+            .saturating_add(1);
+        db.database()
+            .update("session_compatibility_state")
+            .value(
+                "last_event_seq",
+                switchy::database::DatabaseValue::Int64(
+                    i64::try_from(stale_checkpoint).expect("checkpoint"),
+                ),
+            )
+            .where_eq("projection_id", switchy::database::DatabaseValue::Int32(1))
+            .execute(db.database())
+            .await
+            .expect("stale checkpoint");
+        drop(db);
+
+        let snapshot = manager
+            .prepare_session_open(session.id)
+            .await
+            .expect("classify stale projection");
+
+        assert!(matches!(
+            snapshot.outcome,
+            Some(SessionOpenTerminalOutcome::RepairRequired { ref reason })
+                if reason.contains("stale")
+        ));
+        assert_eq!(manager.active_session_migration_count().await, 0);
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
     }
 
     #[tokio::test]
@@ -6559,6 +7050,19 @@ mod tests {
         assert_eq!(first.operation_id, second.operation_id);
         assert_eq!(manager.active_session_migration_count().await, 1);
         let operation_id = first.operation_id;
+        let unrelated_session_id = SessionId::new();
+        assert!(
+            manager
+                .session_open_operation(unrelated_session_id, operation_id)
+                .await
+                .is_none()
+        );
+        assert!(
+            manager
+                .subscribe_session_open_operation(unrelated_session_id, operation_id)
+                .await
+                .is_none()
+        );
         drop(first);
         drop(second);
 
@@ -6679,10 +7183,8 @@ mod tests {
             let started = std::time::Instant::now();
             let manager = SessionManager::persistent_with_metrics(&root, metrics.clone())
                 .expect("benchmark manager");
-            manager
-                .require_write_readiness(session_id)
-                .await
-                .expect("benchmark migration");
+            let terminal = prepare_session_until_terminal(&manager, session_id).await;
+            assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
             let elapsed = started.elapsed();
             let storage_bytes = session_database_files(&root, session_id).iter().fold(
                 0_u64,
@@ -6967,10 +7469,12 @@ mod tests {
         };
 
         let manager = SessionManager::persistent(&root).expect("manager should reopen");
+        let terminal = prepare_session_until_terminal(&manager, session_id).await;
+        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
         manager
             .require_write_readiness(session_id)
             .await
-            .expect("legacy diff event should replay during migration");
+            .expect("prepared legacy diff session should be writable");
         let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
             .await
             .expect("migrated database should open");
@@ -6992,7 +7496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exclusive_load_automatically_migrates_missing_legacy_contract() {
+    async fn detached_preparation_migrates_missing_legacy_contract_before_load() {
         let root = unique_temp_dir();
         let session_id = {
             let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -7036,10 +7540,12 @@ mod tests {
         };
 
         let manager = SessionManager::persistent(&root).expect("manager should reopen");
+        let terminal = prepare_session_until_terminal(&manager, session_id).await;
+        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
         manager
             .require_write_readiness(session_id)
             .await
-            .expect("tableless legacy session should migrate automatically");
+            .expect("prepared tableless legacy session should be writable");
         let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
             .await
             .expect("migrated database should open");
@@ -7057,7 +7563,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
     #[tokio::test]
-    async fn concurrent_first_loads_share_one_automatic_legacy_migration() {
+    async fn concurrent_preparations_share_one_detached_legacy_migration() {
         let root = unique_temp_dir();
         let session_id = {
             let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -7090,11 +7596,14 @@ mod tests {
         let restored = SessionManager::persistent_with_metrics(&root, metrics.clone())
             .expect("manager should restore");
         let (first, second) = tokio::join!(
-            restored.require_write_readiness(session_id),
-            restored.require_write_readiness(session_id)
+            restored.prepare_session_open(session_id),
+            restored.prepare_session_open(session_id)
         );
-        first.expect("first load should succeed");
-        second.expect("second load should share the successful load");
+        let first = first.expect("first preparation");
+        let second = second.expect("second preparation");
+        assert_eq!(first.operation_id, second.operation_id);
+        let terminal = prepare_session_until_terminal(&restored, session_id).await;
+        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
         assert_eq!(
             metrics
                 .snapshot()
@@ -7106,7 +7615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_owner_blocks_automatic_legacy_session_migration() {
+    async fn active_owner_blocks_detached_legacy_session_migration() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -7130,11 +7639,13 @@ mod tests {
         drop(db);
 
         let contender = SessionManager::persistent(&root).expect("contender should initialize");
+        let terminal = prepare_session_until_terminal(&contender, session.id).await;
         assert!(matches!(
-            contender.require_write_readiness(session.id).await,
-            Err(SessionError::Lease(
-                crate::lease::SessionLeaseError::OwnedByOtherDaemon { .. }
-            ))
+            terminal.outcome,
+            Some(SessionOpenTerminalOutcome::Failed {
+                kind: SessionOpenFailureKind::OwnedByOtherDaemon,
+                ..
+            })
         ));
         let unchanged = db::SessionDb::open_existing_turso_in_root(session.id, &root)
             .await
@@ -8178,6 +8689,31 @@ mod tests {
                 .await
                 .expect("fixture event should insert");
         }
+        let mut unresolved: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/migrations/interactive-tool-request-unresolved-v32.json"
+        ))
+        .expect("unresolved fixture JSON");
+        unresolved["sequence"] = 4_u64.into();
+        unresolved["session_id"] =
+            serde_json::to_value(session_id).expect("unresolved session ID JSON");
+        db.database()
+            .insert("events")
+            .value("event_seq", switchy::database::DatabaseValue::Int64(4))
+            .value("event_type", "interactive_tool_request_created")
+            .value(
+                "schema_version",
+                switchy::database::DatabaseValue::Int32(32),
+            )
+            .value(
+                "created_at_ms",
+                switchy::database::DatabaseValue::Int64(
+                    unresolved["timestamp_ms"].as_i64().expect("timestamp"),
+                ),
+            )
+            .value("payload", unresolved.to_string())
+            .execute(db.database())
+            .await
+            .expect("unresolved fixture event should insert");
         db.database()
             .update("session_storage_contract")
             .value("writer_epoch", switchy::database::DatabaseValue::Int64(3))
@@ -8237,10 +8773,12 @@ mod tests {
             "catalog discovery and health classification must not mutate fixture storage"
         );
 
+        let terminal = prepare_session_until_terminal(&manager, session_id).await;
+        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
         let attachment = manager
             .attach_session_recent(session_id, ClientId::new(), 10)
             .await
-            .expect("known-legacy fixture should migrate and attach");
+            .expect("prepared known-legacy fixture should attach");
         assert_eq!(
             attachment
                 .history
@@ -8266,7 +8804,7 @@ mod tests {
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3]
+            vec![0, 1, 2, 3, 4]
         );
         assert!(matches!(
             &page.events[1].kind,
@@ -8283,6 +8821,11 @@ mod tests {
             SessionEventKind::AssistantMessage { text }
                 if text == "history continued under schema 35"
         ));
+        assert!(matches!(
+            &page.events[4].kind,
+            SessionEventKind::LegacyEvent { event_type, .. }
+                if event_type == "interactive_tool_request_created"
+        ));
         assert_eq!(
             manager.session_health(session_id).await,
             SessionHealth::Ready
@@ -8295,7 +8838,7 @@ mod tests {
                 .last_event_sequence()
                 .await
                 .expect("canonical tail"),
-            Some(3)
+            Some(4)
         );
         assert!(
             migrated
@@ -8311,6 +8854,16 @@ mod tests {
                 .expect("tool projection")
                 .is_empty()
         );
+        let model_context = manager
+            .model_context_events(session_id)
+            .await
+            .expect("bounded migrated model context");
+        assert_eq!(model_context.len(), 1);
+        assert!(matches!(
+            &model_context[0].kind,
+            SessionEventKind::AssistantMessage { text }
+                if text == "history continued under schema 35"
+        ));
         let report = metrics.report();
         for metric in [
             "session.migration.ownership_duration_ms",
@@ -8339,14 +8892,14 @@ mod tests {
                 .snapshot
                 .counters
                 .get("session.migration.canonical_events_total"),
-            Some(&4)
+            Some(&5)
         );
         assert_eq!(
             report
                 .snapshot
                 .counters
                 .get("session.migration.projected_events_total"),
-            Some(&4)
+            Some(&5)
         );
         assert!(
             report

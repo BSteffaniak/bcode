@@ -342,6 +342,7 @@ const fn client_event_kind(event: &Event) -> &'static str {
         Event::RuntimeWork(_) => "runtime_work",
         Event::SessionViewResyncRequired { .. } => "session_view_resync_required",
         Event::SessionCatalogUpdated { .. } => "session_catalog_updated",
+        Event::SessionOpenProgress { .. } => "session_open_progress",
     }
 }
 
@@ -1480,7 +1481,14 @@ impl ServerState {
             .contains(&client_id)
     }
 
+    async fn active_migration_shutdown_blocker(&self) -> Option<String> {
+        active_migration_shutdown_blocker(self.sessions.active_session_migration_count().await)
+    }
+
     async fn idle_shutdown_blocker(&self) -> Option<String> {
+        if let Some(blocker) = self.active_migration_shutdown_blocker().await {
+            return Some(blocker);
+        }
         let connected_clients = self.clients.lock().await.len();
         if connected_clients > 1 {
             return Some(format!(
@@ -2273,6 +2281,8 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::InvocationInput { session_id, .. }
         | Request::SessionHistory { session_id }
         | Request::SessionHistoryPage { session_id, .. }
+        | Request::PrepareSessionOpen { session_id }
+        | Request::WaitSessionOpenProgress { session_id, .. }
         | Request::AttachSession { session_id }
         | Request::AttachSessionRecent { session_id, .. }
         | Request::SendUserMessage { session_id, .. }
@@ -2321,6 +2331,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::InvocationInput { .. } => "invocation_input",
         Request::SessionHistory { .. } => "session_history",
         Request::SessionHistoryPage { .. } => "session_history_page",
+        Request::PrepareSessionOpen { .. } => "prepare_session_open",
+        Request::WaitSessionOpenProgress { .. } => "wait_session_open_progress",
         Request::AttachSession { .. } => "attach_session",
         Request::AttachSessionRecent { .. } => "attach_session_recent",
         Request::SendUserMessage { .. } => "send_user_message",
@@ -2592,6 +2604,26 @@ async fn handle_request_inner(
         Request::SessionHistoryPage { session_id, query } => {
             handle_session_history_page(request_id, client_id, state, writer, session_id, query)
                 .await
+        }
+        Request::PrepareSessionOpen { session_id } => {
+            handle_prepare_session_open(request_id, state, writer, session_id).await
+        }
+        Request::WaitSessionOpenProgress {
+            session_id,
+            operation_id,
+            after_revision,
+            timeout_ms,
+        } => {
+            handle_wait_session_open_progress(
+                request_id,
+                state,
+                writer,
+                session_id,
+                operation_id,
+                after_revision,
+                timeout_ms,
+            )
+            .await
         }
         Request::AttachSession { session_id } => {
             let client_cwd = state.client_working_directory(client_id).await;
@@ -3151,12 +3183,28 @@ async fn handle_model_catalog_diagnostics(
     .await
 }
 
+fn active_migration_shutdown_blocker(active_migrations: usize) -> Option<String> {
+    (active_migrations > 0).then(|| {
+        format!(
+            "daemon has {active_migrations} active session migration(s); refusing shutdown until migration completes"
+        )
+    })
+}
+
 async fn handle_server_stop(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
     mode: ServerStopMode,
 ) -> Result<(), ServerError> {
+    if let Some(message) = state.active_migration_shutdown_blocker().await {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("daemon_busy", message)),
+        )
+        .await;
+    }
     if mode == ServerStopMode::IfIdle
         && let Some(message) = state.idle_shutdown_blocker().await
     {
@@ -6104,6 +6152,84 @@ async fn handle_session_history(
     }
 }
 
+const MAX_SESSION_OPEN_PROGRESS_WAIT: Duration = Duration::from_secs(5);
+
+async fn handle_prepare_session_open(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    match state.sessions.prepare_session_open(session_id).await {
+        Ok(snapshot) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionOpenPrepared { snapshot }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_wait_session_open_progress(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    operation_id: bcode_session_models::SessionOpenOperationId,
+    after_revision: u64,
+    timeout_ms: u64,
+) -> Result<(), ServerError> {
+    let Some(mut receiver) = state
+        .sessions
+        .subscribe_session_open_operation(session_id, operation_id)
+        .await
+    else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_open_operation_not_found",
+                format!(
+                    "session-open operation {operation_id} does not belong to session {session_id}"
+                ),
+            )),
+        )
+        .await;
+    };
+    let snapshot = wait_session_open_snapshot(&mut receiver, after_revision, timeout_ms).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionOpenPrepared { snapshot }),
+    )
+    .await
+}
+
+async fn wait_session_open_snapshot(
+    receiver: &mut tokio::sync::watch::Receiver<bcode_session_models::SessionOpenOperationSnapshot>,
+    after_revision: u64,
+    timeout_ms: u64,
+) -> bcode_session_models::SessionOpenOperationSnapshot {
+    let current = receiver.borrow_and_update().clone();
+    if current.revision > after_revision || current.outcome.is_some() {
+        return current;
+    }
+    let timeout = Duration::from_millis(timeout_ms).min(MAX_SESSION_OPEN_PROGRESS_WAIT);
+    let _ = tokio::time::timeout(timeout, receiver.changed()).await;
+    receiver.borrow_and_update().clone()
+}
+
 async fn handle_session_history_page(
     request_id: u64,
     client_id: ClientId,
@@ -6172,6 +6298,9 @@ fn session_error_response(error: &bcode_session::SessionError) -> ErrorResponse 
         ) => ErrorResponse::new("session_active_elsewhere", error.to_string()),
         bcode_session::SessionError::ProjectionStale { .. } => {
             ErrorResponse::new("projection_stale", error.to_string())
+        }
+        bcode_session::SessionError::StorageMigrationRequired { .. } => {
+            ErrorResponse::new("session_migration_required", error.to_string())
         }
         bcode_session::SessionError::Db(db_error) => session_db_error_response(db_error),
         bcode_session::SessionError::NotFound(_) => {
@@ -20320,6 +20449,59 @@ mod tests {
     };
     use switchy::database::{DatabaseValue, query::FilterableQuery};
 
+    fn open_progress_snapshot(
+        revision: u64,
+        terminal: bool,
+    ) -> bcode_session_models::SessionOpenOperationSnapshot {
+        bcode_session_models::SessionOpenOperationSnapshot {
+            operation_id: bcode_session_models::SessionOpenOperationId::new(),
+            revision,
+            session_id: SessionId::new(),
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 4,
+            progress: bcode_session_models::SessionMigrationProgress {
+                stage: if terminal {
+                    bcode_session_models::SessionMigrationStage::Complete
+                } else {
+                    bcode_session_models::SessionMigrationStage::RebuildingProjections
+                },
+                completed_units: Some(revision),
+                total_units: Some(10),
+                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Events),
+                message: "progress".to_owned(),
+            },
+            outcome: terminal.then_some(bcode_session_models::SessionOpenTerminalOutcome::Ready),
+            backup_path: None,
+        }
+    }
+
+    #[test]
+    fn active_session_migration_blocks_idle_and_forced_shutdown() {
+        assert_eq!(active_migration_shutdown_blocker(0), None);
+        let blocker = active_migration_shutdown_blocker(2).expect("migration blocker");
+        assert!(blocker.contains("2 active session migration"));
+        assert!(blocker.contains("refusing shutdown until migration completes"));
+    }
+
+    #[tokio::test]
+    async fn session_open_wait_returns_newer_terminal_or_timeout_snapshot() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(open_progress_snapshot(3, false));
+        assert_eq!(
+            wait_session_open_snapshot(&mut receiver, 2, 1_000)
+                .await
+                .revision,
+            3
+        );
+        let started = Instant::now();
+        let timed_out = wait_session_open_snapshot(&mut receiver, 3, 1).await;
+        assert_eq!(timed_out.revision, 3);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        sender.send_replace(open_progress_snapshot(4, true));
+        let terminal = wait_session_open_snapshot(&mut receiver, 4, 1_000).await;
+        assert_eq!(terminal.revision, 4);
+        assert!(terminal.outcome.is_some());
+    }
+
     #[test]
     fn persisted_format_errors_are_actionable_and_not_reported_as_corruption() {
         let cases = [
@@ -27614,47 +27796,167 @@ library = "test"
         }
     }
 
+    async fn assert_current_session_writer_epoch(session_root: &Path, session_id: SessionId) {
+        let db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, session_root)
+                .await
+                .expect("migrated database");
+        assert_eq!(
+            db.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(bcode_session::db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+    }
+
+    async fn wait_for_user_message(state: &ServerState, session_id: SessionId, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let history = state
+                    .sessions
+                    .session_history(session_id)
+                    .await
+                    .expect("history");
+                if history.iter().any(|event| {
+                    matches!(
+                        &event.kind,
+                        SessionEventKind::UserMessage { text, .. } if text == expected
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("message should persist");
+    }
+
+    async fn create_current_session(sessions: &SessionManager, workspace: &Path) -> SessionId {
+        sessions
+            .create_session(Some("current IPC".to_owned()), workspace.to_path_buf())
+            .await
+            .expect("current session")
+            .id
+    }
+
+    async fn assert_current_session_prepares_and_attaches_without_migration(
+        connection: &mut bcode_client::ClientConnection,
+        state: &ServerState,
+        session_id: SessionId,
+    ) {
+        let current = connection
+            .prepare_session_open(session_id)
+            .await
+            .expect("prepare current session over IPC");
+        assert_eq!(
+            current.outcome,
+            Some(bcode_session_models::SessionOpenTerminalOutcome::Ready)
+        );
+        assert_eq!(state.sessions.active_session_migration_count().await, 0);
+        connection
+            .attach_session_recent(session_id, 16)
+            .await
+            .expect("current bounded attach");
+    }
+
+    async fn prepare_legacy_session_with_two_clients_and_disconnect(
+        client: &bcode_client::BcodeClient,
+        mut initiator: bcode_client::ClientConnection,
+        session_id: SessionId,
+    ) -> bcode_session_models::SessionOpenOperationSnapshot {
+        let initial = initiator
+            .prepare_session_open(session_id)
+            .await
+            .expect("initiating preparation");
+        assert!(initial.outcome.is_none());
+        let mut observer = client
+            .connect("legacy-migration-observer-test")
+            .await
+            .expect("connect second observer");
+        let joined = observer
+            .prepare_session_open(session_id)
+            .await
+            .expect("join preparation");
+        assert_eq!(joined.operation_id, initial.operation_id);
+        for stop in [
+            client.server_stop_if_idle().await,
+            client.server_stop().await,
+        ] {
+            assert!(matches!(
+                stop,
+                Err(bcode_client::ClientError::Server { code, message })
+                    if code == "daemon_busy" && message.contains("active session migration")
+            ));
+        }
+        drop(initiator);
+
+        let mut snapshot = joined;
+        while snapshot.outcome.is_none() {
+            snapshot = observer
+                .wait_session_open_progress(
+                    session_id,
+                    snapshot.operation_id,
+                    snapshot.revision,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("observe migration after initiator disconnect");
+        }
+        assert_eq!(
+            snapshot.outcome,
+            Some(bcode_session_models::SessionOpenTerminalOutcome::Ready)
+        );
+        snapshot
+    }
+
+    async fn create_current_and_legacy_ipc_sessions(
+        session_root: &Path,
+        workspace: &Path,
+    ) -> (SessionId, SessionId) {
+        let sessions = SessionManager::persistent(session_root).expect("persistent sessions");
+        let current_session_id = create_current_session(&sessions, workspace).await;
+        let session = sessions
+            .create_session(Some("legacy IPC".to_owned()), workspace.to_path_buf())
+            .await
+            .expect("session");
+        let db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(session.id, session_root)
+                .await
+                .expect("session database");
+        db.database()
+            .delete("__bcode_session_migrations")
+            .where_in(
+                "id",
+                vec![
+                    DatabaseValue::String("026_session_storage_contract_table".to_owned()),
+                    DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
+                    DatabaseValue::String("028_session_compatibility_state".to_owned()),
+                    DatabaseValue::String("029_session_compatibility_issues".to_owned()),
+                ],
+            )
+            .execute(db.database())
+            .await
+            .expect("remove contract migrations");
+        db.database()
+            .drop_table("session_storage_contract")
+            .execute(db.database())
+            .await
+            .expect("drop contract table");
+        std::fs::write(
+            bcode_session::db::session_dir_path(session_root, session.id)
+                .join("migration-overlap.sidecar"),
+            vec![0x5a; 16 * 1024 * 1024],
+        )
+        .expect("migration overlap sidecar");
+        (session.id, current_session_id)
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn legacy_session_migrates_across_real_attach_and_send_ipc() {
         let workspace = tempfile::tempdir().expect("IPC workspace");
         let session_root = workspace.path().join("sessions");
-        let session_id = {
-            let sessions = SessionManager::persistent(&session_root).expect("persistent sessions");
-            let session = sessions
-                .create_session(
-                    Some("legacy IPC".to_owned()),
-                    workspace.path().to_path_buf(),
-                )
-                .await
-                .expect("session");
-            let db = bcode_session::db::SessionDb::open_existing_turso_in_root(
-                session.id,
-                &session_root,
-            )
-            .await
-            .expect("session database");
-            db.database()
-                .delete("__bcode_session_migrations")
-                .where_in(
-                    "id",
-                    vec![
-                        DatabaseValue::String("026_session_storage_contract_table".to_owned()),
-                        DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
-                        DatabaseValue::String("028_session_compatibility_state".to_owned()),
-                        DatabaseValue::String("029_session_compatibility_issues".to_owned()),
-                    ],
-                )
-                .execute(db.database())
-                .await
-                .expect("remove contract migrations");
-            db.database()
-                .drop_table("session_storage_contract")
-                .execute(db.database())
-                .await
-                .expect("drop contract table");
-            session.id
-        };
+        let (session_id, current_session_id) =
+            create_current_and_legacy_ipc_sessions(&session_root, workspace.path()).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let sessions = SessionManager::persistent(&session_root).expect("restored sessions");
@@ -27677,6 +27979,39 @@ library = "test"
             .connect("legacy-migration-test")
             .await
             .expect("connect");
+        assert_current_session_prepares_and_attaches_without_migration(
+            &mut connection,
+            state.as_ref(),
+            current_session_id,
+        )
+        .await;
+
+        let terminal =
+            prepare_legacy_session_with_two_clients_and_disconnect(&client, connection, session_id)
+                .await;
+        let mut reconnected = client
+            .connect("legacy-migration-reconnect-test")
+            .await
+            .expect("reconnect");
+        let recovered = reconnected
+            .wait_session_open_progress(
+                session_id,
+                terminal.operation_id,
+                terminal.revision,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("recover retained terminal snapshot");
+        assert_eq!(recovered, terminal);
+        let backup_root = workspace.path().join("session-migration-backups");
+        assert_eq!(
+            std::fs::read_dir(&backup_root)
+                .expect("migration backup root")
+                .count(),
+            1,
+            "two observers must share one retained backup"
+        );
+        let mut connection = reconnected;
         connection
             .attach_session_recent(session_id, 16)
             .await
@@ -27689,34 +28024,8 @@ library = "test"
             )
             .await
             .expect("send should be accepted");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let history = state
-                    .sessions
-                    .session_history(session_id)
-                    .await
-                    .expect("history");
-                if history.iter().any(|event| {
-                    matches!(
-                        &event.kind,
-                        SessionEventKind::UserMessage { text, .. } if text == "after migration"
-                    )
-                }) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("message should persist");
-        let db =
-            bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &session_root)
-                .await
-                .expect("migrated database");
-        assert_eq!(
-            db.storage_writer_epoch().await.expect("writer epoch"),
-            u64::from(bcode_session::db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
-        );
+        wait_for_user_message(state.as_ref(), session_id, "after migration").await;
+        assert_current_session_writer_epoch(&session_root, session_id).await;
         server.abort();
     }
 
@@ -27752,7 +28061,8 @@ library = "test"
                     | bcode_ipc::Event::SessionLive(_)
                     | bcode_ipc::Event::SessionViewResyncRequired { .. }) => break event,
                     bcode_ipc::Event::RuntimeWork(_)
-                    | bcode_ipc::Event::SessionCatalogUpdated { .. } => {}
+                    | bcode_ipc::Event::SessionCatalogUpdated { .. }
+                    | bcode_ipc::Event::SessionOpenProgress { .. } => {}
                 }
             }
         })

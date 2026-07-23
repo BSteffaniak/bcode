@@ -347,6 +347,18 @@ if ! rg -q 'explicit_reindex_accepts_retired_interactive_events_as_inert_history
   violations=1
 fi
 
+if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 13' packages/ipc/src/lib.rs \
+  || ! rg -q 'PrepareSessionOpen' packages/ipc/src/lib.rs \
+  || ! rg -q 'WaitSessionOpenProgress' packages/ipc/src/lib.rs \
+  || ! rg -q 'SessionOpenPrepared' packages/ipc/src/lib.rs \
+  || ! rg -q 'session_open_preparation_requests_and_response_round_trip' packages/ipc/src/lib.rs \
+  || ! rg -q 'session_open_wait_returns_newer_terminal_or_timeout_snapshot' packages/server/src/lib.rs \
+  || ! rg -q 'session_open_operation_not_found' packages/server/src/lib.rs \
+  || ! rg -q 'prepare_session_open_until_terminal' packages/client/src/lib.rs; then
+  echo "Session migration IPC violation: protocol-v13 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
+  violations=1
+fi
+
 if ! rg -q 'canonical_row_count_and_tail' packages/session/src/db.rs \
   || ! rg -q 'expected_backup_bytes' packages/session/src/lib.rs \
   || ! rg -q 'assert_successful_migration_progress' packages/session/src/lib.rs \
@@ -398,7 +410,7 @@ fi
 if ! rg -q 'streaming_migration_backup_handles_nested_empty_and_large_files' packages/session/src/lib.rs \
   || ! rg -q 'streaming_migration_backup_refuses_conflicts_and_cleans_failed_copy' packages/session/src/lib.rs \
   || ! rg -q 'migration_backup_faults_are_deterministic_and_cleanup_partial_output' packages/session/src/lib.rs \
-  || ! rg -q 'exclusive_load_automatically_migrates_legacy_storage' packages/session/src/lib.rs \
+  || ! rg -q 'detached_preparation_migrates_legacy_storage_before_exclusive_load' packages/session/src/lib.rs \
   || ! rg -q 'failed_migration_backup_prevents_every_storage_mutation' packages/session/src/lib.rs; then
   echo "Session migration backup violation: streaming, retained-success, conflict, cleanup, and mutation-fence regressions must remain covered." >&2
   violations=1
@@ -464,6 +476,33 @@ done
 
 if ! rg -q 'mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_history' packages/session/src/lib.rs; then
   echo "Session fixture-corpus violation: mixed schema-32/schema-35 history must retain store-level discovery, migration, bounded-history, and inert-runtime coverage." >&2
+  violations=1
+fi
+
+migration_load_body="$(sed -n '/async fn ensure_session_loaded_with_progress(/,/async fn refresh_summary_session(/p' packages/session/src/lib.rs)"
+if ! grep -q 'session_load_gate(session_id)' <<<"$migration_load_body" \
+  || ! grep -q 'let _guard = gate.lock().await' <<<"$migration_load_body" \
+  || ! grep -q 'if progress.is_none()' <<<"$migration_load_body" \
+  || ! grep -q 'StorageMigrationRequired' <<<"$migration_load_body" \
+  || [[ "$(grep -c 'storage_compatibility' <<<"$migration_load_body")" -lt 2 ]] \
+  || ! grep -q 'acquire_maintenance_session_write_lock' <<<"$migration_load_body"; then
+  echo "Session migration gate violation: detached migration must retain the per-session load gate and ownership compatibility rechecks." >&2
+  violations=1
+fi
+
+if ! rg -q "maintenance: &'a lease::SessionMaintenanceGuard" packages/session/src/lib.rs \
+  || ! rg -q "write: &'a lease::SessionWriteGuard" packages/session/src/lib.rs \
+  || ! grep -q 'validate_write_readiness().await' <<<"$migration_load_body" \
+  || ! grep -q 'transition_session_maintenance_to_lease' <<<"$migration_load_body"; then
+  echo "Session migration capability violation: maintenance and write guards must remain borrowed through migration and write-readiness validation before lease transition." >&2
+  violations=1
+fi
+
+if ! rg -q 'preparation_recovers_retained_operation_after_transport_interruption' packages/client/src/lib.rs \
+  || ! rg -q 'dropping_progress_receiver_stops_client_observation_cleanly' packages/client/src/lib.rs \
+  || ! rg -q 'unrelated_events_remain_buffered_in_fifo_order_during_requests' packages/client/src/lib.rs \
+  || ! rg -q 'only_ready_terminal_outcome_allows_writable_attach' packages/client/src/lib.rs; then
+  echo "Session client-observer violation: reconnect, receiver-drop, FIFO buffering, and ready-only attach regression coverage must remain present." >&2
   violations=1
 fi
 
