@@ -274,7 +274,13 @@ pub fn remove_record_if_instance(
 
 async fn probe_daemon_status(endpoint: &IpcEndpoint) -> Option<bcode_ipc::DaemonStatus> {
     let mut stream = bcode_ipc::LocalIpcStream::connect(endpoint).await.ok()?;
-    let envelope = bcode_ipc::request_envelope(2, &bcode_ipc::Request::ServerStatus).ok()?;
+    let envelope = bcode_ipc::request_envelope(
+        2,
+        &bcode_ipc::Request::ServerStatus {
+            working_directory: None,
+        },
+    )
+    .ok()?;
     bcode_ipc::send_envelope(&mut stream, &envelope)
         .await
         .ok()?;

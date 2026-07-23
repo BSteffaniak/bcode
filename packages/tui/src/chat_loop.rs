@@ -350,6 +350,7 @@ async fn run_chat_loop<W: Write>(
                 let services = TuiServices {
                     client,
                     passive_client,
+                    launch_working_directory: settings.launch_working_directory(),
                     keymap: &settings.keymap,
                     theme: render::TuiTheme::for_app(&chat.app),
                 };
@@ -387,6 +388,7 @@ async fn run_chat_loop<W: Write>(
                     services: TuiServices {
                         client,
                         passive_client,
+                        launch_working_directory: settings.launch_working_directory(),
                         keymap: &settings.keymap,
                         theme: render::TuiTheme::for_app(&chat.app),
                     },

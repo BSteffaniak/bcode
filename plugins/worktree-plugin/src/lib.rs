@@ -146,10 +146,12 @@ fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
 }
 
 fn list_worktrees_command(request: &InvokeCommandRequest) -> ServiceResponse {
-    let cwd = request
-        .args
-        .get("cwd")
-        .map_or_else(current_dir, PathBuf::from);
+    let Some(cwd) = request.args.get("cwd").map(PathBuf::from) else {
+        return ServiceResponse::error(
+            "worktree_cwd_required",
+            "worktree commands require an explicit cwd",
+        );
+    };
     match bcode_worktree::list_worktrees(&cwd) {
         Ok(response) => {
             let mut lines = vec![format!(
@@ -238,10 +240,9 @@ fn invoke_list(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
         Ok(request) => request,
         Err(error) => return tool_error(error.to_string()),
     };
-    let cwd = request
-        .cwd
-        .or_else(|| invocation.cwd.clone())
-        .unwrap_or_else(current_dir);
+    let Some(cwd) = request.cwd.or_else(|| invocation.cwd.clone()) else {
+        return tool_error("worktree.list requires an invocation cwd".to_string());
+    };
     match bcode_worktree::list_worktrees(&cwd) {
         Ok(response) => json_tool_response_with_artifact(
             &response,
@@ -263,8 +264,11 @@ fn invoke_create(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
     if request.cwd.is_none() {
         request.cwd.clone_from(&invocation.cwd);
     }
-    let cwd = request.cwd.clone().unwrap_or_else(current_dir);
-    let config = match bcode_config::load_config() {
+    let Some(cwd) = request.cwd.clone() else {
+        return tool_error("worktree.create requires an invocation cwd".to_string());
+    };
+    let config_paths = bcode_config::default_config_paths_from(&cwd);
+    let config = match bcode_config::load_config_from_paths(&config_paths) {
         Ok(config) => config,
         Err(error) => return tool_error(error.to_string()),
     };
@@ -286,11 +290,9 @@ fn invoke_remove(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
             Ok(request) => request,
             Err(error) => return tool_error(error.to_string()),
         };
-    let cwd = request
-        .cwd
-        .clone()
-        .or_else(|| invocation.cwd.clone())
-        .unwrap_or_else(current_dir);
+    let Some(cwd) = request.cwd.clone().or_else(|| invocation.cwd.clone()) else {
+        return tool_error("worktree.remove requires an invocation cwd".to_string());
+    };
     match bcode_worktree::remove_worktree(&cwd, &request.path, request.force) {
         Ok(response) => json_tool_response_with_artifact(
             &response,
@@ -428,10 +430,6 @@ fn remove_definition() -> ToolDefinition {
         },
         ui: tool_ui("removing worktree"),
     }
-}
-
-fn current_dir() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
@@ -697,7 +695,9 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for WorktreeCommandSurfaceFa
         let surface_kind = self.surface_kind;
         let title = self.title;
         Box::pin(async move {
-            let repo_path = request.repo_path.unwrap_or_else(current_dir);
+            let Some(repo_path) = request.repo_path else {
+                return Err("worktree surfaces require an explicit repo path".into());
+            };
             let (lines, worktrees) = worktree_surface_state(surface_kind, &repo_path);
             let session_id = request
                 .options
@@ -861,7 +861,8 @@ impl WorktreeCommandSurface {
             new_session: self.session_id.is_none(),
             no_setup: false,
         };
-        let config = match bcode_config::load_config() {
+        let config_paths = bcode_config::default_config_paths_from(&self.repo_path);
+        let config = match bcode_config::load_config_from_paths(&config_paths) {
             Ok(config) => config,
             Err(error) => {
                 self.status = Some(format!("worktree config unavailable: {error}"));

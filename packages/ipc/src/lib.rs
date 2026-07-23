@@ -206,7 +206,11 @@ pub enum Request {
         daemon_namespace: String,
     },
     Ping,
-    ServerStatus,
+    ServerStatus {
+        /// Client working directory used to scope repository-local status.
+        #[serde(default)]
+        working_directory: Option<PathBuf>,
+    },
     ServerStop {
         #[serde(default)]
         mode: ServerStopMode,
@@ -368,6 +372,9 @@ pub enum Request {
     ImportExternalSession {
         source_id: String,
         external_session_id: String,
+        /// Client working directory used when the imported source has no cwd metadata.
+        #[serde(default)]
+        working_directory: Option<PathBuf>,
     },
     ForkSession {
         source_session_id: SessionId,
@@ -451,6 +458,9 @@ pub enum ServerStopMode {
 /// Per-client model/provider/auth context supplied at connection time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientRuntimeContext {
+    /// Canonical working directory of the client process.
+    #[serde(default)]
+    pub working_directory: Option<PathBuf>,
     #[serde(default)]
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]
@@ -2452,6 +2462,7 @@ mod tests {
             client_name: "test".to_string(),
             daemon_namespace: daemon_namespace(),
             runtime_context: Some(ClientRuntimeContext {
+                working_directory: Some(PathBuf::from("/tmp/client")),
                 selected_provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 selected_model_id: Some("model".to_string()),
                 requested_model_id: None,

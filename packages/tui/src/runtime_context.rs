@@ -26,6 +26,8 @@ pub struct TuiServices<'a> {
     pub client: &'a BcodeClient,
     /// Passive client used for background hydration/polling; never starts the daemon.
     pub passive_client: &'a BcodeClient,
+    /// Canonical directory where this TUI was launched.
+    pub launch_working_directory: &'a std::path::Path,
     pub keymap: &'a BmuxKeyMap,
     pub theme: TuiTheme,
 }

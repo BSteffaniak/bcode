@@ -428,12 +428,15 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
 async fn worktree_command(
     client: &BcodeClient,
     session_id: Option<SessionId>,
+    working_directory: &std::path::Path,
     parts: &[&str],
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     match parts.get(1).copied() {
         Some("list") => {
             let response = client
-                .list_worktrees(WorktreeListRequest { cwd: None })
+                .list_worktrees(WorktreeListRequest {
+                    cwd: Some(working_directory.to_path_buf()),
+                })
                 .await?;
             let mut lines = vec![format!(
                 "worktrees for {}",
@@ -577,6 +580,7 @@ fn slash_client_issue(label: &str, error: &bcode_client::ClientError) -> SlashCo
 pub async fn execute_resolved(
     client: &BcodeClient,
     session_id: Option<SessionId>,
+    working_directory: &std::path::Path,
     current_agent_id: &str,
     message: &str,
     resolution: slash_registry::SlashResolution,
@@ -587,6 +591,7 @@ pub async fn execute_resolved(
             execute_builtin(
                 client,
                 session_id,
+                working_directory,
                 current_agent_id,
                 message,
                 &parts,
@@ -622,6 +627,7 @@ pub async fn execute_resolved(
 async fn execute_builtin(
     client: &BcodeClient,
     session_id: Option<SessionId>,
+    working_directory: &std::path::Path,
     current_agent_id: &str,
     message: &str,
     parts: &[&str],
@@ -721,7 +727,9 @@ async fn execute_builtin(
             };
             Ok(cwd_command(session_id, parts))
         }
-        "worktree" | "worktrees" => worktree_command(client, session_id, parts).await,
+        "worktree" | "worktrees" => {
+            worktree_command(client, session_id, working_directory, parts).await
+        }
         "fork" => {
             if session_id.is_none() {
                 return Ok(SlashCommandOutcome::Handled(

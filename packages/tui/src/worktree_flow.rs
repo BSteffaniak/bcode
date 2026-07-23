@@ -67,10 +67,12 @@ pub async fn create_for_current_session<W: Write>(
                     chat.start_effect(TuiEffect::CreateWorktree {
                         request: bcode_worktree_models::WorktreeCreateRequest {
                             name,
-                            cwd: chat
-                                .app
-                                .working_directory()
-                                .map(std::path::Path::to_path_buf),
+                            cwd: Some(
+                                chat.app
+                                    .working_directory()
+                                    .unwrap_or(services.launch_working_directory)
+                                    .to_path_buf(),
+                            ),
                             path: None,
                             branch: None,
                             new_branch: None,

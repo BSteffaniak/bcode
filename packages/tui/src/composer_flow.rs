@@ -114,6 +114,9 @@ async fn handle_slash_command<W: Write>(
     match slash_commands::execute_resolved(
         services.passive_client,
         session_id,
+        chat.app
+            .working_directory()
+            .unwrap_or(services.launch_working_directory),
         chat.app.current_agent_id(),
         message,
         resolution,

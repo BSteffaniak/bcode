@@ -10,9 +10,9 @@ use bcode_agent_policy::{
     default_config as policy_default_config,
 };
 use bcode_agent_profile::{
-    AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentInfo, AgentList,
-    EvaluateToolCallRequest, OP_AGENT_CONTEXT, OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS,
-    OP_POLICY_STATUS, PolicyStatusResponse,
+    AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
+    AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
+    OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::Deserialize;
@@ -227,14 +227,16 @@ fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
+    let Some(cwd) = request.cwd.as_deref().map(PathBuf::from) else {
+        return json_response(&EvaluateToolCallResponse {
+            decision: AgentDecision::Ask,
+            reason: Some("tool policy requires an explicit session working directory".to_string()),
+        });
+    };
     let (config, _) = load_config();
     let mut agent = agent_config(&config, &request.agent_id);
     let tools_config = load_tools_config();
     apply_tool_selection_for_evaluation(&mut agent, &tools_config, &request.tool_name);
-    let cwd = request.cwd.as_deref().map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        PathBuf::from,
-    );
     let evaluation = evaluate_profile_tool_call(&agent, &request, &cwd);
     json_response(&evaluation)
 }

@@ -295,8 +295,35 @@ const CLIENT_RUNTIME_ENV_VARS: &[&str] = &[
     "AWS_BEARER_TOKEN_BEDROCK",
 ];
 
-fn current_runtime_context() -> Option<ClientRuntimeContext> {
-    let config = bcode_config::load_config().ok()?;
+fn resolve_caller_path(path: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    resolve_path_from(path, &current_working_directory())
+}
+
+fn resolve_path_from(
+    path: Option<std::path::PathBuf>,
+    caller_cwd: &std::path::Path,
+) -> std::path::PathBuf {
+    let path = path.map_or_else(
+        || caller_cwd.to_path_buf(),
+        |path| {
+            if path.is_absolute() {
+                path
+            } else {
+                caller_cwd.join(path)
+            }
+        },
+    );
+    path.canonicalize().unwrap_or(path)
+}
+
+fn current_runtime_context() -> ClientRuntimeContext {
+    let working_directory = current_working_directory();
+    let Ok(config) = bcode_config::load_config() else {
+        return ClientRuntimeContext {
+            working_directory: Some(working_directory),
+            ..ClientRuntimeContext::default()
+        };
+    };
     let mut env = CLIENT_RUNTIME_ENV_VARS
         .iter()
         .filter_map(|name| match std::env::var(name) {
@@ -316,7 +343,8 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
         &mut env,
     );
     let env_keys = env.keys().cloned().map(|key| (key, true)).collect();
-    Some(ClientRuntimeContext {
+    ClientRuntimeContext {
+        working_directory: Some(working_directory),
         selected_provider_plugin_id: resolved.provider_plugin_id,
         selected_model_id: resolved.model_id,
         requested_model_id: resolved.selected_model_id,
@@ -334,7 +362,7 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
         },
         interaction_adapters: Vec::new(),
         env_keys,
-    })
+    }
 }
 
 fn selected_auth_profile(resolved: &bcode_config::ResolvedModelSelection) -> Option<String> {
@@ -736,7 +764,7 @@ impl BcodeClient {
     pub fn default_endpoint() -> Self {
         Self {
             endpoint: default_endpoint(),
-            runtime_context: current_runtime_context(),
+            runtime_context: Some(current_runtime_context()),
             daemon_availability: DaemonAvailability::AutoStart,
             request_timeout: configured_request_timeout(),
         }
@@ -909,7 +937,12 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn server_status(&self) -> Result<bcode_ipc::ServerStatus, ClientError> {
-        match self.send_request(Request::ServerStatus).await? {
+        match self
+            .send_request(Request::ServerStatus {
+                working_directory: Some(current_working_directory()),
+            })
+            .await?
+        {
             ResponsePayload::ServerStatus { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1175,6 +1208,7 @@ impl BcodeClient {
             .send_request(Request::ImportExternalSession {
                 source_id: source_id.into(),
                 external_session_id: external_session_id.into(),
+                working_directory: Some(current_working_directory()),
             })
             .await?
         {
@@ -1245,8 +1279,9 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_worktrees(
         &self,
-        request: WorktreeListRequest,
+        mut request: WorktreeListRequest,
     ) -> Result<WorktreeListResponse, ClientError> {
+        request.cwd = Some(resolve_caller_path(request.cwd));
         match self.send_request(Request::ListWorktrees(request)).await? {
             ResponsePayload::WorktreeList(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
@@ -1260,8 +1295,9 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn create_worktree(
         &self,
-        request: WorktreeCreateRequest,
+        mut request: WorktreeCreateRequest,
     ) -> Result<WorktreeCreateResponse, ClientError> {
+        request.cwd = Some(resolve_caller_path(request.cwd));
         match self.send_request(Request::CreateWorktree(request)).await? {
             ResponsePayload::WorktreeCreated(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
@@ -1275,8 +1311,9 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn remove_worktree(
         &self,
-        request: WorktreeRemoveRequest,
+        mut request: WorktreeRemoveRequest,
     ) -> Result<WorktreeRemoveResponse, ClientError> {
+        request.cwd = Some(resolve_caller_path(request.cwd));
         match self.send_request(Request::RemoveWorktree(request)).await? {
             ResponsePayload::WorktreeRemoved(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
@@ -2401,7 +2438,8 @@ impl ClientConnection {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn refresh_runtime_context(&mut self) -> Result<(), ClientError> {
-        self.update_runtime_context(current_runtime_context()).await
+        self.update_runtime_context(Some(current_runtime_context()))
+            .await
     }
 
     /// Subscribe this connection to catalog update events.
@@ -2691,8 +2729,27 @@ impl ClientConnection {
 
 #[cfg(test)]
 mod client_timeout_tests {
-    use super::BcodeClient;
+    use super::{BcodeClient, resolve_path_from};
+    use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn caller_paths_are_absolute_and_relative_paths_use_the_caller_cwd() {
+        let caller_cwd = Path::new("/tmp/bcode-client-cwd");
+
+        assert_eq!(
+            resolve_path_from(None, caller_cwd),
+            caller_cwd.to_path_buf()
+        );
+        assert_eq!(
+            resolve_path_from(Some("nested".into()), caller_cwd),
+            caller_cwd.join("nested")
+        );
+        assert_eq!(
+            resolve_path_from(Some("/tmp/explicit".into()), caller_cwd),
+            Path::new("/tmp/explicit")
+        );
+    }
 
     #[test]
     fn default_endpoint_honors_process_config_override() {

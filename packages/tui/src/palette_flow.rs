@@ -169,9 +169,11 @@ async fn dispatch_plugin_command_with_arguments<W: Write>(
     arguments: Option<String>,
 ) -> Result<(), TuiError> {
     let mut args = BTreeMap::new();
-    if let Some(cwd) = chat.app.working_directory() {
-        args.insert("cwd".to_string(), cwd.display().to_string());
-    }
+    let cwd = chat
+        .app
+        .working_directory()
+        .unwrap_or(services.launch_working_directory);
+    args.insert("cwd".to_string(), cwd.display().to_string());
     if let Some(session_id) = chat.app.session_id() {
         args.insert("session_id".to_string(), session_id.to_string());
     }
@@ -258,10 +260,12 @@ async fn open_command_plugin_surface<W: Write>(
         &surface_kind,
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
             instance_id: instance_id.clone(),
-            repo_path: chat
-                .app
-                .working_directory()
-                .map(std::path::Path::to_path_buf),
+            repo_path: Some(
+                chat.app
+                    .working_directory()
+                    .unwrap_or(services.launch_working_directory)
+                    .to_path_buf(),
+            ),
             target: None,
             options,
         },

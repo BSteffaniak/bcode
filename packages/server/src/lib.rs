@@ -1337,6 +1337,12 @@ impl ServerState {
             .cloned()
     }
 
+    async fn client_working_directory(&self, client_id: ClientId) -> Option<PathBuf> {
+        self.client_runtime_context(client_id)
+            .await
+            .and_then(|context| context.working_directory)
+    }
+
     async fn client_supports_exchange(
         &self,
         client_id: ClientId,
@@ -1511,11 +1517,12 @@ impl ServerState {
         None
     }
 
-    async fn status(&self) -> ServerStatus {
-        let sessions = self
-            .sessions
-            .cached_sessions(&bcode_ipc::current_working_directory())
-            .await;
+    async fn status(&self, working_directory: Option<&Path>) -> ServerStatus {
+        let sessions = if let Some(working_directory) = working_directory {
+            self.sessions.cached_sessions(working_directory).await
+        } else {
+            Vec::new()
+        };
         let status = catalog_status_to_ipc(self.sessions.catalog_status());
         ServerStatus {
             connected_client_count: self.clients.lock().await.len(),
@@ -2297,7 +2304,7 @@ const fn request_kind(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
         Request::Ping => "ping",
-        Request::ServerStatus => "server_status",
+        Request::ServerStatus { .. } => "server_status",
         Request::ModelCatalogDiagnostics => "model_catalog_diagnostics",
         Request::ServerStop { .. } => "server_stop",
         Request::CreateSession { .. } => "create_session",
@@ -2437,7 +2444,9 @@ async fn handle_request_inner(
             .await
         }
         Request::Ping => handle_ping(request_id, writer).await,
-        Request::ServerStatus => handle_server_status(request_id, state, writer).await,
+        Request::ServerStatus { working_directory } => {
+            handle_server_status(request_id, state, writer, working_directory.as_deref()).await
+        }
         Request::ModelCatalogDiagnostics => {
             handle_model_catalog_diagnostics(request_id, state, writer).await
         }
@@ -2576,7 +2585,10 @@ async fn handle_request_inner(
                 .await
         }
         Request::AttachSession { session_id } => {
-            let session_id = session_import::resolve_attach_session_id(state, session_id).await;
+            let client_cwd = state.client_working_directory(client_id).await;
+            let session_id =
+                session_import::resolve_attach_session_id(state, session_id, client_cwd.as_deref())
+                    .await;
             handle_attach_session(
                 request_id,
                 client_id,
@@ -2588,7 +2600,10 @@ async fn handle_request_inner(
             .await
         }
         Request::AttachSessionRecent { session_id, limit } => {
-            let session_id = session_import::resolve_attach_session_id(state, session_id).await;
+            let client_cwd = state.client_working_directory(client_id).await;
+            let session_id =
+                session_import::resolve_attach_session_id(state, session_id, client_cwd.as_deref())
+                    .await;
             handle_attach_session_recent(
                 request_id,
                 client_id,
@@ -2604,7 +2619,10 @@ async fn handle_request_inner(
             session_id,
             request,
         } => {
-            let session_id = session_import::resolve_attach_session_id(state, session_id).await;
+            let client_cwd = state.client_working_directory(client_id).await;
+            let session_id =
+                session_import::resolve_attach_session_id(state, session_id, client_cwd.as_deref())
+                    .await;
             handle_attach_session_projection_window(
                 request_id,
                 client_id,
@@ -2619,6 +2637,7 @@ async fn handle_request_inner(
         Request::ImportExternalSession {
             source_id,
             external_session_id,
+            working_directory,
         } => {
             session_import::handle_import_external_session(
                 request_id,
@@ -2626,6 +2645,7 @@ async fn handle_request_inner(
                 writer,
                 &source_id,
                 &external_session_id,
+                working_directory,
             )
             .await
         }
@@ -2633,8 +2653,17 @@ async fn handle_request_inner(
             working_directory,
             sources,
         } => {
-            let working_directory =
-                working_directory.unwrap_or_else(bcode_ipc::current_working_directory);
+            let Some(working_directory) = working_directory else {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "catalog_cwd_required",
+                        "catalog refresh requests must include the caller working directory",
+                    )),
+                )
+                .await;
+            };
             handle_refresh_session_catalog(
                 request_id,
                 state,
@@ -3047,8 +3076,9 @@ async fn handle_server_status(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
+    working_directory: Option<&Path>,
 ) -> Result<(), ServerError> {
-    let status = state.status().await;
+    let status = state.status(working_directory).await;
     send_response(
         writer,
         request_id,
@@ -3340,7 +3370,17 @@ async fn handle_list_worktrees(
     writer: &SharedWriter,
     request: WorktreeListRequest,
 ) -> Result<(), ServerError> {
-    let cwd = request.cwd.unwrap_or_else(current_request_cwd);
+    let Some(cwd) = request.cwd else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "worktree_cwd_required",
+                "worktree requests must include the caller working directory",
+            )),
+        )
+        .await;
+    };
     match bcode_worktree::list_worktrees(&cwd) {
         Ok(response) => {
             send_response(
@@ -5171,7 +5211,17 @@ async fn handle_create_worktree(
         )
         .await;
     }
-    let cwd = request.cwd.clone().unwrap_or_else(current_request_cwd);
+    let Some(cwd) = request.cwd.clone() else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "worktree_cwd_required",
+                "worktree requests must include the caller working directory",
+            )),
+        )
+        .await;
+    };
     let config_paths = bcode_config::default_config_paths_from(&cwd);
     let config = bcode_config::load_config_from_paths(&config_paths)?;
     match bcode_worktree::create_worktree(&config, &request, &cwd) {
@@ -5233,7 +5283,17 @@ async fn handle_remove_worktree(
     writer: &SharedWriter,
     request: WorktreeRemoveRequest,
 ) -> Result<(), ServerError> {
-    let cwd = request.cwd.clone().unwrap_or_else(current_request_cwd);
+    let Some(cwd) = request.cwd.clone() else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "worktree_cwd_required",
+                "worktree requests must include the caller working directory",
+            )),
+        )
+        .await;
+    };
     let sessions = state.sessions.cached_sessions(&cwd).await;
     if let Some(session) = sessions
         .iter()
@@ -5274,10 +5334,6 @@ async fn handle_remove_worktree(
             .await
         }
     }
-}
-
-fn current_request_cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn path_is_inside(path: &Path, root: &Path) -> bool {

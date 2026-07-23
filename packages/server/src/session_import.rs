@@ -11,7 +11,7 @@ use bcode_session_models::{
     ClientId, SessionEventKind, SessionEventProvenance, SessionId, SessionImportSummary,
 };
 use sha2::{Digest as _, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -47,8 +47,12 @@ pub async fn import_external_session(
     state: &ServerState,
     source_id: &str,
     external_session_id: &str,
+    fallback_working_directory: &Path,
 ) -> Result<(SessionId, Vec<bcode_session_import::ImportWarning>), String> {
-    if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
+    let config_paths = bcode_config::default_config_paths_from(fallback_working_directory);
+    if !bcode_config::load_config_from_paths(&config_paths)
+        .map_or(true, |config| config.session_import.enabled)
+    {
         return Err("session import is disabled".to_string());
     }
     if let Some(existing) = all_cached_sessions(state)
@@ -110,7 +114,7 @@ pub async fn import_external_session(
             .summary
             .working_directory
             .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .unwrap_or_else(|| fallback_working_directory.to_path_buf());
         let events = importable
             .events
             .into_iter()
@@ -237,8 +241,20 @@ pub async fn handle_import_external_session(
     writer: &SharedWriter,
     source_id: &str,
     external_session_id: &str,
+    working_directory: Option<PathBuf>,
 ) -> Result<(), ServerError> {
-    match import_external_session(state, source_id, external_session_id).await {
+    let Some(working_directory) = working_directory else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "import_cwd_required",
+                "session import requests must include the caller working directory",
+            )),
+        )
+        .await;
+    };
+    match import_external_session(state, source_id, external_session_id, &working_directory).await {
         Ok((session_id, warnings)) => {
             let session = state.sessions.session_summary(session_id).await?;
             state
@@ -278,6 +294,7 @@ fn import_warning_to_ipc(warning: bcode_session_import::ImportWarning) -> Sessio
 pub async fn resolve_attach_session_id(
     state: &Arc<ServerState>,
     session_id: SessionId,
+    fallback_working_directory: Option<&Path>,
 ) -> SessionId {
     if state.sessions.session_summary(session_id).await.is_ok() {
         return session_id;
@@ -287,7 +304,20 @@ pub async fn resolve_attach_session_id(
     else {
         return session_id;
     };
-    match import_external_session(state, &source_id, &external_session_id).await {
+    let Some(fallback_working_directory) = fallback_working_directory else {
+        tracing::warn!(
+            "cannot import external session {source_id}/{external_session_id} without client cwd"
+        );
+        return session_id;
+    };
+    match import_external_session(
+        state,
+        &source_id,
+        &external_session_id,
+        fallback_working_directory,
+    )
+    .await
+    {
         Ok((imported_session_id, warnings)) => {
             if let Ok(session) = state.sessions.session_summary(imported_session_id).await {
                 state.session_catalog.upsert_native_session(session).await;
