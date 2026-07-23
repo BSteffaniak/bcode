@@ -1,4 +1,4 @@
-//! Home page for the Bcode web renderer.
+//! Home page for the Bcode `HyperChad` application.
 
 use bcode_plugin_sdk::path::display_from_current_dir;
 use std::collections::BTreeMap;
@@ -200,7 +200,7 @@ static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
         ])
     });
 
-/// Render the Bcode web renderer shell.
+/// Render the Bcode `HyperChad` application shell.
 #[must_use]
 pub fn home(
     snapshot: &SessionViewSnapshot,
@@ -1928,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn web_shell_renders_all_primary_regions_including_runtime_state() {
+    fn hyperchad_shell_renders_all_primary_regions_including_runtime_state() {
         let mut snapshot = SessionViewSnapshot::empty();
         snapshot.session_id = Some(bcode_session_models::SessionId::new());
         snapshot.runtime_work.push(RuntimeWorkView {
@@ -2205,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_contribution_has_no_raw_web_fallback() {
+    fn unknown_contribution_has_no_raw_hyperchad_fallback() {
         let kind = TranscriptViewItemKind::ToolContribution {
             placement: bcode_session_models::ToolContributionPlacement::Request,
             contribution: bcode_session_models::ToolContributionEvent {
@@ -2255,7 +2255,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_shell_contribution_has_no_raw_web_fallback() {
+    fn unsupported_shell_contribution_has_no_raw_hyperchad_fallback() {
         let kind = TranscriptViewItemKind::ToolContribution {
             placement: bcode_session_models::ToolContributionPlacement::Request,
             contribution: bcode_session_models::ToolContributionEvent {

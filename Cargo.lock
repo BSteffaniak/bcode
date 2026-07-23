@@ -1457,6 +1457,7 @@ dependencies = [
  "bcode_client",
  "bcode_config",
  "bcode_daemon_lifecycle",
+ "bcode_hyperchad",
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",
@@ -1470,7 +1471,6 @@ dependencies = [
  "bcode_session_models",
  "bcode_settings",
  "bcode_tui",
- "bcode_web_render",
  "bcode_worktree_models",
  "bmux_keyboard",
  "bmux_tui",
@@ -1773,6 +1773,43 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_hyperchad"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_bundled_plugins",
+ "bcode_client",
+ "bcode_hyperchad_ui",
+ "bcode_ipc",
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_session_view",
+ "bcode_session_view_models",
+ "bcode_tool",
+ "hyperchad",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bcode_hyperchad_ui"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_session_view_models",
+ "hyperchad",
+ "hyperchad_color",
+ "hyperchad_renderer",
+ "hyperchad_template",
+ "hyperchad_transformer",
+ "hyperchad_transformer_models",
+ "serde",
  "serde_json",
 ]
 
@@ -2147,6 +2184,7 @@ dependencies = [
  "bcode_daemon_lifecycle",
  "bcode_fake_provider_plugin",
  "bcode_filesystem_plugin",
+ "bcode_hyperchad",
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",
@@ -2168,7 +2206,6 @@ dependencies = [
  "bcode_skill_models",
  "bcode_tool",
  "bcode_vim_edit_plugin",
- "bcode_web_render",
  "bcode_web_search_plugin",
  "bcode_workflow",
  "bcode_worktree",
@@ -2480,43 +2517,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
-]
-
-[[package]]
-name = "bcode_web_render"
-version = "0.0.1-alpha.0"
-dependencies = [
- "bcode_bundled_plugins",
- "bcode_client",
- "bcode_ipc",
- "bcode_plugin_sdk",
- "bcode_session_models",
- "bcode_session_view",
- "bcode_session_view_models",
- "bcode_tool",
- "bcode_web_render_ui",
- "hyperchad",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bcode_web_render_ui"
-version = "0.0.1-alpha.0"
-dependencies = [
- "bcode_plugin_sdk",
- "bcode_session_models",
- "bcode_session_view_models",
- "hyperchad",
- "hyperchad_color",
- "hyperchad_renderer",
- "hyperchad_template",
- "hyperchad_transformer",
- "hyperchad_transformer_models",
- "serde",
- "serde_json",
 ]
 
 [[package]]

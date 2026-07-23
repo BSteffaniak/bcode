@@ -2,12 +2,15 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! `HyperChad` web renderer host for Bcode sessions.
+//! `HyperChad` application host for Bcode sessions.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "renderer-html-actix")]
 use std::net::IpAddr;
 use std::str::FromStr as _;
-use std::sync::{Arc, LazyLock, Mutex};
+#[cfg(feature = "renderer-html-actix")]
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 
 use bcode_client::{
     AttachedSessionHistory, BcodeClient, ClientError, SessionWatchEvent, SessionWatcher,
@@ -22,22 +25,28 @@ use bcode_session_view_models::{
     ComposerDraftViewScope, InteractionViewSummary, PromptPlacementView, SessionViewAction,
     SessionViewSnapshot,
 };
+#[cfg(feature = "renderer-html-actix")]
 use hyperchad::app::{App, AppBuilder, renderer::DefaultRenderer};
+#[cfg(feature = "renderer-html-actix")]
 use hyperchad::color::Color;
+#[cfg(feature = "renderer-html-actix")]
 use hyperchad::renderer::Renderer as _;
 use hyperchad::router::{RoutePath, RouteRequest, Router};
 use serde::Deserialize;
 
+#[cfg(feature = "renderer-html-actix")]
 static BACKGROUND_COLOR: LazyLock<Color> = LazyLock::new(|| Color::from_hex("#0d1117"));
 
-/// Default loopback address for the local web renderer.
+/// Default loopback address for the local HTML/Actix renderer.
+#[cfg(feature = "renderer-html-actix")]
 pub const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
-/// Validate a requested web renderer bind address.
+/// Validate a requested HTML/Actix renderer bind address.
 ///
 /// # Errors
 ///
 /// Returns an error when a non-loopback address is requested without explicit opt-in.
+#[cfg(feature = "renderer-html-actix")]
 pub const fn validate_bind_address(
     address: IpAddr,
     allow_non_loopback: bool,
@@ -49,19 +58,20 @@ pub const fn validate_bind_address(
     }
 }
 
-/// Number of recent history events projected into the first web-render snapshot.
+/// Number of recent history events projected into the initial `HyperChad` snapshot.
 pub const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 
 /// Delay between failed daemon watcher reconnection attempts.
 const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Default viewport meta tag for responsive web rendering.
+/// Default viewport meta tag for responsive HTML rendering.
+#[cfg(feature = "renderer-html-actix")]
 pub static VIEWPORT: LazyLock<String> =
     LazyLock::new(|| "width=device-width, initial-scale=1".to_string());
 
-/// Web renderer runtime state shared by `HyperChad` route handlers.
+/// `HyperChad` application state shared by route and action handlers.
 #[derive(Debug, Clone)]
-pub struct WebRenderState {
+pub struct HyperChadAppState {
     client: BcodeClient,
     access_token: Arc<str>,
     watched_sessions: Arc<Mutex<BTreeSet<SessionId>>>,
@@ -85,6 +95,7 @@ impl std::fmt::Debug for LocalInteractionControllers {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "renderer-html-actix"), allow(dead_code))]
 struct ScopedSnapshotUpdate {
     scope: String,
     snapshot: SessionViewSnapshot,
@@ -165,8 +176,8 @@ struct InteractionForm {
     direction: Option<String>,
 }
 
-impl WebRenderState {
-    /// Create web renderer state from a daemon client and per-launch access token.
+impl HyperChadAppState {
+    /// Create `HyperChad` application state from a daemon client and access capability.
     #[must_use]
     pub fn new(client: BcodeClient, access_token: impl Into<Arc<str>>) -> Self {
         let client = client.with_interaction_adapters(local_interaction_adapters());
@@ -207,7 +218,7 @@ impl WebRenderState {
             ))
             .await
             {
-                tracing::error!("web session watcher failed for {session_id}: {error}");
+                tracing::error!("HyperChad session watcher failed for {session_id}: {error}");
             }
             watched_sessions
                 .lock()
@@ -229,7 +240,7 @@ impl WebRenderState {
             .is_some_and(|token| token == self.access_token())
     }
 
-    /// Return the daemon client used by this web renderer.
+    /// Return the daemon client used by this `HyperChad` application.
     #[must_use]
     pub const fn client(&self) -> &BcodeClient {
         &self.client
@@ -276,10 +287,11 @@ impl WebRenderState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&session_id)
             .cloned()
-            .unwrap_or_else(web_projection_window_request);
-        let mut connection = self.client.connect("bcode-web-render").await?;
+            .unwrap_or_else(hyperchad_projection_window_request);
+        let mut connection = self.client.connect("bcode-hyperchad").await?;
         let attached =
-            attach_web_projection_window_with_request(&mut connection, session_id, request).await?;
+            attach_hyperchad_projection_window_with_request(&mut connection, session_id, request)
+                .await?;
         session_view_from_attached_history(&self.client, attached, &self.interaction_controllers)
             .await
     }
@@ -489,14 +501,14 @@ const fn local_interaction_controller(
     None
 }
 
-const fn web_projection_window_request() -> ProjectionWindowRequest {
-    web_projection_window_request_for_anchor(
+const fn hyperchad_projection_window_request() -> ProjectionWindowRequest {
+    hyperchad_projection_window_request_for_anchor(
         ProjectionWindowAnchor::Latest,
         ProjectionWindowDirection::Backward,
     )
 }
 
-const fn web_projection_window_request_for_anchor(
+const fn hyperchad_projection_window_request_for_anchor(
     anchor: ProjectionWindowAnchor,
     direction: ProjectionWindowDirection,
 ) -> ProjectionWindowRequest {
@@ -518,7 +530,7 @@ const fn web_projection_window_request_for_anchor(
     }
 }
 
-async fn attach_web_projection_window_with_request(
+async fn attach_hyperchad_projection_window_with_request(
     connection: &mut bcode_client::ClientConnection,
     session_id: SessionId,
     request: ProjectionWindowRequest,
@@ -566,7 +578,7 @@ pub fn snapshot_from_attached_history(attached: &AttachedSessionHistory) -> Sess
 
 /// Build a state-backed application router.
 #[must_use]
-pub fn router_from_state(state: WebRenderState) -> Router {
+pub fn router_from_state(state: HyperChadAppState) -> Router {
     let root_state = state.clone();
     let session_state = state.clone();
     let submit_state = state.clone();
@@ -633,14 +645,14 @@ pub fn router_from_state(state: WebRenderState) -> Router {
         })
 }
 
-impl WebRenderState {
+impl HyperChadAppState {
     async fn render_initial(&self) -> hyperchad::template::Containers {
         match self.initial_state().await {
             Ok((snapshot, sessions)) => {
                 if let Some(session_id) = snapshot.session_id {
                     self.ensure_session_watcher(session_id);
                 }
-                bcode_web_render_ui::pages::home::home(&snapshot, &sessions, self.access_token())
+                bcode_hyperchad_ui::pages::home::home(&snapshot, &sessions, self.access_token())
             }
             Err(error) => error_page(&error.to_string()),
         }
@@ -853,12 +865,12 @@ impl WebRenderState {
                 ProjectionWindowDirection::Forward,
             ),
         };
-        let request = web_projection_window_request_for_anchor(anchor, direction);
-        let mut connection = match self.client.connect("bcode-web-render-history").await {
+        let request = hyperchad_projection_window_request_for_anchor(anchor, direction);
+        let mut connection = match self.client.connect("bcode-hyperchad-history").await {
             Ok(connection) => connection,
             Err(error) => return error_page(&error.to_string()),
         };
-        let attached = match attach_web_projection_window_with_request(
+        let attached = match attach_hyperchad_projection_window_with_request(
             &mut connection,
             session_id,
             request.clone(),
@@ -897,7 +909,7 @@ impl WebRenderState {
             Ok(sessions) => sessions,
             Err(error) => return error_page(&error.to_string()),
         };
-        bcode_web_render_ui::pages::home::home(&snapshot, &sessions, self.access_token())
+        bcode_hyperchad_ui::pages::home::home(&snapshot, &sessions, self.access_token())
     }
 
     fn apply_local_interaction_input(
@@ -1027,11 +1039,7 @@ impl WebRenderState {
             None => match self.initial_state().await {
                 Ok((mut snapshot, sessions)) => {
                     snapshot.composer.disabled_reason = Some(status.to_owned());
-                    bcode_web_render_ui::pages::home::home(
-                        &snapshot,
-                        &sessions,
-                        self.access_token(),
-                    )
+                    bcode_hyperchad_ui::pages::home::home(&snapshot, &sessions, self.access_token())
                 }
                 Err(error) => error_page(&error.to_string()),
             },
@@ -1057,7 +1065,7 @@ impl WebRenderState {
         match self.session_snapshot(session_id).await {
             Ok(mut snapshot) => {
                 snapshot.composer.disabled_reason = Some(status.to_owned());
-                bcode_web_render_ui::pages::home::home(&snapshot, sessions, self.access_token())
+                bcode_hyperchad_ui::pages::home::home(&snapshot, sessions, self.access_token())
             }
             Err(error) => error_page(&error.to_string()),
         }
@@ -1128,14 +1136,14 @@ fn parse_session_id(value: &str) -> Option<SessionId> {
 }
 
 fn unauthorized_page() -> hyperchad::template::Containers {
-    error_page("missing or invalid web renderer access token")
+    error_page("missing or invalid HyperChad application access capability")
 }
 
 fn error_page(message: &str) -> hyperchad::template::Containers {
     let mut snapshot = SessionViewSnapshot::empty();
-    snapshot.title = Some("Web renderer error".to_owned());
+    snapshot.title = Some("HyperChad application error".to_owned());
     snapshot.composer.disabled_reason = Some(message.to_owned());
-    bcode_web_render_ui::pages::home::home(&snapshot, &[], "")
+    bcode_hyperchad_ui::pages::home::home(&snapshot, &[], "")
 }
 
 /// Build the application router for the current snapshot and session list.
@@ -1146,10 +1154,11 @@ pub fn router(snapshot: SessionViewSnapshot, sessions: Vec<SessionSummary>) -> R
     Router::new().with_static_route(&["/", "/session"], move |_| {
         let snapshot = Arc::clone(&snapshot);
         let sessions = Arc::clone(&sessions);
-        async move { bcode_web_render_ui::pages::home::home(&snapshot, &sessions, "") }
+        async move { bcode_hyperchad_ui::pages::home::home(&snapshot, &sessions, "") }
     })
 }
 
+#[cfg(feature = "renderer-html-actix")]
 fn with_browser_runtime(builder: AppBuilder) -> AppBuilder {
     builder.with_static_asset_route(hyperchad::renderer::assets::StaticAssetRoute {
         route: format!(
@@ -1163,7 +1172,8 @@ fn with_browser_runtime(builder: AppBuilder) -> AppBuilder {
     })
 }
 
-/// Initialize the web renderer application builder with a static initial snapshot.
+/// Initialize the HTML/Actix application builder with a static initial snapshot.
+#[cfg(feature = "renderer-html-actix")]
 #[must_use]
 pub fn init_with_snapshot(
     snapshot: SessionViewSnapshot,
@@ -1175,18 +1185,19 @@ pub fn init_with_snapshot(
             .with_router(router(snapshot, sessions))
             .with_background(*BACKGROUND_COLOR)
             .with_title("bcode web".to_string())
-            .with_description("HyperChad web renderer for Bcode sessions".to_string())
+            .with_description("HyperChad application for Bcode sessions".to_string())
             .with_viewport(VIEWPORT.clone())
             .with_size(1200.0, 800.0),
     )
 }
 
-/// Initialize the web renderer application builder from daemon state.
+/// Initialize the HTML/Actix application builder from daemon state.
 ///
 /// # Errors
 ///
 /// Returns an error when initial daemon state cannot be loaded.
-pub async fn init(state: &WebRenderState) -> Result<AppBuilder, ClientError> {
+#[cfg(feature = "renderer-html-actix")]
+pub async fn init(state: &HyperChadAppState) -> Result<AppBuilder, ClientError> {
     state.client().ensure_daemon_available().await?;
     Ok(with_browser_runtime(
         AppBuilder::new()
@@ -1194,7 +1205,7 @@ pub async fn init(state: &WebRenderState) -> Result<AppBuilder, ClientError> {
             .with_router(router_from_state(state.clone()))
             .with_background(*BACKGROUND_COLOR)
             .with_title("bcode web".to_string())
-            .with_description("HyperChad web renderer for Bcode sessions".to_string())
+            .with_description("HyperChad application for Bcode sessions".to_string())
             .with_viewport(VIEWPORT.clone())
             .with_size(1200.0, 800.0),
     ))
@@ -1206,7 +1217,7 @@ async fn attach_watched_session(
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
 ) -> Result<(SessionWatcher, AttachedSessionHistory, SessionView), ClientError> {
     let mut watcher = client
-        .watch_session_projection_window(session_id, web_projection_window_request())
+        .watch_session_projection_window(session_id, hyperchad_projection_window_request())
         .await?;
     let attached = watcher
         .take_initial()
@@ -1259,9 +1270,10 @@ async fn watched_session_snapshot(
         .get(&session_id)
         .cloned();
     if let Some(request) = history_request {
-        let mut connection = client.connect("bcode-web-render-history-refresh").await?;
+        let mut connection = client.connect("bcode-hyperchad-history-refresh").await?;
         let historical =
-            attach_web_projection_window_with_request(&mut connection, session_id, request).await?;
+            attach_hyperchad_projection_window_with_request(&mut connection, session_id, request)
+                .await?;
         session_view_from_attached_history(client, historical, interaction_controllers).await
     } else {
         Ok(snapshot_from_view(view, attached))
@@ -1280,7 +1292,7 @@ fn apply_watched_event(
                 DurableEventDisposition::IgnoreDuplicate => {}
                 DurableEventDisposition::ResyncGap => {
                     tracing::warn!(
-                        "web session watcher detected event gap for {session_id}: latest={:?}, received={}",
+                        "HyperChad session watcher detected event gap for {session_id}: latest={:?}, received={}",
                         view.snapshot().latest_sequence,
                         event.sequence
                     );
@@ -1312,7 +1324,7 @@ async fn watch_session_updates(
                 if browser_update_sender(&renderer_tx).is_none() {
                     return Ok(());
                 }
-                tracing::warn!("web session watcher attach failed for {session_id}: {error}");
+                tracing::warn!("HyperChad session watcher attach failed for {session_id}: {error}");
                 tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
             }
         }
@@ -1325,7 +1337,7 @@ async fn watch_session_updates(
                 if browser_update_sender(&renderer_tx).is_none() {
                     return Ok(());
                 }
-                tracing::warn!("web session watcher disconnected for {session_id}: {error}");
+                tracing::warn!("HyperChad session watcher disconnected for {session_id}: {error}");
                 tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
                 match attach_watched_session(&client, session_id, &interaction_controllers).await {
                     Ok((new_watcher, new_attached, new_view)) => {
@@ -1336,7 +1348,7 @@ async fn watch_session_updates(
                     }
                     Err(error) => {
                         tracing::warn!(
-                            "web session watcher reconnect failed for {session_id}: {error}"
+                            "HyperChad session watcher reconnect failed for {session_id}: {error}"
                         );
                         continue;
                     }
@@ -1355,7 +1367,7 @@ async fn watch_session_updates(
                             return Ok(());
                         }
                         tracing::warn!(
-                            "web session watcher resync failed for {session_id}: {error}"
+                            "HyperChad session watcher resync failed for {session_id}: {error}"
                         );
                         tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
                     }
@@ -1396,8 +1408,9 @@ async fn watch_session_updates(
     }
 }
 
-/// Configure scoped live snapshot rendering on a built application.
-pub fn configure_live_updates(app: &mut App<DefaultRenderer>, state: &WebRenderState) {
+/// Configure scoped live snapshot rendering on a built HTML/Actix application.
+#[cfg(feature = "renderer-html-actix")]
+pub fn configure_live_updates(app: &mut App<DefaultRenderer>, state: &HyperChadAppState) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ScopedSnapshotUpdate>(1);
     *state
         .renderer_tx
@@ -1407,7 +1420,7 @@ pub fn configure_live_updates(app: &mut App<DefaultRenderer>, state: &WebRenderS
     let access_token = Arc::clone(&state.access_token);
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
-            let containers = bcode_web_render_ui::pages::home::home(
+            let containers = bcode_hyperchad_ui::pages::home::home(
                 &update.snapshot,
                 &update.sessions,
                 &access_token,
@@ -1416,17 +1429,18 @@ pub fn configure_live_updates(app: &mut App<DefaultRenderer>, state: &WebRenderS
                 .render_scoped(update.scope, containers.into())
                 .await
             {
-                tracing::error!("failed to render scoped web snapshot: {error}");
+                tracing::error!("failed to render scoped HyperChad snapshot: {error}");
             }
         }
     });
 }
 
-/// Build the application from the provided builder.
+/// Build the selected HTML/Actix application from the provided builder.
 ///
 /// # Errors
 ///
 /// Returns an error if the application fails to build.
+#[cfg(feature = "renderer-html-actix")]
 pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad::app::Error> {
     Ok(builder.build_default()?)
 }
@@ -1437,7 +1451,7 @@ mod tests {
 
     #[cfg(feature = "static-bundled-question-plugin")]
     #[test]
-    fn web_runs_question_adapter_locally_from_opaque_exchange() {
+    fn hyperchad_runs_question_adapter_locally_from_opaque_exchange() {
         let exchange = bcode_session_models::ToolExchangeRequest {
             invocation_id: "call-1".to_owned(),
             exchange_id: "exchange-1".to_owned(),
@@ -1493,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn web_projection_closes_resolved_permission_but_preserves_transcript_record() {
+    fn hyperchad_projection_closes_resolved_permission_but_preserves_transcript_record() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         let event = |sequence, kind| bcode_session_models::SessionEvent {
@@ -1539,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn web_preserves_compact_single_tool_activity_until_terminal_event() {
+    fn hyperchad_preserves_compact_single_tool_activity_until_terminal_event() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         view.apply_event(&bcode_session_models::SessionEvent {
@@ -1561,7 +1575,7 @@ mod tests {
 
         let rendered = format!(
             "{:?}",
-            bcode_web_render_ui::pages::home::home(view.snapshot(), &[], "token")
+            bcode_hyperchad_ui::pages::home::home(view.snapshot(), &[], "token")
         );
         assert!(rendered.contains("active tool"));
         assert!(!rendered.contains("active invocations"));
@@ -1586,14 +1600,14 @@ mod tests {
         });
         let completed = format!(
             "{:?}",
-            bcode_web_render_ui::pages::home::home(view.snapshot(), &[], "token")
+            bcode_hyperchad_ui::pages::home::home(view.snapshot(), &[], "token")
         );
         assert!(!completed.contains("active tool"));
         assert!(!completed.contains("active invocations"));
     }
 
     #[test]
-    fn web_uses_grouped_heading_only_for_multiple_active_invocations() {
+    fn hyperchad_uses_grouped_heading_only_for_multiple_active_invocations() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         for (sequence, invocation_id) in [(1, "first"), (2, "second")] {
@@ -1617,14 +1631,14 @@ mod tests {
 
         let rendered = format!(
             "{:?}",
-            bcode_web_render_ui::pages::home::home(view.snapshot(), &[], "token")
+            bcode_hyperchad_ui::pages::home::home(view.snapshot(), &[], "token")
         );
         assert!(rendered.contains("active invocations"));
         assert!(!rendered.contains("active tool"));
     }
 
     #[test]
-    fn web_projection_keeps_active_sibling_and_does_not_revive_terminal_work() {
+    fn hyperchad_projection_keeps_active_sibling_and_does_not_revive_terminal_work() {
         let session_id = SessionId::new();
         let first = bcode_session_models::WorkId::new("work-first");
         let second = bcode_session_models::WorkId::new("work-second");
@@ -1669,7 +1683,7 @@ mod tests {
         assert_eq!(snapshot.runtime_work[0].work_id, second);
         let rendered = format!(
             "{:?}",
-            bcode_web_render_ui::pages::home::home(snapshot, &[], "token")
+            bcode_hyperchad_ui::pages::home::home(snapshot, &[], "token")
         );
         assert!(rendered.contains("work-second"));
         assert!(!rendered.contains("revived-marker-unique"));
@@ -1697,14 +1711,14 @@ mod tests {
 
     #[test]
     fn history_window_requests_use_strict_source_anchored_directions() {
-        let older = web_projection_window_request_for_anchor(
+        let older = hyperchad_projection_window_request_for_anchor(
             ProjectionWindowAnchor::BeforeSequence(10),
             ProjectionWindowDirection::Backward,
         );
         assert_eq!(older.anchor, ProjectionWindowAnchor::BeforeSequence(10));
         assert_eq!(older.direction, ProjectionWindowDirection::Backward);
 
-        let newer = web_projection_window_request_for_anchor(
+        let newer = hyperchad_projection_window_request_for_anchor(
             ProjectionWindowAnchor::AfterSequence(20),
             ProjectionWindowDirection::Forward,
         );
@@ -1768,12 +1782,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "renderer-html-actix")]
     #[test]
-    fn web_renderer_init_smoke_test() {
+    fn html_actix_renderer_init_smoke_test() {
         let builder = init_with_snapshot(SessionViewSnapshot::empty(), Vec::new());
         drop(builder);
     }
 
+    #[cfg(feature = "renderer-html-actix")]
     #[test]
     fn bind_address_policy_requires_non_loopback_opt_in() {
         let loopback = "127.0.0.1".parse().expect("loopback should parse");
@@ -1786,7 +1802,7 @@ mod tests {
 
     #[test]
     fn access_token_authorization_requires_exact_query_value() {
-        let state = WebRenderState::new(BcodeClient::default_endpoint(), "secret-token");
+        let state = HyperChadAppState::new(BcodeClient::default_endpoint(), "secret-token");
         let valid = RouteRequest::from_path(
             "/?token=secret-token",
             hyperchad::router::RequestInfo::default(),
@@ -1862,15 +1878,16 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "renderer-html-actix")]
     #[tokio::test]
-    async fn web_renderer_app_build_smoke_test() {
+    async fn html_actix_app_build_smoke_test() {
         tokio::task::yield_now().await;
         let builder = init_with_snapshot(SessionViewSnapshot::empty(), Vec::new());
         assert!(build_app(builder).is_ok());
     }
 
     #[test]
-    fn web_renderer_router_smoke_test() {
+    fn hyperchad_router_smoke_test() {
         let app_router = router(SessionViewSnapshot::empty(), Vec::new());
         drop(app_router);
     }

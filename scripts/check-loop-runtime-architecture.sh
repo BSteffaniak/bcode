@@ -436,7 +436,7 @@ if ! grep -F 'runtime_work_status_label_preserves_semantic_activity' packages/se
    ! grep -F 'authoritative_runtime_work_snapshot_drives_tui_activity' packages/tui/src/app.rs >/dev/null ||
    ! grep -F 'runtime_work_terminal_state_leaves_sibling_active_and_rejects_late_revival' packages/session-view/src/lib.rs >/dev/null ||
    ! grep -F 'terminal_runtime_work_without_visible_start_is_history_only' packages/session-view/src/lib.rs >/dev/null ||
-   ! grep -F 'web_projection_keeps_active_sibling_and_does_not_revive_terminal_work' packages/web-render/src/lib.rs >/dev/null ||
+   ! grep -F 'hyperchad_projection_keeps_active_sibling_and_does_not_revive_terminal_work' packages/hyperchad/src/lib.rs >/dev/null ||
    ! grep -F 'runtime_work_activity_is_excluded_from_model_context' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'late_stream_events_cannot_revive_finished_tool_projection' packages/session/models/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: grouped activity or terminal late-event suppression coverage was removed." >&2
@@ -565,7 +565,7 @@ if ! grep -F 'orchestration_emits_exactly_one_started_and_terminal_lifecycle_per
    ! grep -F 'server_tool_error_persists_failed_generic_lifecycle' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'projection_history_pages_cross_real_ipc_bidirectionally' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'generic_lifecycle_drives_tui_activity_until_terminal_event' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'web_preserves_compact_single_tool_activity_until_terminal_event' packages/web-render/src/lib.rs >/dev/null ||
+   ! grep -F 'hyperchad_preserves_compact_single_tool_activity_until_terminal_event' packages/hyperchad/src/lib.rs >/dev/null ||
    ! grep -F 'legacy_tool_stream_lifecycle_events_are_not_newly_persisted' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: orchestration-owned lifecycle coverage was removed." >&2
   violations=1
@@ -682,16 +682,16 @@ if ! grep -F 'static_provider_adapter_conforms_for_multiple_calls_and_sequential
 fi
 
 if ! grep -F 'generic_lifecycle_drives_tui_activity_until_terminal_event' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'web_preserves_compact_single_tool_activity_until_terminal_event' packages/web-render/src/lib.rs >/dev/null ||
-   ! grep -F 'web_uses_grouped_heading_only_for_multiple_active_invocations' packages/web-render/src/lib.rs >/dev/null; then
+   ! grep -F 'hyperchad_preserves_compact_single_tool_activity_until_terminal_event' packages/hyperchad/src/lib.rs >/dev/null ||
+   ! grep -F 'hyperchad_uses_grouped_heading_only_for_multiple_active_invocations' packages/hyperchad/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: single-tool UX regression coverage was removed." >&2
   violations=1
 fi
 
 if ! grep -F 'batched_actions_keep_single_call_and_apply_to_all_distinct' packages/tui/src/permission_dialog.rs >/dev/null ||
    ! grep -F 'batched_remember_actions_never_apply_to_all' packages/tui/src/permission_dialog.rs >/dev/null ||
-   ! grep -F 'grouped_permission_renders_per_call_and_apply_to_all_actions' packages/web-render/ui/src/pages/home.rs >/dev/null ||
-   ! grep -F 'resolve_permission_batch(form.batch_id, form.approved)' packages/web-render/src/lib.rs >/dev/null; then
+   ! grep -F 'grouped_permission_renders_per_call_and_apply_to_all_actions' packages/hyperchad/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F 'resolve_permission_batch(form.batch_id, form.approved)' packages/hyperchad/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: grouped permission adapter behavior was removed." >&2
   violations=1
 fi
@@ -853,7 +853,7 @@ if rg -n 'ToolInvocationHostAction|InteractiveToolResumeRequest|OP_RESUME_INTERA
 fi
 
 if rg -n 'InteractiveToolRenderTarget|InteractiveToolTurnBehavior|render_target|turn_behavior' \
-  packages/session-view packages/session packages/ipc packages/server packages/tui packages/web-render --glob='*.rs' \
+  packages/session-view packages/session packages/ipc packages/server packages/tui packages/hyperchad --glob='*.rs' \
   | grep -v '^packages/session/src/persisted.rs:' \
   >/tmp/bcode-removed-interaction-placement.txt; then
   echo "Runtime architecture violation: removed interaction placement/turn-behavior DTOs were reintroduced." >&2
@@ -869,7 +869,7 @@ if rg -n 'InteractiveToolRequestSummary|ListInteractiveToolRequests|InteractiveT
 fi
 
 if rg -n 'InteractiveTool|interactive_tool|PendingInteractive|pending_interactive|resume_interactive|InteractiveToolResumeRequest|OP_RESUME_INTERACTIVE_TOOL|append_interactive_tool_request_(created|resolved)_event|InteractionSnapshotResponse|InteractionInputResponse|GetInteractionSnapshot|SubmitInteractionInput|\.interaction_snapshot\(|\.submit_interaction_input\(|pub async fn (interaction_snapshot|submit_interaction_input)' \
-  packages/tool packages/ipc packages/client packages/server packages/session/models packages/session-view packages/tui packages/web-render packages/cli --glob='*.rs' \
+  packages/tool packages/ipc packages/client packages/server packages/session/models packages/session-view packages/tui packages/hyperchad packages/cli --glob='*.rs' \
   >/tmp/bcode-removed-server-interaction-controller.txt; then
   echo "Runtime architecture violation: renderer interaction state/input returned to the server protocol." >&2
   cat /tmp/bcode-removed-server-interaction-controller.txt >&2
@@ -889,7 +889,7 @@ if ! grep -F 'pub struct PluginInteractionAdapterCapability' packages/plugin-sdk
    ! grep -F 'has_exchange_consumer' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'bcode_bundled_plugins::interaction_adapter(' packages/tui/src/effects.rs >/dev/null ||
    ! grep -F 'SessionEventKind::ToolExchangeRequested { request }' packages/tui/src/chat_loop.rs >/dev/null ||
-   ! grep -F 'local_interaction_adapter(&exchange)' packages/web-render/src/lib.rs >/dev/null; then
+   ! grep -F 'local_interaction_adapter(&exchange)' packages/hyperchad/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: renderer-local exchange adapter routing was removed." >&2
   violations=1
 fi
@@ -979,9 +979,9 @@ if ! grep -F 'fn select_visual_adapter' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'adapter.supports(schema, schema_version, surface)' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'adapter.priority' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F '.visual_adapter(schema, schema_version, "tui", producer)' packages/tui/src/plugin_tui.rs >/dev/null ||
-   ! grep -F "BTreeMap<(&'static str, u32), VisualAdapter>" packages/web-render/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F "BTreeMap<(&'static str, u32), VisualAdapter>" packages/hyperchad/ui/src/pages/home.rs >/dev/null ||
    ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/web-render/ui/src/pages/home.rs >/dev/null; then
+   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/hyperchad/ui/src/pages/home.rs >/dev/null; then
   echo "Runtime architecture violation: platform-owned schema/version renderer selection or generic fallback coverage was removed." >&2
   violations=1
 fi
@@ -999,7 +999,7 @@ if [[ "$(rg -l '^pub (struct|enum) (ToolContributionEvent|ToolExchangeRequest|To
    ! grep -F 'input: bcode_tool::ToolInvocationInput' packages/ipc/src/lib.rs >/dev/null ||
    ! grep -F 'pub active_exchanges: BTreeMap<String, bcode_session_models::ToolExchangeRequest>' packages/session-view/models/src/lib.rs >/dev/null ||
    ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/web-render/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/hyperchad/ui/src/pages/home.rs >/dev/null ||
    ! grep -F 'unsupported_headless_exchange_is_explicit_for_required_and_optional_policies' packages/bcode/tests/headless_exchange.rs >/dev/null; then
   echo "Runtime architecture violation: IPC, renderer, and headless hosts no longer consume the canonical opaque invocation envelopes." >&2
   violations=1
@@ -1056,7 +1056,7 @@ if ! grep -F 'select_interaction_adapter' packages/plugin-sdk/src/interaction.rs
 fi
 
 if ! grep -F 'question_exchange_payload_runs_entirely_in_local_tui_surface' packages/tui/src/interactive_surface.rs >/dev/null ||
-   ! grep -F 'web_runs_question_adapter_locally_from_opaque_exchange' packages/web-render/src/lib.rs >/dev/null ||
+   ! grep -F 'hyperchad_runs_question_adapter_locally_from_opaque_exchange' packages/hyperchad/src/lib.rs >/dev/null ||
    ! grep -F 'question_exchange_stays_in_one_invocation_and_validates_response' packages/bcode/tests/question_exchange.rs >/dev/null; then
   echo "Runtime architecture violation: cross-host Question exchange parity coverage was removed." >&2
   violations=1

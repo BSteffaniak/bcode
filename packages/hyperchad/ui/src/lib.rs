@@ -2,6 +2,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! `HyperChad` UI components for the Bcode web renderer.
+//! Portable `HyperChad` UI components for Bcode sessions.
 
 pub mod pages;

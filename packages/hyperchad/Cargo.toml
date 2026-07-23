@@ -1,11 +1,11 @@
 [package]
 authors     = { workspace = true }
-categories  = ["web-programming"]
-description = "HyperChad web renderer for Bcode sessions"
+categories  = ["development-tools", "gui"]
+description = "HyperChad application host for Bcode sessions"
 edition     = { workspace = true }
-keywords    = ["bcode", "web", "renderer"]
+keywords    = ["bcode", "hyperchad", "renderer"]
 license     = { workspace = true }
-name        = "bcode_web_render"
+name        = "bcode_hyperchad"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
@@ -15,28 +15,19 @@ version     = { workspace = true }
 [dependencies]
 bcode_bundled_plugins = { workspace = true, optional = true }
 bcode_client = { workspace = true }
+bcode_hyperchad_ui = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_tool = { workspace = true }
-bcode_web_render_ui = { workspace = true }
 hyperchad = { workspace = true, features = [
     "app",
     "color",
     "json",
     "renderer",
-    "renderer-html-sse",
-    "renderer-vanilla-js",
-    "renderer-vanilla-js-hash",
-    "renderer-vanilla-js-plugin-form",
-    "renderer-vanilla-js-plugin-idiomorph",
-    "renderer-vanilla-js-plugin-nav",
-    "renderer-vanilla-js-plugin-routing",
-    "renderer-vanilla-js-script",
     "router",
     "router-form",
-    "router-static-routes",
 ] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -48,13 +39,22 @@ bcode_ipc = { workspace = true }
 tokio     = { workspace = true, features = ["macros", "rt"] }
 
 [features]
-actix = ["hyperchad/renderer-html-actix"]
-assets = ["hyperchad/renderer-assets"]
-default = ["actix", "html", "assets", "static-routes"]
-fail-on-warnings = ["bcode_web_render_ui/fail-on-warnings"]
-html = ["hyperchad/renderer-html"]
+default = []
+fail-on-warnings = ["bcode_hyperchad_ui/fail-on-warnings"]
+renderer-html-actix = [
+    "hyperchad/renderer-assets",
+    "hyperchad/renderer-html-actix",
+    "hyperchad/renderer-html-sse",
+    "hyperchad/renderer-vanilla-js",
+    "hyperchad/renderer-vanilla-js-hash",
+    "hyperchad/renderer-vanilla-js-plugin-form",
+    "hyperchad/renderer-vanilla-js-plugin-idiomorph",
+    "hyperchad/renderer-vanilla-js-plugin-nav",
+    "hyperchad/renderer-vanilla-js-plugin-routing",
+    "hyperchad/renderer-vanilla-js-script",
+    "hyperchad/router-static-routes",
+]
 static-bundled-question-plugin = [
     "dep:bcode_bundled_plugins",
     "bcode_bundled_plugins/static-bundled-question-plugin",
 ]
-static-routes = ["hyperchad/router-static-routes"]

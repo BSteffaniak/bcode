@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-const RENDERER_NEUTRAL_SCAN_ROOTS: &[&str] = &["packages/session-view", "packages/web-render"];
+const RENDERER_NEUTRAL_SCAN_ROOTS: &[&str] = &["packages/session-view", "packages/hyperchad"];
 
 const PLUGIN_OWNED_CORE_CLI_NEEDLES: &[&str] = &[
     "Commands::Worktree",
@@ -198,9 +198,9 @@ fn plugin_owned_commands_do_not_return_to_core_cli() {
 }
 
 #[test]
-fn web_renderer_uses_hyperchad_instead_of_bcode_owned_browser_transport() {
+fn hyperchad_application_uses_framework_transport_instead_of_bcode_owned_transport() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let web_root = workspace_root.join("packages/web-render");
+    let web_root = workspace_root.join("packages/hyperchad");
     let mut offenders = Vec::new();
     collect_literal_offenders(&web_root, BCODE_BROWSER_TRANSPORT_NEEDLES, &mut offenders);
     collect_browser_source_files(&web_root, &mut offenders);
@@ -249,7 +249,7 @@ fn collect_browser_source_files(path: &Path, offenders: &mut Vec<String>) {
 }
 
 #[test]
-fn renderer_neutral_and_web_crates_do_not_depend_on_terminal_plugin_apis() {
+fn renderer_neutral_and_hyperchad_crates_do_not_depend_on_terminal_plugin_apis() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut offenders = Vec::new();
     for root in RENDERER_NEUTRAL_SCAN_ROOTS {
@@ -261,7 +261,7 @@ fn renderer_neutral_and_web_crates_do_not_depend_on_terminal_plugin_apis() {
     }
     assert!(
         offenders.is_empty(),
-        "terminal plugin APIs leaked into renderer-neutral/web crates:\n{}",
+        "terminal plugin APIs leaked into renderer-neutral/HyperChad crates:\n{}",
         offenders.join("\n")
     );
 }

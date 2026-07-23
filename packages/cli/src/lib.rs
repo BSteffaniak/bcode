@@ -81,8 +81,9 @@ pub enum CliError {
     Plugin(#[from] bcode_plugin::PluginLoadError),
     #[error("plugin service call error: {0}")]
     PluginServiceCall(#[from] bcode_plugin::PluginServiceCallError),
-    #[error("Web renderer error: {0}")]
-    WebRender(String),
+    #[cfg(feature = "web-renderer")]
+    #[error("HyperChad renderer error: {0}")]
+    HyperChadRender(String),
     #[error("sshenv error: {0}")]
     Sshenv(String),
     #[error("interrupted: {0}")]
@@ -251,6 +252,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         )?,
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
+        #[cfg(feature = "web-renderer")]
         Commands::Web {
             bind,
             port,
@@ -309,20 +311,21 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+#[cfg(feature = "web-renderer")]
 async fn handle_web_command(
     bind: std::net::IpAddr,
     requested_port: Option<u16>,
     allow_non_loopback: bool,
 ) -> Result<(), CliError> {
-    let bind = bcode_web_render::validate_bind_address(bind, allow_non_loopback)
-        .map_err(|error| CliError::WebRender(error.to_owned()))?;
+    let bind = bcode_hyperchad::validate_bind_address(bind, allow_non_loopback)
+        .map_err(|error| CliError::HyperChadRender(error.to_owned()))?;
     let port = requested_port.unwrap_or(0);
     let access_token = random_web_access_token()?;
-    let state = bcode_web_render::WebRenderState::new(
+    let state = bcode_hyperchad::HyperChadAppState::new(
         BcodeClient::default_endpoint(),
         access_token.clone(),
     );
-    let builder = bcode_web_render::init(&state).await?;
+    let builder = bcode_hyperchad::init(&state).await?;
     let initial_session_id = initial_web_session_id(&state).await;
     let launch_query = initial_session_id.map_or_else(
         || format!("token={access_token}"),
@@ -334,21 +337,24 @@ async fn handle_web_command(
         .with_actix_bind_address(bind.to_string())
         .with_actix_port(port)
         .with_actix_on_bound(move |address| {
-            println!("Bcode web renderer: http://{address}/?{launch_query}");
+            println!("Bcode HyperChad web renderer: http://{address}/?{launch_query}");
         })
-        .with_viewport(bcode_web_render::VIEWPORT.clone());
-    let mut app = bcode_web_render::build_app(builder)
-        .map_err(|error| CliError::WebRender(error.to_string()))?;
-    bcode_web_render::configure_live_updates(&mut app, &state);
+        .with_viewport(bcode_hyperchad::VIEWPORT.clone());
+    let mut app = bcode_hyperchad::build_app(builder)
+        .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
+    bcode_hyperchad::configure_live_updates(&mut app, &state);
     tokio::task::spawn_blocking(move || app.handle_serve())
         .await
-        .map_err(|error| CliError::WebRender(format!("web renderer task failed: {error}")))?
-        .map_err(|error| CliError::WebRender(error.to_string()))?;
+        .map_err(|error| {
+            CliError::HyperChadRender(format!("HyperChad web renderer task failed: {error}"))
+        })?
+        .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
     Ok(())
 }
 
+#[cfg(feature = "web-renderer")]
 async fn initial_web_session_id(
-    state: &bcode_web_render::WebRenderState,
+    state: &bcode_hyperchad::HyperChadAppState,
 ) -> Option<bcode_session_models::SessionId> {
     const ATTEMPTS: usize = 5;
     for attempt in 0..ATTEMPTS {
@@ -594,13 +600,14 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         Commands::Onboard { .. }
         | Commands::Server { .. }
         | Commands::Session { .. }
-        | Commands::Web { .. }
         | Commands::Plugin { .. }
         | Commands::Model { .. }
         | Commands::Auth { .. }
         | Commands::Login { .. }
         | Commands::Permission { .. }
         | Commands::RuntimeWork { .. } => unreachable!("handled by handle_cli"),
+        #[cfg(feature = "web-renderer")]
+        Commands::Web { .. } => unreachable!("handled by handle_cli"),
     }
     Ok(())
 }
@@ -736,9 +743,10 @@ enum Commands {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    #[cfg(feature = "web-renderer")]
     Web {
         /// Address to bind. Defaults to IPv4 loopback.
-        #[arg(long, default_value_t = bcode_web_render::DEFAULT_BIND_ADDRESS)]
+        #[arg(long, default_value_t = bcode_hyperchad::DEFAULT_BIND_ADDRESS)]
         bind: std::net::IpAddr,
         /// Port to bind. Defaults to an OS-assigned available port.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
@@ -4868,11 +4876,12 @@ fn oauth_callback_url_from_text(input: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+#[cfg(feature = "web-renderer")]
 fn random_web_access_token() -> Result<String, CliError> {
     let mut data = [0_u8; 32];
     rand::rngs::OsRng
         .try_fill_bytes(&mut data)
-        .map_err(|error| CliError::WebRender(error.to_string()))?;
+        .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
     Ok(URL_SAFE_NO_PAD.encode(data))
 }
 
@@ -8389,6 +8398,13 @@ mod web_command_tests {
         ));
     }
 
+    #[cfg(not(feature = "web-renderer"))]
+    #[test]
+    fn web_command_is_absent_without_web_renderer_feature() {
+        assert!(Cli::try_parse_from(["bcode", "web"]).is_err());
+    }
+
+    #[cfg(feature = "web-renderer")]
     #[test]
     fn web_command_defaults_to_loopback_without_external_opt_in() {
         let cli = Cli::try_parse_from(["bcode", "web"]).expect("web command should parse");
@@ -8401,11 +8417,12 @@ mod web_command_tests {
             panic!("expected web command");
         };
 
-        assert_eq!(bind, bcode_web_render::DEFAULT_BIND_ADDRESS);
+        assert_eq!(bind, bcode_hyperchad::DEFAULT_BIND_ADDRESS);
         assert_eq!(port, None);
         assert!(!allow_non_loopback);
     }
 
+    #[cfg(feature = "web-renderer")]
     #[test]
     fn web_command_parses_explicit_external_bind_opt_in() {
         let cli = Cli::try_parse_from([

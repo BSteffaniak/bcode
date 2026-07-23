@@ -1,11 +1,11 @@
 [package]
 authors     = { workspace = true }
-categories  = ["web-programming"]
-description = "HyperChad UI components for the Bcode web renderer"
+categories  = ["development-tools", "gui"]
+description = "Portable HyperChad UI components for Bcode sessions"
 edition     = { workspace = true }
-keywords    = ["bcode", "web", "renderer", "ui"]
+keywords    = ["bcode", "hyperchad", "renderer", "ui"]
 license     = { workspace = true }
-name        = "bcode_web_render_ui"
+name        = "bcode_hyperchad_ui"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }

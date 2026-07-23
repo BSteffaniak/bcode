@@ -8,10 +8,11 @@ The target boundary exists but is not yet the single application boundary:
 
 * `packages/session-view/models` defines renderer-neutral snapshot, transcript, tool, permission, runtime-work, composer, interaction, visual, action, and patch contracts.
 * `packages/session-view` projects bounded history and renderer-relevant live events and executes daemon-backed semantic actions.
-* `packages/web-render` consumes this layer for the HyperChad renderer.
+* `packages/hyperchad` consumes this layer as Bcode's HyperChad application host; selected Cargo features choose the concrete HyperChad backend.
+* `packages/hyperchad/ui` owns portable HyperChad presentation built from canonical HyperChad templates, routes, forms, actions, and renderer APIs.
 * `packages/tui` dual-projects session history/live events into `SessionView` for parity protection and adapts shared transcript items into terminal presentation. Assistant and reasoning streams now consume the shared projection by stable `TranscriptViewItemId`, preserving terminal render identity across incremental replacement and durable finalization even when usage or tool rows are interleaved. The TUI also consumes shared generic user/system/usage items and shared runtime-work, active-skill, plugin-status, model/agent/reasoning-selection, reasoning-visibility, context-occupancy, cumulative-usage, session-metadata, authoritative pending-permission/interaction, and live interaction semantics. Its bounded history-window rebuilds retain authoritative hydrated shared state, while specialized tool/permission/interaction/runtime projections still use established terminal projection paths pending focused migration.
 
-Until TUI migration and projection parity are complete, the shared session view is an extraction target and web-renderer contract, not yet the canonical state path for every renderer. The implementation progress tracker should be kept aligned with the audited gaps described here.
+Until TUI migration and projection parity are complete, the shared session view is an extraction target and HyperChad application contract, not yet the canonical state path for every renderer. The implementation progress tracker should be kept aligned with the audited gaps described here.
 
 ## Shared renderer contract
 
@@ -32,11 +33,11 @@ Renderers must not depend on TUI frame, key, mouse, or BMUX drawing types. They 
 
 `packages/tui` owns terminal layout, terminal-event mapping, viewport and anchoring behavior, frame rendering, and terminal-specific polish. Terminal-specific plugin surfaces remain TUI-only. During migration it also temporarily retains legacy projection logic that should move behind the shared semantic boundary after parity is demonstrated.
 
-`packages/web-render` owns the HyperChad host, daemon connection, bounded snapshot hydration, session selection, browser routes, and mapping HyperChad events into shared semantic actions.
+`packages/hyperchad` owns the HyperChad application host, daemon connection, bounded snapshot hydration, session selection, semantic action mapping, and selected-backend integration. Backend selection flows from consuming package features into `bcode_hyperchad` and then into HyperChad.
 
-`packages/web-render/ui` owns HyperChad presentation. Plugin visuals, artifacts, and interaction snapshots have a generic structured-data fallback. Rich visual adapters are registered by exact plugin-owned `(schema, schema_version)` keys and must retain that fallback.
+`packages/hyperchad/ui` owns portable HyperChad presentation. It uses canonical HyperChad `container!`, `hx-*`, `fx-*`, route, form, action, responsive, and renderer APIs; backend implementations own those semantics. Plugin visuals, artifacts, and interaction snapshots have a generic structured-data fallback. Rich visual adapters are registered by exact plugin-owned `(schema, schema_version)` keys and must retain that fallback.
 
-The local web host binds to loopback unless the CLI receives explicit non-loopback opt-in. Each launch generates a capability token; page and action routes validate it before reading daemon state or executing effects, and generated links/forms propagate it. This is a local companion security model, not by itself a production remote-access design.
+The initial HTML/Actix backend binds to loopback unless the CLI receives explicit non-loopback opt-in. Each launch generates a capability token; page and action routes validate it before reading daemon state or executing effects, and generated links/forms propagate it. This is a local companion security model, not by itself a production remote-access design.
 
 ### Non-loopback access review
 

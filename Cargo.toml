@@ -75,8 +75,8 @@ members = [
     "packages/tool-runtime",
     "packages/tui",
     "packages/tui-components",
-    "packages/web-render",
-    "packages/web-render/ui",
+    "packages/hyperchad",
+    "packages/hyperchad/ui",
     "packages/vim-edit",
     "packages/workflow",
     "packages/workflow-store",
@@ -124,6 +124,8 @@ bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-f
 bcode_git_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/git-plugin" }
 bcode_github_review_publisher_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/github-review-publisher-plugin" }
 bcode_hello_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "examples/hello-plugin" }
+bcode_hyperchad                         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/hyperchad" }
+bcode_hyperchad_ui                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/hyperchad/ui" }
 bcode_ipc                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bcode_loop_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/loop-plugin" }
 bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/markdown-render" }
@@ -169,8 +171,6 @@ bcode_tui                               = { version = "0.0.1-alpha.0", default-f
 bcode_tui_components                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }
 bcode_vim_edit                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/vim-edit" }
 bcode_vim_edit_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/vim-edit-plugin" }
-bcode_web_render                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/web-render" }
-bcode_web_render_ui                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/web-render/ui" }
 bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/web-search-plugin" }
 bcode_workflow                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow" }
 bcode_workflow_store                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow-store" }

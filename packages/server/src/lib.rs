@@ -28448,12 +28448,12 @@ library = "test"
                 });
             }
         });
-        let web_state = bcode_web_render::WebRenderState::new(
+        let web_state = bcode_hyperchad::HyperChadAppState::new(
             bcode_client::BcodeClient::new(endpoint),
             "route-token",
         );
         let route_state = web_state.clone();
-        let router = bcode_web_render::router_from_state(web_state);
+        let router = bcode_hyperchad::router_from_state(web_state);
 
         let unauthorized = router
             .navigate(hyperchad::router::RouteRequest::from_path(
@@ -28464,7 +28464,8 @@ library = "test"
             .expect("unauthorized route")
             .expect("unauthorized content");
         assert!(
-            format!("{unauthorized:?}").contains("missing or invalid web renderer access token")
+            format!("{unauthorized:?}")
+                .contains("missing or invalid HyperChad application access capability")
         );
 
         let initial = router
@@ -28477,7 +28478,7 @@ library = "test"
             .expect("initial content");
         let initial = format!("{initial:?}");
         assert!(initial.contains("daemon connected"));
-        assert!(!initial.contains("Web renderer error"));
+        assert!(!initial.contains("HyperChad application error"));
 
         let selected = router
             .navigate(hyperchad::router::RouteRequest::from_path(

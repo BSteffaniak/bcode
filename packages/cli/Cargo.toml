@@ -11,45 +11,40 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-base64 = { workspace = true }
-bcode_client = { workspace = true }
-bcode_config = { workspace = true }
-bcode_daemon_lifecycle = { workspace = true }
-bcode_ipc = { workspace = true }
-bcode_metrics = { workspace = true }
-bcode_model = { workspace = true }
+base64                       = { workspace = true }
+bcode_client                 = { workspace = true }
+bcode_config                 = { workspace = true }
+bcode_daemon_lifecycle       = { workspace = true }
+bcode_hyperchad              = { workspace = true, optional = true }
+bcode_ipc                    = { workspace = true }
+bcode_metrics                = { workspace = true }
+bcode_model                  = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
-bcode_plugin = { workspace = true }
-bcode_plugin_sdk = { workspace = true }
-bcode_provider_auth = { workspace = true }
-bcode_server = { workspace = true }
-bcode_session = { workspace = true }
-bcode_session_import = { workspace = true }
-bcode_session_models = { workspace = true }
-bcode_settings = { workspace = true }
-bcode_tui = { workspace = true }
-bcode_web_render = { workspace = true, features = [
-    "actix",
-    "assets",
-    "html",
-    "static-routes",
-] }
-bcode_worktree_models = { workspace = true }
-bmux_keyboard = { workspace = true }
-bmux_tui = { workspace = true, features = ["crossterm"] }
-clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
-crossterm = { workspace = true, features = ["events"] }
-rand = { workspace = true }
-reqwest = { workspace = true }
-rpassword = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["process", "signal", "time"] }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-zeroize = { workspace = true }
+bcode_plugin                 = { workspace = true }
+bcode_plugin_sdk             = { workspace = true }
+bcode_provider_auth          = { workspace = true }
+bcode_server                 = { workspace = true }
+bcode_session                = { workspace = true }
+bcode_session_import         = { workspace = true }
+bcode_session_models         = { workspace = true }
+bcode_settings               = { workspace = true }
+bcode_tui                    = { workspace = true }
+bcode_worktree_models        = { workspace = true }
+bmux_keyboard                = { workspace = true }
+bmux_tui                     = { workspace = true, features = ["crossterm"] }
+clap                         = { workspace = true, features = ["derive", "help", "std", "usage"] }
+crossterm                    = { workspace = true, features = ["events"] }
+rand                         = { workspace = true }
+reqwest                      = { workspace = true }
+rpassword                    = { workspace = true }
+serde                        = { workspace = true, features = ["derive"] }
+serde_json                   = { workspace = true }
+sha2                         = { workspace = true }
+thiserror                    = { workspace = true }
+tokio                        = { workspace = true, features = ["process", "signal", "time"] }
+tracing                      = { workspace = true }
+tracing-subscriber           = { workspace = true }
+zeroize                      = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sshenv_vault = { workspace = true, features = [
@@ -114,7 +109,7 @@ static-bundled-plugins = [
 ]
 static-bundled-question-plugin = [
     "_static-bundled",
-    "bcode_web_render/static-bundled-question-plugin",
+    "bcode_hyperchad?/static-bundled-question-plugin",
 ]
 static-bundled-ralph-plugin = [
     "_static-bundled",
@@ -123,3 +118,4 @@ static-bundled-ralph-plugin = [
 static-bundled-shell-plugin = ["_static-bundled"]
 static-bundled-web-search-plugin = ["_static-bundled"]
 static-bundled-worktree-plugin = ["_static-bundled"]
+web-renderer = ["dep:bcode_hyperchad", "bcode_hyperchad/renderer-html-actix"]
