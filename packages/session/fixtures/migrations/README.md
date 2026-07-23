@@ -14,8 +14,10 @@ Fixture suites should cover:
 
 The `plugin-automation-turn-*-v29.json` and `plugin-status-note-v29.json`
 fixtures capture the last active schema-29 durable shapes before the generic
-runtime/loop architecture migration. They are compatibility inputs only and
-must never become templates for new writes.
+runtime/loop architecture migration. The `interactive-tool-request-*-v32.json`
+fixtures capture the retired interactive request lifecycle before generic tool
+exchanges replaced it. These are compatibility inputs only and must never
+become templates for new writes.
 
 Keep fixtures small, intentional, and documented with the schema version and
 expected migration/status outcome.

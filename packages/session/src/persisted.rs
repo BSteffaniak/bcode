@@ -26,7 +26,8 @@ use thiserror::Error;
 /// Returns an error when the event is not a supported persisted session-event
 /// shape or cannot be converted into the current domain model.
 pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
-    let value = serde_json::from_str::<serde_json::Value>(payload)?;
+    let mut value = serde_json::from_str::<serde_json::Value>(payload)?;
+    preserve_retired_event_kind_as_legacy(&mut value)?;
     reject_unsupported_future_shape(&value)?;
     let persisted = serde_json::from_value::<PersistedSessionEvent>(value)?;
     persisted.into_domain()
@@ -80,17 +81,153 @@ fn first_persisted_event_kind_name(kind: &serde_json::Value) -> String {
         .unwrap_or_else(|| "<invalid>".to_string())
 }
 
-/// Decode a persisted session event from durable JSON, returning `None` for
-/// unsupported or corrupt records that should not block normal catalog/open/
-/// attach/history paths.
+const RETIRED_INTERACTIVE_TOOL_EVENT_KINDS: [&str; 2] = [
+    "interactive_tool_request_created",
+    "interactive_tool_request_resolved",
+];
+
+fn preserve_retired_event_kind_as_legacy(
+    value: &mut serde_json::Value,
+) -> Result<(), PersistedSessionEventError> {
+    let Some(kind) = value
+        .get_mut("kind")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let Some(event_type) = RETIRED_INTERACTIVE_TOOL_EVENT_KINDS
+        .iter()
+        .find(|event_type| kind.contains_key(**event_type))
+        .copied()
+    else {
+        return Ok(());
+    };
+    let Some(payload) = kind.get(event_type) else {
+        return Ok(());
+    };
+    validate_retired_event_kind(event_type, payload)?;
+    let payload = kind
+        .remove(event_type)
+        .expect("validated retired event payload must remain present");
+    kind.clear();
+    kind.insert(
+        "legacy_event".to_owned(),
+        serde_json::json!({
+            "event_type": event_type,
+            "payload": payload,
+        }),
+    );
+    Ok(())
+}
+
+fn validate_retired_event_kind(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Result<(), PersistedSessionEventError> {
+    let required_fields: &[&str] = match event_type {
+        "interactive_tool_request_created" => &[
+            "interaction_id",
+            "tool_call_id",
+            "tool_name",
+            "surface_kind",
+            "request_json",
+        ],
+        "interactive_tool_request_resolved" => {
+            &["interaction_id", "tool_call_id", "resolution_json"]
+        }
+        _ => return Ok(()),
+    };
+    let Some(payload) = payload.as_object() else {
+        return Err(PersistedSessionEventError::InvalidLegacyEvent {
+            kind: event_type.to_owned(),
+            reason: "payload is not an object".to_owned(),
+        });
+    };
+    for field in required_fields {
+        if !payload
+            .get(*field)
+            .is_some_and(serde_json::Value::is_string)
+        {
+            return Err(PersistedSessionEventError::InvalidLegacyEvent {
+                kind: event_type.to_owned(),
+                reason: format!("missing or non-string field {field}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Decode a persisted session event for normal user-facing reads.
 ///
-/// This is intentionally lossy and must not be used by repair, doctor, reindex,
-/// or migration code that needs to report exact damage. Normal user-facing reads
-/// use it to degrade safely without implicitly repairing or mutating damaged
-/// logs.
+/// Unknown event kinds and future-schema events with trustworthy envelopes are
+/// represented as inert [`SessionEventKind::LegacyEvent`] values so their
+/// canonical sequence remains visible. Structurally malformed records return an
+/// error. This must not be used by repair, doctor, reindex, or migration code,
+/// which requires strict semantic compatibility as well as envelope validity.
+///
+/// # Errors
+///
+/// Returns an error when the persisted envelope is malformed or cannot be
+/// trusted.
+pub fn decode_session_event_compatible(
+    payload: &str,
+) -> Result<SessionEvent, PersistedSessionEventError> {
+    match decode_session_event(payload) {
+        Ok(event) => Ok(event),
+        Err(
+            PersistedSessionEventError::UnsupportedSchemaVersion { .. }
+            | PersistedSessionEventError::UnsupportedEventKind { .. },
+        ) => decode_opaque_session_event(payload),
+        Err(error) => Err(error),
+    }
+}
+
+/// Decode a persisted event best-effort for bounded metadata discovery.
+///
+/// Unlike [`decode_session_event_compatible`], this helper discards structural
+/// errors. It is reserved for best-effort catalog/metadata scans where one
+/// damaged row must not hide the canonical session directory.
 #[must_use]
 pub fn decode_session_event_degraded(payload: &str) -> Option<SessionEvent> {
-    decode_session_event(payload).ok()
+    decode_session_event_compatible(payload).ok()
+}
+
+fn decode_opaque_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
+    let persisted = serde_json::from_str::<OpaquePersistedSessionEvent>(payload)?;
+    let Some(kind) = persisted.kind.as_object() else {
+        return Err(PersistedSessionEventError::InvalidOpaqueEvent {
+            reason: "kind is not an object".to_owned(),
+        });
+    };
+    if kind.len() != 1 {
+        return Err(PersistedSessionEventError::InvalidOpaqueEvent {
+            reason: "kind must contain exactly one event variant".to_owned(),
+        });
+    }
+    let (event_type, payload) = kind.iter().next().expect("kind length was validated");
+    Ok(SessionEvent {
+        schema_version: persisted.schema_version,
+        sequence: persisted.sequence,
+        timestamp_ms: persisted.timestamp_ms,
+        session_id: persisted.session_id,
+        provenance: persisted.provenance,
+        kind: SessionEventKind::LegacyEvent {
+            event_type: event_type.clone(),
+            payload: payload.clone(),
+        },
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct OpaquePersistedSessionEvent {
+    schema_version: u16,
+    sequence: u64,
+    #[serde(default = "current_unix_timestamp_ms")]
+    timestamp_ms: u64,
+    session_id: SessionId,
+    #[serde(default)]
+    provenance: Option<SessionEventProvenance>,
+    kind: serde_json::Value,
 }
 
 /// Errors returned when decoding persisted session events.
@@ -107,6 +244,12 @@ pub enum PersistedSessionEventError {
     /// Persisted event uses an unknown future event kind not supported by this build.
     #[error("unsupported persisted session event kind {kind}")]
     UnsupportedEventKind { kind: String },
+    /// A recognized retired event kind is malformed and cannot be preserved safely.
+    #[error("invalid legacy persisted session event kind {kind}: {reason}")]
+    InvalidLegacyEvent { kind: String, reason: String },
+    /// A semantically opaque event did not contain a trustworthy persisted envelope.
+    #[error("invalid opaque persisted session event: {reason}")]
+    InvalidOpaqueEvent { reason: String },
 }
 
 /// Persisted session event DTO.
@@ -1385,6 +1528,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decodes_retired_interactive_tool_events_as_inert_legacy_history() {
+        let created = r#"{"schema_version":32,"sequence":1158,"timestamp_ms":1784669781317,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"interactive_tool_request_created":{"interaction_id":"call-1-question","tool_call_id":"call-1","tool_name":"question","interaction_kind":"bcode.question","surface_kind":"bcode.question.inline","request_json":"{\"questions\":[]}","required":true,"turn_behavior":"await_before_continuing","render_target":"transcript_tool_call"}}}"#;
+        let resolved = r#"{"schema_version":32,"sequence":1159,"timestamp_ms":1784669784128,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"interactive_tool_request_resolved":{"interaction_id":"call-1-question","tool_call_id":"call-1","resolution_json":"{\"type\":\"submitted\",\"payload\":{}}"}}}"#;
+
+        let created = decode_session_event(created).expect("retired request should decode");
+        let resolved = decode_session_event(resolved).expect("retired resolution should decode");
+
+        let SessionEventKind::LegacyEvent {
+            event_type,
+            payload,
+        } = created.kind
+        else {
+            panic!("retired request must remain inert legacy history");
+        };
+        assert_eq!(event_type, "interactive_tool_request_created");
+        assert_eq!(payload["interaction_id"], "call-1-question");
+        assert_eq!(payload["tool_call_id"], "call-1");
+        assert_eq!(payload["tool_name"], "question");
+        assert_eq!(payload["interaction_kind"], "bcode.question");
+        assert_eq!(payload["surface_kind"], "bcode.question.inline");
+        assert_eq!(payload["request_json"], r#"{"questions":[]}"#);
+        assert_eq!(payload["required"], true);
+        assert_eq!(payload["turn_behavior"], "await_before_continuing");
+        assert_eq!(payload["render_target"], "transcript_tool_call");
+
+        let SessionEventKind::LegacyEvent {
+            event_type,
+            payload,
+        } = resolved.kind
+        else {
+            panic!("retired resolution must remain inert legacy history");
+        };
+        assert_eq!(event_type, "interactive_tool_request_resolved");
+        assert_eq!(payload["interaction_id"], "call-1-question");
+        assert_eq!(payload["tool_call_id"], "call-1");
+        assert_eq!(
+            payload["resolution_json"],
+            r#"{"type":"submitted","payload":{}}"#
+        );
+    }
+
+    #[test]
+    fn retired_interactive_request_preserves_missing_optional_and_unknown_fields() {
+        let payload = r#"{"schema_version":25,"sequence":1,"timestamp_ms":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"interactive_tool_request_created":{"interaction_id":"interaction-1","tool_call_id":"call-1","tool_name":"question","surface_kind":"bcode.question.inline","request_json":"{}","future_historical_field":{"nested":true}}}}"#;
+
+        let event = decode_session_event(payload).expect("minimal retired request should decode");
+        let SessionEventKind::LegacyEvent { payload, .. } = event.kind else {
+            panic!("retired request must remain inert legacy history");
+        };
+        assert!(payload.get("interaction_kind").is_none());
+        assert!(payload.get("required").is_none());
+        assert!(payload.get("turn_behavior").is_none());
+        assert!(payload.get("render_target").is_none());
+        assert_eq!(payload["future_historical_field"]["nested"], true);
+    }
+
+    #[test]
+    fn retired_interactive_event_reencodes_only_as_legacy_event() {
+        let payload = r#"{"schema_version":32,"sequence":1,"timestamp_ms":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"interactive_tool_request_resolved":{"interaction_id":"interaction-1","tool_call_id":"call-1","resolution_json":"{\"type\":\"aborted\",\"reason\":\"turn_cancelled\"}"}}}"#;
+        let event = decode_session_event(payload).expect("retired resolution should decode");
+
+        let encoded = encode_session_event(&event).expect("legacy event should encode");
+        assert!(encoded.contains("\"legacy_event\""));
+        assert!(!encoded.contains("\"interactive_tool_request_resolved\":{"));
+    }
+
+    #[test]
+    fn malformed_retired_interactive_event_is_rejected() {
+        let payload = r#"{"schema_version":32,"sequence":1,"timestamp_ms":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"interactive_tool_request_created":{"interaction_id":"interaction-1","tool_call_id":"call-1","tool_name":"question","surface_kind":"bcode.question.inline"}}}"#;
+
+        assert!(matches!(
+            decode_session_event(payload),
+            Err(PersistedSessionEventError::InvalidLegacyEvent { .. })
+        ));
+    }
+
+    #[test]
     fn generic_invocation_result_record_round_trips_through_persistence() {
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -1515,6 +1735,28 @@ mod tests {
                 other => panic!("unexpected compatibility event: {other:?}"),
             };
             assert_eq!(actual_kind, expected_kind);
+        }
+    }
+
+    #[test]
+    fn decodes_retired_interactive_tool_compatibility_fixtures() {
+        let cases = [
+            (
+                include_str!("../fixtures/migrations/interactive-tool-request-created-v32.json"),
+                "interactive_tool_request_created",
+            ),
+            (
+                include_str!("../fixtures/migrations/interactive-tool-request-resolved-v32.json"),
+                "interactive_tool_request_resolved",
+            ),
+        ];
+
+        for (payload, expected_kind) in cases {
+            let event = decode_session_event(payload).expect("schema-32 fixture should decode");
+            let SessionEventKind::LegacyEvent { event_type, .. } = event.kind else {
+                panic!("retired interactive event must remain inert legacy history");
+            };
+            assert_eq!(event_type, expected_kind);
         }
     }
 
@@ -1856,6 +2098,57 @@ mod tests {
             error,
             PersistedSessionEventError::UnsupportedEventKind { .. }
         ));
+    }
+
+    #[test]
+    fn degraded_decode_preserves_unknown_and_future_events_as_opaque_history() {
+        for schema_version in [
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION + 1,
+        ] {
+            let payload = serde_json::json!({
+                "schema_version": schema_version,
+                "sequence": 17,
+                "timestamp_ms": 23,
+                "session_id": "00000000-0000-0000-0000-000000000001",
+                "provenance": {
+                    "source_event_id": "source-17",
+                    "source_timestamp_ms": 22,
+                    "source_locator": "bcode://session/source/event/17"
+                },
+                "kind": { "future_event_kind": { "value": true, "nested": [1, 2] } }
+            })
+            .to_string();
+
+            let event = decode_session_event_degraded(&payload)
+                .expect("trustworthy future envelope should remain inspectable");
+            assert_eq!(event.schema_version, schema_version);
+            assert_eq!(event.sequence, 17);
+            assert_eq!(event.timestamp_ms, 23);
+            assert!(event.provenance.is_some());
+            let SessionEventKind::LegacyEvent {
+                event_type,
+                payload,
+            } = event.kind
+            else {
+                panic!("future event should be opaque legacy history");
+            };
+            assert_eq!(event_type, "future_event_kind");
+            assert_eq!(payload["value"], true);
+            assert_eq!(payload["nested"], serde_json::json!([1, 2]));
+        }
+    }
+
+    #[test]
+    fn degraded_decode_rejects_untrustworthy_opaque_envelopes() {
+        for payload in [
+            r#"{"schema_version":39,"sequence":1,"session_id":"not-a-session-id","kind":{"future":{}}}"#,
+            r#"{"schema_version":39,"sequence":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{}}"#,
+            r#"{"schema_version":39,"sequence":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"one":{},"two":{}}}"#,
+            "not json",
+        ] {
+            assert!(decode_session_event_degraded(payload).is_none());
+        }
     }
 
     #[test]

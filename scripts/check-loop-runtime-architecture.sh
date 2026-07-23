@@ -854,6 +854,7 @@ fi
 
 if rg -n 'InteractiveToolRenderTarget|InteractiveToolTurnBehavior|render_target|turn_behavior' \
   packages/session-view packages/session packages/ipc packages/server packages/tui packages/web-render --glob='*.rs' \
+  | grep -v '^packages/session/src/persisted.rs:' \
   >/tmp/bcode-removed-interaction-placement.txt; then
   echo "Runtime architecture violation: removed interaction placement/turn-behavior DTOs were reintroduced." >&2
   cat /tmp/bcode-removed-interaction-placement.txt >&2

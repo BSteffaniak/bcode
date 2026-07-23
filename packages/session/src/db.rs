@@ -15,8 +15,8 @@ use std::{
 };
 
 use crate::persisted::{
-    PersistedSessionEventError, decode_session_event, decode_session_event_degraded,
-    encode_session_event,
+    PersistedSessionEventError, decode_session_event, decode_session_event_compatible,
+    decode_session_event_degraded, encode_session_event,
 };
 
 use bcode_database_observability::ObservedDatabase;
@@ -1472,29 +1472,24 @@ impl SessionDb {
         Ok(first.zip(last))
     }
 
-    /// Return all canonical events in sequence order, skipping unsupported or
-    /// corrupt persisted records for normal user-facing history reads.
+    /// Return all canonical events in sequence order, preserving unknown or
+    /// future semantic events as inert legacy history.
     ///
     /// # Errors
     ///
-    /// Returns an error if the query or event deserialization fails.
+    /// Returns an error if the query fails or a persisted envelope is malformed.
     pub async fn all_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
         let rows = self
             .db
             .select("events")
-            .columns(&["payload"])
+            .columns(&["event_seq", "payload"])
             .sort("event_seq", SortDirection::Asc)
             .execute(&**self.db)
             .await?;
 
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let payload = required_string(&row, "payload")?;
-            if let Some(event) = decode_session_event_degraded(&payload) {
-                events.push(event);
-            }
-        }
-        Ok(events)
+        rows.iter()
+            .map(|row| compatible_event_from_row(row, self.session_id))
+            .collect()
     }
 
     /// Return all canonical events in sequence order using strict persisted DTO
@@ -1547,22 +1542,23 @@ impl SessionDb {
 
         let rows = select.execute(&**self.db).await?;
         let has_more = rows.len() > limit;
-        let mut events = Vec::with_capacity(limit.min(rows.len()));
-        for row in rows.iter().take(limit) {
-            let payload = required_string(row, "payload")?;
-            if let Some(event) = decode_session_event_degraded(&payload) {
-                events.push(event);
-            }
-        }
-        if matches!(query.direction, SessionHistoryDirection::Backward) {
-            events.reverse();
-        }
-        let next_cursor = if has_more {
-            events.first().map(|event| SessionHistoryCursor {
-                sequence: event.sequence,
+        let next_cursor = rows
+            .get(limit)
+            .map(|row| -> SessionDbResult<SessionHistoryCursor> {
+                Ok(SessionHistoryCursor {
+                    sequence: required_non_negative_u64(row, "event_seq")?,
+                })
             })
+            .transpose()?;
+        let events = rows
+            .iter()
+            .take(limit)
+            .map(|row| compatible_event_from_row(row, self.session_id))
+            .collect::<SessionDbResult<Vec<_>>>()?;
+        let events = if matches!(query.direction, SessionHistoryDirection::Backward) {
+            events.into_iter().rev().collect()
         } else {
-            None
+            events
         };
         Ok(SessionHistoryPage {
             session_id: self.session_id,
@@ -1876,7 +1872,7 @@ impl SessionDb {
         let rows = self
             .db
             .select("events")
-            .columns(&["payload"])
+            .columns(&["event_seq", "payload"])
             .where_gte("event_seq", seq_to_value(start_sequence))
             .where_lte("event_seq", seq_to_value(end_sequence))
             .sort("event_seq", SortDirection::Asc)
@@ -1884,14 +1880,9 @@ impl SessionDb {
             .execute(&**self.db)
             .await?;
 
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let payload = required_string(&row, "payload")?;
-            if let Some(event) = decode_session_event_degraded(&payload) {
-                events.push(event);
-            }
-        }
-        Ok(events)
+        rows.iter()
+            .map(|row| compatible_event_from_row(row, self.session_id))
+            .collect()
     }
 
     /// Return latest transcript projection items in chronological order.
@@ -3754,6 +3745,27 @@ fn required_i64(row: &switchy::database::Row, column: &str) -> SessionDbResult<i
         })
 }
 
+fn compatible_event_from_row(
+    row: &switchy::database::Row,
+    session_id: SessionId,
+) -> SessionDbResult<SessionEvent> {
+    let event_seq = required_non_negative_u64(row, "event_seq")?;
+    let payload = required_string(row, "payload")?;
+    let event = decode_session_event_compatible(&payload)?;
+    if event.sequence != event_seq {
+        return Err(SessionDbError::InvalidCanonicalSequence {
+            expected: event_seq,
+            actual: event.sequence,
+        });
+    }
+    if event.session_id != session_id {
+        return Err(SessionDbError::InvalidRow {
+            column: "events.session_id".to_owned(),
+        });
+    }
+    Ok(event)
+}
+
 fn required_non_negative_u64(row: &switchy::database::Row, column: &str) -> SessionDbResult<u64> {
     let value = required_i64(row, column)?;
     if value.is_negative() {
@@ -4290,8 +4302,43 @@ mod tests {
         assert!(!is_database_lock_error_message("permission denied"));
     }
 
+    fn history_sequences(events: &[SessionEvent]) -> Vec<u64> {
+        events.iter().map(|event| event.sequence).collect()
+    }
+
+    async fn insert_raw_history_event(
+        db: &SessionDb,
+        session_id: SessionId,
+        sequence: u64,
+        event_type: &str,
+        kind: serde_json::Value,
+    ) {
+        db.database()
+            .insert("events")
+            .value("event_seq", seq_to_value(sequence))
+            .value("event_type", event_type)
+            .value(
+                "schema_version",
+                DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
+            )
+            .value("created_at_ms", seq_to_value(sequence))
+            .value(
+                "payload",
+                serde_json::json!({
+                    "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    "sequence": sequence,
+                    "session_id": session_id,
+                    "kind": kind,
+                })
+                .to_string(),
+            )
+            .execute(db.database())
+            .await
+            .expect("insert raw history event");
+    }
+
     #[tokio::test]
-    async fn normal_history_reads_skip_corrupt_and_future_persisted_events_without_repair() {
+    async fn normal_history_reads_preserve_future_events_without_mutation() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
@@ -4309,50 +4356,22 @@ mod tests {
         .await
         .expect("append valid event");
 
-        db.database()
-            .insert("events")
-            .value("event_seq", seq_to_value(1))
-            .value("event_type", "future_event_kind")
-            .value(
-                "schema_version",
-                DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
-            )
-            .value("created_at_ms", seq_to_value(1))
-            .value(
-                "payload",
-                serde_json::json!({
-                    "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                    "sequence": 1,
-                    "session_id": session_id,
-                    "kind": { "future_event_kind": { "value": true } }
-                })
-                .to_string(),
-            )
-            .execute(db.database())
-            .await
-            .expect("insert future event");
-        db.database()
-            .insert("events")
-            .value("event_seq", seq_to_value(2))
-            .value("event_type", "tool_call_finished")
-            .value(
-                "schema_version",
-                DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
-            )
-            .value("created_at_ms", seq_to_value(2))
-            .value(
-                "payload",
-                serde_json::json!({
-                    "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                    "sequence": 2,
-                    "session_id": session_id,
-                    "kind": { "tool_call_finished": { "result": "missing call id" } }
-                })
-                .to_string(),
-            )
-            .execute(db.database())
-            .await
-            .expect("insert corrupt event");
+        insert_raw_history_event(
+            &db,
+            session_id,
+            1,
+            "future_event_kind",
+            serde_json::json!({ "future_event_kind": { "value": true } }),
+        )
+        .await;
+        insert_raw_history_event(
+            &db,
+            session_id,
+            2,
+            "tool_call_finished",
+            serde_json::json!({ "tool_call_finished": { "result": "missing call id" } }),
+        )
+        .await;
         insert_event(
             db.database(),
             &event(
@@ -4367,10 +4386,43 @@ mod tests {
         .await
         .expect("insert second valid event");
 
-        let history = db.all_events().await.expect("history should degrade");
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].sequence, 0);
-        assert_eq!(history[1].sequence, 3);
+        let history_error = db
+            .all_events()
+            .await
+            .expect_err("structurally corrupt history must be reported");
+        assert!(matches!(history_error, SessionDbError::PersistedEvent(_)));
+
+        let page_error = db
+            .history_page(SessionHistoryQuery {
+                cursor: None,
+                direction: SessionHistoryDirection::Forward,
+                limit: 8,
+            })
+            .await
+            .expect_err("structurally corrupt page must be reported");
+        assert!(matches!(page_error, SessionDbError::PersistedEvent(_)));
+
+        db.database()
+            .delete("events")
+            .where_eq("event_seq", seq_to_value(2))
+            .execute(db.database())
+            .await
+            .expect("remove deliberately corrupt test row");
+
+        let history = db
+            .all_events()
+            .await
+            .expect("future history should remain visible");
+        assert_eq!(history_sequences(&history), vec![0, 1, 3]);
+        let SessionEventKind::LegacyEvent {
+            event_type,
+            payload,
+        } = &history[1].kind
+        else {
+            panic!("future event should be represented as opaque legacy history");
+        };
+        assert_eq!(event_type, "future_event_kind");
+        assert_eq!(payload["value"], true);
 
         let page = db
             .history_page(SessionHistoryQuery {
@@ -4379,10 +4431,8 @@ mod tests {
                 limit: 8,
             })
             .await
-            .expect("page should degrade");
-        assert_eq!(page.events.len(), 2);
-        assert_eq!(page.events[0].sequence, 0);
-        assert_eq!(page.events[1].sequence, 3);
+            .expect("future page should remain visible");
+        assert_eq!(history_sequences(&page.events), vec![0, 1, 3]);
 
         let raw_rows = db
             .database()
@@ -4392,7 +4442,80 @@ mod tests {
             .execute(db.database())
             .await
             .expect("raw rows should remain");
-        assert_eq!(raw_rows.len(), 4);
+        assert_eq!(raw_rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn history_pagination_advances_across_opaque_only_pages_in_both_directions() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        for sequence in 0_u64..7 {
+            db.database()
+                .insert("events")
+                .value("event_seq", seq_to_value(sequence))
+                .value("event_type", format!("future_{sequence}"))
+                .value(
+                    "schema_version",
+                    DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
+                )
+                .value("created_at_ms", seq_to_value(sequence))
+                .value(
+                    "payload",
+                    serde_json::json!({
+                        "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                        "sequence": sequence,
+                        "timestamp_ms": sequence,
+                        "session_id": session_id,
+                        "kind": { (format!("future_{sequence}")): { "sequence": sequence } }
+                    })
+                    .to_string(),
+                )
+                .execute(db.database())
+                .await
+                .expect("insert opaque event");
+        }
+
+        let mut forward = Vec::new();
+        let mut cursor = Some(SessionHistoryCursor { sequence: 0 });
+        while let Some(page_cursor) = cursor {
+            let page = db
+                .history_page(SessionHistoryQuery {
+                    cursor: Some(page_cursor),
+                    direction: SessionHistoryDirection::Forward,
+                    limit: 2,
+                })
+                .await
+                .expect("forward opaque page");
+            forward.extend(page.events.iter().map(|event| event.sequence));
+            cursor = page.next_cursor;
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(forward, (0_u64..7).collect::<Vec<_>>());
+
+        let mut backward = Vec::new();
+        let mut cursor = Some(SessionHistoryCursor { sequence: 6 });
+        while let Some(page_cursor) = cursor {
+            let page = db
+                .history_page(SessionHistoryQuery {
+                    cursor: Some(page_cursor),
+                    direction: SessionHistoryDirection::Backward,
+                    limit: 2,
+                })
+                .await
+                .expect("backward opaque page");
+            backward.extend(page.events.iter().map(|event| event.sequence));
+            cursor = page.next_cursor;
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(backward, vec![5, 6, 3, 4, 1, 2, 0]);
     }
 
     #[tokio::test]

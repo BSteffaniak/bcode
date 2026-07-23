@@ -864,11 +864,14 @@ mod tests {
         )
         .await;
 
-        let degraded_history = session_db
+        let history_error = session_db
             .all_events()
             .await
-            .expect("normal history should degrade");
-        assert_eq!(degraded_history.len(), 1);
+            .expect_err("normal history must report structural corruption");
+        assert!(matches!(
+            history_error,
+            db::SessionDbError::PersistedEvent(_)
+        ));
 
         let report = doctor_session(temp_dir.path(), session_id)
             .await

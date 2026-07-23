@@ -1,0 +1,1 @@
+{"schema_version":32,"sequence":1159,"timestamp_ms":1784669784128,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"interactive_tool_request_resolved":{"interaction_id":"call-1-question","tool_call_id":"call-1","resolution_json":"{\"type\":\"submitted\",\"payload\":{}}"}}}
