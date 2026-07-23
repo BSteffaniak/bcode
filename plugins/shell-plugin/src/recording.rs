@@ -70,6 +70,40 @@ pub struct IncrementalShellRecordingDecoder {
     saw_finish: bool,
 }
 
+#[derive(Clone, Copy)]
+struct IncrementalDecoderCheckpoint {
+    stream_offset: u64,
+    columns: Option<u16>,
+    rows: Option<u16>,
+    previous_frame_offset: Option<u64>,
+    saw_start: bool,
+    saw_finish: bool,
+}
+
+impl From<&IncrementalShellRecordingDecoder> for IncrementalDecoderCheckpoint {
+    fn from(decoder: &IncrementalShellRecordingDecoder) -> Self {
+        Self {
+            stream_offset: decoder.stream_offset,
+            columns: decoder.columns,
+            rows: decoder.rows,
+            previous_frame_offset: decoder.previous_frame_offset,
+            saw_start: decoder.saw_start,
+            saw_finish: decoder.saw_finish,
+        }
+    }
+}
+
+impl IncrementalDecoderCheckpoint {
+    const fn restore(self, decoder: &mut IncrementalShellRecordingDecoder) {
+        decoder.stream_offset = self.stream_offset;
+        decoder.columns = self.columns;
+        decoder.rows = self.rows;
+        decoder.previous_frame_offset = self.previous_frame_offset;
+        decoder.saw_start = self.saw_start;
+        decoder.saw_finish = self.saw_finish;
+    }
+}
+
 impl IncrementalShellRecordingDecoder {
     /// Append the next contiguous recording range and decode all newly complete frames.
     ///
@@ -85,7 +119,20 @@ impl IncrementalShellRecordingDecoder {
                 "recording range is not contiguous",
             ));
         }
+        let checkpoint = IncrementalDecoderCheckpoint::from(&*self);
+        let buffer_len = self.buffer.len();
         self.buffer.extend_from_slice(bytes);
+        match self.decode_available() {
+            Ok(frames) => Ok(frames),
+            Err(error) => {
+                self.buffer.truncate(buffer_len);
+                checkpoint.restore(self);
+                Err(error)
+            }
+        }
+    }
+
+    fn decode_available(&mut self) -> io::Result<Vec<ShellRecordingFrame>> {
         let mut consumed = if self.columns.is_none() {
             if self.buffer.len() < RECORDING_HEADER_BYTES {
                 return Ok(Vec::new());
@@ -1048,6 +1095,56 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_decoder_rejects_damage_without_losing_retryable_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("retryable.bcsr");
+        let mut writer = ShellRecordingWriter::create(&path, 80, 24).expect("writer");
+        writer
+            .write_replay_output(1, b"before damage\r\n")
+            .expect("replay output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
+        let bytes = std::fs::read(&path).expect("recording bytes");
+        let prefix_len = RECORDING_HEADER_BYTES + RECORDING_FRAME_HEADER_BYTES;
+        let mut decoder = IncrementalShellRecordingDecoder::default();
+        assert_eq!(
+            decoder.push(0, &bytes[..prefix_len]).expect("valid prefix"),
+            vec![ShellRecordingFrame::Start { offset_micros: 0 }]
+        );
+
+        let mut damaged_frame = vec![FRAME_REPLAY_OUTPUT];
+        damaged_frame.extend_from_slice(&1_u64.to_le_bytes());
+        damaged_frame.extend_from_slice(
+            &u32::try_from(MAX_FRAME_BYTES + 1)
+                .expect("oversized frame length")
+                .to_le_bytes(),
+        );
+        assert!(
+            decoder
+                .push(
+                    u64::try_from(prefix_len).expect("prefix offset"),
+                    &damaged_frame,
+                )
+                .is_err()
+        );
+
+        let recovered = decoder
+            .push(
+                u64::try_from(prefix_len).expect("prefix offset"),
+                &bytes[prefix_len..],
+            )
+            .expect("valid replacement range");
+        assert!(matches!(
+            recovered.as_slice(),
+            [
+                ShellRecordingFrame::ReplayOutput { bytes, .. },
+                ShellRecordingFrame::Finish { exit_code: Some(0), .. }
+            ] if bytes == b"before damage\r\n"
+        ));
+    }
 
     #[test]
     fn incremental_decoder_preserves_exact_frames_across_single_byte_ranges() {

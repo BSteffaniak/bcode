@@ -9826,10 +9826,17 @@ enum ToolOutputLivePublisherEvent {
 }
 
 #[derive(Debug)]
+struct PendingArtifactUpdate {
+    event: ToolInvocationStreamEvent,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug)]
 struct ToolOutputLivePublisher {
     pending_output: Option<ToolOutputStreamAccumulator>,
-    pending_artifacts: BTreeMap<(String, String, String), ToolInvocationStreamEvent>,
+    pending_artifacts: BTreeMap<(String, String, String), PendingArtifactUpdate>,
     pending_visuals: BTreeMap<String, ToolInvocationStreamEvent>,
+    artifact_last_seen: BTreeMap<(String, String, String), (u64, Instant)>,
     flush_generation: u64,
     flush_tx: mpsc::UnboundedSender<ToolOutputLivePublisherEvent>,
     flush_rx: mpsc::UnboundedReceiver<ToolOutputLivePublisherEvent>,
@@ -9842,6 +9849,7 @@ impl ToolOutputLivePublisher {
             pending_output: None,
             pending_artifacts: BTreeMap::new(),
             pending_visuals: BTreeMap::new(),
+            artifact_last_seen: BTreeMap::new(),
             flush_generation: 0,
             flush_tx,
             flush_rx,
@@ -9867,7 +9875,7 @@ impl ToolOutputLivePublisher {
             return;
         }
         if matches!(event, ToolInvocationStreamEvent::ArtifactUpdate { .. }) {
-            let (was_empty, finalized) = self.enqueue_artifact_update(event);
+            let (was_empty, finalized) = self.enqueue_artifact_update(&state.metrics, event);
             if finalized {
                 self.flush(state, session_id).await;
             } else if was_empty {
@@ -9922,27 +9930,66 @@ impl ToolOutputLivePublisher {
         self.pending_visuals.insert(tool_call_id.clone(), event);
     }
 
-    fn enqueue_artifact_update(&mut self, event: ToolInvocationStreamEvent) -> (bool, bool) {
+    fn enqueue_artifact_update(
+        &mut self,
+        metrics: &MetricsRegistry,
+        event: ToolInvocationStreamEvent,
+    ) -> (bool, bool) {
         let ToolInvocationStreamEvent::ArtifactUpdate {
             tool_call_id,
             artifact_id,
             reference_key,
+            producer_plugin_id,
+            schema,
+            committed_bytes,
             finalized,
             ..
         } = &event
         else {
             unreachable!("artifact enqueue requires an artifact update");
         };
+        let key = (
+            tool_call_id.clone(),
+            artifact_id.clone(),
+            reference_key.clone(),
+        );
+        let now = Instant::now();
+        let mut labels = MetricLabels::new();
+        labels.insert("producer".to_owned(), producer_plugin_id.clone());
+        labels.insert("schema".to_owned(), schema.clone());
+        labels.insert("finalized".to_owned(), finalized.to_string());
+        metrics.add_counter_with_labels("tool.artifact_update.received_total", 1, labels.clone());
+        if let Some((previous_bytes, previous_at)) = self
+            .artifact_last_seen
+            .insert(key.clone(), (*committed_bytes, now))
+        {
+            metrics.record_histogram_with_labels(
+                "tool.artifact_update.committed_delta_bytes",
+                committed_bytes.saturating_sub(previous_bytes),
+                labels.clone(),
+            );
+            metrics.record_histogram_with_labels(
+                "tool.artifact_update.interarrival_ms",
+                u64::try_from(now.saturating_duration_since(previous_at).as_millis())
+                    .unwrap_or(u64::MAX),
+                labels.clone(),
+            );
+        }
         let was_empty = self.pending_artifacts.is_empty();
         let finalized = *finalized;
-        self.pending_artifacts.insert(
-            (
-                tool_call_id.clone(),
-                artifact_id.clone(),
-                reference_key.clone(),
-            ),
-            event,
-        );
+        if self
+            .pending_artifacts
+            .insert(
+                key,
+                PendingArtifactUpdate {
+                    event,
+                    enqueued_at: now,
+                },
+            )
+            .is_some()
+        {
+            metrics.add_counter_with_labels("tool.artifact_update.coalesced_total", 1, labels);
+        }
         (was_empty, finalized)
     }
 
@@ -9970,8 +10017,9 @@ impl ToolOutputLivePublisher {
         self.flush_generation = self.flush_generation.wrapping_add(1);
         flush_tool_output_stream(state, session_id, &mut self.pending_output).await;
         let artifacts = std::mem::take(&mut self.pending_artifacts);
-        for event in artifacts.into_values() {
-            append_tool_stream_event(state, session_id, event).await;
+        for pending in artifacts.into_values() {
+            record_artifact_update_published(&state.metrics, &pending);
+            append_tool_stream_event(state, session_id, pending.event).await;
         }
         let visuals = std::mem::take(&mut self.pending_visuals);
         for event in visuals.into_values() {
@@ -9988,6 +10036,28 @@ impl ToolOutputLivePublisher {
             let _ = flush_tx.send(ToolOutputLivePublisherEvent::FlushDue { generation });
         });
     }
+}
+
+fn record_artifact_update_published(metrics: &MetricsRegistry, pending: &PendingArtifactUpdate) {
+    let ToolInvocationStreamEvent::ArtifactUpdate {
+        producer_plugin_id,
+        schema,
+        finalized,
+        ..
+    } = &pending.event
+    else {
+        return;
+    };
+    let mut labels = MetricLabels::new();
+    labels.insert("producer".to_owned(), producer_plugin_id.clone());
+    labels.insert("schema".to_owned(), schema.clone());
+    labels.insert("finalized".to_owned(), finalized.to_string());
+    metrics.add_counter_with_labels("tool.artifact_update.published_total", 1, labels.clone());
+    metrics.record_histogram_with_labels(
+        "tool.artifact_update.publish_delay_ms",
+        u64::try_from(pending.enqueued_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        labels,
+    );
 }
 
 #[derive(Debug)]
@@ -29031,25 +29101,45 @@ library = "test"
                 finalized,
             };
 
+        let metrics = MetricsRegistry::default();
         assert_eq!(
-            publisher.enqueue_artifact_update(update(1, 10, false)),
+            publisher.enqueue_artifact_update(&metrics, update(1, 10, false)),
             (true, false)
         );
         assert_eq!(
-            publisher.enqueue_artifact_update(update(2, 20, false)),
+            publisher.enqueue_artifact_update(&metrics, update(2, 20, false)),
             (false, false)
         );
         assert_eq!(publisher.pending_artifacts.len(), 1);
         assert!(matches!(
-            publisher.pending_artifacts.values().next(),
+            publisher
+                .pending_artifacts
+                .values()
+                .next()
+                .map(|pending| &pending.event),
             Some(ToolInvocationStreamEvent::ArtifactUpdate {
                 revision: 2,
                 committed_bytes: 20,
                 ..
             })
         ));
+        let report = metrics.report();
         assert_eq!(
-            publisher.enqueue_artifact_update(update(3, 30, true)),
+            report
+                .snapshot
+                .counters
+                .get("tool.artifact_update.received_total"),
+            Some(&2)
+        );
+        assert_eq!(
+            report
+                .snapshot
+                .counters
+                .get("tool.artifact_update.coalesced_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            publisher.enqueue_artifact_update(&metrics, update(3, 30, true)),
             (false, true)
         );
     }

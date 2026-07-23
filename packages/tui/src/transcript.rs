@@ -257,6 +257,30 @@ impl TranscriptItem {
         true
     }
 
+    /// Return the generic tool invocation id that owns this visual item, when any.
+    #[must_use]
+    pub fn visual_invocation_id(&self) -> Option<&str> {
+        match &self.kind {
+            TranscriptItemKind::ToolRequest { tool_call_id, .. }
+            | TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. }
+            | TranscriptItemKind::ToolResult { tool_call_id, .. }
+            | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => Some(tool_call_id),
+            TranscriptItemKind::ToolContribution { contribution, .. } => {
+                Some(&contribution.invocation_id)
+            }
+            TranscriptItemKind::UserMessage
+            | TranscriptItemKind::AssistantMessage
+            | TranscriptItemKind::ReasoningMessage
+            | TranscriptItemKind::Usage { .. }
+            | TranscriptItemKind::PermissionResult { .. }
+            | TranscriptItemKind::System
+            | TranscriptItemKind::Meta
+            | TranscriptItemKind::Skill
+            | TranscriptItemKind::SkillError
+            | TranscriptItemKind::Generic => None,
+        }
+    }
+
     /// Return revision incremented whenever rendered state mutates.
     #[must_use]
     pub const fn revision(&self) -> u64 {

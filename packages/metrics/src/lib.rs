@@ -2005,7 +2005,17 @@ fn read_jsonl_events_tail(path: &Path, max_bytes: u64) -> Vec<MetricEvent> {
 }
 
 fn infer_unit(key: &str) -> Option<String> {
-    key.ends_with("_ms").then(|| "ms".to_owned())
+    if key.ends_with("_ms") {
+        Some("ms".to_owned())
+    } else if key.ends_with("_us") {
+        Some("us".to_owned())
+    } else if key.ends_with("_bytes") || key.split('.').next_back() == Some("bytes") {
+        Some("bytes".to_owned())
+    } else if key.ends_with("_total") || key.split('.').next_back() == Some("total") {
+        Some("count".to_owned())
+    } else {
+        None
+    }
 }
 
 fn current_unix_millis() -> u64 {
@@ -2098,6 +2108,37 @@ mod tests {
                 .get("tui.frame.total_ms")
                 .map(|histogram| histogram.count),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn tui_and_artifact_metric_descriptors_infer_units() {
+        let metrics = MetricsRegistry::default();
+        metrics.record_histogram("tui.transcript.sync_us", 42);
+        metrics.add_counter("tui.artifact.delivered_bytes", 512);
+        metrics.increment_counter("tui.frame.over_budget_total");
+
+        let report = metrics.report();
+        assert_eq!(
+            report
+                .descriptors
+                .get("tui.transcript.sync_us")
+                .and_then(|descriptor| descriptor.unit.as_deref()),
+            Some("us")
+        );
+        assert_eq!(
+            report
+                .descriptors
+                .get("tui.artifact.delivered_bytes")
+                .and_then(|descriptor| descriptor.unit.as_deref()),
+            Some("bytes")
+        );
+        assert_eq!(
+            report
+                .descriptors
+                .get("tui.frame.over_budget_total")
+                .and_then(|descriptor| descriptor.unit.as_deref()),
+            Some("count")
         );
     }
 

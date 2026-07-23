@@ -786,7 +786,9 @@ fn label_summary(labels: &MetricLabels) -> String {
 }
 
 fn format_dashboard_value(metric: &str, value: u64) -> String {
-    if is_duration_metric(metric) {
+    if metric.ends_with("_us") {
+        format_us(value)
+    } else if is_duration_metric(metric) {
         format_ms(value)
     } else if is_bytes_metric(metric) {
         format_bytes(value)
@@ -796,7 +798,7 @@ fn format_dashboard_value(metric: &str, value: u64) -> String {
 }
 
 fn is_duration_metric(metric: &str) -> bool {
-    metric.ends_with("duration_ms")
+    metric.ends_with("duration_ms") || metric.ends_with("_ms") || metric.ends_with("_us")
 }
 
 fn is_bytes_metric(metric: &str) -> bool {
@@ -814,6 +816,14 @@ fn format_bytes(value: u64) -> String {
         format!("{}.{}KiB", value / KIB, (value % KIB) / (KIB / 10))
     } else {
         format!("{value}B")
+    }
+}
+
+fn format_us(value: u64) -> String {
+    if value >= 1_000 {
+        format_ms(value / 1_000)
+    } else {
+        format!("{value}µs")
     }
 }
 

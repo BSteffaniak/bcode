@@ -144,8 +144,12 @@ impl<'a> TranscriptLayoutInput<'a> {
                         .map_or(0, |preview| preview.revision),
                     _ => 0,
                 };
+                let visual_revision = item.visual_invocation_id().map_or(0, |invocation_id| {
+                    self.plugin_host
+                        .map_or(0, |host| host.visual_revision(invocation_id))
+                });
                 format!(
-                    "{}:{}:{elapsed}:live-preview:{live_preview_revision}",
+                    "{}:{}:{elapsed}:visual:{visual_revision}:live-preview:{live_preview_revision}",
                     item.id().get(),
                     item.revision()
                 )
@@ -158,12 +162,12 @@ impl<'a> TranscriptLayoutInput<'a> {
             .map(|pending| format!("{}:{:?}", pending.text(), pending.state()))
             .collect::<Vec<_>>()
             .join(",");
-        let plugin_host_revision = self.plugin_host.map_or_else(
+        let plugin_host_generation = self.plugin_host.map_or_else(
             || "none".to_owned(),
             |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
         );
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};history:{}:{};plugin-host:{plugin_host_revision};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
+            "width:{};diff:{:?};history:{}:{};plugin-host-generation:{plugin_host_generation};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
             self.width,
             self.diff_viewer_config,
             self.has_older_history,
@@ -174,6 +178,31 @@ impl<'a> TranscriptLayoutInput<'a> {
             pending
         ))
     }
+}
+
+#[cfg(test)]
+#[must_use]
+pub fn test_layout_signature(
+    item: &TranscriptItem,
+    width: u16,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+) -> TranscriptLayoutSignature {
+    let transcript = [item.clone()];
+    let live_tool_previews = std::collections::BTreeMap::new();
+    let pending = [];
+    let input = TranscriptLayoutInput {
+        width,
+        transcript: &transcript,
+        live_tool_previews: &live_tool_previews,
+        plugin_host,
+        diff_viewer_config: TuiDiffViewerConfig::default(),
+        pending: &pending,
+        transcript_projection_revision: 0,
+        pending_submissions_projection_revision: 0,
+        has_older_history: false,
+        loading_older_history: false,
+    };
+    transcript_item_signature(item, &input)
 }
 
 fn transcript_item_signature(
@@ -188,12 +217,13 @@ fn transcript_item_signature(
             .map_or(0, |preview| preview.revision),
         _ => 0,
     };
-    let plugin_host_revision = input.plugin_host.map_or_else(
-        || "none".to_owned(),
-        |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
-    );
+    let visual_revision = item.visual_invocation_id().map_or(0, |invocation_id| {
+        input
+            .plugin_host
+            .map_or(0, |host| host.visual_revision(invocation_id))
+    });
     TranscriptLayoutSignature::new(format!(
-        "{};plugin-host:{plugin_host_revision};live-preview-rev:{live_preview_revision}",
+        "{};visual-rev:{visual_revision};live-preview-rev:{live_preview_revision}",
         base.as_str()
     ))
 }

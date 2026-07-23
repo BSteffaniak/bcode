@@ -1586,6 +1586,16 @@ fn draw_chat_frame<W: Write>(
         );
     }
     if let Some(presentation) = chat.app.plugin_presentation() {
+        for diagnostic in presentation.drain_diagnostics() {
+            let mut labels = bcode_metrics::MetricLabels::new();
+            labels.insert("plugin_id".to_owned(), diagnostic.plugin_id);
+            labels.insert("diagnostic".to_owned(), diagnostic.name);
+            loop_state.telemetry.add_counter_with_labels(
+                "tui.plugin_visual.work",
+                diagnostic.value,
+                labels,
+            );
+        }
         for timing in presentation.drain_timings() {
             let mut labels = bcode_metrics::MetricLabels::new();
             labels.insert("operation".to_owned(), timing.operation.to_owned());

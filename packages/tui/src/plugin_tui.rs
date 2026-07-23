@@ -22,6 +22,17 @@ pub struct PluginVisualTiming {
     pub duration_micros: u64,
 }
 
+/// One bounded adapter diagnostic after generic host routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginVisualDiagnostic {
+    /// Routed plugin identifier.
+    pub plugin_id: String,
+    /// Adapter-owned bounded diagnostic name.
+    pub name: String,
+    /// Non-negative observation value.
+    pub value: u64,
+}
+
 /// Process-local presentation state for one TUI instance.
 ///
 /// Registries are retained because visual adapters may accumulate incremental artifact state that
@@ -30,7 +41,8 @@ pub struct PluginVisualTiming {
 pub struct PluginTuiPresentation {
     host: Arc<PluginHost>,
     registries: Mutex<BTreeMap<String, Arc<PluginTuiRegistry>>>,
-    revision: AtomicU64,
+    visual_revisions: Mutex<BTreeMap<String, u64>>,
+    full_generation: AtomicU64,
     timings: Mutex<Vec<PluginVisualTiming>>,
 }
 
@@ -47,7 +59,8 @@ impl PluginTuiPresentation {
         Self {
             host,
             registries: Mutex::new(BTreeMap::new()),
-            revision: AtomicU64::new(0),
+            visual_revisions: Mutex::new(BTreeMap::new()),
+            full_generation: AtomicU64::new(0),
             timings: Mutex::new(Vec::new()),
         }
     }
@@ -58,10 +71,28 @@ impl PluginTuiPresentation {
         &self.host
     }
 
-    /// Return the presentation revision incremented when adapter-owned visual state changes.
+    /// Return the full presentation generation for registry/adapter replacement.
     #[must_use]
     pub fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Relaxed)
+        self.full_generation.load(Ordering::Relaxed)
+    }
+
+    /// Return the generic adapter-state revision for one invocation.
+    #[must_use]
+    pub fn visual_revision(&self, invocation_id: &str) -> u64 {
+        self.visual_revisions
+            .lock()
+            .ok()
+            .and_then(|revisions| revisions.get(invocation_id).copied())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn bump_visual_revision_for_test(&self, invocation_id: &str) {
+        if let Ok(mut revisions) = self.visual_revisions.lock() {
+            let revision = revisions.entry(invocation_id.to_owned()).or_default();
+            *revision = revision.wrapping_add(1);
+        }
     }
 
     /// Return one retained native TUI registry.
@@ -73,6 +104,7 @@ impl PluginTuiPresentation {
         }
         let registry = Arc::new(tui_registry(plugin_id)?);
         registries.insert(plugin_id.to_owned(), Arc::clone(&registry));
+        self.full_generation.fetch_add(1, Ordering::Relaxed);
         drop(registries);
         Some(registry)
     }
@@ -112,6 +144,29 @@ impl PluginTuiPresentation {
         self.registry(&route.plugin_id).is_some_and(|registry| {
             registry.visual_accepts_artifact_reference(&route.schema, reference_key, content_type)
         })
+    }
+
+    /// Drain bounded diagnostics from retained plugin visual registries.
+    pub fn drain_diagnostics(&self) -> Vec<PluginVisualDiagnostic> {
+        const MAX_DIAGNOSTICS: usize = 64;
+        let Ok(registries) = self.registries.lock() else {
+            return Vec::new();
+        };
+        registries
+            .iter()
+            .flat_map(|(plugin_id, registry)| {
+                registry
+                    .drain_visual_diagnostics()
+                    .into_iter()
+                    .filter(|diagnostic| valid_diagnostic_name(&diagnostic.name))
+                    .map(|diagnostic| PluginVisualDiagnostic {
+                        plugin_id: plugin_id.clone(),
+                        name: diagnostic.name,
+                        value: diagnostic.value,
+                    })
+            })
+            .take(MAX_DIAGNOSTICS)
+            .collect()
     }
 
     /// Drain bounded generic visual-operation timings.
@@ -170,11 +225,20 @@ impl PluginTuiPresentation {
             schema: route.schema,
             duration_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         });
-        if delivered {
-            self.revision.fetch_add(1, Ordering::Relaxed);
+        if delivered && let Ok(mut revisions) = self.visual_revisions.lock() {
+            let revision = revisions.entry(chunk.tool_call_id.clone()).or_default();
+            *revision = revision.wrapping_add(1);
         }
         Ok(delivered)
     }
+}
+
+fn valid_diagnostic_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_')
+        })
 }
 
 /// Return a newly constructed platform-owned TUI registry for an enabled bundled plugin.
@@ -342,6 +406,117 @@ mod tests {
     }
 
     #[test]
+    fn one_visual_revision_changes_only_its_transcript_signature() {
+        let presentation = test_presentation();
+        let first = crate::transcript::tool_request_item(
+            "call-one",
+            Some("bcode.shell"),
+            "shell",
+            "{}",
+            None,
+            None,
+        );
+        let second = crate::transcript::tool_request_item(
+            "call-two",
+            Some("bcode.shell"),
+            "shell",
+            "{}",
+            None,
+            None,
+        );
+        let first_before =
+            crate::transcript_projection::test_layout_signature(&first, 80, Some(&presentation));
+        let second_before =
+            crate::transcript_projection::test_layout_signature(&second, 80, Some(&presentation));
+
+        presentation.bump_visual_revision_for_test("call-one");
+
+        let first_after =
+            crate::transcript_projection::test_layout_signature(&first, 80, Some(&presentation));
+        let second_after =
+            crate::transcript_projection::test_layout_signature(&second, 80, Some(&presentation));
+        assert_ne!(first_before, first_after);
+        assert_eq!(second_before, second_after);
+    }
+
+    #[test]
+    fn one_visual_update_rebuilds_only_its_entry_across_transcript_sizes() {
+        for transcript_len in [10_usize, 500, 2_000] {
+            let presentation = test_presentation();
+            let items = (0..transcript_len)
+                .map(|index| {
+                    crate::transcript::tool_request_item(
+                        &format!("call-{index}"),
+                        Some("bcode.shell"),
+                        "shell",
+                        "{}",
+                        None,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut cache = crate::transcript_layout::TranscriptLayoutCache::default();
+            let initial = cache.sync(crate::transcript_layout::TranscriptLayoutSpec {
+                width: 80,
+                fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
+                    "initial".to_owned(),
+                ),
+                transcript_len,
+                pending_len: 0,
+                transcript_signature: |index| {
+                    crate::transcript_projection::test_layout_signature(
+                        &items[index],
+                        80,
+                        Some(&presentation),
+                    )
+                },
+                transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+                pending_signature: |index| {
+                    crate::transcript_layout::TranscriptLayoutSignature::new(format!(
+                        "pending-{index}"
+                    ))
+                },
+                pending_rows: |_| Vec::new(),
+                history_banner_signature: || None,
+                history_banner_rows: Vec::new,
+                reset: || false,
+            });
+            assert_eq!(initial.entries_rebuilt, transcript_len);
+
+            presentation.bump_visual_revision_for_test("call-0");
+            let updated = cache.sync(crate::transcript_layout::TranscriptLayoutSpec {
+                width: 80,
+                fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
+                    "updated".to_owned(),
+                ),
+                transcript_len,
+                pending_len: 0,
+                transcript_signature: |index| {
+                    crate::transcript_projection::test_layout_signature(
+                        &items[index],
+                        80,
+                        Some(&presentation),
+                    )
+                },
+                transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+                pending_signature: |index| {
+                    crate::transcript_layout::TranscriptLayoutSignature::new(format!(
+                        "pending-{index}"
+                    ))
+                },
+                pending_rows: |_| Vec::new(),
+                history_banner_signature: || None,
+                history_banner_rows: Vec::new,
+                reset: || false,
+            });
+            assert_eq!(updated.entries_scanned, transcript_len);
+            assert_eq!(updated.signatures_changed, 1);
+            assert_eq!(updated.entries_rebuilt, 1);
+            assert_eq!(updated.rows_regenerated, 1);
+        }
+    }
+
+    #[test]
     fn git_contribution_schema_routes_through_platform_registry() {
         let bundled = [StaticBundledPlugin::new(
             include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
@@ -410,7 +585,7 @@ mod tests {
             .insert("bcode.shell".to_owned(), Arc::new(registry));
 
         let first = presentation.registry("bcode.shell").expect("registry");
-        assert_eq!(presentation.revision(), 0);
+        assert_eq!(presentation.revision(), 1);
         assert!(
             presentation
                 .deliver_artifact_chunk(&PluginTuiArtifactChunk {
@@ -430,6 +605,7 @@ mod tests {
                 .expect("deliver artifact chunk")
         );
         assert_eq!(presentation.revision(), 1);
+        assert_eq!(presentation.visual_revision("call"), 1);
 
         let second = presentation.registry("bcode.shell").expect("registry");
         assert!(Arc::ptr_eq(&first, &second));

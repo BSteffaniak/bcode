@@ -26,13 +26,28 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Mutex;
 
+#[derive(Debug, Default)]
+struct ShellTuiDiagnostics {
+    decode_bytes: u64,
+    decode_frames: u64,
+    emulate_bytes: u64,
+    emulate_frames: u64,
+    retained_bytes: u64,
+    retained_frames: u64,
+    emitted_rows: u64,
+    resets: u64,
+    discontinuities: u64,
+}
+
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
+const LIVE_TERMINAL_SCROLLBACK_ROWS: usize = MAX_INLINE_TERMINAL_ROWS * 8;
 
 #[derive(Default)]
 struct LiveTerminalReplay {
     output: Vec<u8>,
     frames: Vec<TerminalReplayFrame>,
+    stream: Option<TerminalGridStream>,
     pending_resizes: Vec<TerminalReplayFrame>,
     next_input_sequence: u64,
     last_frame_sequence: u64,
@@ -46,8 +61,44 @@ struct LiveTerminalReplay {
     cancelled: bool,
 }
 
+impl LiveTerminalReplay {
+    fn ensure_stream(&mut self) -> Option<&mut TerminalGridStream> {
+        if self.stream.is_none() {
+            self.stream = TerminalGridStream::new(
+                self.initial_columns.max(1),
+                self.initial_rows.max(1),
+                GridLimits {
+                    scrollback_rows: LIVE_TERMINAL_SCROLLBACK_ROWS,
+                },
+            )
+            .ok();
+        }
+        self.stream.as_mut()
+    }
+
+    fn apply_frame(&mut self, frame: &TerminalReplayFrame) -> bool {
+        let Some(stream) = self.ensure_stream() else {
+            return false;
+        };
+        match frame {
+            TerminalReplayFrame::Output(bytes) => stream.process(bytes),
+            TerminalReplayFrame::Resize { columns, rows } => {
+                if stream.resize((*columns).max(1), (*rows).max(1)).is_err() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn reset_stream(&mut self) {
+        self.stream = None;
+    }
+}
+
 #[derive(Default)]
 struct LiveArtifactReplay {
+    artifact_id: String,
     decoder: crate::recording::IncrementalShellRecordingDecoder,
     next_offset: u64,
     finalized: bool,
@@ -59,6 +110,7 @@ pub struct ShellRunTuiVisualAdapter {
     live_states: Mutex<BTreeMap<String, TerminalViewerLiveState>>,
     live_replays: Mutex<BTreeMap<String, LiveTerminalReplay>>,
     artifact_replays: Mutex<BTreeMap<String, LiveArtifactReplay>>,
+    diagnostics: Mutex<ShellTuiDiagnostics>,
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
@@ -101,10 +153,15 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             }
             replay.columns = size.width;
             replay.rows = size.height;
-            replay.pending_resizes.push(TerminalReplayFrame::Resize {
+            let resize = TerminalReplayFrame::Resize {
                 columns: size.width,
                 rows: size.height,
-            });
+            };
+            let _ = replay.apply_frame(&resize);
+            if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                diagnostics.emulate_frames = diagnostics.emulate_frames.saturating_add(1);
+            }
+            replay.pending_resizes.push(resize);
             let sequence = replay.next_input_sequence;
             replay.next_input_sequence = replay.next_input_sequence.saturating_add(1);
             sequence
@@ -137,39 +194,82 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 .is_some_and(|content_type| content_type.starts_with(SHELL_RECORDING_MEDIA_TYPE))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn artifact_chunk(
         &self,
         chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk,
     ) -> Result<(), String> {
-        if chunk.reference_key != SHELL_RECORDING_REF_KEY || chunk.offset > chunk.total_bytes {
+        let chunk_len = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
+        if chunk.reference_key != SHELL_RECORDING_REF_KEY
+            || chunk.offset > chunk.total_bytes
+            || chunk.offset.saturating_add(chunk_len) > chunk.total_bytes
+        {
             return Err("invalid shell recording artifact range metadata".to_owned());
         }
-        let mut artifacts = self
-            .artifact_replays
-            .lock()
-            .map_err(|_| "shell artifact replay state poisoned".to_owned())?;
-        let artifact = artifacts.entry(chunk.tool_call_id.clone()).or_default();
-        if chunk.offset != artifact.next_offset {
-            return Err(format!(
-                "shell recording range is not contiguous: expected {} got {}",
-                artifact.next_offset, chunk.offset
-            ));
+        let (frames, dimensions, replaces_replay) = {
+            let mut artifacts = self
+                .artifact_replays
+                .lock()
+                .map_err(|_| "shell artifact replay state poisoned".to_owned())?;
+            let current = artifacts.get(&chunk.tool_call_id);
+            let replaces_replay = current.is_some_and(|artifact| {
+                chunk.offset == 0 && artifact.artifact_id != chunk.artifact_id
+            });
+            let result = if current.is_none() || replaces_replay {
+                let mut candidate = LiveArtifactReplay {
+                    artifact_id: chunk.artifact_id.clone(),
+                    ..LiveArtifactReplay::default()
+                };
+                let frames = candidate
+                    .decoder
+                    .push(chunk.offset, &chunk.bytes)
+                    .map_err(|error| error.to_string())?;
+                candidate.next_offset = candidate.next_offset.saturating_add(chunk_len);
+                candidate.finalized |= chunk.finalized;
+                let dimensions = candidate.decoder.dimensions();
+                artifacts.insert(chunk.tool_call_id.clone(), candidate);
+                (frames, dimensions, replaces_replay)
+            } else {
+                let artifact = artifacts
+                    .get_mut(&chunk.tool_call_id)
+                    .expect("existing artifact replay");
+                if artifact.artifact_id != chunk.artifact_id {
+                    return Err("replacement shell recording must start at offset zero".to_owned());
+                }
+                if chunk.offset != artifact.next_offset {
+                    return Err(format!(
+                        "shell recording range is not contiguous: expected {} got {}",
+                        artifact.next_offset, chunk.offset
+                    ));
+                }
+                let frames = artifact
+                    .decoder
+                    .push(chunk.offset, &chunk.bytes)
+                    .map_err(|error| error.to_string())?;
+                artifact.next_offset = artifact.next_offset.saturating_add(chunk_len);
+                artifact.finalized |= chunk.finalized;
+                (frames, artifact.decoder.dimensions(), false)
+            };
+            drop(artifacts);
+            result
+        };
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            diagnostics.decode_bytes = diagnostics.decode_bytes.saturating_add(chunk_len);
+            diagnostics.decode_frames = diagnostics
+                .decode_frames
+                .saturating_add(u64::try_from(frames.len()).unwrap_or(u64::MAX));
+            if replaces_replay {
+                diagnostics.resets = diagnostics.resets.saturating_add(1);
+            }
         }
-        let frames = artifact
-            .decoder
-            .push(chunk.offset, &chunk.bytes)
-            .map_err(|error| error.to_string())?;
-        artifact.next_offset = artifact
-            .next_offset
-            .saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX));
-        artifact.finalized |= chunk.finalized;
-        let dimensions = artifact.decoder.dimensions();
-        drop(artifacts);
 
         let mut replays = self
             .live_replays
             .lock()
             .map_err(|_| "shell live replay state poisoned".to_owned())?;
+        if replaces_replay {
+            replays.remove(&chunk.tool_call_id);
+        }
         let replay = replays.entry(chunk.tool_call_id.clone()).or_default();
         if let Some((columns, rows)) = dimensions
             && (replay.initial_columns == 0 || replay.initial_rows == 0)
@@ -179,18 +279,39 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             replay.columns = columns;
             replay.rows = rows;
         }
+        let decoded_emulate_bytes = frames.iter().fold(0_u64, |total, frame| match frame {
+            crate::recording::ShellRecordingFrame::ReplayOutput { bytes, .. } => {
+                total.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            }
+            _ => total,
+        });
+        let decoded_emulate_frames = u64::try_from(
+            frames
+                .iter()
+                .filter(|frame| {
+                    matches!(
+                        frame,
+                        crate::recording::ShellRecordingFrame::ReplayOutput { .. }
+                            | crate::recording::ShellRecordingFrame::Resize { .. }
+                    )
+                })
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
         for frame in frames {
             match frame {
                 crate::recording::ShellRecordingFrame::ReplayOutput { bytes, .. } => {
                     replay.output.extend_from_slice(&bytes);
-                    replay.frames.push(TerminalReplayFrame::Output(bytes));
+                    let frame = TerminalReplayFrame::Output(bytes);
+                    let _ = replay.apply_frame(&frame);
+                    replay.frames.push(frame);
                 }
                 crate::recording::ShellRecordingFrame::Resize { columns, rows, .. } => {
                     replay.columns = columns;
                     replay.rows = rows;
-                    replay
-                        .frames
-                        .push(TerminalReplayFrame::Resize { columns, rows });
+                    let frame = TerminalReplayFrame::Resize { columns, rows };
+                    let _ = replay.apply_frame(&frame);
+                    replay.frames.push(frame);
                 }
                 crate::recording::ShellRecordingFrame::Finish {
                     exit_code,
@@ -209,8 +330,43 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 | crate::recording::ShellRecordingFrame::Output { .. } => {}
             }
         }
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            diagnostics.emulate_bytes = diagnostics
+                .emulate_bytes
+                .saturating_add(decoded_emulate_bytes);
+            diagnostics.emulate_frames = diagnostics
+                .emulate_frames
+                .saturating_add(decoded_emulate_frames);
+            diagnostics.retained_bytes = u64::try_from(replay.output.len()).unwrap_or(u64::MAX);
+            diagnostics.retained_frames = u64::try_from(replay.frames.len()).unwrap_or(u64::MAX);
+        }
         drop(replays);
         Ok(())
+    }
+
+    fn drain_diagnostics(&self) -> Vec<bcode_plugin_sdk::tui::PluginTuiDiagnostic> {
+        let Ok(mut diagnostics) = self.diagnostics.lock() else {
+            return Vec::new();
+        };
+        let snapshot = std::mem::take(&mut *diagnostics);
+        [
+            ("decode_bytes", snapshot.decode_bytes),
+            ("decode_frames", snapshot.decode_frames),
+            ("emulate_bytes", snapshot.emulate_bytes),
+            ("emulate_frames", snapshot.emulate_frames),
+            ("retained_bytes", snapshot.retained_bytes),
+            ("retained_frames", snapshot.retained_frames),
+            ("emitted_rows", snapshot.emitted_rows),
+            ("reset_total", snapshot.resets),
+            ("discontinuity_total", snapshot.discontinuities),
+        ]
+        .into_iter()
+        .filter(|(_, value)| *value > 0)
+        .map(|(name, value)| bcode_plugin_sdk::tui::PluginTuiDiagnostic {
+            name: name.to_owned(),
+            value,
+        })
+        .collect()
     }
 
     fn rows(
@@ -230,7 +386,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 .and_then(serde_json::Value::as_str)
             && let Some(replay) = self.live_replay_data(key)
         {
-            return Self::shell_result_rows(payload, width, context, &replay, None);
+            return self.live_shell_result_rows(key, payload, width, context, &replay);
         }
         let mode = payload
             .get("mode")
@@ -274,14 +430,23 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
 }
 
 impl ShellRunTuiVisualAdapter {
+    fn live_grid_rows(&self, key: &str, input: TerminalViewerInput<'_>) -> Option<Vec<Line>> {
+        let replays = self.live_replays.lock().ok()?;
+        let replay = replays.get(key)?;
+        let stream = replay.stream.as_ref()?;
+        let rows = shell_terminal_grid_rows(input, stream.grid());
+        drop(replays);
+        Some(rows)
+    }
+
     fn live_replay_data(&self, key: &str) -> Option<TerminalReplayData> {
         self.live_replays
             .lock()
             .ok()?
             .get(key)
             .map(|replay| TerminalReplayData {
-                output: String::from_utf8_lossy(&replay.output).into_owned(),
-                frames: Some(replay.frames.clone()),
+                output: String::new(),
+                frames: None,
                 columns: replay.columns,
                 rows: replay.rows,
                 initial_columns: replay.initial_columns,
@@ -291,6 +456,46 @@ impl ShellRunTuiVisualAdapter {
                 timed_out: replay.timed_out,
                 cancelled: replay.cancelled,
             })
+    }
+
+    fn live_shell_result_rows(
+        &self,
+        key: &str,
+        payload: &serde_json::Value,
+        width: u16,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        replay: &TerminalReplayData,
+    ) -> Vec<Line> {
+        let mut lines = shell_terminal_prompt_rows(payload, width, context);
+        lines.extend(shell_replay_status_rows(replay));
+        let input = TerminalViewerInput {
+            output: "",
+            columns: replay.initial_columns,
+            rows: replay.initial_rows,
+            exit_code: replay.exit_code,
+            timed_out: Some(replay.timed_out),
+            elapsed: None,
+            output_truncated: terminal_replay_truncated(payload).unwrap_or(false),
+            output_bytes: payload
+                .get("output_bytes")
+                .and_then(serde_json::Value::as_u64),
+            retained_output_bytes: payload
+                .get("retained_output_bytes")
+                .and_then(serde_json::Value::as_u64),
+            show_status: false,
+            sizing: TerminalViewerSizing::Compact,
+        };
+        if let Some(rows) = self.live_grid_rows(key, input) {
+            if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                diagnostics.emitted_rows = diagnostics
+                    .emitted_rows
+                    .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+            }
+            lines.extend(rows);
+        } else {
+            append_terminal_replay_rows(&mut lines, replay, input, width);
+        }
+        lines
     }
 
     fn shell_result_rows(
@@ -360,7 +565,7 @@ impl ShellRunTuiVisualAdapter {
         let initial_columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
         let initial_rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
         let live_bytes = output.as_bytes().to_vec();
-        let frames = self.update_live_replay(key, &live_bytes, None, initial_columns, initial_rows);
+        self.update_live_replay(key, &live_bytes, None, initial_columns, initial_rows);
         let streaming = runtime
             .get("streaming")
             .and_then(serde_json::Value::as_bool)
@@ -381,7 +586,7 @@ impl ShellRunTuiVisualAdapter {
             sizing: TerminalViewerSizing::Compact,
         };
         if streaming {
-            let visible_rows = self.live_visible_rows(key, input, &frames);
+            let visible_rows = self.live_visible_rows(key, input);
             input.sizing = TerminalViewerSizing::Live {
                 visible_rows,
                 max_rows: MAX_INLINE_TERMINAL_ROWS,
@@ -389,10 +594,23 @@ impl ShellRunTuiVisualAdapter {
         }
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(self.live_replay_status_rows(key, runtime));
-        lines.extend(shell_terminal_frame_rows(input, &frames, width));
+        let retained_rows = self.live_grid_rows(key, input);
+        let used_retained_grid = retained_rows.is_some();
+        let terminal_rows = retained_rows.unwrap_or_else(|| terminal_viewer_rows(input, width));
+        if !used_retained_grid {
+            if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                diagnostics.resets = diagnostics.resets.saturating_add(1);
+            }
+        } else if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            diagnostics.emitted_rows = diagnostics
+                .emitted_rows
+                .saturating_add(u64::try_from(terminal_rows.len()).unwrap_or(u64::MAX));
+        }
+        lines.extend(terminal_rows);
         lines
     }
 
+    #[allow(clippy::too_many_lines)]
     fn update_live_replay(
         &self,
         key: &str,
@@ -400,9 +618,9 @@ impl ShellRunTuiVisualAdapter {
         incoming_frames: Option<&[(u64, TerminalReplayFrame)]>,
         initial_columns: u16,
         initial_rows: u16,
-    ) -> Vec<TerminalReplayFrame> {
+    ) {
         let Ok(mut replays) = self.live_replays.lock() else {
-            return vec![TerminalReplayFrame::Output(output.to_vec())];
+            return;
         };
         let replay = replays
             .entry(key.to_owned())
@@ -420,10 +638,13 @@ impl ShellRunTuiVisualAdapter {
             replay.rows = initial_rows;
         }
         if let Some(incoming_frames) = incoming_frames {
+            let mut emulated_bytes = 0_u64;
+            let mut emulated_frames = 0_u64;
             for (sequence, frame) in incoming_frames {
                 if *sequence <= replay.last_frame_sequence {
                     continue;
                 }
+                let mut already_applied = false;
                 if let TerminalReplayFrame::Resize { columns, rows } = frame {
                     replay.columns = *columns;
                     replay.rows = *rows;
@@ -433,36 +654,85 @@ impl ShellRunTuiVisualAdapter {
                         .position(|pending| pending == frame)
                     {
                         replay.pending_resizes.remove(index);
+                        already_applied = true;
                     }
+                }
+                if !already_applied {
+                    let _ = replay.apply_frame(frame);
+                    emulated_bytes = emulated_bytes.saturating_add(match frame {
+                        TerminalReplayFrame::Output(bytes) => {
+                            u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                        }
+                        TerminalReplayFrame::Resize { .. } => 0,
+                    });
+                    emulated_frames = emulated_frames.saturating_add(1);
                 }
                 replay.frames.push(frame.clone());
                 replay.last_frame_sequence = *sequence;
             }
-        } else if !output.is_empty() && output.starts_with(&replay.output) {
-            let appended = &output[replay.output.len()..];
-            if !appended.is_empty() {
-                replay
-                    .frames
-                    .push(TerminalReplayFrame::Output(appended.to_vec()));
+            if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                diagnostics.emulate_bytes =
+                    diagnostics.emulate_bytes.saturating_add(emulated_bytes);
+                diagnostics.emulate_frames =
+                    diagnostics.emulate_frames.saturating_add(emulated_frames);
+                diagnostics.retained_bytes = u64::try_from(replay.output.len()).unwrap_or(u64::MAX);
+                diagnostics.retained_frames =
+                    u64::try_from(replay.frames.len()).unwrap_or(u64::MAX);
             }
-        } else if !output.is_empty() && output != replay.output {
-            replay.frames.clear();
-            replay.pending_resizes.clear();
-            replay
-                .frames
-                .push(TerminalReplayFrame::Output(output.to_vec()));
-            replay.initial_columns = initial_columns;
-            replay.initial_rows = initial_rows;
-            replay.columns = initial_columns;
-            replay.rows = initial_rows;
+        } else {
+            let dimensions_changed = replay.initial_columns != 0
+                && replay.initial_rows != 0
+                && (replay.initial_columns != initial_columns
+                    || replay.initial_rows != initial_rows);
+            let discontinuous_output = !output.is_empty()
+                && !output.starts_with(&replay.output)
+                && output != replay.output;
+            if dimensions_changed || discontinuous_output {
+                replay.frames.clear();
+                replay.pending_resizes.clear();
+                replay.initial_columns = initial_columns;
+                replay.initial_rows = initial_rows;
+                replay.columns = initial_columns;
+                replay.rows = initial_rows;
+                replay.reset_stream();
+                if !output.is_empty() {
+                    let frame = TerminalReplayFrame::Output(output.to_vec());
+                    let _ = replay.apply_frame(&frame);
+                    replay.frames.push(frame);
+                }
+                if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                    diagnostics.resets = diagnostics.resets.saturating_add(1);
+                    diagnostics.discontinuities = diagnostics.discontinuities.saturating_add(1);
+                    diagnostics.emulate_bytes = diagnostics
+                        .emulate_bytes
+                        .saturating_add(u64::try_from(output.len()).unwrap_or(u64::MAX));
+                    if !output.is_empty() {
+                        diagnostics.emulate_frames = diagnostics.emulate_frames.saturating_add(1);
+                    }
+                }
+            } else if !output.is_empty() && output.starts_with(&replay.output) {
+                let appended = &output[replay.output.len()..];
+                if !appended.is_empty() {
+                    let frame = TerminalReplayFrame::Output(appended.to_vec());
+                    let _ = replay.apply_frame(&frame);
+                    if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                        diagnostics.emulate_bytes = diagnostics
+                            .emulate_bytes
+                            .saturating_add(u64::try_from(appended.len()).unwrap_or(u64::MAX));
+                        diagnostics.emulate_frames = diagnostics.emulate_frames.saturating_add(1);
+                    }
+                    replay.frames.push(frame);
+                }
+            }
         }
         if !output.is_empty() {
             replay.output.clear();
             replay.output.extend_from_slice(output);
         }
-        let mut frames = replay.frames.clone();
-        frames.extend(replay.pending_resizes.iter().cloned());
-        frames
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            diagnostics.retained_bytes = u64::try_from(replay.output.len()).unwrap_or(u64::MAX);
+            diagnostics.retained_frames = u64::try_from(replay.frames.len()).unwrap_or(u64::MAX);
+        }
     }
 
     fn live_replay_status_rows(&self, key: &str, fallback: &serde_json::Value) -> Vec<Line> {
@@ -489,20 +759,23 @@ impl ShellRunTuiVisualAdapter {
             .unwrap_or_else(|| shell_status_rows(fallback))
     }
 
-    fn live_visible_rows(
-        &self,
-        key: &str,
-        input: TerminalViewerInput<'_>,
-        frames: &[TerminalReplayFrame],
-    ) -> usize {
+    fn live_visible_rows(&self, key: &str, input: TerminalViewerInput<'_>) -> usize {
         let Ok(mut states) = self.live_states.lock() else {
             return 1;
         };
         let state = states.entry(key.to_owned()).or_default();
-        let content_rows = shell_terminal_stream(input.columns, input.rows, frames).map_or_else(
-            || terminal_viewer_rows(input, u16::MAX).len(),
-            |stream| live_viewport_content_rows(stream.grid(), MAX_INLINE_TERMINAL_ROWS).len(),
-        );
+        let content_rows = self
+            .live_replays
+            .lock()
+            .ok()
+            .and_then(|replays| {
+                replays.get(key).and_then(|replay| {
+                    replay.stream.as_ref().map(|stream| {
+                        live_viewport_content_rows(stream.grid(), MAX_INLINE_TERMINAL_ROWS).len()
+                    })
+                })
+            })
+            .unwrap_or_else(|| terminal_viewer_rows(input, u16::MAX).len());
         state.update_rows(content_rows.max(1), MAX_INLINE_TERMINAL_ROWS);
         state.visible_rows()
     }
@@ -747,15 +1020,7 @@ fn live_viewport_content_rows(grid: &TerminalGrid, max_rows: usize) -> Vec<Physi
         .collect()
 }
 
-fn shell_terminal_frame_rows(
-    input: TerminalViewerInput<'_>,
-    frames: &[TerminalReplayFrame],
-    width: u16,
-) -> Vec<Line> {
-    let Some(stream) = shell_terminal_stream(input.columns, input.rows, frames) else {
-        return terminal_viewer_rows(input, width);
-    };
-    let grid = stream.grid();
+fn shell_terminal_grid_rows(input: TerminalViewerInput<'_>, grid: &TerminalGrid) -> Vec<Line> {
     let max_rows = match input.sizing {
         TerminalViewerSizing::Compact => MAX_INLINE_TERMINAL_ROWS,
         TerminalViewerSizing::Live { max_rows, .. } => max_rows,
@@ -787,6 +1052,17 @@ fn shell_terminal_frame_rows(
         }
     }
     output
+}
+
+fn shell_terminal_frame_rows(
+    input: TerminalViewerInput<'_>,
+    frames: &[TerminalReplayFrame],
+    width: u16,
+) -> Vec<Line> {
+    let Some(stream) = shell_terminal_stream(input.columns, input.rows, frames) else {
+        return terminal_viewer_rows(input, width);
+    };
+    shell_terminal_grid_rows(input, stream.grid())
 }
 
 fn shell_terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
@@ -1194,19 +1470,72 @@ mod tests {
         assert!(rendered.contains("progress 100%"), "{rendered}");
     }
 
-    fn deliver_recording_range(
+    #[test]
+    fn shell_adapter_drains_bounded_decode_and_replay_diagnostics() {
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("diagnostics.bcsr");
+        let mut writer =
+            crate::recording::ShellRecordingWriter::create(&path, 12, 4).expect("writer");
+        writer
+            .write_replay_output(1, b"hello\r\n")
+            .expect("replay output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
+        let bytes = fs::read(path).expect("recording bytes");
+        deliver_recording_range(&adapter, "call", &bytes, 0, bytes.len(), true);
+        let payload = serde_json::json!({
+            "_bcode_runtime": {
+                "live_state_key": "call",
+                "streaming": true,
+                "columns": 12,
+                "rows": 4
+            }
+        });
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let _ = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &adapter,
+            SHELL_RUN_SCHEMA,
+            &payload,
+            &context,
+        );
+
+        let diagnostics =
+            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter);
+        let values = diagnostics
+            .into_iter()
+            .map(|diagnostic| (diagnostic.name, diagnostic.value))
+            .collect::<BTreeMap<_, _>>();
+        assert!(values.get("decode_bytes").is_some_and(|value| *value > 0));
+        assert!(values.get("decode_frames").is_some_and(|value| *value > 0));
+        assert!(values.get("emulate_bytes").is_some_and(|value| *value > 0));
+        assert!(values.get("emulate_frames").is_some_and(|value| *value > 0));
+        assert!(values.get("retained_bytes").is_some_and(|value| *value > 0));
+        assert!(values.get("emitted_rows").is_some_and(|value| *value > 0));
+        assert!(
+            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter).is_empty()
+        );
+    }
+
+    fn try_deliver_recording_range(
         adapter: &ShellRunTuiVisualAdapter,
         key: &str,
+        artifact_id: &str,
         all_bytes: &[u8],
         offset: usize,
         end: usize,
         finalized: bool,
-    ) {
+    ) -> Result<(), String> {
         bcode_plugin_sdk::tui::PluginTuiVisualAdapter::artifact_chunk(
             adapter,
             &bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
                 tool_call_id: key.to_owned(),
-                artifact_id: format!("{key}-artifact"),
+                artifact_id: artifact_id.to_owned(),
                 reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
                 producer_plugin_id: "bcode.shell".to_owned(),
                 schema: "bcode.tool.request.shell.run".to_owned(),
@@ -1218,6 +1547,25 @@ mod tests {
                 finalized,
                 bytes: all_bytes[offset..end].to_vec(),
             },
+        )
+    }
+
+    fn deliver_recording_range(
+        adapter: &ShellRunTuiVisualAdapter,
+        key: &str,
+        all_bytes: &[u8],
+        offset: usize,
+        end: usize,
+        finalized: bool,
+    ) {
+        try_deliver_recording_range(
+            adapter,
+            key,
+            &format!("{key}-artifact"),
+            all_bytes,
+            offset,
+            end,
+            finalized,
         )
         .expect("recording range");
     }
@@ -1243,6 +1591,363 @@ mod tests {
                 None,
             ),
         )
+    }
+
+    #[test]
+    fn damaged_and_discontinuous_artifact_ranges_preserve_the_last_valid_replay() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("damaged-range.bcsr");
+        let mut writer =
+            crate::recording::ShellRecordingWriter::create(&path, 20, 4).expect("recording writer");
+        writer
+            .write_replay_output(1, b"stable before damage\r\n")
+            .expect("replay output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
+        let bytes = std::fs::read(path).expect("recording bytes");
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let prefix_len = 14 + 13 + 13 + 32 + b"stable before damage\r\n".len();
+        deliver_recording_range(&adapter, "call", &bytes, 0, prefix_len, false);
+        let before = retained_snapshot(&adapter, "call");
+
+        assert!(
+            try_deliver_recording_range(
+                &adapter,
+                "call",
+                "call-artifact",
+                &bytes,
+                prefix_len + 1,
+                bytes.len(),
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(retained_snapshot(&adapter, "call"), before);
+
+        let mut damaged = bytes.clone();
+        damaged[prefix_len + 9..prefix_len + 13].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            try_deliver_recording_range(
+                &adapter,
+                "call",
+                "call-artifact",
+                &damaged,
+                prefix_len,
+                damaged.len(),
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(retained_snapshot(&adapter, "call"), before);
+
+        deliver_recording_range(&adapter, "call", &bytes, prefix_len, bytes.len(), true);
+        let rendered = render_hydrated_recording(&adapter, "call")
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("stable before damage"), "{rendered}");
+        assert!(rendered.contains("exit code 0"), "{rendered}");
+    }
+
+    #[test]
+    fn finalized_artifact_identity_replacement_rebuilds_from_offset_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first_path = dir.path().join("first.bcsr");
+        let mut first_writer = crate::recording::ShellRecordingWriter::create(&first_path, 20, 4)
+            .expect("first recording writer");
+        first_writer
+            .write_replay_output(1, b"old artifact\r\n")
+            .expect("old output");
+        first_writer
+            .finish(2, Some(7), None, false, false)
+            .expect("old finish");
+        let first = std::fs::read(first_path).expect("first recording bytes");
+
+        let second_path = dir.path().join("second.bcsr");
+        let mut second_writer = crate::recording::ShellRecordingWriter::create(&second_path, 9, 3)
+            .expect("second recording writer");
+        second_writer
+            .write_replay_output(1, b"new artifact\r\n")
+            .expect("new output");
+        second_writer
+            .finish(2, Some(0), None, false, false)
+            .expect("new finish");
+        let second = std::fs::read(second_path).expect("second recording bytes");
+
+        let adapter = ShellRunTuiVisualAdapter::default();
+        try_deliver_recording_range(
+            &adapter,
+            "call",
+            "first-artifact",
+            &first,
+            0,
+            first.len(),
+            true,
+        )
+        .expect("first recording");
+        try_deliver_recording_range(
+            &adapter,
+            "call",
+            "second-artifact",
+            &second,
+            0,
+            second.len(),
+            true,
+        )
+        .expect("replacement recording");
+
+        let rendered = render_hydrated_recording(&adapter, "call")
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("new artif"), "{rendered}");
+        assert!(!rendered.contains("old artifact"), "{rendered}");
+        assert!(rendered.contains("exit code 0"), "{rendered}");
+        assert!(!rendered.contains("exit code 7"), "{rendered}");
+        let replays = adapter.live_replays.lock().expect("live replays");
+        let replay = replays.get("call").expect("replacement replay");
+        assert_eq!(replay.output, b"new artifact\r\n");
+        assert_eq!((replay.initial_columns, replay.initial_rows), (9, 3));
+        drop(replays);
+        let values = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter)
+            .into_iter()
+            .map(|diagnostic| (diagnostic.name, diagnostic.value))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(values.get("reset_total"), Some(&1));
+    }
+
+    #[test]
+    fn cumulative_discontinuity_and_initial_dimension_change_rebuild_authoritatively() {
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let key = "cumulative-rebuild";
+        adapter.update_live_replay(key, b"12345678ABCD", None, 8, 3);
+        adapter.update_live_replay(key, b"replacement", None, 4, 2);
+
+        let replays = adapter.live_replays.lock().expect("live replays");
+        let replay = replays.get(key).expect("rebuilt replay");
+        assert_eq!((replay.initial_columns, replay.initial_rows), (4, 2));
+        assert_eq!((replay.columns, replay.rows), (4, 2));
+        assert_eq!(replay.output, b"replacement");
+        assert_eq!(
+            replay.frames,
+            vec![TerminalReplayFrame::Output(b"replacement".to_vec())]
+        );
+        let retained = replay.stream.as_ref().expect("retained stream");
+        let authoritative = shell_terminal_stream(4, 2, &replay.frames).expect("fresh replay");
+        let retained_rows = retained
+            .grid()
+            .scrollback_rows_hint()
+            .saturating_add(retained.grid().height());
+        let authoritative_rows = authoritative
+            .grid()
+            .scrollback_rows_hint()
+            .saturating_add(authoritative.grid().height());
+        assert_eq!(
+            retained.snapshot(0, retained_rows),
+            authoritative.snapshot(0, authoritative_rows)
+        );
+        drop(replays);
+        let values = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter)
+            .into_iter()
+            .map(|diagnostic| (diagnostic.name, diagnostic.value))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(values.get("reset_total"), Some(&1));
+        assert_eq!(values.get("discontinuity_total"), Some(&1));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn incremental_and_authoritative_replay_match_terminal_and_lifecycle_matrix() {
+        let terminal_prefix = b"\x1b[31mred\x1b[0m plain\r\nwrap-1234567890\r\ncursor-target\x1b[5DXY\r\nprogress 10%\rprogress 100%\x1b[K\r\n\x1b[2J\x1b[Hhome \xe7\x95\x8c e\xcc\x81\r\n";
+        let terminal_suffix = b"after-resize\r\n\x1b[32mgreen\x1b[0m";
+
+        for (name, exit_code, signal, timed_out, cancelled) in [
+            ("final-status", Some(7), None, false, false),
+            ("signal", Some(1), Some("SIGTERM"), false, false),
+            ("timeout", Some(1), Some("SIGHUP"), true, false),
+            ("cancelled", Some(1), Some("SIGHUP"), false, true),
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join(format!("{name}.bcsr"));
+            let mut writer = crate::recording::ShellRecordingWriter::create(&path, 10, 4)
+                .expect("recording writer");
+            writer
+                .write_replay_output(1, terminal_prefix)
+                .expect("terminal prefix");
+            writer.write_resize(2, 8, 5).expect("resize");
+            writer
+                .write_replay_output(3, terminal_suffix)
+                .expect("terminal suffix");
+            writer
+                .finish(4, exit_code, signal, timed_out, cancelled)
+                .expect("finish");
+            let bytes = std::fs::read(&path).expect("recording bytes");
+
+            let adapter = ShellRunTuiVisualAdapter::default();
+            for (index, chunk) in bytes.chunks(17).enumerate() {
+                let offset = index.saturating_mul(17);
+                deliver_recording_range(
+                    &adapter,
+                    name,
+                    &bytes,
+                    offset,
+                    offset.saturating_add(chunk.len()),
+                    offset.saturating_add(chunk.len()) == bytes.len(),
+                );
+            }
+
+            let (summary, frames) =
+                crate::recording::read_recording(&path).expect("authoritative recording");
+            let authoritative = decode_recording_replay(&summary, frames);
+            let authoritative_frames = authoritative.frames.as_ref().expect("replay frames");
+            let authoritative_stream = shell_terminal_stream(
+                authoritative.initial_columns,
+                authoritative.initial_rows,
+                authoritative_frames,
+            )
+            .expect("authoritative terminal stream");
+            let authoritative_rows = authoritative_stream
+                .grid()
+                .scrollback_rows_hint()
+                .saturating_add(authoritative_stream.grid().height());
+            assert_eq!(
+                retained_snapshot(&adapter, name),
+                authoritative_stream.snapshot(0, authoritative_rows),
+                "{name} terminal state"
+            );
+
+            let replays = adapter.live_replays.lock().expect("live replays");
+            let incremental = replays.get(name).expect("incremental replay");
+            assert_eq!(incremental.exit_code, authoritative.exit_code, "{name}");
+            assert_eq!(incremental.signal, authoritative.signal, "{name}");
+            assert_eq!(incremental.timed_out, authoritative.timed_out, "{name}");
+            assert_eq!(incremental.cancelled, authoritative.cancelled, "{name}");
+            let incremental_status = shell_replay_status_rows(&TerminalReplayData {
+                output: String::new(),
+                frames: None,
+                columns: incremental.columns,
+                rows: incremental.rows,
+                initial_columns: incremental.initial_columns,
+                initial_rows: incremental.initial_rows,
+                exit_code: incremental.exit_code,
+                signal: incremental.signal.clone(),
+                timed_out: incremental.timed_out,
+                cancelled: incremental.cancelled,
+            });
+            drop(replays);
+            assert_eq!(
+                incremental_status,
+                shell_replay_status_rows(&authoritative),
+                "{name} lifecycle status"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_live_emulation_processes_each_new_frame_once_at_sustained_volumes() {
+        const FRAME_BYTES: usize = 16 * 1024;
+        for total_bytes in [64 * 1024, 1024 * 1024, 8 * 1024 * 1024] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join(format!("scaling-{total_bytes}.bcsr"));
+            let mut writer = crate::recording::ShellRecordingWriter::create(&path, 80, 24)
+                .expect("recording writer");
+            let frame = vec![b'x'; FRAME_BYTES];
+            for sequence in 0..(total_bytes / FRAME_BYTES) {
+                writer
+                    .write_replay_output(
+                        u64::try_from(sequence).expect("sequence").saturating_add(1),
+                        &frame,
+                    )
+                    .expect("replay output");
+            }
+            writer
+                .finish(u64::MAX, Some(0), None, false, false)
+                .expect("finish");
+            let bytes = std::fs::read(path).expect("recording bytes");
+            let adapter = ShellRunTuiVisualAdapter::default();
+            let key = format!("scaling-{total_bytes}");
+            let mut offset = 14 + 13;
+            deliver_recording_range(&adapter, &key, &bytes, 0, offset, false);
+            let _ = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter);
+
+            let encoded_frame_bytes = 13 + 32 + FRAME_BYTES;
+            let frame_count = total_bytes / FRAME_BYTES;
+            for _ in 0..frame_count {
+                let end = offset.saturating_add(encoded_frame_bytes);
+                deliver_recording_range(&adapter, &key, &bytes, offset, end, false);
+                offset = end;
+                let values =
+                    bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter)
+                        .into_iter()
+                        .map(|diagnostic| (diagnostic.name, diagnostic.value))
+                        .collect::<BTreeMap<_, _>>();
+                assert_eq!(
+                    values.get("emulate_bytes"),
+                    Some(&u64::try_from(FRAME_BYTES).expect("frame bytes")),
+                    "{total_bytes} byte stream"
+                );
+                assert_eq!(values.get("emulate_frames"), Some(&1));
+                assert!(!values.contains_key("reset_total"));
+                assert!(!values.contains_key("discontinuity_total"));
+            }
+            deliver_recording_range(&adapter, &key, &bytes, offset, bytes.len(), true);
+            let values = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter)
+                .into_iter()
+                .map(|diagnostic| (diagnostic.name, diagnostic.value))
+                .collect::<BTreeMap<_, _>>();
+            assert!(!values.contains_key("emulate_bytes"));
+            assert!(!values.contains_key("emulate_frames"));
+            let (retained_output_bytes, retained_frames) = {
+                let replays = adapter.live_replays.lock().expect("live replays");
+                let replay = replays.get(&key).expect("retained replay");
+                let values = (replay.output.len(), replay.frames.len());
+                drop(replays);
+                values
+            };
+            assert_eq!(retained_output_bytes, total_bytes);
+            assert_eq!(retained_frames, frame_count);
+        }
+    }
+
+    #[test]
+    fn seventeen_byte_live_frames_are_emulated_once_without_replaying_history() {
+        const TOTAL_BYTES: usize = 64 * 1024;
+        const FRAME_BYTES: usize = 17;
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let key = "seventeen-byte-frames";
+        let mut sequence = 1_u64;
+        let full_frames = TOTAL_BYTES / FRAME_BYTES;
+        for _ in 0..full_frames {
+            let frame = TerminalReplayFrame::Output(vec![b'x'; FRAME_BYTES]);
+            adapter.update_live_replay(key, &[], Some(&[(sequence, frame)]), 80, 24);
+            sequence = sequence.saturating_add(1);
+            let values = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter)
+                .into_iter()
+                .map(|diagnostic| (diagnostic.name, diagnostic.value))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(values.get("emulate_bytes"), Some(&17));
+            assert_eq!(values.get("emulate_frames"), Some(&1));
+        }
+        let remainder = TOTAL_BYTES % FRAME_BYTES;
+        adapter.update_live_replay(
+            key,
+            &[],
+            Some(&[(sequence, TerminalReplayFrame::Output(vec![b'x'; remainder]))]),
+            80,
+            24,
+        );
+        let values = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter)
+            .into_iter()
+            .map(|diagnostic| (diagnostic.name, diagnostic.value))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            values.get("emulate_bytes"),
+            Some(&u64::try_from(remainder).expect("remainder"))
+        );
+        assert_eq!(values.get("emulate_frames"), Some(&1));
     }
 
     #[test]
@@ -1431,6 +2136,25 @@ mod tests {
         assert!(!final_rendered.contains("recording unavailable"));
     }
 
+    fn retained_snapshot(
+        adapter: &ShellRunTuiVisualAdapter,
+        key: &str,
+    ) -> bmux_terminal_grid::GridSnapshot {
+        let replays = adapter.live_replays.lock().expect("live replays");
+        let retained = replays
+            .get(key)
+            .and_then(|replay| replay.stream.as_ref())
+            .expect("retained terminal stream");
+        let rows = retained
+            .grid()
+            .scrollback_rows_hint()
+            .saturating_add(retained.grid().height());
+        let snapshot = retained.snapshot(0, rows);
+        drop(replays);
+        snapshot
+    }
+
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn live_and_recording_replay_share_exact_frame_and_terminal_state() {
         let adapter = ShellRunTuiVisualAdapter::default();
@@ -1470,8 +2194,7 @@ mod tests {
             ),
             (3, TerminalReplayFrame::Output(second.to_vec())),
         ];
-        let live_frames =
-            adapter.update_live_replay(key, &cumulative, Some(&incoming_frames), 12, 3);
+        adapter.update_live_replay(key, &cumulative, Some(&incoming_frames), 12, 3);
 
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("parity.bcsr");
@@ -1487,27 +2210,48 @@ mod tests {
             crate::recording::read_recording(&path).expect("read recording");
         let reopened = decode_recording_replay(&summary, recording_frames);
         let reopened_frames = reopened.frames.expect("recording frames");
+        let live_frames = adapter
+            .live_replays
+            .lock()
+            .expect("live replays")
+            .get(key)
+            .expect("live replay")
+            .frames
+            .clone();
 
         assert_eq!(input.producer_id, "bcode.shell");
         assert_eq!(live_frames, reopened_frames);
-        let live = shell_terminal_stream(12, 3, &live_frames).expect("live terminal stream");
+        let retained_snapshot = retained_snapshot(&adapter, key);
         let reopened =
             shell_terminal_stream(12, 3, &reopened_frames).expect("reopened terminal stream");
-        let live_rows = live
-            .grid()
-            .scrollback_rows_hint()
-            .saturating_add(live.grid().height());
         let reopened_rows = reopened
             .grid()
             .scrollback_rows_hint()
             .saturating_add(reopened.grid().height());
+        assert_eq!(retained_snapshot, reopened.snapshot(0, reopened_rows));
+        let replays = adapter.live_replays.lock().expect("live replays");
+        let retained = replays
+            .get(key)
+            .and_then(|replay| replay.stream.as_ref())
+            .expect("retained terminal stream");
         assert_eq!(
-            live.snapshot(0, live_rows),
-            reopened.snapshot(0, reopened_rows)
+            retained.grid().mode(),
+            bmux_terminal_grid::GridMode::Alternate
         );
-        assert_eq!(live.grid().mode(), bmux_terminal_grid::GridMode::Alternate);
-        assert!(!live.grid().cursor().visible);
-        assert!(live.grid().main_content_rows().len() > 300);
+        assert!(!retained.grid().cursor().visible);
+        drop(replays);
+
+        let diagnostics =
+            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter);
+        let values = diagnostics
+            .into_iter()
+            .map(|diagnostic| (diagnostic.name, diagnostic.value))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            values.get("emulate_bytes"),
+            Some(&u64::try_from(first.len() + second.len()).expect("emulated bytes"))
+        );
+        assert_eq!(values.get("emulate_frames"), Some(&3));
     }
 
     #[test]

@@ -245,6 +245,18 @@ pub struct PluginTuiArtifactChunk {
     pub bytes: Vec<u8>,
 }
 
+/// Maximum diagnostic observations drained from one adapter at a time.
+pub const MAX_PLUGIN_TUI_DIAGNOSTICS_PER_DRAIN: usize = 64;
+
+/// One bounded numeric diagnostic emitted by a plugin-owned visual adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginTuiDiagnostic {
+    /// Stable adapter-owned diagnostic name.
+    pub name: String,
+    /// Non-negative observation value.
+    pub value: u64,
+}
+
 /// Native Rust plugin artifact/view renderer for inline transcript content.
 pub trait PluginTuiVisualAdapter: Send + Sync {
     /// Return whether this adapter can render the artifact/view kind.
@@ -289,6 +301,14 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
     /// Returns an error when the chunk metadata, byte range, or plugin-owned payload is invalid.
     fn artifact_chunk(&self, _chunk: &PluginTuiArtifactChunk) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Drain a bounded snapshot of adapter-owned work diagnostics.
+    ///
+    /// The default implementation emits no diagnostics. Hosts validate names and cap every drain;
+    /// adapters must report only low-cardinality numeric work observations.
+    fn drain_diagnostics(&self) -> Vec<PluginTuiDiagnostic> {
+        Vec::new()
     }
 
     /// Build transcript rows for the artifact/view payload at the given width.
@@ -615,6 +635,21 @@ impl PluginTuiRegistry {
         };
         adapter.artifact_chunk(chunk)?;
         Ok(true)
+    }
+
+    /// Drain bounded diagnostics from every registered visual adapter.
+    #[must_use]
+    pub fn drain_visual_diagnostics(&self) -> Vec<PluginTuiDiagnostic> {
+        self.visual_adapters
+            .iter()
+            .flat_map(|adapter| {
+                adapter
+                    .drain_diagnostics()
+                    .into_iter()
+                    .take(MAX_PLUGIN_TUI_DIAGNOSTICS_PER_DRAIN)
+            })
+            .take(MAX_PLUGIN_TUI_DIAGNOSTICS_PER_DRAIN)
+            .collect()
     }
 
     /// Build transcript rows with host-owned presentation preferences.
