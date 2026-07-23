@@ -161,6 +161,13 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
 }
 
 impl FrameLayout {
+    /// Return the body area assigned to transcript projection and rendering.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn transcript_area(self) -> Rect {
+        self.body
+    }
+
     fn with_bottom_dock(self, app: &BmuxApp, requested_height: u16) -> (Self, Rect) {
         let full_body = self.body_without_latest_bar();
         let maximum_height = full_body.height.saturating_sub(1);

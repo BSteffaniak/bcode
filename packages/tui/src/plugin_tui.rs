@@ -95,6 +95,14 @@ impl PluginTuiPresentation {
         }
     }
 
+    #[cfg(test)]
+    pub fn install_registry_for_test(&self, plugin_id: &str, registry: PluginTuiRegistry) {
+        if let Ok(mut registries) = self.registries.lock() {
+            registries.insert(plugin_id.to_owned(), Arc::new(registry));
+            self.full_generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Return one retained native TUI registry.
     #[must_use]
     pub fn registry(&self, plugin_id: &str) -> Option<Arc<PluginTuiRegistry>> {
@@ -104,7 +112,6 @@ impl PluginTuiPresentation {
         }
         let registry = Arc::new(tui_registry(plugin_id)?);
         registries.insert(plugin_id.to_owned(), Arc::clone(&registry));
-        self.full_generation.fetch_add(1, Ordering::Relaxed);
         drop(registries);
         Some(registry)
     }
@@ -585,7 +592,7 @@ mod tests {
             .insert("bcode.shell".to_owned(), Arc::new(registry));
 
         let first = presentation.registry("bcode.shell").expect("registry");
-        assert_eq!(presentation.revision(), 1);
+        assert_eq!(presentation.revision(), 0);
         assert!(
             presentation
                 .deliver_artifact_chunk(&PluginTuiArtifactChunk {
@@ -604,7 +611,7 @@ mod tests {
                 })
                 .expect("deliver artifact chunk")
         );
-        assert_eq!(presentation.revision(), 1);
+        assert_eq!(presentation.revision(), 0);
         assert_eq!(presentation.visual_revision("call"), 1);
 
         let second = presentation.registry("bcode.shell").expect("registry");

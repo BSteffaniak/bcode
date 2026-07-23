@@ -210,6 +210,10 @@ fn transcript_item_signature(
     input: &TranscriptLayoutInput<'_>,
 ) -> TranscriptLayoutSignature {
     let base = render::transcript_item_signature(item, input.width, ());
+    let presentation_generation = input.plugin_host.map_or_else(
+        || "none".to_owned(),
+        |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
+    );
     let live_preview_revision = match item.kind() {
         super::transcript::TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. } => input
             .live_tool_previews
@@ -223,7 +227,7 @@ fn transcript_item_signature(
             .map_or(0, |host| host.visual_revision(invocation_id))
     });
     TranscriptLayoutSignature::new(format!(
-        "{};visual-rev:{visual_revision};live-preview-rev:{live_preview_revision}",
+        "{};presentation-generation:{presentation_generation};visual-rev:{visual_revision};live-preview-rev:{live_preview_revision}",
         base.as_str()
     ))
 }

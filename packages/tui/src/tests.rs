@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -28,6 +28,7 @@ use bmux_tui::buffer::Buffer;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::prelude::Line;
 
 fn context_occupancy(tokens: u64) -> bcode_session_models::RequestContextOccupancy {
     bcode_session_models::RequestContextOccupancy {
@@ -4901,6 +4902,176 @@ fn replayed_shell_transcript_block_renders_generic_duration() {
 
     assert!(rendered.contains("Shell run · duration 12ms"), "{rendered}");
     assert!(rendered.contains("exit code 0"), "{rendered}");
+}
+
+#[derive(Default)]
+struct GrowingVisualAdapter {
+    rows: Mutex<Vec<String>>,
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for GrowingVisualAdapter {
+    fn supports(&self, kind: &str) -> bool {
+        kind == "bcode.tool.request.shell.run"
+    }
+
+    fn artifact_chunk(
+        &self,
+        chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk,
+    ) -> Result<(), String> {
+        let text = String::from_utf8(chunk.bytes.clone()).map_err(|error| error.to_string())?;
+        self.rows
+            .lock()
+            .map_err(|_| "growing visual state poisoned".to_owned())?
+            .extend(text.lines().map(ToOwned::to_owned));
+        Ok(())
+    }
+
+    fn rows(
+        &self,
+        _kind: &str,
+        _payload: &serde_json::Value,
+        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
+        self.rows
+            .lock()
+            .map(|rows| rows.iter().cloned().map(Line::from).collect())
+            .unwrap_or_default()
+    }
+}
+
+fn growing_visual_presentation() -> Arc<super::plugin_tui::PluginTuiPresentation> {
+    let presentation = Arc::new(super::plugin_tui::PluginTuiPresentation::new(
+        shell_plugin_host(),
+    ));
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::<GrowingVisualAdapter>::default());
+    presentation.install_registry_for_test("bcode.shell", registry);
+    presentation
+}
+
+fn deliver_growing_visual_rows(
+    presentation: &super::plugin_tui::PluginTuiPresentation,
+    tool_call_id: &str,
+    rows: &[&str],
+    revision: u64,
+) {
+    let bytes = rows.join("\n").into_bytes();
+    assert!(
+        presentation
+            .deliver_artifact_chunk(&bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
+                tool_call_id: tool_call_id.to_owned(),
+                artifact_id: format!("{tool_call_id}-artifact"),
+                reference_key: "test_rows".to_owned(),
+                producer_plugin_id: "bcode.shell".to_owned(),
+                schema: "bcode.tool.request.shell.run".to_owned(),
+                schema_version: 1,
+                content_type: Some("text/plain".to_owned()),
+                offset: 0,
+                total_bytes: u64::try_from(bytes.len()).expect("artifact bytes"),
+                revision,
+                finalized: false,
+                bytes,
+            })
+            .expect("deliver growing visual rows")
+    );
+}
+
+fn growing_visual_app(
+    session_id: SessionId,
+    presentation: Arc<super::plugin_tui::PluginTuiPresentation>,
+) -> BmuxApp {
+    let mut history = (0..24)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("history {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    history.push(event(
+        session_id,
+        24,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-growing".to_owned(),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"fixture"}"#.to_owned(),
+            working_directory: None,
+            request_visual: Some(PluginVisualDescriptor {
+                visual_id: None,
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                schema: "bcode.tool.request.shell.run".to_owned(),
+                schema_version: 1,
+                title: Some("Growing visual".to_owned()),
+                subtitle: None,
+                payload: serde_json::json!({"command": "fixture"}),
+            }),
+            legacy_request_presentation: None,
+        },
+    ));
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_presentation(presentation);
+    app
+}
+
+#[test]
+fn active_visual_height_changes_preserve_viewport_latest_scroll_and_interaction_dock() {
+    let terminal = Rect::new(0, 0, 80, 18);
+    let interaction_height = 4;
+    let session_id = SessionId::new();
+    let presentation = growing_visual_presentation();
+    let mut detached = growing_visual_app(session_id, Arc::clone(&presentation));
+    let (layout, dock_before) =
+        render::prepare_frame_with_bottom_dock(&mut detached, terminal, interaction_height)
+            .expect("initial detached frame");
+    assert!(detached.scroll_transcript_up(8));
+    let detached_top = detached.transcript_top_row(layout.transcript_area().height);
+    let max_before = detached.transcript_layout().total_rows();
+
+    deliver_growing_visual_rows(
+        &presentation,
+        "call-growing",
+        &["one", "two", "three", "four", "five", "six"],
+        1,
+    );
+    let (layout, dock_after) =
+        render::prepare_frame_with_bottom_dock(&mut detached, terminal, interaction_height)
+            .expect("updated detached frame");
+    assert_eq!(
+        detached.transcript_top_row(layout.transcript_area().height),
+        detached_top,
+        "detached viewport must remain top-anchored"
+    );
+    assert!(detached.transcript_layout().total_rows() > max_before);
+    assert!(detached.scroll_offset() > 8, "scroll limit must grow");
+    assert!(detached.newer_transcript_content_below());
+    assert_eq!(dock_after, dock_before);
+    assert!(layout.transcript_area().bottom() <= dock_after.y);
+
+    let follow_presentation = growing_visual_presentation();
+    let mut following = growing_visual_app(session_id, Arc::clone(&follow_presentation));
+    let (_, follow_dock_before) =
+        render::prepare_frame_with_bottom_dock(&mut following, terminal, interaction_height)
+            .expect("initial following frame");
+    assert_eq!(following.scroll_offset(), 0);
+    assert!(!following.newer_transcript_content_below());
+    deliver_growing_visual_rows(
+        &follow_presentation,
+        "call-growing",
+        &["one", "two", "three", "four", "five", "six"],
+        1,
+    );
+    let (follow_layout, follow_dock_after) =
+        render::prepare_frame_with_bottom_dock(&mut following, terminal, interaction_height)
+            .expect("updated following frame");
+    assert_eq!(following.scroll_offset(), 0);
+    assert_eq!(following.bottom_overscroll(), 0);
+    assert!(!following.newer_transcript_content_below());
+    assert_eq!(follow_dock_after, follow_dock_before);
+    assert!(follow_layout.transcript_area().bottom() <= follow_dock_after.y);
 }
 
 fn shell_run_artifact() -> bcode_session_models::ToolArtifact {
