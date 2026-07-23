@@ -690,7 +690,7 @@ fi
 
 if ! grep -F 'batched_actions_keep_single_call_and_apply_to_all_distinct' packages/tui/src/permission_dialog.rs >/dev/null ||
    ! grep -F 'batched_remember_actions_never_apply_to_all' packages/tui/src/permission_dialog.rs >/dev/null ||
-   ! grep -F 'grouped_permission_renders_per_call_and_apply_to_all_actions' packages/hyperchad/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F 'grouped_permission_renders_per_call_and_apply_to_all_actions' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null ||
    ! grep -F 'resolve_permission_batch(form.batch_id, form.approved)' packages/hyperchad/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: grouped permission adapter behavior was removed." >&2
   violations=1
@@ -979,9 +979,9 @@ if ! grep -F 'fn select_visual_adapter' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'adapter.supports(schema, schema_version, surface)' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'adapter.priority' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F '.visual_adapter(schema, schema_version, "tui", producer)' packages/tui/src/plugin_tui.rs >/dev/null ||
-   ! grep -F "BTreeMap<(&'static str, u32), VisualAdapter>" packages/hyperchad/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F "BTreeMap<(&'static str, u32), VisualAdapter>" packages/hyperchad/ui/src/pages/home/adapters.rs >/dev/null ||
    ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/hyperchad/ui/src/pages/home.rs >/dev/null; then
+   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null; then
   echo "Runtime architecture violation: platform-owned schema/version renderer selection or generic fallback coverage was removed." >&2
   violations=1
 fi
@@ -999,7 +999,7 @@ if [[ "$(rg -l '^pub (struct|enum) (ToolContributionEvent|ToolExchangeRequest|To
    ! grep -F 'input: bcode_tool::ToolInvocationInput' packages/ipc/src/lib.rs >/dev/null ||
    ! grep -F 'pub active_exchanges: BTreeMap<String, bcode_session_models::ToolExchangeRequest>' packages/session-view/models/src/lib.rs >/dev/null ||
    ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/hyperchad/ui/src/pages/home.rs >/dev/null ||
+   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null ||
    ! grep -F 'unsupported_headless_exchange_is_explicit_for_required_and_optional_policies' packages/bcode/tests/headless_exchange.rs >/dev/null; then
   echo "Runtime architecture violation: IPC, renderer, and headless hosts no longer consume the canonical opaque invocation envelopes." >&2
   violations=1

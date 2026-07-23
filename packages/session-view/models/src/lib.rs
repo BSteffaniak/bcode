@@ -846,8 +846,12 @@ pub enum ToolInvocationViewStatus {
     Requested,
     /// Stream lifecycle/output was observed.
     Running,
-    /// Final result was observed.
+    /// Final result was observed or lifecycle completed successfully.
     Finished,
+    /// The owning invocation or turn was cancelled.
+    Cancelled,
+    /// The invocation lifecycle completed with an error.
+    Failed,
 }
 
 impl From<bcode_session_models::ToolInvocationProjectionStatus> for ToolInvocationViewStatus {

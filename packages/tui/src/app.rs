@@ -3251,6 +3251,8 @@ impl BmuxApp {
                             && matches!(
                                 tool.status,
                                 bcode_session_view_models::ToolInvocationViewStatus::Finished
+                                    | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
+                                    | bcode_session_view_models::ToolInvocationViewStatus::Failed
                             )
                 )
             })
@@ -3363,6 +3365,8 @@ impl BmuxApp {
         if !matches!(
             tool.status,
             bcode_session_view_models::ToolInvocationViewStatus::Finished
+                | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
+                | bcode_session_view_models::ToolInvocationViewStatus::Failed
         ) {
             self.active_tool_calls.insert(tool_call_id.to_owned());
         }
@@ -3378,6 +3382,8 @@ impl BmuxApp {
                 matches!(
                     tool.status,
                     bcode_session_view_models::ToolInvocationViewStatus::Finished
+                        | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
+                        | bcode_session_view_models::ToolInvocationViewStatus::Failed
                 )
             });
         if finished {
@@ -6591,6 +6597,8 @@ mod tests {
                             && matches!(
                                 tool.status,
                                 bcode_session_view_models::ToolInvocationViewStatus::Finished
+                                    | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
+                                    | bcode_session_view_models::ToolInvocationViewStatus::Failed
                             )
                 )
             })

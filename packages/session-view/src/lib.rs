@@ -36,6 +36,7 @@ pub struct SessionView {
     contribution_slot_items: BTreeMap<TranscriptViewItemId, usize>,
     contribution_slot_owners: BTreeMap<TranscriptViewItemId, String>,
     terminal_invocations: BTreeSet<String>,
+    terminal_invocation_statuses: BTreeMap<String, ToolInvocationViewStatus>,
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
 }
 
@@ -59,6 +60,7 @@ impl SessionView {
             contribution_slot_items: BTreeMap::new(),
             contribution_slot_owners: BTreeMap::new(),
             terminal_invocations: BTreeSet::new(),
+            terminal_invocation_statuses: BTreeMap::new(),
             terminal_runtime_work: BTreeSet::new(),
         }
     }
@@ -479,6 +481,31 @@ impl SessionView {
                     ToolInvocationLifecycleStage::Completed
                     | ToolInvocationLifecycleStage::Cancelled
                     | ToolInvocationLifecycleStage::Failed => {
+                        let status = match lifecycle.stage {
+                            ToolInvocationLifecycleStage::Completed => {
+                                ToolInvocationViewStatus::Finished
+                            }
+                            ToolInvocationLifecycleStage::Cancelled => {
+                                ToolInvocationViewStatus::Cancelled
+                            }
+                            ToolInvocationLifecycleStage::Failed => {
+                                ToolInvocationViewStatus::Failed
+                            }
+                            ToolInvocationLifecycleStage::Started
+                            | ToolInvocationLifecycleStage::Progress
+                            | ToolInvocationLifecycleStage::Waiting => unreachable!(),
+                        };
+                        if !matches!(status, ToolInvocationViewStatus::Finished) {
+                            self.terminal_invocation_statuses
+                                .insert(lifecycle.invocation_id.clone(), status);
+                            self.apply_terminal_tool_status(
+                                &lifecycle.invocation_id,
+                                status,
+                                lifecycle.message.as_deref(),
+                                event.sequence,
+                                Some(event.timestamp_ms),
+                            );
+                        }
                         self.snapshot
                             .active_invocations
                             .remove(&lifecycle.invocation_id);
@@ -1375,11 +1402,48 @@ impl SessionView {
         self.push_item(id, sequence, timestamp_ms, streaming, kind);
     }
 
+    fn apply_terminal_tool_status(
+        &mut self,
+        tool_call_id: &str,
+        status: ToolInvocationViewStatus,
+        message: Option<&str>,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+    ) {
+        let Some(mut tool) = self.snapshot.tools.get(tool_call_id).cloned() else {
+            return;
+        };
+        tool.status = status;
+        if matches!(status, ToolInvocationViewStatus::Failed) {
+            tool.is_error = Some(true);
+        }
+        if matches!(
+            status,
+            ToolInvocationViewStatus::Cancelled | ToolInvocationViewStatus::Failed
+        ) && tool.result.is_none()
+            && tool.result_text.is_none()
+        {
+            tool.result_text = message.map(ToOwned::to_owned);
+        }
+        self.snapshot
+            .tools
+            .insert(tool_call_id.to_owned(), tool.clone());
+        if let Some(id) = self.tool_item_ids.get(tool_call_id).cloned() {
+            self.update_existing_tool_item(id, tool_call_id, sequence, timestamp_ms, tool);
+        }
+    }
+
     fn upsert_tool_item(&mut self, tool_call_id: &str, sequence: u64, timestamp_ms: Option<u64>) {
         let Some(projection) = self.tool_invocation_projections.get(tool_call_id).cloned() else {
             return;
         };
-        let tool = tool_invocation_view_from_projection(projection);
+        let mut tool = tool_invocation_view_from_projection(projection);
+        if let Some(status) = self.terminal_invocation_statuses.get(tool_call_id).copied() {
+            tool.status = status;
+            if matches!(status, ToolInvocationViewStatus::Failed) {
+                tool.is_error = Some(true);
+            }
+        }
         self.snapshot
             .tools
             .insert(tool_call_id.to_owned(), tool.clone());
@@ -1389,7 +1453,7 @@ impl SessionView {
                 self.update_existing_tool_item(id, tool_call_id, sequence, timestamp_ms, tool);
             }
             Entry::Vacant(_) => {
-                let id = if matches!(tool.status, ToolInvocationViewStatus::Finished) {
+                let id = if is_terminal_tool_status(tool.status) {
                     TranscriptViewItemId::tool(tool_call_id)
                 } else {
                     TranscriptViewItemId::tool_presentation_slot(
@@ -1457,8 +1521,8 @@ impl SessionView {
             | TranscriptViewItemKind::PluginVisual { .. }
             | TranscriptViewItemKind::ToolContribution { .. } => None,
         };
-        if should_split_finished_tool_item(existing_tool.as_ref(), &tool) {
-            self.split_finished_tool_item(
+        if should_split_terminal_tool_item(existing_tool.as_ref(), &tool) {
+            self.split_terminal_tool_item(
                 index,
                 id,
                 tool_call_id,
@@ -1471,7 +1535,7 @@ impl SessionView {
         }
     }
 
-    fn split_finished_tool_item(
+    fn split_terminal_tool_item(
         &mut self,
         index: usize,
         id: TranscriptViewItemId,
@@ -1841,13 +1905,21 @@ fn tool_invocation_view_from_projection(
     }
 }
 
-fn should_split_finished_tool_item(
+fn should_split_terminal_tool_item(
     existing_tool: Option<&ToolInvocationView>,
     next_tool: &ToolInvocationView,
 ) -> bool {
-    matches!(next_tool.status, ToolInvocationViewStatus::Finished)
-        && existing_tool
-            .is_some_and(|tool| !matches!(tool.status, ToolInvocationViewStatus::Finished))
+    is_terminal_tool_status(next_tool.status)
+        && existing_tool.is_some_and(|tool| !is_terminal_tool_status(tool.status))
+}
+
+const fn is_terminal_tool_status(status: ToolInvocationViewStatus) -> bool {
+    matches!(
+        status,
+        ToolInvocationViewStatus::Finished
+            | ToolInvocationViewStatus::Cancelled
+            | ToolInvocationViewStatus::Failed
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2458,6 +2530,129 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn reconnect_replay_reconstructs_cancelled_tool_without_duplicate_lifecycle_state() {
+        let session_id = SessionId::new();
+        let events = [
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-reconnect".to_owned(),
+                    producer_plugin_id: Some("example.plugin".to_owned()),
+                    tool_name: "example.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call-reconnect".to_owned(),
+                        sequence: 2,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+                        message: Some("cancelled during reconnect fixture".to_owned()),
+                        metadata: serde_json::Value::Null,
+                    },
+                },
+            ),
+        ];
+
+        let mut live_view = SessionView::new();
+        let mut reconnected_view = SessionView::new();
+        for event in &events {
+            live_view.apply_event(event);
+        }
+        for event in &events {
+            reconnected_view.apply_event(event);
+        }
+
+        assert_eq!(live_view.snapshot(), reconnected_view.snapshot());
+        assert_eq!(
+            reconnected_view.snapshot().tools["call-reconnect"].status,
+            ToolInvocationViewStatus::Cancelled
+        );
+        assert_eq!(
+            reconnected_view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, TranscriptViewItemKind::ToolInvocation { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lifecycle_cancellation_and_failure_update_existing_tool_semantics() {
+        for (stage, expected_status, is_error) in [
+            (
+                bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+                ToolInvocationViewStatus::Cancelled,
+                None,
+            ),
+            (
+                bcode_session_models::ToolInvocationLifecycleStage::Failed,
+                ToolInvocationViewStatus::Failed,
+                Some(true),
+            ),
+        ] {
+            let session_id = SessionId::new();
+            let mut view = SessionView::new();
+            view.apply_event(&event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("example.plugin".to_owned()),
+                    tool_name: "example.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ));
+            view.apply_event(&event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call-1".to_owned(),
+                        sequence: 2,
+                        stage,
+                        message: Some(format!("{stage:?}")),
+                        metadata: serde_json::Value::Null,
+                    },
+                },
+            ));
+
+            let tool = &view.snapshot().tools["call-1"];
+            assert_eq!(tool.status, expected_status);
+            assert_eq!(tool.is_error, is_error);
+            assert_eq!(
+                tool.result_text.as_deref(),
+                Some(format!("{stage:?}").as_str())
+            );
+            assert!(view.snapshot().active_invocations.is_empty());
+            let transcript_tool = view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .find_map(|item| match &item.kind {
+                    TranscriptViewItemKind::ToolInvocation { tool } => Some(tool.as_ref()),
+                    _ => None,
+                })
+                .expect("terminal tool transcript item");
+            assert_eq!(transcript_tool.status, expected_status);
+        }
     }
 
     #[test]
