@@ -4,12 +4,16 @@
 
 //! `HyperChad` application host for Bcode sessions.
 
+#[cfg(feature = "renderer-html-actix")]
+mod html_actix;
+
+#[cfg(feature = "renderer-html-actix")]
+pub use html_actix::{
+    DEFAULT_BIND_ADDRESS, VIEWPORT, build_app, init, init_with_snapshot, validate_bind_address,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "renderer-html-actix")]
-use std::net::IpAddr;
 use std::str::FromStr as _;
-#[cfg(feature = "renderer-html-actix")]
-use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 
 use bcode_client::{
@@ -25,49 +29,14 @@ use bcode_session_view_models::{
     ComposerDraftViewScope, InteractionViewSummary, PromptPlacementView, SessionViewAction,
     SessionViewSnapshot,
 };
-#[cfg(feature = "renderer-html-actix")]
-use hyperchad::app::{App, AppBuilder, renderer::DefaultRenderer};
-#[cfg(feature = "renderer-html-actix")]
-use hyperchad::color::Color;
-#[cfg(feature = "renderer-html-actix")]
-use hyperchad::renderer::Renderer as _;
 use hyperchad::router::{RoutePath, RouteRequest, Router};
 use serde::Deserialize;
-
-#[cfg(feature = "renderer-html-actix")]
-static BACKGROUND_COLOR: LazyLock<Color> = LazyLock::new(|| Color::from_hex("#0d1117"));
-
-/// Default loopback address for the local HTML/Actix renderer.
-#[cfg(feature = "renderer-html-actix")]
-pub const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-
-/// Validate a requested HTML/Actix renderer bind address.
-///
-/// # Errors
-///
-/// Returns an error when a non-loopback address is requested without explicit opt-in.
-#[cfg(feature = "renderer-html-actix")]
-pub const fn validate_bind_address(
-    address: IpAddr,
-    allow_non_loopback: bool,
-) -> Result<IpAddr, &'static str> {
-    if address.is_loopback() || allow_non_loopback {
-        Ok(address)
-    } else {
-        Err("non-loopback web binds require explicit opt-in")
-    }
-}
 
 /// Number of recent history events projected into the initial `HyperChad` snapshot.
 pub const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 
 /// Delay between failed daemon watcher reconnection attempts.
 const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Default viewport meta tag for responsive HTML rendering.
-#[cfg(feature = "renderer-html-actix")]
-pub static VIEWPORT: LazyLock<String> =
-    LazyLock::new(|| "width=device-width, initial-scale=1".to_string());
 
 /// `HyperChad` application state shared by route and action handlers.
 #[derive(Debug, Clone)]
@@ -1158,59 +1127,6 @@ pub fn router(snapshot: SessionViewSnapshot, sessions: Vec<SessionSummary>) -> R
     })
 }
 
-#[cfg(feature = "renderer-html-actix")]
-fn with_browser_runtime(builder: AppBuilder) -> AppBuilder {
-    builder.with_static_asset_route(hyperchad::renderer::assets::StaticAssetRoute {
-        route: format!(
-            "js/{}",
-            hyperchad::renderer_vanilla_js::SCRIPT_NAME_HASHED.as_str()
-        ),
-        target: hyperchad::renderer::assets::AssetPathTarget::FileContents(
-            hyperchad::renderer_vanilla_js::SCRIPT.as_bytes().into(),
-        ),
-        not_found_behavior: None,
-    })
-}
-
-/// Initialize the HTML/Actix application builder with a static initial snapshot.
-#[cfg(feature = "renderer-html-actix")]
-#[must_use]
-pub fn init_with_snapshot(
-    snapshot: SessionViewSnapshot,
-    sessions: Vec<SessionSummary>,
-) -> AppBuilder {
-    with_browser_runtime(
-        AppBuilder::new()
-            .with_actix_bind_address(DEFAULT_BIND_ADDRESS.to_string())
-            .with_router(router(snapshot, sessions))
-            .with_background(*BACKGROUND_COLOR)
-            .with_title("bcode web".to_string())
-            .with_description("HyperChad application for Bcode sessions".to_string())
-            .with_viewport(VIEWPORT.clone())
-            .with_size(1200.0, 800.0),
-    )
-}
-
-/// Initialize the HTML/Actix application builder from daemon state.
-///
-/// # Errors
-///
-/// Returns an error when initial daemon state cannot be loaded.
-#[cfg(feature = "renderer-html-actix")]
-pub async fn init(state: &HyperChadAppState) -> Result<AppBuilder, ClientError> {
-    state.client().ensure_daemon_available().await?;
-    Ok(with_browser_runtime(
-        AppBuilder::new()
-            .with_actix_bind_address(DEFAULT_BIND_ADDRESS.to_string())
-            .with_router(router_from_state(state.clone()))
-            .with_background(*BACKGROUND_COLOR)
-            .with_title("bcode web".to_string())
-            .with_description("HyperChad application for Bcode sessions".to_string())
-            .with_viewport(VIEWPORT.clone())
-            .with_size(1200.0, 800.0),
-    ))
-}
-
 async fn attach_watched_session(
     client: &BcodeClient,
     session_id: SessionId,
@@ -1408,15 +1324,17 @@ async fn watch_session_updates(
     }
 }
 
-/// Configure scoped live snapshot rendering on a built HTML/Actix application.
-#[cfg(feature = "renderer-html-actix")]
-pub fn configure_live_updates(app: &mut App<DefaultRenderer>, state: &HyperChadAppState) {
+/// Configure scoped live snapshot rendering through a `HyperChad` renderer.
+pub fn configure_live_updates<R>(renderer: &R, state: &HyperChadAppState)
+where
+    R: hyperchad::renderer::Renderer + Clone + 'static,
+{
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ScopedSnapshotUpdate>(1);
     *state
         .renderer_tx
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
-    let renderer = app.renderer.clone();
+    let renderer = renderer.clone();
     let access_token = Arc::clone(&state.access_token);
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
@@ -1433,16 +1351,6 @@ pub fn configure_live_updates(app: &mut App<DefaultRenderer>, state: &HyperChadA
             }
         }
     });
-}
-
-/// Build the selected HTML/Actix application from the provided builder.
-///
-/// # Errors
-///
-/// Returns an error if the application fails to build.
-#[cfg(feature = "renderer-html-actix")]
-pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad::app::Error> {
-    Ok(builder.build_default()?)
 }
 
 #[cfg(test)]
@@ -1882,8 +1790,19 @@ mod tests {
     #[tokio::test]
     async fn html_actix_app_build_smoke_test() {
         tokio::task::yield_now().await;
+        let state = HyperChadAppState::new(BcodeClient::default_endpoint(), "scope-token");
         let builder = init_with_snapshot(SessionViewSnapshot::empty(), Vec::new());
-        assert!(build_app(builder).is_ok());
+        let app = build_app(builder).expect("HTML/Actix application should build");
+        let renderer = app.renderer.clone();
+        configure_live_updates(&renderer, &state);
+        assert!(
+            state
+                .renderer_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        );
+        drop(app);
     }
 
     #[test]

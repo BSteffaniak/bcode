@@ -43,6 +43,17 @@ const BCODE_BROWSER_TRANSPORT_NEEDLES: &[&str] = &[
     "actix_ws",
 ];
 
+const PORTABLE_HYPERCHAD_BACKEND_NEEDLES: &[&str] = &[
+    "with_actix_",
+    "renderer_vanilla_js",
+    "renderer_html_actix",
+    "EventSource",
+    "WebSocket",
+    "text/event-stream",
+    "web_sys::",
+    "wasm_bindgen",
+];
+
 const TERMINAL_PLUGIN_API_NEEDLES: &[&str] = &[
     "PluginTuiSurface",
     "PluginTuiVisualAdapter",
@@ -207,6 +218,24 @@ fn hyperchad_application_uses_framework_transport_instead_of_bcode_owned_transpo
     assert!(
         offenders.is_empty(),
         "Bcode-owned browser transport bypasses HyperChad:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn portable_hyperchad_modules_do_not_import_backend_implementation_details() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut offenders = Vec::new();
+    for root in ["packages/hyperchad/ui/src", "packages/hyperchad/src/lib.rs"] {
+        collect_literal_offenders(
+            &workspace_root.join(root),
+            PORTABLE_HYPERCHAD_BACKEND_NEEDLES,
+            &mut offenders,
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "backend implementation details leaked into portable HyperChad modules:\n{}",
         offenders.join("\n")
     );
 }

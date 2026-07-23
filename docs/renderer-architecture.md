@@ -98,6 +98,10 @@ Raw tool arguments remain available to permission, policy, audit, and explicit d
 compact transcript requests do not render them. This contract applies equally to live events and
 durable replay; renderers must not infer placement from tool names, schemas, or contribution IDs.
 
+## State Authority
+
+Bcode's daemon event log and `SessionView` projection remain the sole authority for session and interaction state. HyperChad receives projected snapshots and routes semantic user intent back to Bcode; its optional shared-state persistence must not journal or independently reconstruct Bcode sessions. Using it as a second store would create conflicting revisions, duplicate recovery rules, and a second repair surface.
+
 ## TUI migration rules
 
 The TUI migration should be incremental:
@@ -112,15 +116,16 @@ The TUI migration should be incremental:
 
 The goal is not to make every renderer look or behave identically. The goal is for them to consume the same product semantics while retaining native presentation and interaction.
 
-## Adding another renderer
+## Adding another HyperChad backend
 
-A new renderer should start with `SessionViewSnapshot`, generic transcript/tool/artifact rendering, and semantic action mapping. It should add renderer-specific layout and input around that contract, then add rich visual adapters only where actual schemas need them.
+A new HyperChad backend should reuse `bcode_hyperchad_ui`, the `SessionViewSnapshot` contract, semantic action mapping, and generic renderer publication. Bcode should add only the consuming Cargo feature propagation and genuinely backend-specific startup/configuration required to construct the selected HyperChad renderer. Canonical `hx-*`, `fx-*`, form, route, and update semantics remain the responsibility of HyperChad backends.
 
-A new renderer must not:
+A new backend must not:
 
+* Create a parallel Bcode presentation stack for semantics already expressed by `bcode_hyperchad_ui`.
 * Reuse `packages/tui` application state.
 * Fork event projection or daemon-effect behavior.
 * Depend on terminal drawing or event types.
 * Assume plugin TUI surfaces are portable.
 * Full-replay event logs on normal paths.
-* Add custom browser/mobile transport inside Bcode when the renderer framework should own it.
+* Add custom browser/mobile/native transport inside Bcode when HyperChad should own it.

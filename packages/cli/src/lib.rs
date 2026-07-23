@@ -342,7 +342,7 @@ async fn handle_web_command(
         .with_viewport(bcode_hyperchad::VIEWPORT.clone());
     let mut app = bcode_hyperchad::build_app(builder)
         .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
-    bcode_hyperchad::configure_live_updates(&mut app, &state);
+    bcode_hyperchad::configure_live_updates(&app.renderer, &state);
     tokio::task::spawn_blocking(move || app.handle_serve())
         .await
         .map_err(|error| {
