@@ -1636,6 +1636,11 @@ async fn absorb_bcode_event(
                 } => loop_state
                     .artifact_stream
                     .observe_contribution(event.session_id, contribution),
+                bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope } => {
+                    loop_state
+                        .artifact_stream
+                        .observe_contribution(event.session_id, &envelope.contribution);
+                }
                 _ => {}
             }
             chat.app.absorb_session_live_event(&event);

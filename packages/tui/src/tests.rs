@@ -4819,19 +4819,22 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
     app.absorb_session_event(&event(
         session_id,
         2,
-        SessionEventKind::ToolContribution {
-            event: bcode_session_models::ToolContributionEvent {
-                invocation_id: "call-live-shell".to_owned(),
-                contribution_id: "shell-run-request".to_owned(),
-                sequence: 1,
-                producer_id: "bcode.shell".to_owned(),
-                schema: "bcode.tool.request.shell.run".to_owned(),
-                schema_version: 1,
-                operation: bcode_session_models::ToolContributionOperation::Upsert,
-                persistence: bcode_session_models::ToolContributionPersistence::Durable,
-                artifact: None,
-                payload: serde_json::json!({"command": "printf red"}),
-            },
+        SessionEventKind::ToolContributionPlaced {
+            envelope: bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Request,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-live-shell".to_owned(),
+                    contribution_id: "shell-run-request".to_owned(),
+                    sequence: 1,
+                    producer_id: "bcode.shell".to_owned(),
+                    schema: "bcode.tool.request.shell.run".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
+                    payload: serde_json::json!({"command": "printf red"}),
+                },
+            ),
         },
     ));
     app.absorb_session_event(&event(
@@ -4993,7 +4996,8 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
     responder.await.expect("artifact responder");
 
     let rendered = render_app_text(&mut app);
-    assert!(!rendered.contains("live red"), "{rendered}");
+    assert!(rendered.contains("live red"), "{rendered}");
+    assert_eq!(rendered.matches("live red").count(), 1, "{rendered}");
     assert!(rendered.contains("printf red"), "{rendered}");
 }
 
