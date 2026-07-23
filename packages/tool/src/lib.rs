@@ -8,10 +8,11 @@ pub mod contracts;
 pub mod interaction;
 
 pub use bcode_tool_models::{
-    ToolContributionArtifact, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolExchangeRequest, ToolExchangeResolution,
-    ToolExchangeResolutionEvent, ToolExchangeResponsePolicy, ToolInvocationInput,
-    ToolInvocationInputResolution, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolContributionArtifact, ToolContributionEnvelope, ToolContributionEvent,
+    ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,
+    ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResolutionEvent,
+    ToolExchangeResponsePolicy, ToolInvocationInput, ToolInvocationInputResolution,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
 };
 pub use contracts::{
     PreparedToolInvocation, TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA, ToolArtifactWriteRequest,

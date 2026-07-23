@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn tool_presentation_slot_ids_are_stable_and_supplementals_are_independent() {
+    assert_eq!(
+        TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Request,
+            None,
+        ),
+        TranscriptViewItemId::new("tool-slot:call-1:request")
+    );
+    assert_ne!(
+        TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Supplemental,
+            Some("one"),
+        ),
+        TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Supplemental,
+            Some("two"),
+        )
+    );
+}
+
+#[test]
 fn empty_snapshot_shows_reasoning_by_default() {
     assert!(SessionViewSnapshot::empty().thinking.visible);
 }

@@ -481,6 +481,9 @@ enum PersistedSessionEventKind {
     ToolInvocationResultRecorded {
         record: bcode_session_models::ToolInvocationResultRecord,
     },
+    ToolContributionPlaced {
+        envelope: bcode_session_models::ToolContributionEnvelope,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -834,6 +837,9 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                     record: record.clone(),
                 }
             }
+            SessionEventKind::ToolContributionPlaced { envelope } => Self::ToolContributionPlaced {
+                envelope: envelope.clone(),
+            },
             SessionEventKind::ToolInvocationStream { event } => Self::ToolInvocationStream {
                 event: event.clone(),
             },
@@ -1179,6 +1185,9 @@ impl PersistedSessionEventKind {
             }
             Self::ToolInvocationResultRecorded { record } => {
                 SessionEventKind::ToolInvocationResultRecorded { record }
+            }
+            Self::ToolContributionPlaced { envelope } => {
+                SessionEventKind::ToolContributionPlaced { envelope }
             }
             Self::ToolInvocationStream { event } => {
                 SessionEventKind::ToolInvocationStream { event }

@@ -7092,6 +7092,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
         SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::ToolContribution { .. } => "tool_contribution",
+        SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
@@ -7366,6 +7367,17 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
             contribution.operation,
             contribution.payload
         ),
+        SessionLiveEventKind::ToolContributionPlaced { envelope } => format!(
+            "live contribution {:?} {}:{} sequence={} schema={}@{} operation={:?} payload={}",
+            envelope.placement,
+            envelope.contribution.invocation_id,
+            envelope.contribution.contribution_id,
+            envelope.contribution.sequence,
+            envelope.contribution.schema,
+            envelope.contribution.schema_version,
+            envelope.contribution.operation,
+            envelope.contribution.payload
+        ),
         SessionLiveEventKind::AssistantTextDelta { turn_id, text } => {
             format!("live assistant delta ({turn_id}): {text}")
         }
@@ -7522,6 +7534,18 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             contribution.schema_version,
             contribution.operation,
             contribution.payload
+        ),
+        SessionEventKind::ToolContributionPlaced { envelope } => println!(
+            "#{} contribution {:?} {}:{} sequence={} schema={}@{} operation={:?} payload={}",
+            event.sequence,
+            envelope.placement,
+            envelope.contribution.invocation_id,
+            envelope.contribution.contribution_id,
+            envelope.contribution.sequence,
+            envelope.contribution.schema,
+            envelope.contribution.schema_version,
+            envelope.contribution.operation,
+            envelope.contribution.payload
         ),
         SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => println!(
             "#{} invocation {}: {:?}{}",

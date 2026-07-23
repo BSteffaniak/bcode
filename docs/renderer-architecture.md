@@ -75,6 +75,26 @@ Full snapshots are the correctness baseline. `SessionViewPatch` is an optional l
 
 Web updates use HyperChad's update/action mechanisms. Missing browser transport, routing, asset, or server capabilities belong upstream in HyperChad rather than in Bcode-specific JavaScript or WebSocket/SSE plumbing.
 
+## Tool presentation slots
+
+Tool contributions use a versioned `ToolContributionEnvelope` whose renderer-neutral placement is
+`request`, `progress`, `result`, `supplemental`, or `hidden`. Placement is host composition
+semantics, while the nested `ToolContributionEvent` remains an opaque producer-owned payload.
+Legacy unplaced contributions are retained in semantic contribution state but are hidden from normal
+transcript presentation.
+
+`SessionView` owns stable slot identity:
+
+* Request, progress, and result each have one replaceable slot per invocation.
+* Supplemental slots are independently keyed by contribution identity and retain event order.
+* Hidden contributions have no transcript item.
+* Renderers route visible payloads by producer, schema, and version. Unsupported payloads must not be
+  exposed as serialized JSON in normal transcript UI.
+
+Raw tool arguments remain available to permission, policy, audit, and explicit diagnostic paths, but
+compact transcript requests do not render them. This contract applies equally to live events and
+durable replay; renderers must not infer placement from tool names, schemas, or contribution IDs.
+
 ## TUI migration rules
 
 The TUI migration should be incremental:

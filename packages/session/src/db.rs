@@ -3418,6 +3418,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
         SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::ToolContribution { .. } => "tool_contribution",
+        SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",

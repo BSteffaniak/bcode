@@ -7950,6 +7950,39 @@ mod tests {
                     },
                 },
             ),
+            (
+                46,
+                "ToolContributionResultRecorded",
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call".to_owned(),
+                        model_output: "done".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
+                },
+            ),
+            (
+                47,
+                "ToolContributionPlaced",
+                SessionEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Request,
+                        bcode_session_models::ToolContributionEvent {
+                            invocation_id: "call".to_owned(),
+                            contribution_id: "request".to_owned(),
+                            sequence: 1,
+                            producer_id: "producer".to_owned(),
+                            schema: "example.request".to_owned(),
+                            schema_version: 1,
+                            operation: bcode_session_models::ToolContributionOperation::Upsert,
+                            persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                            artifact: None,
+                            payload: serde_json::json!({"path": "src/lib.rs"}),
+                        },
+                    ),
+                },
+            ),
         ]
     }
 

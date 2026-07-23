@@ -750,14 +750,6 @@ fn push_transcript_item_rows(
             if canonical_plugin_visual_available(&visual, plugin_host) {
                 push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
                 rows.push(Line::default());
-            } else {
-                push_detail_block(
-                    rows,
-                    &item.display_role(),
-                    item.text(),
-                    Color::BrightBlack,
-                    width,
-                );
             }
         }
         TranscriptItemKind::Generic => {
@@ -925,7 +917,14 @@ fn push_tool_request_rows(
         muted_style(),
     );
     if !item.text().is_empty() {
-        push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            "running",
+            width,
+            muted_style(),
+            muted_style(),
+        );
     }
     rows.push(Line::default());
 }

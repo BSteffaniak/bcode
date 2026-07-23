@@ -16423,6 +16423,18 @@ async fn invoke_model_tool(
                                     lifecycle,
                                 )
                                 .await;
+                            } else if let Ok(envelope) = serde_json::from_slice::<
+                                bcode_session_models::ToolContributionEnvelope,
+                            >(&payload)
+                            {
+                                append_tool_contribution_envelope(
+                                    state,
+                                    session_id,
+                                    &call.id,
+                                    plugin_id,
+                                    envelope,
+                                )
+                                .await;
                             } else if let Ok(contribution) = serde_json::from_slice::<
                                 bcode_session_models::ToolContributionEvent,
                             >(&payload)
@@ -16465,6 +16477,11 @@ async fn invoke_model_tool(
             serde_json::from_slice::<bcode_session_models::ToolInvocationLifecycleEvent>(&payload)
         {
             append_plugin_tool_lifecycle_event(state, session_id, &call.id, lifecycle).await;
+        } else if let Ok(envelope) =
+            serde_json::from_slice::<bcode_session_models::ToolContributionEnvelope>(&payload)
+        {
+            append_tool_contribution_envelope(state, session_id, &call.id, plugin_id, envelope)
+                .await;
         } else if let Ok(contribution) =
             serde_json::from_slice::<bcode_session_models::ToolContributionEvent>(&payload)
         {
@@ -16669,6 +16686,60 @@ fn contribution_artifact_stream_event(
         availability: None,
         finalized: artifact.finalized,
     })
+}
+
+async fn append_tool_contribution_envelope(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+    producer_id: &str,
+    envelope: bcode_session_models::ToolContributionEnvelope,
+) {
+    if envelope.schema_version != bcode_session_models::ToolContributionEnvelope::SCHEMA_VERSION {
+        tracing::warn!(
+            schema_version = envelope.schema_version,
+            "discarded unsupported tool contribution envelope"
+        );
+        return;
+    }
+    let event = &envelope.contribution;
+    if event.invocation_id != invocation_id || event.producer_id != producer_id {
+        tracing::warn!(
+            expected_invocation_id = invocation_id,
+            actual_invocation_id = event.invocation_id,
+            expected_producer_id = producer_id,
+            actual_producer_id = event.producer_id,
+            "discarded placed tool contribution with mismatched identity"
+        );
+        return;
+    }
+    if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
+        if let Some(artifact_event) = contribution_artifact_stream_event(event)
+            && let Err(error) = update_active_artifact(state, session_id, &artifact_event, None)
+        {
+            tracing::warn!(%error, "discarded placed contribution with invalid artifact revision");
+            return;
+        }
+        let _ = state
+            .sessions
+            .publish_live_event(
+                session_id,
+                SessionLiveEventKind::ToolContributionPlaced { envelope },
+            )
+            .await;
+        return;
+    }
+    match state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::ToolContributionPlaced { envelope },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => tracing::warn!(%error, "failed to append placed tool contribution event"),
+    }
 }
 
 async fn append_tool_contribution_event(
@@ -19233,6 +19304,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
         SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::ToolContribution { .. } => "tool_contribution",
+        SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",

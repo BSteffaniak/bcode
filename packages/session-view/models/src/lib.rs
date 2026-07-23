@@ -53,6 +53,30 @@ impl TranscriptViewItemId {
         Self(format!("tool-request:{tool_call_id}"))
     }
 
+    /// Create an identifier for a semantic presentation slot owned by a tool invocation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `placement` is supplemental and `supplemental_id` is absent.
+    #[must_use]
+    pub fn tool_presentation_slot(
+        tool_call_id: &str,
+        placement: bcode_session_models::ToolContributionPlacement,
+        supplemental_id: Option<&str>,
+    ) -> Self {
+        let slot = match placement {
+            bcode_session_models::ToolContributionPlacement::Request => "request".to_owned(),
+            bcode_session_models::ToolContributionPlacement::Progress => "progress".to_owned(),
+            bcode_session_models::ToolContributionPlacement::Result => "result".to_owned(),
+            bcode_session_models::ToolContributionPlacement::Supplemental => format!(
+                "supplemental:{}",
+                supplemental_id.expect("supplemental presentation slots require stable identity")
+            ),
+            bcode_session_models::ToolContributionPlacement::Hidden => "hidden".to_owned(),
+        };
+        Self(format!("tool-slot:{tool_call_id}:{slot}"))
+    }
+
     /// Create an identifier for a permission request.
     #[must_use]
     pub fn permission(permission_id: &str) -> Self {

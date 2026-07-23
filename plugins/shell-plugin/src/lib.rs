@@ -27,9 +27,9 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolArtifactRef, ToolContributionArtifact, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolDefinition, ToolInvocationLifecycleEvent,
-    ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList, ToolSideEffect,
+    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
 };
 use contracts::{
     SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE, SHELL_RECORDING_REF_KEY,
@@ -197,6 +197,7 @@ fn run_shell_tool(
     let arguments_json = serde_json::to_value(&arguments).unwrap_or_else(|_| json!({}));
     emit_tool_contribution(
         events,
+        ToolContributionPlacement::Request,
         &ToolContributionEvent {
             invocation_id: tool_call_id.to_owned(),
             contribution_id: "shell-run-request".to_owned(),
@@ -233,6 +234,7 @@ fn run_shell_tool(
     );
     emit_tool_contribution(
         events,
+        ToolContributionPlacement::Result,
         &ToolContributionEvent {
             invocation_id: tool_call_id.to_owned(),
             contribution_id: "shell-run-summary".to_owned(),
@@ -1381,6 +1383,7 @@ fn shell_recording_commit_observer(
             .saturating_add(1);
         emit_tool_contribution(
             events,
+            ToolContributionPlacement::Progress,
             &ToolContributionEvent {
                 invocation_id: tool_call_id.clone(),
                 contribution_id: "shell-recording".to_owned(),
@@ -1413,8 +1416,13 @@ fn emit_tool_lifecycle(events: ServiceEventEmitter, event: &ToolInvocationLifecy
     }
 }
 
-fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
-    if let Ok(payload) = serde_json::to_vec(event) {
+fn emit_tool_contribution(
+    events: ServiceEventEmitter,
+    placement: ToolContributionPlacement,
+    event: &ToolContributionEvent,
+) {
+    let envelope = bcode_tool::ToolContributionEnvelope::new(placement, event.clone());
+    if let Ok(payload) = serde_json::to_vec(&envelope) {
         events.emit(&payload);
     }
 }

@@ -2184,7 +2184,7 @@ fn prepended_history_coalesces_assistant_deltas() {
 }
 
 #[test]
-fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
+fn transcript_renders_compact_tool_blocks_without_raw_arguments() {
     let session_id = SessionId::new();
     let full_call_id = "call_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let history = [
@@ -2224,8 +2224,9 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
     assert!(output.contains("Tool · shell.run"));
     assert!(output.contains("call call_ABCD"));
     assert!(output.contains(full_call_id));
-    assert!(output.contains("\"command\": \"cargo check\""), "{output}");
-    assert!(output.contains("\"cwd\": \"/tmp/project\""), "{output}");
+    assert!(output.contains("running"));
+    assert!(!output.contains("\"command\""), "{output}");
+    assert!(!output.contains("\"cwd\""), "{output}");
     assert!(output.contains("Tool result · shell.run · ok"));
     assert!(output.contains("    ok"));
 }
@@ -2258,9 +2259,9 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("tool filesystem_write"));
-    assert!(output.contains("\"path\":"), "{output}");
+    assert!(!output.contains("\"path\":"), "{output}");
     assert!(
-        output.contains("/Users/braden/projects/bcode/packages/tui/src/render.rs"),
+        !output.contains("/Users/braden/projects/bcode/packages/tui/src/render.rs"),
         "{output}"
     );
     assert!(!output.contains("File change preview"));
@@ -2430,9 +2431,9 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("example.edit"), "{output}");
-    assert!(output.contains("\"path\": \"src/lib.rs\""), "{output}");
-    assert!(output.contains("\"old_text\":"), "{output}");
-    assert!(output.contains("\"new_text\":"), "{output}");
+    assert!(!output.contains("\"path\""), "{output}");
+    assert!(!output.contains("\"old_text\""), "{output}");
+    assert!(!output.contains("\"new_text\""), "{output}");
     assert!(!output.contains("File change preview"), "{output}");
     assert!(!output.contains("replaced 1 line with 1 line"), "{output}");
 }
@@ -3269,7 +3270,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
     render::render(&mut app, &mut frame);
 
     assert!(rendered_text(&buffer).contains("shell.run"));
-    assert_ne!(output_line_y(&buffer, "Bcode …"), Some(1));
+    assert_eq!(output_line_y(&buffer, "Bcode …"), Some(1));
 }
 
 #[test]
@@ -4971,8 +4972,11 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
     };
     app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
         session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolContribution {
-            event: contribution.clone(),
+        kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+            envelope: bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Progress,
+                contribution.clone(),
+            ),
         },
     });
     coordinator.observe_contribution(session_id, &contribution);
@@ -4989,8 +4993,8 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
     responder.await.expect("artifact responder");
 
     let rendered = render_app_text(&mut app);
-    assert!(rendered.contains("live red"), "{rendered}");
-    assert_eq!(rendered.matches("live red").count(), 1, "{rendered}");
+    assert!(!rendered.contains("live red"), "{rendered}");
+    assert!(rendered.contains("printf red"), "{rendered}");
 }
 
 #[test]
@@ -5238,23 +5242,26 @@ fn durable_request_contribution_replaces_raw_arguments_and_survives_lifecycle() 
     app.absorb_session_event(&event(
         session_id,
         3,
-        SessionEventKind::ToolContribution {
-            event: bcode_session_models::ToolContributionEvent {
-                invocation_id: "call-read".to_owned(),
-                contribution_id: "filesystem-request".to_owned(),
-                sequence: 1,
-                producer_id: "bcode.filesystem".to_owned(),
-                schema: "bcode.filesystem.request".to_owned(),
-                schema_version: 1,
-                operation: bcode_session_models::ToolContributionOperation::Upsert,
-                persistence: bcode_session_models::ToolContributionPersistence::Durable,
-                artifact: None,
-                payload: serde_json::json!({
-                    "operation": "filesystem.read",
-                    "path": "src/lib.rs",
-                    "limit": 20,
-                }),
-            },
+        SessionEventKind::ToolContributionPlaced {
+            envelope: bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Request,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-read".to_owned(),
+                    contribution_id: "filesystem-request".to_owned(),
+                    sequence: 1,
+                    producer_id: "bcode.filesystem".to_owned(),
+                    schema: "bcode.filesystem.request".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
+                    payload: serde_json::json!({
+                        "operation": "filesystem.read",
+                        "path": "src/lib.rs",
+                        "limit": 20,
+                    }),
+                },
+            ),
         },
     ));
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));

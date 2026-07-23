@@ -3370,7 +3370,8 @@ impl ReviewAgentSessionStreamState {
                 self.status = "thinking…".to_string();
             }
             SessionLiveEventKind::ToolOutputDelta { .. }
-            | SessionLiveEventKind::ToolContribution { .. } => {
+            | SessionLiveEventKind::ToolContribution { .. }
+            | SessionLiveEventKind::ToolContributionPlaced { .. } => {
                 self.phase = ReviewAgentThreadPhase::Running;
                 self.status = "running tool…".to_string();
                 self.activity = Some("tool output streaming…".to_string());

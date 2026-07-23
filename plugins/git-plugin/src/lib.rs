@@ -8,8 +8,9 @@ mod git_tui;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
+    ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -418,7 +419,8 @@ fn clone_request_contribution(
 }
 
 fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
-    if let Ok(payload) = serde_json::to_vec(event) {
+    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Request, event.clone());
+    if let Ok(payload) = serde_json::to_vec(&envelope) {
         events.emit(&payload);
     }
 }

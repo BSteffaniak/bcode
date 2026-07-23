@@ -12,10 +12,10 @@
 
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 pub use bcode_tool_models::{
-    ToolContributionArtifact, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolExchangeRequest, ToolExchangeResolution,
-    ToolExchangeResolutionEvent, ToolExchangeResponsePolicy, ToolInvocationLifecycleEvent,
-    ToolInvocationLifecycleStage,
+    ToolContributionArtifact, ToolContributionEnvelope, ToolContributionEvent,
+    ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,
+    ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResolutionEvent,
+    ToolExchangeResponsePolicy, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -256,7 +256,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 37;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 38;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -820,6 +820,8 @@ pub enum SessionLiveEventKind {
     ///
     /// Transient contributions are never persisted, indexed, or replayed.
     ToolContribution { event: ToolContributionEvent },
+    /// Renderer contribution with explicit placement published only to attached clients.
+    ToolContributionPlaced { envelope: ToolContributionEnvelope },
     /// Live-only tool argument visual derived from partial tool-call arguments.
     ToolArgumentPreview {
         /// Model turn associated with this preview update.
@@ -2071,6 +2073,10 @@ pub enum SessionEventKind {
     /// Durable renderer-neutral terminal result for one tool invocation.
     ToolInvocationResultRecorded {
         record: ToolInvocationResultRecord,
+    },
+    /// Versioned renderer contribution with explicit host composition semantics.
+    ToolContributionPlaced {
+        envelope: ToolContributionEnvelope,
     },
 }
 

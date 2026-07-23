@@ -14,9 +14,10 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
-    ToolArgumentExtractor, ToolArgumentKind, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolList, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
+    ToolArgumentExtractor, ToolArgumentKind, ToolContributionEnvelope, ToolContributionEvent,
+    ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolPolicyMetadata,
+    ToolSideEffect, ToolUiMetadata,
 };
 use bcode_vim_edit::{
     VimEditFrame, VimEditMode, VimEditMultiFileEntry, VimEditMultiFileRequest,
@@ -500,7 +501,8 @@ fn emit_vim_live_contribution(
             serde_json::Value::Null
         },
     };
-    if let Ok(payload) = serde_json::to_vec(&event) {
+    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Progress, event);
+    if let Ok(payload) = serde_json::to_vec(&envelope) {
         events.emit(&payload);
     }
 }
@@ -973,7 +975,8 @@ fn emit_request_contribution(
         artifact: None,
         payload: serde_json::Value::Object(payload),
     };
-    if let Ok(payload) = serde_json::to_vec(&event) {
+    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Request, event);
+    if let Ok(payload) = serde_json::to_vec(&envelope) {
         events.emit(&payload);
     }
 }
@@ -995,7 +998,8 @@ fn emit_playback_contribution(
         artifact: None,
         payload: payload.clone(),
     };
-    if let Ok(payload) = serde_json::to_vec(&event) {
+    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Result, event);
+    if let Ok(payload) = serde_json::to_vec(&envelope) {
         events.emit(&payload);
     }
 }

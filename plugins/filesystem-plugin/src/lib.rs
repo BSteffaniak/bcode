@@ -14,9 +14,9 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
     TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolDefinition, ToolInvocationLifecycleEvent,
-    ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList, ToolResultContent, ToolSideEffect,
+    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -734,8 +734,13 @@ fn filesystem_request_contribution(
     }
 }
 
-fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
-    if let Ok(payload) = serde_json::to_vec(event) {
+fn emit_tool_contribution(
+    events: ServiceEventEmitter,
+    placement: ToolContributionPlacement,
+    event: &ToolContributionEvent,
+) {
+    let envelope = bcode_tool::ToolContributionEnvelope::new(placement, event.clone());
+    if let Ok(payload) = serde_json::to_vec(&envelope) {
         events.emit(&payload);
     }
 }
@@ -758,6 +763,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     let cwd = request.cwd.clone();
     emit_tool_contribution(
         context.events,
+        ToolContributionPlacement::Request,
         &filesystem_request_contribution(&request.tool_call_id, &request.name, &request.arguments),
     );
     let response = match request.name.as_str() {

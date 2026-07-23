@@ -58,6 +58,19 @@ One provider tool-call batch is the model's declaration that its calls may overl
 
 A host may explicitly disable parallel execution, and a non-reentrant adapter may serialize internally as a mechanical implementation constraint. Neither case introduces tool-domain policy into canonical orchestration.
 
+## Contribution placement ownership
+
+A producer must wrap visible contributions in `ToolContributionEnvelope` and explicitly select
+request, progress, result, supplemental, or hidden placement. The host validates producer and
+invocation identity, transports transient envelopes live-only, and persists durable envelopes through
+the append-only placed-contribution session event. Legacy unplaced contributions remain accepted for
+compatibility but default to hidden presentation.
+
+Placement selects semantic composition only; it never selects a renderer. Plugins continue to own
+payload schemas and adapters, `SessionView` owns stable slot identity and ordering, and each renderer
+owns native styling. Renderers may expose raw contribution payloads only on an explicit diagnostic or
+developer surface, never as a normal transcript fallback.
+
 ## Artifact write contract
 
 Artifact ABI v1 is a bounded atomic write rather than an allocate/write/finalize protocol. One `ToolArtifactWriteRequest` carries the complete bytes, content type, producer metadata, invocation identity, and invocation-local artifact ID. The host validates identity and size before publication and returns exactly one terminal `ToolArtifactWriteResolution`.

@@ -858,7 +858,10 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
                 subtitle: None,
                 payload: contribution.payload.clone(),
             });
-            render_plugin_visual("tool contribution", &visual)
+            VISUAL_ADAPTERS
+                .get(&(contribution.schema.as_str(), contribution.schema_version))
+                .and_then(|adapter| adapter(&visual))
+                .unwrap_or_default()
         }
     }
 }
@@ -867,12 +870,6 @@ fn render_tool_request(tool: &ToolInvocationView) -> Containers {
     container! {
         div {
             div color="#f0f6fc" margin-bottom=6 { (tool.tool_name.as_deref().unwrap_or("unknown tool")) }
-            @if let Some(arguments_json) = &tool.arguments_json {
-                details margin-bottom=8 {
-                    summary color="#8b949e" { "arguments" }
-                    div white-space="preserve-wrap" color="#c9d1d9" { (arguments_json) }
-                }
-            }
             @if let Some(visual) = &tool.request_visual {
                 (render_plugin_visual("request visual", visual))
             }
@@ -2103,11 +2100,7 @@ mod tests {
             "bcode.web-search.status_request",
             "bcode.web-search.inspect_request",
             "bcode.git.clone_request",
-            "bcode.git.clone_result",
             "bcode.worktree.request",
-            "bcode.worktree.list",
-            "bcode.worktree.create_result",
-            "bcode.worktree.remove_result",
             "bcode.vim-edit.request.preview",
             "bcode.vim-edit.request.apply",
             "bcode.vim-edit.live",
@@ -2195,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_contribution_keeps_complete_opaque_envelope_in_render_tree() {
+    fn unknown_contribution_has_no_raw_web_fallback() {
         let kind = TranscriptViewItemKind::ToolContribution {
             contribution: bcode_session_models::ToolContributionEvent {
                 invocation_id: "call".to_owned(),
@@ -2211,13 +2204,13 @@ mod tests {
             },
         };
         let rendered = format!("{:?}", transcript_item_body(&kind));
-        assert!(rendered.contains("future.unknown/schema"));
-        assert!(rendered.contains("opaque-web"));
-        assert!(rendered.contains("append"));
+        assert!(!rendered.contains("future.unknown/schema"));
+        assert!(!rendered.contains("opaque-web"));
+        assert!(!rendered.contains("append"));
     }
 
     #[test]
-    fn git_contribution_renders_through_schema_adapter_and_keeps_fallback() {
+    fn git_contribution_renders_through_schema_adapter_without_fallback() {
         let kind = TranscriptViewItemKind::ToolContribution {
             contribution: bcode_session_models::ToolContributionEvent {
                 invocation_id: "git-call".to_owned(),
@@ -2239,11 +2232,11 @@ mod tests {
         let rendered = format!("{:?}", transcript_item_body(&kind));
         assert!(rendered.contains("github.com/bmorphism/bcode"));
         assert!(rendered.contains("main"));
-        assert!(rendered.contains("bcode.git.clone_request"));
+        assert!(!rendered.contains("bcode.git.clone_request"));
     }
 
     #[test]
-    fn shell_contribution_keeps_shared_payload_in_web_render_tree() {
+    fn unsupported_shell_contribution_has_no_raw_web_fallback() {
         let kind = TranscriptViewItemKind::ToolContribution {
             contribution: bcode_session_models::ToolContributionEvent {
                 invocation_id: "shell-call".to_owned(),
@@ -2259,8 +2252,8 @@ mod tests {
             },
         };
         let rendered = format!("{:?}", transcript_item_body(&kind));
-        assert!(rendered.contains("bcode.shell.run.summary"));
-        assert!(rendered.contains("shell-render-sentinel"));
+        assert!(!rendered.contains("bcode.shell.run.summary"));
+        assert!(!rendered.contains("shell-render-sentinel"));
     }
 
     #[test]

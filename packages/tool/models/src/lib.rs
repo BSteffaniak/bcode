@@ -36,6 +36,56 @@ pub enum ToolContributionOperation {
     Remove,
 }
 
+/// Renderer-neutral placement for one tool contribution.
+///
+/// Placement controls semantic transcript composition without encoding renderer-specific layout or
+/// styling. Renderers must not infer placement from tool names, schemas, or contribution IDs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolContributionPlacement {
+    /// Primary request presentation for the invocation.
+    Request,
+    /// Current progress presentation for the invocation.
+    Progress,
+    /// Primary final result presentation for the invocation.
+    Result,
+    /// Independently visible supporting presentation.
+    Supplemental,
+    /// Semantic contribution retained without normal transcript presentation.
+    #[default]
+    Hidden,
+}
+
+/// Versioned contribution envelope carrying host composition semantics separately from the opaque
+/// producer payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolContributionEnvelope {
+    /// Envelope schema version.
+    pub schema_version: u16,
+    /// Renderer-neutral placement of the contribution.
+    pub placement: ToolContributionPlacement,
+    /// Opaque producer-owned contribution.
+    pub contribution: ToolContributionEvent,
+}
+
+impl ToolContributionEnvelope {
+    /// Current envelope schema version.
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    /// Wrap a contribution with explicit renderer-neutral placement.
+    #[must_use]
+    pub const fn new(
+        placement: ToolContributionPlacement,
+        contribution: ToolContributionEvent,
+    ) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            placement,
+            contribution,
+        }
+    }
+}
+
 /// Persistence requested for a renderer contribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -204,6 +254,35 @@ pub struct ToolInvocationLifecycleEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contribution_envelope_round_trips_all_placements() {
+        for placement in [
+            ToolContributionPlacement::Request,
+            ToolContributionPlacement::Progress,
+            ToolContributionPlacement::Result,
+            ToolContributionPlacement::Supplemental,
+            ToolContributionPlacement::Hidden,
+        ] {
+            let contribution = ToolContributionEvent {
+                invocation_id: "call-1".to_owned(),
+                contribution_id: "surface".to_owned(),
+                sequence: 1,
+                producer_id: "example.plugin".to_owned(),
+                schema: "example.surface".to_owned(),
+                schema_version: 1,
+                operation: ToolContributionOperation::Upsert,
+                persistence: ToolContributionPersistence::Durable,
+                artifact: None,
+                payload: serde_json::json!({"opaque": true}),
+            };
+            let envelope = ToolContributionEnvelope::new(placement, contribution);
+            let encoded = serde_json::to_vec(&envelope).expect("envelope encodes");
+            let decoded: ToolContributionEnvelope =
+                serde_json::from_slice(&encoded).expect("envelope decodes");
+            assert_eq!(decoded, envelope);
+        }
+    }
 
     #[test]
     fn contribution_without_artifact_remains_decode_compatible() {

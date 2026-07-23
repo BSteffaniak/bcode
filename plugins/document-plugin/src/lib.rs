@@ -10,7 +10,8 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence, ToolDefinition,
+    ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
 };
@@ -625,7 +626,8 @@ fn emit_request_contribution(
         artifact: None,
         payload: serde_json::Value::Object(payload),
     };
-    if let Ok(payload) = serde_json::to_vec(&event) {
+    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Request, event);
+    if let Ok(payload) = serde_json::to_vec(&envelope) {
         events.emit(&payload);
     }
 }

@@ -61,6 +61,21 @@ impl PluginTuiPresentation {
         Some(registry)
     }
 
+    /// Return whether the host can route one visual to a native TUI adapter.
+    #[must_use]
+    pub fn accepts_visual(
+        &self,
+        producer_plugin_id: &str,
+        schema: &str,
+        schema_version: u32,
+    ) -> bool {
+        let producer = Some(producer_plugin_id);
+        self.host
+            .visual_adapter(schema, schema_version, "tui", producer)
+            .and_then(|route| self.registry(&route.plugin_id))
+            .is_some()
+    }
+
     /// Return whether the routed adapter consumes bytes from one artifact reference.
     #[must_use]
     pub fn accepts_artifact_reference(
