@@ -17,10 +17,12 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum QuestionFocusTarget {
-    /// Focus the primary control for a question.
-    Question {
+    /// Focus one selectable option.
+    Option {
         /// Question index.
         question_index: usize,
+        /// Option index within the question.
+        option_index: usize,
     },
     /// Focus a custom text answer.
     Custom {
@@ -38,12 +40,11 @@ impl QuestionFocusTarget {
     #[must_use]
     pub fn control_id(self) -> InteractionControlId {
         match self {
-            Self::Question { question_index } => {
-                InteractionControlId::new(format!("question-{question_index}"))
-            }
-            Self::Custom { question_index } => {
-                InteractionControlId::new(format!("question-{question_index}.custom"))
-            }
+            Self::Option {
+                question_index,
+                option_index,
+            } => option_control_id(question_index, option_index),
+            Self::Custom { question_index } => custom_control_id(question_index),
             Self::Submit => InteractionControlId::new("submit"),
             Self::Cancel => InteractionControlId::new("cancel"),
         }
@@ -61,6 +62,8 @@ pub struct QuestionSnapshot {
     pub focus: QuestionFocusTarget,
     /// Current focused control id.
     pub focused_control_id: InteractionControlId,
+    /// First required question that currently fails validation.
+    pub invalid_question_index: Option<usize>,
 }
 
 /// Renderer-neutral question controller.
@@ -68,6 +71,7 @@ pub struct QuestionInteractionController {
     request: NormalizedQuestionRequest,
     answers: Vec<QuestionAnswerPayload>,
     focus: QuestionFocusTarget,
+    invalid_question_index: Option<usize>,
 }
 
 impl QuestionInteractionController {
@@ -84,31 +88,21 @@ impl QuestionInteractionController {
                 custom: None,
             })
             .collect();
+        let focus = first_focus_target(&request);
         Self {
             request,
             answers,
-            focus: QuestionFocusTarget::Question { question_index: 0 },
+            focus,
+            invalid_question_index: None,
         }
     }
 
     fn focus_targets(&self) -> Vec<QuestionFocusTarget> {
-        let mut targets = Vec::new();
-        for (question_index, question) in self.request.questions.iter().enumerate() {
-            targets.push(QuestionFocusTarget::Question { question_index });
-            if question.custom || question.options.is_empty() {
-                targets.push(QuestionFocusTarget::Custom { question_index });
-            }
-        }
-        targets.push(QuestionFocusTarget::Submit);
-        targets.push(QuestionFocusTarget::Cancel);
-        targets
+        focus_targets(&self.request)
     }
 
     fn navigate(&mut self, direction: InteractionNavigation) {
         let targets = self.focus_targets();
-        if targets.is_empty() {
-            return;
-        }
         let index = targets
             .iter()
             .position(|target| *target == self.focus)
@@ -120,12 +114,14 @@ impl QuestionInteractionController {
     }
 
     fn focus_control(&mut self, control_id: &InteractionControlId) -> InteractionOutput {
-        if let Some(target) = parse_focus_target(control_id.as_str()) {
-            self.focus = target;
-            InteractionOutput::Redraw
-        } else {
-            InteractionOutput::None
+        let Some(target) = parse_focus_target(control_id.as_str()) else {
+            return InteractionOutput::None;
+        };
+        if !self.focus_targets().contains(&target) {
+            return InteractionOutput::None;
         }
+        self.focus = target;
+        InteractionOutput::Redraw
     }
 
     fn activate_control(&mut self, control_id: &InteractionControlId) -> InteractionOutput {
@@ -133,15 +129,26 @@ impl QuestionInteractionController {
             "submit" => self.submit(),
             "cancel" => dismissed(),
             value => {
-                if let Some((question_index, option_index)) = parse_option_control_id(value) {
-                    self.toggle_option(question_index, option_index);
-                    InteractionOutput::Redraw
-                } else if let Some(target) = parse_focus_target(value) {
-                    self.focus = target;
-                    InteractionOutput::Redraw
-                } else {
-                    InteractionOutput::None
+                let Some(target) = parse_focus_target(value) else {
+                    return InteractionOutput::None;
+                };
+                if !self.focus_targets().contains(&target) {
+                    return InteractionOutput::None;
                 }
+                self.focus = target;
+                match target {
+                    QuestionFocusTarget::Option {
+                        question_index,
+                        option_index,
+                    } => {
+                        self.toggle_option(question_index, option_index);
+                        self.invalid_question_index = None;
+                    }
+                    QuestionFocusTarget::Custom { .. }
+                    | QuestionFocusTarget::Submit
+                    | QuestionFocusTarget::Cancel => {}
+                }
+                InteractionOutput::Redraw
             }
         }
     }
@@ -157,7 +164,17 @@ impl QuestionInteractionController {
         let Some(text) = value.as_str() else {
             return InteractionOutput::None;
         };
+        if !self
+            .request
+            .questions
+            .get(question_index)
+            .is_some_and(|question| question.custom || question.options.is_empty())
+        {
+            return InteractionOutput::None;
+        }
+        self.focus = QuestionFocusTarget::Custom { question_index };
         self.set_custom(question_index, text.to_owned());
+        self.invalid_question_index = None;
         InteractionOutput::Redraw
     }
 
@@ -168,11 +185,13 @@ impl QuestionInteractionController {
         let Some(option) = question.options.get(option_index) else {
             return;
         };
+        let Some(answer) = self.answers.get_mut(question_index) else {
+            return;
+        };
         let value = option
             .value
             .clone()
             .unwrap_or_else(|| option_index.to_string());
-        let answer = &mut self.answers[question_index];
         if question.selection_mode == QuestionSelectionMode::Multiple {
             if let Some(index) = answer
                 .selected
@@ -185,34 +204,62 @@ impl QuestionInteractionController {
             }
         } else {
             answer.selected = vec![value];
-            if question.custom_mode == QuestionCustomMode::Exclusive {
-                answer.custom = None;
-            }
+        }
+        if question.custom_mode == QuestionCustomMode::Exclusive {
+            answer.custom = None;
         }
     }
 
     fn set_custom(&mut self, question_index: usize, text: String) {
-        let answer = &mut self.answers[question_index];
+        let Some(question) = self.request.questions.get(question_index) else {
+            return;
+        };
+        let Some(answer) = self.answers.get_mut(question_index) else {
+            return;
+        };
         answer.custom = (!text.is_empty()).then_some(text);
-        if self.request.questions[question_index].custom_mode == QuestionCustomMode::Exclusive {
+        if question.custom_mode == QuestionCustomMode::Exclusive {
             answer.selected.clear();
         }
     }
 
-    fn submit(&self) -> InteractionOutput {
+    fn first_invalid_required_question(&self) -> Option<usize> {
+        self.request
+            .questions
+            .iter()
+            .zip(&self.answers)
+            .position(|(question, answer)| question.required && !answer_is_meaningful(answer))
+    }
+
+    fn submit(&mut self) -> InteractionOutput {
+        if let Some(question_index) = self.first_invalid_required_question() {
+            self.invalid_question_index = Some(question_index);
+            self.focus = first_question_focus_target(&self.request, question_index)
+                .unwrap_or(QuestionFocusTarget::Submit);
+            return InteractionOutput::Redraw;
+        }
+        self.invalid_question_index = None;
+        let answers = self
+            .answers
+            .iter()
+            .filter(|answer| answer_is_meaningful(answer))
+            .cloned()
+            .collect::<Vec<_>>();
         InteractionOutput::Submitted {
             payload: json!({
                 "status": "answered",
-                "questions": self.answers,
+                "questions": answers,
             }),
         }
     }
+
     fn snapshot(&self) -> QuestionSnapshot {
         QuestionSnapshot {
             request: self.request.clone(),
             answers: self.answers.clone(),
             focus: self.focus,
             focused_control_id: self.focus.control_id(),
+            invalid_question_index: self.invalid_question_index,
         }
     }
 
@@ -231,6 +278,55 @@ impl QuestionInteractionController {
             InteractionInput::Submit => self.submit(),
             InteractionInput::Cancel => dismissed(),
         }
+    }
+}
+
+fn answer_is_meaningful(answer: &QuestionAnswerPayload) -> bool {
+    !answer.selected.is_empty()
+        || answer
+            .custom
+            .as_deref()
+            .is_some_and(|custom| !custom.trim().is_empty())
+}
+
+fn focus_targets(request: &NormalizedQuestionRequest) -> Vec<QuestionFocusTarget> {
+    let mut targets = Vec::new();
+    for (question_index, question) in request.questions.iter().enumerate() {
+        targets.extend((0..question.options.len()).map(|option_index| {
+            QuestionFocusTarget::Option {
+                question_index,
+                option_index,
+            }
+        }));
+        if question.custom || question.options.is_empty() {
+            targets.push(QuestionFocusTarget::Custom { question_index });
+        }
+    }
+    targets.push(QuestionFocusTarget::Submit);
+    targets.push(QuestionFocusTarget::Cancel);
+    targets
+}
+
+fn first_focus_target(request: &NormalizedQuestionRequest) -> QuestionFocusTarget {
+    focus_targets(request)
+        .into_iter()
+        .next()
+        .unwrap_or(QuestionFocusTarget::Submit)
+}
+
+fn first_question_focus_target(
+    request: &NormalizedQuestionRequest,
+    question_index: usize,
+) -> Option<QuestionFocusTarget> {
+    let question = request.questions.get(question_index)?;
+    if question.options.is_empty() {
+        (question.custom || question.options.is_empty())
+            .then_some(QuestionFocusTarget::Custom { question_index })
+    } else {
+        Some(QuestionFocusTarget::Option {
+            question_index,
+            option_index: 0,
+        })
     }
 }
 
@@ -275,17 +371,18 @@ fn parse_focus_target(value: &str) -> Option<QuestionFocusTarget> {
     match value {
         "submit" => Some(QuestionFocusTarget::Submit),
         "cancel" => Some(QuestionFocusTarget::Cancel),
-        _ => parse_question_control_id(value)
-            .map(|question_index| QuestionFocusTarget::Question { question_index })
+        _ => parse_option_control_id(value)
+            .map(
+                |(question_index, option_index)| QuestionFocusTarget::Option {
+                    question_index,
+                    option_index,
+                },
+            )
             .or_else(|| {
                 parse_custom_control_id(value)
                     .map(|question_index| QuestionFocusTarget::Custom { question_index })
             }),
     }
-}
-
-fn parse_question_control_id(value: &str) -> Option<usize> {
-    value.strip_prefix("question-")?.parse().ok()
 }
 
 fn parse_option_control_id(value: &str) -> Option<(usize, usize)> {
@@ -308,28 +405,91 @@ mod tests {
     use super::*;
     use crate::{Question, QuestionControl, QuestionCustomMode, QuestionOption};
 
-    fn request() -> NormalizedQuestionRequest {
-        NormalizedQuestionRequest {
-            questions: vec![Question {
-                header: None,
-                text: "Proceed?".to_owned(),
-                options: vec![QuestionOption {
-                    label: "Yes".to_owned(),
-                    value: Some("yes".to_owned()),
+    fn question(
+        options: &[(&str, &str)],
+        selection_mode: QuestionSelectionMode,
+        custom: bool,
+        custom_mode: QuestionCustomMode,
+        required: bool,
+    ) -> Question {
+        Question {
+            header: None,
+            text: "Proceed?".to_owned(),
+            options: options
+                .iter()
+                .map(|(label, value)| QuestionOption {
+                    label: (*label).to_owned(),
+                    value: Some((*value).to_owned()),
                     description: None,
-                }],
-                control: QuestionControl::Radio,
-                selection_mode: QuestionSelectionMode::Single,
-                custom: true,
-                custom_mode: QuestionCustomMode::Additional,
-                required: false,
-            }],
+                })
+                .collect(),
+            control: if selection_mode == QuestionSelectionMode::Multiple {
+                QuestionControl::Checkbox
+            } else {
+                QuestionControl::Radio
+            },
+            selection_mode,
+            custom,
+            custom_mode,
+            required,
+        }
+    }
+
+    fn request(question: Question) -> NormalizedQuestionRequest {
+        NormalizedQuestionRequest {
+            questions: vec![question],
         }
     }
 
     #[test]
+    fn initially_focuses_first_option_and_navigates_each_control() {
+        let controller = QuestionInteractionController::new(request(question(
+            &[("Yes", "yes"), ("No", "no")],
+            QuestionSelectionMode::Single,
+            true,
+            QuestionCustomMode::Additional,
+            false,
+        )));
+        assert_eq!(
+            controller.snapshot().focus,
+            QuestionFocusTarget::Option {
+                question_index: 0,
+                option_index: 0,
+            }
+        );
+
+        let mut controller = controller;
+        controller.handle_input(InteractionInput::Navigate {
+            direction: InteractionNavigation::Next,
+        });
+        assert_eq!(
+            controller.snapshot().focus,
+            QuestionFocusTarget::Option {
+                question_index: 0,
+                option_index: 1,
+            }
+        );
+        controller.handle_input(InteractionInput::Navigate {
+            direction: InteractionNavigation::Previous,
+        });
+        assert_eq!(
+            controller.snapshot().focus,
+            QuestionFocusTarget::Option {
+                question_index: 0,
+                option_index: 0,
+            }
+        );
+    }
+
+    #[test]
     fn cancel_submits_plugin_owned_dismissed_response() {
-        let mut controller = QuestionInteractionController::new(request());
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("Yes", "yes")],
+            QuestionSelectionMode::Single,
+            false,
+            QuestionCustomMode::Additional,
+            false,
+        )));
         assert_eq!(
             controller.handle_input(InteractionInput::Cancel),
             InteractionOutput::Submitted {
@@ -347,18 +507,134 @@ mod tests {
     }
 
     #[test]
-    fn activates_option_and_submits_domain_payload() {
-        let mut controller = QuestionInteractionController::new(request());
+    fn single_selection_replaces_previous_option() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("Yes", "yes"), ("No", "no")],
+            QuestionSelectionMode::Single,
+            false,
+            QuestionCustomMode::Additional,
+            false,
+        )));
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 0),
+        });
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 1),
+        });
+        assert_eq!(controller.snapshot().answers[0].selected, ["no"]);
         assert_eq!(
+            controller.snapshot().focus,
+            QuestionFocusTarget::Option {
+                question_index: 0,
+                option_index: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn multiple_selection_toggles_each_option() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("One", "one"), ("Two", "two")],
+            QuestionSelectionMode::Multiple,
+            false,
+            QuestionCustomMode::Additional,
+            false,
+        )));
+        for option_index in [0, 1, 0] {
             controller.handle_input(InteractionInput::Activate {
-                control_id: option_control_id(0, 0),
-            }),
+                control_id: option_control_id(0, option_index),
+            });
+        }
+        assert_eq!(controller.snapshot().answers[0].selected, ["two"]);
+    }
+
+    #[test]
+    fn exclusive_custom_and_option_answers_clear_each_other() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("Yes", "yes")],
+            QuestionSelectionMode::Single,
+            true,
+            QuestionCustomMode::Exclusive,
+            false,
+        )));
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 0),
+        });
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(0),
+            value: InteractionValue::String("something else".to_owned()),
+        });
+        assert!(controller.snapshot().answers[0].selected.is_empty());
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 0),
+        });
+        assert_eq!(controller.snapshot().answers[0].custom, None);
+    }
+
+    #[test]
+    fn required_validation_keeps_surface_open_and_focuses_question() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("Yes", "yes")],
+            QuestionSelectionMode::Single,
+            false,
+            QuestionCustomMode::Additional,
+            true,
+        )));
+        assert_eq!(
+            controller.handle_input(InteractionInput::Submit),
             InteractionOutput::Redraw
         );
-        let output = controller.handle_input(InteractionInput::Submit);
-        let InteractionOutput::Submitted { payload } = output else {
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.invalid_question_index, Some(0));
+        assert_eq!(
+            snapshot.focus,
+            QuestionFocusTarget::Option {
+                question_index: 0,
+                option_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn optional_unanswered_questions_are_omitted_from_submission() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("Yes", "yes")],
+            QuestionSelectionMode::Single,
+            false,
+            QuestionCustomMode::Additional,
+            false,
+        )));
+        let InteractionOutput::Submitted { payload } =
+            controller.handle_input(InteractionInput::Submit)
+        else {
             panic!("expected submitted output");
         };
-        assert_eq!(payload["questions"][0]["selected"][0], "yes");
+        assert_eq!(payload["questions"], json!([]));
+    }
+
+    #[test]
+    fn malformed_and_out_of_range_control_ids_are_ignored() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("Yes", "yes")],
+            QuestionSelectionMode::Single,
+            false,
+            QuestionCustomMode::Additional,
+            false,
+        )));
+        for control_id in [
+            "question",
+            "question-0",
+            "question-0.option-x",
+            "question-0.option-9",
+            "question-9.custom",
+        ] {
+            assert_eq!(
+                controller.handle_input(InteractionInput::Activate {
+                    control_id: InteractionControlId::new(control_id),
+                }),
+                InteractionOutput::None
+            );
+        }
+        assert!(controller.snapshot().answers[0].selected.is_empty());
     }
 }

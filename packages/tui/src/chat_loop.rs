@@ -12,7 +12,7 @@ use bcode_session_models::SessionEventKind;
 use bcode_session_view::execute_session_view_action;
 use bcode_session_view_models::SessionViewAction;
 use bmux_keyboard::KeyStroke;
-use bmux_tui::event::{Event, FocusEvent};
+use bmux_tui::event::{Event, FocusEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 
@@ -1487,13 +1487,29 @@ fn draw_chat_frame<W: Write>(
 ) -> Result<(), TuiError> {
     let frame_started = Instant::now();
     let prepare_started = frame_started;
-    let layout = render::prepare_frame(&mut chat.app, terminal.area());
+    let full_transcript_area = render::transcript_area_for_frame(&chat.app, terminal.area());
+    let dock_height = loop_state
+        .interactive_surface
+        .as_mut()
+        .map_or(0, |surface| {
+            interactive_surface_height(surface, full_transcript_area)
+        });
+    let prepared =
+        render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height);
+    let layout = prepared.map(|(layout, _dock)| layout);
+    let surface_area = prepared.map_or_else(
+        || {
+            Rect::new(
+                full_transcript_area.x,
+                full_transcript_area.bottom(),
+                full_transcript_area.width,
+                0,
+            )
+        },
+        |(_layout, dock)| dock,
+    );
     let prepare_ms = elapsed_millis(prepare_started);
     let theme = render::TuiTheme::for_app(&chat.app);
-    let transcript_area = layout.map_or_else(
-        || render::transcript_area_for_frame(&chat.app, terminal.area()),
-        |layout| layout.transcript_area(&chat.app),
-    );
     let draw_started = Instant::now();
     terminal.draw(|frame| {
         if let Some(layout) = layout {
@@ -1520,7 +1536,6 @@ fn draw_chat_frame<W: Write>(
             timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
         }
         if let Some(surface) = &mut loop_state.interactive_surface {
-            let surface_area = interactive_surface_area(surface, transcript_area);
             surface.render(surface_area, frame);
         }
     })?;
@@ -1558,10 +1573,16 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn interactive_surface_height(surface: &mut InteractiveSurfaceState, viewport: Rect) -> u16 {
+    let preferred = surface.preferred_height(viewport.width);
+    let maximum = viewport.height.saturating_mul(2).div_ceil(3);
+    preferred
+        .min(maximum)
+        .min(viewport.height.saturating_sub(1))
+}
+
 fn interactive_surface_area(surface: &mut InteractiveSurfaceState, viewport: Rect) -> Rect {
-    let height = surface
-        .preferred_height(viewport.width)
-        .min(viewport.height);
+    let height = interactive_surface_height(surface, viewport);
     Rect::new(
         viewport.x,
         viewport.bottom().saturating_sub(height),
@@ -1727,7 +1748,7 @@ async fn absorb_bcode_event(
 }
 
 async fn maybe_open_interactive_surface(
-    _chat: &ActiveChat,
+    chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     event: &SessionEventKind,
 ) {
@@ -1760,7 +1781,14 @@ async fn maybe_open_interactive_surface(
     });
     let opened =
         InteractiveSurfaceState::open(runtime, interaction_id, surface_kind, &request_json).await;
-    loop_state.interactive_surface = opened.ok();
+    match opened {
+        Ok(surface) => loop_state.interactive_surface = Some(surface),
+        Err(error) => {
+            tracing::warn!(%error, "failed to open interactive TUI surface");
+            chat.app
+                .set_status(format!("Interactive request unavailable: {error}"));
+        }
+    }
 }
 
 async fn next_artifact_fetch_event(
@@ -1932,6 +1960,24 @@ async fn handle_event<W: Write>(
         {
             handle_interactive_surface_host_key(context, chat, loop_state, stroke).await
         }
+        Event::Mouse(mouse)
+            if loop_state.interactive_surface.is_some()
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+        {
+            let hit_id = mouse_flow::mouse_hit_id(context.terminal.hits(), mouse);
+            mouse_flow::handle_mouse(
+                hit_id,
+                context.services.client,
+                chat,
+                &mut loop_state.permission_dialog,
+                mouse,
+                context.mouse_scroll_rows,
+            )
+            .await
+        }
         event @ Event::Key(_) if loop_state.interactive_surface.is_some() => {
             handle_interactive_surface_event(context, chat, loop_state, event).await
         }
@@ -2006,16 +2052,30 @@ async fn handle_interactive_surface_host_key<W: Write>(
             resolve_interactive_surface_dismissed(context, chat, loop_state).await?;
             Ok(true)
         }
+        Some(action) if is_transcript_action(action) => {
+            Ok(input::handle_host_action(&mut chat.app, action).redraw)
+        }
         _ => Ok(false),
     }
 }
 
 fn interactive_surface_host_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> Option<BmuxAction> {
-    match keymap.action_for_key(BmuxScope::Chat, stroke)? {
-        BmuxAction::AppExit => Some(BmuxAction::AppExit),
-        BmuxAction::AppInterrupt => Some(BmuxAction::AppInterrupt),
-        _ => None,
-    }
+    let action = keymap.action_for_key(BmuxScope::Chat, stroke)?;
+    (matches!(action, BmuxAction::AppExit | BmuxAction::AppInterrupt)
+        || is_transcript_action(action))
+    .then_some(action)
+}
+
+const fn is_transcript_action(action: BmuxAction) -> bool {
+    matches!(
+        action,
+        BmuxAction::TranscriptPageUp
+            | BmuxAction::TranscriptPageDown
+            | BmuxAction::TranscriptTop
+            | BmuxAction::TranscriptBottom
+            | BmuxAction::TranscriptLineUp
+            | BmuxAction::TranscriptLineDown
+    )
 }
 
 #[allow(clippy::future_not_send)]
@@ -2044,7 +2104,7 @@ async fn resolve_interactive_surface_dismissed<W: Write>(
 #[allow(clippy::future_not_send)]
 async fn handle_interactive_surface_event<W: Write>(
     context: &ChatEventContext<'_, '_, W>,
-    chat: &ActiveChat,
+    chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     event: Event,
 ) -> Result<bool, TuiError> {
@@ -2057,15 +2117,23 @@ async fn handle_interactive_surface_event<W: Write>(
     );
     if let Some(resolution) = surface.handle_event(&event) {
         let interaction_id = surface.interaction_id().to_owned();
-        loop_state.interactive_surface = None;
-        execute_session_view_action(
+        match execute_session_view_action(
             context.services.client,
             SessionViewAction::ResolveExchange {
                 interaction_id,
                 resolution,
             },
         )
-        .await?;
+        .await
+        {
+            Ok(_) => loop_state.interactive_surface = None,
+            Err(error) => {
+                surface.clear_pending_resolution();
+                tracing::warn!(%error, "failed to resolve interactive request");
+                chat.app
+                    .set_status(format!("Interactive response failed; retry: {error}"));
+            }
+        }
     }
     Ok(true)
 }

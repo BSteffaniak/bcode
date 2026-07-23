@@ -117,10 +117,24 @@ pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
 
 /// Prepare derived frame projections before rendering.
 pub fn prepare_frame(app: &mut BmuxApp, area: Rect) -> Option<FrameLayout> {
+    prepare_frame_with_bottom_dock(app, area, 0).map(|(layout, _dock)| layout)
+}
+
+/// Prepare a frame while reserving a non-overlapping dock at the bottom of the body.
+///
+/// The returned dock is excluded from transcript projection and rendering.
+pub fn prepare_frame_with_bottom_dock(
+    app: &mut BmuxApp,
+    area: Rect,
+    dock_height: u16,
+) -> Option<(FrameLayout, Rect)> {
     let layout = frame_layout(app, area)?;
     app.set_composer_content_area(layout.composer_content);
+    let (layout, dock) = layout.with_bottom_dock(app, dock_height);
     super::transcript_projection::prepare_for_body(app, layout.body_without_latest_bar());
-    Some(frame_layout(app, area).unwrap_or(layout))
+    let refreshed = frame_layout(app, area)
+        .map_or(layout, |layout| layout.with_bottom_dock(app, dock_height).0);
+    Some((refreshed, dock))
 }
 
 /// Render one TUI frame.
@@ -147,10 +161,42 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
 }
 
 impl FrameLayout {
-    /// Return the transcript area for this prepared frame.
-    #[must_use]
-    pub const fn transcript_area(self, app: &BmuxApp) -> Rect {
-        transcript_area_for_body(app, self.body)
+    fn with_bottom_dock(self, app: &BmuxApp, requested_height: u16) -> (Self, Rect) {
+        let full_body = self.body_without_latest_bar();
+        let maximum_height = full_body.height.saturating_sub(1);
+        let dock_height = requested_height.min(maximum_height);
+        if dock_height == 0 {
+            return (
+                self,
+                Rect::new(full_body.x, full_body.bottom(), full_body.width, 0),
+            );
+        }
+        let dock = Rect::new(
+            full_body.x,
+            full_body.bottom().saturating_sub(dock_height),
+            full_body.width,
+            dock_height,
+        );
+        let latest_bar_height = u16::from(app.newer_transcript_content_below());
+        let transcript_height = full_body
+            .height
+            .saturating_sub(dock_height)
+            .saturating_sub(latest_bar_height);
+        let body = Rect::new(full_body.x, full_body.y, full_body.width, transcript_height);
+        let latest_bar = (latest_bar_height > 0).then_some(Rect::new(
+            full_body.x,
+            body.bottom(),
+            full_body.width,
+            1,
+        ));
+        (
+            Self {
+                body,
+                latest_bar,
+                ..self
+            },
+            dock,
+        )
     }
 
     const fn body_without_latest_bar(self) -> Rect {
@@ -198,6 +244,36 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         composer,
         composer_content: composer_panel(TuiTheme::for_app(app).accent).inner_area(composer),
     })
+}
+
+#[cfg(test)]
+#[test]
+fn bottom_dock_never_overlaps_transcript_and_preserves_one_row() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let terminal = Rect::new(0, 0, 80, 20);
+    let normal = prepare_frame(&mut app, terminal).expect("normal frame layout");
+    let normal_body_height = normal.body_without_latest_bar().height;
+    let (layout, dock) =
+        prepare_frame_with_bottom_dock(&mut app, terminal, 100).expect("frame layout");
+    let transcript = transcript_area_for_body(&app, layout.body);
+
+    assert_eq!(dock.height, normal_body_height.saturating_sub(1));
+    assert_eq!(transcript.height, 1);
+    assert!(transcript.bottom() <= dock.y);
+    assert_eq!(transcript.width, dock.width);
+}
+
+#[cfg(test)]
+#[test]
+fn zero_height_bottom_dock_preserves_normal_layout() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let terminal = Rect::new(0, 0, 80, 20);
+    let normal = prepare_frame(&mut app, terminal).expect("normal frame layout");
+    let (docked, dock) =
+        prepare_frame_with_bottom_dock(&mut app, terminal, 0).expect("docked frame layout");
+
+    assert_eq!(normal, docked);
+    assert_eq!(dock.height, 0);
 }
 
 fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Instant) {

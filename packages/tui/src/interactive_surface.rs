@@ -16,6 +16,7 @@ pub struct InteractiveSurfaceState {
     interaction_id: String,
     surface: BoxedPluginTuiSurface,
     host: TokioPluginTuiHost,
+    pending_resolution: Option<ToolExchangeResolution>,
 }
 
 impl InteractiveSurfaceState {
@@ -42,6 +43,7 @@ impl InteractiveSurfaceState {
             interaction_id,
             surface,
             host,
+            pending_resolution: None,
         })
     }
 
@@ -68,9 +70,17 @@ impl InteractiveSurfaceState {
         self.surface.render(area, frame);
     }
 
-    /// Handle an input event and return a close resolution when submitted or cancelled.
+    /// Clear a pending resolution so the user can retry after host delivery fails.
+    pub fn clear_pending_resolution(&mut self) {
+        self.pending_resolution = None;
+    }
+
+    /// Handle an input event and retain a close resolution until the host confirms delivery.
     pub fn handle_event(&mut self, event: &Event) -> Option<ToolExchangeResolution> {
-        match self.surface.handle_event(event, &self.host) {
+        if let Some(resolution) = &self.pending_resolution {
+            return Some(resolution.clone());
+        }
+        let resolution = match self.surface.handle_event(event, &self.host) {
             PluginTuiAction::None
             | PluginTuiAction::Redraw
             | PluginTuiAction::OpenSurface { .. } => None,
@@ -82,7 +92,9 @@ impl InteractiveSurfaceState {
             PluginTuiAction::RunCommand { command } => Some(ToolExchangeResolution::Responded {
                 payload: json!({ "run_command": command }),
             }),
-        }
+        };
+        self.pending_resolution.clone_from(&resolution);
+        resolution
     }
 }
 
@@ -141,6 +153,36 @@ mod tests {
         })
     }
 
+    fn shifted_key(key: KeyCode) -> Event {
+        Event::Key(KeyStroke {
+            key,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        })
+    }
+
+    async fn question_surface(questions: serde_json::Value) -> InteractiveSurfaceState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        );
+        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &[plugin],
+        )
+        .expect("load local question plugin runtime");
+        InteractiveSurfaceState::open(
+            &runtime,
+            "question-call-question",
+            "bcode.question.inline",
+            &serde_json::json!({ "questions": questions }).to_string(),
+        )
+        .await
+        .expect("open local question TUI surface")
+    }
+
     #[tokio::test]
     async fn question_exchange_payload_runs_entirely_in_local_tui_surface() {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
@@ -177,7 +219,7 @@ mod tests {
         .await
         .expect("open local question TUI surface");
 
-        assert!(surface.handle_event(&key(KeyCode::Char('1'))).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Enter)).is_none());
         assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
         let resolution = surface
             .handle_event(&key(KeyCode::Enter))
@@ -191,6 +233,49 @@ mod tests {
                     "questions": [{
                         "question_index": 0,
                         "selected": ["yes"],
+                        "custom": null
+                    }]
+                }),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn question_surface_supports_reverse_navigation_and_required_validation() {
+        let mut surface = question_surface(serde_json::json!([{
+            "header": null,
+            "question": "Choose one",
+            "options": [
+                {"label": "One", "value": "one", "description": null},
+                {"label": "Two", "value": "two", "description": null}
+            ],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": false,
+            "custom_mode": "additional",
+            "required": true
+        }]))
+        .await;
+
+        assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
+        assert!(surface.handle_event(&shifted_key(KeyCode::Tab)).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Enter)).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Enter)).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
+        let resolution = surface
+            .handle_event(&key(KeyCode::Enter))
+            .expect("submit after answering required question");
+        assert_eq!(
+            resolution,
+            ToolExchangeResolution::Responded {
+                payload: serde_json::json!({
+                    "status": "answered",
+                    "questions": [{
+                        "question_index": 0,
+                        "selected": ["one"],
                         "custom": null
                     }]
                 }),
