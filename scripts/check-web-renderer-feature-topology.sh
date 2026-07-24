@@ -19,6 +19,7 @@ if hyperchad_dependency.get("optional") is not True:
     raise SystemExit("bcode_cli must keep bcode_hyperchad optional")
 if cli["features"].get("web-renderer") != [
     "dep:bcode_hyperchad",
+    "dep:open",
     "bcode_hyperchad/renderer-html-actix",
 ]:
     raise SystemExit("bcode_cli/web-renderer feature wiring is not exact")

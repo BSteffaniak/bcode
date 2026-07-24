@@ -29617,11 +29617,31 @@ library = "test"
             id: "question-call".to_string(),
             name: "question".to_string(),
             arguments: serde_json::json!({
-                "questions": [{
-                    "question": "Proceed?",
-                    "options": [{"label": "Yes", "value": "yes"}],
-                    "required": true
-                }]
+                "questions": [
+                    {
+                        "question": "Proceed?",
+                        "options": [{"label": "Yes", "value": "yes"}],
+                        "control": "radio",
+                        "selection_mode": "single",
+                        "required": true
+                    },
+                    {
+                        "question": "Which checks?",
+                        "options": [
+                            {"label": "Format", "value": "format"},
+                            {"label": "Test", "value": "test"}
+                        ],
+                        "control": "checkbox",
+                        "selection_mode": "multiple",
+                        "required": false
+                    },
+                    {
+                        "question": "Why?",
+                        "options": [],
+                        "custom": true,
+                        "required": true
+                    }
+                ]
             }),
         };
         let (tool, preparation) = prepare_server_tool(state.as_ref(), session_id, &call)
@@ -29762,13 +29782,28 @@ library = "test"
             .await
             .expect("question activate route")
             .expect("question activate content");
+        let _activate_multiple = router
+            .navigate(route_input("activate", Some("question-1.option-0")))
+            .await
+            .expect("question multiple activate route")
+            .expect("question multiple activate content");
+        let mut custom = route_input("change", Some("question-2.custom"));
+        let body = format!(
+            "session_id={session_id}&interaction_id={interaction_id}&kind=change&control_id=question-2.custom&value=Because"
+        );
+        custom.body = Some(Arc::new(body.into_bytes().into()));
+        let _custom = router
+            .navigate(custom)
+            .await
+            .expect("question custom change route")
+            .expect("question custom change content");
         assert!(
             state
                 .pending_tool_exchanges
                 .lock()
                 .await
                 .contains_key(&interaction_id),
-            "activate must update local controller state without resolving the exchange"
+            "question variant inputs must update local controller state without resolving the exchange"
         );
 
         let _submitted = router
