@@ -120,6 +120,25 @@ pub fn apply_tool_invocation_projection_event(
             projection.tool_name = Some(tool_name.clone());
             projection.arguments_json = Some(arguments_json.clone());
             projection.working_directory.clone_from(working_directory);
+            projection.started_at_ms.get_or_insert(event.timestamp_ms);
+        }
+        SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
+            let projection = tool_invocation_projection_mut(projections, &lifecycle.invocation_id);
+            match lifecycle.stage {
+                ToolInvocationLifecycleStage::Started => {
+                    projection.status = ToolInvocationProjectionStatus::Running;
+                    projection.started_at_ms = Some(event.timestamp_ms);
+                }
+                ToolInvocationLifecycleStage::Progress | ToolInvocationLifecycleStage::Waiting => {
+                    projection.status = ToolInvocationProjectionStatus::Running;
+                    projection.started_at_ms.get_or_insert(event.timestamp_ms);
+                }
+                ToolInvocationLifecycleStage::Completed
+                | ToolInvocationLifecycleStage::Cancelled
+                | ToolInvocationLifecycleStage::Failed => {
+                    projection.finished_at_ms = Some(event.timestamp_ms);
+                }
+            }
         }
         SessionEventKind::ToolInvocationResultRecorded { record } => {
             let projection = tool_invocation_projection_mut(projections, &record.invocation_id);
@@ -127,6 +146,7 @@ pub fn apply_tool_invocation_projection_event(
             projection.result_text = Some(record.model_output.clone());
             projection.is_error = Some(record.is_error);
             projection.raw_result.clone_from(&record.result);
+            projection.finished_at_ms = Some(event.timestamp_ms);
         }
         _ => {}
     }

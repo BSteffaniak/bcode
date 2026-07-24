@@ -4690,7 +4690,7 @@ fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Shell run"), "{rendered}");
+    assert!(rendered.contains("Shell run · duration 12ms"), "{rendered}");
     assert!(rendered.contains("exit code 0"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
@@ -4718,7 +4718,7 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Shell run"), "{rendered}");
+    assert!(rendered.contains("Shell run · duration 12ms"), "{rendered}");
     assert!(rendered.contains("exit code 0"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");

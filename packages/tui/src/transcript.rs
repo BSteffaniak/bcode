@@ -21,6 +21,8 @@ pub struct ToolTiming {
     pub timeout_ms: Option<u64>,
     /// Whether the tool timed out, when known.
     pub timed_out: Option<bool>,
+    /// Final tool duration in milliseconds, when known.
+    pub duration_ms: Option<u64>,
 }
 
 /// Semantic transcript item type.
@@ -42,6 +44,8 @@ pub enum TranscriptItemKind {
         tool_name: String,
         /// Working directory captured for this invocation.
         working_directory: Option<std::path::PathBuf>,
+        /// Generic timing metadata for the tool invocation.
+        timing: ToolTiming,
     },
     /// Tool-call result with structured metadata.
     ToolResult {
@@ -332,44 +336,73 @@ impl TranscriptItem {
         self.bump_revision();
     }
 
-    /// Return generic tool timing metadata, when this item represents a tool result.
+    /// Return generic tool timing metadata, when this item represents a tool invocation.
     #[must_use]
     pub const fn tool_timing(&self) -> Option<ToolTiming> {
         match &self.kind {
-            TranscriptItemKind::ToolResult { timing, .. } => Some(*timing),
+            TranscriptItemKind::ToolRequest { timing, .. }
+            | TranscriptItemKind::ToolResult { timing, .. } => Some(*timing),
             _ => None,
         }
     }
 
-    /// Set generic tool start time metadata on a tool result item.
+    /// Set generic tool start time metadata on a tool invocation item.
     pub const fn set_tool_started_at_ms(&mut self, started_at_ms: Option<u64>) {
-        if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
-            timing.started_at_ms = started_at_ms;
-            self.bump_revision();
+        match &mut self.kind {
+            TranscriptItemKind::ToolRequest { timing, .. }
+            | TranscriptItemKind::ToolResult { timing, .. } => {
+                timing.started_at_ms = started_at_ms;
+                self.bump_revision();
+            }
+            _ => {}
         }
     }
 
-    /// Set generic tool finish time metadata on a tool result item.
+    /// Set generic tool finish time metadata on a tool invocation item.
     pub const fn set_tool_finished_at_ms(&mut self, finished_at_ms: Option<u64>) {
-        if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
-            timing.finished_at_ms = finished_at_ms;
-            self.bump_revision();
+        match &mut self.kind {
+            TranscriptItemKind::ToolRequest { timing, .. }
+            | TranscriptItemKind::ToolResult { timing, .. } => {
+                timing.finished_at_ms = finished_at_ms;
+                self.bump_revision();
+            }
+            _ => {}
         }
     }
 
-    /// Set generic tool timeout duration metadata on a tool result item.
+    /// Set generic tool timeout duration metadata on a tool invocation item.
     pub const fn set_tool_timeout_ms(&mut self, timeout_ms: Option<u64>) {
-        if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
-            timing.timeout_ms = timeout_ms;
-            self.bump_revision();
+        match &mut self.kind {
+            TranscriptItemKind::ToolRequest { timing, .. }
+            | TranscriptItemKind::ToolResult { timing, .. } => {
+                timing.timeout_ms = timeout_ms;
+                self.bump_revision();
+            }
+            _ => {}
         }
     }
 
-    /// Set generic tool timeout result metadata on a tool result item.
+    /// Set generic tool timeout result metadata on a tool invocation item.
     pub const fn set_tool_timed_out(&mut self, timed_out: Option<bool>) {
-        if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
-            timing.timed_out = timed_out;
-            self.bump_revision();
+        match &mut self.kind {
+            TranscriptItemKind::ToolRequest { timing, .. }
+            | TranscriptItemKind::ToolResult { timing, .. } => {
+                timing.timed_out = timed_out;
+                self.bump_revision();
+            }
+            _ => {}
+        }
+    }
+
+    /// Set final generic tool duration metadata on a tool invocation item.
+    pub const fn set_tool_duration_ms(&mut self, duration_ms: Option<u64>) {
+        match &mut self.kind {
+            TranscriptItemKind::ToolRequest { timing, .. }
+            | TranscriptItemKind::ToolResult { timing, .. } => {
+                timing.duration_ms = duration_ms;
+                self.bump_revision();
+            }
+            _ => {}
         }
     }
 
@@ -435,6 +468,7 @@ pub fn tool_request_item(
             producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
             tool_name: tool_name.to_owned(),
             working_directory,
+            timing: ToolTiming::default(),
         },
     )
 }
@@ -586,6 +620,10 @@ fn tool_timing_from_artifact(artifact: &ToolArtifact) -> ToolTiming {
             .metadata
             .get("timed_out")
             .and_then(serde_json::Value::as_bool),
+        duration_ms: artifact
+            .metadata
+            .get("duration_ms")
+            .and_then(serde_json::Value::as_u64),
         ..ToolTiming::default()
     }
 }
@@ -816,6 +854,7 @@ const fn apply_shared_tool_timing(
     item.set_tool_finished_at_ms(tool.timing.finished_at_ms);
     item.set_tool_timeout_ms(tool.timing.timeout_ms);
     item.set_tool_timed_out(tool.timing.timed_out);
+    item.set_tool_duration_ms(tool.timing.duration_ms);
     item
 }
 

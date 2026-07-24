@@ -875,6 +875,7 @@ fn push_transcript_item_rows(
             producer_plugin_id: _,
             tool_name,
             working_directory: _,
+            timing: _,
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
@@ -1311,6 +1312,34 @@ fn tui_help_markdown_renders_at_normal_and_constrained_widths() {
 
 #[cfg(test)]
 #[test]
+fn generic_tool_headers_render_elapsed_and_duration() {
+    let now_ms = unix_time_millis(std::time::SystemTime::now());
+    let mut request =
+        super::transcript::tool_request_item("call-live", None, "example.run", "{}", None);
+    request.streaming = true;
+    request.set_tool_started_at_ms(Some(now_ms.saturating_sub(2_000)));
+    let request_rows =
+        transcript_item_rows(&[request], 0, 80, None, TuiDiffViewerConfig::default());
+    let request_text = visible_rows_snapshot(&request_rows);
+
+    let mut result = super::transcript::tool_result_item(
+        "call-final",
+        Some("example.run"),
+        Some("{}"),
+        "done",
+        false,
+    );
+    result.set_tool_started_at_ms(Some(1_000));
+    result.set_tool_finished_at_ms(Some(3_500));
+    let result_rows = transcript_item_rows(&[result], 0, 80, None, TuiDiffViewerConfig::default());
+    let result_text = visible_rows_snapshot(&result_rows);
+
+    assert!(request_text.contains("Tool · example.run · elapsed 2.0s"));
+    assert!(result_text.contains("Tool result · example.run · ok · duration 2.5s"));
+}
+
+#[cfg(test)]
+#[test]
 fn pending_signature_captures_width_state_and_text() {
     let mut pending = PendingSubmission::new("# heading".to_owned());
     let sending = pending_submission_signature(&pending, 30);
@@ -1460,19 +1489,13 @@ fn push_tool_request_rows(
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
-    let title = format!("Tool · {}", context.tool_name);
-    let title_color = if item.streaming() {
-        Color::Cyan
-    } else {
-        Color::Yellow
-    };
-    push_wrapped_styled_text(
+    push_tool_block_header(
         rows,
-        Vec::new(),
-        &title,
+        &format!("Tool · {}", context.tool_name),
+        item.tool_timing(),
+        item.streaming(),
+        false,
         width,
-        Style::new().fg(title_color),
-        Style::new().fg(title_color),
     );
     push_wrapped_styled_text(
         rows,
@@ -1616,21 +1639,13 @@ fn push_plugin_transcript_block_rows(
     context: PluginTranscriptBlockContext<'_>,
     width: u16,
 ) {
-    let color = if context.is_error {
-        Color::Red
-    } else if context.streaming {
-        Color::Cyan
-    } else {
-        Color::Yellow
-    };
-    let title = tool_block_title_with_timing(context.title, context.timing, context.streaming);
-    push_wrapped_styled_text(
+    push_tool_block_header(
         rows,
-        Vec::new(),
-        &title,
+        context.title,
+        context.timing,
+        context.streaming,
+        context.is_error,
         width,
-        Style::new().fg(color),
-        muted_style(),
     );
     push_canonical_plugin_visual_rows(
         rows,
@@ -1640,6 +1655,32 @@ fn push_plugin_transcript_block_rows(
         context.plugin_host,
     );
     rows.push(Line::default());
+}
+
+fn push_tool_block_header(
+    rows: &mut Vec<Line>,
+    title: &str,
+    timing: Option<ToolTiming>,
+    streaming: bool,
+    is_error: bool,
+    width: u16,
+) {
+    let color = if is_error {
+        Color::Red
+    } else if streaming {
+        Color::Cyan
+    } else {
+        Color::Yellow
+    };
+    let title = tool_block_title_with_timing(title, timing, streaming);
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        &title,
+        width,
+        Style::new().fg(color),
+        muted_style(),
+    );
 }
 
 fn tool_block_title_with_timing(
@@ -1665,6 +1706,8 @@ fn tool_block_title_with_timing(
         if let Some(timeout_ms) = timing.timeout_ms {
             parts.push(format!("timeout {}", format_millis(timeout_ms)));
         }
+    } else if let Some(duration_ms) = timing.duration_ms {
+        parts.push(format!("duration {}", format_millis(duration_ms)));
     } else if let (Some(started_at_ms), Some(finished_at_ms)) =
         (timing.started_at_ms, timing.finished_at_ms)
     {
@@ -1797,17 +1840,13 @@ fn push_tool_result_rows(
         || format!("Tool result · {status}"),
         |name| format!("Tool result · {name} · {status}"),
     );
-    push_wrapped_styled_text(
+    push_tool_block_header(
         rows,
-        Vec::new(),
         &title,
+        item.tool_timing(),
+        item.streaming(),
+        context.is_error,
         width,
-        if context.is_error {
-            Style::new().fg(Color::Red)
-        } else {
-            Style::new().fg(Color::Yellow)
-        },
-        muted_style(),
     );
     if let Some(artifact) = context.artifact {
         let visual = CanonicalToolVisual::from_artifact(artifact);

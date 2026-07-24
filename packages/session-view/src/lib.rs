@@ -1817,6 +1817,13 @@ fn format_provider_bytes(bytes: usize) -> String {
 fn tool_invocation_view_from_projection(
     projection: ToolInvocationProjection,
 ) -> ToolInvocationView {
+    let timing = ToolTimingView {
+        started_at_ms: projection.started_at_ms,
+        finished_at_ms: projection.finished_at_ms,
+        timeout_ms: projection_timeout_ms(projection.raw_result.as_ref()),
+        timed_out: projection_timed_out(projection.raw_result.as_ref()),
+        duration_ms: projection_duration_ms(projection.raw_result.as_ref()),
+    };
     ToolInvocationView {
         tool_call_id: projection.tool_call_id,
         producer_plugin_id: projection.producer_plugin_id,
@@ -1827,14 +1834,41 @@ fn tool_invocation_view_from_projection(
         result_text: projection.result_text,
         is_error: projection.is_error,
         result: projection.raw_result.map(ToolResultView::from),
-        timing: ToolTimingView {
-            started_at_ms: projection.started_at_ms,
-            finished_at_ms: projection.finished_at_ms,
-            timeout_ms: None,
-            timed_out: None,
-            duration_ms: None,
-        },
+        timing,
     }
+}
+
+fn projection_result_metadata(
+    result: Option<&bcode_session_models::ToolInvocationResult>,
+) -> Option<&serde_json::Value> {
+    let bcode_session_models::ToolInvocationResult::Artifact { artifact } = result? else {
+        return None;
+    };
+    Some(&artifact.metadata)
+}
+
+fn projection_timeout_ms(
+    result: Option<&bcode_session_models::ToolInvocationResult>,
+) -> Option<u64> {
+    projection_result_metadata(result)?
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn projection_timed_out(
+    result: Option<&bcode_session_models::ToolInvocationResult>,
+) -> Option<bool> {
+    projection_result_metadata(result)?
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+}
+
+fn projection_duration_ms(
+    result: Option<&bcode_session_models::ToolInvocationResult>,
+) -> Option<u64> {
+    projection_result_metadata(result)?
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
 }
 
 fn should_split_terminal_tool_item(
