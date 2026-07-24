@@ -619,7 +619,7 @@ const fn option_style(focused: bool, selected: bool) -> Style {
 mod tests {
     use super::*;
     use bcode_plugin_sdk::interaction::PluginInteraction;
-    use bcode_tool::InteractionInput;
+    use bcode_tool::{InteractionInput, InteractionOutput};
     use bmux_keyboard::{KeyStroke, Modifiers};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::geometry::Point;
@@ -669,6 +669,69 @@ mod tests {
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn key(key: KeyCode) -> Event {
+        Event::Key(KeyStroke {
+            key,
+            modifiers: Modifiers::NONE,
+        })
+    }
+
+    fn apply_event(
+        renderer: &mut QuestionTerminalRenderer,
+        controller: &mut QuestionInteractionController,
+        event: &Event,
+    ) -> InteractionOutput {
+        let snapshot = controller.snapshot();
+        renderer
+            .input(event, &snapshot)
+            .map_or(InteractionOutput::None, |input| {
+                controller.handle_input(input)
+            })
+    }
+
+    #[test]
+    fn standard_keyboard_controls_select_radio_and_checkbox_options() {
+        let mut radio = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question(
+                "Radio",
+                &[("One", None), ("Two", None)],
+                false,
+                true,
+            )],
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+        assert_eq!(
+            apply_event(&mut renderer, &mut radio, &key(KeyCode::Down)),
+            InteractionOutput::Redraw
+        );
+        assert_eq!(
+            apply_event(&mut renderer, &mut radio, &key(KeyCode::Enter)),
+            InteractionOutput::Redraw
+        );
+        assert_eq!(radio.snapshot().answers[0].selected, ["Two"]);
+
+        let mut checkbox_question =
+            question("Checkbox", &[("One", None), ("Two", None)], false, false);
+        checkbox_question.control = QuestionControl::Checkbox;
+        checkbox_question.selection_mode = QuestionSelectionMode::Multiple;
+        let mut checkbox = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![checkbox_question],
+        });
+        assert_eq!(
+            apply_event(&mut renderer, &mut checkbox, &key(KeyCode::Space)),
+            InteractionOutput::Redraw
+        );
+        assert_eq!(checkbox.snapshot().answers[0].selected, ["One"]);
+        assert_eq!(
+            apply_event(&mut renderer, &mut checkbox, &key(KeyCode::Space)),
+            InteractionOutput::Redraw
+        );
+        assert!(checkbox.snapshot().answers[0].selected.is_empty());
+        apply_event(&mut renderer, &mut checkbox, &key(KeyCode::Tab));
+        apply_event(&mut renderer, &mut checkbox, &key(KeyCode::Space));
+        assert_eq!(checkbox.snapshot().answers[0].selected, ["Two"]);
     }
 
     #[test]

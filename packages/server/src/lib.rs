@@ -29149,6 +29149,15 @@ library = "test"
             .await
             .expect("question session");
         let session_id = summary.id;
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::AssistantMessage {
+                    text: "Read this explanation before answering.".to_owned(),
+                },
+            )
+            .await
+            .expect("assistant context event");
         let trace_dir = tempfile::tempdir().expect("question trace dir");
         let mut state = test_server_state_with_question_plugin(sessions);
         state.trace_store = TraceStore::new(trace_dir.path().to_path_buf());
@@ -29328,6 +29337,62 @@ library = "test"
             .session_history(session_id)
             .await
             .expect("question history");
+        let assistant_sequence = history
+            .iter()
+            .find_map(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::AssistantMessage { text }
+                        if text == "Read this explanation before answering."
+                )
+                .then_some(event.sequence)
+            })
+            .expect("durable assistant context");
+        let request_sequence = history
+            .iter()
+            .find_map(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::ToolExchangeRequested { request }
+                        if request.invocation_id == "question-call"
+                            && request.exchange_id == "question-call-question"
+                            && request.schema == "bcode.question.request"
+                )
+                .then_some(event.sequence)
+            })
+            .expect("durable question exchange");
+        assert!(assistant_sequence < request_sequence);
+        let snapshot = bcode_session_view::build_session_view_snapshot(&history);
+        let assistant_index = snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                        if message.text == "Read this explanation before answering."
+                )
+            })
+            .expect("projected assistant context");
+        assert!(
+            snapshot.active_exchanges.is_empty(),
+            "resolved exchanges must not remain active after full-history projection"
+        );
+        let resolved_sequence = history
+            .iter()
+            .find_map(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::ToolExchangeResolved { event }
+                        if event.invocation_id == "question-call"
+                            && event.exchange_id == "question-call-question"
+                )
+                .then_some(event.sequence)
+            })
+            .expect("durable question resolution");
+        assert!(request_sequence < resolved_sequence);
+        assert!(assistant_index < snapshot.transcript.items.len());
         assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ToolExchangeRequested { request }
