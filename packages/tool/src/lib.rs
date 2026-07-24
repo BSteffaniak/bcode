@@ -58,8 +58,6 @@ pub struct ToolDefinition {
     pub description: String,
     pub input_schema: serde_json::Value,
     #[serde(default)]
-    pub side_effect: ToolSideEffect,
-    #[serde(default)]
     pub requires_permission: bool,
     #[serde(default)]
     pub policy: ToolPolicyMetadata,
@@ -82,9 +80,6 @@ pub struct ToolPolicyMetadata {
     /// Permission category used by policy providers for grouped rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_category: Option<String>,
-    /// Argument paths that policy providers may inspect without knowing tool-specific schemas.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub argument_extractors: Vec<ToolArgumentExtractor>,
 }
 
 /// Compatibility alias declared by the tool provider that owns the real tool.
@@ -308,25 +303,6 @@ fn selector_for_candidate(
     }
 }
 
-/// Plugin-owned argument extraction metadata for policy providers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolArgumentExtractor {
-    /// Logical argument kind.
-    pub kind: ToolArgumentKind,
-    /// Top-level JSON argument name to inspect.
-    pub argument: String,
-}
-
-/// Logical argument kind used by policy providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolArgumentKind {
-    Command,
-    ReadPath,
-    WritePath,
-    Url,
-}
-
 /// Plugin-owned UI metadata for a model-callable tool.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolUiMetadata {
@@ -371,16 +347,6 @@ pub struct ToolPluginVisualMetadata {
     /// Payload keys mapped to tool argument fields/literals.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub payload: std::collections::BTreeMap<String, ToolVisualPayloadSelector>,
-}
-
-/// Side-effect category for a model-callable tool.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolSideEffect {
-    #[default]
-    ReadOnly,
-    WriteFiles,
-    ExecuteProcess,
 }
 
 /// Tool invocation request.

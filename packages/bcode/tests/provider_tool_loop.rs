@@ -13,7 +13,7 @@ use bcode_model::{
 use bcode_tool::{
     ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationResponse,
-    ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
+    ToolPolicyMetadata, ToolUiMetadata,
 };
 use futures::StreamExt;
 use std::collections::VecDeque;
@@ -30,7 +30,6 @@ fn definition(name: &str) -> ToolDefinition {
         name: name.to_string(),
         description: format!("provider batch tool {name}"),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

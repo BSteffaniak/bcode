@@ -17,7 +17,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
+    ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use bcode_worktree_models::{
     WorktreeCreateRequest, WorktreeInfo, WorktreeListRequest, WorktreeRemoveRequest,
@@ -116,11 +116,16 @@ fn worktree_policy_operation(
         "worktree.list" => bcode_plugin_sdk::ToolPolicyOperation::ReadOnly,
         "worktree.create" => bcode_plugin_sdk::ToolPolicyOperation::Mutating,
         "worktree.remove" => {
-            let arguments: WorktreeRemoveRequest =
-                serde_json::from_value(request.invocation.arguments.clone())
-                    .map_err(|error| error.to_string())?;
+            let paths = request
+                .invocation
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .into_iter()
+                .collect();
             bcode_plugin_sdk::ToolPolicyOperation::Write {
-                paths: vec![arguments.path.display().to_string()],
+                paths,
                 category: "worktree.remove".to_owned(),
             }
         }
@@ -381,14 +386,12 @@ fn list_definition() -> ToolDefinition {
                 "cwd": { "type": "string", "description": "Optional repository discovery directory" }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["worktree.read".to_string()],
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("worktree.read".to_string()),
-            argument_extractors: Vec::new(),
         },
         ui: tool_ui("listing worktrees"),
     }
@@ -413,14 +416,12 @@ fn create_definition() -> ToolDefinition {
                 "no_setup": { "type": "boolean" }
             }
         }),
-        side_effect: ToolSideEffect::ExecuteProcess,
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["worktree.create".to_string()],
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("worktree.create".to_string()),
-            argument_extractors: Vec::new(),
         },
         ui: tool_ui("creating worktree"),
     }
@@ -439,14 +440,12 @@ fn remove_definition() -> ToolDefinition {
                 "force": { "type": "boolean" }
             }
         }),
-        side_effect: ToolSideEffect::ExecuteProcess,
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["worktree.remove".to_string()],
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("worktree.remove".to_string()),
-            argument_extractors: Vec::new(),
         },
         ui: tool_ui("removing worktree"),
     }

@@ -101,7 +101,7 @@ pub use bcode_tool::{
     ToolInvocationInput, ToolInvocationInputResolution, ToolInvocationLifecycleEvent,
     ToolInvocationLifecycleStage, ToolInvocationResponse, ToolInvocationResult,
     ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolList, ToolPolicyMetadata,
-    ToolPreparationRequest, ToolPreparationResponse, ToolSideEffect, ToolUiMetadata,
+    ToolPreparationRequest, ToolPreparationResponse, ToolUiMetadata,
 };
 
 /// Result alias for Bcode SDK operations.
@@ -527,7 +527,6 @@ where
                 description: description.into(),
                 input_schema: serde_json::to_value(schemars::schema_for!(I))
                     .expect("schemars tool input schema should serialize to JSON"),
-                side_effect: ToolSideEffect::ReadOnly,
                 requires_permission: false,
                 policy: ToolPolicyMetadata::default(),
                 ui: ToolUiMetadata::default(),
@@ -535,13 +534,6 @@ where
             policy_operation: ToolPolicyOperation::ReadOnly,
             _types: std::marker::PhantomData,
         }
-    }
-
-    /// Configure the tool's side-effect classification.
-    #[must_use]
-    pub const fn side_effect(mut self, side_effect: ToolSideEffect) -> Self {
-        self.definition.side_effect = side_effect;
-        self
     }
 
     /// Configure the owner-produced policy operation for preparation.

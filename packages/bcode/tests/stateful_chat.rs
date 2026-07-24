@@ -1,7 +1,7 @@
 use bcode::{
     Agent, BcodeError, MessageRole, ModelContentBlock, ModelMessage, ModelProviderInvoker,
     PersistedSession, RuntimeFuture, SessionPersistenceAdapter, ToolCall, ToolDefinition,
-    ToolInvocationResponse, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
+    ToolInvocationResponse, ToolPolicyMetadata, ToolUiMetadata,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -133,7 +133,6 @@ fn definition() -> ToolDefinition {
         name: "lookup".to_string(),
         description: "lookup state".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

@@ -8,7 +8,7 @@ use bcode_model::{
 };
 use bcode_tool::{
     ToolDefinition, ToolInvocationDescriptor, ToolInvocationResponse, ToolPolicyMetadata,
-    ToolSideEffect, ToolUiMetadata,
+    ToolUiMetadata,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
@@ -88,7 +88,6 @@ fn echo_definition() -> ToolDefinition {
             "properties": { "text": { "type": "string" } },
             "required": ["text"]
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: true,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

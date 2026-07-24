@@ -2,16 +2,13 @@ use bcode_agent_permissions::runtime_permission_request_to_profile_request;
 use bcode_agent_profile::prepare_tool_policy;
 use bcode_agent_runtime::{RegisteredTool, RuntimePermissionContext, RuntimePermissionRequest};
 use bcode_model::ToolCall;
-use bcode_tool::{
-    ToolDefinition, ToolInvocationDescriptor, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
-};
+use bcode_tool::{ToolDefinition, ToolInvocationDescriptor, ToolPolicyMetadata, ToolUiMetadata};
 
 fn definition(name: &str) -> ToolDefinition {
     ToolDefinition {
         name: name.to_string(),
         description: "test tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),
@@ -50,7 +47,6 @@ fn permission_request() -> RuntimePermissionRequest {
 fn policy_adapter_consumes_owner_produced_fact_metadata() {
     let mut request = permission_request();
     request.call.arguments = serde_json::json!({"path": "tampered-call"});
-    request.tool.definition.side_effect = ToolSideEffect::ReadOnly;
 
     let profile =
         runtime_permission_request_to_profile_request(&request, std::path::Path::new("."))

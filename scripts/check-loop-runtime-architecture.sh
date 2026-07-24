@@ -113,6 +113,20 @@ for removed_symbol in HostModelNativeWebSearchRequest cancellation_path invocati
   fi
 done
 
+if rg -n '\bToolSideEffect\b|\.side_effect\b' packages plugins examples --glob '*.rs' \
+  >/tmp/bcode-removed-tool-side-effect.txt; then
+  echo "Runtime architecture violation: removed ToolSideEffect definition metadata was reintroduced." >&2
+  cat /tmp/bcode-removed-tool-side-effect.txt >&2
+  violations=1
+fi
+
+if rg -n '\bToolArgumentKind\b|\bToolArgumentExtractor\b|\bargument_extractors\b' \
+  packages plugins examples --glob '*.rs' >/tmp/bcode-removed-policy-extractors.txt; then
+  echo "Runtime architecture violation: removed generic policy argument extractor contracts were reintroduced." >&2
+  cat /tmp/bcode-removed-policy-extractors.txt >&2
+  violations=1
+fi
+
 if rg -n 'request\.invocation\.arguments|\bToolArgumentKind\b|\bToolSideEffect\b|definition\.side_effect' \
   packages/agent-profile/src packages/plugin-sdk/src >/tmp/bcode-generic-policy-inference.txt ||
    rg -n 'argument_extractors: vec!' plugins --glob '*.rs' >/tmp/bcode-plugin-policy-extractors.txt ||
@@ -159,9 +173,13 @@ if rg -n 'legacy_side_effect|legacy_policy_metadata|automation_policy_allows_too
 fi
 
 if rg -n 'request\.(arguments|policy|side_effect)|\bToolArgumentKind\b|\bToolSideEffect\b' \
-  packages/agent-policy/src/lib.rs >/tmp/bcode-agent-policy-argument-inference.txt; then
-  echo "Runtime architecture violation: agent policy reintroduced raw argument or side-effect inference." >&2
-  cat /tmp/bcode-agent-policy-argument-inference.txt >&2
+  packages/agent-policy/src/lib.rs >/tmp/bcode-agent-policy-argument-inference.txt ||
+   ! grep -F 'operation: metadata.operation' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'operation: metadata.operation' packages/agent-permissions/src/lib.rs >/dev/null ||
+   ! rg -U 'let target = SkillToolPolicyTarget \{[\s\S]{0,500}aliases: metadata\.aliases\.clone\(\)[\s\S]{0,500}permission_category: metadata\.permission_category\.clone\(\)' packages/server/src/lib.rs >/dev/null ||
+   rg -U 'SkillToolPolicyRequest \{[\s\S]{0,120}tool: (definition|tool\.clone\(\))' packages/server/src/lib.rs packages/skill/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: a policy decision bypasses owner-produced facts." >&2
+  cat /tmp/bcode-agent-policy-argument-inference.txt 2>/dev/null >&2 || true
   violations=1
 fi
 

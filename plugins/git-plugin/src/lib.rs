@@ -10,7 +10,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
+    ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -42,16 +42,19 @@ impl RustPlugin for GitPlugin {
 fn git_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     _definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
-    let arguments: CloneRequest = serde_json::from_value(request.invocation.arguments.clone())
-        .map_err(|error| error.to_string())?;
-    Ok(bcode_plugin_sdk::ToolPolicyOperation::Write {
-        paths: arguments
-            .destination
-            .map(|path| vec![path.display().to_string()])
-            .unwrap_or_default(),
+) -> bcode_plugin_sdk::ToolPolicyOperation {
+    let paths = request
+        .invocation
+        .arguments
+        .get("destination")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .into_iter()
+        .collect();
+    bcode_plugin_sdk::ToolPolicyOperation::Write {
+        paths,
         category: "write".to_owned(),
-    })
+    }
 }
 
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -61,7 +64,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             request,
             [clone_tool_definition(), github_clone_alias_definition()],
-            git_policy_operation,
+            |request, definition| Ok(git_policy_operation(request, definition)),
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -389,14 +392,12 @@ fn clone_tool_definition() -> ToolDefinition {
                 "destination": { "type": "string" }
             }
         }),
-        side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: Vec::new(),
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("write".to_string()),
-            argument_extractors: Vec::new(),
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("cloning".to_string()),

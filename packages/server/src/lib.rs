@@ -31940,7 +31940,6 @@ library = "test"
             name: "example.tool".to_owned(),
             description: "example".to_owned(),
             input_schema: serde_json::json!({"type": "object"}),
-            side_effect: bcode_tool::ToolSideEffect::ReadOnly,
             requires_permission: true,
             policy: bcode_tool::ToolPolicyMetadata::default(),
             ui: bcode_tool::ToolUiMetadata::default(),

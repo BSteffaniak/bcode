@@ -29,7 +29,7 @@ use bcode_tool::{
     ToolArtifactRef, ToolContributionArtifact, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
+    ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use contracts::{
     SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE, SHELL_RECORDING_REF_KEY,
@@ -81,7 +81,7 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             &context.request,
             [shell_tool_definition()],
-            shell_policy_operation,
+            |request, definition| Ok(shell_policy_operation(request, definition)),
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -94,12 +94,14 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
 fn shell_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     _definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
-    let arguments: ShellRunArguments = serde_json::from_value(request.invocation.arguments.clone())
-        .map_err(|error| error.to_string())?;
-    Ok(bcode_plugin_sdk::ToolPolicyOperation::Command {
-        command: Some(arguments.command),
-    })
+) -> bcode_plugin_sdk::ToolPolicyOperation {
+    let command = request
+        .invocation
+        .arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    bcode_plugin_sdk::ToolPolicyOperation::Command { command }
 }
 
 fn shell_tool_definition() -> ToolDefinition {
@@ -121,14 +123,12 @@ fn shell_tool_definition() -> ToolDefinition {
                         }
                     }
                 }),
-                side_effect: ToolSideEffect::ExecuteProcess,
                 requires_permission: true,
                 policy: bcode_tool::ToolPolicyMetadata {
                     aliases: Vec::new(),
                     compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
                     capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
                     permission_category: Some("command".to_string()),
-            argument_extractors: Vec::new(),
                 },
                 ui: bcode_tool::ToolUiMetadata {
                     activity_label: Some("running".to_string()),
@@ -1620,9 +1620,25 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn shell_catalog_preparation_accepts_missing_command() {
+        let definition = shell_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "catalog".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::Value::Null,
+            },
+            host_context: Vec::new(),
+        };
+        assert_eq!(
+            shell_policy_operation(&request, &definition),
+            bcode_plugin_sdk::ToolPolicyOperation::Command { command: None }
+        );
+    }
+
+    #[test]
     fn shell_owner_prepares_exact_command_without_generic_extractors() {
         let definition = shell_tool_definition();
-        assert!(definition.policy.argument_extractors.is_empty());
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "call".to_owned(),
@@ -1632,7 +1648,7 @@ mod tests {
             host_context: Vec::new(),
         };
         assert_eq!(
-            shell_policy_operation(&request, &definition).expect("shell policy"),
+            shell_policy_operation(&request, &definition),
             bcode_plugin_sdk::ToolPolicyOperation::Command {
                 command: Some("printf hello".to_owned()),
             }

@@ -5,7 +5,7 @@ use bcode_agent_profile::{
 use bcode_plugin_sdk::{ServiceRequest, prepare_tool_from_definitions};
 use bcode_tool::{
     OP_PREPARE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationDescriptor,
-    ToolPolicyMetadata, ToolPreparationRequest, ToolSideEffect, ToolUiMetadata,
+    ToolPolicyMetadata, ToolPreparationRequest, ToolUiMetadata,
 };
 
 fn definition() -> ToolDefinition {
@@ -13,7 +13,6 @@ fn definition() -> ToolDefinition {
         name: "owner.tool".to_string(),
         description: "test tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

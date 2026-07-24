@@ -1,6 +1,6 @@
 use bcode::{
     Agent, ToolCall, ToolDefinition, ToolFailurePolicy, ToolInvocationResponse, ToolPolicyMetadata,
-    ToolSideEffect, ToolUiMetadata,
+    ToolUiMetadata,
 };
 
 fn definition() -> ToolDefinition {
@@ -8,7 +8,6 @@ fn definition() -> ToolDefinition {
         name: "fails".to_string(),
         description: "Always fails".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

@@ -11,7 +11,7 @@ use bcode::{
 };
 use bcode_tool::{
     ToolInvocationResponse, ToolPolicyMetadata, ToolPreparationRequest, ToolPreparationResponse,
-    ToolSideEffect, ToolUiMetadata,
+    ToolUiMetadata,
 };
 use std::sync::{
     Arc, Mutex,
@@ -104,7 +104,6 @@ fn definition() -> ToolDefinition {
         name: "hello_bridge".to_string(),
         description: "embedded bridge parity tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),
@@ -180,7 +179,6 @@ fn shell_definition() -> ToolDefinition {
         name: "shell.run".to_string(),
         description: "reentrant shell overlap conformance tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ExecuteProcess,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),
@@ -257,7 +255,6 @@ async fn assert_direct_batch_overlaps() {
                 name: "direct.overlap".to_string(),
                 description: "direct overlap conformance tool".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
-                side_effect: ToolSideEffect::ReadOnly,
                 requires_permission: false,
                 policy: ToolPolicyMetadata::default(),
                 ui: ToolUiMetadata::default(),
@@ -384,7 +381,6 @@ async fn assert_future_remote_batch_semantics(invoker: Arc<FutureRemoteInvoker>,
                 name: "future.remote".to_owned(),
                 description: "future remote adapter conformance tool".to_owned(),
                 input_schema: serde_json::json!({"type": "object"}),
-                side_effect: ToolSideEffect::ReadOnly,
                 requires_permission: false,
                 policy: ToolPolicyMetadata::default(),
                 ui: ToolUiMetadata::default(),

@@ -155,7 +155,6 @@ fn hello_bridge_definition() -> bcode_tool::ToolDefinition {
         name: "hello_bridge".to_string(),
         description: "Exercise every generic invocation capability".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: bcode_tool::ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata::default(),

@@ -1,7 +1,7 @@
 use bcode::{
     Agent, AgentLoopStopContext, AgentLoopTerminationReason, BcodeError, ModelProviderInvoker,
     RuntimeError, RuntimeFuture, ToolCall, ToolDefinition, ToolInvocationResponse,
-    ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
+    ToolPolicyMetadata, ToolUiMetadata,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -90,7 +90,6 @@ fn echo_definition() -> ToolDefinition {
         name: "echo".to_string(),
         description: "Echo input".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

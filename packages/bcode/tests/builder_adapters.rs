@@ -11,7 +11,7 @@ use bcode_model::{
 };
 use bcode_tool::{
     ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
-    ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
+    ToolPolicyMetadata, ToolUiMetadata,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -24,7 +24,6 @@ fn definition() -> ToolDefinition {
         name: "adapter".to_string(),
         description: "adapter routing test".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

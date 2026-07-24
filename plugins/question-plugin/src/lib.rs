@@ -17,7 +17,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolCompatibilityAlias, ToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
     ToolExchangeResponsePolicy, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList, ToolPolicyMetadata, ToolSideEffect,
+    ToolInvocationResult, ToolList, ToolPolicyMetadata,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -83,14 +83,12 @@ fn question_tool_definition() -> ToolDefinition {
         )
         .to_string(),
         input_schema: canonical_input_schema(),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata {
             aliases: vec!["ask".to_string()],
             compatibility_aliases: vec![ToolCompatibilityAlias::new("opencode", "question")],
             capabilities: vec!["ask_user".to_string(), "interactive_question".to_string()],
             permission_category: Some("read".to_string()),
-            argument_extractors: Vec::new(),
         },
         ui: bcode_tool::ToolUiMetadata::default(),
     }

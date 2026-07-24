@@ -1,5 +1,5 @@
 use bcode::{Agent, ToolCall, ToolDefinition, ToolExecutionOptions};
-use bcode_tool::{ToolInvocationResponse, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
+use bcode_tool::{ToolInvocationResponse, ToolPolicyMetadata, ToolUiMetadata};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{
     Arc,
@@ -11,7 +11,6 @@ fn definition(name: &str) -> ToolDefinition {
         name: name.to_string(),
         description: format!("test tool {name}"),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

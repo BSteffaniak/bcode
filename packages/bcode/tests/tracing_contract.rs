@@ -4,8 +4,7 @@ use bcode::{
     Agent, CancellationToken, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
     ModelResponseCache, ModelTokenPrice, PermissionDecision, ProviderError, ProviderErrorCategory,
     ProviderTurnEvent, RetryPolicy, StopReason, TokenUsage, ToolCall, ToolDefinition,
-    ToolInvocationResponse, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
-    generate_text_builder,
+    ToolInvocationResponse, ToolPolicyMetadata, ToolUiMetadata, generate_text_builder,
     testing::{
         ScriptedModelResponseCache, ScriptedPermissionPolicy, ScriptedProvider,
         ScriptedProviderTurn,
@@ -107,7 +106,6 @@ fn tool_definition() -> ToolDefinition {
         name: "trace_tool".to_string(),
         description: "Trace one tool".to_string(),
         input_schema: serde_json::json!({"type":"object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: true,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

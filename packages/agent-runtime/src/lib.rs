@@ -3870,7 +3870,7 @@ mod tests {
         ToolExchangeResolution, ToolExchangeResponsePolicy, ToolInvocationInput,
         ToolInvocationInputResolution, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
         ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolPolicyMetadata,
-        ToolSideEffect, ToolUiMetadata,
+        ToolUiMetadata,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
@@ -4101,7 +4101,6 @@ mod tests {
             name: name.to_string(),
             description: "test tool".to_string(),
             input_schema: serde_json::json!({ "type": "object" }),
-            side_effect: ToolSideEffect::ReadOnly,
             requires_permission: false,
             policy: ToolPolicyMetadata::default(),
             ui: ToolUiMetadata::default(),

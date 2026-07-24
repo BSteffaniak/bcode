@@ -13,7 +13,7 @@ use bcode_tool::{
     ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolSideEffect,
+    ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -116,18 +116,24 @@ fn document_policy_operation(
     match definition.name.as_str() {
         "document.status" => Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
         "document.extract" => {
-            let arguments: ExtractRequest =
-                serde_json::from_value(request.invocation.arguments.clone())
-                    .map_err(|error| error.to_string())?;
-            if let Some(url) = arguments.url {
-                Ok(bcode_plugin_sdk::ToolPolicyOperation::Web { url: Some(url) })
+            let url = request
+                .invocation
+                .arguments
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            if url.is_some() {
+                Ok(bcode_plugin_sdk::ToolPolicyOperation::Web { url })
             } else {
-                Ok(bcode_plugin_sdk::ToolPolicyOperation::Read {
-                    paths: arguments
-                        .path
-                        .map(|path| vec![path.display().to_string()])
-                        .unwrap_or_default(),
-                })
+                let paths = request
+                    .invocation
+                    .arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+                    .into_iter()
+                    .collect();
+                Ok(bcode_plugin_sdk::ToolPolicyOperation::Read { paths })
             }
         }
         name => Err(format!("unsupported document policy operation: {name}")),
@@ -584,14 +590,12 @@ fn extract_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["read".to_string()],
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("read".to_string()),
-            argument_extractors: Vec::new(),
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("extracting".to_string()),
@@ -608,7 +612,6 @@ fn status_tool_definition() -> ToolDefinition {
             "type": "object",
             "properties": {}
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {

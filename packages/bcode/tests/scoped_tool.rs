@@ -8,8 +8,7 @@ use bcode::{
 };
 use bcode_tool::{
     ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolPolicyMetadata, ToolSideEffect,
-    ToolUiMetadata,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolPolicyMetadata, ToolUiMetadata,
 };
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +17,6 @@ fn definition() -> ToolDefinition {
         name: "scoped".to_string(),
         description: "scope-aware test tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

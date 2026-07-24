@@ -1195,7 +1195,6 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             input_schema: serde_json::Value::default(),
-            side_effect: bcode_tool::ToolSideEffect::ReadOnly,
             requires_permission: false,
             policy,
             ui: bcode_tool::ToolUiMetadata::default(),
@@ -1273,7 +1272,6 @@ mod tests {
                     compatibility_aliases: Vec::new(),
                     capabilities: Vec::new(),
                     permission_category: None,
-                    argument_extractors: Vec::new(),
                 },
             );
             let outcome = evaluate(
@@ -1303,7 +1301,6 @@ mod tests {
                     compatibility_aliases: Vec::new(),
                     capabilities: Vec::new(),
                     permission_category: Some(category.clone()),
-                    argument_extractors: Vec::new(),
                 },
             );
             let outcome = evaluate(
@@ -1333,7 +1330,6 @@ mod tests {
                     compatibility_aliases: Vec::new(),
                     capabilities: vec![capability.clone()],
                     permission_category: None,
-                    argument_extractors: Vec::new(),
                 },
             );
             let outcome = evaluate(
@@ -1365,7 +1361,6 @@ mod tests {
                     compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new(&ecosystem, &alias_name)],
                     capabilities: Vec::new(),
                     permission_category: None,
-                    argument_extractors: Vec::new(),
                 },
             );
             let outcome = evaluate(
@@ -1496,7 +1491,6 @@ mod tests {
                 compatibility_aliases: Vec::new(),
                 capabilities: Vec::new(),
                 permission_category: None,
-                argument_extractors: Vec::new(),
             },
         );
         let tool_b = tool_with_policy(
@@ -1506,7 +1500,6 @@ mod tests {
                 compatibility_aliases: Vec::new(),
                 capabilities: Vec::new(),
                 permission_category: None,
-                argument_extractors: Vec::new(),
             },
         );
         let policy = SkillPermissionPolicy {

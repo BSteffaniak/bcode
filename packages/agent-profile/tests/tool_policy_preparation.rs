@@ -4,7 +4,7 @@ use bcode_agent_profile::{
 };
 use bcode_tool::{
     ToolDefinition, ToolInvocationDescriptor, ToolPolicyMetadata, ToolPreparationRequest,
-    ToolSideEffect, ToolUiMetadata,
+    ToolUiMetadata,
 };
 
 fn definition(name: &str) -> ToolDefinition {
@@ -12,7 +12,6 @@ fn definition(name: &str) -> ToolDefinition {
         name: name.to_string(),
         description: "policy preparation test".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: ToolPolicyMetadata {
             aliases: vec!["owner-alias".to_string()],
@@ -81,8 +80,7 @@ fn preparation_preserves_owner_computed_operations_and_resources() {
 
 #[test]
 fn preparation_does_not_infer_from_definition_side_effect_or_arguments() {
-    let mut definition = definition("owner.tool");
-    definition.side_effect = ToolSideEffect::ReadOnly;
+    let definition = definition("owner.tool");
     let metadata = metadata(
         &request(
             "owner.tool",

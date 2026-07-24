@@ -13,7 +13,7 @@ use bcode_tool::{
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationServiceRequest,
-    ToolInvocationServiceResolution, ToolList, ToolSideEffect,
+    ToolInvocationServiceResolution, ToolList,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -721,14 +721,14 @@ fn web_policy_operation(
     definition: &ToolDefinition,
 ) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
     Ok(match definition.name.as_str() {
-        "web.fetch" => {
-            let arguments: FetchRequest =
-                serde_json::from_value(request.invocation.arguments.clone())
-                    .map_err(|error| error.to_string())?;
-            bcode_plugin_sdk::ToolPolicyOperation::Web {
-                url: Some(arguments.url),
-            }
-        }
+        "web.fetch" => bcode_plugin_sdk::ToolPolicyOperation::Web {
+            url: request
+                .invocation
+                .arguments
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+        },
         "web.search" | "web.status" | "web.inspect" => {
             bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
         }
@@ -1742,7 +1742,6 @@ fn search_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
@@ -1770,14 +1769,12 @@ fn fetch_tool_definition() -> ToolDefinition {
                 "provider": { "type": "string", "description": "Reserved provider override for prompted extraction; plain fetch currently returns content plus prompt metadata" }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["web".to_string()],
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("web".to_string()),
-            argument_extractors: Vec::new(),
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("fetching".to_string()),
@@ -1794,7 +1791,6 @@ fn status_tool_definition() -> ToolDefinition {
             "type": "object",
             "properties": {}
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
@@ -1815,7 +1811,6 @@ fn inspect_tool_definition() -> ToolDefinition {
                 "url": { "type": "string" }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
@@ -2614,9 +2609,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn web_catalog_preparation_accepts_missing_url_and_preserves_read_only_tools() {
+        for definition in [
+            search_tool_definition(),
+            fetch_tool_definition(),
+            status_tool_definition(),
+            inspect_tool_definition(),
+        ] {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "catalog".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments: serde_json::Value::Null,
+                },
+                host_context: Vec::new(),
+            };
+            let operation =
+                web_policy_operation(&request, &definition).expect("catalog web policy");
+            if definition.name != "web.fetch" {
+                assert_eq!(operation, bcode_plugin_sdk::ToolPolicyOperation::ReadOnly);
+            }
+        }
+    }
+
+    #[test]
     fn web_owner_prepares_fetch_url_without_generic_extractors() {
         let definition = fetch_tool_definition();
-        assert!(definition.policy.argument_extractors.is_empty());
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "call".to_owned(),

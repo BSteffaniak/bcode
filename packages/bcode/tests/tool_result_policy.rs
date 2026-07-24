@@ -1,7 +1,4 @@
-use bcode::{
-    Agent, AgentRuntime, ToolCall, ToolDefinition, ToolFailurePolicy, ToolResultPolicy,
-    ToolSideEffect,
-};
+use bcode::{Agent, AgentRuntime, ToolCall, ToolDefinition, ToolFailurePolicy, ToolResultPolicy};
 use bcode_tool::{
     ImageContent, ImageMetadata, ImageRefContent, ToolInvocationResponse, ToolPolicyMetadata,
     ToolResultContent, ToolUiMetadata,
@@ -13,7 +10,6 @@ fn definition() -> ToolDefinition {
         name: "inspect".to_string(),
         description: "return mixed content".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

@@ -16,7 +16,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
     ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolList, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
+    ToolInvocationResponse, ToolList, ToolPolicyMetadata, ToolUiMetadata,
 };
 use bcode_vim_edit::{
     VimEditFrame, VimEditMode, VimEditMultiFileEntry, VimEditMultiFileRequest,
@@ -141,16 +141,28 @@ fn vim_edit_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
 ) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
-    let arguments: VimEditToolRequest =
-        serde_json::from_value(request.invocation.arguments.clone())
-            .map_err(|error| error.to_string())?;
-    let paths = match arguments {
-        VimEditToolRequest::Single { path, .. } => vec![path.display().to_string()],
-        VimEditToolRequest::Multi { files, .. } => files
-            .into_iter()
-            .map(|file| file.path.display().to_string())
-            .collect(),
-    };
+    let paths = request
+        .invocation
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .into_iter()
+        .chain(
+            request
+                .invocation
+                .arguments
+                .get("files")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|file| {
+                    file.get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                }),
+        )
+        .collect();
     Ok(match definition.name.as_str() {
         "vim_edit.preview" => bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
         "vim_edit.apply" => bcode_plugin_sdk::ToolPolicyOperation::Write {
@@ -940,7 +952,6 @@ fn preview_tool_definition() -> ToolDefinition {
         name: "vim_edit.preview".to_string(),
         description: "Preview ordered Vim/Neovim edits using isolated headless Neovim over RPC. Accepts either single-file path+steps or an ordered files array where each entry switches to that file and runs its steps. Does not modify requested files. Optional sandbox=\"dangerously_disabled\" is unsafe and explicitly bypasses default command filtering.".to_string(),
         input_schema: vim_edit_input_schema(),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy("read"),
         ui: ToolUiMetadata {
@@ -955,7 +966,6 @@ fn apply_tool_definition() -> ToolDefinition {
         name: "vim_edit.apply".to_string(),
         description: "Apply ordered Vim/Neovim edits using isolated headless Neovim over RPC. Accepts either single-file path+steps or an ordered files array where each entry switches to that file and runs its steps. Requires write permission and writes only after the full workflow succeeds. Optional sandbox=\"dangerously_disabled\" is unsafe and explicitly bypasses default command filtering.".to_string(),
         input_schema: vim_edit_input_schema(),
-        side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy("edit"),
         ui: ToolUiMetadata {
@@ -1118,7 +1128,6 @@ fn path_policy(category: &str) -> ToolPolicyMetadata {
         compatibility_aliases: Vec::new(),
         capabilities: vec![format!("vim_edit.{category}")],
         permission_category: Some(category.to_string()),
-        argument_extractors: Vec::new(),
     }
 }
 
@@ -1221,11 +1230,25 @@ mod tests {
     }
 
     #[test]
+    fn vim_edit_catalog_preparation_accepts_missing_paths() {
+        for definition in [preview_tool_definition(), apply_tool_definition()] {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "catalog".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments: serde_json::Value::Null,
+                },
+                host_context: Vec::new(),
+            };
+            vim_edit_policy_operation(&request, &definition)
+                .expect("catalog Vim policy preparation should remain total");
+        }
+    }
+
+    #[test]
     fn preview_tool_is_read_only_without_permission() {
         let tool = preview_tool_definition();
-        assert_eq!(tool.side_effect, ToolSideEffect::ReadOnly);
         assert!(!tool.requires_permission);
-        assert!(tool.policy.argument_extractors.is_empty());
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "preview".to_owned(),
@@ -1245,9 +1268,7 @@ mod tests {
     #[test]
     fn apply_tool_writes_and_requires_permission() {
         let tool = apply_tool_definition();
-        assert_eq!(tool.side_effect, ToolSideEffect::WriteFiles);
         assert!(tool.requires_permission);
-        assert!(tool.policy.argument_extractors.is_empty());
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "apply".to_owned(),

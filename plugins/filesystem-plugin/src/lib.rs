@@ -16,7 +16,7 @@ use bcode_tool::{
     TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolResultContent, ToolSideEffect,
+    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolResultContent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -416,7 +416,6 @@ fn path_policy(aliases: &[&str], category: &str) -> bcode_tool::ToolPolicyMetada
             .map(|alias| format!("filesystem.{alias}"))
             .collect(),
         permission_category: Some(category.to_string()),
-        argument_extractors: Vec::new(),
     }
 }
 
@@ -464,7 +463,6 @@ fn read_tool_definition() -> ToolDefinition {
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of text lines to return" }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["read"], "read"),
         ui: path_tool_ui("reading"),
@@ -489,7 +487,6 @@ fn write_tool_definition() -> ToolDefinition {
                 }
             }
         }),
-        side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["write"], "write"),
         ui: write_tool_ui("writing", "Write preview"),
@@ -518,7 +515,6 @@ fn edit_tool_definition() -> ToolDefinition {
                 }
             }
         }),
-        side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["edit"], "edit"),
         ui: edit_tool_ui("editing", "Edit preview"),
@@ -534,7 +530,6 @@ fn exists_tool_definition() -> ToolDefinition {
             "required": ["path"],
             "properties": { "path": { "type": "string" } }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["read"], "read"),
         ui: path_tool_ui("checking"),
@@ -555,7 +550,6 @@ fn list_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["ls", "read"], "read"),
         ui: path_tool_ui("listing"),
@@ -576,7 +570,6 @@ fn find_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["find", "read"], "read"),
         ui: bcode_tool::ToolUiMetadata {
@@ -602,7 +595,6 @@ fn grep_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["grep", "read"], "read"),
         ui: bcode_tool::ToolUiMetadata {
@@ -621,7 +613,6 @@ fn stat_tool_definition() -> ToolDefinition {
             "required": ["path"],
             "properties": { "path": { "type": "string" } }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["stat", "read"], "read"),
         ui: path_tool_ui("stat"),
@@ -637,7 +628,6 @@ fn artifact_metadata_tool_definition() -> ToolDefinition {
             "required": ["path"],
             "properties": { "path": { "type": "string" } }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
@@ -661,7 +651,6 @@ fn artifact_read_tool_definition() -> ToolDefinition {
                 "from_end": { "type": "boolean", "description": "Read the last max_bytes bytes of the artifact" }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
@@ -686,7 +675,6 @@ fn artifact_grep_tool_definition() -> ToolDefinition {
                 "max_matches": { "type": "integer", "minimum": 1 }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
@@ -2506,6 +2494,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn filesystem_catalog_preparation_accepts_missing_resources() {
+        for definition in [
+            read_tool_definition(),
+            write_tool_definition(),
+            edit_tool_definition(),
+            exists_tool_definition(),
+            list_tool_definition(),
+            find_tool_definition(),
+            grep_tool_definition(),
+            stat_tool_definition(),
+            artifact_metadata_tool_definition(),
+            artifact_read_tool_definition(),
+            artifact_grep_tool_definition(),
+        ] {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "catalog".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments: serde_json::Value::Null,
+                },
+                host_context: Vec::new(),
+            };
+            filesystem_policy_operation(&request, &definition)
+                .expect("catalog policy preparation should remain total");
+        }
+    }
+
+    #[test]
     fn filesystem_owner_prepares_path_operations_without_generic_extractors() {
         let operation = |definition: ToolDefinition, arguments| {
             let request = bcode_tool::ToolPreparationRequest {
@@ -2516,7 +2532,6 @@ mod tests {
                 },
                 host_context: Vec::new(),
             };
-            assert!(definition.policy.argument_extractors.is_empty());
             filesystem_policy_operation(&request, &definition).expect("filesystem policy")
         };
         assert_eq!(

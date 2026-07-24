@@ -13,7 +13,7 @@ use bcode_tool::{
     ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolResultContent, ToolSideEffect,
+    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolResultContent,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -629,14 +629,12 @@ fn extract_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["read".to_string()],
             compatibility_aliases: Vec::new(),
             capabilities: vec!["ocr".to_string(), "read".to_string()],
             permission_category: Some("read".to_string()),
-            argument_extractors: Vec::new(),
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("extracting OCR text".to_string()),
@@ -650,7 +648,6 @@ fn status_tool_definition() -> ToolDefinition {
         name: "ocr.status".to_string(),
         description: "Report OCR engine availability and default OCR configuration.".to_string(),
         input_schema: json!({ "type": "object", "properties": {} }),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {

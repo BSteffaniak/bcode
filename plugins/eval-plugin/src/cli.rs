@@ -434,10 +434,7 @@ async fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
                 println!("{}", serde_json::to_string_pretty(&tools)?);
             } else {
                 for tool in tools {
-                    println!(
-                        "{}\t{:?}\t{}",
-                        tool.name, tool.side_effect, tool.description
-                    );
+                    println!("{}\t{}", tool.name, tool.description);
                 }
             }
         }

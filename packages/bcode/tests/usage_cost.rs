@@ -2,8 +2,7 @@
 
 use bcode::{
     Agent, ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice,
-    ProviderTurnEvent, StopReason, TokenUsage, ToolCall, ToolDefinition, ToolSideEffect,
-    ToolUiMetadata,
+    ProviderTurnEvent, StopReason, TokenUsage, ToolCall, ToolDefinition, ToolUiMetadata,
     testing::{ScriptedPermissionPolicy, ScriptedProvider, ScriptedProviderTurn},
 };
 use bcode::{PermissionDecision, ToolInvocationResponse, ToolPolicyMetadata};
@@ -13,7 +12,6 @@ fn tool_definition() -> ToolDefinition {
         name: "lookup".to_string(),
         description: "Lookup data".to_string(),
         input_schema: serde_json::json!({"type":"object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),

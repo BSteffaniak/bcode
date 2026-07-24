@@ -408,7 +408,6 @@ mod tests {
     use bcode_agent_policy::Action;
     use bcode_agent_profile::AgentDecision;
     use bcode_session_models::SessionId;
-    use bcode_tool::ToolSideEffect;
     use serde_json::json;
     use std::path::Path;
     use std::sync::Mutex;
@@ -572,7 +571,6 @@ command = { "python3 *" = "allow" }
                 name: "filesystem.read".to_string(),
                 description: String::new(),
                 input_schema: json!({}),
-                side_effect: ToolSideEffect::ReadOnly,
                 requires_permission: false,
                 policy: bcode_tool::ToolPolicyMetadata::default(),
                 ui: bcode_tool::ToolUiMetadata::default(),
@@ -581,7 +579,6 @@ command = { "python3 *" = "allow" }
                 name: "filesystem.write".to_string(),
                 description: String::new(),
                 input_schema: json!({}),
-                side_effect: ToolSideEffect::WriteFiles,
                 requires_permission: true,
                 policy: bcode_tool::ToolPolicyMetadata::default(),
                 ui: bcode_tool::ToolUiMetadata::default(),

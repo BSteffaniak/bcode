@@ -4,7 +4,7 @@ use bcode::{
     Agent, Bcode, HeadlessExchangePolicy, ToolCall, ToolDefinition, ToolExchangeResolution,
     ToolInvocationResponse,
 };
-use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
+use bcode_tool::{ToolPolicyMetadata, ToolUiMetadata};
 use std::sync::{Arc, Mutex};
 
 fn definition() -> ToolDefinition {
@@ -12,7 +12,6 @@ fn definition() -> ToolDefinition {
         name: "question".to_string(),
         description: "question exchange test".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: ToolPolicyMetadata::default(),
         ui: ToolUiMetadata::default(),
@@ -78,7 +77,6 @@ async fn sdk_discovers_manifest_declared_plugin_tools_with_owned_metadata() {
     assert_eq!(question.plugin_id, "bcode.question");
     assert!(!question.definition.description.is_empty());
     assert!(question.definition.input_schema.is_object());
-    assert_eq!(question.definition.side_effect, ToolSideEffect::ReadOnly);
 }
 
 #[tokio::test]
