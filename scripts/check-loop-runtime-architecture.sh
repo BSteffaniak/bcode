@@ -113,6 +113,17 @@ for removed_symbol in HostModelNativeWebSearchRequest cancellation_path invocati
   fi
 done
 
+if rg -n 'request\.invocation\.arguments|\bToolArgumentKind\b|\bToolSideEffect\b|definition\.side_effect' \
+  packages/agent-profile/src packages/plugin-sdk/src >/tmp/bcode-generic-policy-inference.txt ||
+   rg -n 'argument_extractors: vec!' plugins --glob '*.rs' >/tmp/bcode-plugin-policy-extractors.txt ||
+   ! grep -F 'filesystem_owner_prepares_path_operations_without_generic_extractors' plugins/filesystem-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'shell_owner_prepares_exact_command_without_generic_extractors' plugins/shell-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'web_owner_prepares_fetch_url_without_generic_extractors' plugins/web-search-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic policy inference or legacy argument extractors were reintroduced." >&2
+  cat /tmp/bcode-generic-policy-inference.txt /tmp/bcode-plugin-policy-extractors.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
 if rg -n 'definition\.side_effect == ToolSideEffect::ReadOnly|!definition\.requires_permission' packages/server/src/lib.rs >/tmp/bcode-server-parallel-heuristic.txt; then
   echo "Runtime architecture violation: server concurrency was tied to side-effect or permission metadata." >&2
   cat /tmp/bcode-server-parallel-heuristic.txt >&2

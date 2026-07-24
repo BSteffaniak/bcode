@@ -11,7 +11,6 @@
 use bcode_session_models::SessionId;
 use bcode_tool::{
     ToolAuthorizationFact, ToolDefinition, ToolPreparationRequest, ToolPreparationResponse,
-    ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -156,107 +155,6 @@ impl ToolPolicyAuthorizationMetadata {
     }
 }
 
-fn extracted_argument(
-    request: &ToolPreparationRequest,
-    definition: &ToolDefinition,
-    kind: bcode_tool::ToolArgumentKind,
-) -> Option<String> {
-    definition
-        .policy
-        .argument_extractors
-        .iter()
-        .filter(|extractor| extractor.kind == kind)
-        .find_map(|extractor| {
-            request
-                .invocation
-                .arguments
-                .get(&extractor.argument)
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        })
-}
-
-fn extracted_paths(
-    request: &ToolPreparationRequest,
-    definition: &ToolDefinition,
-    kind: bcode_tool::ToolArgumentKind,
-) -> Vec<String> {
-    definition
-        .policy
-        .argument_extractors
-        .iter()
-        .filter(|extractor| extractor.kind == kind)
-        .flat_map(|extractor| {
-            let value = request.invocation.arguments.get(&extractor.argument);
-            value
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-                .into_iter()
-                .chain(
-                    value
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|entry| {
-                            entry.as_str().map(ToString::to_string).or_else(|| {
-                                entry
-                                    .get("path")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string)
-                            })
-                        }),
-                )
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn prepared_policy_operation(
-    request: &ToolPreparationRequest,
-    definition: &ToolDefinition,
-) -> ToolPolicyOperation {
-    let extractors = &definition.policy.argument_extractors;
-    let command = extracted_argument(request, definition, bcode_tool::ToolArgumentKind::Command);
-    if extractors
-        .iter()
-        .any(|extractor| extractor.kind == bcode_tool::ToolArgumentKind::Command)
-    {
-        return ToolPolicyOperation::Command { command };
-    }
-    let url = extracted_argument(request, definition, bcode_tool::ToolArgumentKind::Url);
-    if url.is_some() {
-        return ToolPolicyOperation::Web { url };
-    }
-    let write_paths = extracted_paths(request, definition, bcode_tool::ToolArgumentKind::WritePath);
-    if !write_paths.is_empty() {
-        return ToolPolicyOperation::Write {
-            paths: write_paths,
-            category: definition
-                .policy
-                .permission_category
-                .clone()
-                .unwrap_or_else(|| "write".to_string()),
-        };
-    }
-    let read_paths = extracted_paths(request, definition, bcode_tool::ToolArgumentKind::ReadPath);
-    if !read_paths.is_empty() {
-        return ToolPolicyOperation::Read { paths: read_paths };
-    }
-    if extractors
-        .iter()
-        .any(|extractor| extractor.kind == bcode_tool::ToolArgumentKind::Url)
-    {
-        return ToolPolicyOperation::Web { url: None };
-    }
-    match definition.side_effect {
-        ToolSideEffect::ReadOnly => ToolPolicyOperation::ReadOnly,
-        ToolSideEffect::WriteFiles | ToolSideEffect::ExecuteProcess => {
-            ToolPolicyOperation::Mutating
-        }
-    }
-}
-
 /// Prepare the standard agent-policy fact for one owner-supplied tool definition.
 ///
 /// # Errors
@@ -266,6 +164,7 @@ fn prepared_policy_operation(
 pub fn prepare_tool_policy(
     request: &ToolPreparationRequest,
     definition: &ToolDefinition,
+    operation: ToolPolicyOperation,
 ) -> Result<ToolPreparationResponse, String> {
     if request.invocation.tool_name != definition.name {
         return Err(format!(
@@ -274,7 +173,6 @@ pub fn prepare_tool_policy(
         ));
     }
     let aliases = definition.policy.aliases.clone();
-    let operation = prepared_policy_operation(request, definition);
     let metadata = ToolPolicyAuthorizationMetadata {
         requires_permission: definition.requires_permission,
         aliases,

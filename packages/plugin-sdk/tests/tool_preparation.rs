@@ -36,7 +36,10 @@ fn preparation_dispatches_to_owner_definition_without_transport_fields() {
         payload: serde_json::to_vec(&preparation).expect("request should encode"),
     };
 
-    let response = prepare_tool_from_definitions(&service, [definition()])
+    let response =
+        prepare_tool_from_definitions(&service, [definition()], |_request, _definition| {
+            Ok(bcode_plugin_sdk::ToolPolicyOperation::Mutating)
+        })
         .expect("owner preparation should succeed");
 
     assert_eq!(response.authorization.len(), 1);
@@ -73,8 +76,10 @@ fn preparation_rejects_unknown_tool() {
         payload: serde_json::to_vec(&preparation).expect("request should encode"),
     };
 
-    let error = prepare_tool_from_definitions(&service, [definition()])
-        .expect_err("unknown tool must fail preparation");
+    let error = prepare_tool_from_definitions(&service, [definition()], |_request, _definition| {
+        Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly)
+    })
+    .expect_err("unknown tool must fail preparation");
 
     assert!(error.contains("tool not found"));
 }

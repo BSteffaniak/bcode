@@ -108,6 +108,26 @@ fn worktree_command(id: &str, title: &str, description: &str) -> CommandContribu
     }
 }
 
+fn worktree_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
+    Ok(match definition.name.as_str() {
+        "worktree.list" => bcode_plugin_sdk::ToolPolicyOperation::ReadOnly,
+        "worktree.create" => bcode_plugin_sdk::ToolPolicyOperation::Mutating,
+        "worktree.remove" => {
+            let arguments: WorktreeRemoveRequest =
+                serde_json::from_value(request.invocation.arguments.clone())
+                    .map_err(|error| error.to_string())?;
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths: vec![arguments.path.display().to_string()],
+                category: "worktree.remove".to_owned(),
+            }
+        }
+        name => return Err(format!("unsupported worktree policy operation: {name}")),
+    })
+}
+
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     let request = &context.request;
     match request.operation.as_str() {
@@ -115,6 +135,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             request,
             [list_definition(), create_definition(), remove_definition()],
+            worktree_policy_operation,
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -425,10 +446,7 @@ fn remove_definition() -> ToolDefinition {
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("worktree.remove".to_string()),
-            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                kind: bcode_tool::ToolArgumentKind::WritePath,
-                argument: "path".to_string(),
-            }],
+            argument_extractors: Vec::new(),
         },
         ui: tool_ui("removing worktree"),
     }

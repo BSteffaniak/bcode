@@ -14,10 +14,9 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
-    ToolArgumentExtractor, ToolArgumentKind, ToolContributionEnvelope, ToolContributionEvent,
-    ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,
-    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolPolicyMetadata,
-    ToolSideEffect, ToolUiMetadata,
+    ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
+    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
+    ToolInvocationResponse, ToolList, ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata,
 };
 use bcode_vim_edit::{
     VimEditFrame, VimEditMode, VimEditMultiFileEntry, VimEditMultiFileRequest,
@@ -138,6 +137,30 @@ struct VimEditToolError<'a> {
     error: String,
 }
 
+fn vim_edit_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
+    let arguments: VimEditToolRequest =
+        serde_json::from_value(request.invocation.arguments.clone())
+            .map_err(|error| error.to_string())?;
+    let paths = match arguments {
+        VimEditToolRequest::Single { path, .. } => vec![path.display().to_string()],
+        VimEditToolRequest::Multi { files, .. } => files
+            .into_iter()
+            .map(|file| file.path.display().to_string())
+            .collect(),
+    };
+    Ok(match definition.name.as_str() {
+        "vim_edit.preview" => bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        "vim_edit.apply" => bcode_plugin_sdk::ToolPolicyOperation::Write {
+            paths,
+            category: "write".to_owned(),
+        },
+        name => return Err(format!("unsupported Vim edit policy operation: {name}")),
+    })
+}
+
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     let request = &context.request;
     match request.operation.as_str() {
@@ -145,6 +168,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             request,
             [preview_tool_definition(), apply_tool_definition()],
+            vim_edit_policy_operation,
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -918,7 +942,7 @@ fn preview_tool_definition() -> ToolDefinition {
         input_schema: vim_edit_input_schema(),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
-        policy: path_policy("read", ToolArgumentKind::ReadPath),
+        policy: path_policy("read"),
         ui: ToolUiMetadata {
             activity_label: Some("previewing Vim edit".to_string()),
             request_visual: None,
@@ -933,7 +957,7 @@ fn apply_tool_definition() -> ToolDefinition {
         input_schema: vim_edit_input_schema(),
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
-        policy: path_policy("edit", ToolArgumentKind::WritePath),
+        policy: path_policy("edit"),
         ui: ToolUiMetadata {
             activity_label: Some("applying Vim edit".to_string()),
             request_visual: None,
@@ -1088,22 +1112,13 @@ fn vim_edit_input_schema() -> serde_json::Value {
     })
 }
 
-fn path_policy(category: &str, kind: ToolArgumentKind) -> ToolPolicyMetadata {
+fn path_policy(category: &str) -> ToolPolicyMetadata {
     ToolPolicyMetadata {
         aliases: vec![category.to_string()],
         compatibility_aliases: Vec::new(),
         capabilities: vec![format!("vim_edit.{category}")],
         permission_category: Some(category.to_string()),
-        argument_extractors: vec![
-            ToolArgumentExtractor {
-                kind,
-                argument: "path".to_string(),
-            },
-            ToolArgumentExtractor {
-                kind,
-                argument: "files".to_string(),
-            },
-        ],
+        argument_extractors: Vec::new(),
     }
 }
 
@@ -1210,7 +1225,21 @@ mod tests {
         let tool = preview_tool_definition();
         assert_eq!(tool.side_effect, ToolSideEffect::ReadOnly);
         assert!(!tool.requires_permission);
-        assert_eq!(tool.policy.argument_extractors.len(), 2);
+        assert!(tool.policy.argument_extractors.is_empty());
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "preview".to_owned(),
+                tool_name: tool.name.clone(),
+                arguments: json!({"path": "src/lib.rs", "steps": []}),
+            },
+            host_context: Vec::new(),
+        };
+        assert_eq!(
+            vim_edit_policy_operation(&request, &tool).expect("preview policy"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read {
+                paths: vec!["src/lib.rs".to_owned()],
+            }
+        );
     }
 
     #[test]
@@ -1218,15 +1247,26 @@ mod tests {
         let tool = apply_tool_definition();
         assert_eq!(tool.side_effect, ToolSideEffect::WriteFiles);
         assert!(tool.requires_permission);
-        assert_eq!(tool.policy.argument_extractors[0].argument, "path");
-        assert_eq!(tool.policy.argument_extractors[1].argument, "files");
+        assert!(tool.policy.argument_extractors.is_empty());
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "apply".to_owned(),
+                tool_name: tool.name.clone(),
+                arguments: json!({
+                    "files": [
+                        {"path": "src/lib.rs", "steps": []},
+                        {"path": "src/main.rs", "steps": []}
+                    ]
+                }),
+            },
+            host_context: Vec::new(),
+        };
         assert_eq!(
-            tool.policy.argument_extractors[0].kind,
-            ToolArgumentKind::WritePath
-        );
-        assert_eq!(
-            tool.policy.argument_extractors[1].kind,
-            ToolArgumentKind::WritePath
+            vim_edit_policy_operation(&request, &tool).expect("apply policy"),
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths: vec!["src/lib.rs".to_owned(), "src/main.rs".to_owned()],
+                category: "write".to_owned(),
+            }
         );
     }
 

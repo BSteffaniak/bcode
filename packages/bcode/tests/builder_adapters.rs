@@ -51,12 +51,15 @@ impl ToolInvoker for CountingInvoker {
         request: &'a ToolPreparationRequest,
         _scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
-        let result = bcode_agent_profile::prepare_tool_policy(request, &tool.definition).map_err(
-            |message| bcode::RuntimeError::ToolPreparation {
-                tool_name: request.invocation.tool_name.clone(),
-                message,
-            },
-        );
+        let result = bcode_agent_profile::prepare_tool_policy(
+            request,
+            &tool.definition,
+            bcode_agent_profile::ToolPolicyOperation::ReadOnly,
+        )
+        .map_err(|message| bcode::RuntimeError::ToolPreparation {
+            tool_name: request.invocation.tool_name.clone(),
+            message,
+        });
         Box::pin(async move { result })
     }
 
@@ -86,12 +89,15 @@ impl ToolInvoker for ContributionInvoker {
         request: &'a ToolPreparationRequest,
         _scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
-        let result = bcode_agent_profile::prepare_tool_policy(request, &tool.definition).map_err(
-            |message| bcode::RuntimeError::ToolPreparation {
-                tool_name: request.invocation.tool_name.clone(),
-                message,
-            },
-        );
+        let result = bcode_agent_profile::prepare_tool_policy(
+            request,
+            &tool.definition,
+            bcode_agent_profile::ToolPolicyOperation::ReadOnly,
+        )
+        .map_err(|message| bcode::RuntimeError::ToolPreparation {
+            tool_name: request.invocation.tool_name.clone(),
+            message,
+        });
         Box::pin(async move { result })
     }
 

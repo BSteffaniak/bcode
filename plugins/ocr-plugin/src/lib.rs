@@ -112,6 +112,7 @@ impl OcrPlugin {
             bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
                 request,
                 [extract_tool_definition(), status_tool_definition()],
+                |_request, _definition| Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
             ),
             OP_INVOKE_TOOL => self.invoke_tool(request, context.events),
             _ => ServiceResponse::error("unsupported_operation", "unsupported tool operation"),

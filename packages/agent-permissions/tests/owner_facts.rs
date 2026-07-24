@@ -31,6 +31,7 @@ fn permission_request() -> RuntimePermissionRequest {
             host_context: Vec::new(),
         },
         &definition,
+        bcode_agent_profile::ToolPolicyOperation::Mutating,
     )
     .expect("tool owner preparation should succeed");
     RuntimePermissionRequest {

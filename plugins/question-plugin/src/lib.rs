@@ -46,9 +46,11 @@ impl RustPlugin for QuestionPlugin {
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(&context.request),
-        bcode_tool::OP_PREPARE_TOOL => {
-            prepare_tool_service_response(&context.request, [question_tool_definition()])
-        }
+        bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
+            &context.request,
+            [question_tool_definition()],
+            |_request, _definition| Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
+        ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",

@@ -716,6 +716,26 @@ struct WebToolPreparationDescriptor {
     model_provider_route_id: Option<String>,
 }
 
+fn web_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
+    Ok(match definition.name.as_str() {
+        "web.fetch" => {
+            let arguments: FetchRequest =
+                serde_json::from_value(request.invocation.arguments.clone())
+                    .map_err(|error| error.to_string())?;
+            bcode_plugin_sdk::ToolPolicyOperation::Web {
+                url: Some(arguments.url),
+            }
+        }
+        "web.search" | "web.status" | "web.inspect" => {
+            bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
+        }
+        name => return Err(format!("unsupported web policy operation: {name}")),
+    })
+}
+
 fn prepare_web_tool_service_response(
     request: &ServiceRequest,
     config: &bcode_plugin_sdk::PluginConfigContext,
@@ -724,7 +744,11 @@ fn prepare_web_tool_service_response(
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    let mut response = match prepare_tool_from_definitions(request, web_tool_definitions(config)) {
+    let mut response = match prepare_tool_from_definitions(
+        request,
+        web_tool_definitions(config),
+        web_policy_operation,
+    ) {
         Ok(response) => response,
         Err(message) => return ServiceResponse::error("invalid_preparation", message),
     };
@@ -1753,10 +1777,7 @@ fn fetch_tool_definition() -> ToolDefinition {
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("web".to_string()),
-            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                kind: bcode_tool::ToolArgumentKind::Url,
-                argument: "url".to_string(),
-            }],
+            argument_extractors: Vec::new(),
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("fetching".to_string()),
@@ -2591,6 +2612,26 @@ bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_owner_prepares_fetch_url_without_generic_extractors() {
+        let definition = fetch_tool_definition();
+        assert!(definition.policy.argument_extractors.is_empty());
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::json!({"url": "https://example.com/page"}),
+            },
+            host_context: Vec::new(),
+        };
+        assert_eq!(
+            web_policy_operation(&request, &definition).expect("web policy"),
+            bcode_plugin_sdk::ToolPolicyOperation::Web {
+                url: Some("https://example.com/page".to_owned()),
+            }
+        );
+    }
 
     #[test]
     fn web_tools_remove_legacy_request_visuals_and_map_request_schemas() {

@@ -326,6 +326,37 @@ fn invoke_filesystem_service(context: &NativeServiceContext) -> ServiceResponse 
     }
 }
 
+fn filesystem_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
+    let path = request
+        .invocation
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let paths = path.into_iter().collect::<Vec<_>>();
+    Ok(match definition.name.as_str() {
+        "filesystem.write" | "filesystem.edit" => bcode_plugin_sdk::ToolPolicyOperation::Write {
+            paths,
+            category: definition
+                .policy
+                .permission_category
+                .clone()
+                .unwrap_or_else(|| "write".to_owned()),
+        },
+        "filesystem.read" | "filesystem.exists" | "filesystem.list" | "filesystem.find"
+        | "filesystem.grep" | "filesystem.stat" => {
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths }
+        }
+        "artifact.metadata" | "artifact.read" | "artifact.grep" => {
+            bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
+        }
+        name => return Err(format!("unsupported filesystem policy operation: {name}")),
+    })
+}
+
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     let request = &context.request;
     match request.operation.as_str() {
@@ -345,6 +376,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
                 artifact_read_tool_definition(),
                 artifact_grep_tool_definition(),
             ],
+            filesystem_policy_operation,
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -375,11 +407,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     })
 }
 
-fn path_policy(
-    aliases: &[&str],
-    category: &str,
-    kind: bcode_tool::ToolArgumentKind,
-) -> bcode_tool::ToolPolicyMetadata {
+fn path_policy(aliases: &[&str], category: &str) -> bcode_tool::ToolPolicyMetadata {
     bcode_tool::ToolPolicyMetadata {
         aliases: aliases.iter().map(ToString::to_string).collect(),
         compatibility_aliases: compatibility_aliases_for(aliases),
@@ -388,10 +416,7 @@ fn path_policy(
             .map(|alias| format!("filesystem.{alias}"))
             .collect(),
         permission_category: Some(category.to_string()),
-        argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-            kind,
-            argument: "path".to_string(),
-        }],
+        argument_extractors: Vec::new(),
     }
 }
 
@@ -441,7 +466,7 @@ fn read_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
-        policy: path_policy(&["read"], "read", bcode_tool::ToolArgumentKind::ReadPath),
+        policy: path_policy(&["read"], "read"),
         ui: path_tool_ui("reading"),
     }
 }
@@ -466,7 +491,7 @@ fn write_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
-        policy: path_policy(&["write"], "write", bcode_tool::ToolArgumentKind::WritePath),
+        policy: path_policy(&["write"], "write"),
         ui: write_tool_ui("writing", "Write preview"),
     }
 }
@@ -495,7 +520,7 @@ fn edit_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
-        policy: path_policy(&["edit"], "edit", bcode_tool::ToolArgumentKind::WritePath),
+        policy: path_policy(&["edit"], "edit"),
         ui: edit_tool_ui("editing", "Edit preview"),
     }
 }
@@ -511,7 +536,7 @@ fn exists_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
-        policy: path_policy(&["read"], "read", bcode_tool::ToolArgumentKind::ReadPath),
+        policy: path_policy(&["read"], "read"),
         ui: path_tool_ui("checking"),
     }
 }
@@ -532,11 +557,7 @@ fn list_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
-        policy: path_policy(
-            &["ls", "read"],
-            "read",
-            bcode_tool::ToolArgumentKind::ReadPath,
-        ),
+        policy: path_policy(&["ls", "read"], "read"),
         ui: path_tool_ui("listing"),
     }
 }
@@ -557,11 +578,7 @@ fn find_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
-        policy: path_policy(
-            &["find", "read"],
-            "read",
-            bcode_tool::ToolArgumentKind::ReadPath,
-        ),
+        policy: path_policy(&["find", "read"], "read"),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("finding".to_string()),
             request_visual: None,
@@ -587,11 +604,7 @@ fn grep_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
-        policy: path_policy(
-            &["grep", "read"],
-            "read",
-            bcode_tool::ToolArgumentKind::ReadPath,
-        ),
+        policy: path_policy(&["grep", "read"], "read"),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("searching".to_string()),
             request_visual: None,
@@ -610,11 +623,7 @@ fn stat_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
-        policy: path_policy(
-            &["stat", "read"],
-            "read",
-            bcode_tool::ToolArgumentKind::ReadPath,
-        ),
+        policy: path_policy(&["stat", "read"], "read"),
         ui: path_tool_ui("stat"),
     }
 }
@@ -2495,6 +2504,35 @@ bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_owner_prepares_path_operations_without_generic_extractors() {
+        let operation = |definition: ToolDefinition, arguments| {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "call".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments,
+                },
+                host_context: Vec::new(),
+            };
+            assert!(definition.policy.argument_extractors.is_empty());
+            filesystem_policy_operation(&request, &definition).expect("filesystem policy")
+        };
+        assert_eq!(
+            operation(read_tool_definition(), json!({"path": "src/lib.rs"})),
+            bcode_plugin_sdk::ToolPolicyOperation::Read {
+                paths: vec!["src/lib.rs".to_owned()],
+            }
+        );
+        assert_eq!(
+            operation(write_tool_definition(), json!({"path": "src/lib.rs"})),
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths: vec!["src/lib.rs".to_owned()],
+                category: "write".to_owned(),
+            }
+        );
+    }
 
     #[test]
     fn progress_uses_neutral_invocation_lifecycle_contract() {

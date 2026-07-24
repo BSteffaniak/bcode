@@ -25,7 +25,11 @@ impl RustPlugin for HelloPlugin {
         if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID
             && context.request.operation == bcode_tool::OP_PREPARE_TOOL
         {
-            return prepare_tool_service_response(&context.request, [hello_bridge_definition()]);
+            return prepare_tool_service_response(
+                &context.request,
+                [hello_bridge_definition()],
+                |_request, _definition| Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
+            );
         }
         if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID
             && context.request.operation == bcode_tool::OP_INVOKE_TOOL

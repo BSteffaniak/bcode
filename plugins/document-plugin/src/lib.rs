@@ -109,6 +109,31 @@ fn progress_lifecycle_event(
     }
 }
 
+fn document_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
+    match definition.name.as_str() {
+        "document.status" => Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
+        "document.extract" => {
+            let arguments: ExtractRequest =
+                serde_json::from_value(request.invocation.arguments.clone())
+                    .map_err(|error| error.to_string())?;
+            if let Some(url) = arguments.url {
+                Ok(bcode_plugin_sdk::ToolPolicyOperation::Web { url: Some(url) })
+            } else {
+                Ok(bcode_plugin_sdk::ToolPolicyOperation::Read {
+                    paths: arguments
+                        .path
+                        .map(|path| vec![path.display().to_string()])
+                        .unwrap_or_default(),
+                })
+            }
+        }
+        name => Err(format!("unsupported document policy operation: {name}")),
+    }
+}
+
 impl DocumentPlugin {
     fn invoke_tool_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         let request = &context.request;
@@ -117,6 +142,7 @@ impl DocumentPlugin {
             bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
                 request,
                 [extract_tool_definition(), status_tool_definition()],
+                document_policy_operation,
             ),
             OP_INVOKE_TOOL => self.invoke_tool(context),
             _ => ServiceResponse::error(
@@ -565,16 +591,7 @@ fn extract_tool_definition() -> ToolDefinition {
             compatibility_aliases: Vec::new(),
             capabilities: Vec::new(),
             permission_category: Some("read".to_string()),
-            argument_extractors: vec![
-                bcode_tool::ToolArgumentExtractor {
-                    kind: bcode_tool::ToolArgumentKind::ReadPath,
-                    argument: "path".to_string(),
-                },
-                bcode_tool::ToolArgumentExtractor {
-                    kind: bcode_tool::ToolArgumentKind::Url,
-                    argument: "url".to_string(),
-                },
-            ],
+            argument_extractors: Vec::new(),
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("extracting".to_string()),

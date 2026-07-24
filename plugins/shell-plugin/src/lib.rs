@@ -78,15 +78,28 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
 
     match context.request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(&context.request),
-        bcode_tool::OP_PREPARE_TOOL => {
-            prepare_tool_service_response(&context.request, [shell_tool_definition()])
-        }
+        bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
+            &context.request,
+            [shell_tool_definition()],
+            shell_policy_operation,
+        ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported tool service operation",
         ),
     }
+}
+
+fn shell_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    _definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
+    let arguments: ShellRunArguments = serde_json::from_value(request.invocation.arguments.clone())
+        .map_err(|error| error.to_string())?;
+    Ok(bcode_plugin_sdk::ToolPolicyOperation::Command {
+        command: Some(arguments.command),
+    })
 }
 
 fn shell_tool_definition() -> ToolDefinition {
@@ -115,10 +128,7 @@ fn shell_tool_definition() -> ToolDefinition {
                     compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
                     capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
                     permission_category: Some("command".to_string()),
-                    argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
-                        kind: bcode_tool::ToolArgumentKind::Command,
-                        argument: "command".to_string(),
-                    }],
+            argument_extractors: Vec::new(),
                 },
                 ui: bcode_tool::ToolUiMetadata {
                     activity_label: Some("running".to_string()),
@@ -1608,6 +1618,26 @@ mod tests {
     use super::*;
     use std::ffi::c_void;
     use std::sync::Mutex;
+
+    #[test]
+    fn shell_owner_prepares_exact_command_without_generic_extractors() {
+        let definition = shell_tool_definition();
+        assert!(definition.policy.argument_extractors.is_empty());
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::json!({"command": "printf hello"}),
+            },
+            host_context: Vec::new(),
+        };
+        assert_eq!(
+            shell_policy_operation(&request, &definition).expect("shell policy"),
+            bcode_plugin_sdk::ToolPolicyOperation::Command {
+                command: Some("printf hello".to_owned()),
+            }
+        );
+    }
 
     #[test]
     fn shell_contribution_envelopes_preserve_placement_identity_and_sequence() {
