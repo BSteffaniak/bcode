@@ -2382,47 +2382,54 @@ async fn migrate_session_storage(
         "Reading canonical session history",
     );
     let decode_timer = metrics.timer();
-    let events = compatible_events_from_database(db, progress).await?;
+    let history = canonical_migration_history(db, session_id, progress).await?;
     metrics.record_histogram(
         "session.migration.canonical_decode_duration_ms",
         decode_timer.elapsed_ms(),
     );
     metrics.add_counter(
         "session.migration.canonical_events_total",
-        u64::try_from(events.len()).unwrap_or(u64::MAX),
+        history.event_total,
     );
-    validate_migration_event_identity(&events, session_id)?;
-    rebuild_migration_projections(db, &events, metrics, progress).await?;
-    validate_migrated_storage(db, &events, metrics, progress).await
+    let replay = rebuild_migration_projections(db, &history, metrics, progress).await?;
+    validate_migrated_storage(db, replay.tail.as_ref(), metrics, progress).await
+}
+
+struct CanonicalMigrationHistory {
+    rows: Vec<switchy::database::Row>,
+    event_total: u64,
+    session_id: SessionId,
+}
+
+struct MigrationReplayOutcome {
+    tail: Option<SessionEvent>,
 }
 
 fn validate_migration_event_identity(
-    events: &[(SessionEvent, Option<SessionEventCompatibilityIssue>)],
+    event: &SessionEvent,
+    expected: u64,
     session_id: SessionId,
 ) -> SessionDbResult<()> {
-    for (index, (event, _)) in events.iter().enumerate() {
-        let expected = u64::try_from(index).unwrap_or(u64::MAX);
-        if event.sequence != expected {
-            return Err(SessionDbError::InvalidCanonicalSequence {
-                expected,
-                actual: event.sequence,
-            });
-        }
-        if event.session_id != session_id {
-            return Err(SessionDbError::InvalidRow {
-                column: "events.session_id".to_owned(),
-            });
-        }
+    if event.sequence != expected {
+        return Err(SessionDbError::InvalidCanonicalSequence {
+            expected,
+            actual: event.sequence,
+        });
+    }
+    if event.session_id != session_id {
+        return Err(SessionDbError::InvalidRow {
+            column: "events.session_id".to_owned(),
+        });
     }
     Ok(())
 }
 
 async fn rebuild_migration_projections(
     db: &dyn Database,
-    events: &[(SessionEvent, Option<SessionEventCompatibilityIssue>)],
+    history: &CanonicalMigrationHistory,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
-) -> SessionDbResult<()> {
+) -> SessionDbResult<MigrationReplayOutcome> {
     for table in [
         "session_compatibility_issues",
         "session_compatibility_state",
@@ -2442,7 +2449,7 @@ async fn rebuild_migration_projections(
     }
     let replay_timer = metrics.timer();
     let mut state = MigrationProjectionState::new();
-    let event_total = u64::try_from(events.len()).unwrap_or(u64::MAX);
+    let event_total = history.event_total;
     report_migration_progress(
         progress,
         bcode_session_models::SessionMigrationStage::RebuildingProjections,
@@ -2450,8 +2457,15 @@ async fn rebuild_migration_projections(
         event_total,
         "Rebuilding session indexes",
     );
-    for (index, (event, issue)) in events.iter().enumerate() {
-        project_migration_event(db, event, issue.as_ref(), metrics, &mut state).await?;
+    let mut tail = None;
+    for (index, row) in history.rows.iter().enumerate() {
+        let event_seq = required_non_negative_u64(row, "event_seq")?;
+        let payload = required_string(row, "payload")?;
+        let decoded = decode_session_event_compatible(&payload)?;
+        validate_migration_event_identity(decoded.event(), event_seq, history.session_id)?;
+        let issue = decoded.issue().cloned();
+        let event = decoded.into_event();
+        project_migration_event(db, &event, issue.as_ref(), metrics, &mut state).await?;
         let completed = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
         if completed == event_total || completed % 100 == 0 {
             report_migration_progress(
@@ -2462,24 +2476,22 @@ async fn rebuild_migration_projections(
                 "Rebuilding session indexes",
             );
         }
+        tail = Some(event);
     }
-    if let Some((tail, _)) = events.last() {
+    if let Some(tail) = tail.as_ref() {
         finalize_migration_context_occupancy(db, tail, &state).await?;
     }
     metrics.record_histogram(
         "session.migration.projection_rebuild_duration_ms",
         replay_timer.elapsed_ms(),
     );
-    metrics.add_counter(
-        "session.migration.projected_events_total",
-        u64::try_from(events.len()).unwrap_or(u64::MAX),
-    );
-    Ok(())
+    metrics.add_counter("session.migration.projected_events_total", event_total);
+    Ok(MigrationReplayOutcome { tail })
 }
 
 async fn validate_migrated_storage(
     db: &dyn Database,
-    events: &[(SessionEvent, Option<SessionEventCompatibilityIssue>)],
+    tail: Option<&SessionEvent>,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
 ) -> SessionDbResult<()> {
@@ -2489,13 +2501,13 @@ async fn validate_migrated_storage(
         bcode_session_models::SessionMigrationStage::ValidatingProjections,
         "Validating rebuilt session indexes",
     );
-    if let Some((tail, _)) = events.last() {
+    if let Some(tail) = tail {
         finalize_migration_session_state(db, tail).await?;
         finalize_migration_model_context(db, tail).await?;
         project_materialized_checkpoints_at_tail(db, tail).await?;
         project_session_compatibility_state(db, tail).await?;
     }
-    let canonical_tail = events.last().map(|(event, _)| event.sequence);
+    let canonical_tail = tail.map(|event| event.sequence);
     validate_all_projection_checkpoints_at_tail(db, canonical_tail).await?;
     if let Some(expected) = canonical_tail {
         let model_state = db
@@ -2623,10 +2635,11 @@ fn report_migration_progress(
     }
 }
 
-async fn compatible_events_from_database(
+async fn canonical_migration_history(
     db: &dyn Database,
+    session_id: SessionId,
     progress: Option<&SessionMigrationProgressCallback>,
-) -> SessionDbResult<Vec<(SessionEvent, Option<SessionEventCompatibilityIssue>)>> {
+) -> SessionDbResult<CanonicalMigrationHistory> {
     let rows = db
         .select("events")
         .columns(&["event_seq", "payload"])
@@ -2647,33 +2660,34 @@ async fn compatible_events_from_database(
         total,
         "Reading canonical session history",
     );
-    rows.iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let event_seq = required_non_negative_u64(row, "event_seq")?;
-            let payload = required_string(row, "payload")?;
-            let decoded = decode_session_event_compatible(&payload)?;
-            if decoded.event().sequence != event_seq {
-                return Err(SessionDbError::InvalidCanonicalSequence {
-                    expected: event_seq,
-                    actual: decoded.event().sequence,
-                });
-            }
-            let issue = decoded.issue().cloned();
-            let event = decoded.into_event();
-            let completed = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
-            if completed == total || completed % 100 == 0 {
-                report_migration_progress(
-                    progress,
-                    bcode_session_models::SessionMigrationStage::ReadingCanonicalHistory,
-                    completed,
-                    total,
-                    "Reading canonical session history",
-                );
-            }
-            Ok((event, issue))
-        })
-        .collect()
+    for (index, row) in rows.iter().enumerate() {
+        let event_seq = required_non_negative_u64(row, "event_seq")?;
+        let payload = required_string(row, "payload")?;
+        let decoded = decode_session_event_compatible(&payload)?;
+        validate_migration_event_identity(decoded.event(), event_seq, session_id)?;
+        let expected = u64::try_from(index).unwrap_or(u64::MAX);
+        if event_seq != expected {
+            return Err(SessionDbError::InvalidCanonicalSequence {
+                expected,
+                actual: event_seq,
+            });
+        }
+        let completed = expected.saturating_add(1);
+        if completed == total || completed % 100 == 0 {
+            report_migration_progress(
+                progress,
+                bcode_session_models::SessionMigrationStage::ReadingCanonicalHistory,
+                completed,
+                total,
+                "Reading canonical session history",
+            );
+        }
+    }
+    Ok(CanonicalMigrationHistory {
+        rows,
+        event_total: total,
+        session_id,
+    })
 }
 
 fn canonical_row_count_and_tail(rows: &[switchy::database::Row]) -> SessionDbResult<(u64, u64)> {
@@ -3614,10 +3628,10 @@ async fn finalize_migration_session_state(
     db: &dyn Database,
     tail: &SessionEvent,
 ) -> SessionDbResult<()> {
-    db.update("session_state")
+    db.upsert("session_state")
+        .value("session_id", tail.session_id.to_string())
         .value("last_event_seq", seq_to_value(tail.sequence))
         .value("updated_at_ms", seq_to_value(event_created_at_ms(tail)))
-        .where_eq("session_id", tail.session_id.to_string())
         .execute(db)
         .await?;
     Ok(())

@@ -204,6 +204,23 @@ Maintenance commands are explicit:
 Repair uses Bcode's native Turso stack. Stock SQLite checkpoint/repair is not the primary recovery
 path. Catalog listing, picker display, normal attach, and paged history must never invoke repair.
 
+### Expected migration duration
+
+On the deterministic generated stores used for release acceptance, migration completed in these
+ranges on the benchmark host:
+
+* about 0.2 seconds for 100 events;
+* about 7 seconds for 5,000 events;
+* about 66 seconds for 50,000 events.
+
+These are diagnostic reference points, not universal deadlines. Storage speed, canonical payload
+size, projection mix, retained sidecars, and host load all affect elapsed time. During healthy work,
+the TUI reports the active stage and stage-local natural units. A large session can spend most of
+its time rebuilding indexes. Investigate when progress stops changing rather than treating these
+host-specific figures as a timeout. Capture `bcode session diagnose <session-id>` and
+`bcode server status --verbose` for support; metrics operators should compare
+`session.migration.*_duration_ms` stage histograms to total migration duration.
+
 ### Migration troubleshooting
 
 Start every investigation with the full session UUID:

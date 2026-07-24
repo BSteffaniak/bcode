@@ -389,10 +389,15 @@ fi
 
 if ! rg -q 'benchmark_generated_legacy_session_migrations' packages/session/src/lib.rs \
   || ! rg -q 'generated_migration_benchmark_store_is_contiguous_and_legacy' packages/session/src/lib.rs \
+  || ! rg -q 'migration_acceptance_thresholds_remain_explicit' packages/session/src/lib.rs \
+  || ! rg -q 'MIGRATION_PROGRESS_OVERHEAD_PERCENT_BUDGET: u128 = 10' packages/session/src/lib.rs \
+  || ! rg -q 'MIGRATION_PROGRESS_OVERHEAD_FIXED_BUDGET_MS: u128 = 25' packages/session/src/lib.rs \
+  || ! rg -q 'CURRENT_SESSION_PREPARE_P95_BUDGET_MS: u128 = 25' packages/session/src/lib.rs \
+  || ! rg -q 'MIGRATION_REPLAY_MAX_RETAINED_DECODED_EVENTS: usize = 1' packages/session/src/lib.rs \
   || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '50_000' \
   || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '5_000' \
   || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '100'; then
-  echo "Session migration benchmark violation: deterministic small, medium, and 50k generated legacy stores must remain available without private content." >&2
+  echo "Session migration benchmark violation: deterministic generated stores and stable CI-safe acceptance thresholds must remain available without private content." >&2
   violations=1
 fi
 

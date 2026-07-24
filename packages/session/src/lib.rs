@@ -6992,7 +6992,10 @@ mod tests {
         session_id
     }
 
-    async fn decoded_log_high_water_proxy(root: &std::path::Path, session_id: SessionId) -> u64 {
+    async fn migration_history_high_water_proxy(
+        root: &std::path::Path,
+        session_id: SessionId,
+    ) -> u64 {
         let db = db::SessionDb::open_existing_turso_in_root(session_id, root)
             .await
             .expect("benchmark DB for memory proxy");
@@ -7003,20 +7006,13 @@ mod tests {
             .execute(db.database())
             .await
             .expect("benchmark canonical payloads");
-        let payload_bytes = rows.iter().fold(0_u64, |total, row| {
+        rows.iter().fold(0_u64, |total, row| {
             let bytes = match row.get("payload") {
                 Some(switchy::database::DatabaseValue::String(payload)) => payload.len(),
                 _ => panic!("benchmark canonical payload missing"),
             };
             total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
-        });
-        payload_bytes.saturating_add(
-            u64::try_from(rows.len())
-                .unwrap_or(u64::MAX)
-                .saturating_mul(
-                    u64::try_from(std::mem::size_of::<SessionEvent>()).unwrap_or(u64::MAX),
-                ),
-        )
+        })
     }
 
     async fn prepare_session_until_terminal(
@@ -7640,14 +7636,143 @@ mod tests {
         ] {
             let root = unique_temp_dir();
             let session_id = generate_legacy_migration_benchmark_store(&root, profile).await;
-            let proxy = decoded_log_high_water_proxy(&root, session_id).await;
+            let proxy = migration_history_high_water_proxy(&root, session_id).await;
             eprintln!(
-                "migration_memory_proxy profile={} events={} decoded_log_bytes={proxy}",
+                "migration_memory_proxy profile={} events={} canonical_payload_bytes={proxy} decoded_events_retained=0",
                 profile.name(),
                 profile.event_count(),
             );
             std::fs::remove_dir_all(root).expect("memory proxy cleanup");
         }
+    }
+
+    const MIGRATION_PROGRESS_OVERHEAD_PERCENT_BUDGET: u128 = 10;
+    const MIGRATION_PROGRESS_OVERHEAD_FIXED_BUDGET_MS: u128 = 25;
+    const CURRENT_SESSION_PREPARE_P95_BUDGET_MS: u128 = 25;
+    const MIGRATION_REPLAY_MAX_RETAINED_DECODED_EVENTS: usize = 1;
+
+    #[test]
+    fn migration_acceptance_thresholds_remain_explicit() {
+        assert_eq!(MIGRATION_PROGRESS_OVERHEAD_PERCENT_BUDGET, 10);
+        assert_eq!(MIGRATION_PROGRESS_OVERHEAD_FIXED_BUDGET_MS, 25);
+        assert_eq!(CURRENT_SESSION_PREPARE_P95_BUDGET_MS, 25);
+        assert_eq!(MIGRATION_REPLAY_MAX_RETAINED_DECODED_EVENTS, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual release acceptance for migration progress overhead"]
+    async fn benchmark_migration_progress_reporting_overhead() {
+        const RUNS: usize = 5;
+
+        async fn measure() -> (Vec<u128>, Vec<u128>) {
+            let mut without_progress = Vec::with_capacity(RUNS);
+            let mut with_progress = Vec::with_capacity(RUNS);
+            for index in 0..RUNS * 2 {
+                let report_progress = if index % 2 == 0 {
+                    index % 4 == 2
+                } else {
+                    index % 4 == 1
+                };
+                let root = unique_temp_dir();
+                let session_id = generate_legacy_migration_benchmark_store(
+                    &root,
+                    MigrationBenchmarkProfile::Small,
+                )
+                .await;
+                let maintenance = lease::acquire_session_maintenance_guard(&root, session_id)
+                    .expect("maintenance guard");
+                let write =
+                    lease::acquire_maintenance_session_write_lock(&maintenance, &root, session_id)
+                        .expect("write guard");
+                let updates = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let progress = report_progress.then(|| {
+                    let updates = updates.clone();
+                    std::sync::Arc::new(move |_| {
+                        updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }) as db::SessionMigrationProgressCallback
+                });
+                let started = std::time::Instant::now();
+                db::SessionDb::migrate_turso_in_root_observed(
+                    session_id,
+                    &root,
+                    &maintenance,
+                    &write,
+                    MetricsRegistry::disabled(),
+                    progress,
+                )
+                .await
+                .expect("benchmark migration");
+                let elapsed = started.elapsed().as_millis();
+                if report_progress {
+                    with_progress.push(elapsed);
+                } else {
+                    without_progress.push(elapsed);
+                }
+                if report_progress {
+                    assert!(
+                        updates.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                        "observed run must publish progress"
+                    );
+                }
+                drop(write);
+                drop(maintenance);
+                std::fs::remove_dir_all(root).expect("benchmark cleanup");
+            }
+            without_progress.sort_unstable();
+            with_progress.sort_unstable();
+            (without_progress, with_progress)
+        }
+
+        let (without_progress, with_progress) = measure().await;
+        let baseline_median = without_progress[RUNS / 2];
+        let observed_median = with_progress[RUNS / 2];
+        let budget_ms = baseline_median.saturating_mul(MIGRATION_PROGRESS_OVERHEAD_PERCENT_BUDGET)
+            / 100
+            + MIGRATION_PROGRESS_OVERHEAD_FIXED_BUDGET_MS;
+        let overhead_ms = observed_median.saturating_sub(baseline_median);
+        eprintln!(
+            "migration_progress_overhead without_ms={without_progress:?} with_ms={with_progress:?} baseline_median_ms={baseline_median} observed_median_ms={observed_median} overhead_ms={overhead_ms} budget_ms={budget_ms}"
+        );
+        assert!(
+            overhead_ms <= budget_ms,
+            "progress overhead {overhead_ms} ms exceeds budget {budget_ms} ms"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual release acceptance for current-session preparation latency"]
+    async fn benchmark_current_session_preparation_latency() {
+        const RUNS: usize = 100;
+
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(Some("current latency".to_owned()), test_working_directory())
+            .await
+            .expect("current session");
+        let mut durations = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = std::time::Instant::now();
+            let snapshot = manager
+                .prepare_session_open(session.id)
+                .await
+                .expect("prepare current session");
+            durations.push(started.elapsed().as_micros());
+            assert_eq!(snapshot.outcome, Some(SessionOpenTerminalOutcome::Ready));
+            assert_eq!(manager.active_session_migration_count().await, 0);
+        }
+        durations.sort_unstable();
+        let median_us = durations[RUNS / 2];
+        let p95_us = durations[RUNS * 95 / 100];
+        let max_us = durations[RUNS - 1];
+        eprintln!(
+            "current_session_prepare_latency runs={RUNS} median_us={median_us} p95_us={p95_us} max_us={max_us} budget_p95_ms={CURRENT_SESSION_PREPARE_P95_BUDGET_MS}"
+        );
+        assert!(
+            p95_us <= CURRENT_SESSION_PREPARE_P95_BUDGET_MS * 1_000,
+            "current-session preparation p95 {p95_us} us exceeds budget"
+        );
+        std::fs::remove_dir_all(root).expect("benchmark cleanup");
     }
 
     #[tokio::test]
