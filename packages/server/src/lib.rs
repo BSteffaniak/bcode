@@ -5971,6 +5971,28 @@ fn read_artifact_file_range(
 
 fn artifact_reference_path(uri: &str, artifact_root: &Path) -> Result<PathBuf, String> {
     if let Ok(url) = url::Url::parse(uri) {
+        if url.scheme() == "bcode-artifact" {
+            if url.host_str() != Some("invocation") {
+                return Err("artifact capability URI has an unsupported owner".to_owned());
+            }
+            let segments = url
+                .path_segments()
+                .map(Iterator::collect::<Vec<_>>)
+                .unwrap_or_default();
+            let [invocation_key, artifact_key] = segments.as_slice() else {
+                return Err("artifact capability URI has an invalid path".to_owned());
+            };
+            if ![invocation_key, artifact_key]
+                .into_iter()
+                .all(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            {
+                return Err("artifact capability URI has an invalid identity".to_owned());
+            }
+            return Ok(artifact_root
+                .join("invocation-artifacts")
+                .join(invocation_key)
+                .join(format!("{artifact_key}.bin")));
+        }
         if url.scheme() != "file" {
             return Err("artifact storage URI is not locally readable".to_owned());
         }
@@ -22330,6 +22352,18 @@ library = "test"
                 .expect("legacy absolute path"),
             PathBuf::from("/tmp/legacy-recording.bcsr")
         );
+        assert_eq!(
+            artifact_reference_path(
+                "bcode-artifact://invocation/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &root,
+            )
+            .expect("capability path"),
+            root.join("invocation-artifacts")
+                .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bin")
+        );
+        assert!(artifact_reference_path("bcode-artifact://other/a/b", &root).is_err());
+        assert!(artifact_reference_path("bcode-artifact://invocation/short/keys", &root).is_err());
         assert!(artifact_reference_path("../escape", &root).is_err());
         assert!(artifact_reference_path("https://example.com/a", &root).is_err());
     }
@@ -27383,6 +27417,101 @@ library = "test"
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn filesystem_image_bytes_persist_as_guarded_session_artifact() {
+        let workspace = tempfile::tempdir().expect("filesystem image workspace");
+        let image_path = workspace.path().join("fixture.png");
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("PNG header");
+            writer
+                .write_image_data(&[255, 0, 0, 255])
+                .expect("PNG image");
+        }
+        std::fs::write(&image_path, &png_bytes).expect("image fixture");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent sessions");
+        let session_id = sessions
+            .create_session(
+                Some("filesystem image".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let mut state = test_server_state_with_filesystem_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let result = execute_model_tool(
+            &state,
+            session_id,
+            bcode_model::ToolCall {
+                id: "filesystem-image".to_owned(),
+                name: "filesystem.read".to_owned(),
+                arguments: serde_json::json!({"path": image_path}),
+            },
+            workspace.path().to_path_buf(),
+            "bcode.filesystem".to_owned(),
+            policy_metadata(bcode_agent_profile::ToolPolicyOperation::Read {
+                paths: vec![workspace.path().display().to_string()],
+            }),
+            serde_json::Value::Null,
+            Arc::new(TurnCancelState::default()),
+            None,
+        )
+        .await
+        .expect("filesystem image result");
+        assert!(!result.is_error, "{:?}", result.content);
+        let Some(ToolInvocationResult::Artifact { artifact }) = result.semantic_result.as_ref()
+        else {
+            panic!("expected semantic image artifact");
+        };
+        assert_eq!(artifact.schema, "bcode.filesystem.image");
+        let reference = artifact
+            .refs
+            .first()
+            .expect("guarded inline image reference");
+        assert_eq!(reference.key, "inline-image");
+        assert_eq!(reference.content_type.as_deref(), Some("image/png"));
+        assert_eq!(reference.byte_len, Some(png_bytes.len() as u64));
+        let storage_uri = reference
+            .storage_uri
+            .as_deref()
+            .expect("capability URI")
+            .to_owned();
+        assert!(storage_uri.starts_with("bcode-artifact://"));
+        assert_ne!(storage_uri, image_path.to_string_lossy().as_ref());
+        append_tool_finished_event(&state, session_id, result).await;
+        let projected = bcode_session_view::build_session_view_snapshot(
+            &state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("image history"),
+        );
+        assert!(projected.tools.values().any(|tool| {
+            matches!(
+                &tool.result,
+                Some(bcode_session_view_models::ToolResultView::Artifact { artifact })
+                    if artifact.artifact.schema == "bcode.filesystem.image"
+                        && artifact.artifact.refs.iter().any(|reference| {
+                            reference.key == "inline-image"
+                                && reference.content_type.as_deref() == Some("image/png")
+                        })
+            )
+        }));
+        let guarded_path =
+            artifact_reference_path(&storage_uri, &default_session_artifact_dir(session_id))
+                .expect("resolve guarded image reference");
+        assert_eq!(
+            std::fs::read(guarded_path).expect("guarded image bytes"),
+            png_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn server_persists_filesystem_progress_as_neutral_lifecycle_only() {
         let workspace = tempfile::tempdir().expect("filesystem progress workspace");
         std::fs::write(workspace.path().join("sentinel.txt"), "sentinel")
@@ -28492,7 +28621,7 @@ library = "test"
             .expect("initial route")
             .expect("initial content");
         let initial = format!("{initial:?}");
-        assert!(initial.contains("daemon connected"));
+        assert!(initial.contains("Connected"));
         assert!(!initial.contains("HyperChad application error"));
 
         let selected = router
@@ -28836,6 +28965,181 @@ library = "test"
                             && permission.approved == Some(true)
                 ))
         );
+
+        let batch_id = "web-route-batch";
+        state
+            .pending_permission_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                batch_id.to_owned(),
+                Arc::new(PendingPermissionBatch::new(session.id)),
+            );
+        let batched_permissions = (0..3)
+            .map(|index| {
+                pending_permission_for_batch(
+                    &format!("web-route-batch-permission-{index}"),
+                    session.id,
+                    index,
+                    batch_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut pending = state.pending_permissions.lock().await;
+            for permission in &batched_permissions {
+                pending.insert(permission.summary.permission_id.clone(), permission.clone());
+            }
+        }
+        let mut permission_batch = hyperchad::router::RouteRequest::from_path(
+            "/actions/permission-batch?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        permission_batch.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        permission_batch.body = Some(Arc::new(
+            format!(
+                "session_id={}&batch_id={batch_id}&approved=false",
+                session.id
+            )
+            .into_bytes()
+            .into(),
+        ));
+        let permission_batch = router
+            .navigate(permission_batch)
+            .await
+            .expect("permission batch action route")
+            .expect("permission batch action content");
+        assert!(format!("{permission_batch:?}").contains("resolved 3 batched permissions"));
+        assert!(state.pending_permissions.lock().await.is_empty());
+        for permission in batched_permissions {
+            assert_eq!(*permission.decision.lock().await, Some(false));
+        }
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn unknown_interaction_submit_and_cancel_cross_guarded_daemon_routes() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(
+                Some("unknown interaction".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let adapter = bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+            producer_id: "unknown.plugin".to_owned(),
+            exchange_schema: "unknown.request".to_owned(),
+            min_schema_version: 7,
+            max_schema_version: 7,
+            platform_id: "test-owner".to_owned(),
+            priority: 0,
+            interaction_kind: "unknown.request".to_owned(),
+            tui_surface_kind: None,
+        };
+        state
+            .set_client_runtime_context(
+                ClientId::new(),
+                Some(ClientRuntimeContext {
+                    interaction_adapters: vec![adapter],
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        let router = bcode_hyperchad::router_from_state(bcode_hyperchad::HyperChadAppState::new(
+            bcode_client::BcodeClient::new(endpoint),
+            "unknown-route-token",
+        ));
+
+        for (index, (kind, value, expected)) in [
+            (
+                "submit",
+                Some("%7B%22accepted%22%3Atrue%7D"),
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"accepted": true}),
+                },
+            ),
+            (
+                "cancel",
+                None,
+                bcode_session_models::ToolExchangeResolution::Cancelled,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let interaction_id = format!("unknown-exchange-{index}");
+            let resolution = Arc::new(Mutex::new(None));
+            state.pending_tool_exchanges.lock().await.insert(
+                interaction_id.clone(),
+                PendingToolExchange {
+                    summary: bcode_ipc::PendingToolExchangeSummary {
+                        session_id: session.id,
+                        request: ToolExchangeRequest {
+                            invocation_id: format!("unknown-call-{index}"),
+                            exchange_id: interaction_id.clone(),
+                            producer_id: "unknown.plugin".to_owned(),
+                            schema: "unknown.request".to_owned(),
+                            schema_version: 7,
+                            payload: serde_json::json!({"original": true}),
+                            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+                        },
+                    },
+                    resolution: Arc::clone(&resolution),
+                    notify: Arc::new(Notify::new()),
+                },
+            );
+            let mut request = hyperchad::router::RouteRequest::from_path(
+                "/actions/interaction?token=unknown-route-token",
+                hyperchad::router::RequestInfo::default(),
+            );
+            request.headers.insert(
+                "content-type".to_owned(),
+                "application/x-www-form-urlencoded".to_owned(),
+            );
+            let mut body = format!(
+                "session_id={}&interaction_id={interaction_id}&kind={kind}&value_is_json=true",
+                session.id
+            );
+            if let Some(value) = value {
+                body.push_str("&value=");
+                body.push_str(value);
+            }
+            request.body = Some(Arc::new(body.into_bytes().into()));
+
+            let _rendered = router
+                .navigate(request)
+                .await
+                .expect("unknown interaction route")
+                .expect("unknown interaction content");
+            assert_eq!(*resolution.lock().await, Some(expected));
+            assert!(
+                !state
+                    .pending_tool_exchanges
+                    .lock()
+                    .await
+                    .contains_key(&interaction_id)
+            );
+        }
         server.abort();
     }
 
@@ -29687,6 +29991,21 @@ library = "test"
             request.body = Some(Arc::new(body.into_bytes().into()));
             request
         };
+        let validation = router
+            .navigate(route_input("submit", None))
+            .await
+            .expect("question validation route")
+            .expect("question validation content");
+        drop(validation);
+        assert!(
+            state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&interaction_id),
+            "validation failure must keep the exchange pending"
+        );
+
         let _activate = router
             .navigate(route_input("activate", Some("question-0.option-0")))
             .await

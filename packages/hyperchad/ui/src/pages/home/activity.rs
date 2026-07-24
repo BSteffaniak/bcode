@@ -2,11 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::theme::{color, radius, space, surface, typeface};
 use bcode_session_view_models::SessionViewSnapshot;
 use hyperchad::actions::logic::if_responsive;
 use hyperchad::template::{Containers, container};
 use hyperchad::transformer::models::LayoutDirection;
 
+use super::components::progress_status;
 use super::semantic_dom_id;
 use super::usage::runtime_usage;
 
@@ -34,14 +36,17 @@ pub(super) fn runtime_state_section(snapshot: &SessionViewSnapshot) -> Container
         },
     );
     container! {
-        section background="#161b22" border="1, #30363d" border-radius=10 padding=12 margin-bottom=18 {
-            div #runtime-summary direction=(if_responsive("narrow").then(LayoutDirection::Column).or_else(LayoutDirection::Row)) gap=18 font-size=12 {
-                div { span color="#8b949e" { "provider " } span color="#c9d1d9" { (provider) } }
-                div { span color="#8b949e" { "model " } span color="#c9d1d9" { (model) } }
-                div { span color="#8b949e" { "agent " } span color="#c9d1d9" { (agent) } }
-                div { span color="#8b949e" { "turn " } span color="#c9d1d9" { (turn) } }
+        section background=(surface::PANEL) border=((1, surface::BORDER)) border-radius=((radius::PANEL)) padding=((space::MD)) margin-bottom=((space::S18)) {
+            div #runtime-summary direction=(if_responsive("narrow").then(LayoutDirection::Column).or_else(LayoutDirection::Row)) gap=((space::S18)) font-size=((typeface::LABEL)) {
+                div { span color=(color::MUTED) { "provider " } span color=(color::TEXT) { (provider) } }
+                div { span color=(color::MUTED) { "model " } span color=(color::TEXT) { (model) } }
+                div { span color=(color::MUTED) { "agent " } span color=(color::TEXT) { (agent) } }
+                div { span color=(color::MUTED) { "turn " } span color=(color::TEXT) { (turn) } }
             }
             (runtime_usage(runtime))
+            @if let Some(progress) = &runtime.provider_progress {
+                (progress_status(&progress.detail, None, None))
+            }
         }
     }
 }
@@ -100,18 +105,18 @@ pub(super) fn active_invocations_section(
         "active invocations"
     };
     container! {
-        section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
-            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { (heading) }
+        section background=(surface::PANEL) border=((1, surface::BORDER)) border-radius=((radius::PANEL)) padding=((space::LG)) margin-bottom=((space::S18)) {
+            h2 color=(color::STRONG) font-size=((typeface::SECTION)) margin-bottom=((space::S14)) { (heading) }
             @for (invocation_id, lifecycle) in active {
                 @let item_id = semantic_dom_id("active-tool", invocation_id);
-                div id=(item_id) background="#0d1117" border="1, #30363d" border-radius=6 padding=10 margin-bottom=8 {
-                    div color="#f0f6fc" {
+                div id=(item_id) background=(surface::APP) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding=((space::S10)) margin-bottom=((space::SM)) {
+                    div color=(color::STRONG) {
                         (lifecycle.message.as_deref().unwrap_or("Tool operation in progress"))
                     }
-                    div color="#8b949e" font-size=11 margin-top=3 { (format!("{:?}", lifecycle.stage)) }
-                    details margin-top=4 {
-                        summary color="#8b949e" font-size=11 { "developer details" }
-                        div color="#8b949e" font-size=11 margin-top=3 { (invocation_id) }
+                    div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S3)) { (format!("{:?}", lifecycle.stage)) }
+                    details margin-top=((space::XS)) {
+                        summary color=(color::MUTED) font-size=((typeface::DETAIL)) { "developer details" }
+                        div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S3)) { (invocation_id) }
                     }
                 }
             }
@@ -123,26 +128,24 @@ pub(super) fn runtime_work_section(
     runtime_work: &[bcode_session_view_models::RuntimeWorkView],
 ) -> Containers {
     container! {
-        section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
-            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "runtime work" }
+        section background=(surface::PANEL) border=((1, surface::BORDER)) border-radius=((radius::PANEL)) padding=((space::LG)) margin-bottom=((space::S18)) {
+            h2 color=(color::STRONG) font-size=((typeface::SECTION)) margin-bottom=((space::S14)) { "runtime work" }
             @for work in runtime_work {
                 @let item_id = semantic_dom_id("runtime-work", &work.work_id.to_string());
-                div id=(item_id) background="#0d1117" border="1, #30363d" border-radius=6 padding=10 margin-bottom=8 {
-                    div color="#f0f6fc" {
+                div id=(item_id) background=(surface::APP) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding=((space::S10)) margin-bottom=((space::SM)) {
+                    div color=(color::STRONG) {
                         (work.label) " · " (format!("{:?}", work.status))
                     }
-                    div color="#8b949e" font-size=11 margin-top=3 { (format!("{:?}", work.kind)) }
-                    details margin-top=4 {
-                        summary color="#8b949e" font-size=11 { "developer details" }
-                        div color="#8b949e" font-size=11 margin-top=3 { (work.work_id.to_string()) }
+                    div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S3)) { (format!("{:?}", work.kind)) }
+                    details margin-top=((space::XS)) {
+                        summary color=(color::MUTED) font-size=((typeface::DETAIL)) { "developer details" }
+                        div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S3)) { (work.work_id.to_string()) }
                     }
                     @if let Some(message) = &work.message {
-                        div color="#8b949e" font-size=12 margin-top=4 { (message) }
+                        div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (message) }
                     }
-                    @if let (Some(completed), Some(total)) = (work.completed_units, work.total_units) {
-                        div color="#58a6ff" font-size=11 margin-top=4 {
-                            (completed.to_string()) "/" (total.to_string())
-                        }
+                    @if work.completed_units.is_some() || work.total_units.is_some() {
+                        (progress_status("Progress", work.completed_units, work.total_units))
                     }
                 }
             }

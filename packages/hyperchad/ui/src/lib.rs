@@ -4,4 +4,5 @@
 
 //! Portable `HyperChad` UI components for Bcode sessions.
 
+pub mod context;
 pub mod pages;

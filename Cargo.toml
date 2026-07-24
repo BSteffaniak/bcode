@@ -235,6 +235,7 @@ hyperchad_markdown = { git = "https://github.com/MoosicBox/MoosicBox.git", branc
     "xss-protection",
 ] }
 hyperchad_renderer = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
+hyperchad_renderer_html = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_template = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_transformer = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_transformer_models = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
@@ -247,6 +248,7 @@ image = { version = "0.25.10", default-features = false, features = [
 jsonschema = { version = "0.47.0", default-features = false }
 libloading = { version = "0.9.0", default-features = false }
 nvim-rs = { version = "0.9.2", default-features = false }
+open = { version = "5.4.0", default-features = false }
 partial-json-fixer = { version = "0.5.3", default-features = false }
 pdf-extract = { version = "0.10.0", default-features = false }
 pin-project-lite = { version = "0.2.17", default-features = false }
@@ -369,8 +371,23 @@ inherits  = "dev"
 opt-level = 0
 
 # HyperChad local development patches
-# [patch."https://github.com/MoosicBox/MoosicBox.git"]
-# hyperchad                         = { path = "../MoosicBox/packages/hyperchad" }
+[patch."https://github.com/MoosicBox/MoosicBox.git"]
+hyperchad                      = { path = "../../MoosicBox/packages/hyperchad" }
+hyperchad_actions              = { path = "../../MoosicBox/packages/hyperchad/actions" }
+hyperchad_app                  = { path = "../../MoosicBox/packages/hyperchad/app" }
+hyperchad_color                = { path = "../../MoosicBox/packages/hyperchad/color" }
+hyperchad_markdown             = { path = "../../MoosicBox/packages/hyperchad/markdown" }
+hyperchad_renderer             = { path = "../../MoosicBox/packages/hyperchad/renderer" }
+hyperchad_renderer_html        = { path = "../../MoosicBox/packages/hyperchad/renderer/html" }
+hyperchad_renderer_vanilla_js  = { path = "../../MoosicBox/packages/hyperchad/renderer/vanilla_js" }
+hyperchad_router               = { path = "../../MoosicBox/packages/hyperchad/router" }
+hyperchad_template             = { path = "../../MoosicBox/packages/hyperchad/template" }
+hyperchad_template_actions_dsl = { path = "../../MoosicBox/packages/hyperchad/template/actions_dsl" }
+hyperchad_template_macros      = { path = "../../MoosicBox/packages/hyperchad/template/macros" }
+hyperchad_transformer          = { path = "../../MoosicBox/packages/hyperchad/transformer" }
+hyperchad_transformer_models   = { path = "../../MoosicBox/packages/hyperchad/transformer/models" }
+switchy                        = { path = "../../MoosicBox/packages/switchy" }
+switchy_async                  = { path = "../../MoosicBox/packages/switchy/async" }
 # hyperchad_actions                 = { path = "../MoosicBox/packages/hyperchad/actions" }
 # hyperchad_app                     = { path = "../MoosicBox/packages/hyperchad/app" }
 # hyperchad_color                   = { path = "../MoosicBox/packages/hyperchad/color" }

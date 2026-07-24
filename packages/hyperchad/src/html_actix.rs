@@ -1,5 +1,8 @@
 //! HTML/Actix backend construction for the Bcode `HyperChad` application.
 
+mod context;
+
+pub use self::context::HtmlActixPresentationContext;
 use std::net::IpAddr;
 use std::sync::LazyLock;
 
@@ -13,12 +16,53 @@ use crate::{HyperChadAppState, router, router_from_state};
 
 static BACKGROUND_COLOR: LazyLock<Color> = LazyLock::new(|| Color::from_hex("#0d1117"));
 
+const ACCESSIBILITY_CSS: &str = r#"
+:where(a, button, input, select, textarea, summary):focus-visible {
+    outline: 3px solid #58a6ff;
+    outline-offset: 3px;
+}
+:where(button, input:not([type="hidden"]), select) {
+    min-height: 44px;
+}
+textarea {
+    min-height: 88px;
+}
+:where(pre, code) {
+    max-width: 100%;
+    overflow-x: auto;
+}
+img {
+    max-width: 100%;
+}
+"#;
+
+#[cfg(test)]
+pub const fn accessibility_css() -> &'static str {
+    ACCESSIBILITY_CSS
+}
+
 /// Default loopback address for the local HTML/Actix renderer.
 pub const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// Default viewport meta tag for responsive HTML rendering.
 pub static VIEWPORT: LazyLock<String> =
     LazyLock::new(|| "width=device-width, initial-scale=1".to_string());
+
+/// Build the guarded local browser launch URL for an HTML/Actix backend.
+#[must_use]
+pub fn build_launch_url(
+    address: std::net::SocketAddr,
+    access_token: &str,
+    initial_session_id: Option<bcode_session_models::SessionId>,
+) -> String {
+    let query = initial_session_id.map_or_else(
+        || format!("token={access_token}"),
+        |session_id| {
+            format!("token={access_token}&hyperchad-event-scope={access_token}:{session_id}")
+        },
+    );
+    format!("http://{address}/?{query}")
+}
 
 /// Validate a requested HTML/Actix renderer bind address.
 ///
@@ -37,16 +81,18 @@ pub const fn validate_bind_address(
 }
 
 fn with_browser_runtime(builder: AppBuilder) -> AppBuilder {
-    builder.with_static_asset_route(hyperchad::renderer::assets::StaticAssetRoute {
-        route: format!(
-            "js/{}",
-            hyperchad::renderer_vanilla_js::SCRIPT_NAME_HASHED.as_str()
-        ),
-        target: hyperchad::renderer::assets::AssetPathTarget::FileContents(
-            hyperchad::renderer_vanilla_js::SCRIPT.as_bytes().into(),
-        ),
-        not_found_behavior: None,
-    })
+    builder
+        .with_inline_css(ACCESSIBILITY_CSS)
+        .with_static_asset_route(hyperchad::renderer::assets::StaticAssetRoute {
+            route: format!(
+                "js/{}",
+                hyperchad::renderer_vanilla_js::SCRIPT_NAME_HASHED.as_str()
+            ),
+            target: hyperchad::renderer::assets::AssetPathTarget::FileContents(
+                hyperchad::renderer_vanilla_js::SCRIPT.as_bytes().into(),
+            ),
+            not_found_behavior: None,
+        })
 }
 
 /// Initialize the HTML/Actix application builder with a static initial snapshot.

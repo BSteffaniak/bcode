@@ -58,6 +58,9 @@ pub struct QuestionSnapshot {
     pub request: NormalizedQuestionRequest,
     /// Current answers.
     pub answers: Vec<QuestionAnswerPayload>,
+    /// Current validation error, when submission is not yet valid.
+    #[serde(default)]
+    pub validation_error: Option<String>,
     /// Current focus target.
     pub focus: QuestionFocusTarget,
     /// Current focused control id.
@@ -72,6 +75,7 @@ pub struct QuestionInteractionController {
     answers: Vec<QuestionAnswerPayload>,
     focus: QuestionFocusTarget,
     invalid_question_index: Option<usize>,
+    validation_error: Option<String>,
 }
 
 impl QuestionInteractionController {
@@ -94,6 +98,7 @@ impl QuestionInteractionController {
             answers,
             focus,
             invalid_question_index: None,
+            validation_error: None,
         }
     }
 
@@ -143,6 +148,7 @@ impl QuestionInteractionController {
                     } => {
                         self.toggle_option(question_index, option_index);
                         self.invalid_question_index = None;
+                        self.validation_error = None;
                     }
                     QuestionFocusTarget::Custom { .. }
                     | QuestionFocusTarget::Submit
@@ -175,6 +181,7 @@ impl QuestionInteractionController {
         self.focus = QuestionFocusTarget::Custom { question_index };
         self.set_custom(question_index, text.to_owned());
         self.invalid_question_index = None;
+        self.validation_error = None;
         InteractionOutput::Redraw
     }
 
@@ -234,11 +241,16 @@ impl QuestionInteractionController {
     fn submit(&mut self) -> InteractionOutput {
         if let Some(question_index) = self.first_invalid_required_question() {
             self.invalid_question_index = Some(question_index);
+            self.validation_error = Some(format!(
+                "Please answer required question {} before submitting.",
+                question_index.saturating_add(1)
+            ));
             self.focus = first_question_focus_target(&self.request, question_index)
                 .unwrap_or(QuestionFocusTarget::Submit);
             return InteractionOutput::Redraw;
         }
         self.invalid_question_index = None;
+        self.validation_error = None;
         let answers = self
             .answers
             .iter()
@@ -257,6 +269,7 @@ impl QuestionInteractionController {
         QuestionSnapshot {
             request: self.request.clone(),
             answers: self.answers.clone(),
+            validation_error: self.validation_error.clone(),
             focus: self.focus,
             focused_control_id: self.focus.control_id(),
             invalid_question_index: self.invalid_question_index,

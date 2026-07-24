@@ -2,11 +2,13 @@
 
 mod activity;
 mod adapters;
+mod components;
 mod composer;
 mod interactions;
 mod navigation;
 mod permissions;
 mod shell;
+mod theme;
 mod tools;
 mod transcript;
 mod usage;

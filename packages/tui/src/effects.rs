@@ -1842,6 +1842,8 @@ async fn load_pending_interactions(
             required: exchange.response_policy
                 == bcode_session_models::ToolExchangeResponsePolicy::Required,
             snapshot: Some(snapshot),
+            state: bcode_session_view_models::InteractionViewState::Pending,
+            status_detail: None,
             resolved: false,
             resolution: None,
         });

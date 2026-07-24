@@ -102,6 +102,63 @@ impl TranscriptViewItemId {
     }
 }
 
+/// Renderer-neutral daemon/session connection state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionConnectionViewStatus {
+    /// No daemon connection or session attachment has been established.
+    #[default]
+    Disconnected,
+    /// The daemon is connected, but no persisted session is attached.
+    Connected,
+    /// A persisted session is attached and receiving updates.
+    Attached,
+    /// The host is attempting to restore an interrupted session watch.
+    Reconnecting,
+    /// The host is rebuilding an authoritative view after detecting stale or missing updates.
+    Resyncing,
+    /// The connection failed and requires user attention.
+    Error(String),
+}
+
+/// Renderer-neutral persistent session catalog state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCatalogViewStatus {
+    /// Discovery has not started yet.
+    #[default]
+    NotStarted,
+    /// Discovery is in progress.
+    Loading,
+    /// Discovery completed successfully.
+    Loaded,
+    /// Discovery produced partial results.
+    Degraded(String),
+    /// Discovery failed.
+    Failed(String),
+}
+
+/// Renderer-neutral user-facing application notice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionViewNotice {
+    /// Semantic severity.
+    pub level: SessionViewNoticeLevel,
+    /// Human-readable message without transport implementation detail.
+    pub message: String,
+}
+
+/// Severity for a renderer-neutral application notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionViewNoticeLevel {
+    /// Informational status.
+    Info,
+    /// Degraded state that may recover or require attention.
+    Warning,
+    /// Action or connection failure.
+    Error,
+}
+
 /// Snapshot of the renderer-neutral state for one session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionViewSnapshot {
@@ -117,6 +174,15 @@ pub struct SessionViewSnapshot {
     pub working_directory: Option<PathBuf>,
     /// Last source event sequence included in this snapshot.
     pub latest_sequence: Option<u64>,
+    /// Current daemon/session connection state.
+    #[serde(default)]
+    pub connection_status: SessionConnectionViewStatus,
+    /// Persistent session catalog state for user-facing loading/degraded/error presentation.
+    #[serde(default)]
+    pub catalog_status: SessionCatalogViewStatus,
+    /// Human-readable action or connection notice, when the host needs to surface one.
+    #[serde(default)]
+    pub notice: Option<SessionViewNotice>,
     /// Renderer-neutral transcript items.
     pub transcript: TranscriptViewDocument,
     /// Active opaque contributions keyed by invocation and contribution identity.
@@ -155,7 +221,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 9;
+    pub const SCHEMA_VERSION: u16 = 12;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -167,6 +233,9 @@ impl SessionViewSnapshot {
             title: None,
             working_directory: None,
             latest_sequence: None,
+            connection_status: SessionConnectionViewStatus::default(),
+            catalog_status: SessionCatalogViewStatus::default(),
+            notice: None,
             transcript: TranscriptViewDocument::default(),
             contributions: BTreeMap::new(),
             active_exchanges: BTreeMap::new(),
@@ -286,7 +355,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 9;
+    pub const SCHEMA_VERSION: u16 = 12;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -1173,6 +1242,25 @@ impl Default for ThinkingViewState {
     }
 }
 
+/// Renderer-neutral lifecycle state for an interactive request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionViewState {
+    /// Awaiting input.
+    #[default]
+    Pending,
+    /// A semantic submission is being processed.
+    Submitting,
+    /// Controller validation rejected the latest input.
+    ValidationError,
+    /// Host or daemon action failed while preserving the pending request.
+    ActionError,
+    /// The request was resolved successfully.
+    Resolved,
+    /// The request was cancelled or dismissed.
+    Cancelled,
+}
+
 /// Renderer-neutral interactive request summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractionViewSummary {
@@ -1192,6 +1280,12 @@ pub struct InteractionViewSummary {
     pub required: bool,
     /// Optional snapshot payload for generic rendering.
     pub snapshot: Option<serde_json::Value>,
+    /// Current renderer-neutral lifecycle state for adjacent control status.
+    #[serde(default)]
+    pub state: InteractionViewState,
+    /// Human-readable action or validation detail associated with the current state.
+    #[serde(default)]
+    pub status_detail: Option<String>,
     /// Whether the interaction has been durably resolved.
     #[serde(default)]
     pub resolved: bool,

@@ -34,6 +34,7 @@ bmux_keyboard                = { workspace = true }
 bmux_tui                     = { workspace = true, features = ["crossterm"] }
 clap                         = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm                    = { workspace = true, features = ["events"] }
+open                         = { workspace = true, optional = true }
 rand                         = { workspace = true }
 reqwest                      = { workspace = true }
 rpassword                    = { workspace = true }
@@ -118,4 +119,8 @@ static-bundled-ralph-plugin = [
 static-bundled-shell-plugin = ["_static-bundled"]
 static-bundled-web-search-plugin = ["_static-bundled"]
 static-bundled-worktree-plugin = ["_static-bundled"]
-web-renderer = ["dep:bcode_hyperchad", "bcode_hyperchad/renderer-html-actix"]
+web-renderer = [
+    "dep:bcode_hyperchad",
+    "dep:open",
+    "bcode_hyperchad/renderer-html-actix",
+]

@@ -3549,6 +3549,8 @@ mod tests {
             title: Some("Question".to_owned()),
             required: true,
             snapshot: Some(serde_json::json!({"questions": []})),
+            state: bcode_session_view_models::InteractionViewState::Pending,
+            status_detail: None,
             resolved: false,
             resolution: None,
         };

@@ -293,6 +293,9 @@ impl QuestionTerminalRenderer {
     fn content_height(snapshot: &QuestionSnapshot, width: u16) -> u16 {
         let width = usize::from(width.max(1));
         let mut height = 1_u16;
+        if snapshot.validation_error.is_some() {
+            height = height.saturating_add(1);
+        }
         for (question_index, question) in snapshot.request.questions.iter().enumerate() {
             let required = if question.required { " *" } else { "" };
             let prompt = question.header.as_ref().map_or_else(
@@ -344,6 +347,9 @@ impl QuestionTerminalRenderer {
     fn focused_content_range(snapshot: &QuestionSnapshot, width: u16) -> (u16, u16) {
         let width = usize::from(width.max(1));
         let mut y = 1_u16;
+        if snapshot.validation_error.is_some() {
+            y = y.saturating_add(1);
+        }
         for (question_index, question) in snapshot.request.questions.iter().enumerate() {
             let required = if question.required { " *" } else { "" };
             let prompt = question.header.as_ref().map_or_else(
@@ -448,6 +454,13 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         frame.fill(area, " ", Style::new().bg(Color::Black));
         let mut content_y = 0;
         self.render_title(frame, &mut content_y);
+        if let Some(error) = &snapshot.validation_error {
+            self.render_line(
+                frame,
+                &mut content_y,
+                &Line::from_spans(vec![Span::styled(error, Style::default().fg(Color::Red))]),
+            );
+        }
         for question_index in 0..snapshot.request.questions.len() {
             self.render_question(frame, &mut content_y, snapshot, question_index);
         }

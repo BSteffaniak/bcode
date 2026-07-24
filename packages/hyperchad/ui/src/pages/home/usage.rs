@@ -1,5 +1,6 @@
 //! Compact context occupancy and token-usage presentation.
 
+use super::theme::{color, radius, space, surface, typeface};
 use bcode_session_models::SessionTokenUsage;
 use bcode_session_view_models::{SessionRuntimeViewState, UsageView};
 use hyperchad::template::{Containers, container};
@@ -10,13 +11,13 @@ fn token_value(value: Option<u32>) -> String {
 
 fn usage_details(usage: &SessionTokenUsage) -> Containers {
     container! {
-        div margin-top=8 color="#8b949e" font-size=11 {
-            div direction=row gap=8 { span { "input" } span color="#c9d1d9" { (token_value(usage.input_tokens)) } }
-            div direction=row gap=8 { span { "output" } span color="#c9d1d9" { (token_value(usage.output_tokens)) } }
-            div direction=row gap=8 { span { "cached input" } span color="#c9d1d9" { (token_value(usage.cached_input_tokens)) } }
-            div direction=row gap=8 { span { "cache write" } span color="#c9d1d9" { (token_value(usage.cache_write_input_tokens)) } }
-            div direction=row gap=8 { span { "reasoning" } span color="#c9d1d9" { (token_value(usage.reasoning_tokens)) } }
-            div direction=row gap=8 { span { "total" } span color="#c9d1d9" { (token_value(usage.metered_total_tokens())) } }
+        div margin-top=((space::SM)) color=(color::MUTED) font-size=((typeface::DETAIL)) {
+            div direction=row gap=((space::SM)) { span { "input" } span color=(color::TEXT) { (token_value(usage.input_tokens)) } }
+            div direction=row gap=((space::SM)) { span { "output" } span color=(color::TEXT) { (token_value(usage.output_tokens)) } }
+            div direction=row gap=((space::SM)) { span { "cached input" } span color=(color::TEXT) { (token_value(usage.cached_input_tokens)) } }
+            div direction=row gap=((space::SM)) { span { "cache write" } span color=(color::TEXT) { (token_value(usage.cache_write_input_tokens)) } }
+            div direction=row gap=((space::SM)) { span { "reasoning" } span color=(color::TEXT) { (token_value(usage.reasoning_tokens)) } }
+            div direction=row gap=((space::SM)) { span { "total" } span color=(color::TEXT) { (token_value(usage.metered_total_tokens())) } }
         }
     }
 }
@@ -32,27 +33,27 @@ pub(super) fn runtime_usage(runtime: &SessionRuntimeViewState) -> Containers {
         (count.tokens(), qualifier, occupancy.observation_sequence)
     });
     container! {
-        div background="#0d1117" border="1, #30363d" border-radius=8 padding=10 margin-top=10 {
-            div direction=row gap=18 font-size=12 {
+        div background=(surface::APP) border=((1, surface::BORDER)) border-radius=((radius::CARD)) padding=((space::S10)) margin-top=((space::S10)) {
+            div direction=row gap=((space::S18)) font-size=((typeface::LABEL)) {
                 div {
-                    span color="#8b949e" { "current context " }
+                    span color=(color::MUTED) { "current context " }
                     @if let Some((tokens, qualifier, _)) = context {
-                        span color="#f0f6fc" { (tokens.to_string()) " tokens" }
-                        span color="#8b949e" font-size=11 { " · " (qualifier) }
+                        span color=(color::STRONG) { (tokens.to_string()) " tokens" }
+                        span color=(color::MUTED) font-size=((typeface::DETAIL)) { " · " (qualifier) }
                     } @else {
-                        span color="#8b949e" { "not observed" }
+                        span color=(color::MUTED) { "not observed" }
                     }
                 }
                 div {
-                    span color="#8b949e" { "session usage " }
-                    span color="#f0f6fc" { (runtime.cumulative_metered_tokens.to_string()) " tokens" }
+                    span color=(color::MUTED) { "session usage " }
+                    span color=(color::STRONG) { (runtime.cumulative_metered_tokens.to_string()) " tokens" }
                 }
             }
             @if context.is_some() || runtime.latest_usage.is_some() {
-                details margin-top=8 {
-                    summary color="#58a6ff" font-size=11 { "usage details" }
+                details margin-top=((space::SM)) {
+                    summary color=(color::INFO) font-size=((typeface::DETAIL)) { "usage details" }
                     @if let Some((_, _, sequence)) = context {
-                        div color="#8b949e" font-size=11 margin-top=8 { "context observed at event " (sequence.to_string()) }
+                        div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::SM)) { "context observed at event " (sequence.to_string()) }
                     }
                     @if let Some(usage) = &runtime.latest_usage {
                         (usage_details(usage))
@@ -66,12 +67,12 @@ pub(super) fn runtime_usage(runtime: &SessionRuntimeViewState) -> Containers {
 pub(super) fn usage_transcript_item(usage: &UsageView) -> Containers {
     container! {
         div {
-            div color="#f0f6fc" {
+            div color=(color::STRONG) {
                 "Model usage · "
                 (usage.usage.metered_total_tokens().map_or_else(|| "total unavailable".to_owned(), |tokens| format!("{tokens} tokens")))
             }
-            details margin-top=6 {
-                summary color="#58a6ff" font-size=11 { "token breakdown" }
+            details margin-top=((space::S6)) {
+                summary color=(color::INFO) font-size=((typeface::DETAIL)) { "token breakdown" }
                 (usage_details(&usage.usage))
             }
         }

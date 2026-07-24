@@ -73,6 +73,7 @@ bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_vim_edit_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_web_search_plugin = { workspace = true, features = ["static-bundled"] }
 hyperchad = { workspace = true, features = ["router", "router-form"] }
+png = { workspace = true }
 switchy = { workspace = true, features = ["database", "database-schema"] }
 tempfile = { workspace = true }
 

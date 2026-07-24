@@ -9,7 +9,8 @@ mod html_actix;
 
 #[cfg(feature = "renderer-html-actix")]
 pub use html_actix::{
-    DEFAULT_BIND_ADDRESS, VIEWPORT, build_app, init, init_with_snapshot, validate_bind_address,
+    DEFAULT_BIND_ADDRESS, VIEWPORT, build_app, build_launch_url, init, init_with_snapshot,
+    validate_bind_address,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,19 +40,65 @@ pub const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// `HyperChad` application state shared by route and action handlers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HyperChadAppState {
     client: BcodeClient,
     access_token: Arc<str>,
     watched_sessions: Arc<Mutex<BTreeSet<SessionId>>>,
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
+    interaction_submissions: Arc<Mutex<BTreeSet<String>>>,
     renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+}
+
+impl std::fmt::Debug for HyperChadAppState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HyperChadAppState")
+            .field("client", &self.client)
+            .field("access_token", &"[REDACTED]")
+            .field("watched_sessions", &self.watched_sessions)
+            .field("history_windows", &self.history_windows)
+            .field("interaction_controllers", &self.interaction_controllers)
+            .field("interaction_submissions", &self.interaction_submissions)
+            .field(
+                "renderer_configured",
+                &self.renderer_tx.lock().map_or(true, |tx| tx.is_some()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Default)]
 struct LocalInteractionControllers {
     entries: BTreeMap<String, bcode_plugin_sdk::interaction::BoxedPluginInteractionController>,
+}
+
+struct InteractionSubmissionGuard {
+    interaction_id: String,
+    submissions: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl InteractionSubmissionGuard {
+    fn acquire(submissions: &Arc<Mutex<BTreeSet<String>>>, interaction_id: &str) -> Option<Self> {
+        submissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(interaction_id.to_owned())
+            .then(|| Self {
+                interaction_id: interaction_id.to_owned(),
+                submissions: Arc::clone(submissions),
+            })
+    }
+}
+
+impl Drop for InteractionSubmissionGuard {
+    fn drop(&mut self) {
+        self.submissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.interaction_id);
+    }
 }
 
 impl std::fmt::Debug for LocalInteractionControllers {
@@ -63,12 +110,33 @@ impl std::fmt::Debug for LocalInteractionControllers {
     }
 }
 
+/// Opaque renderer-owned subscription scope.
+///
+/// Bcode application code stores and forwards this value without parsing or composing it.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RenderSubscriptionScope(String);
+
+impl std::fmt::Debug for RenderSubscriptionScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RenderSubscriptionScope([REDACTED])")
+    }
+}
+
 #[derive(Debug)]
 #[cfg_attr(not(feature = "renderer-html-actix"), allow(dead_code))]
 struct ScopedSnapshotUpdate {
-    scope: String,
+    scope: RenderSubscriptionScope,
     snapshot: SessionViewSnapshot,
     sessions: Vec<SessionSummary>,
+}
+
+struct SessionWatchContext {
+    client: BcodeClient,
+    render_scope: RenderSubscriptionScope,
+    session_id: SessionId,
+    renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+    history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
+    interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,8 +273,33 @@ impl HyperChadAppState {
             watched_sessions: Arc::new(Mutex::new(BTreeSet::new())),
             history_windows: Arc::new(Mutex::new(BTreeMap::new())),
             interaction_controllers: Arc::new(Mutex::new(LocalInteractionControllers::default())),
+            interaction_submissions: Arc::new(Mutex::new(BTreeSet::new())),
             renderer_tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(feature = "renderer-html-actix")]
+    fn render_home(
+        &self,
+        snapshot: &SessionViewSnapshot,
+        sessions: &[SessionSummary],
+    ) -> hyperchad::template::Containers {
+        let context = html_actix::HtmlActixPresentationContext::new(Arc::clone(&self.access_token));
+        bcode_hyperchad_ui::pages::home::home(snapshot, sessions, &context)
+    }
+
+    #[cfg(not(feature = "renderer-html-actix"))]
+    fn render_home(
+        &self,
+        snapshot: &SessionViewSnapshot,
+        sessions: &[SessionSummary],
+    ) -> hyperchad::template::Containers {
+        let _ = self;
+        bcode_hyperchad_ui::pages::home::home(
+            snapshot,
+            sessions,
+            &bcode_hyperchad_ui::context::StaticPresentationContext,
+        )
     }
 
     fn ensure_session_watcher(&self, session_id: SessionId) {
@@ -220,20 +313,25 @@ impl HyperChadAppState {
         drop(watched);
 
         let client = self.client.clone();
-        let access_token = Arc::clone(&self.access_token);
+        #[cfg(feature = "renderer-html-actix")]
+        let render_scope =
+            html_actix::HtmlActixPresentationContext::new(Arc::clone(&self.access_token))
+                .render_scope(session_id);
+        #[cfg(not(feature = "renderer-html-actix"))]
+        let render_scope = RenderSubscriptionScope(session_id.to_string());
         let renderer_tx = Arc::clone(&self.renderer_tx);
         let history_windows = Arc::clone(&self.history_windows);
         let interaction_controllers = Arc::clone(&self.interaction_controllers);
         let watched_sessions = Arc::clone(&self.watched_sessions);
         tokio::spawn(async move {
-            if let Err(error) = Box::pin(watch_session_updates(
+            if let Err(error) = Box::pin(watch_session_updates(SessionWatchContext {
                 client,
-                access_token,
+                render_scope,
                 session_id,
-                Arc::clone(&renderer_tx),
+                renderer_tx: Arc::clone(&renderer_tx),
                 history_windows,
                 interaction_controllers,
-            ))
+            }))
             .await
             {
                 tracing::error!("HyperChad session watcher failed for {session_id}: {error}");
@@ -272,12 +370,13 @@ impl HyperChadAppState {
     pub async fn initial_state(
         &self,
     ) -> Result<(SessionViewSnapshot, Vec<SessionSummary>), ClientError> {
-        let sessions = self.client.list_sessions().await?;
-        let snapshot = self
-            .latest_session_snapshot(&sessions)
+        let session_list = self.client.list_sessions_with_status().await?;
+        let mut snapshot = self
+            .latest_session_snapshot(&session_list.sessions)
             .await?
             .unwrap_or_else(SessionViewSnapshot::empty);
-        Ok((snapshot, sessions))
+        snapshot.catalog_status = catalog_view_status(session_list.catalog_status);
+        Ok((snapshot, session_list.sessions))
     }
 
     async fn latest_session_snapshot(
@@ -409,6 +508,27 @@ async fn hydrate_pending_permissions(
     Ok(())
 }
 
+fn local_interaction_snapshot(
+    exchange: &bcode_session_models::ToolExchangeRequest,
+    interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
+) -> serde_json::Value {
+    let interaction_id = &exchange.exchange_id;
+    let mut controllers = interaction_controllers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !controllers.entries.contains_key(interaction_id)
+        && let Some(controller) = local_interaction_controller(exchange)
+    {
+        controllers
+            .entries
+            .insert(interaction_id.clone(), controller);
+    }
+    controllers.entries.get(interaction_id).map_or_else(
+        || exchange.payload.clone(),
+        |controller| controller.snapshot_json(),
+    )
+}
+
 async fn hydrate_pending_interactions(
     client: &BcodeClient,
     session_id: SessionId,
@@ -431,22 +551,11 @@ async fn hydrate_pending_interactions(
     {
         let exchange = request.request;
         let interaction_id = exchange.exchange_id.clone();
-        let snapshot = {
-            let mut controllers = interaction_controllers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !controllers.entries.contains_key(&interaction_id)
-                && let Some(controller) = local_interaction_controller(&exchange)
-            {
-                controllers
-                    .entries
-                    .insert(interaction_id.clone(), controller);
-            }
-            controllers.entries.get(&interaction_id).map_or_else(
-                || exchange.payload.clone(),
-                |controller| controller.snapshot_json(),
-            )
-        };
+        let snapshot = local_interaction_snapshot(&exchange, interaction_controllers);
+        let validation_error = snapshot
+            .get("validation_error")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
         let adapter = local_interaction_adapter(&exchange);
         let kind = adapter.as_ref().map_or_else(
             || exchange.schema.clone(),
@@ -455,6 +564,12 @@ async fn hydrate_pending_interactions(
         let surface_kind = adapter
             .and_then(|adapter| adapter.tui_surface_kind)
             .unwrap_or_else(|| exchange.schema.clone());
+        let state = if validation_error.is_some() {
+            bcode_session_view_models::InteractionViewState::ValidationError
+        } else {
+            bcode_session_view_models::InteractionViewState::Pending
+        };
+        let status_detail = validation_error;
         view.upsert_interaction(InteractionViewSummary {
             interaction_id,
             kind,
@@ -464,6 +579,8 @@ async fn hydrate_pending_interactions(
             required: exchange.response_policy
                 == bcode_session_models::ToolExchangeResponsePolicy::Required,
             snapshot: Some(snapshot),
+            state,
+            status_detail,
             resolved: false,
             resolution: None,
         });
@@ -572,12 +689,35 @@ fn apply_projection_window_metadata(
     }
 }
 
+fn catalog_view_status(
+    status: bcode_ipc::SessionCatalogStatus,
+) -> bcode_session_view_models::SessionCatalogViewStatus {
+    match status {
+        bcode_ipc::SessionCatalogStatus::NotStarted => {
+            bcode_session_view_models::SessionCatalogViewStatus::NotStarted
+        }
+        bcode_ipc::SessionCatalogStatus::Loading => {
+            bcode_session_view_models::SessionCatalogViewStatus::Loading
+        }
+        bcode_ipc::SessionCatalogStatus::Loaded => {
+            bcode_session_view_models::SessionCatalogViewStatus::Loaded
+        }
+        bcode_ipc::SessionCatalogStatus::Degraded(message) => {
+            bcode_session_view_models::SessionCatalogViewStatus::Degraded(message)
+        }
+        bcode_ipc::SessionCatalogStatus::Failed(message) => {
+            bcode_session_view_models::SessionCatalogViewStatus::Failed(message)
+        }
+    }
+}
+
 fn snapshot_from_view(
     view: &SessionView,
     attached: &AttachedSessionHistory,
 ) -> SessionViewSnapshot {
     let mut snapshot = view.snapshot().clone();
     apply_projection_window_metadata(&mut snapshot, attached.projection_window.as_ref());
+    snapshot.connection_status = bcode_session_view_models::SessionConnectionViewStatus::Attached;
     snapshot.session_id = Some(attached.session.id);
     snapshot.title = attached.session.title().map(ToOwned::to_owned);
     snapshot.working_directory = Some(attached.session.working_directory.clone());
@@ -594,6 +734,56 @@ pub fn snapshot_from_attached_history(attached: &AttachedSessionHistory) -> Sess
     snapshot_from_view(&view, attached)
 }
 
+fn client_error_message(error: &ClientError) -> String {
+    match error {
+        ClientError::Transport(_) | ClientError::Codec(_) | ClientError::DaemonStart(_) => {
+            "The local Bcode service is unavailable. Check that it is running, then try again."
+                .to_owned()
+        }
+        ClientError::RequestTimeout { .. } => {
+            "The local Bcode service did not respond in time. Try again.".to_owned()
+        }
+        ClientError::IncompatibleDaemon { .. } => {
+            "The running Bcode service is incompatible with this application. Restart Bcode and try again."
+                .to_owned()
+        }
+        ClientError::UnexpectedResponse | ClientError::UnexpectedEnvelope => {
+            "The local Bcode service returned an unexpected response. Restart Bcode and try again."
+                .to_owned()
+        }
+        ClientError::Server { code, .. } => match code.as_str() {
+            "session_not_found" => "This session is no longer available.".to_owned(),
+            "session_active_elsewhere" => {
+                "This session is active in another client and cannot perform that action here."
+                    .to_owned()
+            }
+            "session_repair_required" | "projection_stale" => {
+                "This session needs repair before its full history is available.".to_owned()
+            }
+            "session_unavailable" | "session_writer_incompatible" => {
+                "This session is temporarily unavailable.".to_owned()
+            }
+            "daemon_busy" => "Bcode is busy. Wait a moment, then try again.".to_owned(),
+            _ => "The action could not be completed. Try again.".to_owned(),
+        },
+    }
+}
+
+#[cfg(feature = "renderer-html-actix")]
+fn artifact_read_error_message(error: &ClientError) -> &'static str {
+    match error {
+        ClientError::Server { code, .. }
+            if matches!(
+                code.as_str(),
+                "artifact_not_found" | "artifact_unavailable" | "artifact_read_failed"
+            ) =>
+        {
+            "Image preview is unavailable. The session artifact may need to be regenerated."
+        }
+        _ => "Image preview is temporarily unavailable.",
+    }
+}
+
 /// Build a state-backed application router.
 #[must_use]
 pub fn router_from_state(state: HyperChadAppState) -> Router {
@@ -605,8 +795,10 @@ pub fn router_from_state(state: HyperChadAppState) -> Router {
     let permission_state = state.clone();
     let permission_batch_state = state.clone();
     let history_state = state.clone();
+    #[cfg(feature = "renderer-html-actix")]
+    let artifact_state = state.clone();
     let interaction_state = state;
-    Router::new()
+    let router = Router::new()
         .with_route("/", move |request| {
             let state = root_state.clone();
             async move {
@@ -660,19 +852,31 @@ pub fn router_from_state(state: HyperChadAppState) -> Router {
         .with_route("/actions/interaction", move |request| {
             let state = interaction_state.clone();
             async move { state.handle_interaction(request).await }
-        })
+        });
+    #[cfg(feature = "renderer-html-actix")]
+    let router = router.with_route(
+        RoutePath::LiteralPrefix("/artifacts/".to_owned()),
+        move |request| {
+            let state = artifact_state.clone();
+            async move { state.handle_artifact(request).await }
+        },
+    );
+    router
 }
 
 impl HyperChadAppState {
     async fn render_initial(&self) -> hyperchad::template::Containers {
         match self.initial_state().await {
-            Ok((snapshot, sessions)) => {
+            Ok((mut snapshot, sessions)) => {
                 if let Some(session_id) = snapshot.session_id {
                     self.ensure_session_watcher(session_id);
+                } else {
+                    snapshot.connection_status =
+                        bcode_session_view_models::SessionConnectionViewStatus::Connected;
                 }
-                bcode_hyperchad_ui::pages::home::home(&snapshot, &sessions, self.access_token())
+                self.render_home(&snapshot, &sessions)
             }
-            Err(error) => error_page(&error.to_string()),
+            Err(error) => error_page(&client_error_message(&error)),
         }
     }
 
@@ -680,14 +884,17 @@ impl HyperChadAppState {
         &self,
         request: &RouteRequest,
     ) -> hyperchad::template::Containers {
-        let sessions = match self.client.list_sessions().await {
-            Ok(sessions) => sessions,
-            Err(error) => return error_page(&error.to_string()),
+        let session_list = match self.client.list_sessions_with_status().await {
+            Ok(list) => list,
+            Err(error) => return error_page(&client_error_message(&error)),
         };
+        let catalog_status = catalog_view_status(session_list.catalog_status);
+        let sessions = session_list.sessions;
         let Some(session_id) = session_id_from_path(&request.path) else {
             return error_page("invalid session path");
         };
-        self.render_session(session_id, &sessions).await
+        self.render_session(session_id, &sessions, catalog_status)
+            .await
     }
 
     async fn handle_submit_message(
@@ -697,9 +904,10 @@ impl HyperChadAppState {
         if !self.authorizes(&request) {
             return unauthorized_page();
         }
-        let form = match request.parse_form::<PromptForm>() {
-            Ok(form) => form,
-            Err(error) => return error_page(&error.to_string()),
+        let Ok(form) = request.parse_form::<PromptForm>() else {
+            return error_page(
+                "The submitted form could not be read. Review the fields and try again.",
+            );
         };
         let session_id = form.session_id.as_deref().and_then(parse_session_id);
         if form.text.trim().is_empty() {
@@ -710,7 +918,11 @@ impl HyperChadAppState {
         let launch_working_directory = if session_id.is_none() {
             match std::env::current_dir() {
                 Ok(working_directory) => Some(working_directory),
-                Err(error) => return error_page(&error.to_string()),
+                Err(_) => {
+                    return error_page(
+                        "Bcode could not determine the working directory for a new session.",
+                    );
+                }
             }
         } else {
             None
@@ -737,7 +949,7 @@ impl HyperChadAppState {
                     .await
             }
             Err(error) => {
-                self.render_session_or_initial(session_id, &error.to_string())
+                self.render_session_or_initial(session_id, &client_error_message(&error))
                     .await
             }
         }
@@ -747,9 +959,10 @@ impl HyperChadAppState {
         if !self.authorizes(&request) {
             return unauthorized_page();
         }
-        let form = match request.parse_form::<CancelTurnForm>() {
-            Ok(form) => form,
-            Err(error) => return error_page(&error.to_string()),
+        let Ok(form) = request.parse_form::<CancelTurnForm>() else {
+            return error_page(
+                "The submitted form could not be read. Review the fields and try again.",
+            );
         };
         let Some(session_id) = parse_session_id(&form.session_id) else {
             return error_page("invalid session id");
@@ -764,7 +977,7 @@ impl HyperChadAppState {
                     .await
             }
             Err(error) => {
-                self.render_session_or_initial(Some(session_id), &error.to_string())
+                self.render_session_or_initial(Some(session_id), &client_error_message(&error))
                     .await
             }
         }
@@ -781,9 +994,10 @@ impl HyperChadAppState {
         else {
             return error_page("invalid session path");
         };
-        let form = match request.parse_form::<UpdateDraftForm>() {
-            Ok(form) => form,
-            Err(error) => return error_page(&error.to_string()),
+        let Ok(form) = request.parse_form::<UpdateDraftForm>() else {
+            return error_page(
+                "The submitted form could not be read. Review the fields and try again.",
+            );
         };
         let action = SessionViewAction::UpdateDraft {
             scope: ComposerDraftViewScope::Session { session_id },
@@ -795,7 +1009,7 @@ impl HyperChadAppState {
                     .await
             }
             Err(error) => {
-                self.render_session_or_initial(Some(session_id), &error.to_string())
+                self.render_session_or_initial(Some(session_id), &client_error_message(&error))
                     .await
             }
         }
@@ -805,9 +1019,10 @@ impl HyperChadAppState {
         if !self.authorizes(&request) {
             return unauthorized_page();
         }
-        let form = match request.parse_form::<PermissionForm>() {
-            Ok(form) => form,
-            Err(error) => return error_page(&error.to_string()),
+        let Ok(form) = request.parse_form::<PermissionForm>() else {
+            return error_page(
+                "The submitted form could not be read. Review the fields and try again.",
+            );
         };
         let (session_id, action) = match permission_action(form) {
             Ok(value) => value,
@@ -819,7 +1034,7 @@ impl HyperChadAppState {
                     .await
             }
             Err(error) => {
-                self.render_session_or_initial(Some(session_id), &error.to_string())
+                self.render_session_or_initial(Some(session_id), &client_error_message(&error))
                     .await
             }
         }
@@ -832,9 +1047,10 @@ impl HyperChadAppState {
         if !self.authorizes(&request) {
             return unauthorized_page();
         }
-        let form = match request.parse_form::<PermissionBatchForm>() {
-            Ok(form) => form,
-            Err(error) => return error_page(&error.to_string()),
+        let Ok(form) = request.parse_form::<PermissionBatchForm>() else {
+            return error_page(
+                "The submitted form could not be read. Review the fields and try again.",
+            );
         };
         let (session_id, action) = match permission_batch_action(form) {
             Ok(value) => value,
@@ -855,7 +1071,7 @@ impl HyperChadAppState {
                     .await
             }
             Err(error) => {
-                self.render_session_or_initial(Some(session_id), &error.to_string())
+                self.render_session_or_initial(Some(session_id), &client_error_message(&error))
                     .await
             }
         }
@@ -868,9 +1084,10 @@ impl HyperChadAppState {
         if !self.authorizes(&request) {
             return unauthorized_page();
         }
-        let form = match request.parse_form::<HistoryWindowForm>() {
-            Ok(form) => form,
-            Err(error) => return error_page(&error.to_string()),
+        let Ok(form) = request.parse_form::<HistoryWindowForm>() else {
+            return error_page(
+                "The submitted form could not be read. Review the fields and try again.",
+            );
         };
         let Some(session_id) = parse_session_id(&form.session_id) else {
             return error_page("invalid session id");
@@ -888,7 +1105,7 @@ impl HyperChadAppState {
         let request = hyperchad_projection_window_request_for_anchor(anchor, direction);
         let mut connection = match self.client.connect("bcode-hyperchad-history").await {
             Ok(connection) => connection,
-            Err(error) => return error_page(&error.to_string()),
+            Err(error) => return error_page(&client_error_message(&error)),
         };
         let attached = match attach_hyperchad_projection_window_with_request(
             &mut connection,
@@ -898,7 +1115,7 @@ impl HyperChadAppState {
         .await
         {
             Ok(attached) => attached,
-            Err(error) => return error_page(&error.to_string()),
+            Err(error) => return error_page(&client_error_message(&error)),
         };
         let at_tail = attached
             .projection_window
@@ -915,7 +1132,12 @@ impl HyperChadAppState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(session_id, request);
         }
-        let snapshot = match session_view_from_attached_history(
+        let session_list = match self.client.list_sessions_with_status().await {
+            Ok(list) => list,
+            Err(error) => return error_page(&client_error_message(&error)),
+        };
+        let sessions = session_list.sessions.clone();
+        let mut snapshot = match session_view_from_attached_history(
             &self.client,
             attached,
             &self.interaction_controllers,
@@ -923,13 +1145,10 @@ impl HyperChadAppState {
         .await
         {
             Ok(snapshot) => snapshot,
-            Err(error) => return error_page(&error.to_string()),
+            Err(error) => return error_page(&client_error_message(&error)),
         };
-        let sessions = match self.client.list_sessions().await {
-            Ok(sessions) => sessions,
-            Err(error) => return error_page(&error.to_string()),
-        };
-        bcode_hyperchad_ui::pages::home::home(&snapshot, &sessions, self.access_token())
+        snapshot.catalog_status = catalog_view_status(session_list.catalog_status);
+        self.render_home(&snapshot, &sessions)
     }
 
     fn apply_local_interaction_input(
@@ -955,13 +1174,15 @@ impl HyperChadAppState {
             .map(|controller| controller.handle_input(input))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_interaction(&self, request: RouteRequest) -> hyperchad::template::Containers {
         if !self.authorizes(&request) {
             return unauthorized_page();
         }
-        let form = match request.parse_form::<InteractionForm>() {
-            Ok(form) => form,
-            Err(error) => return error_page(&error.to_string()),
+        let Ok(form) = request.parse_form::<InteractionForm>() else {
+            return error_page(
+                "The submitted form could not be read. Review the fields and try again.",
+            );
         };
         let Some(session_id) = parse_session_id(&form.session_id) else {
             return error_page("invalid session id");
@@ -974,12 +1195,12 @@ impl HyperChadAppState {
                     .await;
             }
         };
-        let interaction_id = form.interaction_id;
+        let interaction_id = form.interaction_id.clone();
         let exchanges = match self.client.list_pending_tool_exchanges().await {
             Ok(exchanges) => exchanges,
             Err(error) => {
                 return self
-                    .render_session_or_initial(Some(session_id), &error.to_string())
+                    .render_session_or_initial(Some(session_id), &client_error_message(&error))
                     .await;
             }
         };
@@ -994,34 +1215,66 @@ impl HyperChadAppState {
                 .render_session_or_initial(Some(session_id), "interaction is no longer pending")
                 .await;
         };
-        let Some(output) = self.apply_local_interaction_input(&exchange, input) else {
+        let controller_output = self.apply_local_interaction_input(&exchange, input);
+        let resolution_and_status = if let Some(output) = controller_output {
+            match output {
+                bcode_tool::InteractionOutput::None | bcode_tool::InteractionOutput::Redraw => {
+                    return self
+                        .render_session_or_initial(Some(session_id), "interaction input accepted")
+                        .await;
+                }
+                bcode_tool::InteractionOutput::Submitted { payload } => (
+                    bcode_session_models::ToolExchangeResolution::Responded { payload },
+                    "interaction submitted",
+                ),
+                bcode_tool::InteractionOutput::Cancelled => (
+                    bcode_session_models::ToolExchangeResolution::Cancelled,
+                    "interaction cancelled",
+                ),
+            }
+        } else {
+            match generic_interaction_resolution(&exchange, &form) {
+                Ok(Some(resolution)) => resolution,
+                Ok(None) => {
+                    return self
+                        .render_session_or_initial(
+                            Some(session_id),
+                            "This interaction supports only submit or cancel in the generic controls.",
+                        )
+                        .await;
+                }
+                Err(message) => {
+                    return self
+                        .render_session_or_initial(Some(session_id), &message)
+                        .await;
+                }
+            }
+        };
+        let (resolution, status) = resolution_and_status;
+        let Some(_submission) = InteractionSubmissionGuard::acquire(
+            &self.interaction_submissions,
+            &exchange.exchange_id,
+        ) else {
             return self
-                .render_session_or_initial(
-                    Some(session_id),
-                    "no local renderer adapter supports this interaction",
+                .render_interaction_status(
+                    session_id,
+                    &exchange.exchange_id,
+                    bcode_session_view_models::InteractionViewState::Submitting,
+                    "Interaction response is already being submitted.",
                 )
                 .await;
         };
-        let (resolution, status) = match output {
-            bcode_tool::InteractionOutput::None | bcode_tool::InteractionOutput::Redraw => {
-                return self
-                    .render_session_or_initial(Some(session_id), "interaction input accepted")
-                    .await;
-            }
-            bcode_tool::InteractionOutput::Submitted { payload } => (
-                bcode_session_models::ToolExchangeResolution::Responded { payload },
-                "interaction submitted",
-            ),
-            bcode_tool::InteractionOutput::Cancelled => (
-                bcode_session_models::ToolExchangeResolution::Cancelled,
-                "interaction cancelled",
-            ),
+        let client = if local_interaction_adapter(&exchange).is_none() {
+            self.client
+                .clone()
+                .with_interaction_adapter(generic_interaction_adapter(&exchange))
+        } else {
+            self.client.clone()
         };
-        match self
-            .client
+        let result = client
             .resolve_tool_exchange(exchange.exchange_id.clone(), resolution)
-            .await
-        {
+            .await;
+        match result {
             Ok(true) => {
                 self.interaction_controllers
                     .lock()
@@ -1036,9 +1289,95 @@ impl HyperChadAppState {
                     .await
             }
             Err(error) => {
-                self.render_session_or_initial(Some(session_id), &error.to_string())
-                    .await
+                self.render_interaction_status(
+                    session_id,
+                    &exchange.exchange_id,
+                    bcode_session_view_models::InteractionViewState::ActionError,
+                    client_error_message(&error),
+                )
+                .await
             }
+        }
+    }
+
+    #[cfg(feature = "renderer-html-actix")]
+    async fn handle_artifact(&self, request: RouteRequest) -> hyperchad::renderer::Content {
+        const MAX_INLINE_IMAGE_BYTES: u32 = 1024 * 1024;
+
+        let error = |message: &str| hyperchad::renderer::Content::Raw {
+            data: message.as_bytes().to_vec().into(),
+            content_type: "text/plain; charset=utf-8".to_owned(),
+        };
+        if !self.authorizes(&request) {
+            return error("artifact access is not authorized");
+        }
+        let Some(session_id) = request
+            .path
+            .strip_prefix("/artifacts/")
+            .and_then(parse_session_id)
+        else {
+            return error("invalid session artifact path");
+        };
+        let Some(artifact_id) = request.query.get("artifact_id") else {
+            return error("missing artifact id");
+        };
+        let Some(reference_key) = request.query.get("reference_key") else {
+            return error("missing artifact reference key");
+        };
+        let range = match self
+            .client
+            .session_artifact_range(
+                session_id,
+                artifact_id.clone(),
+                reference_key.clone(),
+                0,
+                MAX_INLINE_IMAGE_BYTES,
+            )
+            .await
+        {
+            Ok(range) => range,
+            Err(client_error) => return error(artifact_read_error_message(&client_error)),
+        };
+        let Some(content_type) = range.content_type.as_deref() else {
+            return error("artifact has no declared content type");
+        };
+        if !is_safe_inline_image_content_type(content_type) {
+            return error("artifact is not a supported image resource");
+        }
+        if !range.is_eof() || range.complete == Some(false) {
+            return error("image artifact exceeds the safe inline preview limit");
+        }
+        hyperchad::renderer::Content::Raw {
+            data: range.bytes.into(),
+            content_type: content_type.to_owned(),
+        }
+    }
+
+    async fn render_interaction_status(
+        &self,
+        session_id: SessionId,
+        interaction_id: &str,
+        state: bcode_session_view_models::InteractionViewState,
+        detail: impl Into<String>,
+    ) -> hyperchad::template::Containers {
+        let session_list = match self.client.list_sessions_with_status().await {
+            Ok(list) => list,
+            Err(error) => return error_page(&client_error_message(&error)),
+        };
+        let sessions = session_list.sessions;
+        match self.session_snapshot(session_id).await {
+            Ok(mut snapshot) => {
+                if let Some(interaction) = snapshot
+                    .interactions
+                    .iter_mut()
+                    .find(|interaction| interaction.interaction_id == interaction_id)
+                {
+                    interaction.state = state;
+                    interaction.status_detail = Some(detail.into());
+                }
+                self.render_home(&snapshot, &sessions)
+            }
+            Err(error) => error_page(&client_error_message(&error)),
         }
     }
 
@@ -1047,21 +1386,27 @@ impl HyperChadAppState {
         session_id: Option<SessionId>,
         status: &str,
     ) -> hyperchad::template::Containers {
-        let sessions = match self.client.list_sessions().await {
-            Ok(sessions) => sessions,
-            Err(error) => return error_page(&error.to_string()),
+        let (notice_level, notice_message) = semantic_notice(status);
+        let session_list = match self.client.list_sessions_with_status().await {
+            Ok(list) => list,
+            Err(error) => return error_page(&client_error_message(&error)),
         };
+        let catalog_status = catalog_view_status(session_list.catalog_status);
+        let sessions = session_list.sessions;
         match session_id {
             Some(session_id) => {
-                self.render_session_with_status(session_id, &sessions, status)
+                self.render_session_with_status(session_id, &sessions, catalog_status, status)
                     .await
             }
             None => match self.initial_state().await {
                 Ok((mut snapshot, sessions)) => {
-                    snapshot.composer.disabled_reason = Some(status.to_owned());
-                    bcode_hyperchad_ui::pages::home::home(&snapshot, &sessions, self.access_token())
+                    snapshot.notice = Some(bcode_session_view_models::SessionViewNotice {
+                        level: notice_level,
+                        message: notice_message,
+                    });
+                    self.render_home(&snapshot, &sessions)
                 }
-                Err(error) => error_page(&error.to_string()),
+                Err(error) => error_page(&client_error_message(&error)),
             },
         }
     }
@@ -1070,9 +1415,10 @@ impl HyperChadAppState {
         &self,
         session_id: SessionId,
         sessions: &[SessionSummary],
+        catalog_status: bcode_session_view_models::SessionCatalogViewStatus,
     ) -> hyperchad::template::Containers {
         self.ensure_session_watcher(session_id);
-        self.render_session_with_status(session_id, sessions, "connected")
+        self.render_session_with_status(session_id, sessions, catalog_status, "connected")
             .await
     }
 
@@ -1080,15 +1426,95 @@ impl HyperChadAppState {
         &self,
         session_id: SessionId,
         sessions: &[SessionSummary],
+        catalog_status: bcode_session_view_models::SessionCatalogViewStatus,
         status: &str,
     ) -> hyperchad::template::Containers {
         match self.session_snapshot(session_id).await {
             Ok(mut snapshot) => {
-                snapshot.composer.disabled_reason = Some(status.to_owned());
-                bcode_hyperchad_ui::pages::home::home(&snapshot, sessions, self.access_token())
+                snapshot.catalog_status = catalog_status;
+                let (level, message) = semantic_notice(status);
+                snapshot.notice =
+                    Some(bcode_session_view_models::SessionViewNotice { level, message });
+                self.render_home(&snapshot, sessions)
             }
-            Err(error) => error_page(&error.to_string()),
+            Err(error) => error_page(&client_error_message(&error)),
         }
+    }
+}
+
+fn semantic_notice(status: &str) -> (bcode_session_view_models::SessionViewNoticeLevel, String) {
+    let normalized = status.to_ascii_lowercase();
+    let level = if [
+        "error",
+        "failed",
+        "invalid",
+        "cannot",
+        "unavailable",
+        "no longer",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+    {
+        bcode_session_view_models::SessionViewNoticeLevel::Error
+    } else if ["reconnect", "resync", "degraded", "repair", "pending"]
+        .iter()
+        .any(|term| normalized.contains(term))
+    {
+        bcode_session_view_models::SessionViewNoticeLevel::Warning
+    } else {
+        bcode_session_view_models::SessionViewNoticeLevel::Info
+    };
+    let message = match normalized.as_str() {
+        "connected" => "Connected to the session.".to_owned(),
+        "interaction is no longer pending" => {
+            "This interaction was already resolved elsewhere.".to_owned()
+        }
+        _ => status.to_owned(),
+    };
+    (level, message)
+}
+
+fn generic_interaction_resolution(
+    exchange: &bcode_session_models::ToolExchangeRequest,
+    form: &InteractionForm,
+) -> Result<Option<(bcode_session_models::ToolExchangeResolution, &'static str)>, String> {
+    match form.kind {
+        InteractionInputKind::Cancel => Ok(Some((
+            bcode_session_models::ToolExchangeResolution::Cancelled,
+            "interaction cancelled",
+        ))),
+        InteractionInputKind::Submit => {
+            let payload = match form.value.as_deref() {
+                Some(value) if form.value_is_json => serde_json::from_str(value)
+                    .map_err(|error| format!("invalid interaction response JSON: {error}"))?,
+                Some(value) => serde_json::Value::String(value.to_owned()),
+                None => exchange.payload.clone(),
+            };
+            Ok(Some((
+                bcode_session_models::ToolExchangeResolution::Responded { payload },
+                "interaction submitted",
+            )))
+        }
+        InteractionInputKind::Activate
+        | InteractionInputKind::Change
+        | InteractionInputKind::Focus
+        | InteractionInputKind::Blur
+        | InteractionInputKind::Navigate => Ok(None),
+    }
+}
+
+fn generic_interaction_adapter(
+    exchange: &bcode_session_models::ToolExchangeRequest,
+) -> bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+    bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+        producer_id: exchange.producer_id.clone(),
+        exchange_schema: exchange.schema.clone(),
+        min_schema_version: exchange.schema_version,
+        max_schema_version: exchange.schema_version,
+        platform_id: "web-generic".to_owned(),
+        priority: 0,
+        interaction_kind: exchange.schema.clone(),
+        tui_surface_kind: None,
     }
 }
 
@@ -1147,6 +1573,14 @@ fn interaction_input_from_form(
     }
 }
 
+#[cfg(feature = "renderer-html-actix")]
+fn is_safe_inline_image_content_type(content_type: &str) -> bool {
+    matches!(
+        content_type.split(';').next().map(str::trim),
+        Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+    )
+}
+
 fn session_id_from_path(path: &str) -> Option<SessionId> {
     path.strip_prefix("/session/").and_then(parse_session_id)
 }
@@ -1162,8 +1596,18 @@ fn unauthorized_page() -> hyperchad::template::Containers {
 fn error_page(message: &str) -> hyperchad::template::Containers {
     let mut snapshot = SessionViewSnapshot::empty();
     snapshot.title = Some("HyperChad application error".to_owned());
-    snapshot.composer.disabled_reason = Some(message.to_owned());
-    bcode_hyperchad_ui::pages::home::home(&snapshot, &[], "")
+    snapshot.connection_status = bcode_session_view_models::SessionConnectionViewStatus::Error(
+        "The application could not load session data.".to_owned(),
+    );
+    snapshot.notice = Some(bcode_session_view_models::SessionViewNotice {
+        level: bcode_session_view_models::SessionViewNoticeLevel::Error,
+        message: message.to_owned(),
+    });
+    bcode_hyperchad_ui::pages::home::home(
+        &snapshot,
+        &[],
+        &bcode_hyperchad_ui::context::StaticPresentationContext,
+    )
 }
 
 /// Build the application router for the current snapshot and session list.
@@ -1174,7 +1618,13 @@ pub fn router(snapshot: SessionViewSnapshot, sessions: Vec<SessionSummary>) -> R
     Router::new().with_static_route(&["/", "/session"], move |_| {
         let snapshot = Arc::clone(&snapshot);
         let sessions = Arc::clone(&sessions);
-        async move { bcode_hyperchad_ui::pages::home::home(&snapshot, &sessions, "") }
+        async move {
+            bcode_hyperchad_ui::pages::home::home(
+                &snapshot,
+                &sessions,
+                &bcode_hyperchad_ui::context::StaticPresentationContext,
+            )
+        }
     })
 }
 
@@ -1276,106 +1726,199 @@ fn apply_watched_event(
     }
 }
 
-async fn watch_session_updates(
-    client: BcodeClient,
-    access_token: Arc<str>,
-    session_id: SessionId,
-    renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
-    history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
-    interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
-) -> Result<(), ClientError> {
-    let (mut watcher, mut attached, mut view) = loop {
-        match attach_watched_session(&client, session_id, &interaction_controllers).await {
-            Ok(state) => break state,
+type AttachedWatchState = (SessionWatcher, AttachedSessionHistory, SessionView);
+
+async fn attach_watch_with_retry(
+    context: &SessionWatchContext,
+    operation: &str,
+) -> Result<Option<AttachedWatchState>, ClientError> {
+    loop {
+        match attach_watched_session(
+            &context.client,
+            context.session_id,
+            &context.interaction_controllers,
+        )
+        .await
+        {
+            Ok(state) => return Ok(Some(state)),
             Err(error) => {
-                if browser_update_sender(&renderer_tx).is_none() {
-                    return Ok(());
+                if browser_update_sender(&context.renderer_tx).is_none() {
+                    return Ok(None);
                 }
-                tracing::warn!("HyperChad session watcher attach failed for {session_id}: {error}");
+                tracing::warn!(
+                    "HyperChad session watcher {operation} failed for {}: {error}",
+                    context.session_id
+                );
                 tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
             }
         }
+    }
+}
+
+async fn send_connection_update(
+    context: &SessionWatchContext,
+    attached: &AttachedSessionHistory,
+    view: &SessionView,
+    status: bcode_session_view_models::SessionConnectionViewStatus,
+) -> Result<bool, ClientError> {
+    let Some(sender) = browser_update_sender(&context.renderer_tx) else {
+        return Ok(false);
+    };
+    let session_list = context.client.list_sessions_with_status().await;
+    let (sessions, catalog_status) = match session_list {
+        Ok(list) => (list.sessions, catalog_view_status(list.catalog_status)),
+        Err(_) => (
+            vec![attached.session.clone()],
+            bcode_session_view_models::SessionCatalogViewStatus::Degraded(
+                "Session navigation is temporarily unavailable while reconnecting.".to_owned(),
+            ),
+        ),
+    };
+    let mut snapshot = watched_session_snapshot(
+        &context.client,
+        context.session_id,
+        attached,
+        view,
+        &context.history_windows,
+        &context.interaction_controllers,
+    )
+    .await
+    .unwrap_or_else(|_| snapshot_from_view(view, attached));
+    snapshot.connection_status = status;
+    snapshot.catalog_status = catalog_status;
+    Ok(sender
+        .send(ScopedSnapshotUpdate {
+            scope: context.render_scope.clone(),
+            snapshot,
+            sessions,
+        })
+        .await
+        .is_ok())
+}
+
+async fn send_watched_snapshot(
+    context: &SessionWatchContext,
+    attached: &mut AttachedSessionHistory,
+    view: &SessionView,
+) -> Result<bool, ClientError> {
+    let session_list = context.client.list_sessions_with_status().await?;
+    if let Some(summary) = session_list
+        .sessions
+        .iter()
+        .find(|summary| summary.id == context.session_id)
+    {
+        attached.session.clone_from(summary);
+    }
+    let mut snapshot = watched_session_snapshot(
+        &context.client,
+        context.session_id,
+        attached,
+        view,
+        &context.history_windows,
+        &context.interaction_controllers,
+    )
+    .await?;
+    snapshot.catalog_status = catalog_view_status(session_list.catalog_status);
+    let Some(sender) = browser_update_sender(&context.renderer_tx) else {
+        return Ok(false);
+    };
+    Ok(sender
+        .send(ScopedSnapshotUpdate {
+            scope: context.render_scope.clone(),
+            snapshot,
+            sessions: session_list.sessions,
+        })
+        .await
+        .is_ok())
+}
+
+async fn watch_session_updates(context: SessionWatchContext) -> Result<(), ClientError> {
+    let SessionWatchContext {
+        client,
+        session_id,
+        renderer_tx,
+        interaction_controllers,
+        ..
+    } = &context;
+    let Some((mut watcher, mut attached, mut view)) =
+        attach_watch_with_retry(&context, "attach").await?
+    else {
+        return Ok(());
     };
 
     loop {
         let event = match watcher.next_event().await {
             Ok(event) => event,
             Err(error) => {
-                if browser_update_sender(&renderer_tx).is_none() {
+                if browser_update_sender(renderer_tx).is_none() {
                     return Ok(());
                 }
                 tracing::warn!("HyperChad session watcher disconnected for {session_id}: {error}");
-                tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
-                match attach_watched_session(&client, session_id, &interaction_controllers).await {
-                    Ok((new_watcher, new_attached, new_view)) => {
-                        watcher = new_watcher;
-                        attached = new_attached;
-                        view = new_view;
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "HyperChad session watcher reconnect failed for {session_id}: {error}"
-                        );
-                        continue;
-                    }
+                if !send_connection_update(
+                    &context,
+                    &attached,
+                    &view,
+                    bcode_session_view_models::SessionConnectionViewStatus::Reconnecting,
+                )
+                .await?
+                {
+                    return Ok(());
                 }
+                tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
+                let Some((new_watcher, new_attached, new_view)) =
+                    attach_watch_with_retry(&context, "reconnect").await?
+                else {
+                    return Ok(());
+                };
+                watcher = new_watcher;
+                attached = new_attached;
+                view = new_view;
+                if !send_connection_update(
+                    &context,
+                    &attached,
+                    &view,
+                    bcode_session_view_models::SessionConnectionViewStatus::Attached,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                continue;
             }
         };
 
-        let resync = apply_watched_event(&mut view, session_id, event);
+        let resync = apply_watched_event(&mut view, *session_id, event);
 
         if resync {
-            let state = loop {
-                match attach_watched_session(&client, session_id, &interaction_controllers).await {
-                    Ok(state) => break state,
-                    Err(error) => {
-                        if browser_update_sender(&renderer_tx).is_none() {
-                            return Ok(());
-                        }
-                        tracing::warn!(
-                            "HyperChad session watcher resync failed for {session_id}: {error}"
-                        );
-                        tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
-                    }
-                }
+            if !send_connection_update(
+                &context,
+                &attached,
+                &view,
+                bcode_session_view_models::SessionConnectionViewStatus::Resyncing,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            let Some(state) = attach_watch_with_retry(&context, "resync").await? else {
+                return Ok(());
             };
             (watcher, attached, view) = state;
         } else {
-            hydrate_session_model_status(&client, session_id, &mut view).await?;
-            hydrate_pending_permissions(&client, session_id, &mut view).await?;
-            hydrate_pending_interactions(&client, session_id, &mut view, &interaction_controllers)
+            hydrate_session_model_status(client, *session_id, &mut view).await?;
+            hydrate_pending_permissions(client, *session_id, &mut view).await?;
+            hydrate_pending_interactions(client, *session_id, &mut view, interaction_controllers)
                 .await?;
         }
 
-        let sessions = client.list_sessions().await?;
-        if let Some(summary) = sessions.iter().find(|summary| summary.id == session_id) {
-            attached.session.clone_from(summary);
-        }
-        let snapshot = watched_session_snapshot(
-            &client,
-            session_id,
-            &attached,
-            &view,
-            &history_windows,
-            &interaction_controllers,
-        )
-        .await?;
-        let update = ScopedSnapshotUpdate {
-            scope: format!("{access_token}:{session_id}"),
-            snapshot,
-            sessions,
-        };
-        let Some(sender) = browser_update_sender(&renderer_tx) else {
-            return Ok(());
-        };
-        if sender.send(update).await.is_err() {
+        if !send_watched_snapshot(&context, &mut attached, &view).await? {
             return Ok(());
         }
     }
 }
 
 /// Configure scoped live snapshot rendering through a `HyperChad` renderer.
+#[cfg(feature = "renderer-html-actix")]
 pub fn configure_live_updates<R>(renderer: &R, state: &HyperChadAppState)
 where
     R: hyperchad::renderer::Renderer + Clone + 'static,
@@ -1389,13 +1932,11 @@ where
     let access_token = Arc::clone(&state.access_token);
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
-            let containers = bcode_hyperchad_ui::pages::home::home(
-                &update.snapshot,
-                &update.sessions,
-                &access_token,
-            );
+            let context = html_actix::HtmlActixPresentationContext::new(Arc::clone(&access_token));
+            let containers =
+                bcode_hyperchad_ui::pages::home::home(&update.snapshot, &update.sessions, &context);
             if let Err(error) = renderer
-                .render_scoped(update.scope, containers.into())
+                .render_scoped(update.scope.0, containers.into())
                 .await
             {
                 tracing::error!("failed to render scoped HyperChad snapshot: {error}");
@@ -1407,6 +1948,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "static-bundled-question-plugin")]
+    #[test]
+    fn question_controller_snapshot_survives_authoritative_rehydration() {
+        let exchange = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-1".to_owned(),
+            exchange_id: "exchange-1".to_owned(),
+            producer_id: "bcode.question".to_owned(),
+            schema: "bcode.question.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({
+                "questions": [{
+                    "header": null,
+                    "question": "Explain?",
+                    "options": [{"label": "Keep", "value": "keep", "description": null}],
+                    "control": "radio",
+                    "selection_mode": "single",
+                    "custom": true,
+                    "custom_mode": "additional",
+                    "required": true
+                }]
+            }),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let controllers = Arc::new(Mutex::new(LocalInteractionControllers::default()));
+        let first = local_interaction_snapshot(&exchange, &controllers);
+        assert_eq!(first["answers"][0]["custom"], serde_json::Value::Null);
+        let output = {
+            let mut controllers = controllers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            controllers
+                .entries
+                .get_mut(&exchange.exchange_id)
+                .expect("question controller")
+                .handle_input(bcode_tool::InteractionInput::Change {
+                    control_id: bcode_tool::InteractionControlId::new("question-0.custom"),
+                    value: bcode_tool::InteractionValue::String("preserved answer".to_owned()),
+                })
+        };
+        assert_eq!(output, bcode_tool::InteractionOutput::Redraw);
+
+        let rerendered = local_interaction_snapshot(&exchange, &controllers);
+        let reconnected = local_interaction_snapshot(&exchange, &controllers);
+        assert_eq!(rerendered["answers"][0]["custom"], "preserved answer");
+        assert_eq!(reconnected, rerendered);
+    }
+
+    #[test]
+    fn interaction_submission_guard_rejects_duplicates_and_releases_on_drop() {
+        let submissions = Arc::new(Mutex::new(BTreeSet::new()));
+        let guard = InteractionSubmissionGuard::acquire(&submissions, "interaction-1")
+            .expect("first submission should acquire the guard");
+        assert!(InteractionSubmissionGuard::acquire(&submissions, "interaction-1").is_none());
+        assert!(InteractionSubmissionGuard::acquire(&submissions, "interaction-2").is_some());
+        drop(guard);
+        assert!(InteractionSubmissionGuard::acquire(&submissions, "interaction-1").is_some());
+    }
 
     #[cfg(feature = "static-bundled-question-plugin")]
     #[test]
@@ -1534,7 +2133,11 @@ mod tests {
 
         let rendered = format!(
             "{:?}",
-            bcode_hyperchad_ui::pages::home::home(view.snapshot(), &[], "token")
+            bcode_hyperchad_ui::pages::home::home(
+                view.snapshot(),
+                &[],
+                &bcode_hyperchad_ui::context::StaticPresentationContext
+            )
         );
         assert!(rendered.contains("active tool"));
         assert!(!rendered.contains("active invocations"));
@@ -1559,7 +2162,11 @@ mod tests {
         });
         let completed = format!(
             "{:?}",
-            bcode_hyperchad_ui::pages::home::home(view.snapshot(), &[], "token")
+            bcode_hyperchad_ui::pages::home::home(
+                view.snapshot(),
+                &[],
+                &bcode_hyperchad_ui::context::StaticPresentationContext
+            )
         );
         assert!(!completed.contains("active tool"));
         assert!(!completed.contains("active invocations"));
@@ -1590,7 +2197,11 @@ mod tests {
 
         let rendered = format!(
             "{:?}",
-            bcode_hyperchad_ui::pages::home::home(view.snapshot(), &[], "token")
+            bcode_hyperchad_ui::pages::home::home(
+                view.snapshot(),
+                &[],
+                &bcode_hyperchad_ui::context::StaticPresentationContext
+            )
         );
         assert!(rendered.contains("active invocations"));
         assert!(!rendered.contains("active tool"));
@@ -1642,7 +2253,11 @@ mod tests {
         assert_eq!(snapshot.runtime_work[0].work_id, second);
         let rendered = format!(
             "{:?}",
-            bcode_hyperchad_ui::pages::home::home(snapshot, &[], "token")
+            bcode_hyperchad_ui::pages::home::home(
+                snapshot,
+                &[],
+                &bcode_hyperchad_ui::context::StaticPresentationContext
+            )
         );
         assert!(rendered.contains("work-second"));
         assert!(!rendered.contains("revived-marker-unique"));
@@ -1855,9 +2470,57 @@ mod tests {
 
     #[cfg(feature = "renderer-html-actix")]
     #[test]
+    fn html_actix_accessibility_css_guarantees_focus_and_control_targets() {
+        assert!(html_actix::accessibility_css().contains(":focus-visible"));
+        assert!(html_actix::accessibility_css().contains("outline: 3px solid #58a6ff"));
+        assert!(html_actix::accessibility_css().contains("min-height: 44px"));
+        assert!(html_actix::accessibility_css().contains("overflow-x: auto"));
+        assert!(html_actix::accessibility_css().contains("max-width: 100%"));
+    }
+
+    #[cfg(feature = "renderer-html-actix")]
+    #[test]
     fn html_actix_renderer_init_smoke_test() {
         let builder = init_with_snapshot(SessionViewSnapshot::empty(), Vec::new());
         drop(builder);
+    }
+
+    #[cfg(feature = "renderer-html-actix")]
+    #[test]
+    fn html_actix_launch_url_preserves_guard_and_exact_session_scope() {
+        let address = "127.0.0.1:4321".parse().expect("socket address");
+        let session_id = SessionId::new();
+
+        assert_eq!(
+            build_launch_url(address, "secret-token", None),
+            "http://127.0.0.1:4321/?token=secret-token"
+        );
+        assert_eq!(
+            build_launch_url(address, "secret-token", Some(session_id)),
+            format!(
+                "http://127.0.0.1:4321/?token=secret-token&hyperchad-event-scope=secret-token:{session_id}"
+            )
+        );
+    }
+
+    #[cfg(feature = "renderer-html-actix")]
+    #[test]
+    fn html_actix_artifact_target_is_guarded_and_percent_encoded() {
+        use bcode_hyperchad_ui::context::PresentationContext as _;
+
+        let session_id = SessionId::new();
+        let context = html_actix::HtmlActixPresentationContext::new(Arc::from("secret token"));
+        let target = context
+            .artifact_target(session_id, "artifact / one", "inline image")
+            .expect("HTML backend exposes guarded artifact bytes");
+
+        assert_eq!(
+            target,
+            format!(
+                "/artifacts/{session_id}?token=secret+token&artifact_id=artifact+%2F+one&reference_key=inline+image"
+            )
+        );
+        assert!(!target.contains("bcode-artifact://"));
     }
 
     #[cfg(feature = "renderer-html-actix")]
@@ -1869,6 +2532,60 @@ mod tests {
         assert_eq!(validate_bind_address(loopback, false), Ok(loopback));
         assert!(validate_bind_address(external, false).is_err());
         assert_eq!(validate_bind_address(external, true), Ok(external));
+    }
+
+    #[test]
+    fn browser_capability_is_redacted_from_debug_output() {
+        let token = "browser-capability-must-not-appear";
+        let state = HyperChadAppState::new(BcodeClient::default_endpoint(), token);
+        let state_debug = format!("{state:?}");
+        assert!(state_debug.contains("[REDACTED]"));
+        assert!(!state_debug.contains(token));
+
+        let scope = RenderSubscriptionScope(format!("{token}:{}", SessionId::new()));
+        assert!(!format!("{scope:?}").contains(token));
+
+        #[cfg(feature = "renderer-html-actix")]
+        {
+            let context =
+                html_actix::HtmlActixPresentationContext::new(Arc::from(token.to_owned()));
+            let context_debug = format!("{context:?}");
+            assert!(context_debug.contains("[REDACTED]"));
+            assert!(!context_debug.contains(token));
+        }
+    }
+
+    #[test]
+    fn client_errors_use_stable_user_facing_language() {
+        let cases = [
+            (
+                ClientError::RequestTimeout {
+                    timeout: std::time::Duration::from_secs(15),
+                },
+                "The local Bcode service did not respond in time. Try again.",
+            ),
+            (
+                ClientError::Server {
+                    code: "session_repair_required".to_owned(),
+                    message: "projection index tail mismatch at event 42".to_owned(),
+                },
+                "This session needs repair before its full history is available.",
+            ),
+            (
+                ClientError::Server {
+                    code: "permission_resolution_failed".to_owned(),
+                    message: "internal permission provider detail".to_owned(),
+                },
+                "The action could not be completed. Try again.",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let message = client_error_message(&error);
+            assert_eq!(message, expected);
+            assert!(!message.contains("projection index"));
+            assert!(!message.contains("provider detail"));
+        }
     }
 
     #[test]
@@ -1991,6 +2708,87 @@ mod tests {
     }
 
     #[test]
+    fn generic_unknown_interactions_support_submit_cancel_and_reject_controller_only_inputs() {
+        let exchange = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-unknown".to_owned(),
+            exchange_id: "exchange-unknown".to_owned(),
+            producer_id: "unknown.plugin".to_owned(),
+            schema: "unknown.request".to_owned(),
+            schema_version: 7,
+            payload: serde_json::json!({"original": true}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let form = |kind, value: Option<&str>, value_is_json| InteractionForm {
+            session_id: SessionId::new().to_string(),
+            interaction_id: exchange.exchange_id.clone(),
+            kind,
+            control_id: None,
+            value: value.map(str::to_owned),
+            value_is_json,
+            direction: None,
+        };
+
+        assert_eq!(
+            generic_interaction_resolution(
+                &exchange,
+                &form(
+                    InteractionInputKind::Submit,
+                    Some("{\"accepted\":true}"),
+                    true
+                ),
+            ),
+            Ok(Some((
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"accepted": true}),
+                },
+                "interaction submitted",
+            )))
+        );
+        assert_eq!(
+            generic_interaction_resolution(
+                &exchange,
+                &form(InteractionInputKind::Submit, None, false),
+            ),
+            Ok(Some((
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: exchange.payload.clone(),
+                },
+                "interaction submitted",
+            )))
+        );
+        assert_eq!(
+            generic_interaction_resolution(
+                &exchange,
+                &form(InteractionInputKind::Cancel, None, false),
+            ),
+            Ok(Some((
+                bcode_session_models::ToolExchangeResolution::Cancelled,
+                "interaction cancelled",
+            )))
+        );
+        assert_eq!(
+            generic_interaction_resolution(
+                &exchange,
+                &form(InteractionInputKind::Focus, None, false),
+            ),
+            Ok(None)
+        );
+        assert!(
+            generic_interaction_resolution(
+                &exchange,
+                &form(InteractionInputKind::Submit, Some("{"), true),
+            )
+            .is_err()
+        );
+
+        let adapter = generic_interaction_adapter(&exchange);
+        assert_eq!(adapter.producer_id, exchange.producer_id);
+        assert_eq!(adapter.exchange_schema, exchange.schema);
+        assert_eq!(adapter.min_schema_version, 7);
+        assert_eq!(adapter.max_schema_version, 7);
+    }
+
+    #[test]
     fn interaction_navigation_form_requires_valid_direction() {
         let form = InteractionForm {
             session_id: SessionId::new().to_string(),
@@ -2006,6 +2804,80 @@ mod tests {
             interaction_input_from_form(&form),
             Err("interaction navigation direction must be next or previous".to_owned())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_failure_route_renders_semantic_unavailable_state() {
+        let socket_dir = tempfile::tempdir().expect("missing daemon socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("missing.sock"));
+        let state = HyperChadAppState::new(BcodeClient::new(endpoint), "failure-token");
+        let content = router_from_state(state)
+            .navigate(hyperchad::router::RouteRequest::from_path(
+                "/?token=failure-token",
+                hyperchad::router::RequestInfo::default(),
+            ))
+            .await
+            .expect("failure route")
+            .expect("failure content");
+        let rendered = format!("{content:?}");
+
+        assert!(rendered.contains("The local Bcode service is unavailable."));
+        assert!(rendered.contains("Session unavailable"));
+        assert!(!rendered.contains("IPC transport"));
+        assert!(!rendered.contains("missing.sock"));
+    }
+
+    #[cfg(feature = "renderer-html-actix")]
+    #[test]
+    fn representative_long_snapshot_render_measurement_stays_bounded() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(SessionId::new());
+        snapshot.connection_status =
+            bcode_session_view_models::SessionConnectionViewStatus::Attached;
+        snapshot.composer.can_submit = true;
+        snapshot.transcript.items = (0..500)
+            .map(|index| bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new(format!(
+                    "performance:{index}"
+                )),
+                revision: 1,
+                sequence: Some(index + 1),
+                timestamp_ms: Some(index + 1),
+                streaming: index == 499,
+                kind: bcode_session_view_models::TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown(format!(
+                        "## Streamed response {index}\n\n{}",
+                        "representative bounded content ".repeat(20)
+                    )),
+                },
+            })
+            .collect();
+        snapshot.transcript.revision = 1;
+        snapshot.transcript.source_start_sequence = Some(1);
+        snapshot.transcript.source_end_sequence = Some(500);
+
+        let context = html_actix::HtmlActixPresentationContext::new(Arc::from("measure-token"));
+        let started = std::time::Instant::now();
+        let containers = bcode_hyperchad_ui::pages::home::home(&snapshot, &[], &context);
+        let build_elapsed = started.elapsed();
+        let root: hyperchad::renderer::transformer::Container = containers.into();
+        let started = std::time::Instant::now();
+        let html = hyperchad::renderer_html::html::container_to_html(
+            &root,
+            &hyperchad::renderer_html::DefaultHtmlTagRenderer::default(),
+        )
+        .expect("representative HTML");
+        let html_elapsed = started.elapsed();
+
+        eprintln!(
+            "HyperChad representative scoped snapshot: build={build_elapsed:?} html={html_elapsed:?} bytes={}",
+            html.len()
+        );
+        assert!(html.contains("Streamed response 499"));
+        assert!(html.len() < 4 * 1024 * 1024);
+        assert!(build_elapsed < std::time::Duration::from_secs(2));
+        assert!(html_elapsed < std::time::Duration::from_secs(2));
     }
 
     #[cfg(feature = "renderer-html-actix")]

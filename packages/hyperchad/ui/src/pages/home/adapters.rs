@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
+use super::theme::{color, radius, space, surface, typeface};
 use bcode_session_view_models::{PluginVisualView, ToolArtifactView};
 use hyperchad::template::{Containers, container};
 
@@ -24,10 +25,6 @@ pub(super) static ARTIFACT_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), Arti
             (
                 ("bcode.filesystem.read", 1),
                 render_filesystem_read_result as ArtifactAdapter,
-            ),
-            (
-                ("bcode.filesystem.image", 1),
-                render_filesystem_image_result as ArtifactAdapter,
             ),
             (
                 ("bcode.filesystem.change", 1),
@@ -233,13 +230,13 @@ fn extracted_text_panel(text: &str, source_truncated: Option<bool>) -> Container
             |(byte_index, _)| (&text[..byte_index], true),
         );
     container! {
-        div border-top="1, #30363d" margin-top=8 padding-top=8 {
-            div color="#c9d1d9" font-size=12 white-space="preserve-wrap" { (text) }
+        div border-top=((1, surface::BORDER)) margin-top=((space::SM)) padding-top=((space::SM)) {
+            div color=(color::TEXT) font-size=((typeface::LABEL)) white-space="preserve-wrap" { (text) }
             @if source_truncated == Some(true) {
-                div color="#f2cc60" font-size=11 margin-top=8 { "Source extraction was truncated." }
+                div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::SM)) { "Source extraction was truncated." }
             }
             @if display_truncated {
-                div color="#f2cc60" font-size=11 margin-top=8 { "Extracted text truncated for display." }
+                div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::SM)) { "Extracted text truncated for display." }
             }
         }
     }
@@ -248,18 +245,18 @@ fn extracted_text_panel(text: &str, source_truncated: Option<bool>) -> Container
 fn artifact_references(artifact: &ToolArtifactView) -> Containers {
     container! {
         @if !artifact.artifact.refs.is_empty() {
-            details margin-top=8 {
-                summary color="#58a6ff" font-size=11 { "artifact references (" (artifact.artifact.refs.len().to_string()) ")" }
+            details margin-top=((space::SM)) {
+                summary color=(color::INFO) font-size=((typeface::DETAIL)) { "artifact references (" (artifact.artifact.refs.len().to_string()) ")" }
                 @for reference in artifact.artifact.refs.iter().take(10) {
-                    div border-top="1, #30363d" padding-top=6 margin-top=6 {
-                        div color="#f0f6fc" font-family="monospace" { (reference.key) }
-                        @if let Some(content_type) = &reference.content_type { div color="#8b949e" font-size=11 { (content_type) } }
-                        @if let Some(storage_uri) = &reference.storage_uri { div color="#8b949e" font-size=11 white-space="preserve-wrap" { (storage_uri) } }
-                        @if let Some(byte_len) = reference.byte_len { div color="#8b949e" font-size=11 { (byte_len.to_string()) " bytes" } }
+                    div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
+                        div color=(color::STRONG) font-family="monospace" { (reference.key) }
+                        @if let Some(content_type) = &reference.content_type { div color=(color::MUTED) font-size=((typeface::DETAIL)) { (content_type) } }
+                        @if let Some(storage_uri) = &reference.storage_uri { div color=(color::MUTED) font-size=((typeface::DETAIL)) white-space="preserve-wrap" { (storage_uri) } }
+                        @if let Some(byte_len) = reference.byte_len { div color=(color::MUTED) font-size=((typeface::DETAIL)) { (byte_len.to_string()) " bytes" } }
                     }
                 }
                 @if artifact.artifact.refs.len() > 10 {
-                    div color="#8b949e" font-size=11 margin-top=6 { "… more references" }
+                    div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "… more references" }
                 }
             }
         }
@@ -286,15 +283,15 @@ pub(super) fn render_document_extract_result(artifact: &ToolArtifactView) -> Opt
         .and_then(serde_json::Value::as_str);
     let text = metadata.get("text").and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Document extraction")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (source) }
-            @if let Some(content_type) = content_type { div color="#8b949e" font-size=12 margin-top=4 { "type: " (content_type) } }
-            @if let Some(extractor) = extractor { div color="#8b949e" font-size=12 margin-top=4 { "extractor: " (extractor) } }
-            @if let Some(document_path) = document_path { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "document: " (document_path) } }
-            @if let Some(text_path) = text_path { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "text: " (text_path) } }
-            @if truncated == Some(true) { div color="#f2cc60" font-size=12 margin-top=4 { "Source extraction was truncated." } }
-            @if let Some(text) = text { (extracted_text_panel(text, None)) } @else { div color="#8b949e" font-size=12 margin-top=8 { "No extracted text was returned." } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Document extraction")) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (source) }
+            @if let Some(content_type) = content_type { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "type: " (content_type) } }
+            @if let Some(extractor) = extractor { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "extractor: " (extractor) } }
+            @if let Some(document_path) = document_path { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "document: " (document_path) } }
+            @if let Some(text_path) = text_path { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "text: " (text_path) } }
+            @if truncated == Some(true) { div color=(color::WARNING) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "Source extraction was truncated." } }
+            @if let Some(text) = text { (extracted_text_panel(text, None)) } @else { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "No extracted text was returned." } }
             (artifact_references(artifact))        }
     })
 }
@@ -349,14 +346,14 @@ fn file_content_panel(path: &str, contents: &str) -> Containers {
         ))
     });
     container! {
-        div border-top="1, #30363d" margin-top=8 padding-top=8 {
+        div border-top=((1, surface::BORDER)) margin-top=((space::SM)) padding-top=((space::SM)) {
             @if let Some(rendered) = rendered {
                 (rendered)
             } @else {
-                div color="#c9d1d9" font-size=12 font-family="monospace" white-space="preserve-wrap" { (contents) }
+                div color=(color::TEXT) font-size=((typeface::LABEL)) font-family="monospace" white-space="preserve-wrap" { (contents) }
             }
             @if display_truncated {
-                div color="#f2cc60" font-size=11 margin-top=8 { "File contents truncated for display." }
+                div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::SM)) { "File contents truncated for display." }
             }
         }
     }
@@ -386,10 +383,10 @@ pub(super) fn render_filesystem_read_result(artifact: &ToolArtifactView) -> Opti
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("File contents")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
-            div color="#8b949e" font-size=11 margin-top=4 {
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("File contents")) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::XS)) {
                 @if let (Some(start_line), Some(end_line), Some(total_lines)) = (start_line, end_line, total_lines) {
                     "lines " (start_line.to_string()) "–" (end_line.to_string()) " of " (total_lines.to_string())
                 }
@@ -400,7 +397,7 @@ pub(super) fn render_filesystem_read_result(artifact: &ToolArtifactView) -> Opti
             }
             (file_content_panel(path, contents))
             @if truncated {
-                div color="#f2cc60" font-size=11 margin-top=8 {
+                div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::SM)) {
                     "More file content is available."
                     @if let Some(end_line) = end_line { " Continue at offset " (end_line.saturating_add(1).to_string()) "." }
                 }
@@ -410,7 +407,17 @@ pub(super) fn render_filesystem_read_result(artifact: &ToolArtifactView) -> Opti
     })
 }
 
-pub(super) fn render_filesystem_image_result(artifact: &ToolArtifactView) -> Option<Containers> {
+fn supported_inline_image_content_type(content_type: &str) -> bool {
+    matches!(
+        content_type.split(';').next().map(str::trim),
+        Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+    )
+}
+
+pub(super) fn render_filesystem_image_result(
+    artifact: &ToolArtifactView,
+    guarded_source: Option<&str>,
+) -> Option<Containers> {
     let metadata = &artifact.artifact.metadata;
     let path = metadata.get("path").and_then(serde_json::Value::as_str)?;
     let mime_type = metadata
@@ -419,13 +426,38 @@ pub(super) fn render_filesystem_image_result(artifact: &ToolArtifactView) -> Opt
     let width = metadata.get("width").and_then(serde_json::Value::as_u64);
     let height = metadata.get("height").and_then(serde_json::Value::as_u64);
     let byte_len = metadata.get("byte_len").and_then(serde_json::Value::as_u64);
+    let preview_source = guarded_source;
+    let guarded_reference = artifact.artifact.refs.iter().find(|reference| {
+        !reference.key.is_empty()
+            && reference
+                .content_type
+                .as_deref()
+                .is_some_and(supported_inline_image_content_type)
+    });
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Image file")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
-            @if let Some(mime_type) = mime_type { div color="#8b949e" font-size=12 margin-top=4 { "type: " (mime_type) } }
-            @if let (Some(width), Some(height)) = (width, height) { div color="#8b949e" font-size=12 margin-top=4 { "dimensions: " (width.to_string()) "x" (height.to_string()) } }
-            @if let Some(byte_len) = byte_len { div color="#8b949e" font-size=12 margin-top=4 { "bytes: " (byte_len.to_string()) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Image file")) }
+            @if let Some(preview_source) = preview_source {
+                image src=(preview_source) alt=(format!("Preview of {}", std::path::Path::new(path).file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("image"))) fit="contain" loading="lazy" width=100% max-height=560 border=((1, surface::BORDER)) border-radius=((radius::CONTROL));
+            } @else if guarded_reference.is_some() {
+                div color=(color::MUTED) background=(surface::PANEL) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) margin-bottom=((space::SM)) {
+                    "Image preview is protected. Use the guarded artifact control when one is available."
+                }
+            } @else {
+                div color=(color::MUTED) background=(surface::PANEL) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) margin-bottom=((space::SM)) {
+                    "No safe inline image source is available."
+                }
+            }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(mime_type) = mime_type { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "type: " (mime_type) } }
+            @if let (Some(width), Some(height)) = (width, height) { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "dimensions: " (width.to_string()) "x" (height.to_string()) } }
+            @if let Some(byte_len) = byte_len { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "bytes: " (byte_len.to_string()) } }
+            @if let Some(reference) = guarded_reference {
+                div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S6)) {
+                    "guarded artifact: " (reference.key)
+                    @if let Some(byte_len) = reference.byte_len { " · " (byte_len.to_string()) " bytes" }
+                }
+            }
         }
     })
 }
@@ -477,24 +509,24 @@ pub(super) fn render_filesystem_change_result(artifact: &ToolArtifactView) -> Op
         (text, truncated, range)
     });
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("File change")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
-            @if let Some(summary) = summary { div color="#8b949e" font-size=12 margin-top=4 white-space="preserve-wrap" { (summary) } }
-            @if let Some(operation) = operation { div color="#8b949e" font-size=11 margin-top=4 { "operation: " (operation) } }
-            div direction=row gap=8 margin-top=8 {
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("File change")) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(summary) = summary { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) white-space="preserve-wrap" { (summary) } }
+            @if let Some(operation) = operation { div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::XS)) { "operation: " (operation) } }
+            div direction=row gap=((space::SM)) margin-top=((space::SM)) {
                 @if let Some((old_text, truncated, range)) = old {
-                    div flex=1 background="#2d1015" border="1, #6e3035" border-radius=6 padding=8 {
-                        div color="#f85149" font-size=11 margin-bottom=4 { "removed" @if let Some(range) = range { " · " (range) } }
-                        div color="#f0b8bd" font-family="monospace" white-space="preserve-wrap" { (old_text) }
-                        @if truncated { div color="#f2cc60" font-size=11 margin-top=6 { "Removed text truncated for display." } }
+                    div flex=1 background=(surface::ERROR_INSET) border=((1, color::ERROR_BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) {
+                        div color=(color::ERROR) font-size=((typeface::DETAIL)) margin-bottom=((space::XS)) { "removed" @if let Some(range) = range { " · " (range) } }
+                        div color=(color::REMOVED_TEXT) font-family="monospace" white-space="preserve-wrap" { (old_text) }
+                        @if truncated { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Removed text truncated for display." } }
                     }
                 }
                 @if let Some((new_text, truncated, range)) = new {
-                    div flex=1 background="#102818" border="1, #2f6f44" border-radius=6 padding=8 {
-                        div color="#7ee787" font-size=11 margin-bottom=4 { "added" @if let Some(range) = range { " · " (range) } }
-                        div color="#b7efc5" font-family="monospace" white-space="preserve-wrap" { (new_text) }
-                        @if truncated { div color="#f2cc60" font-size=11 margin-top=6 { "Added text truncated for display." } }
+                    div flex=1 background=(surface::SUCCESS_INSET) border=((1, color::SUCCESS_BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) {
+                        div color=(color::SUCCESS) font-size=((typeface::DETAIL)) margin-bottom=((space::XS)) { "added" @if let Some(range) = range { " · " (range) } }
+                        div color=(color::ADDED_TEXT) font-family="monospace" white-space="preserve-wrap" { (new_text) }
+                        @if truncated { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Added text truncated for display." } }
                     }
                 }
             }
@@ -509,10 +541,10 @@ pub(super) fn render_filesystem_exists_result(artifact: &ToolArtifactView) -> Op
         .and_then(serde_json::Value::as_bool)?;
     let path = metadata.get("path").and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Path exists")) }
-            div color="#f0f6fc" { (if exists { "Path exists" } else { "Path does not exist" }) }
-            @if let Some(path) = path { div color="#8b949e" font-size=12 font-family="monospace" margin-top=4 { (path) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Path exists")) }
+            div color=(color::STRONG) { (if exists { "Path exists" } else { "Path does not exist" }) }
+            @if let Some(path) = path { div color=(color::MUTED) font-size=((typeface::LABEL)) font-family="monospace" margin-top=((space::XS)) { (path) } }
         }
     })
 }
@@ -524,23 +556,23 @@ pub(super) fn render_filesystem_list_result(artifact: &ToolArtifactView) -> Opti
         .get("entries")
         .and_then(serde_json::Value::as_array)?;
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Directory entries"), entries.len())) }
-            @if entries.is_empty() { div color="#8b949e" font-size=12 { "No directory entries." } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Directory entries"), entries.len())) }
+            @if entries.is_empty() { div color=(color::MUTED) font-size=((typeface::LABEL)) { "No directory entries." } }
             @for entry in entries.iter().take(25) {
                 @if let Some(entry) = entry.as_object() {
-                    div border-top="1, #30363d" padding-top=6 margin-top=6 {
+                    div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
                         @if let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) {
-                            span color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+                            span color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
                         }
                         @if let Some(kind) = entry.get("kind").and_then(serde_json::Value::as_str) {
-                            span color="#8b949e" { " · " (kind) }
+                            span color=(color::MUTED) { " · " (kind) }
                         }
                     }
                 }
             }
             @if entries.len() > 25 {
-                div color="#8b949e" font-size=12 margin-top=8 { "… " ((entries.len() - 25).to_string()) " more entries" }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "… " ((entries.len() - 25).to_string()) " more entries" }
             }
             (filesystem_result_metadata(&artifact.artifact.metadata))
         }
@@ -554,14 +586,14 @@ pub(super) fn render_filesystem_find_result(artifact: &ToolArtifactView) -> Opti
         .get("paths")
         .and_then(serde_json::Value::as_array)?;
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Path matches"), paths.len())) }
-            @if paths.is_empty() { div color="#8b949e" font-size=12 { "No matching paths." } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Path matches"), paths.len())) }
+            @if paths.is_empty() { div color=(color::MUTED) font-size=((typeface::LABEL)) { "No matching paths." } }
             @for path in paths.iter().filter_map(serde_json::Value::as_str).take(30) {
-                div color="#f0f6fc" font-size=12 font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" padding-top=4 margin-top=4 { (path) }
+                div color=(color::STRONG) font-size=((typeface::LABEL)) font-family="monospace" white-space="preserve-wrap" border-top=((1, surface::BORDER)) padding-top=((space::XS)) margin-top=((space::XS)) { (path) }
             }
             @if paths.len() > 30 {
-                div color="#8b949e" font-size=12 margin-top=8 { "… " ((paths.len() - 30).to_string()) " more paths" }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "… " ((paths.len() - 30).to_string()) " more paths" }
             }
             (filesystem_result_metadata(&artifact.artifact.metadata))
         }
@@ -581,12 +613,12 @@ pub(super) fn render_filesystem_stat_result(artifact: &ToolArtifactView) -> Opti
     let path = metadata.get("path").and_then(serde_json::Value::as_str);
     let len = metadata.get("len").and_then(serde_json::Value::as_u64);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Path metadata")) }
-            div color="#f0f6fc" { (if exists { "Path exists" } else { "Path does not exist" }) }
-            @if let Some(path) = path { div color="#8b949e" font-size=12 font-family="monospace" margin-top=4 { (path) } }
-            @if let Some(kind) = kind { div color="#8b949e" font-size=12 margin-top=4 { "kind: " (kind) } }
-            @if let Some(len) = len { div color="#8b949e" font-size=12 margin-top=4 { "len: " (len.to_string()) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Path metadata")) }
+            div color=(color::STRONG) { (if exists { "Path exists" } else { "Path does not exist" }) }
+            @if let Some(path) = path { div color=(color::MUTED) font-size=((typeface::LABEL)) font-family="monospace" margin-top=((space::XS)) { (path) } }
+            @if let Some(kind) = kind { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "kind: " (kind) } }
+            @if let Some(len) = len { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "len: " (len.to_string()) } }
         }
     })
 }
@@ -607,15 +639,15 @@ pub(super) fn render_filesystem_artifact_metadata(
         .and_then(serde_json::Value::as_bool);
     let message = metadata.get("message").and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Artifact metadata")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
-            @if let Some(exists) = exists { div color="#8b949e" font-size=12 margin-top=4 { "exists: " (exists.to_string()) } }
-            @if let Some(kind) = kind { div color="#8b949e" font-size=12 margin-top=4 { "kind: " (kind) } }
-            @if let Some(byte_len) = byte_len { div color="#8b949e" font-size=12 margin-top=4 { "bytes: " (byte_len.to_string()) } }
-            @if let Some(content_type) = content_type { div color="#8b949e" font-size=12 margin-top=4 { "type: " (content_type) } }
-            @if let Some(complete) = complete { div color="#8b949e" font-size=12 margin-top=4 { "complete: " (complete.to_string()) } }
-            @if let Some(message) = message { div color="#8b949e" font-size=12 margin-top=4 white-space="preserve-wrap" { (message) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Artifact metadata")) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(exists) = exists { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "exists: " (exists.to_string()) } }
+            @if let Some(kind) = kind { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "kind: " (kind) } }
+            @if let Some(byte_len) = byte_len { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "bytes: " (byte_len.to_string()) } }
+            @if let Some(content_type) = content_type { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "type: " (content_type) } }
+            @if let Some(complete) = complete { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "complete: " (complete.to_string()) } }
+            @if let Some(message) = message { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) white-space="preserve-wrap" { (message) } }
         }
     })
 }
@@ -634,13 +666,13 @@ pub(super) fn render_filesystem_artifact_read(artifact: &ToolArtifactView) -> Op
         .get("truncated")
         .and_then(serde_json::Value::as_bool);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Artifact contents")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
-            @if let Some(returned_bytes) = returned_bytes { div color="#8b949e" font-size=12 margin-top=4 { "returned bytes: " (returned_bytes.to_string()) } }
-            @if let Some(total_bytes) = total_bytes { div color="#8b949e" font-size=12 margin-top=4 { "total bytes: " (total_bytes.to_string()) } }
-            @if let Some(truncated) = truncated { div color="#8b949e" font-size=12 margin-top=4 { "truncated: " (truncated.to_string()) } }
-            @if let Some(contents) = contents { div color="#c9d1d9" font-size=12 font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { (contents) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Artifact contents")) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            @if let Some(returned_bytes) = returned_bytes { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "returned bytes: " (returned_bytes.to_string()) } }
+            @if let Some(total_bytes) = total_bytes { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "total bytes: " (total_bytes.to_string()) } }
+            @if let Some(truncated) = truncated { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "truncated: " (truncated.to_string()) } }
+            @if let Some(contents) = contents { div color=(color::TEXT) font-size=((typeface::LABEL)) font-family="monospace" white-space="preserve-wrap" border-top=((1, surface::BORDER)) margin-top=((space::SM)) padding-top=((space::SM)) { (contents) } }
         }
     })
 }
@@ -659,23 +691,23 @@ pub(super) fn render_grep_matches(
         .and_then(serde_json::Value::as_array)?;
     let path = metadata.get("path").and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or(fallback_title), matches.len())) }
-            @if matches.is_empty() { div color="#8b949e" font-size=12 { "No text matches." } }
-            @if let Some(path) = path { div color="#8b949e" font-size=12 font-family="monospace" white-space="preserve-wrap" margin-bottom=6 { (path) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or(fallback_title), matches.len())) }
+            @if matches.is_empty() { div color=(color::MUTED) font-size=((typeface::LABEL)) { "No text matches." } }
+            @if let Some(path) = path { div color=(color::MUTED) font-size=((typeface::LABEL)) font-family="monospace" white-space="preserve-wrap" margin-bottom=((space::S6)) { (path) } }
             @for hit in matches.iter().take(30) {
                 @if let Some(hit) = hit.as_object() {
                     @let path = hit.get("path").and_then(serde_json::Value::as_str).map(bounded_search_field);
                     @let line = hit.get("line").and_then(serde_json::Value::as_str).map(bounded_search_field);
-                    div border-top="1, #30363d" padding-top=6 margin-top=6 {
-                        @if let Some((path, truncated)) = path { div color="#f0f6fc" font-size=12 font-family="monospace" white-space="preserve-wrap" { (path) @if truncated { "…" } } }
-                        @if let Some(line_number) = hit.get("line_number").and_then(serde_json::Value::as_u64) { span color="#8b949e" font-size=12 { (line_number.to_string()) ": " } }
-                        @if let Some((line, truncated)) = line { span color="#c9d1d9" font-size=12 white-space="preserve-wrap" { (line) @if truncated { "…" } } }
+                    div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
+                        @if let Some((path, truncated)) = path { div color=(color::STRONG) font-size=((typeface::LABEL)) font-family="monospace" white-space="preserve-wrap" { (path) @if truncated { "…" } } }
+                        @if let Some(line_number) = hit.get("line_number").and_then(serde_json::Value::as_u64) { span color=(color::MUTED) font-size=((typeface::LABEL)) { (line_number.to_string()) ": " } }
+                        @if let Some((line, truncated)) = line { span color=(color::TEXT) font-size=((typeface::LABEL)) white-space="preserve-wrap" { (line) @if truncated { "…" } } }
                     }
                 }
             }
             @if matches.len() > 30 {
-                div color="#8b949e" font-size=12 margin-top=8 { "… " ((matches.len() - 30).to_string()) " more matches" }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "… " ((matches.len() - 30).to_string()) " more matches" }
             }
             (filesystem_result_metadata(metadata))
         }
@@ -694,7 +726,7 @@ fn filesystem_result_metadata(metadata: &serde_json::Value) -> Containers {
     let message = metadata.get("message").and_then(serde_json::Value::as_str);
     container! {
         @if backend.is_some() || visited_entries.is_some() || partial.is_some() || timed_out.is_some() || message.is_some() {
-            div color="#8b949e" font-size=12 margin-top=8 {
+            div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) {
                 @if let Some(backend) = backend { div { "backend: " (backend) } }
                 @if let Some(visited_entries) = visited_entries { div { "visited entries: " (visited_entries.to_string()) } }
                 @if let Some(partial) = partial { div { "partial: " (partial.to_string()) } }
@@ -723,19 +755,19 @@ pub(super) fn render_git_clone_result(artifact: &ToolArtifactView) -> Option<Con
         .and_then(serde_json::Value::as_bool);
     let repo_label = owner.map_or_else(|| repo.to_owned(), |owner| format!("{owner}/{repo}"));
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div direction=row gap=8 align-items=center margin-bottom=6 {
-                span color="#58a6ff" { (artifact.artifact.title.as_deref().unwrap_or("Repository clone")) }
-                @if let Some(host) = host { span color="#8b949e" { (host) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div direction=row gap=((space::SM)) align-items=center margin-bottom=((space::S6)) {
+                span color=(color::INFO) { (artifact.artifact.title.as_deref().unwrap_or("Repository clone")) }
+                @if let Some(host) = host { span color=(color::MUTED) { (host) } }
             }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (repo_label) }
-            div color=(if already_exists == Some(true) { "#f2cc60" } else { "#7ee787" }) font-size=12 margin-top=4 {
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (repo_label) }
+            div color=(if already_exists == Some(true) { color::WARNING } else { color::SUCCESS }) font-size=((typeface::LABEL)) margin-top=((space::XS)) {
                 (if already_exists == Some(true) { "repository already existed" } else { "repository cloned" })
             }
-            @if let Some(path) = path { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "path: " (path) } }
-            @if let Some(git_ref) = git_ref { div color="#8b949e" font-size=12 margin-top=4 { "ref: " (git_ref) } }
-            @if let Some(clone_url) = clone_url { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "remote: " (clone_url) } }
-            @if let Some(already_exists) = already_exists { div color="#8b949e" font-size=12 margin-top=4 { "already exists: " (already_exists.to_string()) } }
+            @if let Some(path) = path { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "path: " (path) } }
+            @if let Some(git_ref) = git_ref { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "ref: " (git_ref) } }
+            @if let Some(clone_url) = clone_url { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "remote: " (clone_url) } }
+            @if let Some(already_exists) = already_exists { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "already exists: " (already_exists.to_string()) } }
         }
     })
 }
@@ -761,13 +793,13 @@ pub(super) fn render_ocr_extract_result(artifact: &ToolArtifactView) -> Option<C
         .get("text_bytes")
         .and_then(serde_json::Value::as_u64);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("OCR extraction")) }
-            @if let Some(path) = path { div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) } }
-            @if let Some(url) = url { div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (url) } }
-            @if let Some(engine) = engine { div color="#8b949e" font-size=12 margin-top=4 { "engine: " (engine) } }
-            @if let Some(language) = language { div color="#8b949e" font-size=12 margin-top=4 { "language: " (language) } }
-            @if let Some(text_bytes) = text_bytes { div color="#8b949e" font-size=12 margin-top=4 { "text bytes: " (text_bytes.to_string()) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("OCR extraction")) }
+            @if let Some(path) = path { div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) } }
+            @if let Some(url) = url { div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (url) } }
+            @if let Some(engine) = engine { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "engine: " (engine) } }
+            @if let Some(language) = language { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "language: " (language) } }
+            @if let Some(text_bytes) = text_bytes { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "text bytes: " (text_bytes.to_string()) } }
             (extracted_text_panel(text, truncated))
             (artifact_references(artifact))
         }
@@ -795,16 +827,16 @@ pub(super) fn render_extract_capabilities(
         .get(entries_key)
         .and_then(serde_json::Value::as_array);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or(title)) }
-            @if let Some(available) = available { div color="#8b949e" font-size=12 margin-bottom=4 { "available: " (available.to_string()) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or(title)) }
+            @if let Some(available) = available { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-bottom=((space::XS)) { "available: " (available.to_string()) } }
             @if let Some(entries) = entries {
                 @for entry in entries {
                     @if let Some(entry) = entry.as_object() {
-                        div border-top="1, #30363d" padding-top=6 margin-top=6 {
-                            @if let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) { span color="#f0f6fc" { (name) } }
-                            @if let Some(quality) = entry.get("quality").and_then(serde_json::Value::as_str) { span color="#8b949e" { " · " (quality) } }
-                            @if let Some(available) = entry.get("available").and_then(serde_json::Value::as_bool) { span color="#8b949e" { " · available: " (available.to_string()) } }
+                        div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
+                            @if let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) { span color=(color::STRONG) { (name) } }
+                            @if let Some(quality) = entry.get("quality").and_then(serde_json::Value::as_str) { span color=(color::MUTED) { " · " (quality) } }
+                            @if let Some(available) = entry.get("available").and_then(serde_json::Value::as_bool) { span color=(color::MUTED) { " · available: " (available.to_string()) } }
                         }
                     }
                 }
@@ -833,11 +865,11 @@ fn shell_output_panel(label: &str, output: &str, source_truncated: bool) -> Cont
             |(byte_index, _)| (&output[..byte_index], true),
         );
     container! {
-        details open=true margin-top=8 {
-            summary color="#8b949e" font-size=11 { (label) }
-            div color="#c9d1d9" font-family="monospace" white-space="preserve-wrap" background="#010409" border="1, #30363d" border-radius=6 padding=8 margin-top=6 { (output) }
-            @if source_truncated { div color="#f2cc60" font-size=11 margin-top=6 { "Shell output was truncated by the producer." } }
-            @if display_truncated { div color="#f2cc60" font-size=11 margin-top=6 { "Shell output truncated for display." } }
+        details open=true margin-top=((space::SM)) {
+            summary color=(color::MUTED) font-size=((typeface::DETAIL)) { (label) }
+            div color=(color::TEXT) font-family="monospace" white-space="preserve-wrap" background=(surface::INSET) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) margin-top=((space::S6)) { (output) }
+            @if source_truncated { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Shell output was truncated by the producer." } }
+            @if display_truncated { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Shell output truncated for display." } }
         }
     }
 }
@@ -861,14 +893,14 @@ pub(super) fn render_shell_result(artifact: &ToolArtifactView) -> Option<Contain
         .and_then(serde_json::Value::as_u64);
     let failed = timed_out || cancelled || exit_code.is_some_and(|code| code != 0);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background=(if failed { "#2d1015" } else { "#010409" }) padding=10 margin-top=8 {
-            div justify-content=space-between gap=8 {
-                div color="#58a6ff" { (artifact.artifact.title.as_deref().unwrap_or("Shell result")) }
-                div color=(if failed { "#f85149" } else { "#7ee787" }) font-size=12 {
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(if failed { surface::ERROR_INSET } else { surface::INSET }) padding=((space::S10)) margin-top=((space::SM)) {
+            div justify-content=space-between gap=((space::SM)) {
+                div color=(color::INFO) { (artifact.artifact.title.as_deref().unwrap_or("Shell result")) }
+                div color=(if failed { color::ERROR } else { color::SUCCESS }) font-size=((typeface::LABEL)) {
                     @if timed_out { "timed out" } @else if cancelled { "cancelled" } @else if let Some(exit_code) = exit_code { "exit " (exit_code.to_string()) } @else { "completed" }
                 }
             }
-            div color="#8b949e" font-size=11 margin-top=4 {
+            div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::XS)) {
                 (mode)
                 @if let Some(duration_ms) = duration_ms { " · " (duration_ms.to_string()) " ms" }
                 @if let (Some(columns), Some(rows)) = (metadata.get("columns").and_then(serde_json::Value::as_u64), metadata.get("rows").and_then(serde_json::Value::as_u64)) { " · " (columns.to_string()) "x" (rows.to_string()) }
@@ -877,7 +909,7 @@ pub(super) fn render_shell_result(artifact: &ToolArtifactView) -> Option<Contain
                 @if let Some(output) = metadata.get("output_tail").and_then(serde_json::Value::as_str) {
                     (shell_output_panel("terminal output", output, metadata.get("output_truncated").and_then(serde_json::Value::as_bool).unwrap_or(false)))
                 }
-                @if let Some(output_bytes) = metadata.get("output_bytes").and_then(serde_json::Value::as_u64) { div color="#8b949e" font-size=11 margin-top=6 { (output_bytes.to_string()) " output bytes" } }
+                @if let Some(output_bytes) = metadata.get("output_bytes").and_then(serde_json::Value::as_u64) { div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { (output_bytes.to_string()) " output bytes" } }
             } @else if mode == "captured" {
                 @if let Some(stdout) = metadata.get("stdout").and_then(serde_json::Value::as_str) { (shell_output_panel("stdout", stdout, metadata.get("stdout_truncated").and_then(serde_json::Value::as_bool).unwrap_or(false))) }
                 @if let Some(stderr) = metadata.get("stderr").and_then(serde_json::Value::as_str) { (shell_output_panel("stderr", stderr, metadata.get("stderr_truncated").and_then(serde_json::Value::as_bool).unwrap_or(false))) }
@@ -895,46 +927,46 @@ pub(super) fn render_web_search_results(artifact: &ToolArtifactView) -> Option<C
     let message = metadata.get("message").and_then(serde_json::Value::as_str);
     let results = metadata.get("results")?.as_array()?;
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div direction=row gap=8 align-items=center margin-bottom=6 {
-                span color="#58a6ff" { (artifact.artifact.title.as_deref().unwrap_or("Search results")) }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div direction=row gap=((space::SM)) align-items=center margin-bottom=((space::S6)) {
+                span color=(color::INFO) { (artifact.artifact.title.as_deref().unwrap_or("Search results")) }
                 @if let Some(provider) = provider {
-                    span color="#8b949e" { (provider) }
+                    span color=(color::MUTED) { (provider) }
                 }
             }
             @if let Some(query) = query {
-                div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" margin-bottom=8 { (query) }
+                div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" margin-bottom=((space::SM)) { (query) }
             }
             @if results.is_empty() {
-                div color="#8b949e" font-size=12 margin-top=8 { "No search results." }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "No search results." }
             }
             @for (index, result) in results.iter().take(10).enumerate() {
                 @if let Some(result) = result.as_object() {
                     @let title = result.get("title").and_then(serde_json::Value::as_str).map(|value| bounded_search_field(value));
                     @let url = result.get("url").and_then(serde_json::Value::as_str).map(|value| bounded_search_field(value));
                     @let snippet = result.get("snippet").and_then(serde_json::Value::as_str).map(|value| bounded_search_field(value));
-                    div border-top="1, #30363d" padding-top=8 margin-top=8 {
-                        div color="#58a6ff" font-size=12 margin-bottom=2 { (format!("{}.", index + 1)) }
+                    div border-top=((1, surface::BORDER)) padding-top=((space::SM)) margin-top=((space::SM)) {
+                        div color=(color::INFO) font-size=((typeface::LABEL)) margin-bottom=((space::S2)) { (format!("{}.", index + 1)) }
                         @if let Some((title, truncated)) = title {
-                            div color="#f0f6fc" white-space="preserve-wrap" { (title) @if truncated { "…" } }
+                            div color=(color::STRONG) white-space="preserve-wrap" { (title) @if truncated { "…" } }
                         }
                         @if let Some((url, truncated)) = url {
-                            div color="#8b949e" font-size=12 font-family="monospace" white-space="preserve-wrap" margin-top=2 { (url) @if truncated { "…" } }
+                            div color=(color::MUTED) font-size=((typeface::LABEL)) font-family="monospace" white-space="preserve-wrap" margin-top=((space::S2)) { (url) @if truncated { "…" } }
                         }
                         @if let Some((snippet, truncated)) = snippet {
-                            div color="#c9d1d9" font-size=12 white-space="preserve-wrap" margin-top=4 { (snippet) @if truncated { "…" } }
+                            div color=(color::TEXT) font-size=((typeface::LABEL)) white-space="preserve-wrap" margin-top=((space::XS)) { (snippet) @if truncated { "…" } }
                         }
                     }
                 }
             }
             @if results.len() > 10 {
-                div color="#8b949e" font-size=12 margin-top=8 { "… " ((results.len() - 10).to_string()) " more results" }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "… " ((results.len() - 10).to_string()) " more results" }
             }
             @if partial == Some(true) {
-                div color="#f2cc60" font-size=12 margin-top=8 { "partial results" }
+                div color=(color::WARNING) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "partial results" }
             }
             @if let Some(message) = message {
-                div color="#8b949e" font-size=12 margin-top=4 white-space="preserve-wrap" { (message) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) white-space="preserve-wrap" { (message) }
             }
         }
     })
@@ -967,14 +999,14 @@ fn fetched_content(preview: &str, content_format: Option<&str>) -> Containers {
         vec![hyperchad::markdown::markdown_to_container(&preview)]
     } else {
         container! {
-            div color="#c9d1d9" font-size=12 white-space="preserve-wrap" { (preview) }
+            div color=(color::TEXT) font-size=((typeface::LABEL)) white-space="preserve-wrap" { (preview) }
         }
     };
     container! {
-        div border-top="1, #30363d" margin-top=8 padding-top=8 {
+        div border-top=((1, surface::BORDER)) margin-top=((space::SM)) padding-top=((space::SM)) {
             (content)
             @if display_truncated {
-                div color="#f2cc60" font-size=11 margin-top=8 { "Fetched content truncated for display." }
+                div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::SM)) { "Fetched content truncated for display." }
             }
         }
     }
@@ -1006,40 +1038,40 @@ pub(super) fn render_web_fetch_result(artifact: &ToolArtifactView) -> Option<Con
         .or_else(|| metadata.get("text"))
         .and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Fetched page")) }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Fetched page")) }
             @if let Some(title) = title {
-                div color="#f0f6fc" white-space="preserve-wrap" margin-bottom=4 { (title) }
+                div color=(color::STRONG) white-space="preserve-wrap" margin-bottom=((space::XS)) { (title) }
             }
             @if let Some(safe_url) = safe_web_url(url) {
-                anchor href=(safe_url) color="#58a6ff" font-size=12 font-family="monospace" text-decoration="none" { (url) }
+                anchor href=(safe_url) color=(color::INFO) font-size=((typeface::LABEL)) font-family="monospace" text-decoration="none" { (url) }
             } @else {
-                div color="#8b949e" font-size=12 font-family="monospace" white-space="preserve-wrap" { (url) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) font-family="monospace" white-space="preserve-wrap" { (url) }
             }
             @if let (Some(original_url), Some(final_url)) = (original_url, final_url) {
                 @if original_url != final_url {
-                    div color="#8b949e" font-size=11 margin-top=3 white-space="preserve-wrap" { "source: " (original_url) }
+                    div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S3)) white-space="preserve-wrap" { "source: " (original_url) }
                 }
             }
             @if let Some(status) = status {
-                div color="#8b949e" font-size=12 margin-top=4 { "status: " (status.to_string()) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "status: " (status.to_string()) }
             }
             @if let Some(content_type) = content_type {
-                div color="#8b949e" font-size=12 margin-top=4 { "type: " (content_type) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "type: " (content_type) }
             }
             @if let Some(content_format) = content_format {
-                div color="#8b949e" font-size=12 margin-top=4 { "format: " (content_format) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "format: " (content_format) }
             }
             @if let Some(rendered) = rendered {
-                div color="#8b949e" font-size=12 margin-top=4 { "rendered: " (rendered.to_string()) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "rendered: " (rendered.to_string()) }
             }
             @if truncated == Some(true) {
-                div color="#f2cc60" font-size=12 margin-top=4 { "Source content was truncated." }
+                div color=(color::WARNING) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "Source content was truncated." }
             }
             @if let Some(preview) = preview {
                 (fetched_content(preview, content_format))
             } @else {
-                div color="#8b949e" font-size=12 margin-top=8 { "No extracted content was returned." }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "No extracted content was returned." }
             }
         }
     })
@@ -1052,26 +1084,26 @@ pub(super) fn render_question_outcome(artifact: &ToolArtifactView) -> Option<Con
         .get("questions")
         .and_then(serde_json::Value::as_array)?;
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div justify-content=space-between gap=8 {
-                div color="#58a6ff" { (artifact.artifact.title.as_deref().unwrap_or("Question outcome")) }
-                div color=(if status == "answered" { "#7ee787" } else { "#f2cc60" }) font-size=12 { (status) }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div justify-content=space-between gap=((space::SM)) {
+                div color=(color::INFO) { (artifact.artifact.title.as_deref().unwrap_or("Question outcome")) }
+                div color=(if status == "answered" { color::SUCCESS } else { color::WARNING }) font-size=((typeface::LABEL)) { (status) }
             }
-            @if questions.is_empty() { div color="#8b949e" font-size=12 margin-top=6 { "No questions were returned." } }
+            @if questions.is_empty() { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::S6)) { "No questions were returned." } }
             @for question in questions.iter().take(20) {
                 @if let Some(question) = question.as_object() {
-                    div border-top="1, #30363d" padding-top=6 margin-top=6 {
-                        @if let Some(header) = question.get("header").and_then(serde_json::Value::as_str) { div color="#f0f6fc" font-weight=bold { (header) } }
-                        @if let Some(prompt) = question.get("question").and_then(serde_json::Value::as_str) { div color="#c9d1d9" font-size=12 margin-top=2 white-space="preserve-wrap" { (prompt) } }
-                        @if let Some(question_status) = question.get("status").and_then(serde_json::Value::as_str) { div color="#8b949e" font-size=11 margin-top=3 { (question_status) @if question.get("required").and_then(serde_json::Value::as_bool) == Some(true) { " · required" } } }
+                    div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
+                        @if let Some(header) = question.get("header").and_then(serde_json::Value::as_str) { div color=(color::STRONG) font-weight=bold { (header) } }
+                        @if let Some(prompt) = question.get("question").and_then(serde_json::Value::as_str) { div color=(color::TEXT) font-size=((typeface::LABEL)) margin-top=((space::S2)) white-space="preserve-wrap" { (prompt) } }
+                        @if let Some(question_status) = question.get("status").and_then(serde_json::Value::as_str) { div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::S3)) { (question_status) @if question.get("required").and_then(serde_json::Value::as_bool) == Some(true) { " · required" } } }
                         @for answer in question.get("selected").and_then(serde_json::Value::as_array).into_iter().flatten().take(20) {
-                            @if let Some(label) = answer.get("label").and_then(serde_json::Value::as_str) { div color="#7ee787" font-size=12 margin-top=3 { "✓ " (label) } }
+                            @if let Some(label) = answer.get("label").and_then(serde_json::Value::as_str) { div color=(color::SUCCESS) font-size=((typeface::LABEL)) margin-top=((space::S3)) { "✓ " (label) } }
                         }
-                        @if let Some(custom) = question.get("custom").and_then(serde_json::Value::as_str) { div color="#7ee787" font-size=12 margin-top=3 white-space="preserve-wrap" { "answer: " (custom) } }
+                        @if let Some(custom) = question.get("custom").and_then(serde_json::Value::as_str) { div color=(color::SUCCESS) font-size=((typeface::LABEL)) margin-top=((space::S3)) white-space="preserve-wrap" { "answer: " (custom) } }
                     }
                 }
             }
-            @if questions.len() > 20 { div color="#f2cc60" font-size=11 margin-top=6 { "Question outcomes truncated for display." } }
+            @if questions.len() > 20 { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Question outcomes truncated for display." } }
         }
     })
 }
@@ -1086,22 +1118,22 @@ pub(super) fn render_web_status(artifact: &ToolArtifactView) -> Option<Container
         return None;
     }
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" { "Web capabilities" }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) { "Web capabilities" }
             @if let Some(search) = search {
-                div border-top="1, #30363d" padding-top=6 margin-top=6 {
-                    div color="#f0f6fc" { "Search" }
-                    @if let Some(available) = search.get("available").and_then(serde_json::Value::as_bool) { div color="#8b949e" font-size=12 { "available: " (available.to_string()) } }
-                    @if let Some(provider) = search.get("provider").and_then(serde_json::Value::as_str) { div color="#8b949e" font-size=12 { "provider: " (provider) } }
-                    @if let Some(quality) = search.get("quality").and_then(serde_json::Value::as_str) { div color="#8b949e" font-size=12 { "quality: " (quality) } }
+                div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
+                    div color=(color::STRONG) { "Search" }
+                    @if let Some(available) = search.get("available").and_then(serde_json::Value::as_bool) { div color=(color::MUTED) font-size=((typeface::LABEL)) { "available: " (available.to_string()) } }
+                    @if let Some(provider) = search.get("provider").and_then(serde_json::Value::as_str) { div color=(color::MUTED) font-size=((typeface::LABEL)) { "provider: " (provider) } }
+                    @if let Some(quality) = search.get("quality").and_then(serde_json::Value::as_str) { div color=(color::MUTED) font-size=((typeface::LABEL)) { "quality: " (quality) } }
                 }
             }
             @if let Some(fetch) = fetch {
-                div border-top="1, #30363d" padding-top=6 margin-top=6 {
-                    div color="#f0f6fc" { "Fetch" }
-                    @if let Some(available) = fetch.get("available").and_then(serde_json::Value::as_bool) { div color="#8b949e" font-size=12 { "available: " (available.to_string()) } }
-                    @if let Some(rendered) = fetch.get("rendered_fetch").and_then(serde_json::Value::as_bool) { div color="#8b949e" font-size=12 { "rendered fetch: " (rendered.to_string()) } }
-                    @if let Some(max_bytes) = fetch.get("max_bytes").and_then(serde_json::Value::as_u64) { div color="#8b949e" font-size=12 { "max bytes: " (max_bytes.to_string()) } }
+                div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
+                    div color=(color::STRONG) { "Fetch" }
+                    @if let Some(available) = fetch.get("available").and_then(serde_json::Value::as_bool) { div color=(color::MUTED) font-size=((typeface::LABEL)) { "available: " (available.to_string()) } }
+                    @if let Some(rendered) = fetch.get("rendered_fetch").and_then(serde_json::Value::as_bool) { div color=(color::MUTED) font-size=((typeface::LABEL)) { "rendered fetch: " (rendered.to_string()) } }
+                    @if let Some(max_bytes) = fetch.get("max_bytes").and_then(serde_json::Value::as_u64) { div color=(color::MUTED) font-size=((typeface::LABEL)) { "max bytes: " (max_bytes.to_string()) } }
                 }
             }
         }
@@ -1120,13 +1152,13 @@ pub(super) fn render_web_inspect_result(artifact: &ToolArtifactView) -> Option<C
         .and_then(serde_json::Value::as_str);
     let notes = metadata.get("notes").and_then(serde_json::Value::as_array);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" { "URL inspection" }
-            div color="#f0f6fc" font-family="monospace" margin-top=4 white-space="preserve-wrap" { (url) }
-            @if let Some(kind) = kind { div color="#8b949e" font-size=12 margin-top=3 { "kind: " (kind) } }
-            @if let Some(tool) = tool { div color="#8b949e" font-size=12 margin-top=3 { "recommended tool: " (tool) } }
-            @if let Some(action) = action { div color="#c9d1d9" font-size=12 margin-top=3 white-space="preserve-wrap" { (action) } }
-            @for note in notes.into_iter().flatten().filter_map(serde_json::Value::as_str).take(20) { div color="#8b949e" font-size=12 margin-top=3 white-space="preserve-wrap" { "• " (note) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) { "URL inspection" }
+            div color=(color::STRONG) font-family="monospace" margin-top=((space::XS)) white-space="preserve-wrap" { (url) }
+            @if let Some(kind) = kind { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::S3)) { "kind: " (kind) } }
+            @if let Some(tool) = tool { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::S3)) { "recommended tool: " (tool) } }
+            @if let Some(action) = action { div color=(color::TEXT) font-size=((typeface::LABEL)) margin-top=((space::S3)) white-space="preserve-wrap" { (action) } }
+            @for note in notes.into_iter().flatten().filter_map(serde_json::Value::as_str).take(20) { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::S3)) white-space="preserve-wrap" { "• " (note) } }
         }
     })
 }
@@ -1144,33 +1176,33 @@ pub(super) fn render_worktree_list_result(artifact: &ToolArtifactView) -> Option
         .or_else(|| metadata.get("entries"))
         .and_then(serde_json::Value::as_array)?;
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Worktrees"), worktrees.len())) }
-            @if let Some(repo_root) = repo_root { div color="#8b949e" font-size=11 font-family="monospace" { "repository: " (repo_root) } }
-            @if let Some(current_worktree) = current_worktree { div color="#8b949e" font-size=11 font-family="monospace" margin-top=3 { "current: " (current_worktree) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (format!("{} ({})", artifact.artifact.title.as_deref().unwrap_or("Worktrees"), worktrees.len())) }
+            @if let Some(repo_root) = repo_root { div color=(color::MUTED) font-size=((typeface::DETAIL)) font-family="monospace" { "repository: " (repo_root) } }
+            @if let Some(current_worktree) = current_worktree { div color=(color::MUTED) font-size=((typeface::DETAIL)) font-family="monospace" margin-top=((space::S3)) { "current: " (current_worktree) } }
             @if worktrees.is_empty() {
-                div color="#8b949e" font-size=12 { "No worktrees found." }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) { "No worktrees found." }
             }
             @for worktree in worktrees.iter().take(20) {
                 @if let Some(worktree) = worktree.as_object() {
-                    div border-top="1, #30363d" padding-top=6 margin-top=6 {
+                    div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
                         @if let Some(path) = worktree.get("path").and_then(serde_json::Value::as_str) {
-                            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+                            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
                         }
                         @if let Some(branch) = worktree.get("branch").and_then(serde_json::Value::as_str) {
-                            div color="#8b949e" font-size=12 margin-top=2 { "branch: " (branch) }
+                            div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::S2)) { "branch: " (branch) }
                         }
                         @if let Some(commit) = worktree.get("commit").and_then(serde_json::Value::as_str) {
-                            div color="#8b949e" font-size=12 margin-top=2 { "commit: " (commit) }
+                            div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::S2)) { "commit: " (commit) }
                         }
                         @if let Some(is_main) = worktree.get("is_main").and_then(serde_json::Value::as_bool) {
-                            div color="#8b949e" font-size=12 margin-top=2 { "main: " (is_main.to_string()) }
+                            div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::S2)) { "main: " (is_main.to_string()) }
                         }
                     }
                 }
             }
             @if worktrees.len() > 20 {
-                div color="#8b949e" font-size=12 margin-top=8 { "… " ((worktrees.len() - 20).to_string()) " more worktrees" }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "… " ((worktrees.len() - 20).to_string()) " more worktrees" }
             }
         }
     })
@@ -1193,16 +1225,16 @@ pub(super) fn render_worktree_create_result(artifact: &ToolArtifactView) -> Opti
         .get("session")
         .and_then(serde_json::Value::as_object);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Worktree created")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
-            div color="#7ee787" font-size=12 margin-top=4 { "worktree created" }
-            @if let Some(repo_root) = repo_root { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "repo: " (repo_root) } }
-            @if let Some(branch) = branch { div color="#8b949e" font-size=12 margin-top=4 { "branch: " (branch) } }
-            @if let Some(created_branch) = created_branch { div color="#8b949e" font-size=12 margin-top=4 { "created branch: " (created_branch.to_string()) } }
-            @if let Some(setup_applied) = setup_applied { div color="#8b949e" font-size=12 margin-top=4 { "setup applied: " (setup_applied.to_string()) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Worktree created")) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            div color=(color::SUCCESS) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "worktree created" }
+            @if let Some(repo_root) = repo_root { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "repo: " (repo_root) } }
+            @if let Some(branch) = branch { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "branch: " (branch) } }
+            @if let Some(created_branch) = created_branch { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "created branch: " (created_branch.to_string()) } }
+            @if let Some(setup_applied) = setup_applied { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "setup applied: " (setup_applied.to_string()) } }
             @if let Some(session) = session {
-                div color="#8b949e" font-size=12 margin-top=4 {
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) {
                     "session: "
                     (session.get("name").and_then(serde_json::Value::as_str).or_else(|| session.get("id").and_then(serde_json::Value::as_str)).unwrap_or("created"))
                 }
@@ -1218,10 +1250,10 @@ pub(super) fn render_worktree_remove_result(artifact: &ToolArtifactView) -> Opti
         .get("path")
         .and_then(serde_json::Value::as_str)?;
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (artifact.artifact.title.as_deref().unwrap_or("Worktree removed")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
-            div color="#7ee787" font-size=12 margin-top=4 { "worktree removed" }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (artifact.artifact.title.as_deref().unwrap_or("Worktree removed")) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            div color=(color::SUCCESS) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "worktree removed" }
         }
     })
 }
@@ -1255,15 +1287,15 @@ pub(super) fn render_extraction_request(visual: &PluginVisualView) -> Option<Con
         .or_else(|| payload.get("url"))
         .and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (visual.descriptor.title.as_deref().unwrap_or(operation)) }
-            @if let Some(source) = source { div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (source) } }
-            @if source.is_none() { div color="#8b949e" font-size=12 { "Check configured extraction capabilities." } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (visual.descriptor.title.as_deref().unwrap_or(operation)) }
+            @if let Some(source) = source { div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (source) } }
+            @if source.is_none() { div color=(color::MUTED) font-size=((typeface::LABEL)) { "Check configured extraction capabilities." } }
             @for key in ["engine", "language"] {
-                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) { div color="#8b949e" font-size=12 margin-top=4 { (key) ": " (value) } }
+                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (key) ": " (value) } }
             }
             @for key in ["max_bytes", "timeout_ms"] {
-                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_u64) { div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value.to_string()) } }
+                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_u64) { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (key.replace('_', " ")) ": " (value.to_string()) } }
             }
         }
     })
@@ -1280,12 +1312,12 @@ pub(super) fn render_web_utility_request(visual: &PluginVisualView) -> Option<Co
         .and_then(serde_json::Value::as_str)?;
     let url = payload.get("url").and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 {
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) {
                 (if operation.contains("inspect") { "Inspect URL" } else { "Web capabilities" })
             }
-            @if let Some(url) = url { div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (url) } }
-            @if url.is_none() { div color="#8b949e" font-size=12 { "Check available search and fetch providers." } }
+            @if let Some(url) = url { div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (url) } }
+            @if url.is_none() { div color=(color::MUTED) font-size=((typeface::LABEL)) { "Check available search and fetch providers." } }
         }
     })
 }
@@ -1302,25 +1334,25 @@ pub(super) fn render_filesystem_request(visual: &PluginVisualView) -> Option<Con
         .unwrap_or("filesystem");
     let path = payload.get("path").and_then(serde_json::Value::as_str)?;
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div direction=row gap=8 align-items=center margin-bottom=6 {
-                span color="#58a6ff" { (operation) }
-                span color="#8b949e" { "filesystem" }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div direction=row gap=((space::SM)) align-items=center margin-bottom=((space::S6)) {
+                span color=(color::INFO) { (operation) }
+                span color=(color::MUTED) { "filesystem" }
             }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
             @for key in ["pattern", "query", "url", "region", "glob", "content_type"] {
                 @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) {
-                    div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value) }
+                    div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (key.replace('_', " ")) ": " (value) }
                 }
             }
             @for key in ["offset", "limit", "max_entries", "max_results", "max_matches", "timeout_ms", "offset_bytes", "max_bytes"] {
                 @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_u64) {
-                    div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value.to_string()) }
+                    div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (key.replace('_', " ")) ": " (value.to_string()) }
                 }
             }
             @for key in ["recursive", "ignore_case", "from_end"] {
                 @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_bool) {
-                    div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value.to_string()) }
+                    div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (key.replace('_', " ")) ": " (value.to_string()) }
                 }
             }
         }
@@ -1337,14 +1369,14 @@ pub(super) fn render_filesystem_change(visual: &PluginVisualView) -> Option<Cont
     let old_text = payload.get("old_text").and_then(serde_json::Value::as_str);
     let new_text = payload.get("new_text").and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (visual.descriptor.title.as_deref().unwrap_or("Filesystem change")) }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (visual.descriptor.title.as_deref().unwrap_or("Filesystem change")) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
             @if let Some(old_text) = old_text {
-                div color="#f85149" font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { "- " (old_text) }
+                div color=(color::ERROR) font-family="monospace" white-space="preserve-wrap" border-top=((1, surface::BORDER)) margin-top=((space::SM)) padding-top=((space::SM)) { "- " (old_text) }
             }
             @if let Some(new_text) = new_text {
-                div color="#7ee787" font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { "+ " (new_text) }
+                div color=(color::SUCCESS) font-family="monospace" white-space="preserve-wrap" border-top=((1, surface::BORDER)) margin-top=((space::SM)) padding-top=((space::SM)) { "+ " (new_text) }
             }
         }
     })
@@ -1358,11 +1390,11 @@ fn vim_diff_panel(diff: &str, source_truncated: bool) -> Containers {
         |(byte_index, _)| (&diff[..byte_index], true),
     );
     container! {
-        details open=true margin-top=8 {
-            summary color="#58a6ff" font-size=11 { "diff" }
-            div color="#c9d1d9" font-family="monospace" white-space="preserve-wrap" background="#010409" border="1, #30363d" border-radius=6 padding=8 margin-top=6 { (diff) }
-            @if source_truncated { div color="#f2cc60" font-size=11 margin-top=6 { "Diff was truncated by the producer." } }
-            @if display_truncated { div color="#f2cc60" font-size=11 margin-top=6 { "Diff truncated for display." } }
+        details open=true margin-top=((space::SM)) {
+            summary color=(color::INFO) font-size=((typeface::DETAIL)) { "diff" }
+            div color=(color::TEXT) font-family="monospace" white-space="preserve-wrap" background=(surface::INSET) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) margin-top=((space::S6)) { (diff) }
+            @if source_truncated { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Diff was truncated by the producer." } }
+            @if display_truncated { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Diff truncated for display." } }
         }
     }
 }
@@ -1376,18 +1408,18 @@ pub(super) fn render_vim_edit_live(visual: &PluginVisualView) -> Option<Containe
     let changed = payload.get("changed").and_then(serde_json::Value::as_bool);
     let cursor = payload.get("cursor").and_then(serde_json::Value::as_object);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div justify-content=space-between gap=8 {
-                div color="#58a6ff" { "Vim edit" }
-                div color=(if error.is_some() { "#f85149" } else { "#7ee787" }) font-size=12 { (phase) }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div justify-content=space-between gap=((space::SM)) {
+                div color=(color::INFO) { "Vim edit" }
+                div color=(if error.is_some() { color::ERROR } else { color::SUCCESS }) font-size=((typeface::LABEL)) { (phase) }
             }
-            @if let Some(path) = path { div color="#f0f6fc" font-family="monospace" margin-top=4 { (path) } }
-            @if let (Some(file_index), Some(file_total)) = (payload.get("file_index").and_then(serde_json::Value::as_u64), payload.get("file_total").and_then(serde_json::Value::as_u64)) { div color="#8b949e" font-size=11 margin-top=4 { "file " (file_index.saturating_add(1).to_string()) " of " (file_total.to_string()) } }
-            @if let (Some(step_index), Some(step_total)) = (payload.get("step_index").and_then(serde_json::Value::as_u64), payload.get("step_total").and_then(serde_json::Value::as_u64)) { div color="#8b949e" font-size=11 margin-top=4 { "step " (step_index.saturating_add(1).to_string()) " of " (step_total.to_string()) } }
-            @if let Some(cursor) = cursor { div color="#8b949e" font-size=11 margin-top=4 { "cursor " (cursor.get("line").and_then(serde_json::Value::as_u64).unwrap_or_default().to_string()) ":" (cursor.get("column").and_then(serde_json::Value::as_u64).unwrap_or_default().to_string()) } }
-            @if let Some(changed) = changed { div color="#8b949e" font-size=11 margin-top=4 { (if changed { "file changed" } else { "no file changes" }) } }
-            @if let Some(message) = message { div color="#c9d1d9" font-size=12 margin-top=6 { (message) } }
-            @if let Some(error) = error { div color="#f85149" font-size=12 margin-top=6 white-space="preserve-wrap" { (error) } }
+            @if let Some(path) = path { div color=(color::STRONG) font-family="monospace" margin-top=((space::XS)) { (path) } }
+            @if let (Some(file_index), Some(file_total)) = (payload.get("file_index").and_then(serde_json::Value::as_u64), payload.get("file_total").and_then(serde_json::Value::as_u64)) { div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::XS)) { "file " (file_index.saturating_add(1).to_string()) " of " (file_total.to_string()) } }
+            @if let (Some(step_index), Some(step_total)) = (payload.get("step_index").and_then(serde_json::Value::as_u64), payload.get("step_total").and_then(serde_json::Value::as_u64)) { div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::XS)) { "step " (step_index.saturating_add(1).to_string()) " of " (step_total.to_string()) } }
+            @if let Some(cursor) = cursor { div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::XS)) { "cursor " (cursor.get("line").and_then(serde_json::Value::as_u64).unwrap_or_default().to_string()) ":" (cursor.get("column").and_then(serde_json::Value::as_u64).unwrap_or_default().to_string()) } }
+            @if let Some(changed) = changed { div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::XS)) { (if changed { "file changed" } else { "no file changes" }) } }
+            @if let Some(message) = message { div color=(color::TEXT) font-size=((typeface::LABEL)) margin-top=((space::S6)) { (message) } }
+            @if let Some(error) = error { div color=(color::ERROR) font-size=((typeface::LABEL)) margin-top=((space::S6)) white-space="preserve-wrap" { (error) } }
         }
     })
 }
@@ -1408,21 +1440,21 @@ pub(super) fn render_vim_edit_playback(visual: &PluginVisualView) -> Option<Cont
         .unwrap_or(false);
     let error = payload.get("error").and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background=(if success { "#010409" } else { "#2d1015" }) padding=10 margin-top=8 {
-            div justify-content=space-between gap=8 {
-                div color="#58a6ff" { "Vim edit result" }
-                div color=(if success { "#7ee787" } else { "#f85149" }) font-size=12 { (if success { "completed" } else { "failed" }) }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(if success { surface::INSET } else { surface::ERROR_INSET }) padding=((space::S10)) margin-top=((space::SM)) {
+            div justify-content=space-between gap=((space::SM)) {
+                div color=(color::INFO) { "Vim edit result" }
+                div color=(if success { color::SUCCESS } else { color::ERROR }) font-size=((typeface::LABEL)) { (if success { "completed" } else { "failed" }) }
             }
-            @if let Some(path) = path { div color="#f0f6fc" font-family="monospace" margin-top=4 { (path) } }
-            div color="#8b949e" font-size=11 margin-top=4 {
+            @if let Some(path) = path { div color=(color::STRONG) font-family="monospace" margin-top=((space::XS)) { (path) } }
+            div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-top=((space::XS)) {
                 @if let Some(mode) = mode { (mode) }
                 @if let Some(changed) = changed { " · " (if changed { "changed" } else { "unchanged" }) }
                 @if let Some(frame_count) = payload.get("frame_count").and_then(serde_json::Value::as_u64) { " · " (frame_count.to_string()) " playback frames" }
             }
-            @if let Some(summary) = summary { div color="#c9d1d9" font-size=12 margin-top=6 { (summary) } }
+            @if let Some(summary) = summary { div color=(color::TEXT) font-size=((typeface::LABEL)) margin-top=((space::S6)) { (summary) } }
             @if let Some(diff) = diff { (vim_diff_panel(diff, diff_truncated)) }
-            @if let Some(error) = error { div color="#f85149" font-size=12 margin-top=6 white-space="preserve-wrap" { (error) } }
-            @if payload.get("frames_truncated").and_then(serde_json::Value::as_bool) == Some(true) { div color="#f2cc60" font-size=11 margin-top=6 { "Playback frames were truncated." } }
+            @if let Some(error) = error { div color=(color::ERROR) font-size=((typeface::LABEL)) margin-top=((space::S6)) white-space="preserve-wrap" { (error) } }
+            @if payload.get("frames_truncated").and_then(serde_json::Value::as_bool) == Some(true) { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Playback frames were truncated." } }
         }
     })
 }
@@ -1444,33 +1476,33 @@ pub(super) fn render_vim_edit_request(visual: &PluginVisualView) -> Option<Conta
         return None;
     }
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { (visual.descriptor.title.as_deref().unwrap_or("Vim edit")) }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (visual.descriptor.title.as_deref().unwrap_or("Vim edit")) }
             @if let Some(path) = single_path {
-                div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+                div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
                 @if let Some(steps) = steps {
-                    div color="#8b949e" font-size=12 margin-top=4 { "steps: " (steps.len().to_string()) }
+                    div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "steps: " (steps.len().to_string()) }
                 }
             }
             @if let Some(files) = files {
                 @for file in files.iter().take(10) {
                     @if let Some(file) = file.as_object() {
-                        div border-top="1, #30363d" padding-top=6 margin-top=6 {
+                        div border-top=((1, surface::BORDER)) padding-top=((space::S6)) margin-top=((space::S6)) {
                             @if let Some(path) = file.get("path").and_then(serde_json::Value::as_str) {
-                                span color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
+                                span color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
                             }
                             @if let Some(steps) = file.get("steps").and_then(serde_json::Value::as_array) {
-                                span color="#8b949e" { " · steps: " (steps.len().to_string()) }
+                                span color=(color::MUTED) { " · steps: " (steps.len().to_string()) }
                             }
                         }
                     }
                 }
                 @if files.len() > 10 {
-                    div color="#8b949e" font-size=12 margin-top=8 { "… " ((files.len() - 10).to_string()) " more files" }
+                    div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "… " ((files.len() - 10).to_string()) " more files" }
                 }
             }
-            @if let Some(sandbox) = sandbox { div color="#8b949e" font-size=12 margin-top=4 { "sandbox: " (sandbox) } }
-            @if let Some(timeout_ms) = timeout_ms { div color="#8b949e" font-size=12 margin-top=4 { "timeout: " (timeout_ms.to_string()) " ms" } }
+            @if let Some(sandbox) = sandbox { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "sandbox: " (sandbox) } }
+            @if let Some(timeout_ms) = timeout_ms { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "timeout: " (timeout_ms.to_string()) " ms" } }
         }
     })
 }
@@ -1490,11 +1522,11 @@ pub(super) fn render_git_clone_request(visual: &PluginVisualView) -> Option<Cont
         .get("destination")
         .and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=6 { "Clone repository" }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (url) }
-            @if let Some(reference) = reference { div color="#8b949e" font-size=12 margin-top=4 { "ref: " (reference) } }
-            @if let Some(destination) = destination { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "destination: " (destination) } }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { "Clone repository" }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (url) }
+            @if let Some(reference) = reference { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "ref: " (reference) } }
+            @if let Some(destination) = destination { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "destination: " (destination) } }
         }
     })
 }
@@ -1522,18 +1554,18 @@ pub(super) fn render_worktree_request(visual: &PluginVisualView) -> Option<Conta
         .get("base_ref")
         .and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div direction=row gap=8 align-items=center margin-bottom=6 {
-                span color="#58a6ff" { (operation) }
-                span color="#8b949e" { "worktree" }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div direction=row gap=((space::SM)) align-items=center margin-bottom=((space::S6)) {
+                span color=(color::INFO) { (operation) }
+                span color=(color::MUTED) { "worktree" }
             }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (primary_path) }
-            @if let Some(cwd) = cwd { div color="#8b949e" font-size=12 margin-top=4 font-family="monospace" white-space="preserve-wrap" { "cwd: " (cwd) } }
-            @if let Some(branch) = branch { div color="#8b949e" font-size=12 margin-top=4 { "branch: " (branch) } }
-            @if let Some(base_ref) = base_ref { div color="#8b949e" font-size=12 margin-top=4 { "base ref: " (base_ref) } }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (primary_path) }
+            @if let Some(cwd) = cwd { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "cwd: " (cwd) } }
+            @if let Some(branch) = branch { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "branch: " (branch) } }
+            @if let Some(base_ref) = base_ref { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "base ref: " (base_ref) } }
             @for key in ["detach", "force", "no_setup"] {
                 @if let Some(value) = arguments.get(key).and_then(serde_json::Value::as_bool) {
-                    div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value.to_string()) }
+                    div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (key.replace('_', " ")) ": " (value.to_string()) }
                 }
             }
         }
@@ -1562,28 +1594,28 @@ pub(super) fn render_web_search_request(visual: &PluginVisualView) -> Option<Con
         .get("max_results")
         .and_then(serde_json::Value::as_u64);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div direction=row gap=8 align-items=center margin-bottom=6 {
-                span color="#58a6ff" { "Web search" }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div direction=row gap=((space::SM)) align-items=center margin-bottom=((space::S6)) {
+                span color=(color::INFO) { "Web search" }
                 @if let Some(provider) = provider {
-                    span color="#8b949e" { (provider) }
+                    span color=(color::MUTED) { (provider) }
                 }
             }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (query) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (query) }
             @if let Some(site) = site {
-                div color="#8b949e" font-size=12 margin-top=4 { "site: " (site) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "site: " (site) }
             }
             @if let Some(freshness) = freshness {
-                div color="#8b949e" font-size=12 margin-top=4 { "freshness: " (freshness) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "freshness: " (freshness) }
             }
             @if let Some(region) = region {
-                div color="#8b949e" font-size=12 margin-top=4 { "region: " (region) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "region: " (region) }
             }
             @if let Some(safe_search) = safe_search {
-                div color="#8b949e" font-size=12 margin-top=4 { "safe search: " (safe_search) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "safe search: " (safe_search) }
             }
             @if let Some(max_results) = max_results {
-                div color="#8b949e" font-size=12 margin-top=4 { "max results: " (max_results.to_string()) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "max results: " (max_results.to_string()) }
             }
         }
     })
@@ -1608,25 +1640,25 @@ pub(super) fn render_web_fetch_request(visual: &PluginVisualView) -> Option<Cont
         .and_then(serde_json::Value::as_u64);
     let prompt = arguments.get("prompt").and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div direction=row gap=8 align-items=center margin-bottom=6 {
-                span color="#58a6ff" { "Fetch page" }
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div direction=row gap=((space::SM)) align-items=center margin-bottom=((space::S6)) {
+                span color=(color::INFO) { "Fetch page" }
                 @if let Some(provider) = provider {
-                    span color="#8b949e" { (provider) }
+                    span color=(color::MUTED) { (provider) }
                 }
             }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (url) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (url) }
             @if let Some(render) = render {
-                div color="#8b949e" font-size=12 margin-top=4 { "rendered browser fetch: " (render.to_string()) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "rendered page fetch: " (render.to_string()) }
             }
             @if let Some(max_bytes) = max_bytes {
-                div color="#8b949e" font-size=12 margin-top=4 { "max bytes: " (max_bytes.to_string()) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "max bytes: " (max_bytes.to_string()) }
             }
             @if let Some(timeout_ms) = timeout_ms {
-                div color="#8b949e" font-size=12 margin-top=4 { "timeout: " (timeout_ms.to_string()) " ms" }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "timeout: " (timeout_ms.to_string()) " ms" }
             }
             @if let Some(prompt) = prompt {
-                div color="#8b949e" font-size=12 margin-top=4 white-space="preserve-wrap" { "prompt: " (prompt) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) white-space="preserve-wrap" { "prompt: " (prompt) }
             }
         }
     })
@@ -1641,13 +1673,13 @@ pub(super) fn render_shell_request(visual: &PluginVisualView) -> Option<Containe
         .pointer("/_bcode_runtime/output")
         .and_then(serde_json::Value::as_str);
     Some(container! {
-        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
             @if let Some(cwd) = cwd {
-                div color="#8b949e" font-size=11 margin-bottom=4 { (cwd) }
+                div color=(color::MUTED) font-size=((typeface::DETAIL)) margin-bottom=((space::XS)) { (cwd) }
             }
-            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (command) }
+            div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (command) }
             @if let Some(output) = output {
-                div color="#c9d1d9" font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { (output) }
+                div color=(color::TEXT) font-family="monospace" white-space="preserve-wrap" border-top=((1, surface::BORDER)) margin-top=((space::SM)) padding-top=((space::SM)) { (output) }
             }
         }
     })
@@ -1662,11 +1694,11 @@ pub(super) fn json_panel(title: &str, value: &serde_json::Value) -> Containers {
         |(byte_index, _)| (&json[..byte_index], true),
     );
     container! {
-        details margin-top=8 {
-            summary color="#8b949e" { (title) }
-            div white-space="preserve-wrap" background="#010409" border="1, #30363d" border-radius=6 padding=8 color="#c9d1d9" { (json) }
+        details margin-top=((space::SM)) {
+            summary color=(color::MUTED) { (title) }
+            div white-space="preserve-wrap" background=(surface::INSET) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) color=(color::TEXT) { (json) }
             @if truncated {
-                div color="#f2cc60" font-size=11 margin-top=6 { "Structured details truncated for display." }
+                div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Structured details truncated for display." }
             }
         }
     }

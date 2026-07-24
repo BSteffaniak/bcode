@@ -2,15 +2,21 @@
 
 use std::borrow::Cow;
 
+use super::theme::{color, radius, space, surface, typeface};
+use crate::context::{PresentationAction, PresentationContext};
 use bcode_session_view_models::{
     ChatMessageView, PluginVisualView, SessionViewSnapshot, TextFormat, TranscriptViewItemKind,
 };
 use hyperchad::template::{Containers, container};
 
 use super::adapters::{VISUAL_ADAPTERS, json_panel, render_plugin_visual};
+use super::components::{
+    MessageArticle, conversation_timeline, disclosure, empty_state, message_article,
+    truncation_notice, unsupported_content,
+};
 use super::permissions::permission_history;
 use super::semantic_dom_id;
-use super::tools::render_tool_lifecycle;
+use super::tools::render_tool_lifecycle_with_context;
 use super::usage::usage_transcript_item;
 
 const MAX_INLINE_MESSAGE_CHARS: usize = 100_000;
@@ -41,43 +47,47 @@ pub(super) fn is_superseded_tool_request(
     })
 }
 
-pub(super) fn transcript_section(snapshot: &SessionViewSnapshot, access_token: &str) -> Containers {
-    container! {
-        section #conversation-timeline background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
-            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "transcript" }
+pub(super) fn transcript_section(
+    snapshot: &SessionViewSnapshot,
+    context: &impl PresentationContext,
+) -> Containers {
+    conversation_timeline(&container! {
             @if snapshot.transcript.has_older_history {
                 @if let (Some(session_id), Some(anchor_sequence)) = (snapshot.session_id, snapshot.transcript.source_start_sequence) {
-                    form hx-post=(format!("/actions/history-window?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this margin-bottom=12 {
+                    form hx-post=(context.action_target(PresentationAction::MoveHistoryWindow)) hx-target="#bcode-web-shell" hx-swap=this margin-bottom=((space::MD)) {
                         input type=hidden name="session_id" value=(session_id.to_string());
                         input type=hidden name="direction" value="older";
                         input type=hidden name="anchor_sequence" value=(anchor_sequence.to_string());
-                        button type=submit background="#21262d" color="#58a6ff" border="1, #30363d" border-radius=6 padding="6, 12" { "load older history" }
+                        button type=submit background=(surface::CONTROL) color=(color::INFO) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding="10, 14" { "load older history" }
                     }
                 }
             }
             @if snapshot.transcript.items.is_empty() {
-                div color="#8b949e" font-size=13 { "Attach or create a session to begin." }
+                (empty_state(if snapshot.session_id.is_some() {
+                    "This session has no conversation entries in the current history view."
+                } else {
+                    "Attach or create a session to begin."
+                }))
             } @else {
                 @for (index, item) in snapshot.transcript.items.iter().enumerate() {
                     @if should_render_transcript_item(item, snapshot.thinking.visible)
                         && !is_superseded_tool_request(&snapshot.transcript.items, index)
                         && !is_active_interaction_summary(item, &snapshot.interactions) {
-                        (transcript_item(item))
+                        (transcript_item_with_context(item, snapshot.session_id, context))
                     }
                 }
             }
             @if snapshot.transcript.has_newer_history {
                 @if let (Some(session_id), Some(anchor_sequence)) = (snapshot.session_id, snapshot.transcript.source_end_sequence) {
-                    form hx-post=(format!("/actions/history-window?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this margin-top=12 {
+                    form hx-post=(context.action_target(PresentationAction::MoveHistoryWindow)) hx-target="#bcode-web-shell" hx-swap=this margin-top=((space::MD)) {
                         input type=hidden name="session_id" value=(session_id.to_string());
                         input type=hidden name="direction" value="newer";
                         input type=hidden name="anchor_sequence" value=(anchor_sequence.to_string());
-                        button type=submit background="#21262d" color="#58a6ff" border="1, #30363d" border-radius=6 padding="6, 12" { "load newer history" }
+                        button type=submit background=(surface::CONTROL) color=(color::INFO) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) padding="10, 14" { "load newer history" }
                     }
                 }
             }
-        }
-    }
+    })
 }
 
 pub(super) const fn should_render_transcript_item(
@@ -100,40 +110,52 @@ pub(super) fn is_active_interaction_summary(
             .any(|active| active.interaction_id == interaction.interaction_id)
 }
 
+#[cfg(test)]
 pub(super) fn transcript_item(item: &bcode_session_view_models::TranscriptViewItem) -> Containers {
+    transcript_item_with_context(item, None, &crate::context::StaticPresentationContext)
+}
+
+fn transcript_item_with_context(
+    item: &bcode_session_view_models::TranscriptViewItem,
+    session_id: Option<bcode_session_models::SessionId>,
+    context: &impl PresentationContext,
+) -> Containers {
     let (background, accent, margin_left, margin_right) = match &item.kind {
-        TranscriptViewItemKind::UserMessage { .. } => ("#0c2d48", "#58a6ff", 48, 0),
-        TranscriptViewItemKind::AssistantMessage { .. } => ("#0d1117", "#7ee787", 0, 48),
-        TranscriptViewItemKind::ReasoningMessage { .. } => ("#161b22", "#a371f7", 24, 24),
+        TranscriptViewItemKind::UserMessage { .. } => (surface::USER_MESSAGE, color::INFO, 48, 0),
+        TranscriptViewItemKind::AssistantMessage { .. } => (surface::APP, color::SUCCESS, 0, 48),
+        TranscriptViewItemKind::ReasoningMessage { .. } => {
+            (surface::PANEL, color::REASONING, 24, 24)
+        }
         TranscriptViewItemKind::SystemMessage { .. }
         | TranscriptViewItemKind::Compaction { .. }
-        | TranscriptViewItemKind::Skill { .. } => ("#161b22", "#8b949e", 24, 24),
-        _ => ("#0d1117", "#30363d", 0, 0),
+        | TranscriptViewItemKind::Skill { .. } => (surface::PANEL, color::MUTED, 24, 24),
+        _ => (surface::APP, surface::DISABLED, 0, 0),
     };
     let item_id = semantic_dom_id("transcript-item", item.id.get());
-    container! {
-        div id=(item_id) background=(background) border-left="2, #30363d" border-radius=8 padding=12 margin-left=(margin_left) margin-right=(margin_right) margin-bottom=10 {
-            div justify-content=space-between margin-bottom=8 color=(accent) font-size=11 {
-                span { (item_label(&item.kind)) }
-                @if item.streaming {
-                    span { "live" }
+    let developer_detail = disclosure(
+        "developer details",
+        &container! {
+            div color=(color::MUTED) font-size=((typeface::DETAIL)) {
+                "item " (item.id.get().to_string()) " · revision " (item.revision.to_string())
+                @if let Some(sequence) = item.sequence {
+                    " · event " (sequence.to_string())
+                }
+                @if let Some(timestamp_ms) = item.timestamp_ms {
+                    " · timestamp " (timestamp_ms.to_string())
                 }
             }
-            (transcript_item_body(&item.kind))
-            details margin-top=8 {
-                summary color="#8b949e" font-size=11 { "developer details" }
-                div color="#8b949e" font-size=11 margin-top=6 {
-                    "item " (item.id.get().to_string()) " · revision " (item.revision.to_string())
-                    @if let Some(sequence) = item.sequence {
-                        " · event " (sequence.to_string())
-                    }
-                    @if let Some(timestamp_ms) = item.timestamp_ms {
-                        " · timestamp " (timestamp_ms.to_string())
-                    }
-                }
-            }
-        }
-    }
+        },
+    );
+    message_article(&MessageArticle {
+        id: &item_id,
+        label: item_label(&item.kind),
+        streaming: item.streaming,
+        background,
+        accent,
+        margins: (margin_left, margin_right),
+        content: &transcript_item_body_with_context(&item.kind, session_id, context),
+        developer_detail: &developer_detail,
+    })
 }
 
 fn compact_unsupported_contribution(
@@ -146,27 +168,29 @@ fn compact_unsupported_contribution(
         bcode_session_models::ToolContributionPlacement::Supplemental
         | bcode_session_models::ToolContributionPlacement::Hidden => return Containers::default(),
     };
-    container! { div color="#8b949e" { (label) } }
+    unsupported_content(&format!(
+        "No rich presentation is available for this {label}; bounded developer details remain available."
+    ))
 }
 
 pub(super) fn message_content(message: &ChatMessageView) -> Containers {
     if message.text.is_empty() {
         return container! {
-            div color="#8b949e" { "Empty message" }
+            div color=(color::MUTED) { "Empty message" }
         };
     }
     let (text, truncated) = bounded_message_text(&message.text);
     let content = match message.format {
         TextFormat::Markdown => vec![hyperchad::markdown::markdown_to_container(&text)],
         TextFormat::PlainText | TextFormat::Json => container! {
-            div white-space="preserve-wrap" margin=0 color="#c9d1d9" { (text) }
+            div white-space="preserve-wrap" margin=0 color=(color::TEXT) { (text) }
         },
     };
     container! {
         div {
             (content)
             @if truncated {
-                div color="#f2cc60" font-size=11 margin-top=8 { "Message truncated for display." }
+                (truncation_notice("Message truncated for display."))
             }
         }
     }
@@ -174,16 +198,16 @@ pub(super) fn message_content(message: &ChatMessageView) -> Containers {
 
 fn compaction_notice(compaction: &bcode_session_view_models::CompactionView) -> Containers {
     container! {
-        aside color="#8b949e" {
-            div font-size=11 margin-bottom=4 {
+        aside color=(color::MUTED) {
+            div font-size=((typeface::DETAIL)) margin-bottom=((space::XS)) {
                 (match compaction.status {
                     bcode_session_view_models::CompactionViewStatus::Local => "Local context compacted",
                     bcode_session_view_models::CompactionViewStatus::Provider => "Provider context compacted",
                 })
             }
             div white-space="preserve-wrap" margin=0 { (compaction.text) }
-            @if let Some(provider) = &compaction.provider_plugin_id { div font-size=11 margin-top=4 { "provider: " (provider) } }
-            @if let Some(model) = &compaction.model_id { div font-size=11 margin-top=2 { "model: " (model) } }
+            @if let Some(provider) = &compaction.provider_plugin_id { div font-size=((typeface::DETAIL)) margin-top=((space::XS)) { "provider: " (provider) } }
+            @if let Some(model) = &compaction.model_id { div font-size=((typeface::DETAIL)) margin-top=((space::S2)) { "model: " (model) } }
         }
     }
 }
@@ -198,11 +222,11 @@ fn interaction_notice(
     };
     container! {
         aside {
-            div justify-content=space-between gap=8 {
-                div color="#f0f6fc" { (interaction.title.as_deref().unwrap_or("Interactive request")) }
-                div color=(if interaction.resolved { "#8b949e" } else { "#f2cc60" }) font-size=11 { (status) }
+            div justify-content=space-between gap=((space::SM)) {
+                div color=(color::STRONG) { (interaction.title.as_deref().unwrap_or("Interactive request")) }
+                div color=(if interaction.resolved { color::MUTED } else { color::WARNING }) font-size=((typeface::DETAIL)) { (status) }
             }
-            div color="#8b949e" font-size=12 { (interaction.kind) @if interaction.required { " · required" } }
+            div color=(color::MUTED) font-size=((typeface::LABEL)) { (interaction.kind) @if interaction.required { " · required" } }
             @if let Some(resolution) = &interaction.resolution {
                 (json_panel("resolution", resolution))
             } @else if let Some(snapshot) = &interaction.snapshot {
@@ -214,36 +238,47 @@ fn interaction_notice(
 
 fn skill_notice(skill: &bcode_session_view_models::SkillView) -> Containers {
     container! {
-        aside color=(if matches!(skill.status, bcode_session_view_models::SkillViewStatus::Failed) { "#f85149" } else { "#8b949e" }) {
-            div font-size=11 margin-bottom=4 { (item_label(&TranscriptViewItemKind::Skill { skill: skill.clone() })) }
+        aside color=(if matches!(skill.status, bcode_session_view_models::SkillViewStatus::Failed) { color::ERROR } else { color::MUTED }) {
+            div font-size=((typeface::DETAIL)) margin-bottom=((space::XS)) { (item_label(&TranscriptViewItemKind::Skill { skill: skill.clone() })) }
             div white-space="preserve-wrap" margin=0 { (skill.text) }
         }
     }
 }
 
+#[cfg(test)]
 pub(super) fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
+    transcript_item_body_with_context(kind, None, &crate::context::StaticPresentationContext)
+}
+
+fn transcript_item_body_with_context(
+    kind: &TranscriptViewItemKind,
+    session_id: Option<bcode_session_models::SessionId>,
+    context: &impl PresentationContext,
+) -> Containers {
     match kind {
         TranscriptViewItemKind::UserMessage { message }
         | TranscriptViewItemKind::AssistantMessage { message } => message_content(message),
         TranscriptViewItemKind::ReasoningMessage { message } => container! {
             details {
-                summary color="#a371f7" { "Reasoning" }
-                div margin-top=8 { (message_content(message)) }
+                summary color=(color::REASONING) { "Reasoning" }
+                div margin-top=((space::SM)) { (message_content(message)) }
             }
         },
         TranscriptViewItemKind::SystemMessage { message } => container! {
-            aside color="#8b949e" { (message_content(message)) }
+            aside color=(color::MUTED) { (message_content(message)) }
         },
         TranscriptViewItemKind::Compaction { compaction } => compaction_notice(compaction),
         TranscriptViewItemKind::Skill { skill } => skill_notice(skill),
         TranscriptViewItemKind::ToolRequest { tool }
-        | TranscriptViewItemKind::ToolInvocation { tool } => render_tool_lifecycle(tool),
+        | TranscriptViewItemKind::ToolInvocation { tool } => {
+            render_tool_lifecycle_with_context(tool, session_id, context)
+        }
         TranscriptViewItemKind::Permission { permission } => permission_history(permission),
         TranscriptViewItemKind::Usage { usage } => usage_transcript_item(usage),
         TranscriptViewItemKind::RuntimeWork { work } => container! {
             div {
-                div color="#f0f6fc" { (work.message.as_deref().unwrap_or("Runtime work")) }
-                div color="#8b949e" font-size=12 { (format!("{:?}", work.status)) }
+                div color=(color::STRONG) { (work.message.as_deref().unwrap_or("Runtime work")) }
+                div color=(color::MUTED) font-size=((typeface::LABEL)) { (format!("{:?}", work.status)) }
             }
         },
         TranscriptViewItemKind::Interaction { interaction } => interaction_notice(interaction),

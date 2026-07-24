@@ -810,6 +810,19 @@ impl BcodeClient {
         self
     }
 
+    /// Add an interaction adapter to future connections while retaining existing runtime context.
+    #[must_use]
+    pub fn with_interaction_adapter(
+        mut self,
+        interaction_adapter: bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability,
+    ) -> Self {
+        self.runtime_context
+            .get_or_insert_default()
+            .interaction_adapters
+            .push(interaction_adapter);
+        self
+    }
+
     /// Configure the maximum wait for connection handshakes and IPC responses.
     #[must_use]
     pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {

@@ -767,7 +767,12 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         &filesystem_request_contribution(&request.tool_call_id, &request.name, &request.arguments),
     );
     let response = match request.name.as_str() {
-        "filesystem.read" => tool_read(request.arguments, cwd.as_deref(), &request.tool_call_id),
+        "filesystem.read" => tool_read(
+            request.arguments,
+            cwd.as_deref(),
+            &request.tool_call_id,
+            &context.bridge,
+        ),
         "filesystem.write" => tool_write(request.arguments, cwd.as_deref(), &request.tool_call_id),
         "filesystem.edit" => tool_edit(request.arguments, cwd.as_deref(), &request.tool_call_id),
         "filesystem.exists" => {
@@ -819,6 +824,7 @@ fn tool_read(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
     tool_call_id: &str,
+    bridge: &ServiceBridge,
 ) -> ToolInvocationResponse {
     match serde_json::from_value::<ReadRequest>(arguments) {
         Ok(request) => read_path_for_tool(
@@ -826,6 +832,7 @@ fn tool_read(
             &request,
             cwd.unwrap_or_else(|| Path::new(".")),
             tool_call_id,
+            Some(bridge),
         ),
         Err(error) => tool_json_error(&error),
     }
@@ -836,9 +843,12 @@ fn read_path_for_tool(
     request: &ReadRequest,
     working_directory: &Path,
     tool_call_id: &str,
+    bridge: Option<&ServiceBridge>,
 ) -> ToolInvocationResponse {
     match image_file_metadata(path) {
-        Ok(Some(image)) => image_tool_response(path, image, working_directory, tool_call_id),
+        Ok(Some(image)) => {
+            image_tool_response(path, image, working_directory, tool_call_id, bridge)
+        }
         Ok(None) => match std::fs::read(path) {
             Ok(bytes) => text_tool_response(path, request, &bytes, working_directory, tool_call_id),
             Err(error) => tool_io_error(&error),
@@ -1126,6 +1136,7 @@ fn image_tool_response(
     image: ImageFileMetadata,
     working_directory: &Path,
     tool_call_id: &str,
+    bridge: Option<&ServiceBridge>,
 ) -> ToolInvocationResponse {
     let metadata = std::fs::metadata(path);
     let byte_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
@@ -1138,6 +1149,67 @@ fn image_tool_response(
         byte_len
     );
     let mime_type = image.mime_type.clone();
+    let image_reference = bridge
+        .filter(|bridge| bridge.is_available())
+        .and_then(|bridge| {
+            let bytes = std::fs::read(path).ok()?;
+            let response = bridge
+                .request(&ServiceBridgeRequest::WriteArtifact(
+                    bcode_tool::ToolArtifactWriteRequest {
+                        invocation_id: tool_call_id.to_owned(),
+                        artifact_id: format!("{tool_call_id}-filesystem-image-bytes"),
+                        content_type: mime_type.clone(),
+                        bytes,
+                        metadata: json!({
+                            "width": image.width,
+                            "height": image.height,
+                            "source_path": path.display().to_string(),
+                        }),
+                    },
+                ))
+                .ok()?;
+            let ServiceBridgeResponse::Artifact(bcode_tool::ToolArtifactWriteResolution::Written {
+                artifact_id,
+                byte_len,
+                reference,
+            }) = response
+            else {
+                return None;
+            };
+            let storage_uri = reference
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            Some(bcode_tool::ToolArtifactRef {
+                key: "inline-image".to_owned(),
+                content_type: Some(mime_type.clone()),
+                storage_uri,
+                byte_len: Some(byte_len),
+                metadata: Some(json!({
+                    "artifact_id": artifact_id,
+                    "width": image.width,
+                    "height": image.height,
+                })),
+            })
+        });
+    let image_artifact = ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-filesystem-image"),
+            producer_plugin_id: FILESYSTEM_PLUGIN_ID.to_owned(),
+            schema: "bcode.filesystem.image".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_owned()),
+            title: Some("Image file".to_owned()),
+            metadata: json!({
+                "path": path.display().to_string(),
+                "mime_type": mime_type,
+                "width": image.width,
+                "height": image.height,
+                "byte_len": byte_len,
+            }),
+            refs: image_reference.into_iter().collect(),
+        }),
+    };
     ToolInvocationResponse {
         output,
         is_error: false,
@@ -1154,19 +1226,7 @@ fn image_tool_response(
             },
         }],
         full_output: None,
-        result: Some(filesystem_artifact_result(
-            tool_call_id,
-            "image",
-            "bcode.filesystem.image",
-            "Image file",
-            json!({
-                "path": path.display().to_string(),
-                "mime_type": mime_type,
-                "width": image.width,
-                "height": image.height,
-                "byte_len": byte_len,
-            }),
-        )),
+        result: Some(image_artifact),
     }
 }
 
@@ -2616,6 +2676,7 @@ mod tests {
             },
             &root,
             "test-read",
+            None,
         );
 
         assert!(!response.is_error);
@@ -2695,6 +2756,7 @@ mod tests {
             },
             &root,
             "test-image",
+            None,
         );
 
         assert!(!response.is_error);

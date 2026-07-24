@@ -82,6 +82,25 @@ coverage_text = "\n".join(
         Path("packages/session-view/src/actions.rs"),
     ]
 )
+
+ui_tests = Path("packages/hyperchad/ui/src/pages/home/tests.rs").read_text()
+required_component_coverage = {
+    "every_non_tool_transcript_state_survives_reconnect_snapshot_and_renders",
+    "every_registered_visual_adapter_has_a_fixture",
+    "every_registered_artifact_adapter_has_a_fixture",
+    "visual_adapters_are_schema_version_specific_and_keep_fallbacks",
+    "tool_lifecycle_card_covers_request_running_success_failure_and_timeout",
+    "unknown_interactions_keep_bounded_active_controls_and_resolved_history",
+    "representative_complete_session_survives_reconnect_and_renders_every_domain",
+}
+missing_component_coverage = sorted(
+    test for test in required_component_coverage if f"fn {test}(" not in ui_tests
+)
+if missing_component_coverage:
+    raise SystemExit(
+        f"semantic component coverage is incomplete: {missing_component_coverage}"
+    )
+
 known_scripts = {path.name for path in Path("scripts").glob("check-*.sh")}
 for row in rows:
     for reference in (value.strip() for value in row["automated"].split(";")):

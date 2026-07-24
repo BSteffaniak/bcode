@@ -1,5 +1,7 @@
 //! Session composer and turn controls.
 
+use super::theme::{accent, color, radius, space, surface, typeface};
+use crate::context::{PresentationAction, PresentationContext};
 use bcode_session_view_models::SessionViewSnapshot;
 use hyperchad::template::{Containers, container};
 
@@ -36,14 +38,17 @@ fn composer_presentation_state(snapshot: &SessionViewSnapshot) -> ComposerPresen
     }
 }
 
-pub(super) fn composer(snapshot: &SessionViewSnapshot, access_token: &str) -> Containers {
-    let action = format!("/actions/submit-message?token={access_token}");
+pub(super) fn composer(
+    snapshot: &SessionViewSnapshot,
+    context: &impl PresentationContext,
+) -> Containers {
+    let action = context.action_target(PresentationAction::SubmitMessage);
     let presentation_state = composer_presentation_state(snapshot);
     let (state_label, state_color) = match presentation_state {
-        ComposerPresentationState::Ready => ("Ready", "#7ee787"),
-        ComposerPresentationState::Pending => ("Pending", "#f2cc60"),
-        ComposerPresentationState::Error => ("Error", "#f85149"),
-        ComposerPresentationState::Disabled => ("Disabled", "#8b949e"),
+        ComposerPresentationState::Ready => ("Ready", color::SUCCESS),
+        ComposerPresentationState::Pending => ("Pending", color::WARNING),
+        ComposerPresentationState::Error => ("Error", color::ERROR),
+        ComposerPresentationState::Disabled => ("Disabled", color::MUTED),
     };
     let state_detail = snapshot.composer.disabled_reason.as_deref().unwrap_or({
         if snapshot.composer.can_submit {
@@ -54,40 +59,41 @@ pub(super) fn composer(snapshot: &SessionViewSnapshot, access_token: &str) -> Co
     });
     container! {
         div #composer-region {
-            form hx-post=(action) hx-target="#bcode-web-shell" hx-swap=this background="#0d1117" border="1, #30363d" border-radius=8 padding=12 {
+            form hx-post=(action) hx-target="#bcode-web-shell" hx-swap=this background=(surface::APP) border=((1, surface::BORDER)) border-radius=((radius::CARD)) padding=((space::MD)) {
                 @if let Some(session_id) = snapshot.session_id {
                     input type=hidden name="session_id" value=(session_id.to_string());
                 }
-                div data-composer-state=(state_label.to_ascii_lowercase()) color=(state_color) font-size=11 margin-bottom=8 {
+                div data-composer-state=(state_label.to_ascii_lowercase()) color=(state_color) font-size=((typeface::DETAIL)) margin-bottom=((space::SM)) {
                     (state_label) ": " (state_detail)
                 }
+                div #composer-message-label color=(color::MUTED) font-size=((typeface::DETAIL)) margin-bottom=((space::XS)) { "Message" }
                 @if let Some(session_id) = snapshot.session_id {
-                    textarea name="text" rows="5" placeholder="Send a message to this session" hx-post=(format!("/actions/update-draft/{session_id}?token={access_token}")) hx-trigger="change" hx-target="#bcode-web-shell" hx-swap=this width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                    textarea #composer-message name="text" rows="5" data-label-id="composer-message-label" placeholder="Send a message to this session" hx-post=(context.action_target(PresentationAction::UpdateDraft { session_id })) hx-trigger="change" hx-target="#bcode-web-shell" hx-swap=this width=100% padding=((space::S10)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT) {
                         (snapshot.composer.draft)
                     }
                 } @else {
-                    textarea name="text" rows="5" placeholder="Send a message to start a session" width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                    textarea #composer-message name="text" rows="5" data-label-id="composer-message-label" placeholder="Send a message to start a session" width=100% padding=((space::S10)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT) {
                         (snapshot.composer.draft)
                     }
                 }
-                div direction=row justify-content=space-between align-items=center gap=10 margin-top=10 {
+                div direction=row justify-content=space-between align-items=center gap=((space::S10)) margin-top=((space::S10)) {
                     div {
-                        div color="#8b949e" font-size=11 margin-bottom=4 { "Message placement" }
-                        select name="placement" selected="steering" padding=7 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                        div #message-placement-label color=(color::MUTED) font-size=((typeface::DETAIL)) margin-bottom=((space::XS)) { "Message placement" }
+                        select #message-placement name="placement" selected="steering" data-label-id="message-placement-label" padding=((space::S7)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT) {
                             option value="steering" { "Steer the active turn" }
                             option value="follow_up" { "Queue as a follow-up" }
                         }
                     }
-                    button type=submit disabled=[!snapshot.composer.can_submit] background=(if snapshot.composer.can_submit { "#238636" } else { "#30363d" }) color=white border-radius=6 padding="8, 14" {
+                    button type=submit disabled=[!snapshot.composer.can_submit] background=(if snapshot.composer.can_submit { accent::POSITIVE } else { surface::DISABLED }) color=(color::ON_ACCENT) border-radius=((radius::CONTROL)) padding="8, 14" {
                         (if snapshot.composer.can_submit { "Send message" } else { "Sending unavailable" })
                     }
                 }
             }
             @if let Some(session_id) = snapshot.session_id {
-                form hx-post=(format!("/actions/cancel-turn?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this margin-top=10 {
+                form hx-post=(context.action_target(PresentationAction::CancelTurn)) hx-target="#bcode-web-shell" hx-swap=this margin-top=((space::S10)) {
                     input type=hidden name="session_id" value=(session_id.to_string());
                     input type=hidden name="clear_queue" value="true";
-                    button type=submit background="#da3633" color=white border-radius=6 padding="8, 14" {
+                    button type=submit background=(accent::DESTRUCTIVE) color=(color::ON_ACCENT) border-radius=((radius::CONTROL)) padding="8, 14" {
                         "Cancel active turn"
                     }
                 }

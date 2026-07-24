@@ -6,7 +6,7 @@ use super::composer::composer;
 use super::interactions::interaction_request;
 use super::navigation::session_navigation;
 use super::permissions::{permission_history, permission_request};
-use super::tools::{render_tool_lifecycle, render_tool_result};
+use super::tools::{render_tool_lifecycle, render_tool_result, render_tool_result_with_context};
 use super::transcript::{
     is_active_interaction_summary, is_superseded_tool_request, item_label, message_content,
     should_render_transcript_item, transcript_item, transcript_item_body,
@@ -276,6 +276,8 @@ fn non_tool_interaction_fixture_items() -> Vec<TranscriptViewItem> {
         title: Some(format!("Interaction {id}")),
         required: true,
         snapshot: Some(serde_json::json!({"state": "pending"})),
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
         resolved,
         resolution,
     };
@@ -362,7 +364,14 @@ fn every_non_tool_transcript_state_survives_reconnect_snapshot_and_renders() {
         serde_json::from_slice(&encoded).expect("deserialize reconnect snapshot");
     assert_eq!(reconnected, snapshot);
 
-    let rendered = format!("{:?}", home(&reconnected, &[], "fixture-token"));
+    let rendered = format!(
+        "{:?}",
+        home(
+            &reconnected,
+            &[],
+            &crate::context::StaticPresentationContext
+        )
+    );
     let text = reconnected
         .transcript
         .items
@@ -449,7 +458,12 @@ fn semantic_component_identities_are_stable_bounded_and_order_independent() {
     for reverse in [false, true] {
         let rendered = format!(
             "{:?}",
-            session_navigation(&sessions(reverse), None, "token")
+            session_navigation(
+                &sessions(reverse),
+                None,
+                &bcode_session_view_models::SessionCatalogViewStatus::Loaded,
+                &crate::context::StaticPresentationContext,
+            )
         );
         for id in [session_a, session_b] {
             assert!(rendered.contains(&semantic_dom_id("session", &id.to_string())));
@@ -489,6 +503,8 @@ fn repeated_domain_components_use_stable_semantic_identities() {
         title: Some("Interaction".to_owned()),
         required: false,
         snapshot: None,
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
         resolved: false,
         resolution: None,
     });
@@ -521,7 +537,10 @@ fn repeated_domain_components_use_stable_semantic_identities() {
         snapshot.revision = revision;
         snapshot.runtime_work.reverse();
         snapshot.permissions.reverse();
-        let rendered = format!("{:?}", home(&snapshot, &[], "token"));
+        let rendered = format!(
+            "{:?}",
+            home(&snapshot, &[], &crate::context::StaticPresentationContext)
+        );
         for id in &expected {
             assert!(rendered.contains(id));
         }
@@ -841,6 +860,7 @@ fn skill_transcript_item_renders_semantic_label_and_text() {
 fn hyperchad_shell_renders_all_primary_regions_including_runtime_state() {
     let mut snapshot = SessionViewSnapshot::empty();
     snapshot.session_id = Some(bcode_session_models::SessionId::new());
+    snapshot.connection_status = bcode_session_view_models::SessionConnectionViewStatus::Attached;
     snapshot.runtime_work.push(RuntimeWorkView {
         work_id: WorkId::new("work-1"),
         kind: bcode_session_models::RuntimeWorkKind::Tool,
@@ -853,11 +873,14 @@ fn hyperchad_shell_renders_all_primary_regions_including_runtime_state() {
         updated_at_ms: Some(1),
     });
 
-    let rendered = format!("{:?}", home(&snapshot, &[], "secret-token"));
+    let rendered = format!(
+        "{:?}",
+        home(&snapshot, &[], &crate::context::StaticPresentationContext)
+    );
     assert!(rendered.contains("sessions"));
     assert!(rendered.contains("transcript"));
     assert!(rendered.contains("composer"));
-    assert!(rendered.contains("daemon connected · session attached"));
+    assert!(rendered.contains("Connected · session attached"));
     assert!(rendered.contains("runtime work"));
     assert!(rendered.contains("index workspace"));
     assert!(rendered.contains("work-1"));
@@ -889,12 +912,12 @@ fn permission_controls_distinguish_single_batch_and_resolved_history() {
     let single_containers = permission_request(
         &permission(1, false, None),
         Some(session_id),
-        "secret-token",
+        &crate::context::tests::GuardedTestContext,
     );
     let batch_containers = permission_request(
         &permission(3, false, None),
         Some(session_id),
-        "secret-token",
+        &crate::context::tests::GuardedTestContext,
     );
     let resolved_containers = permission_history(&permission(3, true, Some(false)));
     let mut single = String::new();
@@ -952,7 +975,10 @@ fn grouped_permission_renders_per_call_and_apply_to_all_actions() {
         can_remember: true,
     });
 
-    let rendered = format!("{:?}", home(&snapshot, &[], "secret-token"));
+    let rendered = format!(
+        "{:?}",
+        home(&snapshot, &[], &crate::context::tests::GuardedTestContext)
+    );
     assert!(rendered.contains("batch"));
     assert!(rendered.contains('1'));
     assert!(rendered.contains('3'));
@@ -972,8 +998,11 @@ fn transcript_history_controls_render_source_anchored_actions() {
     snapshot.transcript.has_older_history = true;
     snapshot.transcript.has_newer_history = true;
 
-    let rendered = format!("{:?}", home(&snapshot, &[], "secret-token"));
-    assert!(rendered.contains("/actions/history-window?token=secret-token"));
+    let rendered = format!(
+        "{:?}",
+        home(&snapshot, &[], &crate::context::tests::GuardedTestContext)
+    );
+    assert!(rendered.contains("/actions/history-window?test-capability=opaque"));
     assert!(rendered.contains("load older history"));
     assert!(rendered.contains("load newer history"));
     assert!(rendered.contains("10"));
@@ -1007,7 +1036,7 @@ fn responsive_targets(
 #[test]
 fn application_shell_declares_canonical_tablet_and_narrow_layouts() {
     let snapshot = SessionViewSnapshot::empty();
-    let containers = home(&snapshot, &[], "secret-token");
+    let containers = home(&snapshot, &[], &crate::context::StaticPresentationContext);
     let mut targets = BTreeSet::new();
     for container in &containers {
         responsive_targets(container, &mut targets);
@@ -1066,8 +1095,12 @@ fn session_navigation_marks_selected_active_and_idle_sessions() {
         ..selected.clone()
     };
 
-    let containers =
-        session_navigation(&[selected.clone(), idle], Some(selected.id), "secret-token");
+    let containers = session_navigation(
+        &[selected.clone(), idle],
+        Some(selected.id),
+        &bcode_session_view_models::SessionCatalogViewStatus::Loaded,
+        &crate::context::StaticPresentationContext,
+    );
     let mut text = String::new();
     for container in &containers {
         container_text(container, &mut text);
@@ -1096,23 +1129,37 @@ fn composer_presents_ready_disabled_and_message_placement_states() {
     disabled.composer.can_submit = false;
     disabled.composer.disabled_reason = Some("Wait for the active operation".to_owned());
 
-    let ready = format!("{:?}", composer(&ready, "secret-token"));
-    let pending = format!("{:?}", composer(&pending, "secret-token"));
-    let errored = format!("{:?}", composer(&errored, "secret-token"));
-    let disabled = format!("{:?}", composer(&disabled, "secret-token"));
+    let ready = format!(
+        "{:?}",
+        composer(&ready, &crate::context::tests::GuardedTestContext)
+    );
+    let pending = format!(
+        "{:?}",
+        composer(&pending, &crate::context::tests::GuardedTestContext)
+    );
+    let errored = format!(
+        "{:?}",
+        composer(&errored, &crate::context::tests::GuardedTestContext)
+    );
+    let disabled = format!(
+        "{:?}",
+        composer(&disabled, &crate::context::tests::GuardedTestContext)
+    );
     assert!(ready.contains("Ready"));
     assert!(ready.contains("Ready to send"));
     assert!(ready.contains("Preserved draft"));
     assert!(ready.contains("Steer the active turn"));
     assert!(ready.contains("Queue as a follow-up"));
     assert!(ready.contains("Send message"));
-    assert!(ready.contains("/actions/submit-message?token=secret-token"));
+    assert!(ready.contains("/actions/submit-message?test-capability=opaque"));
     assert!(ready.contains(&format!(
-        "/actions/update-draft/{session_id}?token=secret-token"
+        "/actions/update-draft/{session_id}?test-capability=opaque"
     )));
-    assert!(ready.contains("/actions/cancel-turn?token=secret-token"));
+    assert!(ready.contains("/actions/cancel-turn?test-capability=opaque"));
     assert!(ready.contains("clear_queue"));
     assert!(ready.contains("placement"));
+    assert!(ready.contains("composer-message-label"));
+    assert!(ready.contains("message-placement-label"));
     assert!(pending.contains("Pending"));
     assert!(pending.contains("Sending message"));
     assert!(errored.contains("Error"));
@@ -1124,17 +1171,21 @@ fn composer_presents_ready_disabled_and_message_placement_states() {
 }
 
 #[test]
-fn access_token_is_propagated_to_browser_actions() {
+fn opaque_action_context_is_propagated_to_all_forms() {
     let rendered = format!(
         "{:?}",
-        home(&SessionViewSnapshot::empty(), &[], "secret-token")
+        home(
+            &SessionViewSnapshot::empty(),
+            &[],
+            &crate::context::tests::GuardedTestContext
+        )
     );
 
-    assert!(rendered.contains("/actions/submit-message?token=secret-token"));
+    assert!(rendered.contains("/actions/submit-message?test-capability=opaque"));
 }
 
 #[test]
-fn session_links_propagate_access_token_and_live_scope() {
+fn opaque_session_context_is_propagated_to_navigation() {
     let session = bcode_session_models::SessionSummary {
         id: bcode_session_models::SessionId::new(),
         name: Some("session".to_owned()),
@@ -1154,18 +1205,13 @@ fn session_links_propagate_access_token_and_live_scope() {
         home(
             &SessionViewSnapshot::empty(),
             std::slice::from_ref(&session),
-            "secret-token"
+            &crate::context::tests::GuardedTestContext
         )
     );
-    assert!(
-        rendered.contains(&format!(
-            "token=secret-token&amp;hyperchad-event-scope=secret-token:{}",
-            session.id
-        )) || rendered.contains(&format!(
-            "token=secret-token&hyperchad-event-scope=secret-token:{}",
-            session.id
-        ))
-    );
+    assert!(rendered.contains(&format!(
+        "test-capability=opaque&test-event-scope=session-{}",
+        session.id
+    )));
 }
 
 #[test]
@@ -1179,10 +1225,21 @@ fn unknown_interactions_keep_bounded_active_controls_and_resolved_history() {
         title: Some("Future interaction".to_owned()),
         required: true,
         snapshot: Some(serde_json::json!({"sentinel": "u".repeat(40_000)})),
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
         resolved: false,
         resolution: None,
     };
+    let cancelled = InteractionViewSummary {
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
+        resolved: true,
+        resolution: Some(serde_json::json!({"status": "cancelled"})),
+        ..active.clone()
+    };
     let resolved = InteractionViewSummary {
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
         resolved: true,
         resolution: Some(serde_json::json!({"status": "future-resolved"})),
         ..active.clone()
@@ -1190,16 +1247,39 @@ fn unknown_interactions_keep_bounded_active_controls_and_resolved_history() {
 
     let active = format!(
         "{:?}",
-        interaction_request(&active, Some(session_id), "secret-token")
+        interaction_request(
+            &active,
+            Some(session_id),
+            &crate::context::tests::GuardedTestContext
+        )
+    );
+    let cancelled = format!(
+        "{:?}",
+        interaction_request(
+            &cancelled,
+            Some(session_id),
+            &crate::context::tests::GuardedTestContext
+        )
     );
     let resolved = format!(
         "{:?}",
-        interaction_request(&resolved, Some(session_id), "secret-token")
+        interaction_request(
+            &resolved,
+            Some(session_id),
+            &crate::context::tests::GuardedTestContext
+        )
     );
+    assert!(active.contains("pending response"));
     assert!(active.contains("controller snapshot"));
     assert!(active.contains("Structured details truncated for display."));
     assert!(active.contains("generic semantic controls"));
+    assert!(active.contains("generic-interaction-kind-label"));
+    assert!(active.contains("generic-interaction-control-label"));
+    assert!(active.contains("generic-interaction-value-label"));
+    assert!(active.contains("generic-interaction-direction-label"));
     assert!(active.contains("/actions/interaction?"));
+    assert!(cancelled.contains("cancelled"));
+    assert!(!cancelled.contains("generic semantic controls"));
     assert!(resolved.contains("future-resolved"));
     assert!(resolved.contains("resolution"));
     assert!(!resolved.contains("generic semantic controls"));
@@ -1228,10 +1308,13 @@ fn question_snapshot_renders_polished_controls_and_generic_fallback() {
                     "required": true
                 }]
             },
+            "validation_error": "Please answer required question 1 before submitting.",
             "answers": [{"question_index": 0, "selected": ["yes"], "custom": null}],
             "focus": {"type": "question", "question_index": 0},
             "focused_control_id": "question-0"
         })),
+        state: bcode_session_view_models::InteractionViewState::ValidationError,
+        status_detail: Some("Please answer required question 1 before submitting.".to_owned()),
         resolved: false,
         resolution: None,
     };
@@ -1241,9 +1324,12 @@ fn question_snapshot_renders_polished_controls_and_generic_fallback() {
         interaction_request(
             &interaction,
             Some(bcode_session_models::SessionId::new()),
-            "secret-token"
+            &crate::context::tests::GuardedTestContext
         )
     );
+    assert!(rendered.contains("validation error"));
+    assert!(rendered.contains("Validation error"));
+    assert!(rendered.contains("Please answer required question 1 before submitting."));
     assert!(rendered.contains("Proceed?"));
     assert!(rendered.contains("Decision"));
     assert!(rendered.contains("Continue"));
@@ -1252,6 +1338,8 @@ fn question_snapshot_renders_polished_controls_and_generic_fallback() {
     assert!(rendered.contains("◉"));
     assert!(rendered.contains(" *"));
     assert!(rendered.contains("question-0.option-0"));
+    assert!(rendered.contains("question-0-option-0-label"));
+    assert!(rendered.contains("question-0-custom-label"));
     assert!(rendered.contains("submit answers"));
     assert!(rendered.contains("generic semantic controls"));
     for label in [
@@ -1297,6 +1385,8 @@ fn question_snapshot_renders_multiple_checkbox_and_exclusive_custom_semantics() 
             "focus": {"type": "custom", "question_index": 0},
             "focused_control_id": "question-0.custom"
         })),
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
         resolved: false,
         resolution: None,
     };
@@ -1304,7 +1394,7 @@ fn question_snapshot_renders_multiple_checkbox_and_exclusive_custom_semantics() 
     let containers = interaction_request(
         &interaction,
         Some(bcode_session_models::SessionId::new()),
-        "secret-token",
+        &crate::context::StaticPresentationContext,
     );
     let mut text = String::new();
     for container in &containers {
@@ -1883,6 +1973,8 @@ fn add_complete_session_active_state(
             }]},
             "answers": []
         })),
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
         resolved: false,
         resolution: None,
     });
@@ -1994,7 +2086,7 @@ fn internal_metadata_and_raw_payloads_stay_inside_developer_disclosures() {
         },
     ));
 
-    let containers = home(&snapshot, &[], "token");
+    let containers = home(&snapshot, &[], &crate::context::StaticPresentationContext);
     let full_text = container_text_all(&containers);
     let mut primary_text = String::new();
     for container in &containers {
@@ -2049,7 +2141,111 @@ fn local_artifact_paths_and_storage_uris_never_become_unguarded_resources() {
 
     assert!(text.contains("/tmp/private-image.png"));
     assert!(!text.contains("file:///tmp/private-image.png"));
+    assert!(text.contains("Image preview is protected."));
     assert!(urls.is_empty());
+}
+
+#[test]
+fn filesystem_image_adapter_never_uses_untrusted_storage_uris_directly() {
+    let artifact = |storage_uri: Option<&str>, content_type: Option<&str>| {
+        ToolArtifactView::from(ToolArtifact {
+            artifact_id: "image-preview-fixture".to_owned(),
+            producer_plugin_id: "bcode.filesystem".to_owned(),
+            schema: "bcode.filesystem.image".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some("image-preview-call".to_owned()),
+            title: Some("Preview image".to_owned()),
+            metadata: serde_json::json!({
+                "path": "/workspace/preview.png",
+                "mime_type": "image/png",
+                "width": 320,
+                "height": 200,
+                "byte_len": 256
+            }),
+            refs: vec![bcode_session_models::ToolArtifactRef {
+                key: "inline-image".to_owned(),
+                content_type: content_type.map(str::to_owned),
+                storage_uri: storage_uri.map(str::to_owned),
+                byte_len: Some(256),
+                metadata: None,
+            }],
+        })
+    };
+
+    let protected = render_tool_result(&ToolResultView::Artifact {
+        artifact: artifact(Some("/untrusted/plugin/path"), Some("image/png")),
+    });
+    let protected_text = container_text_all(&protected);
+    let mut protected_urls = Vec::new();
+    for container in &protected {
+        collect_resource_urls(container, &mut protected_urls);
+    }
+    assert!(protected_urls.is_empty());
+    assert!(protected_text.contains("Image preview is protected."));
+    assert!(protected_text.contains("guarded artifact: inline-image"));
+    assert!(protected_text.contains("dimensions: 320x200"));
+    assert!(protected_text.contains("type: image/png"));
+
+    for (uri, content_type) in [
+        ("javascript:alert(1)", "image/png"),
+        ("https://external.example/private.png", "image/png"),
+        ("/guarded/vector.svg", "image/svg+xml"),
+        ("/guarded/not-an-image", "text/plain"),
+        ("file:///tmp/private.png", "image/png"),
+    ] {
+        let unsafe_result = render_tool_result(&ToolResultView::Artifact {
+            artifact: artifact(Some(uri), Some(content_type)),
+        });
+        let mut urls = Vec::new();
+        for container in &unsafe_result {
+            collect_resource_urls(container, &mut urls);
+        }
+        assert!(urls.is_empty(), "unsafe resource escaped: {uri}");
+    }
+}
+
+#[test]
+fn filesystem_image_adapter_uses_guarded_context_resource() {
+    let session_id = bcode_session_models::SessionId::new();
+    let artifact = ToolArtifactView::from(ToolArtifact {
+        artifact_id: "image artifact / one".to_owned(),
+        producer_plugin_id: "bcode.filesystem".to_owned(),
+        schema: "bcode.filesystem.image".to_owned(),
+        schema_version: 1,
+        tool_call_id: Some("image-preview-call".to_owned()),
+        title: Some("Preview image".to_owned()),
+        metadata: serde_json::json!({
+            "path": "/workspace/preview.png",
+            "mime_type": "image/png",
+            "width": 320,
+            "height": 200,
+            "byte_len": 256
+        }),
+        refs: vec![bcode_session_models::ToolArtifactRef {
+            key: "inline image".to_owned(),
+            content_type: Some("image/png".to_owned()),
+            storage_uri: Some("bcode-artifact://invocation/private/private".to_owned()),
+            byte_len: Some(256),
+            metadata: None,
+        }],
+    });
+
+    let containers = render_tool_result_with_context(
+        &ToolResultView::Artifact { artifact },
+        Some(session_id),
+        &crate::context::tests::GuardedTestContext,
+    );
+    let mut urls = Vec::new();
+    for container in &containers {
+        collect_resource_urls(container, &mut urls);
+    }
+
+    assert_eq!(urls.len(), 1);
+    assert!(urls[0].starts_with(&format!("/artifacts/{session_id}?")));
+    assert!(urls[0].contains("test-capability=opaque"));
+    assert!(urls[0].contains("artifact_id=image artifact / one"));
+    assert!(urls[0].contains("reference_key=inline image"));
+    assert!(!format!("{containers:?}").contains("bcode-artifact://"));
 }
 
 #[test]
@@ -2060,7 +2256,11 @@ fn representative_complete_session_survives_reconnect_and_renders_every_domain()
         serde_json::from_slice(&encoded).expect("deserialize complete session");
     assert_eq!(reconnected, snapshot);
 
-    let containers = home(&reconnected, &[], "complete-token");
+    let containers = home(
+        &reconnected,
+        &[],
+        &crate::context::StaticPresentationContext,
+    );
     let text = container_text_all(&containers);
     let rendered = format!("{containers:?}");
     for expected in [
@@ -2658,6 +2858,8 @@ fn active_interaction_controls_replace_only_matching_pending_timeline_summary() 
         title: Some(format!("Interaction {id}")),
         required: true,
         snapshot: Some(serde_json::json!({"state": "pending"})),
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
         resolved,
         resolution: resolved.then(|| serde_json::json!({"status": "answered"})),
     };
@@ -2712,6 +2914,8 @@ fn session_shell_renders_correlated_tool_runtime_and_interaction_semantics_once(
         title: Some("Unique interaction label".to_owned()),
         required: true,
         snapshot: Some(serde_json::json!({"state": "pending"})),
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
         resolved: false,
         resolution: None,
     };
@@ -2761,8 +2965,15 @@ fn session_shell_renders_correlated_tool_runtime_and_interaction_semantics_once(
         ),
     ]);
 
-    let rendered = format!("{:?}", home(&snapshot, &[], "token"));
-    let text = container_text_all(&home(&snapshot, &[], "token"));
+    let rendered = format!(
+        "{:?}",
+        home(&snapshot, &[], &crate::context::StaticPresentationContext)
+    );
+    let text = container_text_all(&home(
+        &snapshot,
+        &[],
+        &crate::context::StaticPresentationContext,
+    ));
     assert!(!text.contains("active tool"));
     assert_eq!(text.matches("runtime work").count(), 1);
     assert!(text.contains("Unique interaction label"));
@@ -3622,4 +3833,266 @@ fn generic_tool_artifact_keeps_schema_metadata_in_render_tree() {
     let rendered = format!("{:?}", transcript_item_body(&kind));
     assert!(rendered.contains("fixture.artifact"));
     assert!(rendered.contains("artifact-metadata"));
+}
+
+#[test]
+fn home_renders_catalog_and_action_notices_semantically() {
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.catalog_status = bcode_session_view_models::SessionCatalogViewStatus::Degraded(
+        "Some session sources need attention.".to_owned(),
+    );
+    snapshot.notice = Some(bcode_session_view_models::SessionViewNotice {
+        level: bcode_session_view_models::SessionViewNoticeLevel::Error,
+        message: "The action could not be completed.".to_owned(),
+    });
+
+    let rendered = format!(
+        "{:?}",
+        home(&snapshot, &[], &crate::context::StaticPresentationContext)
+    );
+
+    assert!(rendered.contains("Session catalog"));
+    assert!(rendered.contains("Action failed"));
+    assert!(rendered.contains("Some sessions could not be loaded."));
+    assert!(!rendered.contains("Some session sources need attention."));
+    assert!(rendered.contains("The action could not be completed."));
+}
+
+#[test]
+fn connection_states_render_clear_textual_status() {
+    let cases = [
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Disconnected,
+            "Disconnected",
+        ),
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Connected,
+            "Connected · no active session",
+        ),
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Attached,
+            "Connected · session attached",
+        ),
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Reconnecting,
+            "Reconnecting to session…",
+        ),
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Resyncing,
+            "Refreshing session state…",
+        ),
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Error(
+                "Session connection needs attention.".to_owned(),
+            ),
+            "Session unavailable",
+        ),
+    ];
+
+    for (status, expected) in cases {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.connection_status = status;
+        let rendered = format!(
+            "{:?}",
+            home(&snapshot, &[], &crate::context::StaticPresentationContext)
+        );
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn reusable_state_components_expose_semantic_text_and_state_markers() {
+    use super::components::{
+        StatusTone, code_output, disclosure, empty_state, progress_status, section_panel,
+        status_badge, status_notice, truncation_notice, unsupported_content,
+    };
+
+    let cases = [
+        format!("{:?}", status_badge("Connected", StatusTone::Success)),
+        format!(
+            "{:?}",
+            status_notice("Attention", Some("Needs review"), StatusTone::Warning)
+        ),
+        format!("{:?}", empty_state("Nothing here yet.")),
+        format!("{:?}", truncation_notice("More content is available.")),
+        format!("{:?}", progress_status("Indexing", Some(3), Some(4))),
+        format!(
+            "{:?}",
+            section_panel(
+                "Activity",
+                &code_output("cargo check", StatusTone::Info),
+                true
+            )
+        ),
+        format!(
+            "{:?}",
+            disclosure(
+                "More information",
+                &hyperchad::template::container! { div { "Secondary detail" } }
+            )
+        ),
+        format!(
+            "{:?}",
+            unsupported_content("A newer schema requires a generic fallback.")
+        ),
+    ];
+
+    assert!(cases[0].contains("Connected"));
+    assert!(cases[1].contains("Attention"));
+    assert!(cases[1].contains("Needs review"));
+    assert!(cases[2].contains("Nothing here yet."));
+    assert!(cases[3].contains("truncated"));
+    assert!(cases[4].contains("Indexing"));
+    assert!(cases[4].contains("3 of 4 complete (75%)"));
+    assert!(cases[4].contains("progress-percent"));
+    assert!(cases[5].contains("Activity"));
+    assert!(cases[5].contains("cargo check"));
+    assert!(cases[6].contains("More information"));
+    assert!(cases[6].contains("Secondary detail"));
+    assert!(cases[7].contains("Unsupported content"));
+    assert!(cases[7].contains("newer schema"));
+}
+
+#[test]
+fn transcript_empty_state_distinguishes_unattached_and_empty_session() {
+    let unattached = format!(
+        "{:?}",
+        home(
+            &SessionViewSnapshot::empty(),
+            &[],
+            &crate::context::StaticPresentationContext
+        )
+    );
+    let mut attached = SessionViewSnapshot::empty();
+    attached.session_id = Some(bcode_session_models::SessionId::new());
+    attached.connection_status = bcode_session_view_models::SessionConnectionViewStatus::Attached;
+    let attached = format!(
+        "{:?}",
+        home(&attached, &[], &crate::context::StaticPresentationContext)
+    );
+
+    assert!(unattached.contains("Attach or create a session to begin."));
+    assert!(attached.contains("no conversation entries in the current history view"));
+}
+
+#[test]
+fn catalog_loading_degraded_and_error_states_render_semantic_language() {
+    let cases = [
+        (
+            bcode_session_view_models::SessionCatalogViewStatus::NotStarted,
+            "Session discovery has not started.",
+        ),
+        (
+            bcode_session_view_models::SessionCatalogViewStatus::Loading,
+            "Loading available sessions…",
+        ),
+        (
+            bcode_session_view_models::SessionCatalogViewStatus::Degraded(
+                "Some session sources are temporarily unavailable.".to_owned(),
+            ),
+            "Some sessions could not be loaded. Available sessions remain usable; repair damaged sessions to restore the full list.",
+        ),
+        (
+            bcode_session_view_models::SessionCatalogViewStatus::Failed(
+                "Session discovery needs attention.".to_owned(),
+            ),
+            "Sessions could not be loaded. Restart Bcode or run session repair before trying again.",
+        ),
+    ];
+
+    for (status, expected) in cases {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.catalog_status = status;
+        let rendered = format!(
+            "{:?}",
+            home(&snapshot, &[], &crate::context::StaticPresentationContext)
+        );
+        assert!(rendered.contains("Session catalog"));
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}: {rendered}"
+        );
+    }
+
+    let mut loaded = SessionViewSnapshot::empty();
+    loaded.catalog_status = bcode_session_view_models::SessionCatalogViewStatus::Loaded;
+    let rendered = format!(
+        "{:?}",
+        home(&loaded, &[], &crate::context::StaticPresentationContext)
+    );
+    assert!(!rendered.contains("Session catalog"));
+}
+
+#[test]
+fn session_navigation_surfaces_catalog_degraded_and_error_states() {
+    let cases = [
+        (
+            bcode_session_view_models::SessionCatalogViewStatus::Loading,
+            "Updating session list…",
+        ),
+        (
+            bcode_session_view_models::SessionCatalogViewStatus::Degraded("partial".to_owned()),
+            "Session list is incomplete.",
+        ),
+        (
+            bcode_session_view_models::SessionCatalogViewStatus::Failed("failed".to_owned()),
+            "Session list is unavailable.",
+        ),
+    ];
+
+    for (status, expected) in cases {
+        let rendered = format!(
+            "{:?}",
+            session_navigation(
+                &[],
+                None,
+                &status,
+                &crate::context::StaticPresentationContext
+            )
+        );
+        assert!(rendered.contains(expected));
+        assert!(rendered.contains("No sessions loaded yet."));
+    }
+}
+
+#[test]
+fn connection_recovery_states_explain_last_view_and_authoritative_refresh() {
+    let cases = [
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Disconnected,
+            "Live session updates are unavailable.",
+        ),
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Reconnecting,
+            "Showing the last available session view while live updates reconnect.",
+        ),
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Resyncing,
+            "A complete authoritative session view is being requested.",
+        ),
+        (
+            bcode_session_view_models::SessionConnectionViewStatus::Error(
+                "Session failed.".to_owned(),
+            ),
+            "The session could not be refreshed. Try reconnecting or restart Bcode if the problem continues.",
+        ),
+    ];
+
+    for (status, expected) in cases {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.connection_status = status;
+        let rendered = format!(
+            "{:?}",
+            home(&snapshot, &[], &crate::context::StaticPresentationContext)
+        );
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}: {rendered}"
+        );
+        assert!(!rendered.contains("Session failed."));
+        assert!(!rendered.contains("IPC transport"));
+    }
 }

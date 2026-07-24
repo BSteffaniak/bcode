@@ -26,7 +26,34 @@ fn tool_presentation_slot_ids_are_stable_and_supplementals_are_independent() {
 
 #[test]
 fn empty_snapshot_shows_reasoning_by_default() {
-    assert!(SessionViewSnapshot::empty().thinking.visible);
+    let snapshot = SessionViewSnapshot::empty();
+    assert!(snapshot.thinking.visible);
+    assert_eq!(
+        snapshot.connection_status,
+        SessionConnectionViewStatus::Disconnected
+    );
+}
+
+#[test]
+fn legacy_snapshot_defaults_connection_catalog_and_notice_state() {
+    let mut value = serde_json::to_value(SessionViewSnapshot::empty()).expect("serialize snapshot");
+    let object = value.as_object_mut().expect("snapshot object");
+    object.remove("connection_status");
+    object.remove("catalog_status");
+    object.remove("notice");
+
+    let snapshot: SessionViewSnapshot =
+        serde_json::from_value(value).expect("deserialize legacy snapshot");
+
+    assert_eq!(
+        snapshot.connection_status,
+        SessionConnectionViewStatus::Disconnected
+    );
+    assert_eq!(
+        snapshot.catalog_status,
+        SessionCatalogViewStatus::NotStarted
+    );
+    assert!(snapshot.notice.is_none());
 }
 
 #[test]

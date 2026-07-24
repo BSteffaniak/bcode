@@ -326,21 +326,24 @@ async fn handle_web_command(
         access_token.clone(),
     );
     let builder = bcode_hyperchad::init(&state).await?;
-    let initial_session_id = initial_web_session_id(&state).await;
-    let launch_query = initial_session_id.map_or_else(
-        || format!("token={access_token}"),
-        |session_id| {
-            format!("token={access_token}&hyperchad-event-scope={access_token}:{session_id}")
-        },
-    );
+    let launch_session_id = initial_web_session_id(&state).await;
+    let launch_token = access_token;
     let builder = builder
         .with_actix_bind_address(bind.to_string())
         .with_actix_port(port)
         .with_actix_on_bound(move |address| {
-            println!("Bcode HyperChad web renderer: http://{address}/?{launch_query}");
-        })
-        .with_viewport(bcode_hyperchad::VIEWPORT.clone());
-    let mut app = bcode_hyperchad::build_app(builder)
+            let launch_url =
+                bcode_hyperchad::build_launch_url(address, &launch_token, launch_session_id);
+            if open::that_detached(&launch_url).is_err() {
+                eprintln!("Bcode could not open the HyperChad application in a browser.");
+                eprintln!(
+                    "Restart `bcode web` after checking that a graphical browser is available. The private launch capability was not printed."
+                );
+            } else {
+                println!("Bcode HyperChad application opened at http://{address}/");
+            }
+        });
+    let app = bcode_hyperchad::build_app(builder)
         .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
     bcode_hyperchad::configure_live_updates(&app.renderer, &state);
     tokio::task::spawn_blocking(move || app.handle_serve())
