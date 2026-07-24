@@ -1720,6 +1720,10 @@ fn drain_bcode_events(
     loop_state: &mut ChatLoopState,
     budget: usize,
 ) -> bool {
+    loop_state.telemetry.set_gauge(
+        "tui.session_event.queue_depth",
+        i64::try_from(chat.event_receiver.len()).unwrap_or(i64::MAX),
+    );
     let mut needs_redraw = false;
     for update in take_bcode_events(&mut chat.event_receiver, budget) {
         needs_redraw |= absorb_session_stream_update(chat, loop_state, update);

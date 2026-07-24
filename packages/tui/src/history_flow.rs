@@ -1,5 +1,7 @@
 //! History and session event-stream plumbing for the TUI.
 
+use std::collections::BTreeMap;
+
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bcode_session_models::{
@@ -27,6 +29,9 @@ pub enum SessionStreamUpdate {
 }
 
 const INITIAL_TRANSCRIPT_OVERSCAN_VIEWPORTS: usize = 2;
+const SUPERSEDED_PROGRESS_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(50);
+const MAX_PENDING_PROGRESS_KEYS: usize = 256;
 const INITIAL_TRANSCRIPT_MIN_ITEMS: usize = 12;
 const INITIAL_TRANSCRIPT_MAX_ITEMS: usize = 64;
 const INITIAL_TRANSCRIPT_MAX_EVENTS_SCANNED: usize = 2_048;
@@ -302,6 +307,57 @@ fn spawn_reconnecting_window_event_stream(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SupersedableEventKey {
+    Invocation(String),
+    RuntimeWork(bcode_session_models::WorkId),
+}
+
+fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
+    let BcodeEvent::Session(event) = event else {
+        return None;
+    };
+    match &event.kind {
+        bcode_session_models::SessionEventKind::ToolInvocationLifecycle { event }
+            if matches!(
+                event.stage,
+                bcode_session_models::ToolInvocationLifecycleStage::Progress
+                    | bcode_session_models::ToolInvocationLifecycleStage::Waiting
+            ) =>
+        {
+            Some(SupersedableEventKey::Invocation(
+                event.invocation_id.clone(),
+            ))
+        }
+        bcode_session_models::SessionEventKind::RuntimeWorkProgress { work_id, .. } => {
+            Some(SupersedableEventKey::RuntimeWork(work_id.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn flush_superseded_progress(
+    event_sender: &mpsc::UnboundedSender<SessionStreamUpdate>,
+    pending: &mut BTreeMap<SupersedableEventKey, BcodeEvent>,
+) -> bool {
+    let mut events = std::mem::take(pending).into_values().collect::<Vec<_>>();
+    events.sort_by_key(|event| match event {
+        BcodeEvent::Session(event) | BcodeEvent::RuntimeWork(event) => event.sequence,
+        BcodeEvent::SessionLive(_)
+        | BcodeEvent::SessionViewResyncRequired { .. }
+        | BcodeEvent::SessionCatalogUpdated { .. } => 0,
+    });
+    for event in events {
+        if event_sender
+            .send(SessionStreamUpdate::Event(Box::new(event)))
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 async fn reconnecting_event_stream<F>(
     client: BcodeClient,
     session_id: SessionId,
@@ -326,18 +382,52 @@ async fn reconnecting_event_stream<F>(
         + 'static,
 {
     let mut reconnect_delay = std::time::Duration::from_millis(100);
+    let mut pending_progress = BTreeMap::new();
+    let progress_flush = tokio::time::sleep(SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
+    tokio::pin!(progress_flush);
     loop {
-        let needs_resync = match connection.recv_event().await {
+        let received = tokio::select! {
+            event = connection.recv_event() => Some(event),
+            () = &mut progress_flush, if !pending_progress.is_empty() => None,
+        };
+        let Some(received) = received else {
+            if !flush_superseded_progress(&event_sender, &mut pending_progress) {
+                return;
+            }
+            progress_flush
+                .as_mut()
+                .reset(tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
+            continue;
+        };
+        let needs_resync = match received {
             Ok(BcodeEvent::SessionViewResyncRequired {
                 session_id: required,
             }) if required == session_id => true,
             Ok(event) => {
                 reconnect_delay = std::time::Duration::from_millis(100);
-                if event_sender
-                    .send(SessionStreamUpdate::Event(Box::new(event)))
-                    .is_err()
-                {
-                    return;
+                if let Some(key) = supersedable_event_key(&event) {
+                    let was_empty = pending_progress.is_empty();
+                    pending_progress.insert(key, event);
+                    if pending_progress.len() >= MAX_PENDING_PROGRESS_KEYS
+                        && !flush_superseded_progress(&event_sender, &mut pending_progress)
+                    {
+                        return;
+                    }
+                    if was_empty {
+                        progress_flush.as_mut().reset(
+                            tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL,
+                        );
+                    }
+                } else {
+                    // Preserve canonical ordering at non-supersedable boundaries while collapsing
+                    // high-frequency progress updates to their latest state.
+                    if !flush_superseded_progress(&event_sender, &mut pending_progress)
+                        || event_sender
+                            .send(SessionStreamUpdate::Event(Box::new(event)))
+                            .is_err()
+                    {
+                        return;
+                    }
                 }
                 false
             }
@@ -346,6 +436,7 @@ async fn reconnecting_event_stream<F>(
         if !needs_resync {
             continue;
         }
+        pending_progress.clear();
 
         // Dropping the stale connection detaches its client before replacement attach. This keeps
         // session client accounting and idle database release semantics accurate.
@@ -382,5 +473,84 @@ async fn reconnecting_event_stream<F>(
             tokio::time::sleep(reconnect_delay).await;
             reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(2));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lifecycle_event(
+        session_id: SessionId,
+        sequence: u64,
+        stage: bcode_session_models::ToolInvocationLifecycleStage,
+    ) -> BcodeEvent {
+        BcodeEvent::Session(bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence,
+                    stage,
+                    message: Some(sequence.to_string()),
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn progress_events_are_supersedable_but_boundaries_are_not() {
+        let session_id = SessionId::new();
+        assert_eq!(
+            supersedable_event_key(&lifecycle_event(
+                session_id,
+                1,
+                bcode_session_models::ToolInvocationLifecycleStage::Progress,
+            )),
+            Some(SupersedableEventKey::Invocation("call-1".to_owned()))
+        );
+        assert!(
+            supersedable_event_key(&lifecycle_event(
+                session_id,
+                2,
+                bcode_session_models::ToolInvocationLifecycleStage::Completed,
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn progress_flood_collapses_to_latest_update() {
+        let session_id = SessionId::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut pending = BTreeMap::new();
+        for sequence in 1..=10_000 {
+            let event = lifecycle_event(
+                session_id,
+                sequence,
+                bcode_session_models::ToolInvocationLifecycleStage::Progress,
+            );
+            pending.insert(supersedable_event_key(&event).expect("progress key"), event);
+        }
+
+        assert!(flush_superseded_progress(&sender, &mut pending));
+        assert!(pending.is_empty());
+        let SessionStreamUpdate::Event(event) = receiver.try_recv().expect("latest progress")
+        else {
+            panic!("expected progress event");
+        };
+        assert!(matches!(
+            *event,
+            BcodeEvent::Session(bcode_session_models::SessionEvent {
+                sequence: 10_000,
+                ..
+            })
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 }
