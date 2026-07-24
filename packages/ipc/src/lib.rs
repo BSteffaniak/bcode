@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 13;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 14;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4;
@@ -460,6 +460,10 @@ pub enum Request {
     IngestClientMetrics {
         /// Validated-at-ingress metric observations.
         batch: bcode_metrics::ClientMetricBatch,
+    },
+    /// Ask this daemon to close one session database while retaining attached clients.
+    ReleaseSessionDatabase {
+        session_id: SessionId,
     },
 }
 
@@ -1266,6 +1270,10 @@ pub enum ResponsePayload {
     /// Current snapshot after preparing or waiting for session open.
     SessionOpenPrepared {
         snapshot: SessionOpenOperationSnapshot,
+    },
+    SessionDatabaseReleased {
+        session_id: SessionId,
+        released: bool,
     },
 }
 

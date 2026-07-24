@@ -1462,6 +1462,30 @@ impl ServerState {
         }
     }
 
+    async fn release_session_database_if_inactive(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, ServerError> {
+        if self.session_has_active_turn(session_id).await {
+            return Ok(false);
+        }
+        if !self
+            .runtime_work
+            .active_for_session(session_id)
+            .await
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        if self.sessions.active_session_migration_count().await > 0 {
+            return Ok(false);
+        }
+        Ok(self
+            .sessions
+            .release_session_database_resources(session_id)
+            .await?)
+    }
+
     async fn register_client_forwarder(&self, client_id: ClientId, handle: JoinHandle<()>) {
         self.client_forwarders
             .lock()
@@ -2464,6 +2488,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SessionHistoryPage { session_id, .. }
         | Request::PrepareSessionOpen { session_id }
         | Request::WaitSessionOpenProgress { session_id, .. }
+        | Request::ReleaseSessionDatabase { session_id }
         | Request::AttachSession { session_id }
         | Request::AttachSessionRecent { session_id, .. }
         | Request::SendUserMessage { session_id, .. }
@@ -2504,6 +2529,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ServerStatus { .. } => "server_status",
         Request::ModelCatalogDiagnostics => "model_catalog_diagnostics",
         Request::ServerStop { .. } => "server_stop",
+        Request::ReleaseSessionDatabase { .. } => "release_session_database",
         Request::CreateSession { .. } => "create_session",
         Request::ListSessions { .. } => "list_sessions",
         Request::RenameSession { .. } => "rename_session",
@@ -2653,6 +2679,9 @@ async fn handle_request_inner(
             handle_model_catalog_diagnostics(request_id, state, writer).await
         }
         Request::ServerStop { mode } => handle_server_stop(request_id, state, writer, mode).await,
+        Request::ReleaseSessionDatabase { session_id } => {
+            handle_release_session_database(request_id, state, writer, session_id).await
+        }
         Request::SetComposerDraft { scope, text } => {
             handle_set_composer_draft(request_id, state, writer, scope, text).await
         }
@@ -3370,6 +3399,26 @@ fn active_migration_shutdown_blocker(active_migrations: usize) -> Option<String>
             "daemon has {active_migrations} active session migration(s); refusing shutdown until migration completes"
         )
     })
+}
+
+async fn handle_release_session_database(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let released = state
+        .release_session_database_if_inactive(session_id)
+        .await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionDatabaseReleased {
+            session_id,
+            released,
+        }),
+    )
+    .await
 }
 
 async fn handle_server_stop(
@@ -6523,6 +6572,12 @@ fn session_db_error_response(error: &bcode_session::db::SessionDbError) -> Error
         bcode_session::db::SessionDbError::WriterIncompatible { .. } => {
             ErrorResponse::new("session_writer_incompatible", error.to_string())
         }
+        _ if error.is_lock_error() => ErrorResponse::new(
+            "session_database_locked",
+            format!(
+                "{error}; another Bcode instance owns this session database. Retry after its idle timeout, or use `bcode session release-owner <session-id>`; if needed, use `bcode session stop-owner <session-id>` or `bcode session kill-owner <session-id>`"
+            ),
+        ),
         bcode_session::db::SessionDbError::ProjectionIncompatible { .. }
         | bcode_session::db::SessionDbError::ProjectionStale { .. }
         | bcode_session::db::SessionDbError::ModelContextProjectionVersion { .. }

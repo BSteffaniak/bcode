@@ -101,6 +101,8 @@ pub enum CliError {
     SessionRepairUsage(String),
     #[error("legacy stream cleanup usage error: {0}")]
     LegacyStreamCleanupUsage(String),
+    #[error("invalid arguments: {0}")]
+    InvalidArguments(String),
     #[error(transparent)]
     LegacyStreamCleanup(#[from] bcode_session::legacy_stream_cleanup::LegacyStreamCleanupError),
     #[error(transparent)]
@@ -892,6 +894,21 @@ enum SessionCommand {
     Reindex {
         session_id: SessionId,
     },
+    /// Ask the verified daemon owning a session to release its database handle.
+    ReleaseOwner {
+        session_id: SessionId,
+    },
+    /// Gracefully stop the verified daemon owning a session.
+    StopOwner {
+        session_id: SessionId,
+    },
+    /// Forcefully terminate the verified daemon owning a session.
+    KillOwner {
+        session_id: SessionId,
+        /// Skip the destructive-action confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove historically persisted live tool-stream payloads.
     PruneLiveEvents {
         session_id: Option<SessionId>,
@@ -1408,6 +1425,20 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
         }
         SessionCommand::Reindex { session_id } => {
             reindex_session_model_context(session_id).await?;
+        }
+        SessionCommand::ReleaseOwner { session_id } => {
+            release_session_owner(session_id).await?;
+        }
+        SessionCommand::StopOwner { session_id } => {
+            stop_session_owner(session_id, false).await?;
+        }
+        SessionCommand::KillOwner { session_id, yes } => {
+            if !yes {
+                return Err(CliError::InvalidArguments(
+                    "force-killing a session owner requires --yes".to_owned(),
+                ));
+            }
+            stop_session_owner(session_id, true).await?;
         }
         SessionCommand::PruneLiveEvents {
             session_id,
@@ -6364,6 +6395,171 @@ async fn retire_incompatible_daemons() -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+async fn session_owner_record(
+    session_id: SessionId,
+) -> Result<bcode_daemon_lifecycle::DaemonRecord, CliError> {
+    let root = bcode_config::default_session_store_dir();
+    let owners = bcode_session::lease::active_session_owners(&root, session_id)?;
+    let live = bcode_daemon_lifecycle::live_records(&bcode_config::default_state_dir()).await;
+    let matching = owners
+        .into_iter()
+        .filter_map(|owner| {
+            let instance_id = owner.daemon_instance_id.as_deref()?;
+            live.iter()
+                .find(|(_, record)| {
+                    record.instance_id == instance_id && record.pid == Some(owner.pid)
+                })
+                .map(|(_, record)| record.clone())
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [record] => Ok(record.clone()),
+        [] => Err(CliError::InvalidArguments(format!(
+            "no verified live Bcode daemon owner was found for session {session_id}"
+        ))),
+        _ => Err(CliError::InvalidArguments(format!(
+            "session {session_id} has multiple verified daemon owners; refusing to target an arbitrary process"
+        ))),
+    }
+}
+
+async fn release_session_owner(session_id: SessionId) -> Result<(), CliError> {
+    let record = session_owner_record(session_id).await?;
+    let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
+        CliError::InvalidArguments(format!(
+            "daemon {} has no supported IPC endpoint",
+            record.instance_id
+        ))
+    })?;
+    let client =
+        BcodeClient::new(endpoint).with_daemon_availability(DaemonAvailability::RequireRunning);
+    if client.release_session_database(session_id).await? {
+        println!(
+            "released session database from daemon {}",
+            record.instance_id
+        );
+        Ok(())
+    } else {
+        Err(CliError::InvalidArguments(format!(
+            "daemon {} refused release because the session has active work",
+            record.instance_id
+        )))
+    }
+}
+
+async fn stop_session_owner(session_id: SessionId, force: bool) -> Result<(), CliError> {
+    let record = session_owner_record(session_id).await?;
+    if force {
+        terminate_verified_daemon(&record).await?;
+        println!("terminated session owner {}", record.instance_id);
+        return Ok(());
+    }
+    let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
+        CliError::InvalidArguments(format!(
+            "daemon {} has no supported IPC endpoint",
+            record.instance_id
+        ))
+    })?;
+    BcodeClient::new(endpoint)
+        .with_daemon_availability(DaemonAvailability::RequireRunning)
+        .server_stop()
+        .await?;
+    wait_for_daemon_exit(&record).await?;
+    println!("stopped session owner {}", record.instance_id);
+    Ok(())
+}
+
+async fn wait_for_daemon_exit(
+    expected: &bcode_daemon_lifecycle::DaemonRecord,
+) -> Result<(), CliError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let still_live = bcode_daemon_lifecycle::live_records(&bcode_config::default_state_dir())
+            .await
+            .into_iter()
+            .any(|(_, record)| record.instance_id == expected.instance_id);
+        if !still_live {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::InvalidArguments(format!(
+                "daemon {} did not exit within 5 seconds",
+                expected.instance_id
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn terminate_verified_daemon(
+    expected: &bcode_daemon_lifecycle::DaemonRecord,
+) -> Result<(), CliError> {
+    let verified = bcode_daemon_lifecycle::live_records(&bcode_config::default_state_dir())
+        .await
+        .into_iter()
+        .any(|(_, record)| record == *expected);
+    if !verified {
+        return Err(CliError::InvalidArguments(
+            "refusing termination because daemon identity changed".to_owned(),
+        ));
+    }
+    let pid = expected.pid.ok_or_else(|| {
+        CliError::InvalidArguments("verified daemon record has no process id".to_owned())
+    })?;
+    #[cfg(unix)]
+    {
+        let status = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(CliError::InvalidArguments(format!(
+                "failed to terminate verified daemon process {pid}"
+            )));
+        }
+        if wait_for_daemon_exit(expected).await.is_ok() {
+            return Ok(());
+        }
+        let still_verified =
+            bcode_daemon_lifecycle::live_records(&bcode_config::default_state_dir())
+                .await
+                .into_iter()
+                .any(|(_, record)| record == *expected);
+        if !still_verified {
+            return Err(CliError::InvalidArguments(
+                "refusing SIGKILL because daemon identity changed after SIGTERM".to_owned(),
+            ));
+        }
+        let status = tokio::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(CliError::InvalidArguments(format!(
+                "failed to force-kill verified daemon process {pid}"
+            )));
+        }
+        return wait_for_daemon_exit(expected).await;
+    }
+    #[cfg(windows)]
+    let status = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .await?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(CliError::InvalidArguments(
+        "forced daemon termination is unsupported on this platform".to_owned(),
+    ));
+    #[cfg(windows)]
+    if !status.success() {
+        return Err(CliError::InvalidArguments(format!(
+            "failed to terminate verified daemon process {pid}"
+        )));
+    }
+    #[cfg(windows)]
+    wait_for_daemon_exit(expected).await
 }
 
 async fn server_stop() -> Result<(), CliError> {

@@ -27,6 +27,8 @@ pub enum TuiDaemonIssue {
     SessionWriterIncompatible { message: String },
     /// The requested session is unavailable.
     SessionUnavailable { message: String },
+    /// Another Bcode daemon currently owns the session database lock.
+    SessionDatabaseLocked { message: String },
     /// The requested session needs explicit repair before normal use.
     SessionRepairRequired,
     /// The requested projection/index is stale.
@@ -100,6 +102,12 @@ impl TuiDaemonIssue {
                 status: format!("{label}: incompatible session storage writer"),
                 detail: Some(format!(
                     "This session was written by an unsupported storage generation. Use a compatible Bcode build or run `bcode session diagnose <session-id>`. Automatic migration was not attempted.\n\nDaemon error: {message}"
+                )),
+            },
+            Self::SessionDatabaseLocked { message } => TuiDaemonIssueMessage {
+                status: format!("{label}: session database is owned by another Bcode instance"),
+                detail: Some(format!(
+                    "Bcode will automatically release an inactive session database after 30 seconds. Retry now, or run `bcode session release-owner <session-id>`. If the owner does not cooperate, run `bcode session stop-owner <session-id>`. Last resort: `bcode session kill-owner <session-id> --yes` forcefully terminates only the verified owning daemon. Never delete the WAL file.\n\nDaemon error: {message}"
                 )),
             },
             Self::SessionUnavailable { message } => TuiDaemonIssueMessage {
@@ -180,6 +188,9 @@ fn classify_server_error(code: &str, message: &str) -> TuiDaemonIssue {
             message: message.to_owned(),
         },
         "session_writer_incompatible" => TuiDaemonIssue::SessionWriterIncompatible {
+            message: message.to_owned(),
+        },
+        "session_database_locked" => TuiDaemonIssue::SessionDatabaseLocked {
             message: message.to_owned(),
         },
         "session_not_found" | "session_unavailable" => TuiDaemonIssue::SessionUnavailable {

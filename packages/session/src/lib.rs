@@ -3853,6 +3853,29 @@ impl SessionManager {
         Ok(released)
     }
 
+    /// Release the cached database handle without detaching clients.
+    ///
+    /// The actor remains attached and reopens the database lazily on its next durable operation.
+    /// Callers must ensure no model turn, runtime work, migration, or queued write is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session actor is unavailable.
+    pub async fn release_session_database_resources(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, SessionError> {
+        let handle = self
+            .inner
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(SessionError::NotFound(session_id))?;
+        handle.release_database_resources().await
+    }
+
     /// Append a user message to a session.
     ///
     /// # Errors
@@ -8753,6 +8776,18 @@ mod tests {
             .expect("session should attach");
 
         assert!(
+            manager
+                .release_session_database_resources(session.id)
+                .await
+                .expect("explicit database release should succeed"),
+            "attached inactive sessions should release their database handle"
+        );
+        manager
+            .session_summary(session.id)
+            .await
+            .expect("summary should remain available after database release");
+
+        assert!(
             !manager
                 .release_idle_session_resources(session.id)
                 .await
@@ -8765,10 +8800,11 @@ mod tests {
             .await
             .expect("session should detach");
         assert!(
-            manager
+            !manager
                 .release_idle_session_resources(session.id)
                 .await
-                .expect("idle resources should release")
+                .expect("already released resources should remain released"),
+            "the explicit release already dropped the database handle"
         );
 
         assert!(

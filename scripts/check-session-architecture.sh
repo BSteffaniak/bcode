@@ -347,7 +347,7 @@ if ! rg -q 'explicit_reindex_accepts_retired_interactive_events_as_inert_history
   violations=1
 fi
 
-if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 13' packages/ipc/src/lib.rs \
+if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 14' packages/ipc/src/lib.rs \
   || ! rg -q 'PrepareSessionOpen' packages/ipc/src/lib.rs \
   || ! rg -q 'WaitSessionOpenProgress' packages/ipc/src/lib.rs \
   || ! rg -q 'SessionOpenPrepared' packages/ipc/src/lib.rs \
@@ -355,7 +355,7 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 13' packages/ipc/src/lib.rs \
   || ! rg -q 'session_open_wait_returns_newer_terminal_or_timeout_snapshot' packages/server/src/lib.rs \
   || ! rg -q 'session_open_operation_not_found' packages/server/src/lib.rs \
   || ! rg -q 'prepare_session_open_until_terminal' packages/client/src/lib.rs; then
-  echo "Session migration IPC violation: protocol-v13 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
+  echo "Session migration IPC violation: protocol-v14 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
   violations=1
 fi
 

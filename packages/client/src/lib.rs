@@ -1040,6 +1040,28 @@ impl BcodeClient {
         self.server_stop_with_mode(ServerStopMode::IfIdle).await
     }
 
+    /// Ask the connected daemon to close one session database without detaching clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, rejects the request, or returns an
+    /// unexpected response.
+    pub async fn release_session_database(
+        &self,
+        session_id: bcode_session_models::SessionId,
+    ) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::ReleaseSessionDatabase { session_id })
+            .await?
+        {
+            ResponsePayload::SessionDatabaseReleased {
+                session_id: released_session_id,
+                released,
+            } if released_session_id == session_id => Ok(released),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     async fn server_stop_with_mode(&self, mode: ServerStopMode) -> Result<(), ClientError> {
         match self.send_request(Request::ServerStop { mode }).await? {
             ResponsePayload::ServerStopping => Ok(()),

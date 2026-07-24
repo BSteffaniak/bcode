@@ -14,6 +14,8 @@ use bcode_session_models::ProjectionWindowAnchor;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+const SESSION_DATABASE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
     match error {
         SessionDbError::WriterIncompatible { .. } => {
@@ -332,6 +334,10 @@ impl SessionHandle {
         self.send(SessionCommand::ReleaseIdleResources).await
     }
 
+    pub async fn release_database_resources(&self) -> Result<bool, SessionError> {
+        self.send(SessionCommand::ReleaseDatabaseResources).await
+    }
+
     pub fn client_count(&self) -> usize {
         self.snapshot().summary.client_count
     }
@@ -436,6 +442,7 @@ enum SessionCommand {
         reply: oneshot::Sender<()>,
     },
     ReleaseIdleResources(oneshot::Sender<bool>),
+    ReleaseDatabaseResources(oneshot::Sender<bool>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -450,7 +457,27 @@ struct SessionActor {
 impl SessionActor {
     async fn run(mut self) {
         let context = MetricsContext::new().with_session_id(&self.state.summary.id);
-        while let Some(command) = self.commands.recv().await {
+        loop {
+            let command = if self.db.is_some() {
+                if let Ok(command) =
+                    tokio::time::timeout(SESSION_DATABASE_IDLE_TIMEOUT, self.commands.recv()).await
+                {
+                    command
+                } else {
+                    if self.release_database_resources() {
+                        tracing::debug!(
+                            session_id = %self.state.summary.id,
+                            "released idle session database handle"
+                        );
+                    }
+                    continue;
+                }
+            } else {
+                self.commands.recv().await
+            };
+            let Some(command) = command else {
+                break;
+            };
             let should_shutdown =
                 bcode_metrics::scope_metrics_context(context.clone(), self.handle_command(command))
                     .await;
@@ -614,6 +641,9 @@ impl SessionActor {
             SessionCommand::ReleaseIdleResources(reply) => {
                 let _ = reply.send(self.release_idle_resources());
             }
+            SessionCommand::ReleaseDatabaseResources(reply) => {
+                let _ = reply.send(self.release_database_resources());
+            }
             SessionCommand::Shutdown(reply) => {
                 let _ = reply.send(());
                 return true;
@@ -633,7 +663,13 @@ impl SessionActor {
         if !self.state.clients.is_empty() {
             return false;
         }
-        self.db = None;
+        self.release_database_resources()
+    }
+
+    fn release_database_resources(&mut self) -> bool {
+        if self.db.take().is_none() {
+            return false;
+        }
         self.state.events = None;
         self.state.load_status = SessionLoadStatusKind::SummaryOnly;
         self.refresh_snapshot();

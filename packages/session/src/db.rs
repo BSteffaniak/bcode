@@ -157,6 +157,15 @@ pub enum SessionStorageCompatibility {
     KnownLegacy { writer_epoch: u64 },
 }
 
+impl SessionDbError {
+    /// Return whether this error indicates transient ownership of the database lock.
+    #[must_use]
+    pub fn is_lock_error(&self) -> bool {
+        matches!(self, Self::Connection(error) if is_database_lock_error(error))
+            || matches!(self, Self::Database(error) if is_database_lock_error_message(&error.to_string()))
+    }
+}
+
 /// Result type for session DB operations.
 pub type SessionDbResult<T> = Result<T, SessionDbError>;
 
