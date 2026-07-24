@@ -624,6 +624,15 @@ pub enum MarkdownContributionKind {
         /// Source footnote label.
         label: String,
     },
+    /// Safe details/disclosure block.
+    Details {
+        /// Summary Markdown after safe HTML-tag conversion.
+        summary: String,
+        /// Body Markdown.
+        body: String,
+        /// Whether the source includes the `open` attribute.
+        default_open: bool,
+    },
     /// GitHub issue reference resolved under explicit repository context.
     GitHubIssue {
         /// Repository identity.
@@ -656,35 +665,56 @@ pub enum MarkdownContributionKind {
 #[must_use]
 pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> MarkdownRenderResult {
     let document = parse_markdown_document(markdown);
-    let projected_markdown = project_semantic_fallbacks(markdown, &document);
+    let details = collect_details_projections(markdown);
     let contributions = markdown_contributions(
         &document,
         options.document_context.as_ref(),
         options.document_id.as_deref(),
+        &details,
     );
+    let projected_markdown = project_semantic_fallbacks(markdown, &document, &details);
     MarkdownRenderResult {
         lines: render_markdown_lines_internal(&projected_markdown, options),
         contributions,
     }
 }
 
-fn project_semantic_fallbacks<'a>(markdown: &'a str, document: &MarkdownDocument) -> Cow<'a, str> {
+fn project_semantic_fallbacks<'a>(
+    markdown: &'a str,
+    document: &MarkdownDocument,
+    details: &[DetailsProjection],
+) -> Cow<'a, str> {
     let footnotes = collect_footnotes(markdown, document);
     let math = collect_math_projections(markdown, document);
-    if footnotes.references.is_empty() && footnotes.definitions.is_empty() && math.is_empty() {
+    if footnotes.references.is_empty()
+        && footnotes.definitions.is_empty()
+        && math.is_empty()
+        && details.is_empty()
+    {
         return Cow::Borrowed(markdown);
     }
 
-    let mut replacements = math
-        .into_iter()
-        .map(|projection| {
-            let replacement = match projection.kind {
-                MathKind::Inline => format!("`{}`", projection.rendered),
-                MathKind::Display => format!("\n```text\n{}\n```\n", projection.rendered),
-            };
-            (projection.source_range, replacement)
+    let mut replacements = details
+        .iter()
+        .cloned()
+        .map(|details| {
+            (
+                details.source_range,
+                format!(
+                    "**{}**\n\n{}",
+                    details.summary_markdown.trim(),
+                    details.body_markdown.trim()
+                ),
+            )
         })
         .collect::<Vec<_>>();
+    replacements.extend(math.into_iter().map(|projection| {
+        let replacement = match projection.kind {
+            MathKind::Inline => format!("`{}`", projection.rendered),
+            MathKind::Display => format!("\n```text\n{}\n```\n", projection.rendered),
+        };
+        (projection.source_range, replacement)
+    }));
     for reference in &footnotes.references {
         replacements.push((
             reference.source_range.clone(),
@@ -714,6 +744,76 @@ fn project_semantic_fallbacks<'a>(markdown: &'a str, document: &MarkdownDocument
         }
     }
     Cow::Owned(projected)
+}
+
+fn collect_details_projections(markdown: &str) -> Vec<DetailsProjection> {
+    let lower = markdown.to_ascii_lowercase();
+    let mut output = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_start) = lower[offset..].find("<details") {
+        let start = offset + relative_start;
+        let Some(open_end_relative) = lower[start..].find('>') else {
+            break;
+        };
+        let open_end = start + open_end_relative + 1;
+        let Some(close_relative) = lower[open_end..].find("</details>") else {
+            break;
+        };
+        let close_start = open_end + close_relative;
+        let end = close_start + "</details>".len();
+        let inner_lower = &lower[open_end..close_start];
+        let Some(summary_relative) = inner_lower.find("<summary") else {
+            offset = end;
+            continue;
+        };
+        let summary_start = open_end + summary_relative;
+        let Some(summary_open_end_relative) = lower[summary_start..].find('>') else {
+            offset = end;
+            continue;
+        };
+        let summary_open_end = summary_start + summary_open_end_relative + 1;
+        let Some(summary_close_relative) = lower[summary_open_end..close_start].find("</summary>")
+        else {
+            offset = end;
+            continue;
+        };
+        let summary_close = summary_open_end + summary_close_relative;
+        let open_tag = &lower[start..open_end];
+        output.push(DetailsProjection {
+            source_range: start..end,
+            summary_markdown: safe_summary_markdown(&markdown[summary_open_end..summary_close]),
+            body_markdown: markdown[summary_close + "</summary>".len()..close_start].to_owned(),
+            default_open: details_has_open_attribute(open_tag),
+        });
+        offset = end;
+    }
+    output
+}
+
+fn details_has_open_attribute(open_tag: &str) -> bool {
+    open_tag
+        .trim_matches(|character| character == '<' || character == '>')
+        .split_whitespace()
+        .skip(1)
+        .any(|attribute| attribute.trim_end_matches('=').eq_ignore_ascii_case("open"))
+}
+
+fn safe_summary_markdown(summary: &str) -> String {
+    summary
+        .replace("<strong>", "**")
+        .replace("</strong>", "**")
+        .replace("<em>", "*")
+        .replace("</em>", "*")
+        .replace("<code>", "`")
+        .replace("</code>", "`")
+}
+
+#[derive(Debug, Clone)]
+struct DetailsProjection {
+    source_range: Range<usize>,
+    summary_markdown: String,
+    body_markdown: String,
+    default_open: bool,
 }
 
 #[derive(Debug)]
@@ -1091,6 +1191,7 @@ fn markdown_contributions(
     document: &MarkdownDocument,
     context: Option<&MarkdownDocumentContext>,
     document_id: Option<&str>,
+    details: &[DetailsProjection],
 ) -> Vec<MarkdownContribution> {
     let mut contributions = Vec::new();
     let mut containers: Vec<ContributionContainer> = Vec::new();
@@ -1100,6 +1201,17 @@ fn markdown_contributions(
     if let Some(repository) = context.and_then(|context| context.github_repository.as_ref()) {
         contributions.extend(github_issue_contributions(document, repository));
     }
+    contributions.extend(details.iter().map(|details| {
+        contribution(
+            "details",
+            details.source_range.clone(),
+            MarkdownContributionKind::Details {
+                summary: details.summary_markdown.clone(),
+                body: details.body_markdown.clone(),
+                default_open: details.default_open,
+            },
+        )
+    }));
     contributions.sort_by_key(|item| (item.source_range.start, item.source_range.end));
     if let Some(document_id) = document_id {
         for item in &mut contributions {

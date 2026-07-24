@@ -1,0 +1,34 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} ==\\n{}\",\nstyled_snapshot(DETAILS, width))).collect::<Vec<_>>().join(\"\\n\")"
+---
+== width 60 ==
+00 │ Before.
+01 │ [bold]Retry [/][fg=yellow,bold]algorithm[/]
+02 │ Body with [italic]Markdown[/] and a list:
+03 │ [fg=bright-black]•  [/]one
+04 │ [fg=bright-black]•  [/]two
+05 │ 
+06 │ [bold]Open by default[/]
+07 │ Visible body.
+08 │ <details data-unsupported="x">
+09 │ Missing summary remains raw.
+10 │ </details>
+11 │ <details><summary>Incomplete summary</summary>
+== width 24 ==
+00 │ Before.
+01 │ [bold]Retry [/][fg=yellow,bold]algorithm[/]
+02 │ Body with [italic]Markdown[/] and a
+03 │  list:
+04 │ [fg=bright-black]•  [/]one
+05 │ [fg=bright-black]•  [/]two
+06 │ 
+07 │ [bold]Open by default[/]
+08 │ Visible body.
+09 │ <details data-unsupporte
+10 │ d="x">
+11 │ Missing summary remains 
+12 │ raw.
+13 │ </details>
+14 │ <details><summary>Incomp
+15 │ lete summary</summary>

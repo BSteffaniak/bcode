@@ -9,3 +9,4 @@ display-math:148:161 │ 0148..0161 │ DisplayMath { source: "x = y + 1" }
 footnote-reference:173:180 │ 0173..0180 │ FootnoteReference { label: "note" }
 footnote-definition:182:211 │ 0182..0211 │ FootnoteDefinition { label: "note" }
 mermaid:267:304 │ 0267..0304 │ Mermaid { source: "flowchart LR\n  A --> B\n" }
+details:306:352 │ 0306..0352 │ Details { summary: "More", body: "Body", default_open: false }

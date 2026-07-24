@@ -13,6 +13,7 @@ const BLOCKQUOTES: &str = include_str!("fixtures/blockquotes.md");
 const BLOCKS: &str = include_str!("fixtures/blocks.md");
 const CODE_BLOCKS: &str = include_str!("fixtures/code_blocks.md");
 const COMPOSITION: &str = include_str!("fixtures/composition.md");
+const DETAILS: &str = include_str!("fixtures/details.md");
 const FOOTNOTES: &str = include_str!("fixtures/footnotes.md");
 const GITHUB_MARKDOWN_EXAMPLE: &str = include_str!("../../../github-markdown-example.md");
 const HEADINGS: &str = include_str!("fixtures/headings.md");
@@ -174,6 +175,49 @@ fn contribution_snapshot(markdown: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn snapshots_details_noninteractive_fallback_at_normal_and_narrow_widths() {
+    insta::assert_snapshot!(
+        "details_fallback_widths_60_24",
+        [60_u16, 24]
+            .into_iter()
+            .map(|width| format!("== width {width} ==\n{}", styled_snapshot(DETAILS, width)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn details_contributions_preserve_safe_summary_body_and_default_state() {
+    let result = render_markdown(DETAILS, &MarkdownRenderOptions::new(60));
+    let details = result
+        .contributions
+        .iter()
+        .filter_map(|item| match &item.kind {
+            MarkdownContributionKind::Details {
+                summary,
+                body,
+                default_open,
+            } => Some((summary.as_str(), body.as_str(), *default_open)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].0, "**Retry** `algorithm`");
+    assert!(details[0].1.contains("Body with *Markdown*"));
+    assert!(!details[0].2);
+    assert_eq!(details[1].0, "Open by default");
+    assert!(details[1].2);
+
+    let visible = visible_snapshot(DETAILS, 60);
+    assert!(visible.contains("Retry algorithm"));
+    assert!(visible.contains("Body with Markdown and a list:"));
+    assert!(visible.contains("<details data-unsupported=\"x\">"));
+    assert!(visible.contains("<details><summary>Incomplete summary</summary>"));
+    assert!(!visible.contains("<strong>"));
 }
 
 #[test]
@@ -518,8 +562,13 @@ fn github_markdown_example_documents_current_semantic_gaps() {
         "IMPORTANT alert label changed"
     );
     assert!(output.contains("⚠ WARNING"), "WARNING alert label changed");
-    assert!(output.contains("<details>"), "details HTML changed");
-    assert!(output.contains("<summary>"), "summary HTML changed");
+    assert!(
+        output.contains("View the retry algorithm"),
+        "details summary changed"
+    );
+    assert!(output.contains("delay(n) = min"), "details body changed");
+    assert!(!output.contains("<details>"));
+    assert!(!output.contains("<summary>"));
     assert!(output.contains("(n)"), "inline math degradation changed");
     assert!(output.contains("[1]"), "footnote reference changed");
     assert!(output.contains("Footnotes"), "footnote section changed");
