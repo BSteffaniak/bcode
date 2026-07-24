@@ -593,6 +593,49 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual deterministic performance baseline"]
+    async fn artifact_target_fetch_baseline_report() {
+        for observed_targets in [4_u64, 256, 4_096] {
+            let client = BcodeClient::default_endpoint();
+            let mut coordinator = ArtifactStreamCoordinator::new(client);
+            let session_id = SessionId::new();
+            let started = Instant::now();
+            for revision in 1..=observed_targets {
+                coordinator.observe_live_event(
+                    session_id,
+                    &ToolInvocationStreamEvent::ArtifactUpdate {
+                        tool_call_id: "call".to_owned(),
+                        sequence: revision,
+                        artifact_id: "artifact".to_owned(),
+                        reference_key: "recording".to_owned(),
+                        producer_plugin_id: "bcode.shell".to_owned(),
+                        schema: "bcode.shell.run".to_owned(),
+                        schema_version: 1,
+                        content_type: None,
+                        storage_uri: String::new(),
+                        committed_bytes: revision.saturating_mul(17),
+                        revision,
+                        availability: Some("active".to_owned()),
+                        finalized: false,
+                    },
+                );
+            }
+            let stats = coordinator.drain_stats();
+            println!(
+                "BCODE_PERF_CASE {}",
+                serde_json::json!({
+                    "domain": "artifact_fetch",
+                    "observed_targets": stats.observed_targets,
+                    "coalesced_targets": stats.coalesced_targets,
+                    "fetches_started": stats.fetches_started,
+                    "backlog": stats.backlog,
+                    "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn finalized_hydration_selects_only_adapter_owned_references() {
         let client = BcodeClient::default_endpoint();
         let mut coordinator = ArtifactStreamCoordinator::new(client);

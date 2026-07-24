@@ -1758,6 +1758,73 @@ mod tests {
         assert_eq!(values.get("discontinuity_total"), Some(&1));
     }
 
+    #[test]
+    #[ignore = "manual deterministic performance baseline"]
+    fn incremental_replay_work_baseline_report() {
+        for output_bytes in [64 * 1024, 1024 * 1024, 8 * 1024 * 1024] {
+            for chunk_bytes in [17_usize, 4 * 1024, 16 * 1024] {
+                let adapter = ShellRunTuiVisualAdapter::default();
+                let key = format!("replay-{output_bytes}-{chunk_bytes}");
+                let chunk = vec![b'x'; chunk_bytes];
+                let mut delivered = 0_usize;
+                let mut sequence = 1_u64;
+                let started = std::time::Instant::now();
+                while delivered < output_bytes {
+                    let frame_bytes = (output_bytes - delivered).min(chunk_bytes);
+                    adapter.update_live_replay(
+                        &key,
+                        &[],
+                        Some(&[(
+                            sequence,
+                            TerminalReplayFrame::Output(chunk[..frame_bytes].to_vec()),
+                        )]),
+                        80,
+                        24,
+                    );
+                    delivered = delivered.saturating_add(frame_bytes);
+                    sequence = sequence.saturating_add(1);
+                }
+                let values =
+                    bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter)
+                        .into_iter()
+                        .map(|diagnostic| (diagnostic.name, diagnostic.value))
+                        .collect::<BTreeMap<_, _>>();
+                let retained_frame_bytes = adapter
+                    .live_replays
+                    .lock()
+                    .ok()
+                    .and_then(|replays| {
+                        replays.get(&key).map(|replay| {
+                            replay
+                                .frames
+                                .iter()
+                                .fold(0_u64, |total, frame| match frame {
+                                    TerminalReplayFrame::Output(bytes) => total.saturating_add(
+                                        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                                    ),
+                                    TerminalReplayFrame::Resize { .. } => total,
+                                })
+                        })
+                    })
+                    .unwrap_or(0);
+                println!(
+                    "BCODE_PERF_CASE {}",
+                    serde_json::json!({
+                        "domain": "shell_replay",
+                        "output_bytes": output_bytes,
+                        "chunk_bytes": chunk_bytes,
+                        "emulate_bytes": values.get("emulate_bytes").copied().unwrap_or(0),
+                        "emulate_frames": values.get("emulate_frames").copied().unwrap_or(0),
+                        "retained_frame_bytes": retained_frame_bytes,
+                        "retained_frames": values.get("retained_frames").copied().unwrap_or(0),
+                        "reset_total": values.get("reset_total").copied().unwrap_or(0),
+                        "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    })
+                );
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     #[test]
     fn incremental_and_authoritative_replay_match_terminal_and_lifecycle_matrix() {

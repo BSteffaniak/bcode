@@ -250,6 +250,33 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "manual deterministic performance baseline"]
+    async fn telemetry_enabled_disabled_overhead_baseline_report() {
+        const ITERATIONS: u64 = 100_000;
+        for enabled in [false, true] {
+            let client = BcodeClient::default_endpoint();
+            let mut telemetry = TuiTelemetry::new(client, enabled);
+            let started = Instant::now();
+            for frame in 0..ITERATIONS {
+                telemetry.add_counter("tui.frame.total", 1);
+                if frame.is_multiple_of(16) {
+                    telemetry.record_histogram("tui.frame.total_ms", frame % 32);
+                }
+            }
+            println!(
+                "BCODE_PERF_CASE {}",
+                serde_json::json!({
+                    "domain": "telemetry_overhead",
+                    "enabled": enabled,
+                    "iterations": ITERATIONS,
+                    "pending_observations": telemetry.observation_count(),
+                    "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_telemetry_is_a_noop() {
         let client = BcodeClient::default_endpoint();
         let mut telemetry = TuiTelemetry::new(client, false);

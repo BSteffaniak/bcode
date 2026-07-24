@@ -2742,6 +2742,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual deterministic performance baseline"]
+    fn live_shell_output_chunk_baseline_report() {
+        const OUTPUT_VOLUMES: [usize; 3] = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
+        const CHUNK_BYTES: [usize; 3] = [17, 4 * 1024, 16 * 1024];
+
+        for output_bytes in OUTPUT_VOLUMES {
+            for chunk_bytes in CHUNK_BYTES {
+                let started = std::time::Instant::now();
+                let metrics = run_output_chunk_workload(output_bytes, chunk_bytes);
+                println!(
+                    "BCODE_PERF_CASE {}",
+                    serde_json::json!({
+                        "domain": "shell_output",
+                        "output_bytes": metrics.raw_bytes,
+                        "chunk_bytes": chunk_bytes,
+                        "recording_bytes": metrics.recording_bytes,
+                        "raw_updates": metrics.notification_count,
+                        "ipc_bytes": metrics.ipc_bytes,
+                        "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
     fn deterministic_output_chunk_matrix_preserves_exact_bytes_and_expected_updates() {
         const OUTPUT_VOLUMES: [usize; 3] = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
         const CHUNK_BYTES: [usize; 3] = [17, 4 * 1024, 16 * 1024];

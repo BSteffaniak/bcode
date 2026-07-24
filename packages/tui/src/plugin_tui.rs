@@ -447,6 +447,92 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual deterministic performance baseline"]
+    fn targeted_visual_update_transcript_baseline_report() {
+        for transcript_len in [10_usize, 500, 2_000] {
+            let presentation = test_presentation();
+            let items = (0..transcript_len)
+                .map(|index| {
+                    crate::transcript::tool_request_item(
+                        &format!("call-{index}"),
+                        Some("bcode.shell"),
+                        "shell",
+                        "{}",
+                        None,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut cache = crate::transcript_layout::TranscriptLayoutCache::default();
+            cache.sync(crate::transcript_layout::TranscriptLayoutSpec {
+                width: 80,
+                fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
+                    "baseline-initial".to_owned(),
+                ),
+                transcript_len,
+                pending_len: 0,
+                transcript_signature: |index| {
+                    crate::transcript_projection::test_layout_signature(
+                        &items[index],
+                        80,
+                        Some(&presentation),
+                    )
+                },
+                transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+                pending_signature: |index| {
+                    crate::transcript_layout::TranscriptLayoutSignature::new(format!(
+                        "pending-{index}"
+                    ))
+                },
+                pending_rows: |_| Vec::new(),
+                history_banner_signature: || None,
+                history_banner_rows: Vec::new,
+                reset: || false,
+            });
+            presentation.bump_visual_revision_for_test("call-0");
+            let started = Instant::now();
+            let stats = cache.sync(crate::transcript_layout::TranscriptLayoutSpec {
+                width: 80,
+                fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
+                    "baseline-updated".to_owned(),
+                ),
+                transcript_len,
+                pending_len: 0,
+                transcript_signature: |index| {
+                    crate::transcript_projection::test_layout_signature(
+                        &items[index],
+                        80,
+                        Some(&presentation),
+                    )
+                },
+                transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+                pending_signature: |index| {
+                    crate::transcript_layout::TranscriptLayoutSignature::new(format!(
+                        "pending-{index}"
+                    ))
+                },
+                pending_rows: |_| Vec::new(),
+                history_banner_signature: || None,
+                history_banner_rows: Vec::new,
+                reset: || false,
+            });
+            println!(
+                "BCODE_PERF_CASE {}",
+                serde_json::json!({
+                    "domain": "transcript_visual_update",
+                    "transcript_entries": transcript_len,
+                    "entries_scanned": stats.entries_scanned,
+                    "signatures_changed": stats.signatures_changed,
+                    "entries_rebuilt": stats.entries_rebuilt,
+                    "rows_regenerated": stats.rows_regenerated,
+                    "sync_us": stats.duration_micros,
+                    "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                })
+            );
+        }
+    }
+
+    #[test]
     fn one_visual_update_rebuilds_only_its_entry_across_transcript_sizes() {
         for transcript_len in [10_usize, 500, 2_000] {
             let presentation = test_presentation();

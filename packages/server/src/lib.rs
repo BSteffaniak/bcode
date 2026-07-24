@@ -29538,6 +29538,50 @@ library = "test"
     }
 
     #[test]
+    #[ignore = "manual deterministic performance baseline"]
+    fn artifact_update_publisher_baseline_report() {
+        for raw_updates in [4_u64, 256, 4_096] {
+            let mut publisher = ToolOutputLivePublisher::new();
+            let metrics = MetricsRegistry::default();
+            let started = Instant::now();
+            for revision in 1..=raw_updates {
+                let event = ToolInvocationStreamEvent::ArtifactUpdate {
+                    tool_call_id: "call".to_owned(),
+                    sequence: revision,
+                    artifact_id: "artifact".to_owned(),
+                    reference_key: "recording".to_owned(),
+                    producer_plugin_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.run".to_owned(),
+                    schema_version: 1,
+                    content_type: None,
+                    storage_uri: String::new(),
+                    committed_bytes: revision.saturating_mul(17),
+                    revision,
+                    availability: None,
+                    finalized: false,
+                };
+                let _ = publisher.enqueue_artifact_update(&metrics, event);
+            }
+            for pending in publisher.pending_artifacts.values() {
+                record_artifact_update_published(&metrics, pending);
+            }
+            let report = metrics.report();
+            let counter = |name: &str| report.snapshot.counters.get(name).copied().unwrap_or(0);
+            println!(
+                "BCODE_PERF_CASE {}",
+                serde_json::json!({
+                    "domain": "server_artifact_publisher",
+                    "raw_updates": counter("tool.artifact_update.received_total"),
+                    "coalesced_updates": counter("tool.artifact_update.coalesced_total"),
+                    "published_updates": counter("tool.artifact_update.published_total"),
+                    "committed_bytes": raw_updates.saturating_mul(17),
+                    "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                })
+            );
+        }
+    }
+
+    #[test]
     fn tool_output_publisher_coalesces_artifact_revisions_by_identity() {
         let mut publisher = ToolOutputLivePublisher::new();
         let update =

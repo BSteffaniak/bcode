@@ -5018,6 +5018,78 @@ fn growing_visual_app(
 }
 
 #[test]
+#[ignore = "manual deterministic performance baseline"]
+fn active_visual_frame_baseline_report() {
+    let terminal = Rect::new(0, 0, 80, 30);
+    for transcript_entries in [10_u64, 500, 2_000] {
+        let session_id = SessionId::new();
+        let presentation = growing_visual_presentation();
+        let history = (0..transcript_entries.saturating_sub(1))
+            .map(|sequence| {
+                event(
+                    session_id,
+                    sequence,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("history {sequence}"),
+                    },
+                )
+            })
+            .chain(std::iter::once(event(
+                session_id,
+                transcript_entries,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-growing".to_owned(),
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: r#"{"command":"fixture"}"#.to_owned(),
+                    working_directory: None,
+                    request_visual: Some(PluginVisualDescriptor {
+                        visual_id: None,
+                        producer_plugin_id: Some("bcode.shell".to_owned()),
+                        schema: "bcode.tool.request.shell.run".to_owned(),
+                        schema_version: 1,
+                        title: Some("Growing visual".to_owned()),
+                        subtitle: None,
+                        payload: serde_json::json!({"command": "fixture"}),
+                    }),
+                    legacy_request_presentation: None,
+                },
+            )))
+            .collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        app.set_plugin_presentation(Arc::clone(&presentation));
+        let mut buffer = Buffer::empty(terminal);
+        let mut frame = Frame::new(&mut buffer);
+        render::render(&mut app, &mut frame);
+        deliver_growing_visual_rows(
+            &presentation,
+            "call-growing",
+            &["one", "two", "three", "four", "five", "six"],
+            1,
+        );
+        let prepare_started = Instant::now();
+        let layout = render::prepare_frame(&mut app, terminal).expect("prepared frame");
+        let prepare_us = u64::try_from(prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let mut buffer = Buffer::empty(terminal);
+        let mut frame = Frame::new(&mut buffer);
+        let draw_started = Instant::now();
+        render::render_prepared(&mut app, &mut frame, layout);
+        let draw_us = u64::try_from(draw_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        println!(
+            "BCODE_PERF_CASE {}",
+            serde_json::json!({
+                "domain": "tui_frame",
+                "transcript_entries": transcript_entries,
+                "prepare_us": prepare_us,
+                "draw_us": draw_us,
+                "total_us": prepare_us.saturating_add(draw_us),
+                "over_budget": prepare_us.saturating_add(draw_us) >= 16_000,
+            })
+        );
+    }
+}
+
+#[test]
 fn active_visual_height_changes_preserve_viewport_latest_scroll_and_interaction_dock() {
     let terminal = Rect::new(0, 0, 80, 18);
     let interaction_height = 4;
