@@ -68,7 +68,19 @@ if [[ -z "$current_event_schema" || "$current_event_schema" != "$fixture_baselin
 fi
 
 retired_event_pattern='interactive_tool_request_created|interactive_tool_request_resolved|plugin_automation_turn_started|plugin_automation_turn_finished|tool_invocation_presentation|request_presentation'
-if rg -n "$retired_event_pattern" packages/session/src packages/session/models/src packages/server/src packages/ipc/src packages/tui/src packages/hyperchad/src packages/hyperchad/ui/src --glob '*.rs' \
+retired_runtime_paths=(
+  packages/session/src
+  packages/session/models/src
+  packages/server/src
+  packages/ipc/src
+  packages/tui/src
+  packages/hyperchad/src
+  packages/hyperchad/ui/src
+)
+if [[ -d packages/web-render/src ]]; then
+  retired_runtime_paths+=(packages/web-render/src)
+fi
+if rg -n "$retired_event_pattern" "${retired_runtime_paths[@]}" --glob '*.rs' \
   >/tmp/bcode-retired-session-event-decoders.txt; then
   echo "Session hard-cutover violation: a named retired event decoder or presentation field was reintroduced." >&2
   cat /tmp/bcode-retired-session-event-decoders.txt >&2
@@ -175,14 +187,17 @@ if ! rg -q 'create_verified_migration_backup' packages/session/src/lib.rs \
   violations=1
 fi
 
-if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/session/src/lease.rs \
+if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/registry.rs \
+  || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =' packages/session/src/lease.rs \
   || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/ipc/src/lib.rs \
   || ! rg -q 'session_event_schema_version' packages/ipc/src/lib.rs \
   || ! rg -q 'session_compatibility_state' packages/session/src/db.rs \
   || ! rg -q 'CompatibilityDegraded' packages/session/src/db.rs \
-  || ! rg -q 'epoch_three_opaque_history_migrates_to_bounded_read_only_state' packages/session/src/db.rs \
-  || ! rg -q 'migrated_opaque_session_health_is_degraded_and_attach_fails_closed' packages/session/src/lib.rs; then
-  echo "Session compatibility-projection violation: epoch-5 writers must maintain bounded compatibility state and keep opaque sessions read-only." >&2
+  || ! rg -q 'epoch_three_unknown_history_fails_writable_migration_atomically' packages/session/src/db.rs \
+  || ! rg -q 'schema_28_historical_events_normalize_to_current_writable_storage' packages/session/src/db.rs \
+  || ! rg -q 'broken_epoch_four_compatibility_state_is_rebuilt_to_writable_epoch_five' packages/session/src/db.rs \
+  || ! rg -q 'unknown_legacy_history_preparation_fails_closed' packages/session/src/lib.rs; then
+  echo "Session compatibility-projection violation: epoch-5 migration must normalize known history, reject unresolved history atomically, and retain bounded compatibility reporting." >&2
   violations=1
 fi
 
@@ -242,6 +257,14 @@ fi
 if rg -n '\*\.events|sessions/index/' docs/session-persistence-architecture.md >/tmp/bcode-stale-session-docs.txt; then
   echo "Session documentation violation: obsolete file-log/index architecture is documented as current." >&2
   cat /tmp/bcode-stale-session-docs.txt >&2
+  violations=1
+fi
+
+if ! rg -q '^## Current runtime and migration boundaries$' docs/session-persistence-architecture.md \
+  || ! rg -q '`bcode_session` must not depend on `bcode_session_migration`' docs/session-persistence-architecture.md \
+  || ! rg -q 'advance the writer epoch as the final transactional mutation' docs/session-persistence-architecture.md \
+  || ! rg -q 'one daemon instance per session' docs/session-persistence-architecture.md; then
+  echo "Session migration architecture documentation violation: current-only boundaries, dependency direction, epoch ordering, and ownership handoff must remain explicit." >&2
   violations=1
 fi
 
@@ -392,7 +415,7 @@ fi
 if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/db.rs \
   || ! rg -q 'run_session_migrations\(&\*tx\)' packages/session/src/db.rs \
   || ! rg -q 'migrate_session_storage\(&\*tx, session_id, &metrics, progress\.as_ref\(\)\)' packages/session/src/db.rs \
-  || ! rg -q 'set_storage_writer_contract\(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs; then
+  || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs; then
   echo "Session migration violation: schema migration, projection replay, and writer-epoch update must share explicit migration transaction." >&2
   violations=1
 fi
@@ -423,11 +446,13 @@ if rg -q 'KnownLegacy \{ writer_epoch \} => Err\(SessionError::StorageMigrationR
   violations=1
 fi
 
-if ! rg -q 'epoch_three_opaque_history_migrates_to_bounded_read_only_state' packages/session/src/db.rs \
-  || ! sed -n '/async fn epoch_three_opaque_history_migrates_to_bounded_read_only_state(/,/^    }/p' packages/session/src/db.rs | grep -q 'history_sequences(&page.events), vec!\[0, 1\]' \
+if ! rg -q 'epoch_three_unknown_history_fails_writable_migration_atomically' packages/session/src/db.rs \
+  || ! sed -n '/async fn epoch_three_unknown_history_fails_writable_migration_atomically(/,/^    }/p' packages/session/src/db.rs | grep -q 'source store should remain openable after rollback' \
+  || ! rg -q 'schema_28_historical_events_normalize_to_current_writable_storage' packages/session/src/db.rs \
+  || ! sed -n '/async fn schema_28_historical_events_normalize_to_current_writable_storage(/,/^    }/p' packages/session/src/db.rs | grep -q 'migrated store should be writable' \
   || ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' packages/session/src/db.rs \
   || ! sed -n '/async fn failed_explicit_migration_preserves_projection_and_writer_contract(/,/^    }/p' packages/session/src/db.rs | grep -q 'failed migration must preserve every session storage file byte-for-byte'; then
-  echo "Session migration regression violation: opaque-history migration must preserve the canonical tail and failed migration must preserve complete storage bytes." >&2
+  echo "Session migration regression violation: known history must normalize writable and unresolved/failed migration must preserve source storage." >&2
   violations=1
 fi
 
@@ -443,23 +468,34 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 15' packages/ipc/src/lib.rs \
   violations=1
 fi
 
-if ! rg -q 'canonical_row_count_and_tail' packages/session/src/db.rs \
+if ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs \
+  || ! rg -q 'canonical_migration_page' packages/session/src/db.rs \
+  || rg -q 'canonical_migration_history' packages/session/src/db.rs \
+  || ! rg -q 'every_supported_source_epoch_migrates_to_current_writable_storage' packages/session/src/db.rs \
+  || ! rg -q 'migration_pages_more_than_one_thousand_events_without_gaps_or_duplicates' packages/session/src/lib.rs \
+  || ! rg -q 'abort_at_migration_crash_boundary\("before_epoch_update"\)' packages/session/src/db.rs \
+  || ! rg -q 'abort_at_migration_crash_boundary\("after_epoch_update_before_commit"\)' packages/session/src/db.rs \
+  || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs \
+  || ! rg -q 'session.migration.converted_tool_call_finished_events_total' packages/session/src/db.rs \
+  || ! rg -q 'session.migration.converted_context_usage_observed_events_total' packages/session/src/db.rs \
+  || ! rg -q 'report.descriptors\[counter\].label_keys.is_empty' packages/session/src/db.rs \
   || ! rg -q 'expected_backup_bytes' packages/session/src/lib.rs \
   || ! rg -q 'assert_successful_migration_progress' packages/session/src/lib.rs \
   || ! rg -q 'detached_preparation_reports_structured_backup_failure_without_mutation' packages/session/src/lib.rs \
-  || ! rg -q 'publish_backup_path' packages/session/src/migration_operation.rs \
-  || ! rg -q 'completed % 100 == 0' packages/session/src/db.rs \
+  || ! rg -q 'publish_backup_path' packages/session-migration/src/operation.rs \
+  || ! rg -q 'completed.is_multiple_of\(100\)' packages/session/src/db.rs \
   || ! rg -q 'MIGRATION_PROGRESS_BYTE_INTERVAL' packages/session/src/lib.rs; then
   echo "Session migration progress violation: ordered/throttled success, failure, backup, byte, decode, and replay progress coverage must remain intact." >&2
   violations=1
 fi
 
 if ! rg -q 'pub async fn prepare_session_open' packages/session/src/lib.rs \
-  || ! rg -q 'migration_operations: migration_operation::SessionMigrationOperations' packages/session/src/lib.rs \
+  || ! rg -q 'migration_operations: bcode_session_migration::SessionMigrationOperations' packages/session/src/lib.rs \
   || ! rg -q 'concurrent_preparation_joins_one_detached_legacy_migration' packages/session/src/lib.rs \
   || ! rg -q 'current_session_preparation_is_immediately_ready_without_operation' packages/session/src/lib.rs \
-  || ! rg -q 'concurrent_starts_join_one_running_operation' packages/session/src/migration_operation.rs \
-  || ! rg -q 'pruning_is_bounded_and_never_removes_running_operations' packages/session/src/migration_operation.rs; then
+  || ! rg -q 'concurrent_starts_join_one_running_operation' packages/session-migration/src/operation.rs \
+  || ! rg -q 'pruning_is_bounded_and_never_removes_running_operations' packages/session-migration/src/operation.rs \
+  || test -e packages/session/src/migration_operation.rs; then
   echo "Session migration operation violation: production preparation, one-per-session joining, reconnectable snapshots, bounded retention, and current-session bypass must remain covered." >&2
   violations=1
 fi
@@ -604,8 +640,8 @@ if ! rg -q 'preparation_recovers_retained_operation_after_transport_interruption
 fi
 
 if ! rg -q 'normal_open_does_not_decode_canonical_events' packages/session/src/lib.rs \
-  || ! rg -q 'migrated_opaque_session_health_is_degraded_and_attach_fails_closed' packages/session/src/lib.rs; then
-  echo "Session normal-load violation: healthy and degraded manager opens must retain decode-free regression coverage." >&2
+  || ! rg -q 'unknown_legacy_history_preparation_fails_closed' packages/session/src/lib.rs; then
+  echo "Session normal-load violation: healthy opens must remain decode-free and unresolved legacy preparation must fail closed." >&2
   violations=1
 fi
 

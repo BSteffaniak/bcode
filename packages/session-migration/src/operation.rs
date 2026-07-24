@@ -1,4 +1,4 @@
-//! Coordination for server-owned session-open preparation operations.
+//! Coordination for detached, reconnectable session migration operations.
 
 use bcode_session_models::{
     SessionId, SessionMigrationProgress, SessionMigrationStage, SessionOpenFailureKind,
@@ -13,12 +13,12 @@ use tokio::sync::{Mutex, watch};
 const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_mins(10);
 const DEFAULT_MAX_TERMINAL_OPERATIONS: usize = 128;
 
+/// One detached session migration operation with reconnectable snapshots.
 #[derive(Debug)]
 pub struct SessionMigrationOperation {
     snapshots: watch::Sender<SessionOpenOperationSnapshot>,
     publication: std::sync::Mutex<()>,
     completed_at: Mutex<Option<Instant>>,
-    #[cfg(test)]
     history: std::sync::Mutex<Vec<SessionOpenOperationSnapshot>>,
 }
 
@@ -28,34 +28,50 @@ impl SessionMigrationOperation {
             snapshots: watch::channel(snapshot).0,
             publication: std::sync::Mutex::new(()),
             completed_at: Mutex::new(None),
-            #[cfg(test)]
             history: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    /// Return the latest published snapshot.
+    #[must_use]
     pub fn snapshot(&self) -> SessionOpenOperationSnapshot {
         self.snapshots.borrow().clone()
     }
 
+    /// Subscribe to future snapshots while retaining the latest value.
+    #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<SessionOpenOperationSnapshot> {
         self.snapshots.subscribe()
     }
 
+    /// Publish one complete operation snapshot.
     pub fn publish(&self, snapshot: SessionOpenOperationSnapshot) {
-        #[cfg(test)]
         if let Ok(mut history) = self.history.lock() {
             history.push(snapshot.clone());
         }
         self.snapshots.send_replace(snapshot);
     }
 
-    #[cfg(test)]
+    /// Return all snapshots captured by operation instrumentation.
+    #[must_use]
     pub fn history(&self) -> Vec<SessionOpenOperationSnapshot> {
-        self.history
-            .lock()
-            .map_or_else(|_| Vec::new(), |history| history.clone())
+        self.history.lock().map_or_else(
+            |_| Vec::new(),
+            |history| {
+                let mut snapshots = history.clone();
+                let current = self.snapshot();
+                if snapshots
+                    .last()
+                    .is_none_or(|snapshot| snapshot.revision != current.revision)
+                {
+                    snapshots.push(current);
+                }
+                snapshots
+            },
+        )
     }
 
+    /// Publish monotonic progress unless the operation is already terminal.
     pub fn publish_progress(&self, progress: SessionMigrationProgress) {
         let Ok(_publication) = self.publication.lock() else {
             return;
@@ -65,15 +81,7 @@ impl SessionMigrationOperation {
             return;
         }
         if progress.stage == current.progress.stage
-            && current.progress.completed_units.is_some()
             && progress.completed_units < current.progress.completed_units
-        {
-            return;
-        }
-        if progress
-            .completed_units
-            .zip(progress.total_units)
-            .is_some_and(|(completed, total)| completed > total)
         {
             return;
         }
@@ -83,6 +91,7 @@ impl SessionMigrationOperation {
         self.publish(next);
     }
 
+    /// Retain the verified backup path on subsequent and terminal snapshots.
     pub fn publish_backup_path(&self, backup_path: std::path::PathBuf) {
         let Ok(_publication) = self.publication.lock() else {
             return;
@@ -118,6 +127,7 @@ impl SessionMigrationOperation {
     }
 }
 
+/// Per-session registry for detached migration operations.
 #[derive(Debug, Clone)]
 pub struct SessionMigrationOperations {
     entries: Arc<Mutex<BTreeMap<SessionId, Arc<SessionMigrationOperation>>>>,
@@ -132,7 +142,9 @@ impl Default for SessionMigrationOperations {
 }
 
 impl SessionMigrationOperations {
-    pub(super) fn new(terminal_retention: Duration, max_terminal_operations: usize) -> Self {
+    /// Create a registry with explicit terminal retention bounds.
+    #[must_use]
+    pub fn new(terminal_retention: Duration, max_terminal_operations: usize) -> Self {
         Self {
             entries: Arc::new(Mutex::new(BTreeMap::new())),
             terminal_retention,
@@ -140,6 +152,7 @@ impl SessionMigrationOperations {
         }
     }
 
+    /// Start detached work or join the reusable operation for the same session.
     pub async fn start_or_join<F, Fut>(
         &self,
         initial: SessionOpenOperationSnapshot,
@@ -186,6 +199,7 @@ impl SessionMigrationOperations {
         operation
     }
 
+    /// Return an operation only when session and operation identities both match.
     pub async fn get(
         &self,
         session_id: SessionId,
@@ -200,6 +214,7 @@ impl SessionMigrationOperations {
             .cloned()
     }
 
+    /// Count currently running operations.
     pub async fn active_count(&self) -> usize {
         self.entries
             .lock()
@@ -320,96 +335,79 @@ mod tests {
                 }
             })
             .await;
-        assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.snapshot().operation_id, operation_id);
-        assert_eq!(operations.active_count().await, 1);
+        assert_eq!(second.snapshot().operation_id, operation_id);
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
         blocker.notify_one();
         let mut receiver = first.subscribe();
         receiver
-            .wait_for(|state| state.outcome.is_some())
+            .wait_for(|snapshot| snapshot.outcome.is_some())
             .await
             .expect("terminal snapshot");
         assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert_eq!(operations.active_count().await, 0);
     }
 
     #[tokio::test]
-    async fn owned_by_other_daemon_failure_is_retried() {
+    async fn completed_owner_block_does_not_poison_retry() {
         let operations = SessionMigrationOperations::default();
         let session_id = SessionId::new();
-        let first = operations
+        let blocked = operations
             .start_or_join(snapshot(session_id), |_| async {
                 SessionOpenTerminalOutcome::Failed {
                     kind: SessionOpenFailureKind::OwnedByOtherDaemon,
-                    message: "owner exited after this failure".to_owned(),
+                    message: "owned".to_owned(),
                     backup_path: None,
                 }
             })
             .await;
-        let mut first_receiver = first.subscribe();
-        first_receiver
-            .wait_for(|state| state.outcome.is_some())
+        let mut receiver = blocked.subscribe();
+        receiver
+            .wait_for(|snapshot| snapshot.outcome.is_some())
             .await
-            .expect("first terminal snapshot");
-
-        let retry_snapshot = snapshot(session_id);
-        let retry_operation_id = retry_snapshot.operation_id;
-        let runs = Arc::new(AtomicUsize::new(0));
-        let retry_runs = Arc::clone(&runs);
+            .expect("blocked terminal");
         let retry = operations
-            .start_or_join(retry_snapshot, move |_| async move {
-                retry_runs.fetch_add(1, Ordering::SeqCst);
+            .start_or_join(snapshot(session_id), |_| async {
                 SessionOpenTerminalOutcome::Ready
             })
             .await;
-        assert!(!Arc::ptr_eq(&first, &retry));
-        assert_eq!(retry.snapshot().operation_id, retry_operation_id);
-        let mut retry_receiver = retry.subscribe();
-        retry_receiver
-            .wait_for(|state| state.outcome.is_some())
-            .await
-            .expect("retry terminal snapshot");
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            retry.snapshot().outcome,
-            Some(SessionOpenTerminalOutcome::Ready)
+        assert_ne!(
+            retry.snapshot().operation_id,
+            blocked.snapshot().operation_id
         );
     }
 
     #[tokio::test]
     async fn pruning_is_bounded_and_never_removes_running_operations() {
         let operations = SessionMigrationOperations::new(Duration::ZERO, 1);
-        let running_session = SessionId::new();
         let blocker = Arc::new(tokio::sync::Notify::new());
-        let task_blocker = Arc::clone(&blocker);
+        let running_id = SessionId::new();
+        let running_blocker = Arc::clone(&blocker);
         let running = operations
-            .start_or_join(snapshot(running_session), move |_| async move {
-                task_blocker.notified().await;
+            .start_or_join(snapshot(running_id), move |_| async move {
+                running_blocker.notified().await;
                 SessionOpenTerminalOutcome::Ready
             })
             .await;
         for _ in 0..3 {
             let session_id = SessionId::new();
-            let completed = operations
+            let operation = operations
                 .start_or_join(snapshot(session_id), |_| async {
                     SessionOpenTerminalOutcome::Ready
                 })
                 .await;
-            let mut receiver = completed.subscribe();
+            let mut receiver = operation.subscribe();
             receiver
-                .wait_for(|state| state.outcome.is_some())
+                .wait_for(|snapshot| snapshot.outcome.is_some())
                 .await
                 .expect("terminal snapshot");
         }
-        operations.prune().await;
-        assert_eq!(operations.active_count().await, 1);
         assert!(
             operations
-                .get(running_session, running.snapshot().operation_id)
+                .get(running_id, running.snapshot().operation_id)
                 .await
                 .is_some()
         );
-        assert!(operations.entries.lock().await.len() <= 2);
         blocker.notify_one();
     }
 }

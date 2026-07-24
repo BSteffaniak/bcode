@@ -122,6 +122,63 @@ Health, doctor, diagnosis, catalog, and audit paths remain non-migrating. A norm
 load may migrate only storage classified as known legacy after it acquires exclusive per-session
 maintenance ownership. All other maintenance remains explicit.
 
+## Current runtime and migration boundaries
+
+`bcode_session` owns only the current writer contract, current event model, current projections,
+and bounded current-session reads and writes. Historical payload DTOs, released writer-epoch
+planning, historical classification, and conversion belong to the dedicated
+`bcode_session_migration` domain crate. Historical DTOs must not leak into session models, client
+protocols, or runtime APIs.
+
+The intended dependency graph is one-way:
+
+```text
+server composition -> bcode_session_migration -> bcode_session migration-target API
+server composition -> bcode_session
+client/TUI -> typed session-open operation models
+```
+
+`bcode_session` must not depend on `bcode_session_migration` in the final architecture. The current
+migration-target API is deliberately narrow: bounded canonical pages, transactional canonical-row
+replacement, current projector ingestion/finalization, strict validation, and final writer-contract
+advancement. The migration service owns source classification, epoch planning, historical decoding,
+backup evidence, operation progress/terminal state, and orchestration. The server composes the
+migration service with current session loading and ownership; clients and the TUI only observe typed
+operation snapshots.
+
+A migration plan records every monotonic released epoch edge for audit, but canonical history is
+normalized directly to the final current representation in one bounded traversal. It is not replayed
+once per epoch edge or once per projection. Runtime canonical rows remain append-only; the sole
+encoding-rewrite exception is an explicit, exclusively owned writer-epoch migration transaction.
+That transaction preserves event sequence, timestamp, session identity, provenance, ordering, and
+semantics while rebuilding every current derived projection.
+
+Migration order is mandatory:
+
+1. classify the source without mutation;
+2. refuse migration while any live runtime owner exists;
+3. acquire the maintenance coordinator and then the maintenance write lock;
+4. create and verify a retained backup and its evidence manifest;
+5. begin the database transaction;
+6. normalize canonical events and rebuild projections in bounded pages;
+7. reject unresolved compatibility issues and validate all current write-readiness invariants;
+8. write the migration receipt;
+9. advance the writer epoch as the final transactional mutation;
+10. commit and atomically adopt the corrected runtime lease before publishing terminal `Ready`.
+
+The receipt records source and target epochs, stable ordered migration-step IDs, source and target
+ordered payload digests, event count, converted/retired-known counts, backup identity, and completion
+time. Backup evidence records source identity, source/target writer contracts, copied database and
+sidecars, byte counts, and verification status. Receipts are current audit metadata, not runtime
+branches for old behavior.
+
+Corrected runtime ownership is one daemon instance per session, with any number of clients routed
+through that owner. Lease metadata includes writer epoch and daemon instance identity. A live older
+daemon is never forced out or migrated underneath: it continues until release, idle close, graceful
+stop, or process exit. A newer daemon waits or reports actionable owner metadata without taking the
+database lock. Maintenance-to-runtime handoff must have no unowned writable gap, and an older writer
+must not reacquire after epoch advancement.
+
 ## Automatic known-legacy migration
 
 Normal first load is serialized per session. The manager inspects the migration ledger and durable

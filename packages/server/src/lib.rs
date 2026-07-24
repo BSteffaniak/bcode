@@ -196,6 +196,7 @@ type ActivePresentationUpdates =
 #[derive(Debug)]
 pub struct ServerState {
     pub sessions: SessionManager,
+    session_migrations: bcode_session_migration::MigrationPlanService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
@@ -1323,6 +1324,7 @@ impl ServerState {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions,
+            session_migrations: bcode_session_migration::MigrationPlanService,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
             model_catalog: init
@@ -6819,6 +6821,26 @@ async fn handle_prepare_session_open(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
+    let source_writer_epoch = match state.sessions.session_health(session_id).await {
+        bcode_session::SessionHealth::WriterIncompatible {
+            actual: Some(actual),
+            ..
+        } => u32::try_from(actual).ok(),
+        _ => None,
+    };
+    if let Some(source_writer_epoch) = source_writer_epoch
+        && let Err(error) = state.session_migrations.plan(source_writer_epoch)
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_writer_incompatible",
+                error.to_string(),
+            )),
+        )
+        .await;
+    }
     match state.sessions.prepare_session_open(session_id).await {
         Ok(snapshot) => {
             send_response(
