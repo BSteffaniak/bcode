@@ -254,6 +254,22 @@ fn snapshots_partial_streaming_inputs_at_width_40() {
 }
 
 #[test]
+fn requested_widths_80_40_and_20_are_snapshot_covered() {
+    insta::assert_snapshot!(
+        "representative_widths_80_40_20",
+        [
+            "== width 80 ==",
+            &visible_snapshot(COMPOSITION, 80),
+            "== width 40 ==",
+            &visible_snapshot(COMPOSITION, 40),
+            "== width 20 ==",
+            &visible_snapshot(COMPOSITION, 20),
+        ]
+        .join("\n")
+    );
+}
+
+#[test]
 fn snapshots_unicode_at_width_20() {
     insta::assert_snapshot!("unicode_width_20", visible_snapshot(UNICODE, 20));
 }

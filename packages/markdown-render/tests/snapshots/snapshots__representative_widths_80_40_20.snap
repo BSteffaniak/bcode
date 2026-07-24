@@ -1,0 +1,53 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "[\"== width 80 ==\", &visible_snapshot(COMPOSITION, 80), \"== width 40 ==\",\n&visible_snapshot(COMPOSITION, 40), \"== width 20 ==\",\n&visible_snapshot(COMPOSITION, 20),].join(\"\\n\")"
+---
+== width 80 ==
+00 │ Summary
+01 │ 
+02 │ Read the guide before continuing.
+03 │ •  Review important details
+04 │ •  Run cargo test
+05 │ 
+06 │ │ Keep output readable.
+07 │ 
+08 │ ┌───────────┬────────┐
+09 │ │ Item      │ State  │
+10 │ ├───────────┼────────┤
+11 │ │ renderer  │ ready  │
+12 │ ├───────────┼────────┤
+13 │ │ snapshots │ active │
+14 │ └───────────┴────────┘
+== width 40 ==
+00 │ Summary
+01 │ 
+02 │ Read the guide before continuing.
+03 │ •  Review important details
+04 │ •  Run cargo test
+05 │ 
+06 │ │ Keep output readable.
+07 │ 
+08 │ ┌───────────┬────────┐
+09 │ │ Item      │ State  │
+10 │ ├───────────┼────────┤
+11 │ │ renderer  │ ready  │
+12 │ ├───────────┼────────┤
+13 │ │ snapshots │ active │
+14 │ └───────────┴────────┘
+== width 20 ==
+00 │ Summary
+01 │ 
+02 │ Read the guide befor
+03 │ e continuing.
+04 │ •  Review important 
+05 │    details
+06 │ •  Run cargo test
+07 │ 
+08 │ │ Keep output readab
+09 │ │ le.
+10 │ 
+11 │ Item: renderer
+12 │ State: ready
+13 │ 
+14 │ Item: snapshots
+15 │ State: active

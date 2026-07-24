@@ -3,6 +3,31 @@
 //! This crate uses `hyperchad_markdown` as the Markdown parser and semantic
 //! conversion layer, then projects the generated `HyperChad` container tree into
 //! `bmux_tui` terminal lines and spans.
+//!
+//! # Supported Markdown
+//!
+//! The renderer supports paragraphs, soft and hard line breaks, headings,
+//! horizontal rules, blockquotes, fenced and indented code blocks, ordered and
+//! unordered lists, task lists, emphasis, strong emphasis, strikethrough,
+//! inline code, links, autolinks, images, and GFM tables. Rendering is bounded
+//! by terminal display width and preserves Unicode grapheme clusters.
+//!
+//! # Terminal-specific behavior
+//!
+//! * All heading levels intentionally share one terminal style.
+//! * Tables use borders at widths where they fit and a header-labelled stacked
+//!   layout at narrower widths.
+//! * Ordered lists restart at one because the parser's container projection
+//!   does not retain source start values.
+//! * GFM table alignment is not applied because the parser's container
+//!   projection does not retain alignment metadata.
+//! * Images render as `[image: description]` using alt text, then source, then
+//!   a generic fallback.
+//! * Dangerous HTML is escaped by parser-level XSS protection; safe raw HTML is
+//!   displayed as text.
+//! * Footnotes and emoji aliases are intentionally disabled.
+//! * Incomplete streaming input uses the same rendering path as finalized input;
+//!   incomplete fences, inline syntax, tables, and lists remain best-effort.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
@@ -881,38 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_heading_and_paragraph_text() {
-        let output = rendered_text("# Title\n\nHello **world**.");
-
-        assert!(output.contains("Title"));
-        assert!(output.contains("Hello world."));
-    }
-
-    #[test]
-    fn renders_lists_with_markers() {
-        let output = rendered_text("- one\n- two");
-
-        assert!(output.contains("•  one"));
-        assert!(output.contains("•  two"));
-    }
-
-    #[test]
-    fn renders_code_blocks_preserving_lines() {
-        let output = rendered_text("```rust\nfn main() {}\n```");
-
-        assert!(output.contains("fn main() {}"));
-    }
-
-    #[test]
-    fn renders_code_block_frame_with_language() {
-        let output = rendered_text("```rust\nfn main() {}\n```");
-
-        assert!(output.contains("┌─ rust"));
-        assert!(output.contains("│ fn main() {}"));
-        assert!(output.contains("└─"));
-    }
-
-    #[test]
     fn renders_code_block_with_generic_syntax_highlighting() {
         let rows =
             render_markdown_lines("```rust\nfn main() {}\n```", MarkdownRenderOptions::new(80));
@@ -961,24 +954,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_horizontal_rule() {
-        let output = rendered_text("before\n\n---\n\nafter");
-
-        assert!(output.contains("before"));
-        assert!(output.contains("────"));
-        assert!(output.contains("after"));
-    }
-
-    #[test]
-    fn renders_table_with_borders() {
-        let output = rendered_text("| A | B |\n|---|---|\n| 1 | 2 |");
-
-        assert!(output.contains("┌"));
-        assert!(output.contains("│ 1 │ 2 │"));
-        assert!(output.contains("└"));
-    }
-
-    #[test]
     fn blockquote_wraps_with_bar_on_each_line() {
         let output = render_markdown_lines(
             "> a very long quoted line that should wrap when rendered with the test width",
@@ -995,14 +970,6 @@ mod tests {
         .join("\n");
 
         assert!(output.lines().filter(|line| line.starts_with("│ ")).count() >= 2);
-    }
-
-    #[test]
-    fn renders_task_list_markers() {
-        let output = rendered_text("- [x] done\n- [ ] todo");
-
-        assert!(output.contains("•  ☑ done"));
-        assert!(output.contains("•  ☐ todo"));
     }
 
     #[test]

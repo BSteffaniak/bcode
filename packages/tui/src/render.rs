@@ -1005,6 +1005,54 @@ fn push_markdown_message_block(
     rows.push(Line::default());
 }
 
+#[cfg(test)]
+#[test]
+fn tui_markdown_message_block_indents_content_and_reserves_width() {
+    let mut rows = Vec::new();
+    push_markdown_message_block(&mut rows, "Bcode", "1234567890", Color::Green, 8, true);
+
+    let text = rows
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(text, ["Bcode", "  123456", "  7890", ""]);
+    assert!(text.iter().all(|line| line.chars().count() <= 8));
+}
+
+#[cfg(test)]
+#[test]
+fn tui_markdown_message_block_preserves_table_borders_after_indent() {
+    let mut rows = Vec::new();
+    push_markdown_message_block(
+        &mut rows,
+        "Bcode",
+        "| A | B |\n|---|---|\n| 1 | 2 |",
+        Color::Green,
+        20,
+        true,
+    );
+
+    let text = rows
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    assert!(text.iter().any(|line| line.starts_with("  ┌")));
+    assert!(text.iter().any(|line| line.starts_with("  │ A")));
+    assert!(text.iter().all(|line| line.chars().count() <= 20));
+}
+
 fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
     let title = if item.streaming() {
         "Reasoning …"
