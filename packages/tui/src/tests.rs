@@ -4168,6 +4168,10 @@ fn semantic_text_result_renders_generic_tool_result() {
         item.kind(),
         TranscriptItemKind::ToolResult { result, .. } if result == "semantic text"
     )));
+    assert!(transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text_format() == bcode_session_view_models::TextFormat::PlainText
+    }));
     assert!(
         !transcript
             .iter()

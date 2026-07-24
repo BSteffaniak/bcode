@@ -140,6 +140,58 @@ impl MarkdownRenderOptions {
     }
 }
 
+/// Render Markdown into a compact plain-text projection.
+///
+/// This is intended for bounded one-line previews where full Markdown layout is inappropriate.
+/// Semantic text is collected through the Markdown parser rather than by stripping punctuation.
+#[must_use]
+pub fn markdown_to_plain_text(markdown: &str) -> String {
+    let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
+    let mut output = String::new();
+    collect_plain_text(&container, &mut output);
+    normalize_inline_whitespace(&output).trim().to_owned()
+}
+
+fn collect_plain_text(container: &Container, output: &mut String) {
+    match &container.element {
+        Element::Text { value } | Element::Raw { value } => output.push_str(value),
+        Element::Input {
+            input: Input::Checkbox { checked },
+            ..
+        } => output.push_str(if checked.unwrap_or(false) {
+            "checked "
+        } else {
+            "unchecked "
+        }),
+        Element::Image { alt, source, .. } => {
+            output.push_str(
+                alt.as_deref()
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| source.as_deref().filter(|value| !value.is_empty()))
+                    .unwrap_or("image"),
+            );
+            output.push(' ');
+        }
+        _ => {
+            for child in &container.children {
+                collect_plain_text(child, output);
+                if is_block_container(child)
+                    || matches!(
+                        child.element,
+                        Element::Heading { .. }
+                            | Element::ListItem
+                            | Element::TR
+                            | Element::TH { .. }
+                            | Element::TD { .. }
+                    )
+                {
+                    output.push(' ');
+                }
+            }
+        }
+    }
+}
+
 /// Render Markdown into terminal lines.
 #[must_use]
 pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> Vec<Line> {
@@ -889,7 +941,9 @@ fn text_display_width(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarkdownRenderOptions, MarkdownTheme, render_markdown_lines};
+    use super::{
+        MarkdownRenderOptions, MarkdownTheme, markdown_to_plain_text, render_markdown_lines,
+    };
     use bmux_tui::prelude::{Color, Style};
 
     fn rendered_text(markdown: &str) -> String {
@@ -903,6 +957,16 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn plain_text_projection_uses_markdown_semantics() {
+        assert_eq!(
+            markdown_to_plain_text(
+                "# Request\n\n- Use **care**\n- Run `cargo test`\n\n[Guide](https://example.com)"
+            ),
+            "Request Use care Run cargo test Guide"
+        );
     }
 
     #[test]

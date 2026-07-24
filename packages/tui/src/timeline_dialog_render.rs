@@ -1,10 +1,13 @@
 //! TUI timeline dialog rendering.
 
+use bcode_markdown_render::markdown_to_plain_text;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui::text_width::display_width;
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::render::TuiTheme;
 use super::timeline_dialog::{TimelineDialogState, TimelineEntry};
@@ -129,7 +132,7 @@ fn entry_line(entry: &TimelineEntry, selected: bool, width: u16, theme: TuiTheme
         Span::styled(" ", base),
         Span::styled(format_timestamp(entry.timestamp_ms()), dim),
         Span::styled("  ", base),
-        Span::styled(truncate(entry.text(), preview_width), base),
+        Span::styled(markdown_preview(entry.text(), preview_width), base),
     ])
 }
 
@@ -172,12 +175,49 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     )
 }
 
-fn truncate(value: &str, width: usize) -> String {
-    let mut chars = value.chars();
-    let mut result = chars.by_ref().take(width).collect::<String>();
-    if chars.next().is_some() && width > 1 {
-        result.truncate(result.len().saturating_sub(1));
-        result.push('…');
+fn markdown_preview(value: &str, width: usize) -> String {
+    truncate_display_width(&markdown_to_plain_text(value), width)
+}
+
+fn truncate_display_width(value: &str, width: usize) -> String {
+    if display_width(value) <= width {
+        return value.to_owned();
     }
+    if width == 0 {
+        return String::new();
+    }
+    let content_width = width.saturating_sub(1);
+    let mut result = String::new();
+    let mut used = 0_usize;
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if used.saturating_add(grapheme_width) > content_width {
+            break;
+        }
+        result.push_str(grapheme);
+        used = used.saturating_add(grapheme_width);
+    }
+    result.push('…');
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{markdown_preview, truncate_display_width};
+    use bmux_tui::text_width::display_width;
+
+    #[test]
+    fn timeline_preview_flattens_markdown_semantically() {
+        assert_eq!(
+            markdown_preview("# Request\n\n- Use **care**\n- Run `cargo test`", 80),
+            "Request Use care Run cargo test"
+        );
+    }
+
+    #[test]
+    fn timeline_preview_truncates_by_terminal_display_width() {
+        let preview = truncate_display_width("こんにちは world", 8);
+        assert!(display_width(&preview) <= 8);
+        assert!(preview.ends_with('…'));
+    }
 }
