@@ -65,6 +65,14 @@ impl PluginTuiHost for BcodePluginTuiHost {
         let _ = self.redraw_sender.send(());
     }
 
+    fn copy_text(&self, text: String) -> Result<(), PluginTuiHostError> {
+        let mut clipboard = arboard::Clipboard::new()
+            .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+        clipboard
+            .set_text(text)
+            .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+    }
+
     fn subscribe_session_events(
         &self,
         request: PluginSessionEventSubscriptionRequest,

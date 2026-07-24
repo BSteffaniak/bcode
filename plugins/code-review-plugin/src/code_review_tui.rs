@@ -298,6 +298,7 @@ impl PluginTuiSurface for CodeReviewSurface {
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         let mut needs_redraw = handle_event_no_resize(&mut self.app, event);
+        needs_redraw |= self.app.flush_pending_clipboard_text(host);
         self.app.queue_selected_file_load();
         if self.ensure_selected_repository_file_load(host) {
             needs_redraw = true;
@@ -1830,6 +1831,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         }
         KeyCode::Char('a') => app.open_comment_editor_with_action(ReviewCommentAction::AskBcode),
         KeyCode::Char('A') => app.toggle_selected_agent_answer_expanded(),
+        KeyCode::Char('Y') => app.queue_copy_agent_answer_at_selection(),
         KeyCode::Char('s') => app.suggest_comment_from_agent_answer_at_selection(),
         KeyCode::Char(';') => app.accept_suggestion_at_selection(),
         KeyCode::Char('f') => app.refine_suggestion_at_selection(),
@@ -3967,6 +3969,8 @@ pub struct ReviewApp {
     pub draft_comments: BTreeMap<ReviewCommentAnchor, Vec<ReviewDraftComment>>,
     /// Local AI-suggested comments keyed by anchor.
     pub suggested_comments: BTreeMap<ReviewCommentAnchor, Vec<ReviewSuggestedComment>>,
+    /// Text awaiting a host clipboard write.
+    pub pending_clipboard_text: Option<String>,
     /// Active draft editor, if open.
     pub comment_editor: Option<ReviewCommentEditor>,
     /// Draft comment awaiting persistence.
@@ -4072,6 +4076,7 @@ impl ReviewApp {
             status_message: None,
             draft_comments: BTreeMap::new(),
             suggested_comments: BTreeMap::new(),
+            pending_clipboard_text: None,
             comment_editor: None,
             pending_draft_save: None,
             pending_draft_delete: None,
@@ -8003,6 +8008,38 @@ impl ReviewApp {
         true
     }
 
+    /// Queue the latest visible Bcode answer for a host clipboard write.
+    pub fn queue_copy_agent_answer_at_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a linked Bcode answer to copy".to_string());
+            return true;
+        };
+        let Some(state) = self.agent_state_for_anchor(&anchor) else {
+            self.status_message = Some("selected thread has no Bcode answer".to_string());
+            return true;
+        };
+        let answer = state.answer.trim().to_string();
+        if answer.is_empty() {
+            self.status_message = Some("selected Bcode thread has no answer to copy".to_string());
+            return true;
+        }
+        self.pending_clipboard_text = Some(answer);
+        self.status_message = Some("copying Bcode answer…".to_string());
+        true
+    }
+
+    /// Write queued clipboard text through the generic TUI host.
+    pub fn flush_pending_clipboard_text(&mut self, host: &dyn PluginTuiHost) -> bool {
+        let Some(text) = self.pending_clipboard_text.take() else {
+            return false;
+        };
+        self.status_message = Some(match host.copy_text(text) {
+            Ok(()) => "copied Bcode answer to clipboard".to_string(),
+            Err(error) => format!("failed to copy Bcode answer: {error}"),
+        });
+        true
+    }
+
     /// Add a local suggested comment at the selected anchor from the latest Bcode answer.
     pub fn suggest_comment_from_agent_answer_at_selection(&mut self) -> bool {
         let Some(anchor) = self.selected_comment_anchor() else {
@@ -8960,6 +8997,7 @@ impl ReviewApp {
                 self.retry_linked_session_stream_at_selection()
             }
             Some(ReviewThreadAction::ToggleAnswer) => self.toggle_selected_agent_answer_expanded(),
+            Some(ReviewThreadAction::CopyAnswer) => self.queue_copy_agent_answer_at_selection(),
             Some(ReviewThreadAction::SuggestAnswer) => {
                 self.suggest_comment_from_agent_answer_at_selection()
             }
@@ -9912,6 +9950,25 @@ fn rendered_rows_for_prompt(file: &ReviewFile) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct ClipboardTestHost {
+        copied: Mutex<Vec<String>>,
+    }
+
+    impl PluginTuiHost for ClipboardTestHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+
+        fn request_redraw(&self) {}
+
+        fn copy_text(&self, text: String) -> Result<(), bcode_plugin_sdk::tui::PluginTuiHostError> {
+            self.copied.lock().expect("clipboard lock").push(text);
+            Ok(())
+        }
+    }
 
     fn sample_app() -> ReviewApp {
         ReviewApp::new(ReviewSummary {
@@ -10885,7 +10942,7 @@ mod tests {
         assert_eq!(pending.new_body, "After");
         assert_eq!(
             app.selected_draft_preview().as_deref(),
-            Some("1 draft: After")
+            Some("draft 1/1 (unsaved): After")
         );
     }
 
@@ -11305,6 +11362,47 @@ mod tests {
         );
 
         assert_eq!(app.diagnostic_source_counts(), (1, 1, 1));
+    }
+
+    #[test]
+    fn copies_agent_answer_through_tui_host() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("editor should open")
+            .buffer
+            .insert_str("Can Bcode check this?");
+        assert!(app.save_comment_editor());
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        let key = ReviewApp::thread_key_for_anchor(&anchor);
+        app.agent_thread_states.insert(
+            key,
+            ReviewAgentThreadState {
+                phase: ReviewAgentThreadPhase::Complete,
+                session_id: None,
+                question: "Can Bcode check this?".to_string(),
+                status: "answered".to_string(),
+                answer: "  Use a clearer error message.  ".to_string(),
+                stream_warning: None,
+                activity: None,
+                error: None,
+            },
+        );
+
+        assert!(app.queue_copy_agent_answer_at_selection());
+        let host = ClipboardTestHost::default();
+        assert!(app.flush_pending_clipboard_text(&host));
+
+        assert_eq!(
+            *host.copied.lock().expect("clipboard lock"),
+            vec!["Use a clearer error message.".to_string()]
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("copied Bcode answer to clipboard")
+        );
     }
 
     #[test]

@@ -581,6 +581,8 @@ pub enum ReviewThreadAction {
     RetrySession,
     /// Toggle full/compact display for the selected linked Bcode answer.
     ToggleAnswer,
+    /// Copy the latest Bcode answer to the clipboard.
+    CopyAnswer,
     /// Create a suggested comment from the latest Bcode answer.
     SuggestAnswer,
     /// Accept the latest suggested comment into drafts.
@@ -624,6 +626,7 @@ impl ReviewThreadAction {
         }
         if has_agent_answer {
             actions.push(Self::ToggleAnswer);
+            actions.push(Self::CopyAnswer);
             actions.push(Self::SuggestAnswer);
             actions.push(Self::DraftAnswer);
         }
@@ -653,6 +656,7 @@ impl ReviewThreadAction {
             Self::OpenSession => "open-session",
             Self::RetrySession => "retry-session",
             Self::ToggleAnswer => "toggle-answer",
+            Self::CopyAnswer => "copy-answer",
             Self::SuggestAnswer => "suggest-answer",
             Self::AcceptSuggestion => "accept-suggestion",
             Self::RefineSuggestion => "refine-suggestion",
@@ -675,6 +679,7 @@ impl ReviewThreadAction {
             Self::OpenSession => "o",
             Self::RetrySession => "y",
             Self::ToggleAnswer => "A",
+            Self::CopyAnswer => "Y",
             Self::SuggestAnswer => "s",
             Self::AcceptSuggestion => ";",
             Self::RefineSuggestion => "f",
@@ -697,6 +702,7 @@ impl ReviewThreadAction {
             Self::OpenSession => "open session",
             Self::RetrySession => "retry stream",
             Self::ToggleAnswer => "expand answer",
+            Self::CopyAnswer => "copy answer",
             Self::SuggestAnswer => "suggest comment",
             Self::AcceptSuggestion => "accept suggestion",
             Self::RefineSuggestion => "refine suggestion",
@@ -720,6 +726,7 @@ impl ReviewThreadAction {
             b"open-session" => Some(Self::OpenSession),
             b"retry-session" => Some(Self::RetrySession),
             b"toggle-answer" => Some(Self::ToggleAnswer),
+            b"copy-answer" => Some(Self::CopyAnswer),
             b"suggest-answer" => Some(Self::SuggestAnswer),
             b"accept-suggestion" => Some(Self::AcceptSuggestion),
             b"refine-suggestion" => Some(Self::RefineSuggestion),

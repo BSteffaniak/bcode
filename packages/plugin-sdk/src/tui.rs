@@ -125,6 +125,18 @@ pub trait PluginTuiHost: Send + Sync {
     /// Request another terminal redraw.
     fn request_redraw(&self);
 
+    /// Copy plain text to the host clipboard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host does not support clipboard writes or the platform clipboard
+    /// cannot be opened or updated.
+    fn copy_text(&self, _text: String) -> Result<(), PluginTuiHostError> {
+        Err(PluginTuiHostError::Unsupported(
+            "clipboard writes are not available from this host".to_string(),
+        ))
+    }
+
     /// Subscribe to events for one explicit Bcode session.
     ///
     /// # Errors

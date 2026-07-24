@@ -14,7 +14,6 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-arboard = { workspace = true }
 bcode_client = { workspace = true }
 bcode_code_review_models = { workspace = true }
 bcode_command = { workspace = true }

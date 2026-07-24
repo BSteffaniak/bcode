@@ -1527,7 +1527,6 @@ dependencies = [
 name = "bcode_code_review_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "arboard",
  "bcode_client",
  "bcode_code_review_models",
  "bcode_command",
