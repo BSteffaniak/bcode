@@ -13750,7 +13750,11 @@ async fn finish_all_tool_request_drafts(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::large_stack_frames,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 async fn handle_provider_turn_event(
     state: &ServerState,
     session_id: SessionId,

@@ -2137,13 +2137,14 @@ impl SessionManager {
             Arc::new(move |update| progress.operation.publish_progress(update))
                 as db::SessionMigrationProgressCallback
         });
-        let migrated = db::SessionDb::migrate_turso_in_root_observed(
+        let migrated = db::SessionDb::migrate_turso_in_root_observed_with_operation(
             session_id,
             root,
             maintenance,
             write,
             self.metrics.clone(),
             db_progress,
+            progress.map(|progress| progress.operation.snapshot().operation_id),
         )
         .await
         .inspect_err(|error| {
@@ -5268,6 +5269,9 @@ mod tests {
                     switchy::database::DatabaseValue::String(
                         "032_terminal_tool_lifecycle_projection".to_owned(),
                     ),
+                    switchy::database::DatabaseValue::String(
+                        "033_session_migration_receipts_table".to_owned(),
+                    ),
                 ],
             )
             .execute(db.database())
@@ -6409,6 +6413,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn detached_preparation_migrates_legacy_storage_before_exclusive_load() {
         let state_root = unique_temp_dir();
         let root = state_root.join("sessions");
@@ -6477,6 +6482,39 @@ mod tests {
             migrated.storage_writer_epoch().await.expect("writer epoch"),
             u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
         );
+        let receipt_row = migrated
+            .database()
+            .select("session_migration_receipts")
+            .columns(&["operation_id", "receipt"])
+            .execute_first(migrated.database())
+            .await
+            .expect("receipt query")
+            .expect("automatic migration receipt");
+        assert_eq!(
+            receipt_row.get("operation_id"),
+            Some(switchy::database::DatabaseValue::String(
+                terminal.operation_id.to_string()
+            ))
+        );
+        let receipt_json = match receipt_row.get("receipt") {
+            Some(switchy::database::DatabaseValue::String(receipt)) => receipt,
+            other => panic!("unexpected receipt value: {other:?}"),
+        };
+        let receipt =
+            serde_json::from_str::<bcode_session_migration::SessionMigrationReceipt>(&receipt_json)
+                .expect("receipt JSON");
+        assert_eq!(receipt.operation_id, terminal.operation_id.to_string());
+        assert_eq!(
+            receipt.source_writer_epoch,
+            db::LEGACY_SESSION_STORAGE_WRITER_EPOCH
+        );
+        assert_eq!(
+            receipt.target_writer_epoch,
+            db::CURRENT_SESSION_STORAGE_WRITER_EPOCH
+        );
+        assert_eq!(receipt.source_event_count, receipt.target_event_count);
+        assert_eq!(receipt.source_event_tail, receipt.target_event_tail);
+        assert!(receipt.completed_at_ms > 0);
         let backup_root = root
             .parent()
             .expect("session root parent")
@@ -7904,6 +7942,9 @@ mod tests {
                         ),
                         switchy::database::DatabaseValue::String(
                             "032_terminal_tool_lifecycle_projection".to_owned(),
+                        ),
+                        switchy::database::DatabaseValue::String(
+                            "033_session_migration_receipts_table".to_owned(),
                         ),
                     ],
                 )

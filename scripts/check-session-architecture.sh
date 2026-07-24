@@ -208,6 +208,13 @@ if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' pac
   violations=1
 fi
 
+if ! rg -q '033_session_migration_receipts_table' packages/session/src/db.rs \
+  || ! rg -q 'write_session_migration_receipt' packages/session/src/db.rs \
+  || ! rg -q 'automatic migration receipt' packages/session/src/lib.rs; then
+  echo "Session migration receipt violation: successful migration must transactionally retain operation, plan, canonical digest/count, classification, and completion audit metadata." >&2
+  violations=1
+fi
+
 if rg -n 'decode_session_event_degraded' packages/session/src/db.rs \
   >/tmp/bcode-lossy-session-read-violations.txt; then
   echo "Session history violation: DB-backed canonical/indexed reads must not silently discard undecodable rows." >&2
@@ -550,7 +557,7 @@ if ! rg -q 'streaming_migration_backup_handles_nested_empty_and_large_files' pac
   violations=1
 fi
 
-migration_metric_sources="$(sed -n '/fn create_verified_migration_backup(/,/^}/p; /async fn migrate_legacy_session_for_load(/,/^    }/p; /async fn migrate_owned_legacy_storage(/,/^    }/p' packages/session/src/lib.rs; sed -n '/pub async fn migrate_turso_in_root_observed(/,/^    }/p; /async fn migrate_session_storage(/,/^}/p; /async fn rebuild_migration_projections(/,/^}/p; /async fn validate_migrated_storage(/,/^}/p; /async fn project_migration_event(/,/^}/p' packages/session/src/db.rs)"
+migration_metric_sources="$(sed -n '/fn create_verified_migration_backup(/,/^}/p; /async fn migrate_legacy_session_for_load(/,/^    }/p; /async fn migrate_owned_legacy_storage(/,/^    }/p' packages/session/src/lib.rs; sed -n '/pub async fn migrate_turso_in_root_observed(/,/pub async fn open_turso_in_root/p; /async fn migrate_session_storage(/,/^}/p; /async fn rebuild_migration_projections(/,/^}/p; /async fn validate_migrated_storage(/,/^}/p; /async fn project_migration_event(/,/^}/p' packages/session/src/db.rs)"
 for metric in \
   session.migration.ownership_duration_ms \
   session.migration.backup.plan_duration_ms \
