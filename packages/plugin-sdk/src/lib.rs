@@ -293,6 +293,111 @@ impl ServiceEventEmitter {
 unsafe impl Send for ServiceEventEmitter {}
 unsafe impl Sync for ServiceEventEmitter {}
 
+/// Scoped producer for one replaceable live tool progress contribution.
+///
+/// The publisher fixes progress placement and transient persistence so plugin authors cannot
+/// accidentally make intermediate state durable. Each successful mutation receives the next
+/// monotonic sequence number. Call [`Self::finish`] at every terminal boundary; the host also
+/// clears remaining transient state when the invocation terminates unexpectedly.
+#[derive(Debug, Clone)]
+pub struct TransientProgressPublisher {
+    events: ServiceEventEmitter,
+    invocation_id: String,
+    contribution_id: String,
+    producer_id: String,
+    schema: String,
+    schema_version: u32,
+    sequence: u64,
+    finished: bool,
+}
+
+impl TransientProgressPublisher {
+    /// Create a scoped transient progress publisher.
+    #[must_use]
+    pub fn new(
+        events: ServiceEventEmitter,
+        invocation_id: impl Into<String>,
+        contribution_id: impl Into<String>,
+        producer_id: impl Into<String>,
+        schema: impl Into<String>,
+        schema_version: u32,
+    ) -> Self {
+        Self {
+            events,
+            invocation_id: invocation_id.into(),
+            contribution_id: contribution_id.into(),
+            producer_id: producer_id.into(),
+            schema: schema.into(),
+            schema_version,
+            sequence: 0,
+            finished: false,
+        }
+    }
+
+    /// Publish a replacement snapshot and return its sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `payload` or the resulting contribution envelope cannot be encoded.
+    pub fn upsert<T: Serialize + ?Sized>(&mut self, payload: &T) -> Result<u64, serde_json::Error> {
+        let payload = serde_json::to_value(payload)?;
+        self.emit(bcode_tool::ToolContributionOperation::Upsert, payload)
+    }
+
+    /// Remove the active progress contribution and return its terminal sequence.
+    ///
+    /// Repeated calls are idempotent and return the last emitted sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the removal envelope cannot be encoded.
+    pub fn finish(&mut self) -> Result<u64, serde_json::Error> {
+        if self.finished {
+            return Ok(self.sequence);
+        }
+        let sequence = self.emit(
+            bcode_tool::ToolContributionOperation::Remove,
+            serde_json::Value::Null,
+        )?;
+        self.finished = true;
+        Ok(sequence)
+    }
+
+    /// Return the last successfully emitted sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    fn emit(
+        &mut self,
+        operation: bcode_tool::ToolContributionOperation,
+        payload: serde_json::Value,
+    ) -> Result<u64, serde_json::Error> {
+        let sequence = self.sequence.saturating_add(1);
+        let event = bcode_tool::ToolContributionEvent {
+            invocation_id: self.invocation_id.clone(),
+            contribution_id: self.contribution_id.clone(),
+            sequence,
+            producer_id: self.producer_id.clone(),
+            schema: self.schema.clone(),
+            schema_version: self.schema_version,
+            operation,
+            persistence: bcode_tool::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload,
+        };
+        let envelope = bcode_tool::ToolContributionEnvelope::new(
+            bcode_tool::ToolContributionPlacement::Progress,
+            event,
+        );
+        let encoded = serde_json::to_vec(&envelope)?;
+        self.events.emit(&encoded);
+        self.sequence = sequence;
+        Ok(sequence)
+    }
+}
+
 /// Renderer- and transport-neutral request routed through the native invocation bridge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1670,8 +1775,9 @@ pub mod prelude {
         ServiceBridge, ServiceBridgeCallback, ServiceBridgeError, ServiceBridgeRequest,
         ServiceBridgeResponse, ServiceError, ServiceEventCallback, ServiceEventEmitter,
         ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn,
-        export_concurrent_plugin, export_plugin, prepare_tool_from_definitions,
-        prepare_tool_service_response, static_concurrent_plugin_vtable, static_plugin_vtable,
+        TransientProgressPublisher, export_concurrent_plugin, export_plugin,
+        prepare_tool_from_definitions, prepare_tool_service_response,
+        static_concurrent_plugin_vtable, static_plugin_vtable,
     };
 }
 
@@ -1679,7 +1785,8 @@ pub mod prelude {
 mod tests {
     use super::{
         SERVICE_BRIDGE_STATUS_OK, ServiceBridge, ServiceBridgeRequest, ServiceBridgeResponse,
-        ServiceCancellation, ServiceRequest, ServiceResponse,
+        ServiceCancellation, ServiceEventEmitter, ServiceRequest, ServiceResponse,
+        TransientProgressPublisher,
     };
     use serde::{Deserialize, Serialize};
     use std::ffi::c_void;
@@ -1688,6 +1795,75 @@ mod tests {
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct ExamplePayload {
         value: String,
+    }
+
+    extern "C" fn collect_progress_event(
+        payload: *const u8,
+        payload_len: usize,
+        user_data: *mut c_void,
+    ) {
+        let events = unsafe { &*(user_data.cast::<Mutex<Vec<Vec<u8>>>>()) };
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+        events
+            .lock()
+            .expect("event collector")
+            .push(payload.to_vec());
+    }
+
+    #[test]
+    fn transient_progress_publisher_owns_safe_envelope_defaults_and_cleanup() {
+        let events: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(collect_progress_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let mut progress = TransientProgressPublisher::new(
+            emitter,
+            "call-1",
+            "preview",
+            "example.plugin",
+            "example.progress",
+            1,
+        );
+
+        assert_eq!(
+            progress
+                .upsert(&serde_json::json!({"step": 1}))
+                .expect("first progress"),
+            1
+        );
+        assert_eq!(
+            progress
+                .upsert(&serde_json::json!({"step": 2}))
+                .expect("second progress"),
+            2
+        );
+        assert_eq!(progress.finish().expect("finish progress"), 3);
+        assert_eq!(progress.finish().expect("repeat finish"), 3);
+
+        let decoded = events
+            .lock()
+            .expect("event collector")
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolContributionEnvelope>(payload)
+                    .expect("progress envelope")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded.len(), 3);
+        assert!(decoded.iter().all(|envelope| {
+            envelope.placement == bcode_tool::ToolContributionPlacement::Progress
+                && envelope.contribution.persistence
+                    == bcode_tool::ToolContributionPersistence::Transient
+        }));
+        assert_eq!(decoded[0].contribution.sequence, 1);
+        assert_eq!(decoded[1].contribution.sequence, 2);
+        assert_eq!(decoded[2].contribution.sequence, 3);
+        assert_eq!(
+            decoded[2].contribution.operation,
+            bcode_tool::ToolContributionOperation::Remove
+        );
+        assert_eq!(decoded[2].contribution.payload, serde_json::Value::Null);
     }
 
     #[test]

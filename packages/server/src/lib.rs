@@ -17130,6 +17130,7 @@ fn update_active_contribution(
     registry
         .session_bytes
         .insert(session_id, next_session_bytes);
+    drop(registry);
     Ok(true)
 }
 
