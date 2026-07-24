@@ -77,7 +77,7 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 71 │ 
 72 │ <details>
 73 │ <summary><strong>View the retry algorithm</strong></summary>
-74 │ For attempt (n), the delay is conceptually:
+74 │ For attempt [fg=yellow]n[/], the delay is conceptually:
 75 │ 
 76 │ [fg=bright-black]┌─ text[/]
 77 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial_delay × 2ⁿ + jitter, maximum_delay)[/]
@@ -206,7 +206,7 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 73 │ 
 74 │ <details>
 75 │ <summary><strong>View the retry algorithm</strong></summary>
-76 │ For attempt (n), the delay is conceptually:
+76 │ For attempt [fg=yellow]n[/], the delay is conceptually:
 77 │ 
 78 │ [fg=bright-black]┌─ text[/]
 79 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial_delay × 2ⁿ + jitter, maximum_delay)[/]
@@ -378,8 +378,8 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 114 │ <summary><strong>View th
 115 │ e retry algorithm</stron
 116 │ g></summary>
-117 │ For attempt (n), the del
-118 │ ay is conceptually:
+117 │ For attempt [fg=yellow]n[/], the delay
+118 │  is conceptually:
 119 │ 
 120 │ [fg=bright-black]┌─ text[/]
 121 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial[/]

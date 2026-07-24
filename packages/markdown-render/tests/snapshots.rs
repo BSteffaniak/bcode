@@ -23,6 +23,7 @@ const LINKS_IMAGES: &str = include_str!("fixtures/links_images.md");
 const LISTS: &str = include_str!("fixtures/lists.md");
 const LISTS_NUMBERING: &str = include_str!("fixtures/lists_numbering.md");
 const LISTS_TIGHT_LOOSE: &str = include_str!("fixtures/lists_tight_loose.md");
+const MATH: &str = include_str!("fixtures/math.md");
 const PARAGRAPHS: &str = include_str!("fixtures/paragraphs.md");
 const SEMANTIC_EXTENSIONS: &str = include_str!("fixtures/semantic_extensions.md");
 const SEMANTIC_MALFORMED: &str = include_str!("fixtures/semantic_malformed.md");
@@ -172,6 +173,29 @@ fn contribution_snapshot(markdown: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn snapshots_math_at_normal_and_constrained_widths() {
+    insta::assert_snapshot!(
+        "math_widths_60_24",
+        [60_u16, 24]
+            .into_iter()
+            .map(|width| format!("== width {width} ==\n{}", styled_snapshot(MATH, width)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn math_uses_unicode_subset_and_preserves_unsupported_source() {
+    let output = visible_snapshot(MATH, 60);
+
+    assert!(output.contains("x² + α × y₁ ≤ ∞"));
+    assert!(output.contains("n²"));
+    assert!(output.contains("∑_{i=1}ⁿ i²"));
+    assert!(output.contains(r"\frac{a}{b} + q^{word}"));
+    assert!(output.contains("$unterminated math remains source text"));
 }
 
 #[test]

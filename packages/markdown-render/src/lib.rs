@@ -546,11 +546,21 @@ pub fn render_markdown(markdown: &str, options: MarkdownRenderOptions) -> Markdo
 
 fn project_semantic_fallbacks<'a>(markdown: &'a str, document: &MarkdownDocument) -> Cow<'a, str> {
     let footnotes = collect_footnotes(markdown, document);
-    if footnotes.references.is_empty() && footnotes.definitions.is_empty() {
+    let math = collect_math_projections(markdown, document);
+    if footnotes.references.is_empty() && footnotes.definitions.is_empty() && math.is_empty() {
         return Cow::Borrowed(markdown);
     }
 
-    let mut replacements = Vec::new();
+    let mut replacements = math
+        .into_iter()
+        .map(|projection| {
+            let replacement = match projection.kind {
+                MathKind::Inline => format!("`{}`", projection.rendered),
+                MathKind::Display => format!("\n```text\n{}\n```\n", projection.rendered),
+            };
+            (projection.source_range, replacement)
+        })
+        .collect::<Vec<_>>();
     for reference in &footnotes.references {
         replacements.push((
             reference.source_range.clone(),
@@ -580,6 +590,186 @@ fn project_semantic_fallbacks<'a>(markdown: &'a str, document: &MarkdownDocument
         }
     }
     Cow::Owned(projected)
+}
+
+#[derive(Debug)]
+struct MathProjection {
+    source_range: Range<usize>,
+    kind: MathKind,
+    rendered: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MathKind {
+    Inline,
+    Display,
+}
+
+fn collect_math_projections(markdown: &str, document: &MarkdownDocument) -> Vec<MathProjection> {
+    document
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            MarkdownSemanticEventKind::InlineMath(source) => Some(MathProjection {
+                source_range: event.source_range.clone(),
+                kind: MathKind::Inline,
+                rendered: render_terminal_math(source),
+            }),
+            MarkdownSemanticEventKind::DisplayMath(source) => Some(MathProjection {
+                source_range: event.source_range.clone(),
+                kind: MathKind::Display,
+                rendered: render_terminal_math(source),
+            }),
+            _ => None,
+        })
+        .chain(escaped_inline_math(markdown, document))
+        .collect()
+}
+
+fn escaped_inline_math(
+    markdown: &str,
+    document: &MarkdownDocument,
+) -> impl Iterator<Item = MathProjection> + use<> {
+    let parsed_ranges = document
+        .events
+        .iter()
+        .filter_map(|event| {
+            matches!(
+                event.kind,
+                MarkdownSemanticEventKind::InlineMath(_)
+                    | MarkdownSemanticEventKind::DisplayMath(_)
+            )
+            .then_some(event.source_range.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_start) = markdown[offset..].find("\\(") {
+        let start = offset + relative_start;
+        let content_start = start + 2;
+        let Some(relative_end) = markdown[content_start..].find("\\)") else {
+            break;
+        };
+        let end = content_start + relative_end + 2;
+        if !parsed_ranges
+            .iter()
+            .any(|range| range.start <= start && range.end >= end)
+        {
+            output.push(MathProjection {
+                source_range: start..end,
+                kind: MathKind::Inline,
+                rendered: render_terminal_math(&markdown[content_start..end - 2]),
+            });
+        }
+        offset = end;
+    }
+    output.into_iter()
+}
+
+fn render_terminal_math(source: &str) -> String {
+    const MAX_SOURCE_BYTES: usize = 4096;
+    if source.len() > MAX_SOURCE_BYTES {
+        return source.to_owned();
+    }
+    let mut output = source.to_owned();
+    for (command, replacement) in [
+        ("\\times", "×"),
+        ("\\cdot", "·"),
+        ("\\leq", "≤"),
+        ("\\geq", "≥"),
+        ("\\neq", "≠"),
+        ("\\to", "→"),
+        ("\\infty", "∞"),
+        ("\\alpha", "α"),
+        ("\\beta", "β"),
+        ("\\gamma", "γ"),
+        ("\\Delta", "Δ"),
+        ("\\sum", "∑"),
+        ("\\sqrt", "√"),
+    ] {
+        output = output.replace(command, replacement);
+    }
+    output = replace_math_scripts(&output, '^', true);
+    replace_math_scripts(&output, '_', false)
+}
+
+fn replace_math_scripts(source: &str, marker: char, superscript: bool) -> String {
+    let characters = source.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] == marker && index + 1 < characters.len() {
+            let (script, consumed) = if characters[index + 1] == '{' {
+                let mut end = index + 2;
+                while end < characters.len() && characters[end] != '}' {
+                    end += 1;
+                }
+                if end == characters.len() {
+                    output.push(marker);
+                    index += 1;
+                    continue;
+                }
+                (
+                    characters[index + 2..end].iter().collect::<String>(),
+                    end - index,
+                )
+            } else {
+                (characters[index + 1].to_string(), 1)
+            };
+            if let Some(converted) = unicode_script(&script, superscript) {
+                output.push_str(&converted);
+            } else {
+                output.push(marker);
+                if consumed > 1 {
+                    output.push('{');
+                    output.push_str(&script);
+                    output.push('}');
+                } else {
+                    output.push_str(&script);
+                }
+            }
+            index += consumed + 1;
+        } else {
+            output.push(characters[index]);
+            index += 1;
+        }
+    }
+    output
+}
+
+fn unicode_script(source: &str, superscript: bool) -> Option<String> {
+    source
+        .chars()
+        .map(|character| match (superscript, character) {
+            (true, '0') => Some('⁰'),
+            (true, '1') => Some('¹'),
+            (true, '2') => Some('²'),
+            (true, '3') => Some('³'),
+            (true, '4') => Some('⁴'),
+            (true, '5') => Some('⁵'),
+            (true, '6') => Some('⁶'),
+            (true, '7') => Some('⁷'),
+            (true, '8') => Some('⁸'),
+            (true, '9') => Some('⁹'),
+            (true, '+') => Some('⁺'),
+            (true, '-') => Some('⁻'),
+            (true, 'n') => Some('ⁿ'),
+            (true, 'i') => Some('ⁱ'),
+            (false, '0') => Some('₀'),
+            (false, '1') => Some('₁'),
+            (false, '2') => Some('₂'),
+            (false, '3') => Some('₃'),
+            (false, '4') => Some('₄'),
+            (false, '5') => Some('₅'),
+            (false, '6') => Some('₆'),
+            (false, '7') => Some('₇'),
+            (false, '8') => Some('₈'),
+            (false, '9') => Some('₉'),
+            (false, '+') => Some('₊'),
+            (false, '-') => Some('₋'),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Debug)]

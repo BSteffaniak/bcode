@@ -1,0 +1,27 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} ==\\n{}\",\nstyled_snapshot(MATH, width))).collect::<Vec<_>>().join(\"\\n\")"
+---
+== width 60 ==
+00 │ Inline [fg=yellow]x² + α × y₁ ≤ ∞[/] and escaped [fg=yellow]n²[/].
+01 │ 
+02 │ [fg=bright-black]┌─ text[/]
+03 │ [fg=bright-black]│ [/][fg=yellow]∑_{i=1}ⁿ i²[/]
+04 │ [fg=bright-black]└─[/]
+05 │ 
+06 │ Unsupported [fg=yellow]\frac{a}{b} + q^{word}[/] remains faithful.
+07 │ Malformed $unterminated math remains source text.
+== width 24 ==
+00 │ Inline [fg=yellow]x² + α × y₁ ≤ ∞[/] a
+01 │ nd escaped [fg=yellow]n²[/].
+02 │ 
+03 │ [fg=bright-black]┌─ text[/]
+04 │ [fg=bright-black]│ [/][fg=yellow]∑_{i=1}ⁿ i²[/]
+05 │ [fg=bright-black]└─[/]
+06 │ 
+07 │ Unsupported [fg=yellow]\frac{a}{b} [/]
+08 │ [fg=yellow]+ q^{word}[/] remains faith
+09 │ ful.
+10 │ Malformed $unterminated 
+11 │ math remains source text
+12 │ .
