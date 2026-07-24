@@ -1493,24 +1493,7 @@ pub fn conversational_units(
 ) -> Vec<ConversationalUnit> {
     let mut units = Vec::<ConversationalUnit>::new();
     let mut pending_tool_calls = BTreeSet::new();
-    let generic_result_invocations = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::ToolInvocationResultRecorded { record } => {
-                Some(record.invocation_id.as_str())
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-
     for event in events {
-        if matches!(
-            &event.kind,
-            SessionEventKind::ToolCallFinished { tool_call_id, .. }
-                if generic_result_invocations.contains(tool_call_id.as_str())
-        ) {
-            continue;
-        }
         let starts_turn_boundary = matches!(event.kind, SessionEventKind::ModelTurnStarted { .. })
             && !pending_tool_calls.is_empty();
         if matches!(event.kind, SessionEventKind::ModelTurnStarted { .. }) {
@@ -1554,9 +1537,6 @@ pub fn conversational_units(
         match &event.kind {
             SessionEventKind::ToolCallRequested { tool_call_id, .. } => {
                 pending_tool_calls.insert(tool_call_id.clone());
-            }
-            SessionEventKind::ToolCallFinished { tool_call_id, .. } => {
-                pending_tool_calls.remove(tool_call_id);
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
                 pending_tool_calls.remove(&record.invocation_id);
@@ -1742,21 +1722,6 @@ pub fn session_event_compaction_line(
             event.sequence,
             truncate_text(arguments_json, COMPACTION_MAX_EVENT_CONTENT_CHARS)
         )),
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result,
-            is_error,
-            output,
-            ..
-        } => Some(format!(
-            "#{} tool result {tool_call_id} (error={is_error}):\n{}",
-            event.sequence,
-            project_tool_result_for_model_context(
-                result,
-                output.as_ref().map(trace_blob_read_path),
-                tool_output_context_chars.min(COMPACTION_TOOL_RESULT_CHARS),
-            )
-        )),
         SessionEventKind::ToolInvocationResultRecorded { record } => Some(format!(
             "#{} tool result {} (error={}):\n{}",
             event.sequence,
@@ -1835,8 +1800,6 @@ mod generic_result_tests {
                     tool_name: "example.one".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -1847,8 +1810,6 @@ mod generic_result_tests {
                     tool_name: "example.two".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -1871,26 +1832,6 @@ mod generic_result_tests {
                         is_error: false,
                         result: None,
                     },
-                },
-            ),
-            event(
-                8,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_owned(),
-                    result: "legacy one".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
-                },
-            ),
-            event(
-                9,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-2".to_owned(),
-                    result: "legacy two".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
                 },
             ),
         ];

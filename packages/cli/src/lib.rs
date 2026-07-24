@@ -5,7 +5,6 @@
 //! Command-line interface for Bcode.
 
 mod plugin_cli;
-mod session_cleanup;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -69,8 +68,6 @@ pub enum CliError {
     Session(#[from] bcode_session::SessionError),
     #[error("session repair error: {0}")]
     SessionRepair(#[from] bcode_session::repair::SessionRepairError),
-    #[error("semantic migration audit error: {0}")]
-    SemanticMigrationAudit(#[from] bcode_session::semantic_migration::SemanticMigrationAuditError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("settings error: {0}")]
@@ -100,12 +97,8 @@ pub enum CliError {
     IncompatibleDaemonStorage(String),
     #[error("session repair usage error: {0}")]
     SessionRepairUsage(String),
-    #[error("legacy stream cleanup usage error: {0}")]
-    LegacyStreamCleanupUsage(String),
     #[error("invalid arguments: {0}")]
     InvalidArguments(String),
-    #[error(transparent)]
-    LegacyStreamCleanup(#[from] bcode_session::legacy_stream_cleanup::LegacyStreamCleanupError),
     #[error(transparent)]
     PluginCliComposition(#[from] plugin_cli::CompositionError),
     #[error("plugin CLI command failed: {0}")]
@@ -920,27 +913,6 @@ enum SessionCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Remove historically persisted live tool-stream payloads.
-    PruneLiveEvents {
-        session_id: Option<SessionId>,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        apply: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Audit local sessions for semantic-result migration readiness without writing changes.
-    MigrateSemanticResults {
-        /// Session store root to audit. Defaults to Bcode's local session store.
-        #[arg(long)]
-        root: Option<PathBuf>,
-        /// Emit the full JSON audit report.
-        #[arg(long)]
-        json: bool,
-    },
     Import {
         #[command(subcommand)]
         command: SessionImportCommand,
@@ -1450,37 +1422,6 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
                 ));
             }
             stop_session_owner(session_id, true).await?;
-        }
-        SessionCommand::PruneLiveEvents {
-            session_id,
-            all,
-            dry_run,
-            apply,
-            json,
-        } => {
-            if dry_run == apply {
-                return Err(CliError::LegacyStreamCleanupUsage(
-                    "choose exactly one of --dry-run or --apply".to_owned(),
-                ));
-            }
-            if all == session_id.is_some() {
-                return Err(CliError::LegacyStreamCleanupUsage(
-                    "provide exactly one session id or --all".to_owned(),
-                ));
-            }
-            let target = session_id.map_or(
-                session_cleanup::RunTarget::All,
-                session_cleanup::RunTarget::Session,
-            );
-            let mode = if apply {
-                session_cleanup::RunMode::Apply
-            } else {
-                session_cleanup::RunMode::DryRun
-            };
-            session_cleanup::run(session_cleanup::RunOptions { target, mode, json }).await?;
-        }
-        SessionCommand::MigrateSemanticResults { root, json } => {
-            audit_semantic_result_migration(root, json).await?;
         }
         SessionCommand::Import { command } => handle_session_import_command(command).await?,
     }
@@ -6852,86 +6793,6 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
     Ok(())
 }
 
-async fn audit_semantic_result_migration(
-    root: Option<PathBuf>,
-    json: bool,
-) -> Result<(), CliError> {
-    let root = root.unwrap_or_else(bcode_config::default_session_store_dir);
-    let report = bcode_session::semantic_migration::audit_semantic_result_migration(&root).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_semantic_migration_audit(&report);
-    }
-    Ok(())
-}
-
-fn print_semantic_migration_audit(
-    report: &bcode_session::semantic_migration::SemanticMigrationAuditReport,
-) {
-    println!("semantic migration audit");
-    println!("root: {}", display_from_current_dir(&report.root));
-    println!("sessions scanned: {}", report.sessions_scanned);
-    println!("sessions decoded: {}", report.sessions_decoded);
-    println!("events scanned: {}", report.events_scanned);
-    println!("tool completions: {}", report.tool_call_finished.total);
-    println!(
-        "  with semantic_result: {}",
-        report.tool_call_finished.with_semantic_result
-    );
-    println!(
-        "  without semantic_result: {}",
-        report.tool_call_finished.without_semantic_result
-    );
-    println!(
-        "  legacy terminal JSON: {}",
-        report.tool_call_finished.legacy_terminal_json
-    );
-    println!(
-        "  non-terminal JSON: {}",
-        report.tool_call_finished.non_terminal_json
-    );
-    println!("  plain text: {}", report.tool_call_finished.plain_text);
-    println!("presentations: {}", report.presentations.total);
-    println!("  terminal: {}", report.presentations.terminal);
-    println!("  file_change: {}", report.presentations.file_change);
-    println!(
-        "  matched to completion: {}",
-        report.presentations.matched_to_completion
-    );
-    println!("  orphan: {}", report.presentations.orphan);
-    println!("  duplicate: {}", report.presentations.duplicate);
-    println!("  conflict: {}", report.presentations.conflict);
-    println!("migration readiness:");
-    println!(
-        "  removable presentations: {}",
-        report.readiness.removable_presentations
-    );
-    println!(
-        "  addable terminal results: {}",
-        report.readiness.addable_terminal_results
-    );
-    println!(
-        "  addable file-change results: {}",
-        report.readiness.addable_file_change_results
-    );
-    println!(
-        "  sessions requiring review: {}",
-        report.readiness.sessions_requiring_review
-    );
-    if !report.issues.is_empty() {
-        println!("issues:");
-        for issue in &report.issues {
-            println!(
-                "  {:?}: {} ({})",
-                issue.issue,
-                issue.detail,
-                display_from_current_dir(&issue.path)
-            );
-        }
-    }
-}
-
 struct SessionRepairCliOptions {
     target: SessionRepairCliTarget,
     mode: SessionRepairCliMode,
@@ -7292,7 +7153,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
-        SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
@@ -7326,14 +7186,13 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
-        SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
-        SessionEventKind::LegacyEvent { .. } => "legacy_event",
+        SessionEventKind::OpaqueEvent { .. } => "opaque_event",
     }
 }
 
@@ -7622,19 +7481,6 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
         SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
             format!("live context occupancy: {occupancy:?}")
         }
-        SessionLiveEventKind::ToolArgumentPreview {
-            tool_call_id,
-            tool_name,
-            argument_bytes,
-            preview,
-            ..
-        } => format!(
-            "live tool preview {tool_name} ({tool_call_id}) bytes={argument_bytes} schema={}@{} payload={}",
-            preview.visual.schema, preview.visual.schema_version, preview.visual.payload
-        ),
-        SessionLiveEventKind::ToolOutputDelta { event } => {
-            format!("live tool output: {event:?}")
-        }
     }
 }
 
@@ -7717,22 +7563,6 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence, arguments_json
             );
         }
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result,
-            is_error,
-            output,
-            ..
-        } => {
-            let status = if *is_error { "error" } else { "ok" };
-            let artifact = output
-                .as_ref()
-                .map_or_else(String::new, |output| format!(" artifact={}", output.path));
-            println!(
-                "#{} tool call finished ({status}): {tool_call_id}: {result}{artifact}",
-                event.sequence
-            );
-        }
         SessionEventKind::ToolInvocationResultRecorded { record } => {
             let status = if record.is_error { "error" } else { "ok" };
             println!(
@@ -7789,11 +7619,6 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 .as_deref()
                 .map_or_else(String::new, |message| format!(" — {message}"))
         ),
-        SessionEventKind::ToolInvocationStream {
-            event: stream_event,
-        } => {
-            println!("#{} tool stream: {stream_event:?}", event.sequence);
-        }
         SessionEventKind::PermissionRequested {
             permission_id,
             tool_call_id,
@@ -7993,7 +7818,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::PluginStatusNote {
             plugin_id, text, ..
         } => println!("#{} plugin status {plugin_id}: {text}", event.sequence),
-        SessionEventKind::LegacyEvent { event_type, .. } => {
+        SessionEventKind::OpaqueEvent { event_type, .. } => {
             println!("#{} legacy event: {event_type}", event.sequence);
         }
         SessionEventKind::TraceEvent { .. } => {}
@@ -8039,13 +7864,12 @@ fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
         } => {
             println!("{prefix} tool requested: {tool_name} ({tool_call_id})");
         }
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            is_error,
-            ..
-        } => {
-            let status = if *is_error { "error" } else { "ok" };
-            println!("{prefix} tool finished: {tool_call_id} {status}");
+        SessionEventKind::ToolInvocationResultRecorded { record } => {
+            let status = if record.is_error { "error" } else { "ok" };
+            println!(
+                "{prefix} invocation result: {} {status}",
+                record.invocation_id
+            );
         }
         SessionEventKind::ModelTurnStarted { turn_id } => {
             println!("{prefix} model turn started: {turn_id}");
@@ -8262,9 +8086,6 @@ fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) ->
         } => format!(
             "tool finished {tool_call_id} duration_ms={duration_ms} error={is_error} output_bytes={output_bytes}"
         ),
-        bcode_session_models::SessionTracePayload::ToolInvocationStreamEvent(event) => {
-            format!("tool stream {event:?}")
-        }
         bcode_session_models::SessionTracePayload::ContextCompaction {
             reason,
             projected_context_chars,
@@ -8462,23 +8283,6 @@ mod web_command_tests {
 mod context_compaction_tests {
     use super::*;
 
-    fn snapshot(
-        origin: bcode_session_models::ProviderContextSnapshotOrigin,
-    ) -> bcode_session_models::ProviderContextSnapshot {
-        bcode_session_models::ProviderContextSnapshot {
-            format_version: 1,
-            request_fingerprint: None,
-            request_id: None,
-            provider_plugin_id: "provider".to_string(),
-            model_id: "model".to_string(),
-            compatibility_key: "surface".to_string(),
-            auth_profile: None,
-            origin,
-            messages_json: "opaque-secret".to_string(),
-            portable_summary: "portable-secret".to_string(),
-        }
-    }
-
     #[test]
     fn generic_live_contribution_description_preserves_opaque_identity_and_payload() {
         let event = SessionLiveEvent {
@@ -8503,93 +8307,6 @@ mod context_compaction_tests {
         assert!(description.contains("call-1:surface"));
         assert!(description.contains("future.unknown/schema@42"));
         assert!(description.contains("opaque_cli"));
-    }
-
-    #[test]
-    fn cli_origin_labels_are_distinct_and_opaque_data_is_not_disclosed() {
-        let explicit = provider_compaction_description(
-            &snapshot(bcode_session_models::ProviderContextSnapshotOrigin::Explicit),
-            7,
-        );
-        let managed = provider_compaction_description(
-            &snapshot(bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged),
-            7,
-        );
-        assert!(explicit.contains("explicit provider-native"));
-        assert!(managed.contains("provider-managed"));
-        for output in [explicit, managed] {
-            assert!(!output.contains("opaque-secret"));
-            assert!(!output.contains("portable-secret"));
-        }
-    }
-}
-
-#[cfg(test)]
-mod session_export_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn explicit_export_reads_legacy_stream_history_without_migration() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let session_id = SessionId::new();
-        let db = bcode_session::db::SessionDb::open_turso_in_root(session_id, temp_dir.path())
-            .await
-            .expect("initialize session db");
-        let event = |sequence, kind| SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        db.append_event(&event(
-            0,
-            SessionEventKind::SessionCreated {
-                name: Some("pre-cutover export".to_owned()),
-                working_directory: temp_dir.path().to_path_buf(),
-            },
-        ))
-        .await
-        .expect("append session event");
-        db.append_event(&event(
-            1,
-            SessionEventKind::ToolInvocationStream {
-                event: bcode_session_models::ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-1".to_owned(),
-                    stream: bcode_session_models::ToolOutputStream::Stdout,
-                    sequence: 1,
-                    text: "legacy output".to_owned(),
-                    byte_len: 13,
-                },
-            },
-        ))
-        .await
-        .expect("append pre-cutover stream event");
-        db.database()
-            .exec_raw("UPDATE session_storage_contract SET writer_epoch = 2 WHERE contract_id = 1")
-            .await
-            .expect("mark store legacy");
-        drop(db);
-
-        let exported = session_export_events_from_root(session_id, temp_dir.path())
-            .await
-            .expect("explicit export should read legacy history");
-        assert_eq!(exported.len(), 2);
-        assert!(matches!(
-            &exported[1].kind,
-            SessionEventKind::ToolInvocationStream {
-                event: bcode_session_models::ToolInvocationStreamEvent::OutputDelta {
-                    text,
-                    ..
-                }
-            } if text == "legacy output"
-        ));
-        let unchanged =
-            bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
-                .await
-                .expect("reopen legacy store");
-        assert_eq!(unchanged.storage_writer_epoch().await.expect("epoch"), 2);
     }
 }
 

@@ -2,16 +2,13 @@ use bcode_agent_permissions::runtime_permission_request_to_profile_request;
 use bcode_agent_profile::prepare_tool_policy;
 use bcode_agent_runtime::{RegisteredTool, RuntimePermissionContext, RuntimePermissionRequest};
 use bcode_model::ToolCall;
-use bcode_tool::{ToolDefinition, ToolInvocationDescriptor, ToolPolicyMetadata, ToolUiMetadata};
+use bcode_tool::{ToolDefinition, ToolInvocationDescriptor};
 
 fn definition(name: &str) -> ToolDefinition {
     ToolDefinition {
         name: name.to_string(),
         description: "test tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: true,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 
@@ -28,7 +25,10 @@ fn permission_request() -> RuntimePermissionRequest {
             host_context: Vec::new(),
         },
         &definition,
-        bcode_agent_profile::ToolPolicyOperation::Mutating,
+        bcode_agent_profile::ToolPolicyPreparation::new(
+            true,
+            bcode_agent_profile::ToolPolicyOperation::Mutating,
+        ),
     )
     .expect("tool owner preparation should succeed");
     RuntimePermissionRequest {

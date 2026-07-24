@@ -81,7 +81,7 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             &context.request,
             [shell_tool_definition()],
-            |request, definition| Ok(shell_policy_operation(request, definition)),
+            |request, definition| Ok(shell_policy_preparation(request, definition)),
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -89,6 +89,19 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
             "unsupported tool service operation",
         ),
     }
+}
+
+fn shell_policy_preparation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> bcode_plugin_sdk::ToolPolicyPreparation {
+    bcode_plugin_sdk::ToolPolicyPreparation::new(true, shell_policy_operation(request, definition))
+        .with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
+            aliases: Vec::new(),
+            compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
+            capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
+            permission_category: Some("command".to_string()),
+        })
 }
 
 fn shell_policy_operation(
@@ -123,17 +136,6 @@ fn shell_tool_definition() -> ToolDefinition {
                         }
                     }
                 }),
-                requires_permission: true,
-                policy: bcode_tool::ToolPolicyMetadata {
-                    aliases: Vec::new(),
-                    compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
-                    capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
-                    permission_category: Some("command".to_string()),
-                },
-                ui: bcode_tool::ToolUiMetadata {
-                    activity_label: Some("running".to_string()),
-                    request_visual: None,
-                },
             }
 }
 
@@ -1412,6 +1414,7 @@ fn shell_recording_commit_observer(
                     committed_bytes: commit.committed_bytes,
                     revision,
                     finalized: commit.finalized,
+                    availability: None,
                 }),
                 payload: serde_json::to_value(ShellLiveRecordingPayload { mode: "terminal" })
                     .unwrap_or(serde_json::Value::Null),
@@ -1616,6 +1619,14 @@ bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_request_is_generic_contribution_only() {
+        let encoded =
+            serde_json::to_value(shell_tool_definition()).expect("tool definition encodes");
+        assert!(encoded.get("ui").is_none());
+    }
+
     use std::ffi::c_void;
     use std::sync::Mutex;
 
@@ -1647,8 +1658,22 @@ mod tests {
             },
             host_context: Vec::new(),
         };
+        let policy = shell_policy_preparation(&request, &definition);
+        assert!(policy.requires_permission);
         assert_eq!(
-            shell_policy_operation(&request, &definition),
+            policy.identity.compatibility_aliases,
+            vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")]
+        );
+        assert_eq!(
+            policy.identity.capabilities,
+            vec!["shell.run", "process.execute"]
+        );
+        assert_eq!(
+            policy.identity.permission_category.as_deref(),
+            Some("command")
+        );
+        assert_eq!(
+            policy.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Command {
                 command: Some("printf hello".to_owned()),
             }
@@ -1689,9 +1714,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shell_request_visual_is_generic_contribution_only() {
-        assert!(shell_tool_definition().ui.request_visual.is_none());
+    extern "C" fn capture_service_event(
+        payload: *const u8,
+        payload_len: usize,
+        user_data: *mut c_void,
+    ) {
+        // SAFETY: tests pass a live `Mutex<Vec<Vec<u8>>>` pointer for the entire invocation and the
+        // emitter invokes this callback synchronously.
+        let events = unsafe { &*(user_data.cast::<Mutex<Vec<Vec<u8>>>>()) };
+        // SAFETY: the emitter provides a valid payload pointer and length for this callback.
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+        events.lock().expect("event lock").push(payload.to_vec());
     }
 
     struct CapturedServiceEvent {
@@ -1716,19 +1749,6 @@ mod tests {
                 payload: payload.to_vec(),
                 observed_at: Instant::now(),
             });
-    }
-
-    extern "C" fn capture_service_event(
-        payload: *const u8,
-        payload_len: usize,
-        user_data: *mut c_void,
-    ) {
-        // SAFETY: tests pass a live `Mutex<Vec<Vec<u8>>>` pointer for the entire invocation and the
-        // emitter invokes this callback synchronously.
-        let events = unsafe { &*(user_data.cast::<Mutex<Vec<Vec<u8>>>>()) };
-        // SAFETY: the emitter provides a valid payload pointer and length for this callback.
-        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
-        events.lock().expect("event lock").push(payload.to_vec());
     }
 
     struct TestResizeInputState {

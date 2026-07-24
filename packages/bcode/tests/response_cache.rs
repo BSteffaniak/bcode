@@ -2,8 +2,7 @@ use bcode::{
     Agent, AgentTurnRequest, GenerateTextResponse, InMemoryModelResponseCache, ModelMiddleware,
     ModelProviderInvoker, ModelResponseCache, ModelResponseCacheKey, ModelResponseCachePrivacy,
     ModelResponseCacheStatus, RuntimeFuture, StopReason, ToolCall, ToolDefinition,
-    ToolInvocationResponse, ToolPolicyMetadata, ToolUiMetadata, generate_object_builder,
-    generate_text_builder,
+    ToolInvocationResponse, generate_object_builder, generate_text_builder,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -548,9 +547,6 @@ fn tool_definition() -> ToolDefinition {
         name: "cached_tool".to_string(),
         description: "cache safety test".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 

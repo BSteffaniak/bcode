@@ -9,7 +9,7 @@ pub mod path;
 #[cfg(feature = "tui")]
 pub mod tui;
 
-pub use bcode_agent_profile::ToolPolicyOperation;
+pub use bcode_agent_profile::{ToolPolicyIdentity, ToolPolicyOperation, ToolPolicyPreparation};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_void};
@@ -768,10 +768,10 @@ impl ServiceRequest {
 pub fn prepare_tool_from_definitions(
     request: &ServiceRequest,
     definitions: impl IntoIterator<Item = bcode_tool::ToolDefinition>,
-    prepare_operation: impl FnOnce(
+    prepare_policy: impl FnOnce(
         &bcode_tool::ToolPreparationRequest,
         &bcode_tool::ToolDefinition,
-    ) -> Result<ToolPolicyOperation, String>,
+    ) -> Result<ToolPolicyPreparation, String>,
 ) -> Result<bcode_tool::ToolPreparationResponse, String> {
     let preparation = request
         .payload_json::<bcode_tool::ToolPreparationRequest>()
@@ -785,8 +785,8 @@ pub fn prepare_tool_from_definitions(
                 preparation.invocation.tool_name
             )
         })?;
-    let operation = prepare_operation(&preparation, &definition)?;
-    bcode_agent_profile::prepare_tool_policy(&preparation, &definition, operation)
+    let policy = prepare_policy(&preparation, &definition)?;
+    bcode_agent_profile::prepare_tool_policy(&preparation, &definition, policy)
 }
 
 /// Encode plugin tool preparation as a standard service response.
@@ -794,12 +794,12 @@ pub fn prepare_tool_from_definitions(
 pub fn prepare_tool_service_response(
     request: &ServiceRequest,
     definitions: impl IntoIterator<Item = bcode_tool::ToolDefinition>,
-    prepare_operation: impl FnOnce(
+    prepare_policy: impl FnOnce(
         &bcode_tool::ToolPreparationRequest,
         &bcode_tool::ToolDefinition,
-    ) -> Result<ToolPolicyOperation, String>,
+    ) -> Result<ToolPolicyPreparation, String>,
 ) -> ServiceResponse {
-    match prepare_tool_from_definitions(request, definitions, prepare_operation) {
+    match prepare_tool_from_definitions(request, definitions, prepare_policy) {
         Ok(response) => ServiceResponse::json(&response)
             .unwrap_or_else(|error| ServiceResponse::error("encode_failed", error.to_string())),
         Err(message) => ServiceResponse::error("invalid_preparation", message),

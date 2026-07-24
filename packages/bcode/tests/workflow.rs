@@ -7,7 +7,7 @@ use bcode::workflow::{
 
 use bcode::{
     ProviderError, ProviderErrorCategory, ProviderTurnEvent, StopReason, ToolApplicationError,
-    ToolCall, ToolSideEffect, TypedTool,
+    ToolCall, ToolPolicyOperation, TypedTool,
     testing::{ScriptedProviderTurn, ScriptedRequestExpectation},
 };
 use schemars::JsonSchema;
@@ -85,12 +85,12 @@ async fn agent_step_tool_restrictions_narrow_provider_exposure() {
                 agent
                     .typed_tool(
                         TypedTool::<ToolInput, ToolOutput>::new("inspect", "Inspect")
-                            .side_effect(ToolSideEffect::ReadOnly),
+                            .policy_operation(ToolPolicyOperation::ReadOnly),
                         |_input| Ok(ToolOutput),
                     )
                     .typed_tool_async(
                         TypedTool::<ToolInput, ToolOutput>::new("mutate", "Mutate")
-                            .side_effect(ToolSideEffect::WriteFiles),
+                            .policy_operation(ToolPolicyOperation::Mutating),
                         |_input, _context| async move {
                             Ok::<_, ToolApplicationError<serde_json::Value>>(ToolOutput)
                         },
@@ -182,7 +182,7 @@ async fn read_only_reviewer_cannot_invoke_parent_build_tool() {
             .configure_agent(|agent| {
                 agent.typed_tool_async(
                     TypedTool::<ToolInput, ToolOutput>::new("mutate", "Mutate")
-                        .side_effect(ToolSideEffect::WriteFiles),
+                        .policy_operation(ToolPolicyOperation::Mutating),
                     |_input, _context| async move {
                         Err::<ToolOutput, ToolApplicationError<serde_json::Value>>(
                             ToolApplicationError::new(

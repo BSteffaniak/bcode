@@ -13,7 +13,6 @@ use bcode_model::{
 use bcode_tool::{
     ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationResponse,
-    ToolPolicyMetadata, ToolUiMetadata,
 };
 use futures::StreamExt;
 use std::collections::VecDeque;
@@ -30,9 +29,6 @@ fn definition(name: &str) -> ToolDefinition {
         name: name.to_string(),
         description: format!("provider batch tool {name}"),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 
@@ -147,7 +143,7 @@ impl ToolInvoker for ParallelInvoker {
         let result = bcode_agent_profile::prepare_tool_policy(
             request,
             &tool.definition,
-            bcode_agent_profile::ToolPolicyOperation::ReadOnly,
+            bcode_agent_profile::ToolPolicyPreparation::read_only(),
         )
         .map_err(|message| bcode::RuntimeError::ToolPreparation {
             tool_name: request.invocation.tool_name.clone(),
@@ -575,7 +571,7 @@ impl ToolInvoker for BlockingInvoker {
         let result = bcode_agent_profile::prepare_tool_policy(
             request,
             &tool.definition,
-            bcode_agent_profile::ToolPolicyOperation::ReadOnly,
+            bcode_agent_profile::ToolPolicyPreparation::read_only(),
         )
         .map_err(|message| bcode::RuntimeError::ToolPreparation {
             tool_name: request.invocation.tool_name.clone(),

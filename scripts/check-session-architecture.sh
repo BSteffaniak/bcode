@@ -10,44 +10,70 @@ if [[ -z "$current_event_schema" || "$current_event_schema" != "$fixture_baselin
   violations=1
 fi
 
-retired_interactive_kinds=(
-  interactive_tool_request_created
-  interactive_tool_request_resolved
-)
-for kind in "${retired_interactive_kinds[@]}"; do
-  fixture="packages/session/fixtures/migrations/${kind//_/-}-v32.json"
-  if ! rg -q "\"${kind}\"" packages/session/src/persisted.rs \
-    || [[ ! -f "$fixture" ]] \
-    || ! rg -q "\"${kind}\"" "$fixture"; then
-    echo "Session persisted-compatibility violation: retired event ${kind} must retain its decode adapter and schema-32 fixture." >&2
-    violations=1
-  fi
-done
-for fixture in \
-  packages/session/fixtures/migrations/interactive-tool-request-unresolved-v32.json \
-  packages/session/fixtures/migrations/mixed-interactive-history-v32-v35.jsonl \
-  packages/session/fixtures/migrations/unknown-old-event-kind-v32.json \
-  packages/session/fixtures/migrations/unknown-future-event-kind-v38.json \
-  packages/session/fixtures/migrations/future-schema-v40.json \
-  packages/session/fixtures/migrations/malformed-json-v38.json \
-  packages/session/fixtures/migrations/mismatched-session-id-v38.json \
-  packages/session/fixtures/migrations/sequence-gap-v38.jsonl \
-  packages/session/fixtures/migrations/tool-presentation-diff-v25.json; do
-  if [[ ! -f "$fixture" ]]; then
-    echo "Session persisted-compatibility violation: required historical fixture $fixture is missing." >&2
-    violations=1
-  fi
-done
-if ! rg -q 'mixed_schema_32_35_fixture_decodes_contiguously_without_reviving_interactions' packages/session/src/persisted.rs \
-  || ! rg -q 'compatibility_failure_fixtures_have_exact_strict_and_degraded_outcomes' packages/session/src/persisted.rs; then
-  echo "Session persisted-compatibility violation: mixed and failure-classification fixtures must remain regression-tested." >&2
+retired_event_pattern='interactive_tool_request_created|interactive_tool_request_resolved|plugin_automation_turn_started|plugin_automation_turn_finished|tool_invocation_presentation|request_presentation'
+if rg -n "$retired_event_pattern" packages/session/src packages/session/models/src packages/server/src packages/ipc/src packages/tui/src packages/web-render/src --glob '*.rs' \
+  >/tmp/bcode-retired-session-event-decoders.txt; then
+  echo "Session hard-cutover violation: a named retired event decoder or presentation field was reintroduced." >&2
+  cat /tmp/bcode-retired-session-event-decoders.txt >&2
   violations=1
 fi
-if ! rg -q 'preserve_retired_event_kind_as_legacy' packages/session/src/persisted.rs \
-  || ! rg -q 'decodes_retired_interactive_tool_compatibility_fixtures' packages/session/src/persisted.rs \
-  || ! rg -q 'retired_interactive_request_preserves_missing_optional_and_unknown_fields' packages/session/src/persisted.rs \
-  || ! rg -q 'retired_interactive_event_reencodes_only_as_legacy_event' packages/session/src/persisted.rs; then
-  echo "Session persisted-compatibility violation: retired interactive events must preserve raw payloads, remain decode-only, and stay fixture-tested." >&2
+
+for removed_fixture in \
+  packages/session/fixtures/migrations/interactive-tool-request-created-v32.json \
+  packages/session/fixtures/migrations/interactive-tool-request-resolved-v32.json \
+  packages/session/fixtures/migrations/interactive-tool-request-unresolved-v32.json \
+  packages/session/fixtures/migrations/mixed-interactive-history-v32-v35.jsonl \
+  packages/session/fixtures/migrations/plugin-automation-turn-started-v29.json \
+  packages/session/fixtures/migrations/plugin-automation-turn-finished-v29.json \
+  packages/session/fixtures/migrations/tool-presentation-diff-v25.json; do
+  if [[ -e "$removed_fixture" ]]; then
+    echo "Session hard-cutover violation: retired fixture remains: $removed_fixture" >&2
+    violations=1
+  fi
+done
+
+for fixture in \
+  packages/session/fixtures/migrations/unknown-future-event-kind-v39.json \
+  packages/session/fixtures/migrations/future-schema-v40.json \
+  packages/session/fixtures/migrations/malformed-json-v39.json \
+  packages/session/fixtures/migrations/mismatched-session-id-v39.json \
+  packages/session/fixtures/migrations/sequence-gap-v39.jsonl; do
+  if [[ ! -f "$fixture" ]]; then
+    echo "Session compatibility fixture missing: $fixture" >&2
+    violations=1
+  fi
+done
+
+if find packages/session/fixtures/migrations -maxdepth 1 -type f \
+    \( -name '*-v[0-9]*.json' -o -name '*-v[0-9]*.jsonl' \) \
+    | grep -Ev -- '-v(39|40)\.jsonl?$' >/tmp/bcode-old-session-fixture-names.txt \
+  || ! python3 - <<'PY'
+from pathlib import Path
+import re
+
+invalid = []
+for pattern in ("*.json", "*.jsonl"):
+    for path in Path("packages/session/fixtures/migrations").glob(pattern):
+        for line_number, line in enumerate(path.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            match = re.search(r'"schema_version"\s*:\s*(\d+)', line)
+            if match is None or int(match.group(1)) not in {39, 40}:
+                invalid.append(f"{path}:{line_number}")
+if invalid:
+    print("\n".join(invalid))
+    raise SystemExit(1)
+PY
+then
+  echo "Session fixture hard-cutover violation: every fixture must use the current schema or the intentional next-schema compatibility case." >&2
+  cat /tmp/bcode-old-session-fixture-names.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if ! rg -q 'decode_opaque_session_event' packages/session/src/persisted.rs \
+  || ! rg -q 'degraded_decode_preserves_unknown_and_future_events_as_opaque_history' packages/session/src/persisted.rs \
+  || ! rg -q 'degraded_decode_rejects_untrustworthy_opaque_envelopes' packages/session/src/persisted.rs; then
+  echo "Session compatibility violation: generic trustworthy opaque-envelope handling must remain covered." >&2
   violations=1
 fi
 
@@ -183,7 +209,7 @@ if rg -n "handle\.state" packages/session/src/lib.rs >/tmp/bcode-session-actor-v
 fi
 
 if rg -n "std::fs|OpenOptions|fs::File|File::open|File::create" packages/session/src --glob '*.rs' \
-  | rg -v 'packages/session/src/(lib|index|reader|migration|semantic_migration|event_migration|legacy_storage|legacy_stream_cleanup|derived|db|lease|repair)\.rs' \
+  | rg -v 'packages/session/src/(lib|index|reader|migration|event_migration|legacy_storage|derived|db|lease|repair)\.rs' \
   >/tmp/bcode-session-fs-violations.txt; then
   echo "Session persistence architecture violation: direct filesystem access outside approved store modules." >&2
   cat /tmp/bcode-session-fs-violations.txt >&2
@@ -320,8 +346,9 @@ if ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
     | grep -q 'open_existing_turso_in_root' \
   || ! sed -n '/async fn session_export_events_from_root(/,/^}/p' packages/cli/src/lib.rs \
     | grep -q 'all_events_strict' \
-  || ! rg -q 'explicit_export_reads_legacy_stream_history_without_migration' packages/cli/src/lib.rs; then
-  echo "Session export violation: pre-cutover export must read legacy canonical history explicitly without normal runtime loading or migration." >&2
+  || rg -q 'explicit_export_reads_legacy_stream_history_without_migration|ToolInvocationStreamEvent|ToolOutputStream' \
+    packages/cli/src packages/session/src --glob '*.rs'; then
+  echo "Session export violation: current export must remain strict and must not restore legacy stream decoding." >&2
   violations=1
 fi
 
@@ -339,15 +366,15 @@ if rg -q 'KnownLegacy \{ writer_epoch \} => Err\(SessionError::StorageMigrationR
   violations=1
 fi
 
-if ! rg -q 'explicit_reindex_accepts_retired_interactive_events_as_inert_history' packages/session/src/db.rs \
-  || ! sed -n '/async fn explicit_reindex_accepts_retired_interactive_events_as_inert_history(/,/^    }/p' packages/session/src/db.rs | grep -q 'checkpoint: canonical_tail' \
+if ! rg -q 'epoch_three_opaque_history_migrates_to_bounded_read_only_state' packages/session/src/db.rs \
+  || ! sed -n '/async fn epoch_three_opaque_history_migrates_to_bounded_read_only_state(/,/^    }/p' packages/session/src/db.rs | grep -q 'history_sequences(&page.events), vec!\[0, 1\]' \
   || ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' packages/session/src/db.rs \
   || ! sed -n '/async fn failed_explicit_migration_preserves_projection_and_writer_contract(/,/^    }/p' packages/session/src/db.rs | grep -q 'failed migration must preserve every session storage file byte-for-byte'; then
-  echo "Session migration regression violation: known-legacy reindex must reach the queried canonical tail and failed migration must preserve complete storage bytes." >&2
+  echo "Session migration regression violation: opaque-history migration must preserve the canonical tail and failed migration must preserve complete storage bytes." >&2
   violations=1
 fi
 
-if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 14' packages/ipc/src/lib.rs \
+if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 15' packages/ipc/src/lib.rs \
   || ! rg -q 'PrepareSessionOpen' packages/ipc/src/lib.rs \
   || ! rg -q 'WaitSessionOpenProgress' packages/ipc/src/lib.rs \
   || ! rg -q 'SessionOpenPrepared' packages/ipc/src/lib.rs \
@@ -355,7 +382,7 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 14' packages/ipc/src/lib.rs \
   || ! rg -q 'session_open_wait_returns_newer_terminal_or_timeout_snapshot' packages/server/src/lib.rs \
   || ! rg -q 'session_open_operation_not_found' packages/server/src/lib.rs \
   || ! rg -q 'prepare_session_open_until_terminal' packages/client/src/lib.rs; then
-  echo "Session migration IPC violation: protocol-v14 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
+  echo "Session migration IPC violation: protocol-v15 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
   violations=1
 fi
 
@@ -445,9 +472,9 @@ if grep -Eq 'record_histogram_with_labels|add_counter_with_labels|increment_coun
   echo "Session migration observability violation: migration stage metrics must use fixed unlabeled names to keep cardinality bounded." >&2
   violations=1
 fi
-if ! sed -n '/async fn mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_history(/,/^    }/p' packages/session/src/lib.rs \
-  | grep -q 'missing migration stage metric'; then
-  echo "Session migration observability violation: production migration regression must assert every stage metric." >&2
+if ! sed -n '/fn assert_successful_migration_progress(/,/^    }/p' packages/session/src/lib.rs \
+  | grep -q 'missing migration progress stage'; then
+  echo "Session migration observability violation: migration progress regression must assert every stage." >&2
   violations=1
 fi
 
@@ -480,8 +507,8 @@ for fixture in packages/session/fixtures/migrations/*.json packages/session/fixt
   fi
 done
 
-if ! rg -q 'mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_history' packages/session/src/lib.rs; then
-  echo "Session fixture-corpus violation: mixed schema-32/schema-35 history must retain store-level discovery, migration, bounded-history, and inert-runtime coverage." >&2
+if rg -q 'mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_history' packages/session/src/lib.rs; then
+  echo "Session hard-cutover violation: retired mixed schema-32/schema-35 migration coverage was reintroduced." >&2
   violations=1
 fi
 

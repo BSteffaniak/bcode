@@ -6,10 +6,7 @@ use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse, StopReason,
 };
-use bcode_tool::{
-    ToolDefinition, ToolInvocationDescriptor, ToolInvocationResponse, ToolPolicyMetadata,
-    ToolUiMetadata,
-};
+use bcode_tool::{ToolDefinition, ToolInvocationDescriptor, ToolInvocationResponse};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     Arc,
@@ -88,9 +85,6 @@ fn echo_definition() -> ToolDefinition {
             "properties": { "text": { "type": "string" } },
             "required": ["text"]
         }),
-        requires_permission: true,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 

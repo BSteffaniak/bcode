@@ -3,7 +3,6 @@ use bcode::{
     InvocationScope, ToolCall, ToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
     ToolExchangeResponsePolicy, ToolInvocationResponse,
 };
-use bcode_tool::{ToolPolicyMetadata, ToolUiMetadata};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -14,9 +13,6 @@ fn definition(name: &str) -> ToolDefinition {
         name: name.to_string(),
         description: "headless exchange test".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 

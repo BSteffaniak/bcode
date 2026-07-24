@@ -173,18 +173,6 @@ pub struct SkillToolPolicyTarget {
     pub permission_category: Option<String>,
 }
 
-impl From<bcode_tool::ToolDefinition> for SkillToolPolicyTarget {
-    fn from(tool: bcode_tool::ToolDefinition) -> Self {
-        Self {
-            name: tool.name,
-            aliases: tool.policy.aliases,
-            compatibility_aliases: tool.policy.compatibility_aliases,
-            capabilities: tool.policy.capabilities,
-            permission_category: tool.policy.permission_category,
-        }
-    }
-}
-
 /// Request to evaluate one tool call against active skill policies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillToolPolicyRequest {

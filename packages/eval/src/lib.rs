@@ -1276,7 +1276,7 @@ fn write_tool_calls_jsonl(
         if matches!(
             event.kind,
             bcode_session_models::SessionEventKind::ToolCallRequested { .. }
-                | bcode_session_models::SessionEventKind::ToolCallFinished { .. }
+                | bcode_session_models::SessionEventKind::ToolInvocationResultRecorded { .. }
                 | bcode_session_models::SessionEventKind::PermissionRequested { .. }
                 | bcode_session_models::SessionEventKind::PermissionResolved { .. }
         ) {
@@ -1352,7 +1352,9 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
             bcode_session_models::SessionEventKind::ToolCallRequested { tool_name, .. } => {
                 *tool_counts.entry(tool_name.clone()).or_default() += 1;
             }
-            bcode_session_models::SessionEventKind::ToolCallFinished { is_error: true, .. } => {
+            bcode_session_models::SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.is_error =>
+            {
                 tool_errors += 1;
             }
             bcode_session_models::SessionEventKind::PermissionRequested { .. } => {

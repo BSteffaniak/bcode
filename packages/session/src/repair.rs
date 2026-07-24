@@ -854,12 +854,12 @@ mod tests {
             &session_db,
             session_id,
             2,
-            "tool_call_finished",
+            "tool_invocation_result_recorded",
             serde_json::json!({
                 "schema_version": bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 "sequence": 2,
                 "session_id": session_id,
-                "kind": { "tool_call_finished": { "result": "missing call id" } }
+                "kind": { "tool_invocation_result_recorded": { "record": { "model_output": "missing invocation id" } } }
             }),
         )
         .await;

@@ -216,8 +216,5 @@ fn bcode_tool_definition(name: &str) -> bcode::ToolDefinition {
         name: name.to_owned(),
         description: name.to_owned(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: bcode::ToolPolicyMetadata::default(),
-        ui: bcode::ToolUiMetadata::default(),
     }
 }

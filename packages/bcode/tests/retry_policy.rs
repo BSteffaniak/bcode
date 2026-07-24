@@ -1,8 +1,7 @@
 use bcode::{
     ModelContentBlock, ModelProviderInvoker, ProviderError, ProviderErrorCategory,
     ProviderRetryHint, RetryPolicy, RuntimeFuture, StopReason, TextStreamItem, ToolCall,
-    ToolDefinition, ToolInvocationResponse, ToolPolicyMetadata, ToolUiMetadata,
-    generate_text_builder, stream_text_builder,
+    ToolDefinition, ToolInvocationResponse, generate_text_builder, stream_text_builder,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -179,9 +178,6 @@ async fn provider_retry_after_unsafe_tool_result_never_reexecutes_the_tool() {
                 name: "unsafe".to_string(),
                 description: "unsafe side effect".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
-                requires_permission: false,
-                policy: ToolPolicyMetadata::default(),
-                ui: ToolUiMetadata::default(),
             },
             move |_| {
                 count.fetch_add(1, Ordering::SeqCst);

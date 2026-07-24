@@ -13,14 +13,14 @@ pub use actions::execute_session_view_action;
 
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionId, SessionLiveEvent, SessionLiveEventKind,
-    ToolInvocationProjection, ToolInvocationStreamEvent, apply_tool_invocation_projection_event,
+    ToolInvocationProjection, apply_tool_invocation_projection_event,
 };
 use bcode_session_view_models::{
     ChatMessageView, CompactionView, CompactionViewStatus, ComposerViewState,
-    InteractionViewSummary, PluginStatusView, PluginVisualView, ProviderProgressView,
-    SessionViewSnapshot, SkillView, SkillViewStatus, TextFormat, ThinkingViewState,
-    ToolInvocationView, ToolInvocationViewStatus, ToolOutputView, ToolResultView, ToolTimingView,
-    TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind,
+    InteractionViewSummary, PluginStatusView, ProviderProgressView, SessionViewSnapshot, SkillView,
+    SkillViewStatus, TextFormat, ThinkingViewState, ToolInvocationView, ToolInvocationViewStatus,
+    ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
+    TranscriptViewItemKind,
 };
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
@@ -530,8 +530,7 @@ impl SessionView {
                 }
                 self.bump_revision();
             }
-            SessionEventKind::ToolCallRequested { tool_call_id, .. }
-            | SessionEventKind::ToolCallFinished { tool_call_id, .. } => {
+            SessionEventKind::ToolCallRequested { tool_call_id, .. } => {
                 self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
@@ -540,27 +539,6 @@ impl SessionView {
                     event.sequence,
                     Some(event.timestamp_ms),
                 );
-            }
-            SessionEventKind::ToolInvocationStream { event: stream } => {
-                let tool_call_id = stream_tool_call_id(stream);
-                self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
-                if let ToolInvocationStreamEvent::VisualUpdate {
-                    visual, streaming, ..
-                } = stream
-                {
-                    self.push_item(
-                        TranscriptViewItemId::new(format!(
-                            "tool-visual:{tool_call_id}:{}",
-                            stream_sequence(stream)
-                        )),
-                        event.sequence,
-                        Some(event.timestamp_ms),
-                        *streaming,
-                        TranscriptViewItemKind::PluginVisual {
-                            visual: PluginVisualView::from(visual.clone()),
-                        },
-                    );
-                }
             }
             SessionEventKind::SystemMessage { text } => {
                 self.push_item(
@@ -1132,19 +1110,6 @@ impl SessionView {
                     text,
                 );
             }
-            SessionLiveEventKind::ToolOutputDelta { event: stream } => {
-                let synthetic = SessionEvent {
-                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                    sequence: 0,
-                    timestamp_ms: bcode_session_models::current_unix_timestamp_ms(),
-                    session_id: event.session_id,
-                    provenance: None,
-                    kind: SessionEventKind::ToolInvocationStream {
-                        event: stream.clone(),
-                    },
-                };
-                self.apply_event(&synthetic);
-            }
             SessionLiveEventKind::ToolContribution {
                 event: contribution,
             } => self.apply_contribution_event(
@@ -1155,32 +1120,6 @@ impl SessionView {
             ),
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_contribution_event(0, None, &envelope.contribution, envelope.placement);
-            }
-            SessionLiveEventKind::ToolArgumentPreview {
-                tool_call_id,
-                tool_name,
-                preview,
-                ..
-            } => {
-                let id = TranscriptViewItemId::new(format!("tool-preview:{tool_call_id}"));
-                self.upsert_item(
-                    id,
-                    0,
-                    None,
-                    true,
-                    TranscriptViewItemKind::PluginVisual {
-                        visual: PluginVisualView::from(preview.visual.clone()),
-                    },
-                );
-                self.tool_invocation_projections
-                    .entry(tool_call_id.clone())
-                    .or_insert_with(|| ToolInvocationProjection {
-                        tool_call_id: tool_call_id.clone(),
-                        tool_name: Some(tool_name.clone()),
-                        request_visual: Some(preview.visual.clone()),
-                        ..ToolInvocationProjection::default()
-                    });
-                self.upsert_tool_item(tool_call_id, 0, None);
             }
             SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
                 self.snapshot.runtime.provider_progress = Some(ProviderProgressView {
@@ -1518,7 +1457,6 @@ impl SessionView {
             | TranscriptViewItemKind::Compaction { .. }
             | TranscriptViewItemKind::Skill { .. }
             | TranscriptViewItemKind::Interaction { .. }
-            | TranscriptViewItemKind::PluginVisual { .. }
             | TranscriptViewItemKind::ToolContribution { .. } => None,
         };
         if should_split_terminal_tool_item(existing_tool.as_ref(), &tool) {
@@ -1885,16 +1823,10 @@ fn tool_invocation_view_from_projection(
         tool_name: projection.tool_name,
         arguments_json: projection.arguments_json,
         working_directory: projection.working_directory,
-        request_visual: projection.request_visual.map(PluginVisualView::from),
         status: projection.status.into(),
         result_text: projection.result_text,
         is_error: projection.is_error,
         result: projection.raw_result.map(ToolResultView::from),
-        output: projection.stream_output.map(|output| ToolOutputView {
-            text: output.output,
-            columns: output.columns,
-            rows: output.rows,
-        }),
         timing: ToolTimingView {
             started_at_ms: projection.started_at_ms,
             finished_at_ms: projection.finished_at_ms,
@@ -2002,7 +1934,6 @@ fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::Compaction { .. }
         | TranscriptViewItemKind::Skill { .. }
         | TranscriptViewItemKind::Interaction { .. }
-        | TranscriptViewItemKind::PluginVisual { .. }
         | TranscriptViewItemKind::ToolContribution { .. } => {}
     }
 }
@@ -2021,34 +1952,7 @@ fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::Compaction { .. }
         | TranscriptViewItemKind::Skill { .. }
         | TranscriptViewItemKind::Interaction { .. }
-        | TranscriptViewItemKind::PluginVisual { .. }
         | TranscriptViewItemKind::ToolContribution { .. } => {}
-    }
-}
-
-const fn stream_sequence(event: &ToolInvocationStreamEvent) -> u64 {
-    match event {
-        ToolInvocationStreamEvent::Started { sequence, .. }
-        | ToolInvocationStreamEvent::OutputDelta { sequence, .. }
-        | ToolInvocationStreamEvent::VisualUpdate { sequence, .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { sequence, .. }
-        | ToolInvocationStreamEvent::Status { sequence, .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { sequence, .. }
-        | ToolInvocationStreamEvent::Finished { sequence, .. } => *sequence,
-        ToolInvocationStreamEvent::LegacyTransientPruned { .. } => 0,
-    }
-}
-
-fn stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
-    match event {
-        ToolInvocationStreamEvent::Started { tool_call_id, .. }
-        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
-        | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyTransientPruned { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
     }
 }
 
@@ -2117,7 +2021,6 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, LocalContextEstimate, ModelRequestIdentity,
         RequestContextObservation, RequestContextTokenCount, SessionEvent, SessionEventKind,
         SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTokenUsage, ToolInvocationResult,
-        ToolOutputStream,
     };
     use std::path::PathBuf;
 
@@ -2195,8 +2098,6 @@ mod tests {
                     tool_name: "future.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             lifecycle(
@@ -2492,8 +2393,6 @@ mod tests {
                 tool_name: "example.tool".to_owned(),
                 arguments_json: "{}".to_owned(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
             },
         ));
         view.apply_event(&event(
@@ -2545,8 +2444,6 @@ mod tests {
                     tool_name: "example.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -2615,8 +2512,6 @@ mod tests {
                     tool_name: "example.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ));
             view.apply_event(&event(
@@ -3013,8 +2908,6 @@ mod tests {
                     tool_name: "shell.run".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
         ];
@@ -3056,110 +2949,6 @@ mod tests {
         view.apply_event(&event);
 
         assert_eq!(view.snapshot(), &snapshot);
-    }
-
-    #[test]
-    fn durable_tool_request_adopts_source_metadata_after_live_preview() {
-        let session_id = SessionId::new();
-        let mut view = SessionView::new();
-        view.apply_live_event(&SessionLiveEvent {
-            session_id,
-            kind: SessionLiveEventKind::ToolArgumentPreview {
-                turn_id: "turn-1".to_owned(),
-                tool_call_id: "tool-1".to_owned(),
-                tool_name: "shell.run".to_owned(),
-                argument_bytes: 2,
-                preview: bcode_session_models::LiveToolArgumentPreview {
-                    visual: bcode_session_models::PluginVisualDescriptor {
-                        visual_id: Some("preview-1".to_owned()),
-                        producer_plugin_id: Some("shell".to_owned()),
-                        schema: "shell.preview".to_owned(),
-                        schema_version: 1,
-                        title: Some("preview".to_owned()),
-                        subtitle: None,
-                        payload: serde_json::json!({}),
-                    },
-                    streaming_status: None,
-                    argument_bytes: 2,
-                },
-            },
-        });
-
-        view.apply_event(&event(
-            session_id,
-            7,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "tool-1".to_owned(),
-                producer_plugin_id: Some("shell".to_owned()),
-                tool_name: "shell.run".to_owned(),
-                arguments_json: "{}".to_owned(),
-                working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
-            },
-        ));
-
-        let request = view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .find(|item| {
-                matches!(
-                    &item.kind,
-                    TranscriptViewItemKind::ToolInvocation { tool }
-                        if tool.tool_call_id == "tool-1"
-                )
-            })
-            .expect("durable tool request");
-        assert_eq!(request.sequence, Some(7));
-        assert_eq!(request.timestamp_ms, Some(70));
-    }
-
-    #[test]
-    fn repeated_live_tool_previews_replace_one_stable_item() {
-        let session_id = SessionId::new();
-        let mut view = SessionView::new();
-        for (argument_bytes, title) in [(3, "first"), (6, "second")] {
-            view.apply_live_event(&SessionLiveEvent {
-                session_id,
-                kind: SessionLiveEventKind::ToolArgumentPreview {
-                    turn_id: "turn-1".to_owned(),
-                    tool_call_id: "tool-1".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    argument_bytes,
-                    preview: bcode_session_models::LiveToolArgumentPreview {
-                        visual: bcode_session_models::PluginVisualDescriptor {
-                            visual_id: Some("preview-1".to_owned()),
-                            producer_plugin_id: Some("shell".to_owned()),
-                            schema: "shell.preview".to_owned(),
-                            schema_version: 1,
-                            title: Some(title.to_owned()),
-                            subtitle: None,
-                            payload: serde_json::json!({"title": title}),
-                        },
-                        streaming_status: None,
-                        argument_bytes,
-                    },
-                },
-            });
-        }
-
-        let previews = view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .filter(|item| matches!(item.kind, TranscriptViewItemKind::PluginVisual { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(previews.len(), 1);
-        assert_eq!(previews[0].id.get(), "tool-preview:tool-1");
-        assert_eq!(previews[0].revision, 1);
-        assert!(matches!(
-            &previews[0].kind,
-            TranscriptViewItemKind::PluginVisual { visual }
-                if visual.descriptor.title.as_deref() == Some("second")
-        ));
     }
 
     #[test]
@@ -3209,8 +2998,6 @@ mod tests {
                     tool_name: "test.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -3484,6 +3271,8 @@ mod tests {
             title: Some("Question".to_owned()),
             required: true,
             snapshot: Some(serde_json::json!({"questions": [{"question": "Proceed?"}]})),
+            state: bcode_session_view_models::InteractionViewState::Pending,
+            status_detail: None,
             resolved: false,
             resolution: None,
         });
@@ -3511,6 +3300,8 @@ mod tests {
             title: Some("Question".to_owned()),
             required: true,
             snapshot: None,
+            state: bcode_session_view_models::InteractionViewState::Resolved,
+            status_detail: None,
             resolved: true,
             resolution: Some(serde_json::json!({"status": "answered"})),
         });
@@ -3601,7 +3392,6 @@ mod tests {
                 producer_plugin_id: Some("shell".to_owned()),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                legacy_request_presentation: None,
                 batch: None,
                 policy_source: None,
                 policy_reason: Some("requires approval".to_owned()),
@@ -3637,7 +3427,6 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "example.tool".to_owned(),
                 arguments_json: "{}".to_owned(),
-                legacy_request_presentation: None,
                 batch: Some(bcode_session_models::PermissionBatchCorrelation {
                     batch_id: "batch-1".to_owned(),
                     call_index: 1,
@@ -3771,8 +3560,6 @@ mod tests {
                 tool_name: "test.tool".to_owned(),
                 arguments_json: serde_json::json!({"secret": true}).to_string(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
             },
         ));
         let compact = view.snapshot().transcript.items[0].clone();
@@ -4141,7 +3928,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_results_reconcile_cumulative_live_state_without_losing_it_early() {
+    fn durable_results_reconcile_cumulative_assistant_live_state() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         view.apply_event(&event(
@@ -4153,8 +3940,6 @@ mod tests {
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
             },
         ));
         for text in ["live ", "answer"] {
@@ -4166,33 +3951,11 @@ mod tests {
                 },
             });
         }
-        view.apply_live_event(&SessionLiveEvent {
-            session_id,
-            kind: SessionLiveEventKind::ToolOutputDelta {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "tool-1".to_owned(),
-                    sequence: 1,
-                    stream: ToolOutputStream::Stdout,
-                    text: "live output".to_owned(),
-                    byte_len: 11,
-                },
-            },
-        });
-
         assert!(matches!(
             &view.snapshot().transcript.items[1].kind,
             TranscriptViewItemKind::AssistantMessage { message }
                 if message.text == "live answer"
         ));
-        assert_eq!(
-            view.snapshot()
-                .tools
-                .get("tool-1")
-                .and_then(|tool| tool.output.as_ref())
-                .map(|output| output.text.as_str()),
-            Some("live output")
-        );
-
         view.apply_event(&event(
             session_id,
             2,
@@ -4203,14 +3966,15 @@ mod tests {
         view.apply_event(&event(
             session_id,
             3,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "tool-1".to_owned(),
-                result: "durable output".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(ToolInvocationResult::Text {
-                    text: "durable output".to_owned(),
-                }),
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "tool-1".to_owned(),
+                    model_output: "durable output".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "durable output".to_owned(),
+                    }),
+                },
             },
         ));
 
@@ -4602,62 +4366,5 @@ mod tests {
                     && skill.status == SkillViewStatus::Failed
                     && skill.text == "review: boom"
         ));
-    }
-
-    #[test]
-    fn projects_tool_invocation_output() {
-        let session_id = SessionId::new();
-        let snapshot = build_session_view_snapshot(&[
-            event(
-                session_id,
-                1,
-                SessionEventKind::ToolCallRequested {
-                    tool_call_id: "tool-1".to_owned(),
-                    producer_plugin_id: Some("shell".to_owned()),
-                    tool_name: "shell.run".to_owned(),
-                    arguments_json: "{}".to_owned(),
-                    working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
-                },
-            ),
-            event(
-                session_id,
-                2,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::Started {
-                        tool_call_id: "tool-1".to_owned(),
-                        tool_name: "shell.run".to_owned(),
-                        sequence: 1,
-                        terminal: true,
-                        columns: Some(80),
-                        rows: Some(24),
-                        started_at_ms: Some(20),
-                    },
-                },
-            ),
-            event(
-                session_id,
-                3,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "tool-1".to_owned(),
-                        stream: ToolOutputStream::Stdout,
-                        sequence: 2,
-                        text: "hello".to_owned(),
-                        byte_len: 5,
-                    },
-                },
-            ),
-        ]);
-
-        let tool = snapshot.tools.get("tool-1").expect("tool projected");
-        assert_eq!(tool.tool_name.as_deref(), Some("shell.run"));
-        assert_eq!(tool.status, ToolInvocationViewStatus::Running);
-        assert_eq!(
-            tool.output.as_ref().map(|output| output.text.as_str()),
-            Some("hello")
-        );
-        assert_eq!(snapshot.transcript.items.len(), 1);
     }
 }

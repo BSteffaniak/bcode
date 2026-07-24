@@ -17,20 +17,9 @@ Fixture suites should cover:
 * future-version logs
 * corrupt tails / repair-required logs
 * idempotent re-apply behavior
-* historical event shapes that active migrations must continue to decode
+* trustworthy unknown event envelopes
 
-The `plugin-automation-turn-*-v29.json` and `plugin-status-note-v29.json`
-fixtures capture the last active schema-29 durable shapes before the generic
-runtime/loop architecture migration. The `interactive-tool-request-*-v32.json`
-fixtures capture created, resolved, and unresolved retired interactive request
-lifecycle records before generic tool exchanges replaced them. The
-`mixed-interactive-history-v32-v35.jsonl` fixture captures a contiguous minimal
-schema-32 legacy interaction followed by schema-35 history, matching the schema
-boundary structure of session `#1e5587bb` without copying private content.
-These are compatibility inputs only and must never become templates for new
-writes. The `unknown-*-event-kind`, `future-schema-v40`, malformed,
-mismatched-identity, and sequence-gap fixtures separate trustworthy opaque
-semantics from structural corruption and future-build incompatibility.
+The schema-39 fixtures cover current plugin status, unknown event kinds, malformed JSON, mismatched identity, and sequence gaps. The schema-40 fixture covers a trustworthy future envelope. Named interactive-tool, plugin-automation, presentation, and other pre-cutover typed fixtures were removed with their runtime decoders; old stores are rejected by format epoch before normal event replay.
 
 Keep fixtures small, intentional, and documented with the schema version and
 expected migration/status outcome.

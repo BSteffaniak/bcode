@@ -115,6 +115,9 @@ pub struct ToolContributionArtifact {
     /// Whether no later bytes will be appended.
     #[serde(default)]
     pub finalized: bool,
+    /// Optional generic availability state such as `active`, `complete`, or `incomplete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<String>,
 }
 
 /// Schema-versioned renderer contribution emitted by a tool owner.
@@ -366,6 +369,7 @@ mod tests {
                 committed_bytes: 42,
                 revision: 2,
                 finalized: false,
+                availability: None,
             }),
             payload: serde_json::json!({"opaque": [1, 2]}),
         };
@@ -374,5 +378,47 @@ mod tests {
             serde_json::from_slice(&encoded).expect("decode contribution");
 
         assert_eq!(decoded, contribution);
+        assert_eq!(
+            decoded
+                .artifact
+                .as_ref()
+                .and_then(|artifact| artifact.availability.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn contribution_artifact_availability_round_trips() {
+        let mut contribution = ToolContributionEvent {
+            invocation_id: "call-1".to_owned(),
+            contribution_id: "recording".to_owned(),
+            sequence: 3,
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.recording".to_owned(),
+            schema_version: 1,
+            operation: ToolContributionOperation::Upsert,
+            persistence: ToolContributionPersistence::Transient,
+            artifact: Some(ToolContributionArtifact {
+                artifact_id: "recording-1".to_owned(),
+                reference_key: "bytes".to_owned(),
+                content_type: None,
+                storage_uri: "file:///tmp/recording".to_owned(),
+                committed_bytes: 42,
+                revision: 3,
+                finalized: false,
+                availability: Some("incomplete".to_owned()),
+            }),
+            payload: serde_json::Value::Null,
+        };
+        let encoded = serde_json::to_vec(&contribution).expect("encode contribution");
+        contribution = serde_json::from_slice(&encoded).expect("decode contribution");
+
+        assert_eq!(
+            contribution
+                .artifact
+                .as_ref()
+                .and_then(|artifact| artifact.availability.as_deref()),
+            Some("incomplete")
+        );
     }
 }

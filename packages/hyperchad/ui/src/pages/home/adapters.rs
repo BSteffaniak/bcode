@@ -5,10 +5,11 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use super::theme::{color, radius, space, surface, typeface};
-use bcode_session_view_models::{PluginVisualView, ToolArtifactView};
+use bcode_session_view_models::ToolArtifactView;
 use hyperchad::template::{Containers, container};
 
-pub(super) type VisualAdapter = fn(&PluginVisualView) -> Option<Containers>;
+pub(super) type VisualAdapter =
+    fn(&bcode_session_models::ToolContributionEvent) -> Option<Containers>;
 pub(super) type ArtifactAdapter = fn(&ToolArtifactView) -> Option<Containers>;
 
 pub(super) static ARTIFACT_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), ArtifactAdapter>> =
@@ -1258,27 +1259,33 @@ pub(super) fn render_worktree_remove_result(artifact: &ToolArtifactView) -> Opti
     })
 }
 
-pub(super) fn render_plugin_visual(title: &str, visual: &PluginVisualView) -> Containers {
-    let rich = VISUAL_ADAPTERS
-        .get(&(
-            visual.descriptor.schema.as_str(),
-            visual.descriptor.schema_version,
-        ))
-        .and_then(|adapter| adapter(visual));
-    container! {
-        @if let Some(rich) = rich {
-            (rich)
-        }
-        (json_panel(title, &visual.generic_payload))
-    }
+pub(super) fn render_tool_contribution(
+    contribution: &bcode_session_models::ToolContributionEvent,
+    placement: bcode_session_models::ToolContributionPlacement,
+) -> Containers {
+    VISUAL_ADAPTERS
+        .get(&(contribution.schema.as_str(), contribution.schema_version))
+        .and_then(|adapter| adapter(contribution))
+        .unwrap_or_else(|| compact_unsupported_contribution(placement))
 }
 
-pub(super) fn render_extraction_request(visual: &PluginVisualView) -> Option<Containers> {
-    let payload = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+fn compact_unsupported_contribution(
+    placement: bcode_session_models::ToolContributionPlacement,
+) -> Containers {
+    let label = match placement {
+        bcode_session_models::ToolContributionPlacement::Request => "tool request",
+        bcode_session_models::ToolContributionPlacement::Progress => "tool progress",
+        bcode_session_models::ToolContributionPlacement::Result => "tool result",
+        bcode_session_models::ToolContributionPlacement::Supplemental
+        | bcode_session_models::ToolContributionPlacement::Hidden => return Containers::default(),
+    };
+    container! { div color=(color::MUTED) { (label) } }
+}
+
+pub(super) fn render_extraction_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let payload = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let operation = payload
         .get("operation")
         .and_then(serde_json::Value::as_str)?;
@@ -1288,7 +1295,7 @@ pub(super) fn render_extraction_request(visual: &PluginVisualView) -> Option<Con
         .and_then(serde_json::Value::as_str);
     Some(container! {
         div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
-            div color=(color::INFO) margin-bottom=((space::S6)) { (visual.descriptor.title.as_deref().unwrap_or(operation)) }
+            div color=(color::INFO) margin-bottom=((space::S6)) { (operation) }
             @if let Some(source) = source { div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (source) } }
             @if source.is_none() { div color=(color::MUTED) font-size=((typeface::LABEL)) { "Check configured extraction capabilities." } }
             @for key in ["engine", "language"] {
@@ -1301,12 +1308,10 @@ pub(super) fn render_extraction_request(visual: &PluginVisualView) -> Option<Con
     })
 }
 
-pub(super) fn render_web_utility_request(visual: &PluginVisualView) -> Option<Containers> {
-    let payload = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+pub(super) fn render_web_utility_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let payload = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let operation = payload
         .get("operation")
         .and_then(serde_json::Value::as_str)?;
@@ -1322,12 +1327,10 @@ pub(super) fn render_web_utility_request(visual: &PluginVisualView) -> Option<Co
     })
 }
 
-pub(super) fn render_filesystem_request(visual: &PluginVisualView) -> Option<Containers> {
-    let payload = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+pub(super) fn render_filesystem_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let payload = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let operation = payload
         .get("operation")
         .and_then(serde_json::Value::as_str)
@@ -1359,18 +1362,16 @@ pub(super) fn render_filesystem_request(visual: &PluginVisualView) -> Option<Con
     })
 }
 
-pub(super) fn render_filesystem_change(visual: &PluginVisualView) -> Option<Containers> {
-    let payload = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+pub(super) fn render_filesystem_change(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let payload = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let path = payload.get("path").and_then(serde_json::Value::as_str)?;
     let old_text = payload.get("old_text").and_then(serde_json::Value::as_str);
     let new_text = payload.get("new_text").and_then(serde_json::Value::as_str);
     Some(container! {
         div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
-            div color=(color::INFO) margin-bottom=((space::S6)) { (visual.descriptor.title.as_deref().unwrap_or("Filesystem change")) }
+            div color=(color::INFO) margin-bottom=((space::S6)) { ("Filesystem change") }
             div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
             @if let Some(old_text) = old_text {
                 div color=(color::ERROR) font-family="monospace" white-space="preserve-wrap" border-top=((1, surface::BORDER)) margin-top=((space::SM)) padding-top=((space::SM)) { "- " (old_text) }
@@ -1399,8 +1400,10 @@ fn vim_diff_panel(diff: &str, source_truncated: bool) -> Containers {
     }
 }
 
-pub(super) fn render_vim_edit_live(visual: &PluginVisualView) -> Option<Containers> {
-    let payload = &visual.descriptor.payload;
+pub(super) fn render_vim_edit_live(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let payload = &visual.payload;
     let phase = payload.get("phase").and_then(serde_json::Value::as_str)?;
     let path = payload.get("path").and_then(serde_json::Value::as_str);
     let message = payload.get("message").and_then(serde_json::Value::as_str);
@@ -1424,8 +1427,10 @@ pub(super) fn render_vim_edit_live(visual: &PluginVisualView) -> Option<Containe
     })
 }
 
-pub(super) fn render_vim_edit_playback(visual: &PluginVisualView) -> Option<Containers> {
-    let payload = &visual.descriptor.payload;
+pub(super) fn render_vim_edit_playback(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let payload = &visual.payload;
     let success = payload
         .get("success")
         .and_then(serde_json::Value::as_bool)?;
@@ -1459,12 +1464,10 @@ pub(super) fn render_vim_edit_playback(visual: &PluginVisualView) -> Option<Cont
     })
 }
 
-pub(super) fn render_vim_edit_request(visual: &PluginVisualView) -> Option<Containers> {
-    let arguments = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+pub(super) fn render_vim_edit_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let arguments = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let single_path = arguments.get("path").and_then(serde_json::Value::as_str);
     let files = arguments.get("files").and_then(serde_json::Value::as_array);
     let steps = arguments.get("steps").and_then(serde_json::Value::as_array);
@@ -1477,7 +1480,7 @@ pub(super) fn render_vim_edit_request(visual: &PluginVisualView) -> Option<Conta
     }
     Some(container! {
         div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
-            div color=(color::INFO) margin-bottom=((space::S6)) { (visual.descriptor.title.as_deref().unwrap_or("Vim edit")) }
+            div color=(color::INFO) margin-bottom=((space::S6)) { ("Vim edit") }
             @if let Some(path) = single_path {
                 div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
                 @if let Some(steps) = steps {
@@ -1507,12 +1510,10 @@ pub(super) fn render_vim_edit_request(visual: &PluginVisualView) -> Option<Conta
     })
 }
 
-pub(super) fn render_git_clone_request(visual: &PluginVisualView) -> Option<Containers> {
-    let arguments = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+pub(super) fn render_git_clone_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let arguments = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let url = arguments.get("url")?.as_str()?;
     let reference = arguments
         .get("ref")
@@ -1531,12 +1532,10 @@ pub(super) fn render_git_clone_request(visual: &PluginVisualView) -> Option<Cont
     })
 }
 
-pub(super) fn render_worktree_request(visual: &PluginVisualView) -> Option<Containers> {
-    let arguments = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+pub(super) fn render_worktree_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let arguments = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let operation = arguments
         .get("operation")
         .and_then(serde_json::Value::as_str)
@@ -1572,12 +1571,10 @@ pub(super) fn render_worktree_request(visual: &PluginVisualView) -> Option<Conta
     })
 }
 
-pub(super) fn render_web_search_request(visual: &PluginVisualView) -> Option<Containers> {
-    let arguments = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+pub(super) fn render_web_search_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let arguments = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let query = arguments.get("query")?.as_str()?;
     let provider = arguments
         .get("provider")
@@ -1621,12 +1618,10 @@ pub(super) fn render_web_search_request(visual: &PluginVisualView) -> Option<Con
     })
 }
 
-pub(super) fn render_web_fetch_request(visual: &PluginVisualView) -> Option<Containers> {
-    let arguments = visual
-        .descriptor
-        .payload
-        .get("arguments")
-        .unwrap_or(&visual.descriptor.payload);
+pub(super) fn render_web_fetch_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let arguments = visual.payload.get("arguments").unwrap_or(&visual.payload);
     let url = arguments.get("url")?.as_str()?;
     let provider = arguments
         .get("provider")
@@ -1664,8 +1659,10 @@ pub(super) fn render_web_fetch_request(visual: &PluginVisualView) -> Option<Cont
     })
 }
 
-pub(super) fn render_shell_request(visual: &PluginVisualView) -> Option<Containers> {
-    let payload = &visual.descriptor.payload;
+pub(super) fn render_shell_request(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let payload = &visual.payload;
     let arguments = payload.get("arguments").unwrap_or(payload);
     let command = arguments.get("command")?.as_str()?;
     let cwd = arguments.get("cwd").and_then(serde_json::Value::as_str);

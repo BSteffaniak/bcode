@@ -23,13 +23,10 @@ pub use legacy_storage::{
 mod actor;
 pub mod db;
 pub mod lease;
-pub mod legacy_stream_cleanup;
 mod migration_operation;
 pub mod persisted;
-mod persisted_legacy;
 pub mod projection;
 pub mod repair;
-pub mod semantic_migration;
 mod store_executor;
 
 use actor::{AttachMode, SessionHandle};
@@ -64,7 +61,6 @@ use tokio::task::spawn_blocking;
 /// Return the stable kind name when a session event is live-only and must not be persisted.
 const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'static str> {
     match kind {
-        SessionEventKind::ToolInvocationStream { .. } => Some("tool_invocation_stream"),
         SessionEventKind::ToolContribution { event }
             if matches!(
                 event.persistence,
@@ -83,7 +79,7 @@ fn ensure_durable_session_event_kind(
     kind: &SessionEventKind,
     metrics: Option<&MetricsRegistry>,
 ) -> Result<(), SessionError> {
-    if matches!(kind, SessionEventKind::LegacyEvent { .. }) {
+    if matches!(kind, SessionEventKind::OpaqueEvent { .. }) {
         return Err(SessionError::EventSerialization(
             "historical compatibility events cannot be appended".to_owned(),
         ));
@@ -125,7 +121,7 @@ fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &Sessio
         SessionEventKind::UserMessage { .. }
             | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ToolCallRequested { .. }
-            | SessionEventKind::ToolCallFinished { .. }
+            | SessionEventKind::ToolInvocationResultRecorded { .. }
             | SessionEventKind::SystemMessage { .. }
             | SessionEventKind::WorkingDirectoryChanged { .. }
             | SessionEventKind::ContextCompacted { .. }
@@ -135,14 +131,15 @@ fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &Sessio
         metrics.increment_counter("session.event.semantic_rows");
     }
     match &event.kind {
-        SessionEventKind::ToolCallFinished {
-            semantic_result: Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }),
-            ..
-        } => {
-            metrics.add_counter(
-                "session.event.artifact_references",
-                u64::try_from(artifact.refs.len()).unwrap_or(u64::MAX),
-            );
+        SessionEventKind::ToolInvocationResultRecorded { record } => {
+            if let Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }) =
+                &record.result
+            {
+                metrics.add_counter(
+                    "session.event.artifact_references",
+                    u64::try_from(artifact.refs.len()).unwrap_or(u64::MAX),
+                );
+            }
         }
         SessionEventKind::ContextCompacted { .. }
         | SessionEventKind::ProviderContextCompacted { .. } => {
@@ -1249,11 +1246,6 @@ pub struct AppendToolCallRequestedInput {
     pub producer_plugin_id: Option<String>,
     /// Working directory captured for this invocation.
     pub working_directory: Option<std::path::PathBuf>,
-    /// Plugin-owned request visual captured at request time.
-    pub request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
-    /// Legacy request presentation metadata retained for old sessions/imports.
-    pub legacy_request_presentation:
-        Option<bcode_session_models::LegacyToolRequestPresentationMetadata>,
 }
 
 /// In-memory session manager with optional DB-backed persistence.
@@ -4030,8 +4022,6 @@ impl SessionManager {
                 arguments_json: input.arguments_json,
                 producer_plugin_id: input.producer_plugin_id,
                 working_directory: input.working_directory,
-                request_visual: input.request_visual,
-                legacy_request_presentation: input.legacy_request_presentation,
             },
         )
         .await
@@ -4052,32 +4042,6 @@ impl SessionManager {
             SessionEventKind::ToolInvocationResultRecorded { record },
         )
         .await
-    }
-
-    /// Append an interactive tool request event to a session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session does not exist or the event cannot be persisted.
-    pub async fn append_interactive_tool_request_created(
-        &self,
-        session_id: SessionId,
-        event: SessionEventKind,
-    ) -> Result<SessionEvent, SessionError> {
-        self.append_event(session_id, event).await
-    }
-
-    /// Append an interactive tool resolution event to a session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session does not exist or the event cannot be persisted.
-    pub async fn append_interactive_tool_request_resolved(
-        &self,
-        session_id: SessionId,
-        event: SessionEventKind,
-    ) -> Result<SessionEvent, SessionError> {
-        self.append_event(session_id, event).await
     }
 
     /// Publish a live-only event to currently attached session subscribers.
@@ -5015,18 +4979,18 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendToolCallRequestedInput, CURRENT_SESSION_FORMAT_EPOCH,
-        MAX_DURABLE_GENERIC_EVENT_BYTES, MIGRATION_BACKUP_BUFFER_BYTES, MigrationBackupCopyFault,
-        SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION, SessionCatalogLoadStatus,
-        SessionError, SessionHealth, SessionLeaseOwnerContext, SessionLoadStatusKind,
-        SessionManager, SessionMigrationStage, SessionOpenFailureKind, SessionOpenOperationId,
-        SessionOpenTerminalOutcome, SessionStore, copy_and_hash_backup_files,
-        create_verified_migration_backup_blocking, db, lease, migration_backup_files, persisted,
-        shared_execution_session, verify_backup_files,
+        AppendToolCallRequestedInput, CURRENT_SESSION_FORMAT_EPOCH, MIGRATION_BACKUP_BUFFER_BYTES,
+        MigrationBackupCopyFault, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
+        SessionCatalogLoadStatus, SessionError, SessionHealth, SessionLeaseOwnerContext,
+        SessionLoadStatusKind, SessionManager, SessionMigrationStage, SessionOpenFailureKind,
+        SessionOpenOperationId, SessionOpenTerminalOutcome, SessionStore,
+        copy_and_hash_backup_files, create_verified_migration_backup_blocking, db, lease,
+        migration_backup_files, persisted, shared_execution_session, verify_backup_files,
     };
     use bcode_metrics::MetricsRegistry;
     use bcode_session_models::{
-        ExecutionSessionContextMode, ExecutionSessionProvenance, SessionVisibility,
+        ExecutionSessionContextMode, ExecutionSessionProvenance, SessionHistoryDirection,
+        SessionVisibility,
     };
     use std::time::Duration;
     use switchy::database::query::FilterableQuery;
@@ -5385,272 +5349,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn durable_boundary_rejects_tool_stream_status_regardless_of_payload_size() {
-        let manager = SessionManager::default();
-        let session = manager
-            .create_session(Some("stream-boundary".to_owned()), test_working_directory())
-            .await
-            .expect("session should create");
-        for message in [
-            "status".to_owned(),
-            "x".repeat(MAX_DURABLE_GENERIC_EVENT_BYTES),
-        ] {
-            let error = manager
-                .append_event(
-                    session.id,
-                    SessionEventKind::ToolInvocationStream {
-                        event: ToolInvocationStreamEvent::Status {
-                            tool_call_id: "call".to_owned(),
-                            sequence: 1,
-                            message,
-                        },
-                    },
-                )
-                .await
-                .expect_err("tool stream status must remain live-only");
-            assert!(matches!(
-                error,
-                SessionError::LiveEventPersistenceRejected {
-                    event_kind: "tool_invocation_stream"
-                }
-            ));
-        }
-
-        let large_semantic_message = "y".repeat(MAX_DURABLE_GENERIC_EVENT_BYTES + 1);
-        manager
-            .append_event(
-                session.id,
-                SessionEventKind::AssistantMessage {
-                    text: large_semantic_message.clone(),
-                },
-            )
-            .await
-            .expect("semantic message is governed by its own domain, not the stream limit");
-        assert!(
-            manager
-                .session_history(session.id)
-                .await
-                .expect("history")
-                .iter()
-                .any(|event| matches!(
-                    &event.kind,
-                    SessionEventKind::AssistantMessage { text } if text == &large_semantic_message
-                ))
-        );
-    }
-
-    #[tokio::test]
-    async fn durable_boundary_rejects_live_only_tool_stream_events() {
-        let manager = SessionManager::default();
-        let session = manager
-            .create_session(Some("live-boundary".to_owned()), test_working_directory())
-            .await
-            .expect("session should create");
-        let variants = [
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call".to_owned(),
-                stream: bcode_session_models::ToolOutputStream::Pty,
-                sequence: 1,
-                text: "live".to_owned(),
-                byte_len: 4,
-            },
-            ToolInvocationStreamEvent::VisualUpdate {
-                tool_call_id: "call".to_owned(),
-                sequence: 2,
-                visual: bcode_session_models::PluginVisualDescriptor {
-                    visual_id: None,
-                    producer_plugin_id: Some("fixture.plugin".to_owned()),
-                    schema: "fixture.visual".to_owned(),
-                    schema_version: 1,
-                    title: None,
-                    subtitle: None,
-                    payload: serde_json::json!({"cumulative": "live"}),
-                },
-                streaming: true,
-            },
-            ToolInvocationStreamEvent::ArtifactUpdate {
-                tool_call_id: "call".to_owned(),
-                sequence: 3,
-                artifact_id: "artifact".to_owned(),
-                reference_key: "recording".to_owned(),
-                producer_plugin_id: "fixture.plugin".to_owned(),
-                schema: "fixture.recording".to_owned(),
-                schema_version: 1,
-                content_type: Some("application/octet-stream".to_owned()),
-                storage_uri: "recording.bin".to_owned(),
-                committed_bytes: 4,
-                revision: 1,
-                availability: None,
-                finalized: false,
-            },
-            ToolInvocationStreamEvent::LegacyPresentation {
-                tool_call_id: "call".to_owned(),
-                sequence: 4,
-                presentation: bcode_session_models::LegacyToolPresentationEvent::Card(
-                    bcode_session_models::LegacyToolCardPresentation {
-                        target: bcode_session_models::LegacyToolPresentationTarget::Result,
-                        title: "legacy".to_owned(),
-                        subtitle: None,
-                        sections: Vec::new(),
-                    },
-                ),
-            },
-            ToolInvocationStreamEvent::Status {
-                tool_call_id: "call".to_owned(),
-                sequence: 5,
-                message: "legacy status".to_owned(),
-            },
-            ToolInvocationStreamEvent::Started {
-                tool_call_id: "call".to_owned(),
-                tool_name: "fixture.tool".to_owned(),
-                sequence: 6,
-                terminal: false,
-                columns: None,
-                rows: None,
-                started_at_ms: None,
-            },
-            ToolInvocationStreamEvent::Finished {
-                tool_call_id: "call".to_owned(),
-                sequence: 7,
-                is_error: false,
-                finished_at_ms: None,
-            },
-        ];
-
-        for event in variants {
-            let error = manager
-                .append_event(session.id, SessionEventKind::ToolInvocationStream { event })
-                .await
-                .expect_err("live-only event must be rejected");
-            assert!(matches!(
-                error,
-                SessionError::LiveEventPersistenceRejected {
-                    event_kind: "tool_invocation_stream"
-                }
-            ));
-        }
-
-        let history = manager
-            .session_history(session.id)
-            .await
-            .expect("history should read");
-        assert!(
-            !history
-                .iter()
-                .any(|event| matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn durable_boundary_blocks_thousands_of_cumulative_visual_snapshots() {
-        const SNAPSHOTS: usize = 4_096;
-        let manager = SessionManager::default();
-        let session = manager
-            .create_session(
-                Some("visual-growth-guard".to_owned()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session should create");
-        let mut cumulative = String::new();
-        for sequence in 1..=SNAPSHOTS {
-            cumulative.push('x');
-            let error = manager
-                .append_event(
-                    session.id,
-                    SessionEventKind::ToolInvocationStream {
-                        event: ToolInvocationStreamEvent::VisualUpdate {
-                            tool_call_id: "shell-call".to_owned(),
-                            sequence: u64::try_from(sequence).expect("sequence"),
-                            visual: bcode_session_models::PluginVisualDescriptor {
-                                visual_id: None,
-                                producer_plugin_id: Some("fixture.shell".to_owned()),
-                                schema: "fixture.shell".to_owned(),
-                                schema_version: 1,
-                                title: None,
-                                subtitle: None,
-                                payload: serde_json::json!({"output": cumulative}),
-                            },
-                            streaming: true,
-                        },
-                    },
-                )
-                .await
-                .expect_err("every cumulative visual snapshot must be rejected");
-            assert!(matches!(
-                error,
-                SessionError::LiveEventPersistenceRejected {
-                    event_kind: "tool_invocation_stream"
-                }
-            ));
-        }
-
-        let history = manager
-            .session_history(session.id)
-            .await
-            .expect("history should read");
-        assert_eq!(history.len(), 1, "only session creation may be durable");
-        assert_eq!(
-            serde_json::to_vec(&history)
-                .expect("history encoding")
-                .len(),
-            serde_json::to_vec(&history[..1])
-                .expect("creation encoding")
-                .len(),
-            "canonical payload bytes must be independent of visual snapshot count"
-        );
-    }
-
-    #[tokio::test]
-    async fn reading_legacy_stream_events_does_not_rewrite_session_storage() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should create");
-        let session = manager
-            .create_session(Some("legacy-stream".to_owned()), test_working_directory())
-            .await
-            .expect("session should create");
-        let legacy_event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id: session.id,
-            provenance: None,
-            kind: SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "legacy-call".to_owned(),
-                    stream: bcode_session_models::ToolOutputStream::Pty,
-                    sequence: 1,
-                    text: "legacy persisted bytes".to_owned(),
-                    byte_len: 22,
-                },
-            },
-        };
-        let db = db::SessionDb::open_turso_in_root(session.id, &root)
-            .await
-            .expect("session DB should open");
-        db.append_event(&legacy_event)
-            .await
-            .expect("legacy fixture should append below the current durable boundary");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let before = session_database_files(&root, session.id);
-
-        let history = manager
-            .session_history(session.id)
-            .await
-            .expect("history should read");
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta { text, .. }
-            } if text == "legacy persisted bytes"
-        )));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let after = session_database_files(&root, session.id);
-
-        assert_eq!(after, before);
-    }
-
     async fn persistent_artifact_session_bytes(
         root: &std::path::Path,
         artifact_bytes: u64,
@@ -5674,8 +5372,6 @@ mod tests {
                     tool_name: "fixture.run".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             )
             .await
@@ -5684,45 +5380,52 @@ mod tests {
             manager
                 .publish_live_event(
                     session.id,
-                    SessionLiveEventKind::ToolOutputDelta {
-                        event: ToolInvocationStreamEvent::OutputDelta {
-                            tool_call_id: "call-1".to_owned(),
-                            stream: bcode_session_models::ToolOutputStream::Pty,
+                    SessionLiveEventKind::ToolContribution {
+                        event: bcode_session_models::ToolContributionEvent {
+                            invocation_id: "call-1".to_owned(),
+                            contribution_id: "transient-volume".to_owned(),
                             sequence: u64::try_from(sequence).expect("sequence"),
-                            text: "x".repeat(4_096),
-                            byte_len: 4_096,
+                            producer_id: "fixture.plugin".to_owned(),
+                            schema: "fixture.transient-volume".to_owned(),
+                            schema_version: 1,
+                            operation: bcode_session_models::ToolContributionOperation::Upsert,
+                            persistence:
+                                bcode_session_models::ToolContributionPersistence::Transient,
+                            artifact: None,
+                            payload: serde_json::json!({"chunk": "x".repeat(4_096)}),
                         },
                     },
                 )
                 .await
-                .expect("transient output should publish");
+                .expect("transient contribution should publish");
         }
         manager
             .append_event(
                 session.id,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_owned(),
-                    result: "bounded result".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: Some(ToolInvocationResult::Artifact {
-                        artifact: Box::new(bcode_session_models::ToolArtifact {
-                            artifact_id: "artifact-1".to_owned(),
-                            producer_plugin_id: "fixture.plugin".to_owned(),
-                            schema: "fixture.artifact".to_owned(),
-                            schema_version: 1,
-                            tool_call_id: Some("call-1".to_owned()),
-                            title: None,
-                            metadata: serde_json::Value::Null,
-                            refs: vec![bcode_session_models::ToolArtifactRef {
-                                key: "complete_output".to_owned(),
-                                content_type: Some("application/octet-stream".to_owned()),
-                                storage_uri: Some("file:///external/artifact".to_owned()),
-                                byte_len: Some(artifact_bytes),
-                                metadata: None,
-                            }],
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "bounded result".to_owned(),
+                        is_error: false,
+                        result: Some(ToolInvocationResult::Artifact {
+                            artifact: Box::new(bcode_session_models::ToolArtifact {
+                                artifact_id: "artifact-1".to_owned(),
+                                producer_plugin_id: "fixture.plugin".to_owned(),
+                                schema: "fixture.artifact".to_owned(),
+                                schema_version: 1,
+                                tool_call_id: Some("call-1".to_owned()),
+                                title: None,
+                                metadata: serde_json::Value::Null,
+                                refs: vec![bcode_session_models::ToolArtifactRef {
+                                    key: "complete_output".to_owned(),
+                                    content_type: Some("application/octet-stream".to_owned()),
+                                    storage_uri: Some("file:///external/artifact".to_owned()),
+                                    byte_len: Some(artifact_bytes),
+                                    metadata: None,
+                                }],
+                            }),
                         }),
-                    }),
+                    },
                 },
             )
             .await
@@ -5783,14 +5486,15 @@ mod tests {
                 timestamp_ms: 1,
                 session_id,
                 provenance: None,
-                kind: SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call".to_owned(),
-                    result: "done".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: Some(ToolInvocationResult::Artifact {
-                        artifact: Box::new(artifact),
-                    }),
+                kind: SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call".to_owned(),
+                        model_output: "done".to_owned(),
+                        is_error: false,
+                        result: Some(ToolInvocationResult::Artifact {
+                            artifact: Box::new(artifact),
+                        }),
+                    },
                 },
             },
             SessionEvent {
@@ -5836,10 +5540,9 @@ mod tests {
         ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
         ProjectionWindowTarget, ProviderContextSnapshot, ProviderContextSnapshotOrigin,
         ProviderStreamEvent, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-        SessionEventProvenance, SessionForkKind, SessionHistoryDirection, SessionHistoryQuery,
-        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionProjectionKind,
-        SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationResult,
-        ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef, WorkId,
+        SessionEventProvenance, SessionForkKind, SessionHistoryQuery, SessionId, SessionLiveEvent,
+        SessionLiveEventKind, SessionProjectionKind, SessionTraceEvent, SessionTracePayload,
+        SessionTracePhase, ToolInvocationResult, TraceBlobRef, WorkId,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -6127,58 +5830,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_tool_output_delta_is_not_persisted() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should create");
-        let session = manager
-            .create_session(Some("test".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        let mut attachment = manager
-            .attach_session(session.id, ClientId::new())
-            .await
-            .expect("session should attach");
-        let stream_event = ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id: "tool-1".to_string(),
-            stream: ToolOutputStream::Stdout,
-            sequence: 1,
-            text: "live only".to_string(),
-            byte_len: 9,
-        };
-        manager
-            .publish_live_event(
-                session.id,
-                SessionLiveEventKind::ToolOutputDelta {
-                    event: stream_event.clone(),
-                },
-            )
-            .await
-            .expect("live event should publish");
-        let received = attachment
-            .live_events
-            .recv()
-            .await
-            .expect("subscriber should receive live event");
-        assert_eq!(
-            received.kind,
-            SessionLiveEventKind::ToolOutputDelta {
-                event: stream_event
-            }
-        );
-        let persisted = manager
-            .session_history(session.id)
-            .await
-            .expect("history should read");
-        assert!(!persisted.iter().any(|event| matches!(
-            event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta { .. }
-            }
-        )));
-        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
-    }
-
-    #[tokio::test]
     async fn persisted_semantic_result_session_reopens_and_attaches() {
         let root = unique_temp_dir();
         let session_id = {
@@ -6205,35 +5856,36 @@ mod tests {
             manager
                 .append_event(
                     session.id,
-                    SessionEventKind::ToolCallFinished {
-                        tool_call_id: "call-1".to_string(),
-                        result: "legacy fallback".to_string(),
-                        is_error: false,
-                        output: None,
-                        semantic_result: Some(ToolInvocationResult::Artifact {
-                            artifact: Box::new(bcode_session_models::ToolArtifact {
-                                artifact_id: "call-1-shell-run".to_string(),
-                                producer_plugin_id: "test.shell".to_string(),
-                                schema: "test.shell-artifact".to_string(),
-                                schema_version: 1,
-                                tool_call_id: Some("call-1".to_string()),
-                                title: Some("Shell run".to_string()),
-                                metadata: serde_json::json!({
-                                    "mode": "terminal",
-                                    "exit_code": 0,
-                                    "timed_out": false,
-                                    "cancelled": false,
-                                    "duration_ms": null,
-                                    "output_tail": "hello\n",
-                                    "output_truncated": false,
-                                    "output_bytes": 6,
-                                    "retained_output_bytes": 6,
-                                    "columns": 120,
-                                    "rows": 30,
+                    SessionEventKind::ToolInvocationResultRecorded {
+                        record: bcode_session_models::ToolInvocationResultRecord {
+                            invocation_id: "call-1".to_string(),
+                            model_output: "model fallback".to_string(),
+                            is_error: false,
+                            result: Some(ToolInvocationResult::Artifact {
+                                artifact: Box::new(bcode_session_models::ToolArtifact {
+                                    artifact_id: "call-1-shell-run".to_string(),
+                                    producer_plugin_id: "test.shell".to_string(),
+                                    schema: "test.shell-artifact".to_string(),
+                                    schema_version: 1,
+                                    tool_call_id: Some("call-1".to_string()),
+                                    title: Some("Shell run".to_string()),
+                                    metadata: serde_json::json!({
+                                        "mode": "terminal",
+                                        "exit_code": 0,
+                                        "timed_out": false,
+                                        "cancelled": false,
+                                        "duration_ms": null,
+                                        "output_tail": "hello\n",
+                                        "output_truncated": false,
+                                        "output_bytes": 6,
+                                        "retained_output_bytes": 6,
+                                        "columns": 120,
+                                        "rows": 30,
+                                    }),
+                                    refs: Vec::new(),
                                 }),
-                                refs: Vec::new(),
                             }),
-                        }),
+                        },
                     },
                 )
                 .await
@@ -6249,55 +5901,14 @@ mod tests {
 
         assert!(attachment.history.iter().any(|event| matches!(
             &event.kind,
-            SessionEventKind::ToolCallFinished {
-                semantic_result: Some(ToolInvocationResult::Artifact { artifact }),
-                ..
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    result: Some(ToolInvocationResult::Artifact { artifact }),
+                    ..
+                },
             } if artifact.schema == "test.shell-artifact"
                 && artifact.metadata["mode"] == "terminal"
                 && artifact.metadata["output_tail"] == "hello\n"
-        )));
-        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
-    }
-
-    #[tokio::test]
-    async fn old_persisted_session_without_semantic_result_reopens_and_attaches() {
-        let root = unique_temp_dir();
-        let session_id = {
-            let manager = SessionManager::persistent(&root).expect("manager should create");
-            let session = manager
-                .create_session(Some("legacy reopen".to_string()), test_working_directory())
-                .await
-                .expect("session should create");
-            manager
-                .append_event(
-                    session.id,
-                    SessionEventKind::ToolCallFinished {
-                        tool_call_id: "call-legacy".to_string(),
-                        result: "legacy result".to_string(),
-                        is_error: false,
-                        output: None,
-                        semantic_result: None,
-                    },
-                )
-                .await
-                .expect("legacy finish should append");
-            session.id
-        };
-
-        let reopened = SessionManager::persistent(&root).expect("manager should reopen");
-        let attachment = reopened
-            .attach_session(session_id, ClientId::new())
-            .await
-            .expect("legacy session should attach after reopen");
-
-        assert!(attachment.history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id,
-                result,
-                semantic_result: None,
-                ..
-            } if tool_call_id == "call-legacy" && result == "legacy result"
         )));
         std::fs::remove_dir_all(root).expect("temp session dir should be removed");
     }
@@ -6326,109 +5937,6 @@ mod tests {
             receiver.try_recv().expect("event should be available"),
             event
         );
-    }
-
-    #[tokio::test]
-    async fn transient_tool_output_delta_is_not_persisted() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should create");
-        let session = manager
-            .create_session(Some("test".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        let mut attachment = manager
-            .attach_session(session.id, ClientId::new())
-            .await
-            .expect("session should attach");
-        let stream_event = ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id: "tool-1".to_string(),
-            stream: ToolOutputStream::Stdout,
-            sequence: 1,
-            text: "live only".to_string(),
-            byte_len: 9,
-        };
-        manager
-            .publish_transient_event(
-                session.id,
-                SessionEventKind::ToolInvocationStream {
-                    event: stream_event.clone(),
-                },
-            )
-            .await
-            .expect("transient event should publish");
-        let received = loop {
-            let event = attachment
-                .events
-                .recv()
-                .await
-                .expect("subscriber should receive transient event");
-            if matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }) {
-                break event;
-            }
-        };
-        assert_eq!(
-            received.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: stream_event
-            }
-        );
-        let persisted = manager
-            .session_history(session.id)
-            .await
-            .expect("history should read");
-        assert!(!persisted.iter().any(|event| matches!(
-            event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta { .. }
-            }
-        )));
-        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
-    }
-
-    #[test]
-    fn tool_stream_session_event_round_trips_through_bmux_codec() {
-        let session_id = bcode_session_models::SessionId::new();
-        let event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 0,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call".to_string(),
-                    stream: ToolOutputStream::Stdout,
-                    sequence: 1,
-                    text: "output".to_string(),
-                    byte_len: 6,
-                },
-            },
-        };
-
-        let bytes = bmux_codec::to_vec(&event).expect("tool stream event should encode");
-        let decoded: SessionEvent =
-            bmux_codec::from_bytes(&bytes).expect("tool stream event should decode");
-
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn tool_stream_trace_payload_round_trips_through_bmux_codec() {
-        let payload = SessionTracePayload::ToolInvocationStreamEvent(
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call".to_string(),
-                stream: ToolOutputStream::Stdout,
-                sequence: 1,
-                text: "output".to_string(),
-                byte_len: 6,
-            },
-        );
-
-        let bytes = bmux_codec::to_vec(&payload).expect("tool stream payload should encode");
-        let decoded: SessionTracePayload =
-            bmux_codec::from_bytes(&bytes).expect("tool stream payload should decode");
-
-        assert_eq!(decoded, payload);
     }
 
     #[test]
@@ -6638,12 +6146,13 @@ mod tests {
         manager
             .append_event(
                 session.id,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "tool-1".to_string(),
-                    result: "ok".to_string(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "tool-1".to_string(),
+                        model_output: "ok".to_string(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             )
             .await
@@ -6720,8 +6229,10 @@ mod tests {
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
-            SessionEventKind::ToolCallFinished { tool_call_id, result, is_error, .. }
-                if tool_call_id == "tool-1" && result == "ok" && !is_error
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.invocation_id == "tool-1"
+                    && record.model_output == "ok"
+                    && !record.is_error
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
@@ -8031,103 +7542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_storage_migration_replays_presentation_diff_sections() {
-        let root = unique_temp_dir();
-        let session_id = {
-            let manager = SessionManager::persistent(&root).expect("manager should initialize");
-            let session = manager
-                .create_session(Some("legacy diff".to_owned()), test_working_directory())
-                .await
-                .expect("session should create");
-            let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
-                .await
-                .expect("fixture database should open");
-            let payload = serde_json::json!({
-                "schema_version": 25,
-                "sequence": 1,
-                "timestamp_ms": 1,
-                "session_id": session.id,
-                "provenance": null,
-                "kind": {
-                    "tool_invocation_stream": {
-                        "event": {
-                            "presentation": {
-                                "tool_call_id": "call-1",
-                                "sequence": 1,
-                                "presentation": {
-                                    "card": {
-                                        "target": "preview",
-                                        "title": "Edit preview",
-                                        "sections": [{
-                                            "type": "diff",
-                                            "path": "/tmp/file.rs",
-                                            "old_text": "before",
-                                            "new_text": "after"
-                                        }]
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-            .to_string();
-            db.database()
-                .insert("events")
-                .value("event_seq", switchy::database::DatabaseValue::Int64(1))
-                .value("event_type", "tool_invocation_stream")
-                .value(
-                    "schema_version",
-                    switchy::database::DatabaseValue::Int32(25),
-                )
-                .value("created_at_ms", switchy::database::DatabaseValue::Int64(1))
-                .value("payload", switchy::database::DatabaseValue::String(payload))
-                .execute(db.database())
-                .await
-                .expect("legacy diff payload should insert");
-            db.database()
-                .update("session_storage_contract")
-                .value(
-                    "writer_epoch",
-                    switchy::database::DatabaseValue::Int64(i64::from(
-                        db::LEGACY_SESSION_STORAGE_WRITER_EPOCH,
-                    )),
-                )
-                .execute(db.database())
-                .await
-                .expect("writer epoch should become legacy");
-            session.id
-        };
-
-        let manager = SessionManager::persistent(&root).expect("manager should reopen");
-        let terminal = prepare_session_until_terminal(&manager, session_id).await;
-        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
-        manager
-            .require_write_readiness(session_id)
-            .await
-            .expect("prepared legacy diff session should be writable");
-        let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
-            .await
-            .expect("migrated database should open");
-        assert_eq!(
-            migrated.storage_writer_epoch().await.expect("writer epoch"),
-            u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
-        );
-        assert!(matches!(
-            migrated
-                .all_events_strict()
-                .await
-                .expect("migrated history should decode")[1]
-                .kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation { .. }
-            }
-        ));
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn detached_preparation_migrates_missing_legacy_contract_before_load() {
+    async fn exclusive_load_automatically_migrates_missing_legacy_contract() {
         let root = unique_temp_dir();
         let session_id = {
             let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -9156,56 +8571,24 @@ mod tests {
                 include_str!("../fixtures/migrations/future-schema-v40.json"),
             ),
             (
-                "interactive-tool-request-created-v32.json",
-                include_str!("../fixtures/migrations/interactive-tool-request-created-v32.json"),
+                "malformed-json-v39.json",
+                include_str!("../fixtures/migrations/malformed-json-v39.json"),
             ),
             (
-                "interactive-tool-request-resolved-v32.json",
-                include_str!("../fixtures/migrations/interactive-tool-request-resolved-v32.json"),
+                "mismatched-session-id-v39.json",
+                include_str!("../fixtures/migrations/mismatched-session-id-v39.json"),
             ),
             (
-                "interactive-tool-request-unresolved-v32.json",
-                include_str!("../fixtures/migrations/interactive-tool-request-unresolved-v32.json"),
+                "plugin-status-note-v39.json",
+                include_str!("../fixtures/migrations/plugin-status-note-v39.json"),
             ),
             (
-                "malformed-json-v38.json",
-                include_str!("../fixtures/migrations/malformed-json-v38.json"),
+                "unknown-future-event-kind-v39.json",
+                include_str!("../fixtures/migrations/unknown-future-event-kind-v39.json"),
             ),
             (
-                "mismatched-session-id-v38.json",
-                include_str!("../fixtures/migrations/mismatched-session-id-v38.json"),
-            ),
-            (
-                "plugin-automation-turn-finished-v29.json",
-                include_str!("../fixtures/migrations/plugin-automation-turn-finished-v29.json"),
-            ),
-            (
-                "plugin-automation-turn-started-v29.json",
-                include_str!("../fixtures/migrations/plugin-automation-turn-started-v29.json"),
-            ),
-            (
-                "plugin-status-note-v29.json",
-                include_str!("../fixtures/migrations/plugin-status-note-v29.json"),
-            ),
-            (
-                "tool-presentation-diff-v25.json",
-                include_str!("../fixtures/migrations/tool-presentation-diff-v25.json"),
-            ),
-            (
-                "unknown-future-event-kind-v38.json",
-                include_str!("../fixtures/migrations/unknown-future-event-kind-v38.json"),
-            ),
-            (
-                "unknown-old-event-kind-v32.json",
-                include_str!("../fixtures/migrations/unknown-old-event-kind-v32.json"),
-            ),
-            (
-                "mixed-interactive-history-v32-v35.jsonl",
-                include_str!("../fixtures/migrations/mixed-interactive-history-v32-v35.jsonl"),
-            ),
-            (
-                "sequence-gap-v38.jsonl",
-                include_str!("../fixtures/migrations/sequence-gap-v38.jsonl"),
+                "sequence-gap-v39.jsonl",
+                include_str!("../fixtures/migrations/sequence-gap-v39.jsonl"),
             ),
         ];
         let mut expected = BTreeMap::new();
@@ -9282,319 +8665,6 @@ mod tests {
                 "catalog discovery must not mutate fixture {fixture_name}"
             );
         }
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_history() {
-        let root = unique_temp_dir();
-        let session_id = SessionId::new();
-        let db = db::SessionDb::open_turso_in_root(session_id, &root)
-            .await
-            .expect("session DB should initialize");
-        db.append_event(&bcode_session_models::SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 0,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::SessionCreated {
-                name: Some("mixed fixture".to_owned()),
-                working_directory: test_working_directory(),
-            },
-        })
-        .await
-        .expect("session-created event should append");
-
-        for (offset, fixture) in
-            include_str!("../fixtures/migrations/mixed-interactive-history-v32-v35.jsonl")
-                .lines()
-                .enumerate()
-        {
-            let sequence = u64::try_from(offset).expect("fixture offset should fit") + 1;
-            let mut payload: serde_json::Value =
-                serde_json::from_str(fixture).expect("fixture should be valid JSON");
-            let schema_version = payload["schema_version"]
-                .as_u64()
-                .and_then(|version| i32::try_from(version).ok())
-                .expect("fixture schema should fit");
-            let event_type = payload["kind"]
-                .as_object()
-                .and_then(|kind| kind.keys().next())
-                .expect("fixture should have one event kind")
-                .clone();
-            payload["sequence"] = sequence.into();
-            payload["session_id"] = serde_json::to_value(session_id).expect("session ID JSON");
-            db.database()
-                .insert("events")
-                .value(
-                    "event_seq",
-                    switchy::database::DatabaseValue::Int64(
-                        i64::try_from(sequence).expect("sequence should fit"),
-                    ),
-                )
-                .value("event_type", event_type)
-                .value(
-                    "schema_version",
-                    switchy::database::DatabaseValue::Int32(schema_version),
-                )
-                .value(
-                    "created_at_ms",
-                    switchy::database::DatabaseValue::Int64(
-                        payload["timestamp_ms"]
-                            .as_i64()
-                            .expect("fixture timestamp should fit"),
-                    ),
-                )
-                .value("payload", payload.to_string())
-                .execute(db.database())
-                .await
-                .expect("fixture event should insert");
-        }
-        let mut unresolved: serde_json::Value = serde_json::from_str(include_str!(
-            "../fixtures/migrations/interactive-tool-request-unresolved-v32.json"
-        ))
-        .expect("unresolved fixture JSON");
-        unresolved["sequence"] = 4_u64.into();
-        unresolved["session_id"] =
-            serde_json::to_value(session_id).expect("unresolved session ID JSON");
-        db.database()
-            .insert("events")
-            .value("event_seq", switchy::database::DatabaseValue::Int64(4))
-            .value("event_type", "interactive_tool_request_created")
-            .value(
-                "schema_version",
-                switchy::database::DatabaseValue::Int32(32),
-            )
-            .value(
-                "created_at_ms",
-                switchy::database::DatabaseValue::Int64(
-                    unresolved["timestamp_ms"].as_i64().expect("timestamp"),
-                ),
-            )
-            .value("payload", unresolved.to_string())
-            .execute(db.database())
-            .await
-            .expect("unresolved fixture event should insert");
-        db.database()
-            .update("session_storage_contract")
-            .value("writer_epoch", switchy::database::DatabaseValue::Int64(3))
-            .where_eq("contract_id", switchy::database::DatabaseValue::Int32(1))
-            .execute(db.database())
-            .await
-            .expect("fixture store should represent epoch three");
-        db.database()
-            .delete("__bcode_session_migrations")
-            .where_in(
-                "id",
-                vec![
-                    switchy::database::DatabaseValue::String(
-                        "028_session_compatibility_state".to_owned(),
-                    ),
-                    switchy::database::DatabaseValue::String(
-                        "029_session_compatibility_issues".to_owned(),
-                    ),
-                    switchy::database::DatabaseValue::String(
-                        "030_session_state_visibility_column".to_owned(),
-                    ),
-                    switchy::database::DatabaseValue::String(
-                        "031_session_state_execution_provenance_column".to_owned(),
-                    ),
-                ],
-            )
-            .execute(db.database())
-            .await
-            .expect("epoch-four migration ledger should clear");
-        db.database()
-            .exec_raw("ALTER TABLE session_state DROP COLUMN execution_provenance")
-            .await
-            .expect("execution provenance column should drop");
-        db.database()
-            .exec_raw("ALTER TABLE session_state DROP COLUMN visibility")
-            .await
-            .expect("visibility column should drop");
-        db.database()
-            .exec_raw("DROP TABLE session_compatibility_issues")
-            .await
-            .expect("compatibility issues should drop");
-        db.database()
-            .exec_raw("DROP TABLE session_compatibility_state")
-            .await
-            .expect("compatibility state should drop");
-        drop(db);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let before_discovery = session_database_files(&root, session_id);
-        let metrics = MetricsRegistry::in_memory();
-        let manager = SessionManager::persistent_with_metrics(&root, metrics.clone())
-            .expect("manager should initialize");
-        let entry = manager
-            .all_session_catalog_entries()
-            .await
-            .into_iter()
-            .find(|entry| entry.summary.id == session_id)
-            .expect("fixture session should be discovered");
-        assert_eq!(entry.load_status, SessionCatalogLoadStatus::SummaryOnly);
-        assert_eq!(
-            manager.session_health(session_id).await,
-            SessionHealth::WriterIncompatible {
-                actual: Some(3),
-                expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
-            }
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            session_database_files(&root, session_id),
-            before_discovery,
-            "catalog discovery and health classification must not mutate fixture storage"
-        );
-
-        let terminal = prepare_session_until_terminal(&manager, session_id).await;
-        assert_eq!(terminal.outcome, Some(SessionOpenTerminalOutcome::Ready));
-        let attachment = manager
-            .attach_session_recent(session_id, ClientId::new(), 10)
-            .await
-            .expect("prepared known-legacy fixture should attach");
-        assert_eq!(
-            attachment
-                .history
-                .iter()
-                .map(|event| event.sequence)
-                .collect::<Vec<_>>(),
-            vec![3],
-            "inert legacy events must not be fabricated as transcript entries"
-        );
-        let page = manager
-            .session_history_page(
-                session_id,
-                SessionHistoryQuery {
-                    cursor: None,
-                    direction: SessionHistoryDirection::Forward,
-                    limit: 10,
-                },
-            )
-            .await
-            .expect("bounded canonical history should load");
-        assert_eq!(
-            page.events
-                .iter()
-                .map(|event| event.sequence)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
-        );
-        assert!(matches!(
-            &page.events[1].kind,
-            SessionEventKind::LegacyEvent { event_type, .. }
-                if event_type == "interactive_tool_request_created"
-        ));
-        assert!(matches!(
-            &page.events[2].kind,
-            SessionEventKind::LegacyEvent { event_type, .. }
-                if event_type == "interactive_tool_request_resolved"
-        ));
-        assert!(matches!(
-            &page.events[3].kind,
-            SessionEventKind::AssistantMessage { text }
-                if text == "history continued under schema 35"
-        ));
-        assert!(matches!(
-            &page.events[4].kind,
-            SessionEventKind::LegacyEvent { event_type, .. }
-                if event_type == "interactive_tool_request_created"
-        ));
-        assert_eq!(
-            manager.session_health(session_id).await,
-            SessionHealth::Ready
-        );
-        let migrated = db::SessionDb::open_existing_turso_in_root(session_id, &root)
-            .await
-            .expect("migrated fixture DB should open");
-        assert_eq!(
-            migrated
-                .last_event_sequence()
-                .await
-                .expect("canonical tail"),
-            Some(4)
-        );
-        assert!(
-            migrated
-                .active_runtime_work()
-                .await
-                .expect("runtime projection")
-                .is_empty()
-        );
-        assert!(
-            migrated
-                .active_tool_runs()
-                .await
-                .expect("tool projection")
-                .is_empty()
-        );
-        let model_context = manager
-            .model_context_events(session_id)
-            .await
-            .expect("bounded migrated model context");
-        assert_eq!(model_context.len(), 1);
-        assert!(matches!(
-            &model_context[0].kind,
-            SessionEventKind::AssistantMessage { text }
-                if text == "history continued under schema 35"
-        ));
-        let report = metrics.report();
-        for metric in [
-            "session.migration.ownership_duration_ms",
-            "session.migration.backup.plan_duration_ms",
-            "session.migration.backup.copy_duration_ms",
-            "session.migration.backup.verify_duration_ms",
-            "session.migration.schema_duration_ms",
-            "session.migration.canonical_decode_duration_ms",
-            "session.migration.projection_rebuild_duration_ms",
-            "session.migration.projector.materialized_duration_ms",
-            "session.migration.projector.model_context_duration_ms",
-            "session.migration.projector.context_occupancy_duration_ms",
-            "session.migration.projector.turn_receipt_duration_ms",
-            "session.migration.projector.compatibility_duration_ms",
-            "session.migration.validation_duration_ms",
-            "session.migration.commit_duration_ms",
-            "session.migration.write_readiness_duration_ms",
-        ] {
-            assert!(
-                report.snapshot.histograms.contains_key(metric),
-                "missing migration stage metric {metric}"
-            );
-        }
-        assert_eq!(
-            report
-                .snapshot
-                .counters
-                .get("session.migration.canonical_events_total"),
-            Some(&5)
-        );
-        assert_eq!(
-            report
-                .snapshot
-                .counters
-                .get("session.migration.projected_events_total"),
-            Some(&5)
-        );
-        assert!(
-            report
-                .snapshot
-                .counters
-                .get("session.migration.backup.files_total")
-                .is_some_and(|files| *files > 0)
-        );
-        assert!(
-            report
-                .snapshot
-                .counters
-                .get("session.migration.backup.bytes_total")
-                .is_some_and(|bytes| *bytes > 0)
-        );
-        drop(migrated);
-        drop(manager);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -10775,23 +9845,10 @@ mod tests {
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             (
                 7,
-                "ToolCallFinished",
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call".to_string(),
-                    result: "ok".to_string(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
-                },
-            ),
-            (
-                8,
                 "PermissionRequested",
                 SessionEventKind::PermissionRequested {
                     permission_id: "permission".to_string(),
@@ -10799,14 +9856,13 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
-                    legacy_request_presentation: None,
                     batch: None,
                     policy_source: None,
                     policy_reason: None,
                 },
             ),
             (
-                9,
+                8,
                 "PermissionResolved",
                 SessionEventKind::PermissionResolved {
                     permission_id: "permission".to_string(),
@@ -10814,7 +9870,7 @@ mod tests {
                 },
             ),
             (
-                10,
+                9,
                 "ModelChanged",
                 SessionEventKind::ModelChanged {
                     provider: "provider".to_string(),
@@ -10822,28 +9878,28 @@ mod tests {
                 },
             ),
             (
-                11,
+                10,
                 "SystemMessage",
                 SessionEventKind::SystemMessage {
                     text: "system".to_string(),
                 },
             ),
             (
-                12,
+                11,
                 "AgentChanged",
                 SessionEventKind::AgentChanged {
                     agent_id: "build".to_string(),
                 },
             ),
             (
-                13,
+                12,
                 "ModelTurnStarted",
                 SessionEventKind::ModelTurnStarted {
                     turn_id: "turn".to_string(),
                 },
             ),
             (
-                14,
+                13,
                 "ModelTurnFinished",
                 SessionEventKind::ModelTurnFinished {
                     turn_id: "turn".to_string(),
@@ -10852,7 +9908,7 @@ mod tests {
                 },
             ),
             (
-                15,
+                14,
                 "ModelUsage",
                 SessionEventKind::ModelUsage {
                     turn_id: "turn".to_string(),
@@ -10867,7 +9923,7 @@ mod tests {
                 },
             ),
             (
-                16,
+                15,
                 "ContextCompacted",
                 SessionEventKind::ContextCompacted {
                     summary: "summary".to_string(),
@@ -10875,14 +9931,14 @@ mod tests {
                 },
             ),
             (
-                17,
+                16,
                 "SessionRenamed",
                 SessionEventKind::SessionRenamed {
                     name: Some("renamed".to_string()),
                 },
             ),
             (
-                18,
+                17,
                 "TraceEvent",
                 SessionEventKind::TraceEvent {
                     trace: Box::new(SessionTraceEvent {
@@ -10897,7 +9953,7 @@ mod tests {
                 },
             ),
             (
-                19,
+                18,
                 "SkillInvoked",
                 SessionEventKind::SkillInvoked {
                     skill_id: skill_id.clone(),
@@ -10907,7 +9963,7 @@ mod tests {
                 },
             ),
             (
-                20,
+                19,
                 "SkillSuggested",
                 SessionEventKind::SkillSuggested {
                     skill_id: skill_id.clone(),
@@ -10916,7 +9972,7 @@ mod tests {
                 },
             ),
             (
-                21,
+                20,
                 "SkillActivated",
                 SessionEventKind::SkillActivated {
                     skill_id: skill_id.clone(),
@@ -10926,7 +9982,7 @@ mod tests {
                 },
             ),
             (
-                22,
+                21,
                 "SkillDeactivated",
                 SessionEventKind::SkillDeactivated {
                     skill_id: skill_id.clone(),
@@ -10934,7 +9990,7 @@ mod tests {
                 },
             ),
             (
-                23,
+                22,
                 "SkillContextLoaded",
                 SessionEventKind::SkillContextLoaded {
                     skill_id: skill_id.clone(),
@@ -10946,7 +10002,7 @@ mod tests {
                 },
             ),
             (
-                24,
+                23,
                 "SkillInvocationFailed",
                 SessionEventKind::SkillInvocationFailed {
                     skill_id,
@@ -10955,21 +10011,21 @@ mod tests {
                 },
             ),
             (
-                25,
+                24,
                 "AssistantReasoningDelta",
                 SessionEventKind::AssistantReasoningDelta {
                     text: "reasoning".to_string(),
                 },
             ),
             (
-                26,
+                25,
                 "AssistantReasoningMessage",
                 SessionEventKind::AssistantReasoningMessage {
                     text: "reasoning".to_string(),
                 },
             ),
             (
-                27,
+                26,
                 "RuntimeWorkStarted",
                 SessionEventKind::RuntimeWorkStarted {
                     work_id: WorkId::new("work"),
@@ -10985,7 +10041,7 @@ mod tests {
                 },
             ),
             (
-                28,
+                27,
                 "RuntimeWorkCancelRequested",
                 SessionEventKind::RuntimeWorkCancelRequested {
                     work_id: WorkId::new("work"),
@@ -10994,7 +10050,7 @@ mod tests {
                 },
             ),
             (
-                29,
+                28,
                 "RuntimeWorkFinished",
                 SessionEventKind::RuntimeWorkFinished {
                     work_id: WorkId::new("work"),
@@ -11004,7 +10060,7 @@ mod tests {
                 },
             ),
             (
-                30,
+                29,
                 "RuntimeWorkProgress",
                 SessionEventKind::RuntimeWorkProgress {
                     work_id: WorkId::new("work"),
@@ -11015,7 +10071,7 @@ mod tests {
                 },
             ),
             (
-                31,
+                30,
                 "ModelTurnCancelRequested",
                 SessionEventKind::ModelTurnCancelRequested {
                     turn_id: "turn".to_string(),
@@ -11024,20 +10080,7 @@ mod tests {
                 },
             ),
             (
-                32,
-                "ToolInvocationStream",
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "call".to_string(),
-                        stream: ToolOutputStream::Stdout,
-                        sequence: 1,
-                        text: "output".to_string(),
-                        byte_len: 6,
-                    },
-                },
-            ),
-            (
-                33,
+                31,
                 "WorkingDirectoryChanged",
                 SessionEventKind::WorkingDirectoryChanged {
                     old_working_directory: test_working_directory(),
@@ -11045,7 +10088,7 @@ mod tests {
                 },
             ),
             (
-                34,
+                32,
                 "SessionImported",
                 SessionEventKind::SessionImported {
                     source_id: "pi".to_string(),
@@ -11055,7 +10098,7 @@ mod tests {
                 },
             ),
             (
-                35,
+                33,
                 "SessionForked",
                 SessionEventKind::SessionForked {
                     source_session_id: SessionId::new(),
@@ -11067,7 +10110,7 @@ mod tests {
                 },
             ),
             (
-                36,
+                34,
                 "RalphLifecycle",
                 SessionEventKind::RalphLifecycle {
                     loop_name: "loop".to_string(),
@@ -11078,7 +10121,7 @@ mod tests {
                 },
             ),
             (
-                37,
+                35,
                 "ReasoningChanged",
                 SessionEventKind::ReasoningChanged {
                     effort: Some("medium".to_string()),
@@ -11086,7 +10129,7 @@ mod tests {
                 },
             ),
             (
-                40,
+                38,
                 "ProviderContextCompacted",
                 SessionEventKind::ProviderContextCompacted {
                     snapshot: bcode_session_models::ProviderContextSnapshot {
@@ -11106,7 +10149,7 @@ mod tests {
                 },
             ),
             (
-                41,
+                39,
                 "RequestContextObserved",
                 SessionEventKind::RequestContextObserved {
                     observation: bcode_session_models::RequestContextObservation {
@@ -11135,7 +10178,7 @@ mod tests {
                 },
             ),
             (
-                42,
+                40,
                 "PluginStatusNote",
                 SessionEventKind::PluginStatusNote {
                     plugin_id: "plugin".to_string(),
@@ -11145,15 +10188,15 @@ mod tests {
                 },
             ),
             (
-                43,
-                "LegacyEvent",
-                SessionEventKind::LegacyEvent {
+                41,
+                "OpaqueEvent",
+                SessionEventKind::OpaqueEvent {
                     event_type: "legacy".to_string(),
                     payload: serde_json::Value::Null,
                 },
             ),
             (
-                44,
+                42,
                 "ToolInvocationLifecycle",
                 SessionEventKind::ToolInvocationLifecycle {
                     event: bcode_session_models::ToolInvocationLifecycleEvent {
@@ -11166,7 +10209,7 @@ mod tests {
                 },
             ),
             (
-                45,
+                43,
                 "ToolContribution",
                 SessionEventKind::ToolContribution {
                     event: bcode_session_models::ToolContributionEvent {
@@ -11184,7 +10227,7 @@ mod tests {
                 },
             ),
             (
-                38,
+                36,
                 "ToolExchangeRequested",
                 SessionEventKind::ToolExchangeRequested {
                     request: bcode_session_models::ToolExchangeRequest {
@@ -11199,7 +10242,7 @@ mod tests {
                 },
             ),
             (
-                39,
+                37,
                 "ToolExchangeResolved",
                 SessionEventKind::ToolExchangeResolved {
                     event: bcode_session_models::ToolExchangeResolutionEvent {
@@ -11212,8 +10255,8 @@ mod tests {
                 },
             ),
             (
-                46,
-                "ToolContributionResultRecorded",
+                44,
+                "ToolInvocationResultRecorded",
                 SessionEventKind::ToolInvocationResultRecorded {
                     record: bcode_session_models::ToolInvocationResultRecord {
                         invocation_id: "call".to_owned(),
@@ -11224,7 +10267,7 @@ mod tests {
                 },
             ),
             (
-                47,
+                45,
                 "ToolContributionPlaced",
                 SessionEventKind::ToolContributionPlaced {
                     envelope: bcode_session_models::ToolContributionEnvelope::new(
@@ -11431,19 +10474,6 @@ mod tests {
                 8,
                 "ProviderStreamEvent",
                 SessionTracePayload::ProviderStreamEvent(ProviderStreamEvent::TurnStarted),
-            ),
-            (
-                9,
-                "ToolInvocationStreamEvent",
-                SessionTracePayload::ToolInvocationStreamEvent(
-                    ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "call".to_string(),
-                        stream: ToolOutputStream::Stdout,
-                        sequence: 1,
-                        text: "output".to_string(),
-                        byte_len: 6,
-                    },
-                ),
             ),
         ]
     }

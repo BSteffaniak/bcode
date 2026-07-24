@@ -4,7 +4,6 @@ use bcode::{
     Agent, Bcode, HeadlessExchangePolicy, ToolCall, ToolDefinition, ToolExchangeResolution,
     ToolInvocationResponse,
 };
-use bcode_tool::{ToolPolicyMetadata, ToolUiMetadata};
 use std::sync::{Arc, Mutex};
 
 fn definition() -> ToolDefinition {
@@ -12,9 +11,6 @@ fn definition() -> ToolDefinition {
         name: "question".to_string(),
         description: "question exchange test".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 

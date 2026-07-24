@@ -39,6 +39,19 @@ impl RustPlugin for GitPlugin {
     }
 }
 
+fn git_policy_preparation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> bcode_plugin_sdk::ToolPolicyPreparation {
+    bcode_plugin_sdk::ToolPolicyPreparation::new(true, git_policy_operation(request, definition))
+        .with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
+            aliases: Vec::new(),
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
+            permission_category: Some("write".to_string()),
+        })
+}
+
 fn git_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     _definition: &ToolDefinition,
@@ -64,7 +77,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             request,
             [clone_tool_definition(), github_clone_alias_definition()],
-            |request, definition| Ok(git_policy_operation(request, definition)),
+            |request, definition| Ok(git_policy_preparation(request, definition)),
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -392,17 +405,6 @@ fn clone_tool_definition() -> ToolDefinition {
                 "destination": { "type": "string" }
             }
         }),
-        requires_permission: true,
-        policy: bcode_tool::ToolPolicyMetadata {
-            aliases: Vec::new(),
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some("write".to_string()),
-        },
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("cloning".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -516,8 +518,6 @@ mod tests {
 
     #[test]
     fn clone_request_uses_durable_generic_contribution_without_legacy_visual() {
-        let definition = clone_tool_definition();
-        assert!(definition.ui.request_visual.is_none());
         let contribution = clone_request_contribution(
             "call-1",
             &CloneRequest {
@@ -539,6 +539,31 @@ mod tests {
             "https://github.com/bmorphism/bcode"
         );
         assert_eq!(contribution.payload["ref"], "main");
+    }
+
+    #[test]
+    fn git_owner_prepares_permission_required_clone_policy() {
+        let definition = clone_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::json!({
+                    "url": "https://github.com/bmorphism/bcode",
+                    "destination": "/tmp/bcode"
+                }),
+            },
+            host_context: Vec::new(),
+        };
+        let policy = git_policy_preparation(&request, &definition);
+        assert!(policy.requires_permission);
+        assert_eq!(
+            policy.operation,
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths: vec!["/tmp/bcode".to_owned()],
+                category: "write".to_owned(),
+            }
+        );
     }
 
     #[test]

@@ -28,8 +28,7 @@ use bcode_plugin_sdk::tui::{
     PluginSessionEventSubscriptionRequest, PluginTuiAction, PluginTuiHost, PluginTuiSurface,
 };
 use bcode_session_models::{
-    LiveToolArgumentPreview, ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId,
-    SessionLiveEventKind,
+    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionLiveEventKind,
 };
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
@@ -3334,18 +3333,13 @@ impl ReviewAgentSessionStreamState {
                 self.status = format!("running tool: {tool_name}");
                 self.activity = Some(format!("tool: {tool_name}"));
             }
-            SessionEventKind::ToolCallFinished { is_error, .. } => {
-                self.activity = Some(if is_error {
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                self.activity = Some(if record.is_error {
                     "tool failed".to_string()
                 } else {
                     "tool finished".to_string()
                 });
                 self.status = self.activity.clone().unwrap_or_default();
-            }
-            SessionEventKind::ToolInvocationStream { .. } => {
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = "running tool…".to_string();
-                self.activity = Some("tool output streaming…".to_string());
             }
             _ => {}
         }
@@ -3369,23 +3363,11 @@ impl ReviewAgentSessionStreamState {
                 self.phase = ReviewAgentThreadPhase::Running;
                 self.status = "thinking…".to_string();
             }
-            SessionLiveEventKind::ToolOutputDelta { .. }
-            | SessionLiveEventKind::ToolContribution { .. }
+            SessionLiveEventKind::ToolContribution { .. }
             | SessionLiveEventKind::ToolContributionPlaced { .. } => {
                 self.phase = ReviewAgentThreadPhase::Running;
                 self.status = "running tool…".to_string();
                 self.activity = Some("tool output streaming…".to_string());
-            }
-            SessionLiveEventKind::ToolArgumentPreview {
-                turn_id,
-                tool_name,
-                preview,
-                ..
-            } => {
-                self.active_turn_id = Some(turn_id);
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = live_tool_preview_status(&tool_name, &preview);
-                self.activity = Some(format!("tool: {}", self.status));
             }
             SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
             SessionLiveEventKind::ProviderStreamProgress { turn_id, .. } => {
@@ -3452,15 +3434,6 @@ impl ReviewAgentSessionStreamState {
         }
         answer
     }
-}
-
-fn live_tool_preview_status(tool_name: &str, preview: &LiveToolArgumentPreview) -> String {
-    preview
-        .streaming_status
-        .as_deref()
-        .or(preview.visual.subtitle.as_deref())
-        .or(preview.visual.title.as_deref())
-        .map_or_else(|| format!("preparing {tool_name}"), ToString::to_string)
 }
 
 /// Draft comment editor mode.

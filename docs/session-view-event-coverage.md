@@ -58,7 +58,7 @@ Status meanings:
 | `ProviderContextCompacted` | Clears stale occupancy and appends portable provider/model compaction status. | Appends provider compaction presentation. | **Complete** for portable semantic status. |
 | `RequestContextObserved` | Projects authoritative occupancy from the durable observation with epoch/sequence stale-update rejection. | Footer context accounting consumes shared occupancy; attach/model-status hydration updates the same shared state. | **Complete** for authoritative occupancy semantics. |
 | `PluginStatusNote` | Upserts plugin/note-keyed structured status and one stable transcript item. | TUI transcript projection renders durable plugin status and the statusline consumes shared hydrated plugin-status semantics. | **Complete** for durable and hydrated status-note semantics. |
-| `LegacyEvent` | No-op. | Compatibility-only event with no application behavior. | **Intentional no-op**. |
+| `OpaqueEvent` | No-op. | Unknown-schema event with a trustworthy envelope and no application behavior. | **Intentional no-op**. |
 
 ## Live `SessionLiveEventKind` coverage
 
@@ -66,8 +66,8 @@ Status meanings:
 |---|---|---|---|
 | `AssistantTextDelta` | Cumulatively updates the active assistant item with stable semantic identity. | Upserts terminal presentation by shared `TranscriptViewItemId` while retaining renderer-local identity and anchoring. | **Complete** for semantic content and canonical projection consumption. |
 | `AssistantReasoningDelta` | Cumulatively updates reasoning item and thinking state without overriding renderer-selected visibility. | Upserts terminal reasoning presentation by shared `TranscriptViewItemId` while preserving split-stream boundaries and anchoring. | **Complete** for semantic content, visibility, and canonical projection consumption. |
-| `ToolOutputDelta` | Applies the stream event to shared tool projection/output. | Updates terminal tool output and viewport. | **Complete** for generic semantic output. |
-| `ToolArgumentPreview` | Replaces one tool-call-keyed plugin visual preview with stable identity. | Updates terminal live preview and viewport. | **Complete** for semantic preview state; viewport behavior remains renderer-owned. |
+The former `ToolArgumentPreview` and `ToolOutputDelta` channels were removed. Plugin-owned transient contributions and durable request visuals now carry tool visual updates without host-projected partial-argument or output events.
+
 | `RequestContextOccupancyChanged` | Replaces authoritative current occupancy while rejecting stale epoch/sequence updates. | Footer context accounting consumes shared occupancy. | **Complete**. |
 | `ProviderStreamProgress` | Projects turn-correlated human-readable progress and retry timing. | Live provider-stream activity consumes the shared projected detail/timing; trace-only diagnostics remain terminal-local. | **Complete** for semantic progress; animation/timers remain renderer-owned. |
 

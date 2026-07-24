@@ -45,8 +45,6 @@ pub struct ToolInvocationProjection {
     pub arguments_json: Option<String>,
     /// Working directory captured for this invocation.
     pub working_directory: Option<PathBuf>,
-    /// Plugin-owned request visual reconstructed at request time.
-    pub request_visual: Option<PluginVisualDescriptor>,
     /// Current lifecycle status.
     pub status: ToolInvocationProjectionStatus,
     /// Raw final text result returned by the tool, when finished.
@@ -55,10 +53,6 @@ pub struct ToolInvocationProjection {
     pub is_error: Option<bool>,
     /// Raw semantic result returned by the tool.
     pub raw_result: Option<ToolInvocationResult>,
-    /// Raw terminal/text stream output observed for the tool.
-    pub stream_output: Option<ToolInvocationProjectionStreamOutput>,
-    /// Legacy persisted presentation events, retained only as compatibility facts.
-    pub legacy_presentations: Vec<LegacyToolPresentationEvent>,
     /// Tool start time as UNIX epoch milliseconds, when known.
     pub started_at_ms: Option<u64>,
     /// Tool finish time as UNIX epoch milliseconds, when known.
@@ -71,21 +65,10 @@ pub enum ToolInvocationProjectionStatus {
     /// Request was observed but no stream/final result has been seen.
     #[default]
     Requested,
-    /// Stream lifecycle/output was observed.
+    /// Canonical invocation lifecycle reported the tool as running.
     Running,
     /// Final result was observed.
     Finished,
-}
-
-/// Renderer-neutral raw stream output captured for a tool invocation.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ToolInvocationProjectionStreamOutput {
-    /// Raw stream output text.
-    pub output: String,
-    /// Terminal columns reported by the producer.
-    pub columns: Option<u16>,
-    /// Terminal rows reported by the producer.
-    pub rows: Option<u16>,
 }
 
 /// Build renderer-neutral tool invocation projections from chronological session events.
@@ -130,7 +113,6 @@ pub fn apply_tool_invocation_projection_event(
             tool_name,
             arguments_json,
             working_directory,
-            request_visual,
             ..
         } => {
             let projection = tool_invocation_projection_mut(projections, tool_call_id);
@@ -138,23 +120,6 @@ pub fn apply_tool_invocation_projection_event(
             projection.tool_name = Some(tool_name.clone());
             projection.arguments_json = Some(arguments_json.clone());
             projection.working_directory.clone_from(working_directory);
-            projection.request_visual.clone_from(request_visual);
-        }
-        SessionEventKind::ToolInvocationStream { event } => {
-            apply_tool_invocation_stream_projection_event(projections, event);
-        }
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result,
-            is_error,
-            semantic_result,
-            ..
-        } => {
-            let projection = tool_invocation_projection_mut(projections, tool_call_id);
-            projection.status = ToolInvocationProjectionStatus::Finished;
-            projection.result_text = Some(result.clone());
-            projection.is_error = Some(*is_error);
-            projection.raw_result.clone_from(semantic_result);
         }
         SessionEventKind::ToolInvocationResultRecorded { record } => {
             let projection = tool_invocation_projection_mut(projections, &record.invocation_id);
@@ -167,69 +132,6 @@ pub fn apply_tool_invocation_projection_event(
     }
 }
 
-fn apply_tool_invocation_stream_projection_event(
-    projections: &mut BTreeMap<String, ToolInvocationProjection>,
-    event: &ToolInvocationStreamEvent,
-) {
-    let tool_call_id = tool_projection_stream_tool_call_id(event);
-    if projections
-        .get(tool_call_id)
-        .is_some_and(|projection| projection.status == ToolInvocationProjectionStatus::Finished)
-    {
-        return;
-    }
-    let projection = tool_invocation_projection_mut(projections, tool_call_id);
-    match event {
-        ToolInvocationStreamEvent::Started {
-            columns,
-            rows,
-            started_at_ms,
-            ..
-        } => {
-            projection.status = ToolInvocationProjectionStatus::Running;
-            projection.started_at_ms = *started_at_ms;
-            let stream_output = projection
-                .stream_output
-                .get_or_insert_with(Default::default);
-            stream_output.columns = *columns;
-            stream_output.rows = *rows;
-        }
-        ToolInvocationStreamEvent::OutputDelta { text, .. } => {
-            projection.status = ToolInvocationProjectionStatus::Running;
-            projection
-                .stream_output
-                .get_or_insert_with(Default::default)
-                .output
-                .push_str(text);
-        }
-        ToolInvocationStreamEvent::VisualUpdate { .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { .. }
-        | ToolInvocationStreamEvent::Status { .. } => {
-            projection.status = ToolInvocationProjectionStatus::Running;
-        }
-        ToolInvocationStreamEvent::Finished {
-            is_error,
-            finished_at_ms,
-            ..
-        } => {
-            projection.status = ToolInvocationProjectionStatus::Finished;
-            projection.is_error = Some(*is_error);
-            projection.finished_at_ms = *finished_at_ms;
-        }
-        ToolInvocationStreamEvent::LegacyPresentation { presentation, .. } => {
-            legacy_record_tool_presentation(projection, presentation);
-        }
-        ToolInvocationStreamEvent::LegacyTransientPruned { .. } => {}
-    }
-}
-
-fn legacy_record_tool_presentation(
-    projection: &mut ToolInvocationProjection,
-    presentation: &LegacyToolPresentationEvent,
-) {
-    projection.legacy_presentations.push(presentation.clone());
-}
-
 fn tool_invocation_projection_mut<'a>(
     projections: &'a mut BTreeMap<String, ToolInvocationProjection>,
     tool_call_id: &str,
@@ -240,19 +142,6 @@ fn tool_invocation_projection_mut<'a>(
             tool_call_id: tool_call_id.to_owned(),
             ..ToolInvocationProjection::default()
         })
-}
-
-fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
-    match event {
-        ToolInvocationStreamEvent::Started { tool_call_id, .. }
-        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
-        | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyTransientPruned { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
-    }
 }
 
 /// Current persisted session event schema version.
@@ -1280,31 +1169,12 @@ pub enum SessionLiveEventKind {
     AssistantTextDelta { turn_id: String, text: String },
     /// Coalesced provider-exposed reasoning text produced by an active model turn.
     AssistantReasoningDelta { turn_id: String, text: String },
-    /// Raw output emitted while a tool is running.
-    ///
-    /// Output deltas are live-only and must never be persisted in canonical session history.
-    /// Opaque visual updates currently share this live transport, but active-artifact snapshots
-    /// must replace their cumulative payload before durable visual compatibility can be removed.
-    ToolOutputDelta { event: ToolInvocationStreamEvent },
     /// Opaque renderer contribution published only to currently attached clients.
     ///
     /// Transient contributions are never persisted, indexed, or replayed.
     ToolContribution { event: ToolContributionEvent },
     /// Renderer contribution with explicit placement published only to attached clients.
     ToolContributionPlaced { envelope: ToolContributionEnvelope },
-    /// Live-only tool argument visual derived from partial tool-call arguments.
-    ToolArgumentPreview {
-        /// Model turn associated with this preview update.
-        turn_id: String,
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// User-facing tool name.
-        tool_name: String,
-        /// Total assembled argument bytes received so far.
-        argument_bytes: usize,
-        /// Partial tool argument visual.
-        preview: LiveToolArgumentPreview,
-    },
     /// Authoritative current context occupancy after a durable projection update.
     RequestContextOccupancyChanged {
         /// Current occupancy, or `None` when a model/compaction boundary cleared it.
@@ -1317,41 +1187,6 @@ pub enum SessionLiveEventKind {
         /// Coalesced provider stream progress event.
         event: ProviderStreamEvent,
     },
-}
-
-/// Plugin-owned visual descriptor for transcript rendering.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginVisualDescriptor {
-    /// Stable producer-owned visual instance id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub visual_id: Option<String>,
-    /// Producer plugin id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub producer_plugin_id: Option<String>,
-    /// Producer-owned schema identifier.
-    pub schema: String,
-    /// Producer-owned schema version.
-    pub schema_version: u32,
-    /// Optional human-readable fallback title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// Optional human-readable fallback subtitle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtitle: Option<String>,
-    /// Opaque producer-owned payload.
-    pub payload: serde_json::Value,
-}
-
-/// Live-only tool argument visual derived from partial tool-call arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LiveToolArgumentPreview {
-    /// Plugin-owned visual descriptor.
-    pub visual: PluginVisualDescriptor,
-    /// Plugin-owned streaming status text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub streaming_status: Option<String>,
-    /// Total assembled argument bytes received so far.
-    pub argument_bytes: usize,
 }
 
 /// Session projection kind.
@@ -1569,402 +1404,6 @@ pub struct ToolArtifactRef {
     /// Plugin-owned reference metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-}
-
-/// Kind of historical transient stream payload removed by one-time maintenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyTransientStreamKind {
-    OutputDelta,
-    VisualUpdate,
-    ArtifactUpdate,
-    LegacyPresentation,
-}
-
-/// Incremental event emitted while a tool invocation is running.
-///
-/// This enum is persisted inside [`SessionEventKind`]. Keep the default
-/// externally tagged representation so binary codecs do not need
-/// self-describing `deserialize_any` support.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolInvocationStreamEvent {
-    /// Tool execution has started inside the provider plugin.
-    Started {
-        tool_call_id: String,
-        tool_name: String,
-        #[serde(default)]
-        sequence: u64,
-        #[serde(default)]
-        terminal: bool,
-        #[serde(default)]
-        columns: Option<u16>,
-        #[serde(default)]
-        rows: Option<u16>,
-        #[serde(default)]
-        started_at_ms: Option<u64>,
-    },
-    /// A chunk of live tool output is available.
-    OutputDelta {
-        tool_call_id: String,
-        stream: ToolOutputStream,
-        sequence: u64,
-        text: String,
-        #[serde(default)]
-        byte_len: usize,
-    },
-    /// Plugin-owned visual update for transcript rendering.
-    VisualUpdate {
-        tool_call_id: String,
-        sequence: u64,
-        visual: PluginVisualDescriptor,
-        #[serde(default)]
-        streaming: bool,
-    },
-    /// Human-readable progress status from a long-running tool.
-    Status {
-        tool_call_id: String,
-        sequence: u64,
-        message: String,
-    },
-    /// Legacy plugin-owned presentation update retained only for old persisted logs.
-    #[serde(rename = "presentation")]
-    LegacyPresentation {
-        tool_call_id: String,
-        sequence: u64,
-        presentation: LegacyToolPresentationEvent,
-    },
-    /// Tool execution has finished inside the provider plugin.
-    Finished {
-        tool_call_id: String,
-        sequence: u64,
-        is_error: bool,
-        #[serde(default)]
-        finished_at_ms: Option<u64>,
-    },
-    /// Generic active-artifact registration or committed-length revision.
-    ArtifactUpdate {
-        tool_call_id: String,
-        sequence: u64,
-        artifact_id: String,
-        reference_key: String,
-        producer_plugin_id: String,
-        schema: String,
-        schema_version: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        content_type: Option<String>,
-        /// Host-local path used only while routing the producer update; never serialized to clients.
-        #[serde(skip)]
-        storage_uri: String,
-        committed_bytes: u64,
-        revision: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        availability: Option<String>,
-        #[serde(default)]
-        finalized: bool,
-    },
-    /// Tiny compatibility marker replacing a historically persisted transient payload.
-    LegacyTransientPruned {
-        tool_call_id: String,
-        original_kind: LegacyTransientStreamKind,
-    },
-}
-
-/// A generic argument field selector for plugin-owned opaque presentation payloads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyToolPresentationPayloadSelector {
-    /// Candidate top-level JSON argument names, in priority order.
-    #[serde(default)]
-    pub fields: Vec<String>,
-    /// Literal fallback value when no field is available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub literal: Option<serde_json::Value>,
-    /// Whether this selector must resolve before the payload can be emitted.
-    #[serde(default)]
-    pub required: bool,
-}
-
-/// Opaque plugin-owned presentation payload metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyToolPluginViewMetadata {
-    /// Producer-owned schema identifier.
-    pub schema: String,
-    /// Producer-owned schema version.
-    pub schema_version: u32,
-    /// Producer plugin id for adapter routing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub producer_plugin_id: Option<String>,
-    /// Optional human-readable fallback title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// Optional human-readable fallback subtitle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtitle: Option<String>,
-    /// Payload keys mapped to tool argument fields/literals.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub payload: BTreeMap<String, LegacyToolPresentationPayloadSelector>,
-}
-
-/// Opaque plugin-owned presentation payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyToolPluginViewPresentation {
-    /// Presentation target.
-    pub target: LegacyToolPresentationTarget,
-    /// Producer plugin id.
-    pub producer_plugin_id: String,
-    /// Producer-owned schema identifier.
-    pub schema: String,
-    /// Producer-owned schema version.
-    pub schema_version: u32,
-    /// Optional human-readable fallback title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// Optional human-readable fallback subtitle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtitle: Option<String>,
-    /// Opaque producer-owned payload.
-    pub payload: serde_json::Value,
-}
-
-/// Legacy request-preview metadata retained only for old persisted session events.
-///
-/// New tool definitions and new session writes must not use this as active UI input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LegacyToolRequestPreviewMetadata {
-    /// Plugin-owned generic presentation template.
-    PluginView {
-        /// Opaque plugin-owned view metadata.
-        view: LegacyToolPluginViewMetadata,
-    },
-    /// File edit/write style preview.
-    FileEdit {
-        /// Candidate path fields.
-        #[serde(default)]
-        path_fields: Vec<String>,
-        /// Candidate old-text fields.
-        #[serde(default)]
-        old_text_fields: Vec<String>,
-        /// Candidate new-text/content fields.
-        new_text_fields: Vec<String>,
-    },
-}
-
-/// Legacy request-presentation metadata retained only for old persisted session events.
-///
-/// New tool definitions and new session writes must not use this as active UI input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyToolRequestPresentationMetadata {
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fields: Vec<LegacyToolPresentationField>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview: Option<LegacyToolRequestPreviewMetadata>,
-}
-
-/// Declarative presentation metadata for one request argument field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyToolPresentationField {
-    pub label: String,
-    pub argument: String,
-    pub kind: LegacyLegacyToolPresentationFieldKind,
-    #[serde(default)]
-    pub optional: bool,
-}
-
-/// Generic UI presentation hint for request argument fields.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LegacyLegacyToolPresentationFieldKind {
-    #[default]
-    Text,
-    Path,
-    Url,
-    Command,
-    Boolean,
-    Count,
-    DurationMs,
-    Json,
-}
-
-impl LegacyLegacyToolPresentationFieldKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Path => "path",
-            Self::Url => "url",
-            Self::Command => "command",
-            Self::Boolean => "boolean",
-            Self::Count => "count",
-            Self::DurationMs => "duration_ms",
-            Self::Json => "json",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "text" => Some(Self::Text),
-            "path" => Some(Self::Path),
-            "url" => Some(Self::Url),
-            "command" => Some(Self::Command),
-            "boolean" => Some(Self::Boolean),
-            "count" => Some(Self::Count),
-            "duration_ms" => Some(Self::DurationMs),
-            "json" => Some(Self::Json),
-            _ => None,
-        }
-    }
-}
-
-impl Serialize for LegacyLegacyToolPresentationFieldKind {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for LegacyLegacyToolPresentationFieldKind {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).ok_or_else(|| {
-            serde::de::Error::unknown_variant(
-                &value,
-                &[
-                    "text",
-                    "path",
-                    "url",
-                    "command",
-                    "boolean",
-                    "count",
-                    "duration_ms",
-                    "json",
-                ],
-            )
-        })
-    }
-}
-
-/// Plugin-owned presentation update for a running tool invocation.
-///
-/// Keep the default externally tagged representation so direct typed-stable IPC
-/// can carry nested presentation payloads without codec-specific DTO shims.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyToolPresentationEvent {
-    /// Status text for an activity, preview, or result target.
-    Status(LegacyToolStatusPresentation),
-    /// Card-style structured presentation.
-    Card(LegacyToolCardPresentation),
-    /// Progress update.
-    Progress(LegacyToolProgressPresentation),
-    /// Opaque plugin-owned presentation view.
-    PluginView(LegacyToolPluginViewPresentation),
-    /// Clear a previous presentation target.
-    Clear {
-        target: LegacyToolPresentationTarget,
-    },
-}
-
-/// Tool presentation target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyToolPresentationTarget {
-    Activity,
-    Preview,
-    Result,
-}
-
-/// Presentation severity/level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyToolPresentationLevel {
-    Info,
-    Success,
-    Warning,
-    Error,
-}
-
-/// Tool status presentation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyToolStatusPresentation {
-    pub target: LegacyToolPresentationTarget,
-    pub text: String,
-    #[serde(default = "default_presentation_level")]
-    pub level: LegacyToolPresentationLevel,
-}
-
-/// Tool progress presentation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyToolProgressPresentation {
-    pub target: LegacyToolPresentationTarget,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub percent: Option<u8>,
-    #[serde(default = "default_presentation_level")]
-    pub level: LegacyToolPresentationLevel,
-}
-
-/// Tool card presentation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyToolCardPresentation {
-    pub target: LegacyToolPresentationTarget,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtitle: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sections: Vec<LegacyToolPresentationSection>,
-}
-
-/// Generic section in a tool presentation card.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LegacyToolPresentationSection {
-    Text {
-        label: Option<String>,
-        text: String,
-    },
-    Fields {
-        fields: Vec<LegacyLegacyToolPresentationFieldValue>,
-    },
-    /// Historical file-change preview retained for persisted session compatibility.
-    Diff {
-        path: Option<String>,
-        old_text: String,
-        new_text: String,
-    },
-    Terminal {
-        output: String,
-        columns: u16,
-        rows: u16,
-    },
-}
-
-/// Label/value field for a presentation section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyLegacyToolPresentationFieldValue {
-    pub label: String,
-    pub value: String,
-    #[serde(default)]
-    pub kind: LegacyLegacyToolPresentationFieldKind,
-}
-
-const fn default_presentation_level() -> LegacyToolPresentationLevel {
-    LegacyToolPresentationLevel::Info
-}
-
-/// Logical output stream for an incremental tool output chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolOutputStream {
-    Stdout,
-    Stderr,
-    Pty,
 }
 
 /// Model turn terminal outcome.
@@ -2189,7 +1628,6 @@ pub enum SessionTracePayload {
         message: Option<String>,
     },
     ProviderStreamEvent(ProviderStreamEvent),
-    ToolInvocationStreamEvent(ToolInvocationStreamEvent),
 }
 
 /// Reference to a trace payload stored outside the main session event stream.
@@ -2280,24 +1718,6 @@ pub enum SessionEventKind {
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         working_directory: Option<PathBuf>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_visual: Option<PluginVisualDescriptor>,
-        #[serde(
-            default,
-            rename = "request_presentation",
-            skip_serializing_if = "Option::is_none"
-        )]
-        legacy_request_presentation: Option<LegacyToolRequestPresentationMetadata>,
-    },
-    ToolCallFinished {
-        tool_call_id: String,
-        result: String,
-        #[serde(default)]
-        is_error: bool,
-        #[serde(default)]
-        output: Option<TraceBlobRef>,
-        #[serde(default)]
-        semantic_result: Option<ToolInvocationResult>,
     },
     PermissionRequested {
         permission_id: String,
@@ -2306,12 +1726,6 @@ pub enum SessionEventKind {
         producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
-        #[serde(
-            default,
-            rename = "request_presentation",
-            skip_serializing_if = "Option::is_none"
-        )]
-        legacy_request_presentation: Option<LegacyToolRequestPresentationMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch: Option<PermissionBatchCorrelation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2459,10 +1873,6 @@ pub enum SessionEventKind {
         #[serde(default)]
         client_id: Option<ClientId>,
     },
-    /// Incremental tool invocation event emitted while a tool is running.
-    ToolInvocationStream {
-        event: ToolInvocationStreamEvent,
-    },
     /// Durable marker that moves the session's canonical working directory.
     WorkingDirectoryChanged {
         old_working_directory: PathBuf,
@@ -2528,7 +1938,7 @@ pub enum SessionEventKind {
         metadata: BTreeMap<String, serde_json::Value>,
     },
     /// Opaque historical event retained for replay/export compatibility only.
-    LegacyEvent {
+    OpaqueEvent {
         event_type: String,
         payload: serde_json::Value,
     },
@@ -2603,62 +2013,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_result_record_finishes_projection_and_late_stream_cannot_revive_it() {
-        let session_id = SessionId::new();
-        let mut projections = BTreeMap::new();
-        let session_event = |sequence, kind| SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        apply_tool_invocation_projection_event(
-            &mut projections,
-            &session_event(
-                1,
-                SessionEventKind::ToolInvocationResultRecorded {
-                    record: ToolInvocationResultRecord {
-                        invocation_id: "call-1".to_owned(),
-                        model_output: "done".to_owned(),
-                        is_error: false,
-                        result: Some(ToolInvocationResult::Text {
-                            text: "semantic".to_owned(),
-                        }),
-                    },
-                },
-            ),
-        );
-        apply_tool_invocation_projection_event(
-            &mut projections,
-            &session_event(
-                2,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "call-1".to_owned(),
-                        stream: ToolOutputStream::Stdout,
-                        sequence: 2,
-                        text: "late".to_owned(),
-                        byte_len: 4,
-                    },
-                },
-            ),
-        );
-
-        let projection = projections.get("call-1").expect("generic projection");
-        assert_eq!(projection.status, ToolInvocationProjectionStatus::Finished);
-        assert_eq!(projection.result_text.as_deref(), Some("done"));
-        assert_eq!(
-            projection.raw_result,
-            Some(ToolInvocationResult::Text {
-                text: "semantic".to_owned(),
-            })
-        );
-        assert!(projection.stream_output.is_none());
-    }
-
-    #[test]
     fn turn_receipt_derives_the_existing_model_work_identity() {
         let session_id = SessionId::from_str("00000000-0000-0000-0000-000000000001")
             .expect("session id should parse");
@@ -2671,53 +2025,6 @@ mod tests {
             WorkId::new(format!("model_{session_id}-42"))
         );
         assert_eq!(receipt.accepted_event_sequence, 42);
-    }
-
-    #[test]
-    fn late_stream_events_cannot_revive_finished_tool_projection() {
-        let session_id = SessionId::new();
-        let mut projections = BTreeMap::new();
-        let session_event = |sequence, kind| SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        apply_tool_invocation_projection_event(
-            &mut projections,
-            &session_event(
-                1,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_owned(),
-                    result: "done".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
-                },
-            ),
-        );
-        apply_tool_invocation_projection_event(
-            &mut projections,
-            &session_event(
-                2,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "call-1".to_owned(),
-                        stream: ToolOutputStream::Stdout,
-                        sequence: 2,
-                        text: "late".to_owned(),
-                        byte_len: 4,
-                    },
-                },
-            ),
-        );
-
-        let projection = projections.get("call-1").expect("projection");
-        assert_eq!(projection.status, ToolInvocationProjectionStatus::Finished);
-        assert_eq!(projection.result_text.as_deref(), Some("done"));
-        assert!(projection.stream_output.is_none());
     }
 
     #[test]
@@ -3067,46 +2374,6 @@ mod tests {
 
             assert_eq!(decoded, expected);
         }
-    }
-
-    #[test]
-    fn tool_call_finished_without_semantic_result_json_decodes() {
-        let decoded: SessionEventKind = serde_json::from_str(
-            r#"{"tool_call_finished":{"tool_call_id":"call-1","result":"legacy result"}}"#,
-        )
-        .expect("legacy tool call finished event kind should decode");
-
-        assert_eq!(
-            decoded,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-1".to_string(),
-                result: "legacy result".to_string(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
-            }
-        );
-    }
-
-    #[test]
-    fn legacy_serialized_tool_stream_presentation_decodes_to_legacy_variant() {
-        let decoded: ToolInvocationStreamEvent = serde_json::from_str(
-            r#"{"presentation":{"tool_call_id":"call-1","sequence":2,"presentation":{"status":{"target":"result","text":"done","level":"success"}}}}"#,
-        )
-        .expect("legacy presentation stream event should decode");
-
-        assert_eq!(
-            decoded,
-            ToolInvocationStreamEvent::LegacyPresentation {
-                tool_call_id: "call-1".to_string(),
-                sequence: 2,
-                presentation: LegacyToolPresentationEvent::Status(LegacyToolStatusPresentation {
-                    target: LegacyToolPresentationTarget::Result,
-                    text: "done".to_string(),
-                    level: LegacyToolPresentationLevel::Success,
-                }),
-            }
-        );
     }
 
     fn semantic_tool_result_fixtures() -> Vec<(&'static str, ToolInvocationResult)> {

@@ -144,19 +144,18 @@ pub async fn import_external_session(
                         tool_name,
                         arguments_json,
                         working_directory: None,
-                        request_visual: None,
-                        legacy_request_presentation: None,
                     },
                     ImportableSessionEventKind::ToolCallFinished {
                         tool_call_id,
                         result,
                         is_error,
-                    } => SessionEventKind::ToolCallFinished {
-                        tool_call_id,
-                        result,
-                        is_error,
-                        output: None,
-                        semantic_result: None,
+                    } => SessionEventKind::ToolInvocationResultRecorded {
+                        record: bcode_session_models::ToolInvocationResultRecord {
+                            invocation_id: tool_call_id,
+                            model_output: result,
+                            is_error,
+                            result: None,
+                        },
                     },
                     ImportableSessionEventKind::ModelUsage {
                         input_tokens,

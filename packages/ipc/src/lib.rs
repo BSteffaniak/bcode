@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 14;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 15;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4;
@@ -1994,10 +1994,8 @@ fn default_socket_path(endpoint_override_allowed: bool) -> PathBuf {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolPresentationEvent,
-        LegacyToolPresentationLevel, LegacyToolPresentationTarget, LegacyToolStatusPresentation,
-        ModelTurnOutcome, SessionEventKind, SessionForkKind, SessionForkResult, SessionId,
-        SessionSummary, SessionTraceEvent, ToolInvocationResult, ToolInvocationStreamEvent,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ModelTurnOutcome, SessionEventKind, SessionForkKind,
+        SessionForkResult, SessionId, SessionSummary, SessionTraceEvent, ToolInvocationResult,
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
@@ -2682,12 +2680,13 @@ mod tests {
             timestamp_ms: 1,
             session_id,
             provenance: None,
-            kind: SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-1".to_string(),
-                result: "z".repeat(MAX_FRAME_PAYLOAD_SIZE + 100_000),
-                is_error: false,
-                output: None,
-                semantic_result: None,
+            kind: SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_string(),
+                    model_output: "z".repeat(MAX_FRAME_PAYLOAD_SIZE + 100_000),
+                    is_error: false,
+                    result: None,
+                },
             },
         });
 
@@ -2731,17 +2730,16 @@ mod tests {
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
             },
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-1".to_string(),
-                result: "done".to_string(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(ToolInvocationResult::Text {
-                    text: "done".to_string(),
-                }),
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_string(),
+                    model_output: "done".to_string(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "done".to_string(),
+                    }),
+                },
             },
             SessionEventKind::PermissionRequested {
                 permission_id: "perm-1".to_string(),
@@ -2749,7 +2747,6 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
-                legacy_request_presentation: None,
                 batch: None,
                 policy_source: None,
                 policy_reason: None,
@@ -2923,30 +2920,6 @@ mod tests {
                     },
                 },
             },
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-1".to_string(),
-                    tool_name: "shell.run".to_string(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(24),
-                    started_at_ms: Some(1),
-                },
-            },
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-1".to_string(),
-                    sequence: 1,
-                    presentation: LegacyToolPresentationEvent::Status(
-                        LegacyToolStatusPresentation {
-                            target: LegacyToolPresentationTarget::Activity,
-                            text: "running".to_string(),
-                            level: LegacyToolPresentationLevel::Info,
-                        },
-                    ),
-                },
-            },
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory: "/tmp/old".into(),
                 new_working_directory: "/tmp/new".into(),
@@ -3015,6 +2988,56 @@ mod tests {
             let decoded = decode_event(&received.payload).expect("event should decode");
             assert_eq!(decoded, event);
         }
+    }
+
+    fn semantic_tool_result_event(
+        session_id: SessionId,
+        semantic_result: ToolInvocationResult,
+    ) -> SessionEvent {
+        SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 77,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_string(),
+                    model_output: "tool result".to_string(),
+                    is_error: false,
+                    result: Some(semantic_result),
+                },
+            },
+        }
+    }
+
+    fn semantic_tool_results() -> Vec<ToolInvocationResult> {
+        vec![
+            ToolInvocationResult::Artifact {
+                artifact: Box::new(bcode_session_models::ToolArtifact {
+                    artifact_id: "artifact-1".to_string(),
+                    producer_plugin_id: "bcode.test".to_string(),
+                    schema: "bcode.test.artifact".to_string(),
+                    schema_version: 1,
+                    tool_call_id: Some("call-1".to_string()),
+                    title: Some("Test artifact".to_string()),
+                    metadata: serde_json::json!({"ok": true}),
+                    refs: vec![bcode_session_models::ToolArtifactRef {
+                        key: "data".to_string(),
+                        content_type: Some("application/json".to_string()),
+                        storage_uri: None,
+                        byte_len: Some(11),
+                        metadata: None,
+                    }],
+                }),
+            },
+            ToolInvocationResult::Text {
+                text: "plain text".to_string(),
+            },
+            ToolInvocationResult::Json {
+                value: r#"{"ok":true}"#.to_string(),
+            },
+        ]
     }
 
     #[tokio::test]
@@ -3245,117 +3268,6 @@ mod tests {
                 assert_eq!(decoded, response);
             }
         }
-    }
-
-    #[tokio::test]
-    async fn presentation_event_response_histories_round_trip_across_ipc_frames() {
-        let session_id = SessionId::new();
-        let session = test_session_summary("presentation history");
-        let event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-1".to_string(),
-                    sequence: 1,
-                    presentation: LegacyToolPresentationEvent::Status(
-                        LegacyToolStatusPresentation {
-                            target: LegacyToolPresentationTarget::Result,
-                            text: "completed".to_string(),
-                            level: LegacyToolPresentationLevel::Success,
-                        },
-                    ),
-                },
-            },
-        };
-
-        for response in [
-            Response::Ok(ResponsePayload::Attached {
-                session_id,
-                session: session.clone(),
-                history: vec![event.clone()],
-                input_history: Vec::new(),
-                import_warnings: Vec::new(),
-                draft: None,
-                runtime_selection: SessionRuntimeSelection::default(),
-                projection_window: None,
-            }),
-            Response::Ok(ResponsePayload::SessionHistory {
-                session_id,
-                history: vec![event.clone()],
-            }),
-            Response::Ok(ResponsePayload::SessionHistoryPage {
-                page: bcode_session_models::SessionHistoryPage {
-                    session_id,
-                    events: vec![event.clone()],
-                    compatibility_issues: Vec::new(),
-                    next_cursor: None,
-                    has_more: false,
-                },
-            }),
-            Response::Ok(ResponsePayload::RuntimeWorkHistory {
-                events: vec![event.clone()],
-            }),
-        ] {
-            let envelope = response_envelope(42, &response).expect("response should encode");
-
-            let received = round_trip_envelope(envelope).await;
-
-            let decoded = decode_response(&received.payload).expect("response should decode");
-            assert_eq!(decoded, response);
-        }
-    }
-
-    fn semantic_tool_result_event(
-        session_id: SessionId,
-        semantic_result: ToolInvocationResult,
-    ) -> SessionEvent {
-        SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 77,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-1".to_string(),
-                result: "tool result".to_string(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(semantic_result),
-            },
-        }
-    }
-
-    fn semantic_tool_results() -> Vec<ToolInvocationResult> {
-        vec![
-            ToolInvocationResult::Artifact {
-                artifact: Box::new(bcode_session_models::ToolArtifact {
-                    artifact_id: "artifact-1".to_string(),
-                    producer_plugin_id: "bcode.test".to_string(),
-                    schema: "bcode.test.artifact".to_string(),
-                    schema_version: 1,
-                    tool_call_id: Some("call-1".to_string()),
-                    title: Some("Test artifact".to_string()),
-                    metadata: serde_json::json!({"ok": true}),
-                    refs: vec![bcode_session_models::ToolArtifactRef {
-                        key: "data".to_string(),
-                        content_type: Some("application/json".to_string()),
-                        storage_uri: None,
-                        byte_len: Some(11),
-                        metadata: None,
-                    }],
-                }),
-            },
-            ToolInvocationResult::Text {
-                text: "plain text".to_string(),
-            },
-            ToolInvocationResult::Json {
-                value: r#"{"ok":true}"#.to_string(),
-            },
-        ]
     }
 
     #[test]

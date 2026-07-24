@@ -112,6 +112,55 @@ pub enum ToolPolicyOperation {
     Mutating,
 }
 
+/// Tool-owner-produced policy identity used for selector matching.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolPolicyIdentity {
+    /// Backward-compatible or user-facing aliases that may enable this tool.
+    pub aliases: Vec<String>,
+    /// Source-ecosystem aliases this tool provider declares it can satisfy.
+    pub compatibility_aliases: Vec<bcode_tool::ToolCompatibilityAlias>,
+    /// Declarative capabilities this tool provides for policy matching.
+    pub capabilities: Vec<String>,
+    /// Permission category used by policy providers for grouped rules.
+    pub permission_category: Option<String>,
+}
+
+/// Tool-owner-produced preparation policy encoded into the standard authorization fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPolicyPreparation {
+    /// Whether this invocation requires explicit permission absent a stronger policy decision.
+    pub requires_permission: bool,
+    /// Owner-declared policy identity.
+    pub identity: ToolPolicyIdentity,
+    /// Owner-extracted operation and resources.
+    pub operation: ToolPolicyOperation,
+}
+
+impl ToolPolicyPreparation {
+    /// Create an owner preparation policy with no aliases, capabilities, or permission category.
+    #[must_use]
+    pub fn new(requires_permission: bool, operation: ToolPolicyOperation) -> Self {
+        Self {
+            requires_permission,
+            identity: ToolPolicyIdentity::default(),
+            operation,
+        }
+    }
+
+    /// Attach owner-declared policy identity.
+    #[must_use]
+    pub fn with_identity(mut self, identity: ToolPolicyIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// Create an explicitly permission-free read-only policy.
+    #[must_use]
+    pub fn read_only() -> Self {
+        Self::new(false, ToolPolicyOperation::ReadOnly)
+    }
+}
+
 /// Tool-owner-produced metadata consumed only by the agent policy adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPolicyAuthorizationMetadata {
@@ -164,7 +213,7 @@ impl ToolPolicyAuthorizationMetadata {
 pub fn prepare_tool_policy(
     request: &ToolPreparationRequest,
     definition: &ToolDefinition,
-    operation: ToolPolicyOperation,
+    preparation: ToolPolicyPreparation,
 ) -> Result<ToolPreparationResponse, String> {
     if request.invocation.tool_name != definition.name {
         return Err(format!(
@@ -172,14 +221,13 @@ pub fn prepare_tool_policy(
             request.invocation.tool_name
         ));
     }
-    let aliases = definition.policy.aliases.clone();
     let metadata = ToolPolicyAuthorizationMetadata {
-        requires_permission: definition.requires_permission,
-        aliases,
-        compatibility_aliases: definition.policy.compatibility_aliases.clone(),
-        capabilities: definition.policy.capabilities.clone(),
-        permission_category: definition.policy.permission_category.clone(),
-        operation,
+        requires_permission: preparation.requires_permission,
+        aliases: preparation.identity.aliases,
+        compatibility_aliases: preparation.identity.compatibility_aliases,
+        capabilities: preparation.identity.capabilities,
+        permission_category: preparation.identity.permission_category,
+        operation: preparation.operation,
     };
     Ok(ToolPreparationResponse {
         authorization: vec![ToolAuthorizationFact {

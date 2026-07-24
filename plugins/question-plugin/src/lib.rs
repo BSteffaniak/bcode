@@ -17,7 +17,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolCompatibilityAlias, ToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
     ToolExchangeResponsePolicy, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList, ToolPolicyMetadata,
+    ToolInvocationResult, ToolList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -49,7 +49,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             &context.request,
             [question_tool_definition()],
-            |_request, _definition| Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
+            |_request, _definition| Ok(question_policy_preparation()),
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -57,6 +57,17 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
             "unsupported question tool service operation",
         ),
     }
+}
+
+fn question_policy_preparation() -> bcode_plugin_sdk::ToolPolicyPreparation {
+    bcode_plugin_sdk::ToolPolicyPreparation::read_only().with_identity(
+        bcode_plugin_sdk::ToolPolicyIdentity {
+            aliases: vec!["ask".to_string()],
+            compatibility_aliases: vec![ToolCompatibilityAlias::new("opencode", "question")],
+            capabilities: vec!["ask_user".to_string(), "interactive_question".to_string()],
+            permission_category: Some("read".to_string()),
+        },
+    )
 }
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
@@ -83,14 +94,6 @@ fn question_tool_definition() -> ToolDefinition {
         )
         .to_string(),
         input_schema: canonical_input_schema(),
-        requires_permission: false,
-        policy: ToolPolicyMetadata {
-            aliases: vec!["ask".to_string()],
-            compatibility_aliases: vec![ToolCompatibilityAlias::new("opencode", "question")],
-            capabilities: vec!["ask_user".to_string(), "interactive_question".to_string()],
-            permission_category: Some("read".to_string()),
-        },
-        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 
@@ -730,6 +733,22 @@ mod tests {
             ),
             Err("question exchange failed (route_failed): consumer unavailable".to_owned())
         );
+    }
+
+    #[test]
+    fn question_owner_prepares_catalog_policy_identity() {
+        let policy = question_policy_preparation();
+        assert!(!policy.requires_permission);
+        assert_eq!(policy.identity.aliases, vec!["ask"]);
+        assert_eq!(
+            policy.identity.compatibility_aliases,
+            vec![ToolCompatibilityAlias::new("opencode", "question")]
+        );
+        assert_eq!(
+            policy.identity.capabilities,
+            vec!["ask_user", "interactive_question"]
+        );
+        assert_eq!(policy.identity.permission_category.as_deref(), Some("read"));
     }
 
     #[test]

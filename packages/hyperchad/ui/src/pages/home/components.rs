@@ -250,12 +250,3 @@ pub(super) fn truncation_notice(message: &str) -> Containers {
         div data-content-state="truncated" color=(color::WARNING) font-size=(typeface::DETAIL) margin-top=(space::SM) { (message) }
     }
 }
-
-pub(super) fn unsupported_content(message: &str) -> Containers {
-    container! {
-        aside data-content-state="unsupported" color=(color::WARNING) background=(surface::PANEL) border=((1, surface::BORDER)) border-radius=(radius::CONTROL) padding=(space::SM) margin-top=(space::SM) {
-            div font-size=((typeface::LABEL)) { "Unsupported content" }
-            div color=(color::TEXT) font-size=(typeface::DETAIL) margin-top=(space::XS) white-space="preserve-wrap" { (message) }
-        }
-    }
-}

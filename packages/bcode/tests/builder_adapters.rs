@@ -1,18 +1,16 @@
 use bcode::{
     Agent, InvocationScope, PreparationScope, PreparedToolInvocation, RegisteredTool,
     ToolAuthorizationCoordinator, ToolAuthorizationDecision, ToolAuthorizationRequest, ToolCall,
-    ToolDefinition, ToolInvocationResponse, ToolInvoker, ToolPreparationRequest,
-    ToolPreparationResponse, TurnEventObservability, TurnEventPersistence,
+    ToolDefinition, ToolInvocationResponse, ToolInvoker, ToolPolicyIdentity, ToolPolicyOperation,
+    ToolPolicyPreparation, ToolPreparationRequest, ToolPreparationResponse, TurnEventObservability,
+    TurnEventPersistence,
 };
 use bcode_agent_runtime::{ModelProviderInvoker, RuntimeFuture, TurnScope};
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse, StopReason,
 };
-use bcode_tool::{
-    ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence,
-    ToolPolicyMetadata, ToolUiMetadata,
-};
+use bcode_tool::{ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence};
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -24,9 +22,6 @@ fn definition() -> ToolDefinition {
         name: "adapter".to_string(),
         description: "adapter routing test".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 
@@ -53,7 +48,7 @@ impl ToolInvoker for CountingInvoker {
         let result = bcode_agent_profile::prepare_tool_policy(
             request,
             &tool.definition,
-            bcode_agent_profile::ToolPolicyOperation::ReadOnly,
+            bcode_agent_profile::ToolPolicyPreparation::read_only(),
         )
         .map_err(|message| bcode::RuntimeError::ToolPreparation {
             tool_name: request.invocation.tool_name.clone(),
@@ -91,7 +86,7 @@ impl ToolInvoker for ContributionInvoker {
         let result = bcode_agent_profile::prepare_tool_policy(
             request,
             &tool.definition,
-            bcode_agent_profile::ToolPolicyOperation::ReadOnly,
+            bcode_agent_profile::ToolPolicyPreparation::read_only(),
         )
         .map_err(|message| bcode::RuntimeError::ToolPreparation {
             tool_name: request.invocation.tool_name.clone(),
@@ -246,6 +241,57 @@ impl TurnEventObservability for ContributionCountingHostExtension {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
+}
+
+#[derive(Debug)]
+struct AssertOwnerIdentityCoordinator;
+
+impl ToolAuthorizationCoordinator for AssertOwnerIdentityCoordinator {
+    fn authorize_batch<'a>(
+        &'a self,
+        requests: &'a [ToolAuthorizationRequest],
+        _scope: &'a TurnScope,
+    ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
+        let metadata = requests
+            .first()
+            .and_then(|request| {
+                bcode_agent_profile::tool_policy_authorization_metadata(
+                    &request.facts,
+                    &request.call.name,
+                )
+                .ok()
+            })
+            .expect("owner policy identity should be encoded");
+        assert_eq!(metadata.aliases, vec!["adapter-alias"]);
+        assert_eq!(metadata.capabilities, vec!["adapter.capability"]);
+        assert_eq!(metadata.permission_category.as_deref(), Some("adapter"));
+        Box::pin(async { Ok(vec![ToolAuthorizationDecision::Allow]) })
+    }
+}
+
+#[tokio::test]
+async fn inline_tool_policy_identity_is_owner_prepared() {
+    let agent = Agent::builder()
+        .inline_tool_with_policy(
+            definition(),
+            ToolPolicyPreparation::new(false, ToolPolicyOperation::ReadOnly).with_identity(
+                ToolPolicyIdentity {
+                    aliases: vec!["adapter-alias".to_owned()],
+                    compatibility_aliases: Vec::new(),
+                    capabilities: vec!["adapter.capability".to_owned()],
+                    permission_category: Some("adapter".to_owned()),
+                },
+            ),
+            |_| Ok(response("prepared")),
+        )
+        .authorization_coordinator(Arc::new(AssertOwnerIdentityCoordinator))
+        .build();
+
+    let output = agent
+        .execute_tool_call(&call())
+        .await
+        .expect("owner-prepared inline tool should execute");
+    assert_eq!(output.invocation.output, "prepared");
 }
 
 #[tokio::test]

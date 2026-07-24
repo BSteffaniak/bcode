@@ -2177,12 +2177,17 @@ fn conversation_line_from_session_event(
                 text: format!("requested {tool_name}"),
             })
         }
-        bcode_session_models::SessionEventKind::ToolCallFinished {
-            result, is_error, ..
-        } => Some(BlimsConversationLine {
-            speaker: if is_error { "Tool error" } else { "Tool" }.to_string(),
-            text: result,
-        }),
+        bcode_session_models::SessionEventKind::ToolInvocationResultRecorded { record } => {
+            Some(BlimsConversationLine {
+                speaker: if record.is_error {
+                    "Tool error"
+                } else {
+                    "Tool"
+                }
+                .to_string(),
+                text: record.model_output,
+            })
+        }
         _ => None,
     }
 }

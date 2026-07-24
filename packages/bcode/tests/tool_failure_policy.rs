@@ -1,16 +1,10 @@
-use bcode::{
-    Agent, ToolCall, ToolDefinition, ToolFailurePolicy, ToolInvocationResponse, ToolPolicyMetadata,
-    ToolUiMetadata,
-};
+use bcode::{Agent, ToolCall, ToolDefinition, ToolFailurePolicy, ToolInvocationResponse};
 
 fn definition() -> ToolDefinition {
     ToolDefinition {
         name: "fails".to_string(),
         description: "Always fails".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 

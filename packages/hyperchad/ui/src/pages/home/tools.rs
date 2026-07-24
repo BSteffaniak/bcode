@@ -8,7 +8,7 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_view_models::{ToolInvocationView, ToolInvocationViewStatus, ToolResultView};
 use hyperchad::template::{Containers, container};
 
-use super::adapters::{ARTIFACT_ADAPTERS, json_panel, render_plugin_visual};
+use super::adapters::{ARTIFACT_ADAPTERS, json_panel};
 use super::components::{StatusTone, code_output, disclosure, tool_card};
 
 const MAX_INLINE_ARGUMENT_CHARS: usize = 8_000;
@@ -65,11 +65,6 @@ fn timing_summary(tool: &ToolInvocationView) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-pub(super) fn render_tool_lifecycle(tool: &ToolInvocationView) -> Containers {
-    render_tool_lifecycle_with_context(tool, None, &crate::context::StaticPresentationContext)
-}
-
 pub(super) fn render_tool_lifecycle_with_context(
     tool: &ToolInvocationView,
     session_id: Option<bcode_session_models::SessionId>,
@@ -81,10 +76,6 @@ pub(super) fn render_tool_lifecycle_with_context(
         .arguments_json
         .as_deref()
         .map(|arguments| bounded_preview(arguments, MAX_INLINE_ARGUMENT_CHARS));
-    let output = tool
-        .output
-        .as_ref()
-        .map(|output| bounded_preview(&output.text, MAX_INLINE_OUTPUT_CHARS));
     let result_text = tool
         .result_text
         .as_deref()
@@ -114,17 +105,6 @@ pub(super) fn render_tool_lifecycle_with_context(
                 (code_output(&arguments, StatusTone::Neutral))
                 @if truncated {
                     div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Arguments truncated for display." }
-                }
-            }))
-        }
-        @if let Some(visual) = &tool.request_visual {
-            (render_plugin_visual("request", visual))
-        }
-        @if let Some((output, truncated)) = output {
-            (disclosure("live output", &container! {
-                (code_output(&output, StatusTone::Neutral))
-                @if truncated {
-                    div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Output truncated for display; the underlying result remains available through its artifact when provided." }
                 }
             }))
         }

@@ -3,8 +3,7 @@
 use bcode::{
     Agent, AgentTurnRequest, BcodeError, GenerationStep, ModelResponseCache, PermissionDecision,
     PersistedSession, ProviderTurnEvent, RuntimeError, SessionId, SessionPersistenceAdapter,
-    StopReason, ToolCall, ToolDefinition, ToolPolicyMetadata, ToolUiMetadata,
-    generate_text_builder,
+    StopReason, ToolCall, ToolDefinition, generate_text_builder,
     testing::{
         ManualClock, ScriptedCacheOperation, ScriptedModelResponseCache, ScriptedPermissionPolicy,
         ScriptedProvider, ScriptedProviderTurn, ScriptedSessionStore, ScriptedTool,
@@ -19,9 +18,6 @@ fn tool_definition() -> ToolDefinition {
         name: "scripted".to_string(),
         description: "Deterministic scripted tool".to_string(),
         input_schema: serde_json::json!({"type":"object"}),
-        requires_permission: true,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 

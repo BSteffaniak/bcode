@@ -3869,8 +3869,7 @@ mod tests {
         ToolContributionOperation, ToolContributionPersistence, ToolExchangeRequest,
         ToolExchangeResolution, ToolExchangeResponsePolicy, ToolInvocationInput,
         ToolInvocationInputResolution, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
-        ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolPolicyMetadata,
-        ToolUiMetadata,
+        ToolInvocationServiceRequest, ToolInvocationServiceResolution,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
@@ -4043,7 +4042,7 @@ mod tests {
             let result = bcode_agent_profile::prepare_tool_policy(
                 request,
                 &tool.definition,
-                bcode_agent_profile::ToolPolicyOperation::ReadOnly,
+                bcode_agent_profile::ToolPolicyPreparation::read_only(),
             )
             .map_err(|message| RuntimeError::ToolPreparation {
                 tool_name: request.invocation.tool_name.clone(),
@@ -4101,9 +4100,6 @@ mod tests {
             name: name.to_string(),
             description: "test tool".to_string(),
             input_schema: serde_json::json!({ "type": "object" }),
-            requires_permission: false,
-            policy: ToolPolicyMetadata::default(),
-            ui: ToolUiMetadata::default(),
         }
     }
 
@@ -4498,7 +4494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_loop_preserves_provider_parallel_capability_fallback() {
+    async fn canonical_loop_preserves_unknown_provider_parallel_capability() {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let mut provider = MultiRoundProvider::new(
             [vec![ProviderTurnEvent::TurnFinished {
@@ -4531,9 +4527,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].tool_call_policy.parallel,
-            Some(false),
-            "scheduler support must not upgrade unsupported provider/model capability"
+            requests[0].tool_call_policy.parallel, None,
+            "unknown provider/model capability must remain unknown until resolution"
         );
         drop(requests);
     }

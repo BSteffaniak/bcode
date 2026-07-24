@@ -27,22 +27,12 @@ if [[ -n "$active_artifact_violations" ]]; then
   exit 1
 fi
 
-# New durable session writes must reject every live-only stream variant. A single rejection of the
-# enclosing ToolInvocationStream event is stronger than spelling out each current variant; retain
-# the variant-specific fallback so the guard also protects branches that classify variants
-# individually.
-if ! grep -A8 'fn live_only_session_event_kind' packages/session/src/lib.rs \
-  | grep -q 'SessionEventKind::ToolInvocationStream { .. }'; then
-  for variant in OutputDelta VisualUpdate ArtifactUpdate LegacyPresentation; do
-    if ! grep -A12 'fn live_only_session_event_kind' packages/session/src/lib.rs \
-      | grep -q "ToolInvocationStreamEvent::$variant"; then
-      echo "durable session boundary must reject live-only stream variant $variant" >&2
-      exit 1
-    fi
-  done
-fi
-if ! grep -q 'LiveEventPersistenceRejected' packages/session/src/lib.rs; then
-  echo "durable session boundary must fail closed for live-only stream events" >&2
+# Legacy core stream DTOs have been hard-cut from current source. Shell live output must use
+# neutral contributions and artifact ranges, while the repository-wide runtime guard prevents
+# reintroduction of the removed event and output-stream contracts.
+if grep -R --include='*.rs' -nE 'ToolInvocationStreamEvent|ToolOutputStream|SessionEventKind::ToolInvocationStream' \
+  packages plugins examples; then
+  echo "removed legacy tool stream contracts were reintroduced" >&2
   exit 1
 fi
 

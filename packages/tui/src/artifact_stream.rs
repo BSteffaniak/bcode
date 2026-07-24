@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use bcode_client::{BcodeClient, ClientError};
 use bcode_plugin_sdk::tui::PluginTuiArtifactChunk;
-use bcode_session_models::{SessionEventKind, SessionId, ToolInvocationStreamEvent};
+use bcode_session_models::{SessionEventKind, SessionId};
 
 const ACTIVE_ARTIFACT_FETCH_BYTES: u32 = 256 * 1024;
 const ACTIVE_ARTIFACT_RETRY_BASE: Duration = Duration::from_millis(100);
@@ -148,14 +148,15 @@ impl ArtifactStreamCoordinator {
         event: &SessionEventKind,
         accepts_reference: impl Fn(&str, &str, u32, &str, Option<&str>) -> bool,
     ) {
-        let SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            semantic_result: Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }),
-            ..
-        } = event
+        let SessionEventKind::ToolInvocationResultRecorded { record } = event else {
+            return;
+        };
+        let Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }) =
+            &record.result
         else {
             return;
         };
+        let tool_call_id = &record.invocation_id;
         for reference in &artifact.refs {
             if !accepts_reference(
                 &artifact.producer_plugin_id,
@@ -234,51 +235,7 @@ impl ArtifactStreamCoordinator {
                 revision: artifact.revision,
                 finalized: artifact.finalized,
             },
-            false,
-        );
-    }
-
-    pub(crate) fn observe_live_event(
-        &mut self,
-        session_id: SessionId,
-        event: &ToolInvocationStreamEvent,
-    ) {
-        let ToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id,
-            artifact_id,
-            reference_key,
-            producer_plugin_id,
-            schema,
-            schema_version,
-            content_type,
-            committed_bytes,
-            revision,
-            availability,
-            finalized,
-            ..
-        } = event
-        else {
-            return;
-        };
-        let key = (
-            session_id,
-            tool_call_id.clone(),
-            artifact_id.clone(),
-            reference_key.clone(),
-        );
-        self.observe_artifact_target(
-            session_id,
-            &key,
-            ActiveArtifactTarget {
-                producer_plugin_id: producer_plugin_id.clone(),
-                schema: schema.clone(),
-                schema_version: *schema_version,
-                content_type: content_type.clone(),
-                committed_bytes: *committed_bytes,
-                revision: *revision,
-                finalized: *finalized,
-            },
-            availability.as_deref() == Some("incomplete"),
+            artifact.availability.as_deref() == Some("incomplete"),
         );
     }
 
@@ -592,47 +549,50 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore = "manual deterministic performance baseline"]
-    async fn artifact_target_fetch_baseline_report() {
-        for observed_targets in [4_u64, 256, 4_096] {
-            let client = BcodeClient::default_endpoint();
-            let mut coordinator = ArtifactStreamCoordinator::new(client);
-            let session_id = SessionId::new();
-            let started = Instant::now();
-            for revision in 1..=observed_targets {
-                coordinator.observe_live_event(
-                    session_id,
-                    &ToolInvocationStreamEvent::ArtifactUpdate {
-                        tool_call_id: "call".to_owned(),
-                        sequence: revision,
-                        artifact_id: "artifact".to_owned(),
-                        reference_key: "recording".to_owned(),
-                        producer_plugin_id: "test.producer".to_owned(),
-                        schema: "test.artifact".to_owned(),
-                        schema_version: 1,
-                        content_type: None,
-                        storage_uri: String::new(),
-                        committed_bytes: revision.saturating_mul(17),
-                        revision,
-                        availability: Some("active".to_owned()),
-                        finalized: false,
-                    },
-                );
-            }
-            let stats = coordinator.drain_stats();
-            println!(
-                "BCODE_PERF_CASE {}",
-                serde_json::json!({
-                    "domain": "artifact_fetch",
-                    "observed_targets": stats.observed_targets,
-                    "coalesced_targets": stats.coalesced_targets,
-                    "fetches_started": stats.fetches_started,
-                    "backlog": stats.backlog,
-                    "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                })
-            );
-        }
+    #[test]
+    fn incomplete_contribution_stops_without_scheduling_a_range_fetch() {
+        let client = BcodeClient::default_endpoint();
+        let mut coordinator = ArtifactStreamCoordinator::new(client);
+        let session_id = SessionId::new();
+        let event = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call".to_owned(),
+            contribution_id: "recording".to_owned(),
+            sequence: 2,
+            producer_id: "test.producer".to_owned(),
+            schema: "test.artifact".to_owned(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: Some(bcode_session_models::ToolContributionArtifact {
+                artifact_id: "artifact".to_owned(),
+                reference_key: "reference".to_owned(),
+                content_type: Some("application/octet-stream".to_owned()),
+                storage_uri: String::new(),
+                committed_bytes: 9,
+                revision: 2,
+                finalized: false,
+                availability: Some("incomplete".to_owned()),
+            }),
+            payload: serde_json::Value::Null,
+        };
+
+        coordinator.observe_contribution(session_id, &event);
+
+        let key = (
+            session_id,
+            "call".to_owned(),
+            "artifact".to_owned(),
+            "reference".to_owned(),
+        );
+        let state = coordinator
+            .artifact_fetches
+            .get(&key)
+            .expect("incomplete artifact state");
+        assert!(!state.fetching);
+        assert!(state.retry_at.is_none());
+        assert!(state.terminal_error.as_deref().is_some_and(|error| {
+            error.contains("incomplete") && error.contains("producer stopped")
+        }));
     }
 
     #[tokio::test]
@@ -640,38 +600,39 @@ mod tests {
         let client = BcodeClient::default_endpoint();
         let mut coordinator = ArtifactStreamCoordinator::new(client);
         let session_id = SessionId::new();
-        let event = SessionEventKind::ToolCallFinished {
-            tool_call_id: "call".to_owned(),
-            result: String::new(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(bcode_session_models::ToolInvocationResult::Artifact {
-                artifact: Box::new(bcode_session_models::ToolArtifact {
-                    artifact_id: "artifact".to_owned(),
-                    producer_plugin_id: "test.producer".to_owned(),
-                    schema: "test.visual".to_owned(),
-                    schema_version: 1,
-                    tool_call_id: Some("call".to_owned()),
-                    title: None,
-                    metadata: serde_json::Value::Null,
-                    refs: vec![
-                        bcode_session_models::ToolArtifactRef {
-                            key: "ignored".to_owned(),
-                            content_type: Some("text/plain".to_owned()),
-                            storage_uri: None,
-                            byte_len: Some(5),
-                            metadata: None,
-                        },
-                        bcode_session_models::ToolArtifactRef {
-                            key: "accepted".to_owned(),
-                            content_type: Some("application/test".to_owned()),
-                            storage_uri: None,
-                            byte_len: Some(10),
-                            metadata: None,
-                        },
-                    ],
+        let event = SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call".to_owned(),
+                model_output: String::new(),
+                is_error: false,
+                result: Some(bcode_session_models::ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_session_models::ToolArtifact {
+                        artifact_id: "artifact".to_owned(),
+                        producer_plugin_id: "test.producer".to_owned(),
+                        schema: "test.visual".to_owned(),
+                        schema_version: 1,
+                        tool_call_id: Some("call".to_owned()),
+                        title: None,
+                        metadata: serde_json::Value::Null,
+                        refs: vec![
+                            bcode_session_models::ToolArtifactRef {
+                                key: "ignored".to_owned(),
+                                content_type: Some("text/plain".to_owned()),
+                                storage_uri: None,
+                                byte_len: Some(5),
+                                metadata: None,
+                            },
+                            bcode_session_models::ToolArtifactRef {
+                                key: "accepted".to_owned(),
+                                content_type: Some("application/test".to_owned()),
+                                storage_uri: None,
+                                byte_len: Some(10),
+                                metadata: None,
+                            },
+                        ],
+                    }),
                 }),
-            }),
+            },
         };
         coordinator.observe_finalized_artifact(
             session_id,

@@ -719,8 +719,8 @@ struct WebToolPreparationDescriptor {
 fn web_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
-    Ok(match definition.name.as_str() {
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let operation = match definition.name.as_str() {
         "web.fetch" => bcode_plugin_sdk::ToolPolicyOperation::Web {
             url: request
                 .invocation
@@ -733,7 +733,21 @@ fn web_policy_operation(
             bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
         }
         name => return Err(format!("unsupported web policy operation: {name}")),
-    })
+    };
+    let identity = if definition.name == "web.fetch" {
+        bcode_plugin_sdk::ToolPolicyIdentity {
+            aliases: vec!["web".to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
+            permission_category: Some("web".to_string()),
+        }
+    } else {
+        bcode_plugin_sdk::ToolPolicyIdentity::default()
+    };
+    Ok(
+        bcode_plugin_sdk::ToolPolicyPreparation::new(definition.name == "web.fetch", operation)
+            .with_identity(identity),
+    )
 }
 
 fn prepare_web_tool_service_response(
@@ -1742,12 +1756,6 @@ fn search_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("searching".to_string()),
-            request_visual: None
-        },
     }
 }
 
@@ -1769,17 +1777,6 @@ fn fetch_tool_definition() -> ToolDefinition {
                 "provider": { "type": "string", "description": "Reserved provider override for prompted extraction; plain fetch currently returns content plus prompt metadata" }
             }
         }),
-        requires_permission: true,
-        policy: bcode_tool::ToolPolicyMetadata {
-            aliases: vec!["web".to_string()],
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some("web".to_string()),
-        },
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("fetching".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -1791,12 +1788,6 @@ fn status_tool_definition() -> ToolDefinition {
             "type": "object",
             "properties": {}
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("checking web capabilities".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -1811,12 +1802,6 @@ fn inspect_tool_definition() -> ToolDefinition {
                 "url": { "type": "string" }
             }
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("inspecting URL".to_string()),
-            request_visual: None
-        },
     }
 }
 
@@ -2609,62 +2594,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn web_catalog_preparation_accepts_missing_url_and_preserves_read_only_tools() {
-        for definition in [
-            search_tool_definition(),
-            fetch_tool_definition(),
-            status_tool_definition(),
-            inspect_tool_definition(),
-        ] {
-            let request = bcode_tool::ToolPreparationRequest {
-                invocation: bcode_tool::ToolInvocationDescriptor {
-                    invocation_id: "catalog".to_owned(),
-                    tool_name: definition.name.clone(),
-                    arguments: serde_json::Value::Null,
-                },
-                host_context: Vec::new(),
-            };
-            let operation =
-                web_policy_operation(&request, &definition).expect("catalog web policy");
-            if definition.name != "web.fetch" {
-                assert_eq!(operation, bcode_plugin_sdk::ToolPolicyOperation::ReadOnly);
-            }
-        }
-    }
-
-    #[test]
-    fn web_owner_prepares_fetch_url_without_generic_extractors() {
-        let definition = fetch_tool_definition();
-        let request = bcode_tool::ToolPreparationRequest {
-            invocation: bcode_tool::ToolInvocationDescriptor {
-                invocation_id: "call".to_owned(),
-                tool_name: definition.name.clone(),
-                arguments: serde_json::json!({"url": "https://example.com/page"}),
-            },
-            host_context: Vec::new(),
-        };
-        assert_eq!(
-            web_policy_operation(&request, &definition).expect("web policy"),
-            bcode_plugin_sdk::ToolPolicyOperation::Web {
-                url: Some("https://example.com/page".to_owned()),
-            }
-        );
-    }
-
-    #[test]
-    fn web_tools_remove_legacy_request_visuals_and_map_request_schemas() {
-        for definition in [
-            search_tool_definition(),
-            fetch_tool_definition(),
-            status_tool_definition(),
-            inspect_tool_definition(),
-        ] {
-            assert!(
-                definition.ui.request_visual.is_none(),
-                "{}",
-                definition.name
-            );
-        }
+    fn web_tools_emit_mapped_request_contributions() {
         assert_eq!(
             web_request_schema("web.search"),
             Some(WEB_SEARCH_REQUEST_SCHEMA)
@@ -2682,6 +2612,54 @@ mod tests {
             Some(WEB_INSPECT_REQUEST_SCHEMA)
         );
         assert_eq!(web_request_schema("unknown"), None);
+    }
+
+    #[test]
+    fn web_catalog_preparation_accepts_missing_url_and_preserves_read_only_tools() {
+        for definition in [
+            search_tool_definition(),
+            fetch_tool_definition(),
+            status_tool_definition(),
+            inspect_tool_definition(),
+        ] {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "catalog".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments: serde_json::Value::Null,
+                },
+                host_context: Vec::new(),
+            };
+            let policy = web_policy_operation(&request, &definition).expect("catalog web policy");
+            assert_eq!(policy.requires_permission, definition.name == "web.fetch");
+            if definition.name != "web.fetch" {
+                assert_eq!(
+                    policy.operation,
+                    bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn web_owner_prepares_fetch_url_without_generic_extractors() {
+        let definition = fetch_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::json!({"url": "https://example.com/page"}),
+            },
+            host_context: Vec::new(),
+        };
+        let policy = web_policy_operation(&request, &definition).expect("web policy");
+        assert!(policy.requires_permission);
+        assert_eq!(
+            policy.operation,
+            bcode_plugin_sdk::ToolPolicyOperation::Web {
+                url: Some("https://example.com/page".to_owned()),
+            }
+        );
     }
 
     #[test]

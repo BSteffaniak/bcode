@@ -5,14 +5,14 @@ use std::borrow::Cow;
 use super::theme::{color, radius, space, surface, typeface};
 use crate::context::{PresentationAction, PresentationContext};
 use bcode_session_view_models::{
-    ChatMessageView, PluginVisualView, SessionViewSnapshot, TextFormat, TranscriptViewItemKind,
+    ChatMessageView, SessionViewSnapshot, TextFormat, TranscriptViewItemKind,
 };
 use hyperchad::template::{Containers, container};
 
-use super::adapters::{VISUAL_ADAPTERS, json_panel, render_plugin_visual};
+use super::adapters::{json_panel, render_tool_contribution};
 use super::components::{
     MessageArticle, conversation_timeline, disclosure, empty_state, message_article,
-    truncation_notice, unsupported_content,
+    truncation_notice,
 };
 use super::permissions::permission_history;
 use super::semantic_dom_id;
@@ -158,21 +158,6 @@ fn transcript_item_with_context(
     })
 }
 
-fn compact_unsupported_contribution(
-    placement: bcode_session_models::ToolContributionPlacement,
-) -> Containers {
-    let label = match placement {
-        bcode_session_models::ToolContributionPlacement::Request => "tool request",
-        bcode_session_models::ToolContributionPlacement::Progress => "tool progress",
-        bcode_session_models::ToolContributionPlacement::Result => "tool result",
-        bcode_session_models::ToolContributionPlacement::Supplemental
-        | bcode_session_models::ToolContributionPlacement::Hidden => return Containers::default(),
-    };
-    unsupported_content(&format!(
-        "No rich presentation is available for this {label}; bounded developer details remain available."
-    ))
-}
-
 pub(super) fn message_content(message: &ChatMessageView) -> Containers {
     if message.text.is_empty() {
         return container! {
@@ -282,30 +267,10 @@ fn transcript_item_body_with_context(
             }
         },
         TranscriptViewItemKind::Interaction { interaction } => interaction_notice(interaction),
-        TranscriptViewItemKind::PluginVisual { visual } => {
-            render_plugin_visual("plugin visual", visual)
-        }
         TranscriptViewItemKind::ToolContribution {
             contribution,
             placement,
-        } => {
-            let visual = PluginVisualView::from(bcode_session_models::PluginVisualDescriptor {
-                visual_id: Some(format!(
-                    "{}-{}",
-                    contribution.invocation_id, contribution.contribution_id
-                )),
-                producer_plugin_id: Some(contribution.producer_id.clone()),
-                schema: contribution.schema.clone(),
-                schema_version: contribution.schema_version,
-                title: Some("Tool contribution".to_owned()),
-                subtitle: None,
-                payload: contribution.payload.clone(),
-            });
-            VISUAL_ADAPTERS
-                .get(&(contribution.schema.as_str(), contribution.schema_version))
-                .and_then(|adapter| adapter(&visual))
-                .unwrap_or_else(|| compact_unsupported_contribution(*placement))
-        }
+        } => render_tool_contribution(contribution, *placement),
     }
 }
 
@@ -328,7 +293,6 @@ pub(super) const fn item_label(kind: &TranscriptViewItemKind) -> &'static str {
             | bcode_session_view_models::SkillViewStatus::Suggested => "skill",
         },
         TranscriptViewItemKind::SystemMessage { .. } => "system",
-        TranscriptViewItemKind::PluginVisual { .. } => "plugin visual",
         TranscriptViewItemKind::ToolContribution { .. } => "tool contribution",
     }
 }

@@ -571,17 +571,11 @@ command = { "python3 *" = "allow" }
                 name: "filesystem.read".to_string(),
                 description: String::new(),
                 input_schema: json!({}),
-                requires_permission: false,
-                policy: bcode_tool::ToolPolicyMetadata::default(),
-                ui: bcode_tool::ToolUiMetadata::default(),
             },
             bcode_tool::ToolDefinition {
                 name: "filesystem.write".to_string(),
                 description: String::new(),
                 input_schema: json!({}),
-                requires_permission: true,
-                policy: bcode_tool::ToolPolicyMetadata::default(),
-                ui: bcode_tool::ToolUiMetadata::default(),
             },
         ];
 

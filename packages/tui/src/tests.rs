@@ -2,8 +2,8 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use bcode_agent_profile::AgentInfo;
@@ -12,15 +12,10 @@ use bcode_config::{
     TuiAccentTransitionCurve, TuiAccentTransitionMode, TuiConfig, TuiThemeConfig, TuiThinkingConfig,
 };
 use bcode_session_models::{
-    ClientId, LegacyLegacyToolPresentationFieldKind, LegacyToolPluginViewPresentation,
-    LegacyToolPresentationEvent, LegacyToolPresentationField, LegacyToolPresentationLevel,
-    LegacyToolPresentationSection, LegacyToolPresentationTarget,
-    LegacyToolRequestPresentationMetadata, LegacyToolRequestPreviewMetadata,
-    LegacyToolStatusPresentation, LiveToolArgumentPreview, PluginVisualDescriptor, RuntimeWorkKind,
-    SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionProjectionKind,
-    SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolArtifact, ToolArtifactRef, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream, WorkId,
+    ClientId, RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+    SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolArtifact, ToolArtifactRef,
+    ToolInvocationResult, WorkId,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -28,7 +23,6 @@ use bmux_tui::buffer::Buffer;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::prelude::Line;
 
 fn context_occupancy(tokens: u64) -> bcode_session_models::RequestContextOccupancy {
     bcode_session_models::RequestContextOccupancy {
@@ -107,64 +101,6 @@ use super::{
     transcript_document::TranscriptDocument,
 };
 
-fn shell_legacy_request_presentation() -> LegacyToolRequestPresentationMetadata {
-    LegacyToolRequestPresentationMetadata {
-        title: "Shell command".to_owned(),
-        fields: vec![
-            LegacyToolPresentationField {
-                label: "command".to_owned(),
-                argument: "command".to_owned(),
-                kind: LegacyLegacyToolPresentationFieldKind::Command,
-                optional: false,
-            },
-            LegacyToolPresentationField {
-                label: "cwd".to_owned(),
-                argument: "cwd".to_owned(),
-                kind: LegacyLegacyToolPresentationFieldKind::Path,
-                optional: true,
-            },
-            LegacyToolPresentationField {
-                label: "terminal".to_owned(),
-                argument: "terminal".to_owned(),
-                kind: LegacyLegacyToolPresentationFieldKind::Boolean,
-                optional: true,
-            },
-        ],
-        preview: None,
-    }
-}
-
-fn file_edit_legacy_request_presentation() -> LegacyToolRequestPresentationMetadata {
-    LegacyToolRequestPresentationMetadata {
-        title: "Edit file".to_owned(),
-        fields: vec![
-            LegacyToolPresentationField {
-                label: "Path".to_owned(),
-                argument: "path".to_owned(),
-                kind: LegacyLegacyToolPresentationFieldKind::Path,
-                optional: false,
-            },
-            LegacyToolPresentationField {
-                label: "Old text".to_owned(),
-                argument: "old_text".to_owned(),
-                kind: LegacyLegacyToolPresentationFieldKind::Text,
-                optional: false,
-            },
-            LegacyToolPresentationField {
-                label: "New text".to_owned(),
-                argument: "new_text".to_owned(),
-                kind: LegacyLegacyToolPresentationFieldKind::Text,
-                optional: false,
-            },
-        ],
-        preview: Some(LegacyToolRequestPreviewMetadata::FileEdit {
-            path_fields: vec!["path".to_owned()],
-            old_text_fields: vec!["old_text".to_owned()],
-            new_text_fields: vec!["new_text".to_owned(), "contents".to_owned()],
-        }),
-    }
-}
-
 fn theme_transition_config(curve: TuiAccentTransitionCurve) -> TuiConfig {
     TuiConfig {
         theme: TuiThemeConfig {
@@ -184,6 +120,253 @@ fn disable_theme_transition(app: &mut BmuxApp) {
         },
         ..TuiConfig::default()
     });
+}
+
+fn agent_infos(items: &[(&str, bool)]) -> Vec<AgentInfo> {
+    agent_infos_with_accents(
+        &items
+            .iter()
+            .map(|(id, is_default)| (*id, *is_default, None))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn agent_infos_with_accents(items: &[(&str, bool, Option<&str>)]) -> Vec<AgentInfo> {
+    items
+        .iter()
+        .map(|(id, is_default, accent)| AgentInfo {
+            id: (*id).to_owned(),
+            name: (*id).to_owned(),
+            description: String::new(),
+            badge: None,
+            accent: accent.map(ToOwned::to_owned),
+            aliases: Vec::new(),
+            is_default: *is_default,
+        })
+        .collect()
+}
+
+fn alt_char(ch: char) -> KeyStroke {
+    KeyStroke {
+        key: KeyCode::Char(ch),
+        modifiers: Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        },
+    }
+}
+
+fn ctrl_key(ch: char) -> KeyStroke {
+    ctrl_key_code(KeyCode::Char(ch))
+}
+
+fn ctrl_key_code(key: KeyCode) -> KeyStroke {
+    KeyStroke {
+        key,
+        modifiers: Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        },
+    }
+}
+
+fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
+    SessionEvent {
+        schema_version: 1,
+        sequence,
+        timestamp_ms: 1,
+        session_id,
+        provenance: None,
+        kind,
+    }
+}
+
+fn file_change_artifact(result: &FileChangeResult) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(bcode_session_models::ToolArtifact {
+            artifact_id: "test-file-change".to_string(),
+            producer_plugin_id: "test.filesystem".to_string(),
+            schema: "test.file-change-artifact".to_string(),
+            schema_version: 1,
+            tool_call_id: None,
+            title: Some("File change".to_string()),
+            metadata: serde_json::to_value(result).expect("file change should serialize"),
+            refs: Vec::new(),
+        }),
+    }
+}
+
+fn is_terminal_visual_test_item(_item: &TranscriptItem) -> bool {
+    false
+}
+
+fn key(key: KeyCode) -> KeyStroke {
+    KeyStroke {
+        key,
+        modifiers: Modifiers::NONE,
+    }
+}
+
+fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+    MouseEvent::new(kind, Point::new(x, y))
+}
+
+fn output_line_y(buffer: &Buffer, needle: &str) -> Option<u16> {
+    (0..buffer.area().height).find(|row| {
+        buffer
+            .row_symbols(*row)
+            .is_some_and(|line| line.contains(needle))
+    })
+}
+
+fn question_outcome_artifact() -> bcode_session_models::ToolArtifact {
+    bcode_session_models::ToolArtifact {
+        artifact_id: "question-outcome-call-question".to_owned(),
+        producer_plugin_id: "bcode.question".to_owned(),
+        schema: "bcode.question.outcome".to_owned(),
+        schema_version: 1,
+        tool_call_id: Some("call-question".to_owned()),
+        title: Some("Question outcome".to_owned()),
+        metadata: serde_json::json!({
+            "status": "answered",
+            "questions": [{
+                "question_index": 0,
+                "header": "Decision",
+                "question": "Proceed?",
+                "status": "answered",
+                "selected": [{"label": "Yes", "value": "yes"}],
+                "custom": null,
+                "required": true
+            }]
+        }),
+        refs: Vec::new(),
+    }
+}
+
+fn question_plugin_host() -> bcode_plugin::PluginHost {
+    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+        bcode_question_plugin::static_plugin(),
+    )];
+    let selected = bcode_plugin::filter_selected_static_plugins(
+        &bundled,
+        &bcode_plugin::PluginSelection::all_enabled(),
+    )
+    .expect("static question plugin manifest should parse");
+    bcode_plugin::PluginHost::load_static_plugins(&selected)
+        .expect("static question plugin should load")
+}
+
+fn render_app_text(app: &mut BmuxApp) -> String {
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(app, &mut frame);
+    rendered_text(&buffer)
+}
+
+fn rendered_text(buffer: &Buffer) -> String {
+    (0..buffer.area().height)
+        .filter_map(|row| buffer.row_symbols(row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rendered_tool_body(rendered: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .skip(1)
+        .take_while(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('⠴')
+                && !trimmed.starts_with('⠸')
+                && !trimmed.starts_with('⠼')
+                && !trimmed.starts_with('┌')
+        })
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn session_summary(session_id: SessionId) -> SessionSummary {
+    SessionSummary {
+        id: session_id,
+        name: Some("Opened session".to_owned()),
+        explicit_name: Some("Opened session".to_owned()),
+        derived_title: None,
+        title_source: SessionTitleSource::Explicit,
+        client_count: 1,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        working_directory: "/tmp/bcode-tui-test".into(),
+        import: None,
+        fork: None,
+        execution: None,
+    }
+}
+
+fn shell_plugin_host() -> bcode_plugin::PluginHost {
+    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+        bcode_shell_plugin::static_plugin(),
+    )];
+    let selected = bcode_plugin::filter_selected_static_plugins(
+        &bundled,
+        &bcode_plugin::PluginSelection::all_enabled(),
+    )
+    .expect("static shell plugin manifest should parse");
+    bcode_plugin::PluginHost::load_static_plugins(&selected)
+        .expect("static shell plugin should load")
+}
+
+fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(bcode_session_models::ToolArtifact {
+            artifact_id: "test-shell-run".to_string(),
+            producer_plugin_id: "test.shell".to_string(),
+            schema: "test.shell-artifact".to_string(),
+            schema_version: 1,
+            tool_call_id: None,
+            title: Some("Shell run".to_string()),
+            metadata: serde_json::to_value(result).expect("shell result should serialize"),
+            refs: Vec::new(),
+        }),
+    }
+}
+
+fn shell_run_artifact() -> bcode_session_models::ToolArtifact {
+    bcode_session_models::ToolArtifact {
+        artifact_id: "call-shell-shell-run".to_owned(),
+        producer_plugin_id: "bcode.shell".to_owned(),
+        schema: "bcode.shell.run".to_owned(),
+        schema_version: 1,
+        tool_call_id: Some("call-shell".to_owned()),
+        title: Some("Shell run".to_owned()),
+        metadata: serde_json::json!({
+            "mode": "terminal",
+            "exit_code": 0,
+            "timed_out": false,
+            "cancelled": false,
+            "duration_ms": 12,
+            "output_tail": "shell raw output\n",
+            "output_truncated": false,
+            "output_bytes": 17,
+            "retained_output_bytes": 17,
+            "columns": 80,
+            "rows": 24
+        }),
+        refs: Vec::new(),
+    }
+}
+
+fn shift_key(key: KeyCode) -> KeyStroke {
+    KeyStroke {
+        key,
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        },
+    }
 }
 
 #[test]
@@ -2083,7 +2266,7 @@ fn switch_to_draft_session_preserves_plugin_host() {
 }
 
 #[tokio::test]
-async fn session_open_preserved_plugin_host_renders_live_file_preview() {
+async fn session_open_preserved_plugin_host_renders_live_request_contribution() {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
@@ -2104,30 +2287,43 @@ async fn session_open_preserved_plugin_host_renders_live_file_preview() {
         session_id,
         super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24)),
     );
-    chat.app
-        .absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-            session_id,
-            kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-                turn_id: "turn-1".to_owned(),
-                tool_call_id: "call_write".to_owned(),
-                tool_name: "filesystem_write".to_owned(),
-                argument_bytes: 36,
-                preview: file_change_preview(
-                    "Write preview",
-                    Some("writing src/lib.rs"),
-                    Some("src/lib.rs"),
-                    "",
-                    "pub fn demo() {}",
-                    false,
-                ),
-            },
-        });
+    chat.app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_write".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem_write".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "src/lib.rs",
+                "contents": "pub fn demo() {}",
+            })
+            .to_string(),
+            working_directory: None,
+        },
+    ));
+    chat.app.absorb_session_event(&request_contribution_event(
+        session_id,
+        2,
+        "call_write",
+        "bcode.filesystem",
+        "bcode.filesystem.change",
+        serde_json::json!({
+            "operation": "filesystem.write",
+            "path": "src/lib.rs",
+            "contents": "pub fn demo() {}",
+            "old_text": "",
+            "new_text": "pub fn demo() {}",
+        }),
+    ));
 
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut chat.app, &mut frame);
     let output = rendered_text(&buffer);
-    assert!(output.contains("Write preview"), "{output}");
+    assert!(output.contains("Writing file"), "{output}");
+    assert!(output.contains("src/lib.rs"), "{output}");
+    assert!(output.contains("pub fn demo() {}"), "{output}");
     assert!(!output.contains("plugin host unavailable"), "{output}");
 }
 
@@ -2416,19 +2612,18 @@ fn transcript_renders_compact_tool_blocks_without_raw_arguments() {
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"cargo check","cwd":"/tmp/project"}"#.to_owned(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
             session_id,
             2,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: full_call_id.to_owned(),
-                result: "ok".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: full_call_id.to_owned(),
+                    model_output: "ok".to_owned(),
+                    is_error: false,
+                    result: None,
+                },
             },
         ),
     ];
@@ -2467,8 +2662,6 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
             })
             .to_string(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 72, 16));
@@ -2506,8 +2699,6 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -2519,7 +2710,6 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             batch: None,
             policy_source: None,
             policy_reason: None,
@@ -2535,27 +2725,26 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
     app.absorb_session_event(&event(
         session_id,
         3,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call_edit".to_owned(),
-                tool_name: "filesystem_edit".to_owned(),
-                sequence: 0,
-                terminal: false,
-                columns: None,
-                rows: None,
-                started_at_ms: None,
+        SessionEventKind::ToolInvocationLifecycle {
+            event: bcode_session_models::ToolInvocationLifecycleEvent {
+                invocation_id: "call_edit".to_owned(),
+                sequence: 1,
+                stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                message: None,
+                metadata: serde_json::Value::Null,
             },
         },
     ));
     app.absorb_session_event(&event(
         session_id,
         4,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call_edit".to_owned(),
-            result: "edited src/lib.rs".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: None,
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call_edit".to_owned(),
+                model_output: "edited src/lib.rs".to_owned(),
+                is_error: false,
+                result: None,
+            },
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
@@ -2585,8 +2774,6 @@ fn denied_file_permission_marks_preview_failed() {
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -2598,7 +2785,6 @@ fn denied_file_permission_marks_preview_failed() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             batch: None,
             policy_source: None,
             policy_reason: None,
@@ -2638,8 +2824,6 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
             })
             .to_string(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2663,23 +2847,24 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
     let history = [event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call_terminal".to_owned(),
-            result: String::new(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                duration_ms: None,
-                output_tail: "one\r\ntwo".to_owned(),
-                output_truncated: false,
-                output_bytes: None,
-                retained_output_bytes: None,
-                columns: 80,
-                rows: 10,
-            })),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call_terminal".to_owned(),
+                model_output: String::new(),
+                is_error: false,
+                result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: "one\r\ntwo".to_owned(),
+                    output_truncated: false,
+                    output_bytes: None,
+                    retained_output_bytes: None,
+                    columns: 80,
+                    rows: 10,
+                })),
+            },
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2703,23 +2888,24 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
     let history = [event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call_terminal".to_owned(),
-            result: String::new(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                duration_ms: None,
-                output_tail: "one\r\ntwo".to_owned(),
-                output_truncated: true,
-                output_bytes: Some(70000),
-                retained_output_bytes: Some(65536),
-                columns: 80,
-                rows: 10,
-            })),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call_terminal".to_owned(),
+                model_output: String::new(),
+                is_error: false,
+                result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: "one\r\ntwo".to_owned(),
+                    output_truncated: true,
+                    output_bytes: Some(70000),
+                    retained_output_bytes: Some(65536),
+                    columns: 80,
+                    rows: 10,
+                })),
+            },
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2735,141 +2921,6 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
     assert!(!output.contains("artifact_id"));
     assert!(!output.contains("producer_plugin_id"));
     assert!(!output.contains("metadata"));
-}
-
-#[test]
-fn streamed_terminal_output_renders_running_until_final_result() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-running".to_owned(),
-            producer_plugin_id: None,
-            tool_name: "shell.run".to_owned(),
-            arguments_json: "{}".to_owned(),
-            working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(shell_legacy_request_presentation()),
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call-running".to_owned(),
-                tool_name: "shell.run".to_owned(),
-                sequence: 0,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: Some(1_000),
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        3,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-running".to_owned(),
-                stream: ToolOutputStream::Pty,
-                sequence: 1,
-                text: "still running\n".to_owned(),
-                byte_len: "still running\n".len(),
-            },
-        },
-    ));
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-
-    assert!(!output.contains(" · terminal"));
-    assert!(!output.contains("exit 0"));
-}
-
-#[test]
-fn streamed_terminal_output_updates_header_after_final_result() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-final".to_owned(),
-            producer_plugin_id: None,
-            tool_name: "shell.run".to_owned(),
-            arguments_json: "{}".to_owned(),
-            working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(shell_legacy_request_presentation()),
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call-final".to_owned(),
-                tool_name: "shell.run".to_owned(),
-                sequence: 0,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: None,
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        3,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-final".to_owned(),
-                stream: ToolOutputStream::Pty,
-                sequence: 1,
-                text: "done\n".to_owned(),
-                byte_len: "done\n".len(),
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        4,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-final".to_owned(),
-            result: "done\n".to_string(),
-            is_error: true,
-            output: None,
-            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                exit_code: Some(2),
-                timed_out: false,
-                cancelled: false,
-                duration_ms: None,
-                output_tail: "done\n".to_owned(),
-                output_truncated: false,
-                output_bytes: Some(5),
-                retained_output_bytes: Some(5),
-                columns: 80,
-                rows: 24,
-            })),
-        },
-    ));
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-
-    assert!(!output.contains("Terminal · shell.run · running"));
 }
 
 #[test]
@@ -3295,8 +3346,6 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
@@ -3480,8 +3529,6 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: None,
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
@@ -3568,19 +3615,18 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
         session_id,
         2,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "tool-1".to_owned(),
-            result: "done".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: None,
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "tool-1".to_owned(),
+                model_output: "done".to_owned(),
+                is_error: false,
+                result: None,
+            },
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
@@ -3724,75 +3770,6 @@ fn committed_user_echo_does_not_restart_submitted_message_anchor() {
 }
 
 #[test]
-fn streamed_tool_output_is_not_duplicated_by_final_result() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-1".to_owned(),
-            producer_plugin_id: None,
-            tool_name: "filesystem.shell.run".to_owned(),
-            arguments_json: "{}".to_owned(),
-            working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call-1".to_owned(),
-                tool_name: "filesystem.shell.run".to_owned(),
-                sequence: 0,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: None,
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        3,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-1".to_owned(),
-                stream: ToolOutputStream::Pty,
-                sequence: 0,
-                text: "first\n".to_owned(),
-                byte_len: "first\n".len(),
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        4,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-1".to_owned(),
-            result: "first\n".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: None,
-        },
-    ));
-
-    let tool_results = app
-        .transcript()
-        .iter()
-        .filter(|item| item.text() == "first\n")
-        .collect::<Vec<_>>();
-    assert_eq!(tool_results.len(), 1);
-    assert_eq!(tool_results[0].text(), "first\n");
-    assert!(!tool_results[0].streaming());
-}
-
-#[test]
 fn file_change_artifact_history_renders_generic_tool_result_without_request() {
     let session_id = SessionId::new();
     let events = file_change_semantic_result_events(session_id, false);
@@ -3863,31 +3840,30 @@ fn file_change_semantic_result_events(
                 tool_name: "example.write".to_owned(),
                 arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             },
         ));
     }
     events.push(event(
         session_id,
         2,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-file".to_owned(),
-            result: "wrote 2 bytes".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(file_change_artifact(&FileChangeResult {
-                tool_name: "example.write".to_owned(),
-                summary: "wrote 2 bytes".to_owned(),
-                path: Some("file.txt".to_owned()),
-            })),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-file".to_owned(),
+                model_output: "wrote 2 bytes".to_owned(),
+                is_error: false,
+                result: Some(file_change_artifact(&FileChangeResult {
+                    tool_name: "example.write".to_owned(),
+                    summary: "wrote 2 bytes".to_owned(),
+                    path: Some("file.txt".to_owned()),
+                })),
+            },
         },
     ));
     events
 }
 
 #[test]
-fn streamed_tool_without_output_renders_final_result() {
+fn canonical_lifecycle_without_output_renders_final_result() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -3899,34 +3875,18 @@ fn streamed_tool_without_output_renders_final_result() {
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 working_directory: None,
-                request_visual: Some(shell_request_visual("cargo test", None)),
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-empty".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(120),
-                    rows: Some(40),
-                    started_at_ms: None,
-                },
             },
         ),
         event(
             session_id,
             3,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-empty".to_owned(),
-                result: "final result".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-empty".to_owned(),
+                    model_output: "final result".to_owned(),
+                    is_error: false,
+                    result: None,
+                },
             },
         ),
     ];
@@ -3949,45 +3909,29 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 working_directory: None,
-                request_visual: Some(shell_request_visual("cargo test", None)),
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-no-live".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(24),
-                    started_at_ms: Some(1_000),
-                },
             },
         ),
         event(
             session_id,
             3,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-no-live".to_owned(),
-                result: String::new(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: String::new(),
-                    output_truncated: false,
-                    output_bytes: Some(0),
-                    retained_output_bytes: Some(0),
-                    columns: 80,
-                    rows: 24,
-                })),
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-no-live".to_owned(),
+                    model_output: String::new(),
+                    is_error: false,
+                    result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        cancelled: false,
+                        duration_ms: None,
+                        output_tail: String::new(),
+                        output_truncated: false,
+                        output_bytes: Some(0),
+                        retained_output_bytes: Some(0),
+                        columns: 80,
+                        rows: 24,
+                    })),
+                },
             },
         ),
     ];
@@ -4026,30 +3970,29 @@ fn live_shell_result_preserves_request_block() {
                 })
                 .to_string(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
             session_id,
             2,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-live-shell".to_owned(),
-                result: String::new(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(shell_result_artifact(&ShellRunResult::Captured {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    stdout: "hello\n".to_owned(),
-                    stderr: String::new(),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                    stdout_bytes: Some(6),
-                    stderr_bytes: Some(0),
-                })),
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-live-shell".to_owned(),
+                    model_output: String::new(),
+                    is_error: false,
+                    result: Some(shell_result_artifact(&ShellRunResult::Captured {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        cancelled: false,
+                        duration_ms: None,
+                        stdout: "hello\n".to_owned(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        stdout_bytes: Some(6),
+                        stderr_bytes: Some(0),
+                    })),
+                },
             },
         ),
     ];
@@ -4075,23 +4018,24 @@ fn semantic_terminal_result_without_stream_renders_generic_artifact() {
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-terminal".to_owned(),
-            result: String::new(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                duration_ms: None,
-                output_tail: "ansi tail\n".to_owned(),
-                output_truncated: false,
-                output_bytes: Some(10),
-                retained_output_bytes: Some(10),
-                columns: 80,
-                rows: 24,
-            })),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-terminal".to_owned(),
+                model_output: String::new(),
+                is_error: false,
+                result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: "ansi tail\n".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some(10),
+                    retained_output_bytes: Some(10),
+                    columns: 80,
+                    rows: 24,
+                })),
+            },
         },
     )];
 
@@ -4111,23 +4055,24 @@ fn semantic_captured_shell_result_renders_generic_artifact() {
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-captured".to_owned(),
-            result: "legacy output should not be used".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(shell_result_artifact(&ShellRunResult::Captured {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                duration_ms: None,
-                stdout: "captured stdout\n".to_owned(),
-                stderr: "captured stderr\n".to_owned(),
-                stdout_truncated: false,
-                stderr_truncated: true,
-                stdout_bytes: Some(16),
-                stderr_bytes: Some(16),
-            })),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-captured".to_owned(),
+                model_output: "legacy output should not be used".to_owned(),
+                is_error: false,
+                result: Some(shell_result_artifact(&ShellRunResult::Captured {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    stdout: "captured stdout\n".to_owned(),
+                    stderr: "captured stderr\n".to_owned(),
+                    stdout_truncated: false,
+                    stderr_truncated: true,
+                    stdout_bytes: Some(16),
+                    stderr_bytes: Some(16),
+                })),
+            },
         },
     )];
 
@@ -4159,27 +4104,26 @@ fn legacy_terminal_result_renders_plain_tool_result() {
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 working_directory: None,
-                request_visual: Some(shell_request_visual("cargo test", None)),
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
             session_id,
             2,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-old-order".to_owned(),
-                result: serde_json::json!({
-                    "mode": "terminal",
-                    "exit_code": 0,
-                    "timed_out": false,
-                    "output": "legacy tail\n",
-                    "columns": 80,
-                    "rows": 24,
-                })
-                .to_string(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-old-order".to_owned(),
+                    model_output: serde_json::json!({
+                        "mode": "terminal",
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "output": "legacy tail\n",
+                        "columns": 80,
+                        "rows": 24,
+                    })
+                    .to_string(),
+                    is_error: false,
+                    result: None,
+                },
             },
         ),
     ];
@@ -4199,282 +4143,20 @@ fn legacy_terminal_result_renders_plain_tool_result() {
 }
 
 #[test]
-fn presentation_events_replay_ignores_legacy_presentation_events() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-present".to_owned(),
-                producer_plugin_id: None,
-                tool_name: "third.party".to_owned(),
-                arguments_json: "{}".to_owned(),
-                working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-present".to_owned(),
-                    sequence: 1,
-                    presentation: LegacyToolPresentationEvent::Status(
-                        LegacyToolStatusPresentation {
-                            target: LegacyToolPresentationTarget::Result,
-                            text: "custom status".to_owned(),
-                            level: LegacyToolPresentationLevel::Success,
-                        },
-                    ),
-                },
-            },
-        ),
-    ];
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-
-    assert!(transcript.iter().any(|item| matches!(
-        item.kind(),
-        TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-present"
-    )));
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("custom status"))
-    );
-}
-
-#[test]
-fn legacy_presentation_card_does_not_replace_tool_request_surface() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-present".to_owned(),
-                producer_plugin_id: None,
-                tool_name: "third.party".to_owned(),
-                arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
-                working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-present".to_owned(),
-                    sequence: 1,
-                    presentation: LegacyToolPresentationEvent::Card(
-                        bcode_session_models::LegacyToolCardPresentation {
-                            target: LegacyToolPresentationTarget::Preview,
-                            title: "Plugin preview".to_owned(),
-                            subtitle: None,
-                            sections: Vec::new(),
-                        },
-                    ),
-                },
-            },
-        ),
-    ];
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-
-    assert!(transcript.iter().any(|item| matches!(
-        item.kind(),
-        TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-present"
-    )));
-    assert!(
-        transcript
-            .iter()
-            .any(|item| item.text().contains("arguments"))
-    );
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("Plugin preview"))
-    );
-}
-
-#[test]
-fn legacy_result_presentation_does_not_suppress_generic_tool_result() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-present".to_owned(),
-                producer_plugin_id: None,
-                tool_name: "third.party".to_owned(),
-                arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
-                working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-present".to_owned(),
-                    sequence: 1,
-                    presentation: LegacyToolPresentationEvent::Card(
-                        bcode_session_models::LegacyToolCardPresentation {
-                            target: LegacyToolPresentationTarget::Result,
-                            title: "Plugin result".to_owned(),
-                            subtitle: None,
-                            sections: Vec::new(),
-                        },
-                    ),
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-present".to_owned(),
-                result: "raw result".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
-            },
-        ),
-    ];
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("Plugin result"))
-    );
-    assert!(transcript.iter().any(|item| matches!(
-        item.kind(),
-        TranscriptItemKind::ToolResult { result, .. } if result == "raw result"
-    )));
-}
-
-#[test]
-fn presentation_clear_removes_replayed_transcript_card() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-present".to_owned(),
-                    sequence: 1,
-                    presentation: LegacyToolPresentationEvent::Status(
-                        LegacyToolStatusPresentation {
-                            target: LegacyToolPresentationTarget::Result,
-                            text: "custom status".to_owned(),
-                            level: LegacyToolPresentationLevel::Success,
-                        },
-                    ),
-                },
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-present".to_owned(),
-                    sequence: 2,
-                    presentation: LegacyToolPresentationEvent::Clear {
-                        target: LegacyToolPresentationTarget::Result,
-                    },
-                },
-            },
-        ),
-    ];
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("custom status"))
-    );
-}
-
-#[test]
-fn legacy_live_presentation_card_is_ignored_by_normal_transcript() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-present".to_owned(),
-                producer_plugin_id: None,
-                tool_name: "third.party".to_owned(),
-                arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
-                working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-present".to_owned(),
-                    sequence: 1,
-                    presentation: LegacyToolPresentationEvent::Card(
-                        bcode_session_models::LegacyToolCardPresentation {
-                            target: LegacyToolPresentationTarget::Result,
-                            title: "Custom result".to_owned(),
-                            subtitle: Some("plugin-owned".to_owned()),
-                            sections: vec![LegacyToolPresentationSection::Text {
-                                label: Some("Summary".to_owned()),
-                                text: "Rendered from plugin presentation".to_owned(),
-                            }],
-                        },
-                    ),
-                },
-            },
-        ),
-    ];
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-
-    assert!(transcript.iter().any(|item| matches!(
-        item.kind(),
-        TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-present"
-    )));
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("Custom result"))
-    );
-}
-
-#[test]
 fn semantic_text_result_renders_generic_tool_result() {
     let session_id = SessionId::new();
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-text".to_owned(),
-            result: "legacy text".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Text {
-                text: "semantic text".to_owned(),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-text".to_owned(),
+                model_output: "model fallback text".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Text {
+                    text: "semantic text".to_owned(),
+                }),
+            },
         },
     )];
 
@@ -4487,7 +4169,7 @@ fn semantic_text_result_renders_generic_tool_result() {
     assert!(
         !transcript
             .iter()
-            .any(|item| item.text().contains("legacy text"))
+            .any(|item| item.text().contains("model fallback text"))
     );
 }
 
@@ -4591,8 +4273,6 @@ fn transcript_resident_window_does_not_trim_with_active_tool() {
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     for index in 0..50_u64 {
@@ -4634,26 +4314,24 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 working_directory: None,
-                request_visual: Some(shell_request_visual("cargo test", None)),
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ));
         app.absorb_session_event(&event(
             session_id,
             base.saturating_add(2),
-            SessionEventKind::ToolCallFinished {
-                tool_call_id,
-                result: "ok".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: tool_call_id,
+                    model_output: "ok".to_owned(),
+                    is_error: false,
+                    result: None,
+                },
             },
         ));
     }
 
     assert!(app.resident_transcript_event_count() <= 600);
     assert!(app.resident_tool_call_context_count() < 360);
-    assert_eq!(app.resident_streamed_tool_result_count(), 0);
 }
 
 fn filesystem_change_artifact() -> bcode_session_models::ToolArtifact {
@@ -4674,6 +4352,37 @@ fn filesystem_change_artifact() -> bcode_session_models::ToolArtifact {
     }
 }
 
+fn request_contribution_event(
+    session_id: SessionId,
+    event_sequence: u64,
+    invocation_id: &str,
+    producer_id: &str,
+    schema: &str,
+    payload: serde_json::Value,
+) -> SessionEvent {
+    event(
+        session_id,
+        event_sequence,
+        SessionEventKind::ToolContributionPlaced {
+            envelope: bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Request,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: invocation_id.to_owned(),
+                    contribution_id: "request".to_owned(),
+                    sequence: 1,
+                    producer_id: producer_id.to_owned(),
+                    schema: schema.to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
+                    payload,
+                },
+            ),
+        },
+    )
+}
+
 fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
     let bundled = [bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
@@ -4688,835 +4397,12 @@ fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
         .expect("static filesystem plugin should load")
 }
 
-fn file_change_preview(
-    title: &str,
-    streaming_status: Option<&str>,
-    path: Option<&str>,
-    old_text: &str,
-    new_text: &str,
-    truncated: bool,
-) -> LiveToolArgumentPreview {
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "title".to_owned(),
-        serde_json::Value::String(title.to_owned()),
-    );
-    payload.insert(
-        "summary".to_owned(),
-        serde_json::Value::String(title.to_owned()),
-    );
-    if let Some(path) = path {
-        payload.insert(
-            "path".to_owned(),
-            serde_json::Value::String(path.to_owned()),
-        );
-    }
-    payload.insert(
-        "old_text".to_owned(),
-        serde_json::Value::String(old_text.to_owned()),
-    );
-    payload.insert(
-        "new_text".to_owned(),
-        serde_json::Value::String(new_text.to_owned()),
-    );
-    payload.insert("truncated".to_owned(), serde_json::Value::Bool(truncated));
-    LiveToolArgumentPreview {
-        visual: PluginVisualDescriptor {
-            visual_id: None,
-            producer_plugin_id: Some("bcode.filesystem".to_owned()),
-            schema: "bcode.filesystem.change".to_owned(),
-            schema_version: 1,
-            title: Some(title.to_owned()),
-            subtitle: streaming_status.map(ToOwned::to_owned),
-            payload: serde_json::Value::Object(payload),
-        },
-        streaming_status: streaming_status.map(ToOwned::to_owned),
-        argument_bytes: 36,
-    }
-}
-
-fn shell_request_preview(command: &str, cwd: Option<&str>) -> LiveToolArgumentPreview {
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "command".to_owned(),
-        serde_json::Value::String(command.to_owned()),
-    );
-    if let Some(cwd) = cwd {
-        payload.insert("cwd".to_owned(), serde_json::Value::String(cwd.to_owned()));
-    }
-    LiveToolArgumentPreview {
-        visual: PluginVisualDescriptor {
-            visual_id: None,
-            producer_plugin_id: Some("bcode.shell".to_owned()),
-            schema: "bcode.tool.request.shell.run".to_owned(),
-            schema_version: 1,
-            title: Some("Shell command".to_owned()),
-            subtitle: None,
-            payload: serde_json::Value::Object(payload),
-        },
-        streaming_status: None,
-        argument_bytes: 36,
-    }
-}
-
-fn shell_request_visual(command: &str, cwd: Option<&str>) -> PluginVisualDescriptor {
-    shell_request_preview(command, cwd).visual
-}
-
-fn file_change_visual(
-    title: &str,
-    path: Option<&str>,
-    old_text: &str,
-    new_text: &str,
-    truncated: bool,
-) -> PluginVisualDescriptor {
-    file_change_preview(title, None, path, old_text, new_text, truncated).visual
-}
-
-fn web_search_request_preview(query: &str) -> LiveToolArgumentPreview {
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "query".to_owned(),
-        serde_json::Value::String(query.to_owned()),
-    );
-    LiveToolArgumentPreview {
-        visual: PluginVisualDescriptor {
-            visual_id: None,
-            producer_plugin_id: Some("bcode.web_search".to_owned()),
-            schema: "bcode.web_search.search_request".to_owned(),
-            schema_version: 1,
-            title: Some("Search query".to_owned()),
-            subtitle: None,
-            payload: serde_json::Value::Object(payload),
-        },
-        streaming_status: None,
-        argument_bytes: 32,
-    }
-}
-
-#[test]
-fn live_shell_transcript_block_renders_generic_elapsed() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-    let started_at_ms =
-        super::time_format::unix_time_millis(SystemTime::now()).saturating_sub(1_200);
-
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call-shell".to_owned(),
-                tool_name: "shell.run".to_owned(),
-                sequence: 0,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: Some(started_at_ms),
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::VisualUpdate {
-                tool_call_id: "call-shell".to_owned(),
-                sequence: 1,
-                visual: PluginVisualDescriptor {
-                    visual_id: None,
-                    producer_plugin_id: Some("bcode.shell".to_owned()),
-                    schema: "bcode.tool.request.shell.run".to_owned(),
-                    schema_version: 1,
-                    title: Some("Shell command".to_owned()),
-                    subtitle: None,
-                    payload: serde_json::json!({
-                        "arguments": {"command": "echo hi"},
-                        "_bcode_runtime": {"output": "hi\n", "columns": 80, "rows": 24, "streaming": true, "timeout_ms": 60_000}
-                    }),
-                },
-                streaming: true,
-            },
-        },
-    ));
-
-    let rendered = render_app_text(&mut app);
-
-    assert!(rendered.contains("Shell command · elapsed"), "{rendered}");
-    assert!(rendered.contains("timeout 1m"), "{rendered}");
-    assert!(rendered.contains("hi"), "{rendered}");
-    assert!(
-        app.invalidation_requests(Instant::now(), SystemTime::now())
-            .len()
-            > 1
-    );
-}
-
-#[test]
-fn replayed_shell_transcript_block_renders_generic_duration() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-shell".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(24),
-                    started_at_ms: Some(1_000),
-                },
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Finished {
-                    tool_call_id: "call-shell".to_owned(),
-                    sequence: 1,
-                    is_error: false,
-                    finished_at_ms: Some(1_012),
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-shell".to_owned(),
-                result: "shell completed".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(ToolInvocationResult::Artifact {
-                    artifact: Box::new(shell_run_artifact()),
-                }),
-            },
-        ),
-    ];
-    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-
-    let rendered = render_app_text(&mut app);
-
-    assert!(rendered.contains("Shell run · duration 12ms"), "{rendered}");
-    assert!(rendered.contains("exit code 0"), "{rendered}");
-}
-
-#[derive(Default)]
-struct GrowingVisualAdapter {
-    rows: Mutex<Vec<String>>,
-}
-
-impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for GrowingVisualAdapter {
-    fn supports(&self, kind: &str) -> bool {
-        kind == "bcode.tool.request.shell.run"
-    }
-
-    fn artifact_chunk(
-        &self,
-        chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk,
-    ) -> Result<(), String> {
-        let text = String::from_utf8(chunk.bytes.clone()).map_err(|error| error.to_string())?;
-        self.rows
-            .lock()
-            .map_err(|_| "growing visual state poisoned".to_owned())?
-            .extend(text.lines().map(ToOwned::to_owned));
-        Ok(())
-    }
-
-    fn rows(
-        &self,
-        _kind: &str,
-        _payload: &serde_json::Value,
-        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
-    ) -> Vec<Line> {
-        self.rows
-            .lock()
-            .map(|rows| rows.iter().cloned().map(Line::from).collect())
-            .unwrap_or_default()
-    }
-}
-
-fn growing_visual_presentation() -> Arc<super::plugin_tui::PluginTuiPresentation> {
-    let presentation = Arc::new(super::plugin_tui::PluginTuiPresentation::new(
-        shell_plugin_host(),
-    ));
-    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::<GrowingVisualAdapter>::default());
-    presentation.install_registry_for_test("bcode.shell", registry);
-    presentation
-}
-
-fn deliver_growing_visual_rows(
-    presentation: &super::plugin_tui::PluginTuiPresentation,
-    tool_call_id: &str,
-    rows: &[&str],
-    revision: u64,
-) {
-    let bytes = rows.join("\n").into_bytes();
-    assert!(
-        presentation
-            .deliver_artifact_chunk(&bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
-                tool_call_id: tool_call_id.to_owned(),
-                artifact_id: format!("{tool_call_id}-artifact"),
-                reference_key: "test_rows".to_owned(),
-                producer_plugin_id: "bcode.shell".to_owned(),
-                schema: "bcode.tool.request.shell.run".to_owned(),
-                schema_version: 1,
-                content_type: Some("text/plain".to_owned()),
-                offset: 0,
-                total_bytes: u64::try_from(bytes.len()).expect("artifact bytes"),
-                revision,
-                finalized: false,
-                bytes,
-            })
-            .expect("deliver growing visual rows")
-    );
-}
-
-fn growing_visual_app(
-    session_id: SessionId,
-    presentation: Arc<super::plugin_tui::PluginTuiPresentation>,
-) -> BmuxApp {
-    let mut history = (0..24)
-        .map(|sequence| {
-            event(
-                session_id,
-                sequence,
-                SessionEventKind::AssistantMessage {
-                    text: format!("history {sequence}"),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    history.push(event(
-        session_id,
-        24,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-growing".to_owned(),
-            producer_plugin_id: Some("bcode.shell".to_owned()),
-            tool_name: "shell.run".to_owned(),
-            arguments_json: r#"{"command":"fixture"}"#.to_owned(),
-            working_directory: None,
-            request_visual: Some(PluginVisualDescriptor {
-                visual_id: None,
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                schema: "bcode.tool.request.shell.run".to_owned(),
-                schema_version: 1,
-                title: Some("Growing visual".to_owned()),
-                subtitle: None,
-                payload: serde_json::json!({"command": "fixture"}),
-            }),
-            legacy_request_presentation: None,
-        },
-    ));
-    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-    app.set_plugin_presentation(presentation);
-    app
-}
-
-fn shell_matrix_recording(output_bytes: usize, chunk_bytes: usize) -> Vec<u8> {
-    let dir = tempfile::tempdir().expect("recording temp dir");
-    let path = dir.path().join("matrix.bcsr");
-    let mut writer = bcode_shell_plugin::recording::ShellRecordingWriter::create(&path, 80, 24)
-        .expect("recording writer");
-    let chunk = vec![b'x'; chunk_bytes];
-    let mut written = 0_usize;
-    let mut sequence = 1_u64;
-    while written < output_bytes {
-        let length = (output_bytes - written).min(chunk_bytes);
-        writer
-            .write_output(sequence, &chunk[..length])
-            .expect("exact output frame");
-        writer
-            .write_replay_output(sequence, &chunk[..length])
-            .expect("replay output frame");
-        written = written.saturating_add(length);
-        sequence = sequence.saturating_add(1);
-    }
-    writer
-        .finish(sequence, Some(0), None, false, false)
-        .expect("finish recording");
-    std::fs::read(path).expect("recording bytes")
-}
-
-fn shell_matrix_app(
-    transcript_entries: u64,
-    presentation: Arc<super::plugin_tui::PluginTuiPresentation>,
-) -> BmuxApp {
-    let session_id = SessionId::new();
-    let mut history = (0..transcript_entries.saturating_sub(1))
-        .map(|sequence| {
-            event(
-                session_id,
-                sequence,
-                SessionEventKind::AssistantMessage {
-                    text: format!("history {sequence}"),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    history.push(event(
-        session_id,
-        transcript_entries,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-matrix".to_owned(),
-            producer_plugin_id: Some("bcode.shell".to_owned()),
-            tool_name: "shell.run".to_owned(),
-            arguments_json: r#"{"command":"matrix"}"#.to_owned(),
-            working_directory: None,
-            request_visual: Some(PluginVisualDescriptor {
-                visual_id: None,
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                schema: "bcode.shell.run".to_owned(),
-                schema_version: 1,
-                title: Some("Shell run".to_owned()),
-                subtitle: None,
-                payload: serde_json::json!({
-                    "mode": "terminal",
-                    "columns": 80,
-                    "rows": 24,
-                    "streaming": true,
-                    "command": "matrix"
-                }),
-            }),
-            legacy_request_presentation: None,
-        },
-    ));
-    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-    app.set_plugin_presentation(presentation);
-    app
-}
-
-#[test]
-#[ignore = "manual deterministic performance baseline"]
-#[allow(clippy::too_many_lines)] // One integration matrix case keeps delivery and frame measurements together.
-fn shell_output_chunk_transcript_matrix_report() {
-    const OUTPUT_VOLUMES: [usize; 3] = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
-    const CHUNK_BYTES: [usize; 3] = [17, 4 * 1024, 16 * 1024];
-    const TRANSCRIPT_ENTRIES: [u64; 3] = [10, 500, 2_000];
-    const ARTIFACT_RANGE_BYTES: usize = 256 * 1024;
-    let terminal = Rect::new(0, 0, 80, 30);
-
-    for output_bytes in OUTPUT_VOLUMES {
-        for chunk_bytes in CHUNK_BYTES {
-            let recording = shell_matrix_recording(output_bytes, chunk_bytes);
-            for transcript_entries in TRANSCRIPT_ENTRIES {
-                let presentation = Arc::new(super::plugin_tui::PluginTuiPresentation::new(
-                    shell_plugin_host(),
-                ));
-                let mut app = shell_matrix_app(transcript_entries, Arc::clone(&presentation));
-                let mut buffer = Buffer::empty(terminal);
-                let mut frame = Frame::new(&mut buffer);
-                render::render(&mut app, &mut frame);
-                let _ = app.transcript_layout_mut().drain_sync_stats();
-                let _ = presentation.drain_timings();
-                let _ = presentation.drain_diagnostics();
-
-                let delivery_started = Instant::now();
-                let total_bytes = u64::try_from(recording.len()).expect("recording length");
-                for (index, bytes) in recording.chunks(ARTIFACT_RANGE_BYTES).enumerate() {
-                    let offset = u64::try_from(index.saturating_mul(ARTIFACT_RANGE_BYTES))
-                        .expect("artifact offset");
-                    assert!(
-                        presentation
-                            .deliver_artifact_chunk(
-                                &bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
-                                    tool_call_id: "call-matrix".to_owned(),
-                                    artifact_id: "call-matrix-shell-run".to_owned(),
-                                    reference_key: "shell_recording".to_owned(),
-                                    producer_plugin_id: "bcode.shell".to_owned(),
-                                    schema: "bcode.shell.run".to_owned(),
-                                    schema_version: 1,
-                                    content_type: Some(
-                                        "application/x-bcode-shell-recording; version=3".to_owned(),
-                                    ),
-                                    offset,
-                                    total_bytes,
-                                    revision: u64::try_from(index).unwrap_or(u64::MAX) + 1,
-                                    finalized: false,
-                                    bytes: bytes.to_vec(),
-                                }
-                            )
-                            .expect("deliver recording range")
-                    );
-                }
-                let delivery_us =
-                    u64::try_from(delivery_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                let prepare_started = Instant::now();
-                let layout = render::prepare_frame(&mut app, terminal).expect("prepared frame");
-                let prepare_us =
-                    u64::try_from(prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                let mut buffer = Buffer::empty(terminal);
-                let mut frame = Frame::new(&mut buffer);
-                let draw_started = Instant::now();
-                render::render_prepared(&mut app, &mut frame, layout);
-                let draw_us = u64::try_from(draw_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                let sync = app
-                    .transcript_layout_mut()
-                    .drain_sync_stats()
-                    .into_iter()
-                    .fold(
-                        (0_usize, 0_usize, 0_usize, 0_usize),
-                        |(scanned, changed, rebuilt, rows), stats| {
-                            (
-                                scanned.saturating_add(stats.entries_scanned),
-                                changed.saturating_add(stats.signatures_changed),
-                                rebuilt.saturating_add(stats.entries_rebuilt),
-                                rows.saturating_add(stats.rows_regenerated),
-                            )
-                        },
-                    );
-                let diagnostics = presentation
-                    .drain_diagnostics()
-                    .into_iter()
-                    .map(|diagnostic| (diagnostic.name, diagnostic.value))
-                    .collect::<BTreeMap<_, _>>();
-                let visual_render_us = presentation
-                    .drain_timings()
-                    .into_iter()
-                    .filter(|timing| timing.operation == "render_rows")
-                    .map(|timing| timing.duration_micros)
-                    .sum::<u64>();
-                println!(
-                    "BCODE_PERF_CASE {}",
-                    serde_json::json!({
-                        "domain": "shell_tui_matrix",
-                        "output_bytes": output_bytes,
-                        "chunk_bytes": chunk_bytes,
-                        "transcript_entries": transcript_entries,
-                        "recording_bytes": recording.len(),
-                        "artifact_ranges": recording.len().div_ceil(ARTIFACT_RANGE_BYTES),
-                        "artifact_delivery_us": delivery_us,
-                        "prepare_us": prepare_us,
-                        "draw_us": draw_us,
-                        "frame_total_us": prepare_us.saturating_add(draw_us),
-                        "over_budget": prepare_us.saturating_add(draw_us) >= 16_000,
-                        "entries_scanned": sync.0,
-                        "signatures_changed": sync.1,
-                        "entries_rebuilt": sync.2,
-                        "rows_regenerated": sync.3,
-                        "visual_render_us": visual_render_us,
-                        "decode_bytes": diagnostics.get("decode_bytes").copied().unwrap_or(0),
-                        "emulate_bytes": diagnostics.get("emulate_bytes").copied().unwrap_or(0),
-                        "emulate_frames": diagnostics.get("emulate_frames").copied().unwrap_or(0),
-                        "reset_total": diagnostics.get("reset_total").copied().unwrap_or(0),
-                    })
-                );
-            }
-        }
-    }
-}
-
-#[test]
-#[ignore = "manual deterministic performance baseline"]
-fn active_visual_frame_baseline_report() {
-    let terminal = Rect::new(0, 0, 80, 30);
-    for transcript_entries in [10_u64, 500, 2_000] {
-        let session_id = SessionId::new();
-        let presentation = growing_visual_presentation();
-        let history = (0..transcript_entries.saturating_sub(1))
-            .map(|sequence| {
-                event(
-                    session_id,
-                    sequence,
-                    SessionEventKind::AssistantMessage {
-                        text: format!("history {sequence}"),
-                    },
-                )
-            })
-            .chain(std::iter::once(event(
-                session_id,
-                transcript_entries,
-                SessionEventKind::ToolCallRequested {
-                    tool_call_id: "call-growing".to_owned(),
-                    producer_plugin_id: Some("bcode.shell".to_owned()),
-                    tool_name: "shell.run".to_owned(),
-                    arguments_json: r#"{"command":"fixture"}"#.to_owned(),
-                    working_directory: None,
-                    request_visual: Some(PluginVisualDescriptor {
-                        visual_id: None,
-                        producer_plugin_id: Some("bcode.shell".to_owned()),
-                        schema: "bcode.tool.request.shell.run".to_owned(),
-                        schema_version: 1,
-                        title: Some("Growing visual".to_owned()),
-                        subtitle: None,
-                        payload: serde_json::json!({"command": "fixture"}),
-                    }),
-                    legacy_request_presentation: None,
-                },
-            )))
-            .collect::<Vec<_>>();
-        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-        app.set_plugin_presentation(Arc::clone(&presentation));
-        let mut buffer = Buffer::empty(terminal);
-        let mut frame = Frame::new(&mut buffer);
-        render::render(&mut app, &mut frame);
-        deliver_growing_visual_rows(
-            &presentation,
-            "call-growing",
-            &["one", "two", "three", "four", "five", "six"],
-            1,
-        );
-        let prepare_started = Instant::now();
-        let layout = render::prepare_frame(&mut app, terminal).expect("prepared frame");
-        let prepare_us = u64::try_from(prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        let mut buffer = Buffer::empty(terminal);
-        let mut frame = Frame::new(&mut buffer);
-        let draw_started = Instant::now();
-        render::render_prepared(&mut app, &mut frame, layout);
-        let draw_us = u64::try_from(draw_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        println!(
-            "BCODE_PERF_CASE {}",
-            serde_json::json!({
-                "domain": "tui_frame",
-                "transcript_entries": transcript_entries,
-                "prepare_us": prepare_us,
-                "draw_us": draw_us,
-                "total_us": prepare_us.saturating_add(draw_us),
-                "over_budget": prepare_us.saturating_add(draw_us) >= 16_000,
-            })
-        );
-    }
-}
-
-#[test]
-fn structural_transcript_change_overrides_dirty_visual_targeting() {
-    let terminal = Rect::new(0, 0, 80, 18);
-    let session_id = SessionId::new();
-    let presentation = growing_visual_presentation();
-    let mut app = growing_visual_app(session_id, Arc::clone(&presentation));
-    render::prepare_frame(&mut app, terminal).expect("initial frame");
-    let _ = app.transcript_layout_mut().drain_sync_stats();
-
-    deliver_growing_visual_rows(&presentation, "call-growing", &["new visual row"], 1);
-    app.absorb_session_event(&event(
-        session_id,
-        25,
-        SessionEventKind::AssistantMessage {
-            text: "structural transcript change".to_owned(),
-        },
-    ));
-    let expected_entries = app.transcript().len();
-    render::prepare_frame(&mut app, terminal).expect("updated frame");
-    let stats = app.transcript_layout_mut().drain_sync_stats();
-
-    assert!(!stats.is_empty(), "{stats:?}");
-    assert_eq!(stats[0].entries_scanned, expected_entries);
-    assert!(stats[0].entries_scanned > 1);
-}
-
-#[test]
-fn active_visual_height_changes_preserve_viewport_latest_scroll_and_interaction_dock() {
-    let terminal = Rect::new(0, 0, 80, 18);
-    let interaction_height = 4;
-    let session_id = SessionId::new();
-    let presentation = growing_visual_presentation();
-    let mut detached = growing_visual_app(session_id, Arc::clone(&presentation));
-    let (layout, dock_before) =
-        render::prepare_frame_with_bottom_dock(&mut detached, terminal, interaction_height)
-            .expect("initial detached frame");
-    assert!(detached.scroll_transcript_up(8));
-    let detached_top = detached.transcript_top_row(layout.transcript_area().height);
-    let max_before = detached.transcript_layout().total_rows();
-    let _ = detached.transcript_layout_mut().drain_sync_stats();
-
-    deliver_growing_visual_rows(
-        &presentation,
-        "call-growing",
-        &["one", "two", "three", "four", "five", "six"],
-        1,
-    );
-    let (layout, dock_after) =
-        render::prepare_frame_with_bottom_dock(&mut detached, terminal, interaction_height)
-            .expect("updated detached frame");
-    assert_eq!(
-        detached.transcript_top_row(layout.transcript_area().height),
-        detached_top,
-        "detached viewport must remain top-anchored"
-    );
-    assert!(detached.transcript_layout().total_rows() > max_before);
-    assert!(detached.scroll_offset() > 8, "scroll limit must grow");
-    assert!(detached.newer_transcript_content_below());
-    assert_eq!(dock_after, dock_before);
-    assert!(layout.transcript_area().bottom() <= dock_after.y);
-    let targeted = detached.transcript_layout_mut().drain_sync_stats();
-    assert!(!targeted.is_empty(), "{targeted:?}");
-    assert_eq!(targeted[0].entries_scanned, 1);
-    assert_eq!(targeted[0].entries_rebuilt, 1);
-    assert!(
-        targeted[1..]
-            .iter()
-            .all(|stats| stats.entries_scanned == 0 && stats.entries_rebuilt == 0),
-        "{targeted:?}"
-    );
-
-    let follow_presentation = growing_visual_presentation();
-    let mut following = growing_visual_app(session_id, Arc::clone(&follow_presentation));
-    let (_, follow_dock_before) =
-        render::prepare_frame_with_bottom_dock(&mut following, terminal, interaction_height)
-            .expect("initial following frame");
-    assert_eq!(following.scroll_offset(), 0);
-    assert!(!following.newer_transcript_content_below());
-    deliver_growing_visual_rows(
-        &follow_presentation,
-        "call-growing",
-        &["one", "two", "three", "four", "five", "six"],
-        1,
-    );
-    let (follow_layout, follow_dock_after) =
-        render::prepare_frame_with_bottom_dock(&mut following, terminal, interaction_height)
-            .expect("updated following frame");
-    assert_eq!(following.scroll_offset(), 0);
-    assert_eq!(following.bottom_overscroll(), 0);
-    assert!(!following.newer_transcript_content_below());
-    assert_eq!(follow_dock_after, follow_dock_before);
-    assert!(follow_layout.transcript_area().bottom() <= follow_dock_after.y);
-}
-
-fn shell_run_artifact() -> bcode_session_models::ToolArtifact {
-    bcode_session_models::ToolArtifact {
-        artifact_id: "call-shell-shell-run".to_owned(),
-        producer_plugin_id: "bcode.shell".to_owned(),
-        schema: "bcode.shell.run".to_owned(),
-        schema_version: 1,
-        tool_call_id: Some("call-shell".to_owned()),
-        title: Some("Shell run".to_owned()),
-        metadata: serde_json::json!({
-            "mode": "terminal",
-            "exit_code": 0,
-            "timed_out": false,
-            "cancelled": false,
-            "duration_ms": 12,
-            "output_tail": "shell raw output\n",
-            "output_truncated": false,
-            "output_bytes": 17,
-            "retained_output_bytes": 17,
-            "columns": 80,
-            "rows": 24
-        }),
-        refs: Vec::new(),
-    }
-}
-
-fn shell_plugin_host() -> bcode_plugin::PluginHost {
-    let bundled = [bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-        bcode_shell_plugin::static_plugin(),
-    )];
-    let selected = bcode_plugin::filter_selected_static_plugins(
-        &bundled,
-        &bcode_plugin::PluginSelection::all_enabled(),
-    )
-    .expect("static shell plugin manifest should parse");
-    bcode_plugin::PluginHost::load_static_plugins(&selected)
-        .expect("static shell plugin should load")
-}
-
-fn question_outcome_artifact() -> bcode_session_models::ToolArtifact {
-    bcode_session_models::ToolArtifact {
-        artifact_id: "question-outcome-call-question".to_owned(),
-        producer_plugin_id: "bcode.question".to_owned(),
-        schema: "bcode.question.outcome".to_owned(),
-        schema_version: 1,
-        tool_call_id: Some("call-question".to_owned()),
-        title: Some("Question outcome".to_owned()),
-        metadata: serde_json::json!({
-            "status": "answered",
-            "questions": [{
-                "question_index": 0,
-                "header": "Decision",
-                "question": "Proceed?",
-                "status": "answered",
-                "selected": [{"label": "Yes", "value": "yes"}],
-                "custom": null,
-                "required": true
-            }]
-        }),
-        refs: Vec::new(),
-    }
-}
-
-fn question_plugin_host() -> bcode_plugin::PluginHost {
-    let bundled = [bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-        bcode_question_plugin::static_plugin(),
-    )];
-    let selected = bcode_plugin::filter_selected_static_plugins(
-        &bundled,
-        &bcode_plugin::PluginSelection::all_enabled(),
-    )
-    .expect("static question plugin manifest should parse");
-    bcode_plugin::PluginHost::load_static_plugins(&selected)
-        .expect("static question plugin should load")
-}
-
-fn session_summary(session_id: SessionId) -> SessionSummary {
-    SessionSummary {
-        id: session_id,
-        name: Some("Opened session".to_owned()),
-        explicit_name: Some("Opened session".to_owned()),
-        derived_title: None,
-        title_source: SessionTitleSource::Explicit,
-        client_count: 1,
-        created_at_ms: 1,
-        updated_at_ms: 2,
-        working_directory: "/tmp/bcode-tui-test".into(),
-        import: None,
-        fork: None,
-        execution: None,
-    }
-}
-
-fn is_terminal_visual_test_item(_item: &TranscriptItem) -> bool {
-    false
-}
-
-fn render_app_text(app: &mut BmuxApp) -> String {
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(app, &mut frame);
-    rendered_text(&buffer)
-}
-
-fn rendered_tool_body(rendered: &str) -> Vec<String> {
-    rendered
-        .lines()
-        .skip(1)
-        .take_while(|line| {
-            let trimmed = line.trim_start();
-            !trimmed.starts_with('⠴')
-                && !trimmed.starts_with('⠸')
-                && !trimmed.starts_with('⠼')
-                && !trimmed.starts_with('┌')
-        })
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn live_shell_recording_chunk_renders_once_through_canonical_request_contribution() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-live-shell".to_owned(),
-            tool_call_id: "call-live-shell".to_owned(),
-            tool_name: "shell.run".to_owned(),
-            argument_bytes: 10,
-            preview: shell_request_preview("printf red", None),
-        },
-    });
     app.absorb_session_event(&event(
         session_id,
         1,
@@ -5526,8 +4412,6 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"printf red"}"#.to_owned(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: None,
         },
     ));
     app.absorb_session_event(&event(
@@ -5690,6 +4574,7 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
             committed_bytes: u64::try_from(bytes.len()).expect("recording length"),
             revision: 2,
             finalized: false,
+            availability: None,
         }),
         payload: serde_json::json!({"mode": "terminal"}),
     };
@@ -5729,14 +4614,15 @@ fn live_question_artifact_renders_outcome_from_raw_metadata() {
     app.absorb_session_event(&event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-question".to_owned(),
-            result: "question answered".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(question_outcome_artifact()),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-question".to_owned(),
+                model_output: "question answered".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(question_outcome_artifact()),
+                }),
+            },
         },
     ));
 
@@ -5754,14 +4640,15 @@ fn replayed_question_artifact_renders_outcome_from_raw_metadata() {
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-question".to_owned(),
-            result: "question answered".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(question_outcome_artifact()),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-question".to_owned(),
+                model_output: "question answered".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(question_outcome_artifact()),
+                }),
+            },
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
@@ -5783,14 +4670,15 @@ fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
     app.absorb_session_event(&event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-shell".to_owned(),
-            result: "shell completed".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(shell_run_artifact()),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-shell".to_owned(),
+                model_output: "shell completed".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(shell_run_artifact()),
+                }),
+            },
         },
     ));
 
@@ -5808,14 +4696,15 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-shell".to_owned(),
-            result: "shell completed".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(shell_run_artifact()),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-shell".to_owned(),
+                model_output: "shell completed".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(shell_run_artifact()),
+                }),
+            },
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
@@ -5854,14 +4743,15 @@ fn replayed_legacy_shell_artifact_does_not_read_files_during_render() {
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-shell".to_owned(),
-            result: "shell completed".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(artifact),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-shell".to_owned(),
+                model_output: "shell completed".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(artifact),
+                }),
+            },
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
@@ -5888,8 +4778,6 @@ fn canonical_generic_result_record_renders_filesystem_source_viewer() {
             tool_name: "filesystem.read".to_owned(),
             arguments_json: serde_json::json!({"path": "src/lib.rs"}).to_string(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: None,
         },
     ));
     app.absorb_session_event(&event(
@@ -5947,8 +4835,6 @@ fn compact_to_rich_request_reuses_unrelated_layout_entry() {
             tool_name: "filesystem.read".to_owned(),
             arguments_json: serde_json::json!({"path": "src/lib.rs"}).to_string(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: None,
         },
     ));
     app.absorb_session_event(&event(
@@ -6018,8 +4904,6 @@ fn durable_request_contribution_replaces_raw_arguments_and_survives_lifecycle() 
             tool_name: "filesystem.read".to_owned(),
             arguments_json: serde_json::json!({"path": "src/lib.rs", "limit": 20}).to_string(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: None,
         },
     ));
     app.absorb_session_event(&event(
@@ -6071,7 +4955,7 @@ fn durable_request_contribution_replaces_raw_arguments_and_survives_lifecycle() 
 }
 
 #[test]
-fn filesystem_write_request_preview_renders_from_plugin_visual_metadata() {
+fn filesystem_write_request_renders_from_contribution() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -6088,26 +4972,30 @@ fn filesystem_write_request_preview_renders_from_plugin_visual_metadata() {
             })
             .to_string(),
             working_directory: None,
-            request_visual: Some(file_change_visual(
-                "Write preview",
-                Some("/tmp/raw-preview.txt"),
-                "",
-                "created from raw args\n",
-                false,
-            )),
-            legacy_request_presentation: None,
         },
+    ));
+    app.absorb_session_event(&request_contribution_event(
+        session_id,
+        2,
+        "call-write",
+        "bcode.filesystem",
+        "bcode.filesystem.change",
+        serde_json::json!({
+            "operation": "filesystem.write",
+            "path": "/tmp/raw-preview.txt",
+            "contents": "created from raw args\n",
+            "old_text": "",
+            "new_text": "created from raw args\n",
+        }),
     ));
 
     let rendered = render_app_text(&mut app);
-
-    assert!(rendered.contains("/tmp/raw-preview.txt"), "{rendered}");
     assert!(rendered.contains("created from raw args"), "{rendered}");
     assert!(!rendered.contains("arguments"), "{rendered}");
 }
 
 #[test]
-fn filesystem_edit_request_preview_renders_from_plugin_visual_metadata() {
+fn filesystem_edit_request_renders_from_contribution() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -6125,17 +5013,20 @@ fn filesystem_edit_request_preview_renders_from_plugin_visual_metadata() {
             })
             .to_string(),
             working_directory: None,
-            request_visual: Some(file_change_visual(
-                "Edit preview",
-                Some("/tmp/raw-edit.txt"),
-                "old raw args
-",
-                "new raw args
-",
-                false,
-            )),
-            legacy_request_presentation: None,
         },
+    ));
+    app.absorb_session_event(&request_contribution_event(
+        session_id,
+        2,
+        "call-edit",
+        "bcode.filesystem",
+        "bcode.filesystem.change",
+        serde_json::json!({
+            "operation": "filesystem.edit",
+            "path": "/tmp/raw-edit.txt",
+            "old_text": "old raw args\n",
+            "new_text": "new raw args\n",
+        }),
     ));
 
     let rendered = render_app_text(&mut app);
@@ -6164,21 +5055,20 @@ fn same_raw_filesystem_events_render_same_live_and_replayed_tool_ui() {
                 })
                 .to_string(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
             },
         ),
         event(
             session_id,
             2,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-file".to_owned(),
-                result: "edited file".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(ToolInvocationResult::Artifact {
-                    artifact: Box::new(filesystem_change_artifact()),
-                }),
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-file".to_owned(),
+                    model_output: "edited file".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(filesystem_change_artifact()),
+                    }),
+                },
             },
         ),
     ];
@@ -6221,21 +5111,20 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
             })
             .to_string(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: None,
         },
     ));
     app.absorb_session_event(&event(
         session_id,
         2,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-file".to_owned(),
-            result: "edited file".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(filesystem_change_artifact()),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-file".to_owned(),
+                model_output: "edited file".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(filesystem_change_artifact()),
+                }),
+            },
         },
     ));
 
@@ -6248,95 +5137,22 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
 }
 
 #[test]
-fn final_filesystem_artifact_supersedes_matching_live_plugin_preview() {
+fn final_filesystem_artifact_renders_without_stream_fallback() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call-file".to_owned(),
-            tool_name: "filesystem.write".to_owned(),
-            argument_bytes: 42,
-            preview: file_change_preview(
-                "Writing file",
-                Some("Writing file"),
-                Some("/tmp/hello.txt"),
-                "before\n",
-                "after\n",
-                false,
-            ),
-        },
-    });
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-file".to_owned(),
-            result: "edited file".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(filesystem_change_artifact()),
-            }),
-        },
-    ));
-
-    let rendered = render_app_text(&mut app);
-
-    assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
-    assert!(rendered.contains("after"), "{rendered}");
-    assert!(!rendered.contains("Streaming preview"), "{rendered}");
-    assert!(rendered.contains("File change"), "{rendered}");
-}
-
-#[test]
-fn streamed_filesystem_json_is_replaced_by_final_rich_artifact() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call-file".to_owned(),
-            tool_name: "filesystem.write".to_owned(),
-            argument_bytes: 42,
-            preview: file_change_preview(
-                "Writing file",
-                Some("Writing file"),
-                Some("/tmp/hello.txt"),
-                "before\n",
-                "after\n",
-                false,
-            ),
-        },
-    });
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-file".to_owned(),
-                stream: ToolOutputStream::Stdout,
-                sequence: 1,
-                text: r#"{"path":"/tmp/hello.txt","new_text":"after"}"#.to_owned(),
-                byte_len: 44,
-            },
-        },
-    ));
     app.absorb_session_event(&event(
         session_id,
         2,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-file".to_owned(),
-            result: "edited file".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(filesystem_change_artifact()),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-file".to_owned(),
+                model_output: "edited file".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(filesystem_change_artifact()),
+                }),
+            },
         },
     ));
 
@@ -6350,92 +5166,20 @@ fn streamed_filesystem_json_is_replaced_by_final_rich_artifact() {
 }
 
 #[test]
-fn shell_live_preview_is_not_superseded_by_terminal_result() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call-shell".to_owned(),
-            tool_name: "shell.run".to_owned(),
-            argument_bytes: 24,
-            preview: shell_request_preview("cargo test", Some("/tmp/project")),
-        },
-    });
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-shell".to_owned(),
-            result: "finished".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(shell_run_artifact()),
-            }),
-        },
-    ));
-
-    let rendered = render_app_text(&mut app);
-
-    assert!(rendered.contains("❯ cargo test"), "{rendered}");
-    assert!(rendered.contains("Shell run"), "{rendered}");
-    assert!(rendered.contains("shell raw output"), "{rendered}");
-}
-
-#[test]
-fn query_live_preview_is_not_superseded_by_unmatched_result() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call-query".to_owned(),
-            tool_name: "web.search".to_owned(),
-            argument_bytes: 32,
-            preview: web_search_request_preview("rust borrow checker"),
-        },
-    });
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-query".to_owned(),
-            result: "search completed".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: None,
-        },
-    ));
-
-    let rendered = render_app_text(&mut app);
-
-    assert!(rendered.contains("Search query"), "{rendered}");
-    assert!(
-        rendered.contains("query: rust borrow checker"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("Tool result"), "{rendered}");
-    assert!(rendered.contains("search completed"), "{rendered}");
-}
-
-#[test]
 fn replayed_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
     let session_id = SessionId::new();
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-file".to_owned(),
-            result: "edited file".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(filesystem_change_artifact()),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-file".to_owned(),
+                model_output: "edited file".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(filesystem_change_artifact()),
+                }),
+            },
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
@@ -6456,14 +5200,15 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-file".to_owned(),
-            result: "edited file".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(filesystem_change_artifact()),
-            }),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-file".to_owned(),
+                model_output: "edited file".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(filesystem_change_artifact()),
+                }),
+            },
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
@@ -6521,12 +5266,13 @@ fn legacy_serialized_artifact_result_does_not_render_raw_json() {
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-file".to_owned(),
-            result: serde_json::to_string(&artifact).expect("artifact should serialize"),
-            is_error: false,
-            output: None,
-            semantic_result: None,
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-file".to_owned(),
+                model_output: serde_json::to_string(&artifact).expect("artifact should serialize"),
+                is_error: false,
+                result: None,
+            },
         },
     )];
 
@@ -6567,12 +5313,14 @@ fn legacy_serialized_semantic_artifact_result_does_not_render_raw_json() {
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-file".to_owned(),
-            result: serde_json::to_string(&result).expect("semantic result should serialize"),
-            is_error: false,
-            output: None,
-            semantic_result: None,
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-file".to_owned(),
+                model_output: serde_json::to_string(&result)
+                    .expect("semantic result should serialize"),
+                is_error: false,
+                result: None,
+            },
         },
     )];
 
@@ -6596,23 +5344,24 @@ fn generic_artifact_fallback_projection_is_repeatable_and_non_mutating() {
     let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-artifact".to_owned(),
-            result: "fallback".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(bcode_session_models::ToolArtifact {
-                    artifact_id: "artifact-1".to_owned(),
-                    producer_plugin_id: "test.plugin".to_owned(),
-                    schema: "test.schema".to_owned(),
-                    schema_version: 1,
-                    tool_call_id: Some("call-artifact".to_owned()),
-                    title: Some("Test artifact".to_owned()),
-                    metadata: serde_json::json!({"path": "/tmp/example.txt"}),
-                    refs: Vec::new(),
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-artifact".to_owned(),
+                model_output: "fallback".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_session_models::ToolArtifact {
+                        artifact_id: "artifact-1".to_owned(),
+                        producer_plugin_id: "test.plugin".to_owned(),
+                        schema: "test.schema".to_owned(),
+                        schema_version: 1,
+                        tool_call_id: Some("call-artifact".to_owned()),
+                        title: Some("Test artifact".to_owned()),
+                        metadata: serde_json::json!({"path": "/tmp/example.txt"}),
+                        refs: Vec::new(),
+                    }),
                 }),
-            }),
+            },
         },
     )];
     let original_events = events.clone();
@@ -6629,200 +5378,6 @@ fn generic_artifact_fallback_projection_is_repeatable_and_non_mutating() {
         TranscriptItemKind::ToolResult { result, .. }
             if result.contains("Test artifact") && result.contains("test.schema")
     )));
-}
-
-#[test]
-fn live_shared_tool_projection_matches_replayed_projection() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-1".to_owned(),
-                producer_plugin_id: Some("plugin.shell".to_owned()),
-                tool_name: "shell.run".to_owned(),
-                arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
-                working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-1".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(120),
-                    rows: Some(30),
-                    started_at_ms: Some(10),
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-1".to_owned(),
-                    stream: ToolOutputStream::Stdout,
-                    sequence: 1,
-                    text: "hi\n".to_owned(),
-                    byte_len: 3,
-                },
-            },
-        ),
-        event(
-            session_id,
-            4,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-1".to_owned(),
-                result: "final text".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(ToolInvocationResult::Text {
-                    text: "semantic text".to_owned(),
-                }),
-            },
-        ),
-    ];
-    let mut replay = bcode_session_view::SessionView::new();
-    replay.apply_history(&events);
-    let replay_projection = replay.snapshot().tools.clone();
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-
-    for event in &events {
-        app.absorb_session_event(event);
-    }
-    assert_eq!(app.session_view_snapshot().tools, replay_projection);
-}
-
-fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {
-    ToolInvocationResult::Artifact {
-        artifact: Box::new(bcode_session_models::ToolArtifact {
-            artifact_id: "test-shell-run".to_string(),
-            producer_plugin_id: "test.shell".to_string(),
-            schema: "test.shell-artifact".to_string(),
-            schema_version: 1,
-            tool_call_id: None,
-            title: Some("Shell run".to_string()),
-            metadata: serde_json::to_value(result).expect("shell result should serialize"),
-            refs: Vec::new(),
-        }),
-    }
-}
-
-fn file_change_artifact(result: &FileChangeResult) -> ToolInvocationResult {
-    ToolInvocationResult::Artifact {
-        artifact: Box::new(bcode_session_models::ToolArtifact {
-            artifact_id: "test-file-change".to_string(),
-            producer_plugin_id: "test.filesystem".to_string(),
-            schema: "test.file-change-artifact".to_string(),
-            schema_version: 1,
-            tool_call_id: None,
-            title: Some("File change".to_string()),
-            metadata: serde_json::to_value(result).expect("file change should serialize"),
-            refs: Vec::new(),
-        }),
-    }
-}
-fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
-    SessionEvent {
-        schema_version: 1,
-        sequence,
-        timestamp_ms: 1,
-        session_id,
-        provenance: None,
-        kind,
-    }
-}
-
-fn key(key: KeyCode) -> KeyStroke {
-    KeyStroke {
-        key,
-        modifiers: Modifiers::NONE,
-    }
-}
-
-fn shift_key(key: KeyCode) -> KeyStroke {
-    KeyStroke {
-        key,
-        modifiers: Modifiers {
-            shift: true,
-            ..Modifiers::NONE
-        },
-    }
-}
-
-fn ctrl_key(ch: char) -> KeyStroke {
-    ctrl_key_code(KeyCode::Char(ch))
-}
-
-fn alt_char(ch: char) -> KeyStroke {
-    KeyStroke {
-        key: KeyCode::Char(ch),
-        modifiers: Modifiers {
-            alt: true,
-            ..Modifiers::NONE
-        },
-    }
-}
-
-fn ctrl_key_code(key: KeyCode) -> KeyStroke {
-    KeyStroke {
-        key,
-        modifiers: Modifiers {
-            ctrl: true,
-            ..Modifiers::NONE
-        },
-    }
-}
-
-fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
-    MouseEvent::new(kind, Point::new(x, y))
-}
-
-fn output_line_y(buffer: &Buffer, needle: &str) -> Option<u16> {
-    (0..buffer.area().height).find(|row| {
-        buffer
-            .row_symbols(*row)
-            .is_some_and(|line| line.contains(needle))
-    })
-}
-
-fn rendered_text(buffer: &Buffer) -> String {
-    (0..buffer.area().height)
-        .filter_map(|row| buffer.row_symbols(row))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn agent_infos(items: &[(&str, bool)]) -> Vec<AgentInfo> {
-    agent_infos_with_accents(
-        &items
-            .iter()
-            .map(|(id, is_default)| (*id, *is_default, None))
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn agent_infos_with_accents(items: &[(&str, bool, Option<&str>)]) -> Vec<AgentInfo> {
-    items
-        .iter()
-        .map(|(id, is_default, accent)| AgentInfo {
-            id: (*id).to_owned(),
-            name: (*id).to_owned(),
-            description: String::new(),
-            badge: None,
-            accent: accent.map(ToOwned::to_owned),
-            aliases: Vec::new(),
-            is_default: *is_default,
-        })
-        .collect()
 }
 
 #[test]
@@ -7004,101 +5559,6 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
 }
 
 #[test]
-fn plugin_view_result_presentation_is_ignored_in_normal_live_path() {
-    let session_id = SessionId::new();
-    let events = vec![event(
-        session_id,
-        1,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::LegacyPresentation {
-                tool_call_id: "call-view".to_owned(),
-                sequence: 1,
-                presentation: LegacyToolPresentationEvent::PluginView(
-                    LegacyToolPluginViewPresentation {
-                        target: LegacyToolPresentationTarget::Result,
-                        producer_plugin_id: "plugin".to_owned(),
-                        schema: "legacy.view".to_owned(),
-                        schema_version: 1,
-                        title: Some("Legacy view".to_owned()),
-                        subtitle: None,
-                        payload: serde_json::json!({"raw": true}),
-                    },
-                ),
-            },
-        },
-    )];
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("Legacy view"))
-    );
-}
-
-#[test]
-fn replayed_plugin_view_result_does_not_suppress_artifact_json_fallback() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-view".to_owned(),
-                    sequence: 1,
-                    presentation: LegacyToolPresentationEvent::PluginView(
-                        LegacyToolPluginViewPresentation {
-                            target: LegacyToolPresentationTarget::Result,
-                            producer_plugin_id: "plugin".to_owned(),
-                            schema: "legacy.view".to_owned(),
-                            schema_version: 1,
-                            title: Some("Legacy view".to_owned()),
-                            subtitle: None,
-                            payload: serde_json::json!({"raw": true}),
-                        },
-                    ),
-                },
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-view".to_owned(),
-                result: "fallback".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(ToolInvocationResult::Artifact {
-                    artifact: Box::new(ToolArtifact {
-                        artifact_id: "artifact-1".to_owned(),
-                        producer_plugin_id: "filesystem".to_owned(),
-                        schema: "bcode.filesystem.change".to_owned(),
-                        schema_version: 1,
-                        tool_call_id: Some("call-view".to_owned()),
-                        title: Some("Applied file change".to_owned()),
-                        metadata: serde_json::json!({"path": "/tmp/main.rs"}),
-                        refs: Vec::new(),
-                    }),
-                }),
-            },
-        ),
-    ];
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("Legacy view"))
-    );
-    assert!(transcript.iter().any(|item| matches!(
-        item.kind(),
-        TranscriptItemKind::ToolResult { result, .. } if result.contains("bcode.filesystem.change")
-    )));
-}
-
-#[test]
 fn plugin_visual_degrades_without_rendering_raw_payload() {
     let artifact = ToolArtifact {
         artifact_id: "artifact-1".to_owned(),
@@ -7127,7 +5587,6 @@ fn plugin_visual_degrades_without_rendering_raw_payload() {
 
     let rows = render::transcript_item_rows(
         &[item],
-        &BTreeMap::new(),
         0,
         90,
         None,
@@ -7143,116 +5602,47 @@ fn plugin_visual_degrades_without_rendering_raw_payload() {
 }
 
 #[test]
-fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
+fn replayed_shell_request_uses_shell_request_contribution_renderer() {
     let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call_shell".to_owned(),
-            tool_name: "shell_run".to_owned(),
-            argument_bytes: 36,
-            preview: shell_request_preview("cargo test -p bcode_tui", Some("/repo")),
-        },
-    });
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 20));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert!(output.contains("Shell command"), "{output}");
-    assert!(
-        output.contains("command: cargo test -p bcode_tui"),
-        "{output}"
-    );
-    assert!(output.contains("cwd: /repo"), "{output}");
-
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call_shell".to_owned(),
-            producer_plugin_id: None,
-            tool_name: "shell_run".to_owned(),
-            arguments_json: serde_json::json!({
-                "command": "cargo test -p bcode_tui",
-                "cwd": "/repo",
-            })
-            .to_string(),
-            working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(shell_legacy_request_presentation()),
-        },
-    ));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 20));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert!(output.contains("Shell command"), "{output}");
-    assert!(!output.contains("Tool · shell_run"), "{output}");
-    assert!(!output.contains("streaming preview"), "{output}");
-    assert!(
-        output.contains("command: cargo test -p bcode_tui"),
-        "{output}"
-    );
-
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call_shell".to_owned(),
-            result: "finished".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: None,
-        },
-    ));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert!(output.contains("Shell command"), "{output}");
-    assert!(!output.contains("Tool · shell_run"), "{output}");
-    assert!(
-        output.contains("command: cargo test -p bcode_tui"),
-        "{output}"
-    );
-    assert!(output.contains("finished"), "{output}");
-}
-
-#[test]
-fn replayed_shell_request_uses_shell_plugin_request_renderer_without_legacy_metadata() {
-    let session_id = SessionId::new();
-    let history = vec![event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call_shell".to_owned(),
-            producer_plugin_id: Some("bcode.shell".to_owned()),
-            tool_name: "shell.run".to_owned(),
-            arguments_json: serde_json::json!({
+    let history = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call_shell".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: serde_json::json!({
+                    "command": "cargo check --workspace",
+                    "cwd": "/Users/braden/GitHub/bcode",
+                    "columns": 120,
+                    "rows": 30,
+                    "timeout_ms": 120_000,
+                })
+                .to_string(),
+                working_directory: None,
+            },
+        ),
+        request_contribution_event(
+            session_id,
+            2,
+            "call_shell",
+            "bcode.shell",
+            "bcode.tool.request.shell.run",
+            serde_json::json!({
                 "command": "cargo check --workspace",
                 "cwd": "/Users/braden/GitHub/bcode",
                 "columns": 120,
                 "rows": 30,
                 "timeout_ms": 120_000,
-            })
-            .to_string(),
-            working_directory: None,
-            request_visual: Some(shell_request_visual(
-                "cargo check --workspace",
-                Some("/Users/braden/GitHub/bcode"),
-            )),
-            legacy_request_presentation: None,
-        },
-    )];
+            }),
+        ),
+    ];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Shell command"), "{rendered}");
     assert!(rendered.contains("❯ cargo check --workspace"), "{rendered}");
     assert!(
         rendered.contains("/Users/braden/GitHub/bcode ❯"),
@@ -7260,254 +5650,4 @@ fn replayed_shell_request_uses_shell_plugin_request_renderer_without_legacy_meta
     );
     assert!(!rendered.contains("Tool · shell.run"), "{rendered}");
     assert!(!rendered.contains("arguments"), "{rendered}");
-}
-
-#[test]
-fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
-    for contents in ["fn main", "fn main() {\n    println!(\"hi\");\n}"] {
-        app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-            session_id,
-            kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-                turn_id: "turn-1".to_owned(),
-                tool_call_id: "call_write".to_owned(),
-                tool_name: "filesystem_write".to_owned(),
-                argument_bytes: contents.len(),
-                preview: file_change_preview(
-                    "File change preview",
-                    None,
-                    Some("src/main.rs"),
-                    "",
-                    contents,
-                    false,
-                ),
-            },
-        });
-    }
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert_eq!(output.matches("File change preview").count(), 1, "{output}");
-    assert!(output.contains("received:"), "{output}");
-    assert!(output.contains("src/main.rs"), "{output}");
-    assert!(!output.contains("Ready to apply"), "{output}");
-
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call_write".to_owned(),
-            producer_plugin_id: None,
-            tool_name: "filesystem_write".to_owned(),
-            arguments_json: serde_json::json!({
-                "path": "src/main.rs",
-                "contents": "fn main() {\n    println!(\"hi\");\n}",
-            })
-            .to_string(),
-            working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
-        },
-    ));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert!(output.contains("tool filesystem_write"), "{output}");
-    assert!(!output.contains("streaming preview"), "{output}");
-}
-
-#[test]
-fn live_file_preview_is_removed_when_final_filesystem_artifact_arrives() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call_write".to_owned(),
-            tool_name: "filesystem.write".to_owned(),
-            argument_bytes: 18,
-            preview: file_change_preview(
-                "Write preview",
-                Some("writing src/main.rs"),
-                Some("src/main.rs"),
-                "",
-                "fn main() {}",
-                false,
-            ),
-        },
-    });
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call_write".to_owned(),
-            producer_plugin_id: None,
-            tool_name: "filesystem.write".to_owned(),
-            arguments_json: serde_json::json!({
-                "path": "src/main.rs",
-                "contents": "fn main() {}",
-            })
-            .to_string(),
-            working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call_write".to_owned(),
-            result: "wrote 12 bytes".to_owned(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(ToolInvocationResult::Artifact {
-                artifact: Box::new(ToolArtifact {
-                    artifact_id: "call_write-filesystem-change".to_owned(),
-                    producer_plugin_id: "bcode.filesystem".to_owned(),
-                    schema: "bcode.filesystem.change".to_owned(),
-                    schema_version: 1,
-                    tool_call_id: Some("call_write".to_owned()),
-                    title: Some("File change".to_owned()),
-                    metadata: serde_json::json!({
-                        "tool_name": "filesystem.write",
-                        "summary": "wrote 12 bytes",
-                        "path": "src/main.rs",
-                        "old_text": "",
-                        "new_text": "fn main() {}",
-                    }),
-                    refs: Vec::new(),
-                }),
-            }),
-        },
-    ));
-
-    assert!(
-        !app.transcript()
-            .iter()
-            .any(|item| item.is_live_preview_anchor_for("call_write"))
-    );
-    assert_eq!(
-        app.transcript()
-            .iter()
-            .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
-            .count(),
-        1
-    );
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert!(output.contains("File change"), "{output}");
-    assert!(!output.contains("Write preview"), "{output}");
-    assert!(!output.contains("received:"), "{output}");
-}
-
-#[test]
-fn live_file_preview_renders_available_new_text_before_original_text() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call_edit".to_owned(),
-            tool_name: "filesystem_edit".to_owned(),
-            argument_bytes: 40,
-            preview: file_change_preview(
-                "File change preview",
-                None,
-                Some("src/lib.rs"),
-                "",
-                "pub fn demo() {\n    println!(\"hi\");\n}",
-                false,
-            ),
-        },
-    });
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-
-    assert!(!output.contains("waiting for original text"), "{output}");
-    assert!(output.contains("File change preview"), "{output}");
-    assert!(output.contains("src/lib.rs"), "{output}");
-    assert!(!output.contains("old_text"), "{output}");
-    assert!(!output.contains("new_text"), "{output}");
-}
-
-#[test]
-fn live_file_preview_renders_truncation_note_and_received_bytes() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call_write".to_owned(),
-            tool_name: "filesystem_write".to_owned(),
-            argument_bytes: 2048,
-            preview: file_change_preview(
-                "File change preview",
-                Some("received: 2.0 KiB"),
-                Some("src/lib.rs"),
-                "",
-                "pub fn demo() {}",
-                true,
-            ),
-        },
-    });
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 24));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert!(output.contains("received: 2.0 KiB"), "{output}");
-    assert!(
-        output.contains("preview truncated; showing available diff rows"),
-        "{output}"
-    );
-}
-
-#[test]
-fn live_file_preview_uses_plugin_owned_renderer() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call_write".to_owned(),
-            tool_name: "filesystem_write".to_owned(),
-            argument_bytes: 36,
-            preview: file_change_preview(
-                "File change preview",
-                None,
-                Some("src/lib.rs"),
-                "",
-                "pub fn demo() {\n    println!(\"hi\");\n}",
-                false,
-            ),
-        },
-    });
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert!(output.contains("File change preview"), "{output}");
-    assert!(output.contains("src/lib.rs"), "{output}");
-    assert!(!output.contains("old_text"), "{output}");
-    assert!(!output.contains("new_text"), "{output}");
 }

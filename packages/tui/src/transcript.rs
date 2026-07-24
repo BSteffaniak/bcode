@@ -42,17 +42,6 @@ pub enum TranscriptItemKind {
         tool_name: String,
         /// Working directory captured for this invocation.
         working_directory: Option<std::path::PathBuf>,
-        /// Plugin-owned request visual.
-        request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
-        /// Whether this item was derived from live-only partial tool arguments.
-        live_preview: bool,
-    },
-    /// Live-only tool preview anchor resolved from ephemeral app state.
-    LiveToolPreviewAnchor {
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// Tool name.
-        tool_name: String,
     },
     /// Tool-call result with structured metadata.
     ToolResult {
@@ -262,7 +251,6 @@ impl TranscriptItem {
     pub fn visual_invocation_id(&self) -> Option<&str> {
         match &self.kind {
             TranscriptItemKind::ToolRequest { tool_call_id, .. }
-            | TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. }
             | TranscriptItemKind::ToolResult { tool_call_id, .. }
             | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => Some(tool_call_id),
             TranscriptItemKind::ToolContribution { contribution, .. } => {
@@ -322,19 +310,6 @@ impl TranscriptItem {
         self.bump_revision();
     }
 
-    /// Replace the plugin-owned visual on a tool request and set its live state.
-    pub fn set_tool_request_visual(
-        &mut self,
-        visual: bcode_session_models::PluginVisualDescriptor,
-        streaming: bool,
-    ) {
-        if let TranscriptItemKind::ToolRequest { request_visual, .. } = &mut self.kind {
-            *request_visual = Some(visual);
-            self.streaming = streaming;
-            self.bump_revision();
-        }
-    }
-
     /// Mark this transcript item as no longer streaming.
     pub const fn finish_streaming(&mut self) {
         self.streaming = false;
@@ -383,27 +358,6 @@ impl TranscriptItem {
     }
 
     /// Copy generic tool timing from another tool item.
-    pub const fn copy_tool_timing_from(&mut self, other: &Self) {
-        if let Some(source_timing) = other.tool_timing()
-            && let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind
-        {
-            *timing = source_timing;
-            self.bump_revision();
-        }
-    }
-
-    /// Return whether this item is a live preview anchor for `tool_call_id`.
-    #[must_use]
-    pub fn is_live_preview_anchor_for(&self, tool_call_id: &str) -> bool {
-        matches!(
-            &self.kind,
-            TranscriptItemKind::LiveToolPreviewAnchor {
-                tool_call_id: item_tool_call_id,
-                ..
-            } if item_tool_call_id == tool_call_id
-        )
-    }
-
     /// Return semantic item kind.
     #[must_use]
     pub const fn kind(&self) -> &TranscriptItemKind {
@@ -449,7 +403,6 @@ pub fn tool_request_item(
     tool_name: &str,
     arguments_json: &str,
     working_directory: Option<std::path::PathBuf>,
-    request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 ) -> TranscriptItem {
     TranscriptItem::with_kind(
         "Tool",
@@ -460,136 +413,6 @@ pub fn tool_request_item(
             producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
             tool_name: tool_name.to_owned(),
             working_directory,
-            request_visual,
-            live_preview: false,
-        },
-    )
-}
-
-/// Build a transcript item anchoring a live-only partial tool argument preview.
-#[must_use]
-pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> TranscriptItem {
-    TranscriptItem::with_kind(
-        "Tool",
-        String::new(),
-        true,
-        TranscriptItemKind::LiveToolPreviewAnchor {
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: tool_name.to_owned(),
-        },
-    )
-}
-
-/// Build a streaming transcript item for a plugin-owned visual update.
-#[must_use]
-pub fn streaming_tool_visual_item(
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    working_directory: Option<&std::path::Path>,
-    visual: &bcode_session_models::PluginVisualDescriptor,
-    streaming: bool,
-) -> TranscriptItem {
-    let artifact = ToolArtifact {
-        artifact_id: visual
-            .visual_id
-            .clone()
-            .unwrap_or_else(|| format!("{tool_call_id}-stream-visual")),
-        producer_plugin_id: visual
-            .producer_plugin_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_owned()),
-        schema: visual.schema.clone(),
-        schema_version: visual.schema_version,
-        tool_call_id: Some(tool_call_id.to_owned()),
-        title: visual.title.clone(),
-        metadata: visual.payload.clone(),
-        refs: Vec::new(),
-    };
-    TranscriptItem::with_kind(
-        "Tool",
-        artifact_summary_text(&artifact),
-        streaming,
-        TranscriptItemKind::ToolResult {
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: tool_name.map(ToOwned::to_owned),
-            arguments_json: None,
-            working_directory: working_directory.map(std::path::Path::to_path_buf),
-            result: artifact_summary_text(&artifact),
-            artifact: Some(Box::new(artifact)),
-            is_error: false,
-            timing: ToolTiming::default(),
-        },
-    )
-}
-
-/// Upsert a plugin-owned visual update item for a tool call.
-pub fn upsert_tool_visual_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) -> usize {
-    let Some((tool_call_id, visual_key)) = tool_visual_identity(&item) else {
-        items.push(item);
-        return items.len().saturating_sub(1);
-    };
-    let tool_call_id = tool_call_id.to_owned();
-    let visual_key = visual_key.to_owned();
-    if let Some(index) = items.iter().position(|existing| {
-        tool_visual_identity(existing) == Some((tool_call_id.as_str(), visual_key.as_str()))
-    }) {
-        let mut item = item;
-        item.copy_tool_timing_from(&items[index]);
-        items[index] = item;
-        return index;
-    }
-    if let Some(index) = items.iter().position(|existing| {
-        existing.is_live_preview_anchor_for(&tool_call_id)
-            || matches!(
-                existing.kind(),
-                TranscriptItemKind::ToolRequest {
-                    tool_call_id: item_tool_call_id,
-                    ..
-                } if item_tool_call_id == &tool_call_id
-            )
-    }) {
-        let mut item = item;
-        item.copy_tool_timing_from(&items[index]);
-        items[index] = item;
-        return index;
-    }
-    items.push(item);
-    items.len().saturating_sub(1)
-}
-
-fn tool_visual_identity(item: &TranscriptItem) -> Option<(&str, &str)> {
-    let TranscriptItemKind::ToolResult {
-        tool_call_id,
-        artifact: Some(artifact),
-        ..
-    } = item.kind()
-    else {
-        return None;
-    };
-    Some((tool_call_id.as_str(), artifact.artifact_id.as_str()))
-}
-
-/// Build a streaming transcript item for live tool output.
-#[must_use]
-pub fn streaming_tool_output_item(
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    arguments_json: Option<&str>,
-    text: &str,
-) -> TranscriptItem {
-    TranscriptItem::with_kind(
-        "Tool",
-        text.to_owned(),
-        true,
-        TranscriptItemKind::ToolResult {
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: tool_name.map(ToOwned::to_owned),
-            arguments_json: arguments_json.map(ToOwned::to_owned),
-            working_directory: None,
-            result: text.to_owned(),
-            artifact: None,
-            is_error: false,
-            timing: ToolTiming::default(),
         },
     )
 }
@@ -843,16 +666,6 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
         TranscriptViewItemKind::Interaction { interaction } => {
             terminal_interaction_item_from_shared(interaction)
         }
-        TranscriptViewItemKind::PluginVisual { visual } => {
-            let fallback = serde_json::to_string_pretty(&visual.generic_payload)
-                .unwrap_or_else(|_| visual.generic_payload.to_string());
-            TranscriptItem::with_kind(
-                "Plugin visual",
-                fallback,
-                item.streaming,
-                TranscriptItemKind::Generic,
-            )
-        }
         TranscriptViewItemKind::ToolContribution {
             contribution,
             placement,
@@ -919,9 +732,6 @@ fn terminal_tool_request_item_from_shared(tool: &ToolInvocationView) -> Transcri
             tool.tool_name.as_deref().unwrap_or("unknown tool"),
             tool.arguments_json.as_deref().unwrap_or("{}"),
             tool.working_directory.clone(),
-            tool.request_visual
-                .as_ref()
-                .map(|visual| visual.descriptor.clone()),
         ),
         tool,
     )
@@ -952,39 +762,12 @@ fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
             tool,
         );
     }
-    if let Some(output) = &tool.output
-        && !output.text.is_empty()
-    {
-        let mut item = if matches!(tool.status, ToolInvocationViewStatus::Running) {
-            streaming_tool_output_item(
-                &tool.tool_call_id,
-                tool.tool_name.as_deref(),
-                tool.arguments_json.as_deref(),
-                &output.text,
-            )
-        } else {
-            tool_result_item(
-                &tool.tool_call_id,
-                tool.tool_name.as_deref(),
-                tool.arguments_json.as_deref(),
-                &output.text,
-                tool.is_error.unwrap_or(false),
-            )
-        };
-        if matches!(tool.status, ToolInvocationViewStatus::Finished) {
-            item.finish_streaming();
-        }
-        return apply_shared_tool_timing(item, tool);
-    }
     let mut item = tool_request_item(
         &tool.tool_call_id,
         tool.producer_plugin_id.as_deref(),
         tool.tool_name.as_deref().unwrap_or("unknown tool"),
         tool.arguments_json.as_deref().unwrap_or("{}"),
         tool.working_directory.clone(),
-        tool.request_visual
-            .as_ref()
-            .map(|visual| visual.descriptor.clone()),
     );
     if matches!(tool.status, ToolInvocationViewStatus::Running) {
         item.streaming = true;
@@ -1256,6 +1039,8 @@ mod tests {
             snapshot: Some(serde_json::json!({
                 "questions": [{"question": "Secret raw form payload"}]
             })),
+            state: bcode_session_view_models::InteractionViewState::Pending,
+            status_detail: None,
             resolved: false,
             resolution: None,
         };
@@ -1276,6 +1061,8 @@ mod tests {
             title: Some("Question".to_owned()),
             required: true,
             snapshot: None,
+            state: bcode_session_view_models::InteractionViewState::Resolved,
+            status_detail: None,
             resolved: true,
             resolution: Some(serde_json::json!({"status": "answered", "selected": ["yes"]})),
         };

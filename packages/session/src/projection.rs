@@ -1,7 +1,7 @@
 use bcode_session_models::{
     ProjectionSourceRange, ProjectionWindow, ProjectionWindowAnchor, ProjectionWindowDirection,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionProjectionKind,
-    ToolInvocationStreamEvent, TranscriptProjectionItem, TranscriptProjectionItemKind,
+    TranscriptProjectionItem, TranscriptProjectionItemKind,
 };
 use std::collections::BTreeMap;
 
@@ -389,18 +389,6 @@ impl TranscriptProjectionBuilder {
                 self.flush_streams();
                 self.start_tool_invocation(tool_call_id, event.sequence, arguments_json.len());
             }
-            SessionEventKind::ToolInvocationStream { event: stream } => {
-                self.flush_streams();
-                self.apply_tool_stream(event.sequence, stream);
-            }
-            SessionEventKind::ToolCallFinished {
-                tool_call_id,
-                result,
-                ..
-            } => {
-                self.flush_streams();
-                self.finish_tool_invocation(tool_call_id, event.sequence, result.len());
-            }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
                 self.flush_streams();
                 self.finish_tool_invocation(
@@ -493,26 +481,6 @@ impl TranscriptProjectionBuilder {
                 saw_stream_output: false,
             },
         );
-    }
-
-    fn apply_tool_stream(&mut self, sequence: u64, event: &ToolInvocationStreamEvent) {
-        let tool_call_id = tool_stream_tool_call_id(event);
-        let invocation = self
-            .tool_invocations
-            .entry(tool_call_id.to_owned())
-            .or_insert(PendingToolInvocation {
-                start_sequence: sequence,
-                end_sequence: sequence,
-                content_bytes: 0,
-                saw_stream_output: false,
-            });
-        invocation.end_sequence = sequence;
-        invocation.content_bytes = invocation
-            .content_bytes
-            .saturating_add(tool_stream_content_bytes(event));
-        if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
-            invocation.saw_stream_output = true;
-        }
     }
 
     fn finish_tool_invocation(&mut self, tool_call_id: &str, sequence: u64, result_bytes: usize) {
@@ -654,42 +622,6 @@ fn non_streaming_item(event: &SessionEvent) -> Option<(TranscriptProjectionItemK
     }
 }
 
-fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
-    match event {
-        ToolInvocationStreamEvent::Started { tool_call_id, .. }
-        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
-        | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyTransientPruned { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
-    }
-}
-
-fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
-    match event {
-        ToolInvocationStreamEvent::Started { tool_name, .. } => tool_name.len(),
-        ToolInvocationStreamEvent::OutputDelta { text, .. }
-        | ToolInvocationStreamEvent::Status { message: text, .. } => text.len(),
-        ToolInvocationStreamEvent::VisualUpdate { visual, .. } => {
-            serde_json::to_vec(visual).map_or(0, |encoded| encoded.len())
-        }
-        ToolInvocationStreamEvent::LegacyPresentation { presentation, .. } => {
-            legacy_tool_presentation_content_bytes(presentation)
-        }
-        ToolInvocationStreamEvent::ArtifactUpdate { .. }
-        | ToolInvocationStreamEvent::LegacyTransientPruned { .. }
-        | ToolInvocationStreamEvent::Finished { .. } => 0,
-    }
-}
-
-fn legacy_tool_presentation_content_bytes(
-    presentation: &bcode_session_models::LegacyToolPresentationEvent,
-) -> usize {
-    serde_json::to_vec(presentation).map_or(0, |encoded| encoded.len())
-}
-
 fn estimate_rows(content_bytes: usize, width_columns: Option<u16>) -> Option<usize> {
     let width = usize::from(width_columns?);
     if width == 0 {
@@ -702,10 +634,9 @@ fn estimate_rows(content_bytes: usize, width_columns: Option<u16>) -> Option<usi
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacyToolPresentationEvent,
-        ProjectionWindowLimits, ProjectionWindowRequest, ProjectionWindowTarget, SessionId,
-        ToolInvocationProjectionStatus, ToolInvocationProjectionStreamOutput, ToolInvocationResult,
-        ToolInvocationStreamEvent, ToolOutputStream, build_tool_invocation_projections,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowLimits,
+        ProjectionWindowRequest, ProjectionWindowTarget, SessionId, ToolInvocationProjectionStatus,
+        ToolInvocationResult, build_tool_invocation_projections,
     };
 
     fn tool_invocation_projection_replay_events(session_id: SessionId) -> Vec<SessionEvent> {
@@ -719,66 +650,20 @@ mod tests {
                     tool_name: "shell.run".to_owned(),
                     arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
                 session_id,
                 2,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::Started {
-                        tool_call_id: "call-1".to_owned(),
-                        tool_name: "shell.run".to_owned(),
-                        sequence: 0,
-                        terminal: true,
-                        columns: Some(120),
-                        rows: Some(30),
-                        started_at_ms: Some(10),
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "final text".to_owned(),
+                        is_error: false,
+                        result: Some(ToolInvocationResult::Text {
+                            text: "semantic text".to_owned(),
+                        }),
                     },
-                },
-            ),
-            event(
-                session_id,
-                3,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "call-1".to_owned(),
-                        sequence: 1,
-                        stream: ToolOutputStream::Stdout,
-                        text: "hi\n".to_owned(),
-                        byte_len: 3,
-                    },
-                },
-            ),
-            event(
-                session_id,
-                4,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::LegacyPresentation {
-                        tool_call_id: "call-1".to_owned(),
-                        sequence: 2,
-                        presentation: LegacyToolPresentationEvent::Status(
-                            bcode_session_models::LegacyToolStatusPresentation {
-                                target: bcode_session_models::LegacyToolPresentationTarget::Result,
-                                text: "legacy status".to_owned(),
-                                level: bcode_session_models::LegacyToolPresentationLevel::Success,
-                            },
-                        ),
-                    },
-                },
-            ),
-            event(
-                session_id,
-                5,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_owned(),
-                    result: "final text".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: Some(ToolInvocationResult::Text {
-                        text: "semantic text".to_owned(),
-                    }),
                 },
             ),
         ]
@@ -812,15 +697,6 @@ mod tests {
                 text: "semantic text".to_owned()
             })
         );
-        assert_eq!(
-            projection.stream_output,
-            Some(ToolInvocationProjectionStreamOutput {
-                output: "hi\n".to_owned(),
-                columns: Some(120),
-                rows: Some(30),
-            })
-        );
-        assert_eq!(projection.legacy_presentations.len(), 1);
     }
 
     #[test]
@@ -836,19 +712,18 @@ mod tests {
                     tool_name: "unknown.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
                 session_id,
                 2,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_owned(),
-                    result: "raw result only".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "raw result only".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             ),
         ];
@@ -860,8 +735,6 @@ mod tests {
 
         assert_eq!(projection.result_text.as_deref(), Some("raw result only"));
         assert!(projection.raw_result.is_none());
-        assert!(projection.stream_output.is_none());
-        assert!(projection.legacy_presentations.is_empty());
     }
     #[test]
     fn latest_projection_window_from_db_transcript_items_satisfies_targets() {
@@ -1099,73 +972,6 @@ mod tests {
     }
 
     #[test]
-    fn streamed_tool_invocation_groups_source_range_and_avoids_final_double_count() {
-        let session_id = SessionId::new();
-        let events = vec![
-            event(
-                session_id,
-                1,
-                SessionEventKind::ToolCallRequested {
-                    tool_call_id: "tool".to_owned(),
-                    producer_plugin_id: None,
-                    tool_name: "shell".to_owned(),
-                    arguments_json: "{}".to_owned(),
-                    working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
-                },
-            ),
-            event(
-                session_id,
-                2,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::Started {
-                        tool_call_id: "tool".to_owned(),
-                        tool_name: "shell".to_owned(),
-                        sequence: 0,
-                        terminal: false,
-                        columns: None,
-                        rows: None,
-                        started_at_ms: None,
-                    },
-                },
-            ),
-            event(
-                session_id,
-                3,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "tool".to_owned(),
-                        stream: ToolOutputStream::Stdout,
-                        sequence: 1,
-                        text: "output".to_owned(),
-                        byte_len: 6,
-                    },
-                },
-            ),
-            event(
-                session_id,
-                4,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "tool".to_owned(),
-                    result: "final result".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
-                },
-            ),
-        ];
-
-        let items = build_transcript_projection(&events, Some(80));
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, TranscriptProjectionItemKind::ToolInvocation);
-        assert_eq!(items[0].source_range.start_sequence, 1);
-        assert_eq!(items[0].source_range.end_sequence, 4);
-        assert_eq!(items[0].content_bytes, 13);
-    }
-
-    #[test]
     fn non_streamed_tool_invocation_groups_request_and_result() {
         let session_id = SessionId::new();
         let events = vec![
@@ -1178,19 +984,18 @@ mod tests {
                     tool_name: "read".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
                 session_id,
                 2,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "tool".to_owned(),
-                    result: "result".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "tool".to_owned(),
+                        model_output: "result".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             ),
         ];
@@ -1217,8 +1022,6 @@ mod tests {
                     tool_name: "example.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -1242,45 +1045,6 @@ mod tests {
         assert_eq!(items[0].source_range.start_sequence, 1);
         assert_eq!(items[0].source_range.end_sequence, 2);
         assert_eq!(items[0].content_bytes, 6);
-    }
-
-    #[test]
-    fn non_streaming_items_preserve_chronological_ranges() {
-        let session_id = SessionId::new();
-        let events = vec![
-            event(
-                session_id,
-                1,
-                SessionEventKind::UserMessage {
-                    client_id: ClientId::new(),
-                    text: "question".to_owned(),
-                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                },
-            ),
-            event(
-                session_id,
-                2,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "tool".to_owned(),
-                        stream: ToolOutputStream::Stdout,
-                        sequence: 1,
-                        text: "output".to_owned(),
-                        byte_len: 6,
-                    },
-                },
-            ),
-        ];
-
-        let items = build_transcript_projection(&events, Some(4));
-
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].kind, TranscriptProjectionItemKind::UserMessage);
-        assert_eq!(items[0].source_range.start_sequence, 1);
-        assert_eq!(items[1].kind, TranscriptProjectionItemKind::ToolInvocation);
-        assert_eq!(items[1].source_range.start_sequence, 2);
-        assert_eq!(items[0].estimated_rows, Some(3));
-        assert_eq!(items[1].estimated_rows, Some(2));
     }
 
     #[test]
@@ -1604,8 +1368,6 @@ mod tests {
                     tool_name: "late".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -1617,8 +1379,6 @@ mod tests {
                     tool_name: "early".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(

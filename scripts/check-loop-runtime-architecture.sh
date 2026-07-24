@@ -105,13 +105,50 @@ if [[ -n "$native_search_implementations" ]] && grep -Ev '^plugins/[^/]*provider
   violations=1
 fi
 
-for removed_symbol in HostModelNativeWebSearchRequest cancellation_path invocation_action_path ToolSchedulingContract ToolResourceClaim ToolResourceAccess; do
+for removed_symbol in HostModelNativeWebSearchRequest cancellation_path invocation_action_path ToolSchedulingContract ToolResourceClaim ToolResourceAccess ToolInvocationStreamEvent ToolOutputStream LegacyToolRequestPresentationMetadata LegacyToolRequestPreviewMetadata LegacyToolPresentationEvent LegacyToolInvocationPresentation PluginVisualDescriptor PluginVisualView; do
   if rg -n "\\b${removed_symbol}\\b" packages plugins examples --glob '*.rs' >/tmp/bcode-removed-runtime-symbol.txt; then
     echo "Runtime architecture violation: removed symbol ${removed_symbol} was reintroduced." >&2
     cat /tmp/bcode-removed-runtime-symbol.txt >&2
     violations=1
   fi
 done
+
+if rg -n '\blegacy_request_presentation\b|\brequest_visual\b|request_presentation|tool_invocation_presentation|\bpersisted_legacy\b' \
+  packages plugins examples --glob '*.rs' >/tmp/bcode-removed-legacy-presentation.txt; then
+  echo "Runtime architecture violation: removed legacy presentation persistence was reintroduced." >&2
+  cat /tmp/bcode-removed-legacy-presentation.txt >&2
+  violations=1
+fi
+
+if rg -n '\b(ToolUiMetadata|ToolPluginVisualMetadata|ToolVisualPayloadSelector)\b|definition\.ui\b|tool\.ui\b' \
+  packages plugins examples --glob '*.rs' >/tmp/bcode-removed-definition-ui-metadata.txt ||
+   rg -n '\b(StreamingJsonStringFields|StreamingJsonStringFieldParser)\b|tool_request_visual_descriptor|publish_tool_argument_preview_live|live_tool_argument_preview_from_fields' \
+  packages/server/src/lib.rs >/tmp/bcode-server-tool-argument-projection.txt ||
+   rg -n '\b(LiveToolArgumentPreview|ToolArgumentPreview|LiveToolPreviewState|LiveToolPreviewAnchor)\b|live_tool_preview|SessionLiveEventKind::ToolOutputDelta|SessionEventKind::ToolInvocationStream|observe_live_event' \
+  packages plugins examples --glob '*.rs' >/tmp/bcode-removed-tool-argument-preview.txt; then
+  echo "Runtime architecture violation: canonical UI metadata or host tool-argument visual projection was reintroduced." >&2
+  cat /tmp/bcode-removed-definition-ui-metadata.txt /tmp/bcode-server-tool-argument-projection.txt /tmp/bcode-removed-tool-argument-preview.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if rg -n '\bToolPolicyMetadata\b|definition\.policy\b|tool\.policy\b' packages plugins examples --glob '*.rs' \
+  >/tmp/bcode-removed-definition-policy-metadata.txt ||
+   rg -n '\bresolve_tool_reference\b' packages/tool --glob '*.rs' \
+  >/tmp/bcode-neutral-tool-policy-resolution.txt ||
+   ! grep -F 'ambiguous_alias_resolution_is_not_silent_allow' packages/skill/src/lib.rs >/dev/null ||
+   ! grep -F 'compatibility_alias_selector_matches_declared_alias_pair_case_insensitive_ecosystem' packages/skill/src/lib.rs >/dev/null ||
+   ! grep -F 'skill_policy_target_uses_only_owner_prepared_identity' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: provider-definition policy metadata or generic policy resolution was reintroduced." >&2
+  cat /tmp/bcode-removed-definition-policy-metadata.txt /tmp/bcode-neutral-tool-policy-resolution.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if rg -n '\brequires_permission\b' packages/tool/src packages/tool/models/src packages/model/src --glob '*.rs' \
+  >/tmp/bcode-provider-definition-permission-policy.txt; then
+  echo "Runtime architecture violation: canonical/provider-visible tool definitions contain permission policy." >&2
+  cat /tmp/bcode-provider-definition-permission-policy.txt >&2
+  violations=1
+fi
 
 if rg -n '\bToolSideEffect\b|\.side_effect\b' packages plugins examples --glob '*.rs' \
   >/tmp/bcode-removed-tool-side-effect.txt; then
@@ -176,7 +213,8 @@ if rg -n 'request\.(arguments|policy|side_effect)|\bToolArgumentKind\b|\bToolSid
   packages/agent-policy/src/lib.rs >/tmp/bcode-agent-policy-argument-inference.txt ||
    ! grep -F 'operation: metadata.operation' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'operation: metadata.operation' packages/agent-permissions/src/lib.rs >/dev/null ||
-   ! rg -U 'let target = SkillToolPolicyTarget \{[\s\S]{0,500}aliases: metadata\.aliases\.clone\(\)[\s\S]{0,500}permission_category: metadata\.permission_category\.clone\(\)' packages/server/src/lib.rs >/dev/null ||
+   ! rg -U 'fn skill_tool_policy_target\([\s\S]{0,800}aliases: metadata\.aliases,[\s\S]{0,800}permission_category: metadata\.permission_category' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'owner_prepared_skill_tool_targets(state, session_id).await' packages/server/src/lib.rs >/dev/null ||
    rg -U 'SkillToolPolicyRequest \{[\s\S]{0,120}tool: (definition|tool\.clone\(\))' packages/server/src/lib.rs packages/skill/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: a policy decision bypasses owner-produced facts." >&2
   cat /tmp/bcode-agent-policy-argument-inference.txt 2>/dev/null >&2 || true
@@ -187,6 +225,14 @@ if rg -U 'SkillToolPolicyRequest \{[\s\S]{0,120}tool: (definition|tool\.clone\(\
   packages/server/src/lib.rs packages/skill/src/lib.rs >/tmp/bcode-skill-definition-policy.txt; then
   echo "Runtime architecture violation: skill policy reintroduced full ToolDefinition evaluation." >&2
   cat /tmp/bcode-skill-definition-policy.txt >&2
+  violations=1
+fi
+
+if rg -n '\b(ToolInvocationStreamEvent|ToolOutputStream|ToolStreamEventSink|ToolStreamVisualUpdate)\b' \
+  packages/tool/src packages/agent-runtime/src packages/plugin-sdk/src --glob '*.rs' \
+  >/tmp/bcode-canonical-legacy-tool-stream.txt; then
+  echo "Runtime architecture violation: canonical tool/runtime contracts contain legacy tool stream transport." >&2
+  cat /tmp/bcode-canonical-legacy-tool-stream.txt >&2
   violations=1
 fi
 
@@ -466,8 +512,7 @@ if ! grep -F 'runtime_work_status_label_preserves_semantic_activity' packages/se
    ! grep -F 'runtime_work_terminal_state_leaves_sibling_active_and_rejects_late_revival' packages/session-view/src/lib.rs >/dev/null ||
    ! grep -F 'terminal_runtime_work_without_visible_start_is_history_only' packages/session-view/src/lib.rs >/dev/null ||
    ! grep -F 'hyperchad_projection_keeps_active_sibling_and_does_not_revive_terminal_work' packages/hyperchad/src/lib.rs >/dev/null ||
-   ! grep -F 'runtime_work_activity_is_excluded_from_model_context' packages/server/src/lib.rs >/dev/null ||
-   ! grep -F 'late_stream_events_cannot_revive_finished_tool_projection' packages/session/models/src/lib.rs >/dev/null; then
+   ! grep -F 'runtime_work_activity_is_excluded_from_model_context' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: grouped activity or terminal late-event suppression coverage was removed." >&2
   violations=1
 fi
@@ -479,8 +524,7 @@ if ! grep -F 'transient_contribution_bypasses_persistence_but_remains_observable
   violations=1
 fi
 
-if ! grep -F 'presentation_and_exchange_payloads_are_excluded_from_model_context' packages/server/src/lib.rs >/dev/null ||
-   ! grep -F 'legacy_stream_presentation_payload_is_excluded_from_model_context' packages/server/src/lib.rs >/dev/null; then
+if ! grep -F 'presentation_and_exchange_payloads_are_excluded_from_model_context' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: presentation/exchange model-context exclusion coverage was removed." >&2
   violations=1
 fi
@@ -799,9 +843,9 @@ if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*S
   violations=1
 fi
 
-if ! grep -F 'document_tools_remove_legacy_request_visuals' plugins/document-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'ocr_tools_remove_legacy_request_visuals' plugins/ocr-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'web_tools_remove_legacy_request_visuals_and_map_request_schemas' plugins/web-search-plugin/src/lib.rs >/dev/null; then
+if ! grep -F 'document_tools_emit_request_contributions' plugins/document-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ocr_tools_emit_request_contributions' plugins/ocr-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'web_tools_emit_mapped_request_contributions' plugins/web-search-plugin/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: generic Document/OCR/Web request coverage was removed." >&2
   violations=1
 fi
@@ -813,7 +857,7 @@ if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*S
   violations=1
 fi
 
-if ! grep -F 'shell_request_visual_is_generic_contribution_only' plugins/shell-plugin/src/lib.rs >/dev/null ||
+if ! grep -F 'shell_request_is_generic_contribution_only' plugins/shell-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'contribution_id: "shell-run-request"' plugins/shell-plugin/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: generic Shell request contribution coverage was removed." >&2
   violations=1
@@ -939,12 +983,11 @@ if ! grep -F 'TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA' packages/tool/src/contracts
   violations=1
 fi
 
-if rg 'append_tool_call_finished\(' packages scripts --glob '*.rs' --glob '*.sh' >/dev/null; then
-  echo "Runtime architecture violation: the legacy tool-finish write API was restored." >&2
-  violations=1
-fi
-if rg -U 'append_tool_invocation_result\([\s\S]{0,1200}append_tool_call_finished\(' packages/server/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: production tool results still dual-write generic and legacy finish events." >&2
+if rg -n '(^|[^A-Za-z])SessionEventKind::ToolCallFinished|"tool_call_finished"|\bsemantic_migration\b|MigrateSemanticResults' \
+  packages/session packages/session-view packages/ipc packages/server packages/tui packages/web-render packages/cli packages/eval plugins/blims-plugin plugins/code-review-plugin \
+  --glob '*.rs' >/tmp/bcode-removed-session-result-compatibility.txt; then
+  echo "Runtime architecture violation: removed legacy session result compatibility was reintroduced." >&2
+  cat /tmp/bcode-removed-session-result-compatibility.txt >&2
   violations=1
 fi
 
@@ -955,7 +998,7 @@ if ! grep -F 'generic_records_reopen_to_identical_canonical_and_bounded_projecti
 fi
 
 if ! grep -F 'generic_results_keep_parallel_tool_batch_in_one_compaction_unit' packages/server/src/context_compaction.rs >/dev/null ||
-   ! grep -F 'generic_final_result_is_model_visible_once_during_dual_write' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'generic_final_result_is_model_visible_exactly_once' packages/server/src/lib.rs >/dev/null ||
    ! rg -U 'ToolInvocationResultRecorded \{ record \}[\s\S]{0,800}ContentBlock::ToolResult' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'tool_invocation_result_recorded' packages/session/src/db.rs >/dev/null; then
   echo "Runtime architecture violation: generic result model-context/compaction cutover coverage was removed." >&2
@@ -991,9 +1034,12 @@ if rg -n 'bcode\.shell\.(run|invocation-input)|application/x-bcode-(terminal-pty
 fi
 
 if rg -n 'ToolInvocationStreamEvent|ToolStreamVisualUpdate|OutputDelta|ArtifactUpdate|ToolOutputStream' \
-  plugins/shell-plugin/src >/tmp/bcode-shell-legacy-stream-contracts.txt; then
-  echo "Runtime architecture violation: shell transport regressed to legacy core stream DTOs." >&2
-  cat /tmp/bcode-shell-legacy-stream-contracts.txt >&2
+  plugins/shell-plugin/src >/tmp/bcode-shell-legacy-stream-contracts.txt ||
+   awk '/^#\[cfg\(test\)\]/{exit} {print}' packages/server/src/lib.rs |
+     rg -n 'ToolInvocationStreamEvent::ArtifactUpdate|contribution_artifact_stream_event|\.stream_event\(' \
+       >/tmp/bcode-server-artifact-stream-bridge.txt; then
+  echo "Runtime architecture violation: shell/server artifact transport regressed to legacy core stream DTOs." >&2
+  cat /tmp/bcode-shell-legacy-stream-contracts.txt /tmp/bcode-server-artifact-stream-bridge.txt 2>/dev/null >&2 || true
   violations=1
 fi
 
@@ -1012,7 +1058,7 @@ if ! grep -F 'fn select_visual_adapter' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F '.visual_adapter(schema, schema_version, "tui", producer)' packages/tui/src/plugin_tui.rs >/dev/null ||
    ! grep -F "BTreeMap<(&'static str, u32), VisualAdapter>" packages/hyperchad/ui/src/pages/home/adapters.rs >/dev/null ||
    ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null; then
+   ! grep -F 'unknown_contribution_has_no_raw_hyperchad_fallback' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null; then
   echo "Runtime architecture violation: platform-owned schema/version renderer selection or generic fallback coverage was removed." >&2
   violations=1
 fi
@@ -1030,7 +1076,7 @@ if [[ "$(rg -l '^pub (struct|enum) (ToolContributionEvent|ToolExchangeRequest|To
    ! grep -F 'input: bcode_tool::ToolInvocationInput' packages/ipc/src/lib.rs >/dev/null ||
    ! grep -F 'pub active_exchanges: BTreeMap<String, bcode_session_models::ToolExchangeRequest>' packages/session-view/models/src/lib.rs >/dev/null ||
    ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
-   ! grep -F 'unknown_visual_schema_uses_generic_fallback' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null ||
+   ! grep -F 'unknown_contribution_has_no_raw_hyperchad_fallback' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null ||
    ! grep -F 'unsupported_headless_exchange_is_explicit_for_required_and_optional_policies' packages/bcode/tests/headless_exchange.rs >/dev/null; then
   echo "Runtime architecture violation: IPC, renderer, and headless hosts no longer consume the canonical opaque invocation envelopes." >&2
   violations=1

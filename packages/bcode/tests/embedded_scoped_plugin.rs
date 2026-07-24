@@ -9,10 +9,7 @@ use bcode::{
     ToolInvocationInputResolution, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
     ToolInvoker, TurnEventObservability,
 };
-use bcode_tool::{
-    ToolInvocationResponse, ToolPolicyMetadata, ToolPreparationRequest, ToolPreparationResponse,
-    ToolUiMetadata,
-};
+use bcode_tool::{ToolInvocationResponse, ToolPreparationRequest, ToolPreparationResponse};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -104,9 +101,6 @@ fn definition() -> ToolDefinition {
         name: "hello_bridge".to_string(),
         description: "embedded bridge parity tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 
@@ -179,9 +173,6 @@ fn shell_definition() -> ToolDefinition {
         name: "shell.run".to_string(),
         description: "reentrant shell overlap conformance tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 
@@ -255,9 +246,6 @@ async fn assert_direct_batch_overlaps() {
                 name: "direct.overlap".to_string(),
                 description: "direct overlap conformance tool".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
-                requires_permission: false,
-                policy: ToolPolicyMetadata::default(),
-                ui: ToolUiMetadata::default(),
             },
             move |invocation, _scope| {
                 let barrier = Arc::clone(&handler_barrier);
@@ -381,9 +369,6 @@ async fn assert_future_remote_batch_semantics(invoker: Arc<FutureRemoteInvoker>,
                 name: "future.remote".to_owned(),
                 description: "future remote adapter conformance tool".to_owned(),
                 input_schema: serde_json::json!({"type": "object"}),
-                requires_permission: false,
-                policy: ToolPolicyMetadata::default(),
-                ui: ToolUiMetadata::default(),
             },
             |_| unreachable!("future remote invoker owns execution"),
         )

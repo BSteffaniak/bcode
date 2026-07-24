@@ -28,7 +28,7 @@ impl RustPlugin for HelloPlugin {
             return prepare_tool_service_response(
                 &context.request,
                 [hello_bridge_definition()],
-                |_request, _definition| Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
+                |_request, _definition| Ok(bcode_plugin_sdk::ToolPolicyPreparation::read_only()),
             );
         }
         if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID
@@ -155,9 +155,6 @@ fn hello_bridge_definition() -> bcode_tool::ToolDefinition {
         name: "hello_bridge".to_string(),
         description: "Exercise every generic invocation capability".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 

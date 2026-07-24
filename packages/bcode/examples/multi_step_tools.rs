@@ -1,7 +1,7 @@
 use bcode::{
     Agent, BcodeError, ModelProviderInvoker, PermissionDecision, PermissionPolicy, RuntimeFuture,
     RuntimePermissionRequest, StopReason, ToolCall, ToolDefinition, ToolInvocationDescriptor,
-    ToolInvocationResponse, ToolPolicyMetadata, ToolUiMetadata,
+    ToolInvocationResponse,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -13,9 +13,6 @@ fn definition() -> ToolDefinition {
         name: "echo".to_string(),
         description: "Echo text".to_string(),
         input_schema: serde_json::json!({"type":"object"}),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 

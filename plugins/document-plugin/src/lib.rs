@@ -112,9 +112,9 @@ fn progress_lifecycle_event(
 fn document_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
-    match definition.name.as_str() {
-        "document.status" => Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let operation = match definition.name.as_str() {
+        "document.status" => bcode_plugin_sdk::ToolPolicyOperation::ReadOnly,
         "document.extract" => {
             let url = request
                 .invocation
@@ -123,7 +123,7 @@ fn document_policy_operation(
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string);
             if url.is_some() {
-                Ok(bcode_plugin_sdk::ToolPolicyOperation::Web { url })
+                bcode_plugin_sdk::ToolPolicyOperation::Web { url }
             } else {
                 let paths = request
                     .invocation
@@ -133,11 +133,26 @@ fn document_policy_operation(
                     .map(ToString::to_string)
                     .into_iter()
                     .collect();
-                Ok(bcode_plugin_sdk::ToolPolicyOperation::Read { paths })
+                bcode_plugin_sdk::ToolPolicyOperation::Read { paths }
             }
         }
-        name => Err(format!("unsupported document policy operation: {name}")),
-    }
+        name => return Err(format!("unsupported document policy operation: {name}")),
+    };
+    let identity = match definition.name.as_str() {
+        "document.extract" => bcode_plugin_sdk::ToolPolicyIdentity {
+            aliases: vec!["read".to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
+            permission_category: Some("read".to_string()),
+        },
+        "document.status" => bcode_plugin_sdk::ToolPolicyIdentity::default(),
+        name => return Err(format!("unsupported document policy operation: {name}")),
+    };
+    Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
+        definition.name == "document.extract",
+        operation,
+    )
+    .with_identity(identity))
 }
 
 impl DocumentPlugin {
@@ -590,17 +605,6 @@ fn extract_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        requires_permission: true,
-        policy: bcode_tool::ToolPolicyMetadata {
-            aliases: vec!["read".to_string()],
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some("read".to_string()),
-        },
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("extracting".to_string()),
-            request_visual: None
-        },
     }
 }
 
@@ -612,12 +616,6 @@ fn status_tool_definition() -> ToolDefinition {
             "type": "object",
             "properties": {}
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("checking document extractors".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -760,13 +758,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn document_tools_remove_legacy_request_visuals() {
+    fn document_tools_emit_request_contributions() {
         for definition in [extract_tool_definition(), status_tool_definition()] {
-            assert!(
-                definition.ui.request_visual.is_none(),
-                "{}",
-                definition.name
-            );
+            let encoded = serde_json::to_value(definition).expect("tool definition encodes");
+            assert!(encoded.get("ui").is_none());
+        }
+    }
+
+    #[test]
+    fn document_owner_prepares_mixed_permission_policy() {
+        for (definition, arguments, expected_permission) in [
+            (status_tool_definition(), serde_json::Value::Null, false),
+            (
+                extract_tool_definition(),
+                serde_json::json!({"path": "report.pdf"}),
+                true,
+            ),
+        ] {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "call".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments,
+                },
+                host_context: Vec::new(),
+            };
+            let policy = document_policy_operation(&request, &definition).expect("document policy");
+            assert_eq!(policy.requires_permission, expected_permission);
         }
     }
 

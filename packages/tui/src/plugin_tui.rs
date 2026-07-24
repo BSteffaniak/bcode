@@ -449,14 +449,12 @@ mod tests {
             "shell",
             "{}",
             None,
-            None,
         );
         let second = crate::transcript::tool_request_item(
             "call-two",
             Some("bcode.shell"),
             "shell",
             "{}",
-            None,
             None,
         );
         let first_before =
@@ -486,7 +484,6 @@ mod tests {
                         Some("bcode.shell"),
                         "shell",
                         "{}",
-                        None,
                         None,
                     )
                 })
@@ -564,7 +561,6 @@ mod tests {
                         Some("bcode.shell"),
                         "shell",
                         "{}",
-                        None,
                         None,
                     )
                 })

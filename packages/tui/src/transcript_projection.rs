@@ -2,7 +2,7 @@
 
 use bmux_tui::geometry::Rect;
 
-use super::app::{BmuxApp, LiveToolPreviewState};
+use super::app::BmuxApp;
 use super::pending_submission::PendingSubmission;
 use super::render;
 use super::transcript::TranscriptItem;
@@ -21,7 +21,6 @@ pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
     if latest_bar_height == 0 {
         return;
     }
-
     let body = Rect::new(
         body.x,
         body.y,
@@ -83,7 +82,6 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
             |index| {
                 render::transcript_item_rows(
                     input.transcript,
-                    input.live_tool_previews,
                     index,
                     input.width,
                     input.plugin_host,
@@ -104,7 +102,6 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         transcript_rows: |index| {
             render::transcript_item_rows(
                 input.transcript,
-                input.live_tool_previews,
                 index,
                 input.width,
                 input.plugin_host,
@@ -135,12 +132,11 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
 struct TranscriptLayoutInput<'a> {
     width: u16,
     transcript: &'a [TranscriptItem],
-    live_tool_previews: &'a std::collections::BTreeMap<String, LiveToolPreviewState>,
     plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
     diff_viewer_config: TuiDiffViewerConfig,
     pending: &'a [PendingSubmission],
     elapsed_layout_revision: u64,
-    transcript_structural_projection_revision: u64,
+    transcript_projection_revision: u64,
     pending_submissions_projection_revision: u64,
     has_older_history: bool,
     loading_older_history: bool,
@@ -151,13 +147,11 @@ impl<'a> TranscriptLayoutInput<'a> {
         Self {
             width,
             transcript: app.transcript(),
-            live_tool_previews: app.live_tool_previews(),
             plugin_host: app.plugin_presentation(),
             diff_viewer_config: app.effective_diff_viewer_config(),
             pending: app.pending_submissions(),
             elapsed_layout_revision: app.elapsed_layout_revision(),
-            transcript_structural_projection_revision: app
-                .transcript_structural_projection_revision(),
+            transcript_projection_revision: app.transcript_projection_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
             has_older_history: app.has_older_history(),
             loading_older_history: app.loading_older_history(),
@@ -194,7 +188,7 @@ impl<'a> TranscriptLayoutInput<'a> {
             self.diff_viewer_config,
             self.has_older_history,
             self.loading_older_history,
-            self.transcript_structural_projection_revision,
+            self.transcript_projection_revision,
             self.transcript.len(),
             self.pending_submissions_projection_revision,
             self.pending.len()
@@ -210,17 +204,15 @@ pub fn test_layout_signature(
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) -> TranscriptLayoutSignature {
     let transcript = [item.clone()];
-    let live_tool_previews = std::collections::BTreeMap::new();
     let pending = [];
     let input = TranscriptLayoutInput {
         width,
         transcript: &transcript,
-        live_tool_previews: &live_tool_previews,
         plugin_host,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,
         elapsed_layout_revision: 0,
-        transcript_structural_projection_revision: 0,
+        transcript_projection_revision: 0,
         pending_submissions_projection_revision: 0,
         has_older_history: false,
         loading_older_history: false,
@@ -237,20 +229,13 @@ fn transcript_item_signature(
         || "none".to_owned(),
         |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
     );
-    let live_preview_revision = match item.kind() {
-        super::transcript::TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. } => input
-            .live_tool_previews
-            .get(tool_call_id)
-            .map_or(0, |preview| preview.revision),
-        _ => 0,
-    };
     let visual_revision = item.visual_invocation_id().map_or(0, |invocation_id| {
         input
             .plugin_host
             .map_or(0, |host| host.visual_revision(invocation_id))
     });
     TranscriptLayoutSignature::new(format!(
-        "{};presentation-generation:{presentation_generation};visual-rev:{visual_revision};live-preview-rev:{live_preview_revision}",
+        "{};presentation-generation:{presentation_generation};visual-rev:{visual_revision}",
         base.as_str()
     ))
 }

@@ -9,9 +9,9 @@
 //! browser DOM primitives, daemon clients, or application orchestration.
 
 use bcode_session_models::{
-    ClientId, ModelTurnOutcome, PluginVisualDescriptor, RequestContextOccupancy, RuntimeWorkKind,
-    RuntimeWorkStatus, SessionForkResult, SessionId, SessionSummary, SessionTokenUsage,
-    ToolArtifact, ToolInvocationResult, WorkId,
+    ClientId, ModelTurnOutcome, RequestContextOccupancy, RuntimeWorkKind, RuntimeWorkStatus,
+    SessionForkResult, SessionId, SessionSummary, SessionTokenUsage, ToolArtifact,
+    ToolInvocationResult, WorkId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -765,8 +765,6 @@ pub enum TranscriptViewItemKind {
     Skill { skill: SkillView },
     /// System/status message.
     SystemMessage { message: ChatMessageView },
-    /// Generic plugin visual payload.
-    PluginVisual { visual: PluginVisualView },
     /// Opaque schema-versioned tool contribution with explicit semantic placement.
     ToolContribution {
         contribution: bcode_session_models::ToolContributionEvent,
@@ -890,8 +888,6 @@ pub struct ToolInvocationView {
     pub arguments_json: Option<String>,
     /// Working directory captured for this invocation, when known.
     pub working_directory: Option<PathBuf>,
-    /// Plugin-owned request visual.
-    pub request_visual: Option<PluginVisualView>,
     /// Current lifecycle status.
     pub status: ToolInvocationViewStatus,
     /// Raw final text result, when finished.
@@ -900,8 +896,6 @@ pub struct ToolInvocationView {
     pub is_error: Option<bool>,
     /// Semantic result, when supplied by the tool.
     pub result: Option<ToolResultView>,
-    /// Raw terminal/text stream output observed for the tool.
-    pub output: Option<ToolOutputView>,
     /// Tool timing metadata.
     pub timing: ToolTimingView,
 }
@@ -913,7 +907,7 @@ pub enum ToolInvocationViewStatus {
     /// Request was observed but no stream/final result has been seen.
     #[default]
     Requested,
-    /// Stream lifecycle/output was observed.
+    /// Canonical invocation lifecycle reported the tool as running.
     Running,
     /// Final result was observed or lifecycle completed successfully.
     Finished,
@@ -931,17 +925,6 @@ impl From<bcode_session_models::ToolInvocationProjectionStatus> for ToolInvocati
             bcode_session_models::ToolInvocationProjectionStatus::Finished => Self::Finished,
         }
     }
-}
-
-/// Renderer-neutral tool output view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolOutputView {
-    /// Raw stream output text.
-    pub text: String,
-    /// Terminal columns reported by the producer, when known.
-    pub columns: Option<u16>,
-    /// Terminal rows reported by the producer, when known.
-    pub rows: Option<u16>,
 }
 
 /// Renderer-neutral tool timing metadata.
@@ -997,25 +980,6 @@ impl From<ToolArtifact> for ToolArtifactView {
         let generic_payload = serde_json::to_value(&artifact).unwrap_or(serde_json::Value::Null);
         Self {
             artifact,
-            generic_payload,
-        }
-    }
-}
-
-/// Renderer-neutral plugin visual view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginVisualView {
-    /// Raw plugin visual descriptor.
-    pub descriptor: PluginVisualDescriptor,
-    /// Generic renderer payload for structured display.
-    pub generic_payload: serde_json::Value,
-}
-
-impl From<PluginVisualDescriptor> for PluginVisualView {
-    fn from(descriptor: PluginVisualDescriptor) -> Self {
-        let generic_payload = serde_json::to_value(&descriptor).unwrap_or(serde_json::Value::Null);
-        Self {
-            descriptor,
             generic_payload,
         }
     }

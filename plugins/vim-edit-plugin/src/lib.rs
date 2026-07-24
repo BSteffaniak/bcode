@@ -16,7 +16,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
     ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolList, ToolPolicyMetadata, ToolUiMetadata,
+    ToolInvocationResponse, ToolList,
 };
 use bcode_vim_edit::{
     VimEditFrame, VimEditMode, VimEditMultiFileEntry, VimEditMultiFileRequest,
@@ -140,7 +140,7 @@ struct VimEditToolError<'a> {
 fn vim_edit_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
     let paths = request
         .invocation
         .arguments
@@ -163,14 +163,26 @@ fn vim_edit_policy_operation(
                 }),
         )
         .collect();
-    Ok(match definition.name.as_str() {
+    let operation = match definition.name.as_str() {
         "vim_edit.preview" => bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
         "vim_edit.apply" => bcode_plugin_sdk::ToolPolicyOperation::Write {
             paths,
             category: "write".to_owned(),
         },
         name => return Err(format!("unsupported Vim edit policy operation: {name}")),
-    })
+    };
+    let category = match definition.name.as_str() {
+        "vim_edit.preview" => "read",
+        "vim_edit.apply" => "edit",
+        name => return Err(format!("unsupported Vim edit policy operation: {name}")),
+    };
+    Ok(
+        bcode_plugin_sdk::ToolPolicyPreparation::new(
+            definition.name == "vim_edit.apply",
+            operation,
+        )
+        .with_identity(path_policy(category)),
+    )
 }
 
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -952,12 +964,6 @@ fn preview_tool_definition() -> ToolDefinition {
         name: "vim_edit.preview".to_string(),
         description: "Preview ordered Vim/Neovim edits using isolated headless Neovim over RPC. Accepts either single-file path+steps or an ordered files array where each entry switches to that file and runs its steps. Does not modify requested files. Optional sandbox=\"dangerously_disabled\" is unsafe and explicitly bypasses default command filtering.".to_string(),
         input_schema: vim_edit_input_schema(),
-        requires_permission: false,
-        policy: path_policy("read"),
-        ui: ToolUiMetadata {
-            activity_label: Some("previewing Vim edit".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -966,12 +972,6 @@ fn apply_tool_definition() -> ToolDefinition {
         name: "vim_edit.apply".to_string(),
         description: "Apply ordered Vim/Neovim edits using isolated headless Neovim over RPC. Accepts either single-file path+steps or an ordered files array where each entry switches to that file and runs its steps. Requires write permission and writes only after the full workflow succeeds. Optional sandbox=\"dangerously_disabled\" is unsafe and explicitly bypasses default command filtering.".to_string(),
         input_schema: vim_edit_input_schema(),
-        requires_permission: true,
-        policy: path_policy("edit"),
-        ui: ToolUiMetadata {
-            activity_label: Some("applying Vim edit".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -1122,8 +1122,8 @@ fn vim_edit_input_schema() -> serde_json::Value {
     })
 }
 
-fn path_policy(category: &str) -> ToolPolicyMetadata {
-    ToolPolicyMetadata {
+fn path_policy(category: &str) -> bcode_plugin_sdk::ToolPolicyIdentity {
+    bcode_plugin_sdk::ToolPolicyIdentity {
         aliases: vec![category.to_string()],
         compatibility_aliases: Vec::new(),
         capabilities: vec![format!("vim_edit.{category}")],
@@ -1193,18 +1193,9 @@ export_plugin!(VimEditPlugin, include_str!("../bcode-plugin.toml"));
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::c_void;
-
-    extern "C" fn collect_event(payload: *const u8, len: usize, user_data: *mut c_void) {
-        let events = unsafe { &mut *(user_data.cast::<Vec<ToolContributionEnvelope>>()) };
-        let payload = unsafe { std::slice::from_raw_parts(payload, len) };
-        events.push(serde_json::from_slice(payload).expect("contribution event"));
-    }
 
     #[test]
     fn vim_edit_requests_remove_legacy_visuals_and_map_contribution_schemas() {
-        assert!(preview_tool_definition().ui.request_visual.is_none());
-        assert!(apply_tool_definition().ui.request_visual.is_none());
         assert_eq!(
             vim_edit_request_schema("vim_edit.preview"),
             Some(VIM_EDIT_REQUEST_PREVIEW_SCHEMA)
@@ -1214,6 +1205,13 @@ mod tests {
             Some(VIM_EDIT_REQUEST_APPLY_SCHEMA)
         );
         assert_eq!(vim_edit_request_schema("unknown"), None);
+    }
+    use std::ffi::c_void;
+
+    extern "C" fn collect_event(payload: *const u8, len: usize, user_data: *mut c_void) {
+        let events = unsafe { &mut *(user_data.cast::<Vec<ToolContributionEnvelope>>()) };
+        let payload = unsafe { std::slice::from_raw_parts(payload, len) };
+        events.push(serde_json::from_slice(payload).expect("contribution event"));
     }
 
     #[test]
@@ -1248,7 +1246,6 @@ mod tests {
     #[test]
     fn preview_tool_is_read_only_without_permission() {
         let tool = preview_tool_definition();
-        assert!(!tool.requires_permission);
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "preview".to_owned(),
@@ -1257,8 +1254,10 @@ mod tests {
             },
             host_context: Vec::new(),
         };
+        let policy = vim_edit_policy_operation(&request, &tool).expect("preview policy");
+        assert!(!policy.requires_permission);
         assert_eq!(
-            vim_edit_policy_operation(&request, &tool).expect("preview policy"),
+            policy.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Read {
                 paths: vec!["src/lib.rs".to_owned()],
             }
@@ -1268,7 +1267,6 @@ mod tests {
     #[test]
     fn apply_tool_writes_and_requires_permission() {
         let tool = apply_tool_definition();
-        assert!(tool.requires_permission);
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "apply".to_owned(),
@@ -1282,8 +1280,10 @@ mod tests {
             },
             host_context: Vec::new(),
         };
+        let policy = vim_edit_policy_operation(&request, &tool).expect("apply policy");
+        assert!(policy.requires_permission);
         assert_eq!(
-            vim_edit_policy_operation(&request, &tool).expect("apply policy"),
+            policy.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Write {
                 paths: vec!["src/lib.rs".to_owned(), "src/main.rs".to_owned()],
                 category: "write".to_owned(),

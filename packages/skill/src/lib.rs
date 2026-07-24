@@ -11,7 +11,9 @@ use bcode_skill_models::{
     SkillSource, SkillSourceKind, SkillSummary, SkillThinkingEffort, SkillToolPolicyOutcome,
     SkillToolPolicyRequest, SkillToolPolicyTarget,
 };
-use bcode_tool::{ResolvedToolSelector, ToolDefinition, ToolReferenceResolution};
+use bcode_tool::{
+    ResolvedToolSelector, ToolReferenceResolution, ToolResolutionCandidate, UnresolvedToolReference,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -757,18 +759,137 @@ fn diagnostic(
     }
 }
 
-/// Resolve a canonical skill permission policy against the available tool catalog.
+fn resolve_tool_reference(
+    reference: &UnresolvedToolReference,
+    tools: &[SkillToolPolicyTarget],
+) -> ToolReferenceResolution {
+    if let Some(selector) = explicit_tool_selector(reference) {
+        return ToolReferenceResolution::Resolved { selector };
+    }
+
+    let candidates = tool_reference_candidates(reference, tools);
+    match candidates.as_slice() {
+        [] => ToolReferenceResolution::Unknown {
+            reference: reference.clone(),
+        },
+        [candidate] => ToolReferenceResolution::Resolved {
+            selector: selector_for_tool_candidate(reference, candidate),
+        },
+        _ => ToolReferenceResolution::Ambiguous {
+            reference: reference.clone(),
+            candidates,
+        },
+    }
+}
+
+fn explicit_tool_selector(reference: &UnresolvedToolReference) -> Option<ResolvedToolSelector> {
+    let UnresolvedToolReference::Raw { value } = reference else {
+        return None;
+    };
+    value
+        .strip_prefix("category:")
+        .map(|category| ResolvedToolSelector::PermissionCategory {
+            category: category.to_string(),
+        })
+        .or_else(|| {
+            value
+                .strip_prefix("capability:")
+                .map(|capability| ResolvedToolSelector::Capability {
+                    capability: capability.to_string(),
+                })
+        })
+}
+
+fn tool_reference_candidates(
+    reference: &UnresolvedToolReference,
+    tools: &[SkillToolPolicyTarget],
+) -> Vec<ToolResolutionCandidate> {
+    let mut candidates = BTreeMap::<String, ToolResolutionCandidate>::new();
+    match reference {
+        UnresolvedToolReference::Raw { value } => {
+            for tool in tools {
+                let matched_by = if tool.name == *value {
+                    Some("tool_name".to_string())
+                } else if tool.aliases.iter().any(|alias| alias == value) {
+                    Some(format!("alias:{value}"))
+                } else if tool
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == value)
+                {
+                    Some(format!("capability:{value}"))
+                } else {
+                    None
+                };
+                if let Some(matched_by) = matched_by {
+                    candidates.insert(
+                        tool.name.clone(),
+                        ToolResolutionCandidate {
+                            tool_name: tool.name.clone(),
+                            matched_by,
+                        },
+                    );
+                }
+            }
+        }
+        UnresolvedToolReference::CompatibilityAlias { ecosystem, name } => {
+            for tool in tools {
+                if tool.compatibility_aliases.iter().any(|alias| {
+                    alias.ecosystem.eq_ignore_ascii_case(ecosystem) && alias.name == *name
+                }) {
+                    candidates.insert(
+                        tool.name.clone(),
+                        ToolResolutionCandidate {
+                            tool_name: tool.name.clone(),
+                            matched_by: format!("compatibility_alias:{ecosystem}:{name}"),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    candidates.into_values().collect()
+}
+
+fn selector_for_tool_candidate(
+    reference: &UnresolvedToolReference,
+    candidate: &ToolResolutionCandidate,
+) -> ResolvedToolSelector {
+    match reference {
+        UnresolvedToolReference::Raw { value } if candidate.matched_by == "tool_name" => {
+            ResolvedToolSelector::ToolName {
+                name: value.clone(),
+            }
+        }
+        UnresolvedToolReference::Raw { value } if candidate.matched_by.starts_with("alias:") => {
+            ResolvedToolSelector::Alias {
+                alias: value.clone(),
+            }
+        }
+        UnresolvedToolReference::Raw { value } => ResolvedToolSelector::Capability {
+            capability: value.clone(),
+        },
+        UnresolvedToolReference::CompatibilityAlias { ecosystem, name } => {
+            ResolvedToolSelector::CompatibilityAlias {
+                ecosystem: ecosystem.clone(),
+                name: name.clone(),
+            }
+        }
+    }
+}
+
+/// Resolve a canonical skill permission policy against owner-prepared tool identities.
 #[must_use]
 pub fn resolve_skill_permission_policy(
     policy: &SkillPermissionPolicy,
-    available_tools: &[ToolDefinition],
+    available_tools: &[SkillToolPolicyTarget],
 ) -> ResolvedSkillPermissionPolicy {
     let mut selectors = Vec::new();
     let mut unknown_references = Vec::new();
     let mut ambiguous_references = Vec::new();
 
     for reference in &policy.tools {
-        match bcode_tool::resolve_tool_reference(reference, available_tools) {
+        match resolve_tool_reference(reference, available_tools) {
             ToolReferenceResolution::Resolved { selector } => selectors.push(selector),
             ToolReferenceResolution::Unknown { reference } => unknown_references.push(reference),
             ambiguous @ ToolReferenceResolution::Ambiguous { .. } => {
@@ -1190,19 +1311,19 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn tool_with_policy(name: &str, policy: bcode_tool::ToolPolicyMetadata) -> ToolDefinition {
-        ToolDefinition {
-            name: name.to_string(),
-            description: String::new(),
-            input_schema: serde_json::Value::default(),
-            requires_permission: false,
-            policy,
-            ui: bcode_tool::ToolUiMetadata::default(),
-        }
+    fn tool_with_policy(name: &str, mut tool: SkillToolPolicyTarget) -> SkillToolPolicyTarget {
+        tool.name = name.to_string();
+        tool
     }
 
-    fn basic_tool(name: &str) -> ToolDefinition {
-        tool_with_policy(name, bcode_tool::ToolPolicyMetadata::default())
+    fn basic_tool(name: &str) -> SkillToolPolicyTarget {
+        SkillToolPolicyTarget {
+            name: name.to_string(),
+            aliases: Vec::new(),
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
+            permission_category: None,
+        }
     }
 
     fn policy_with_selector(
@@ -1218,11 +1339,11 @@ mod tests {
     }
 
     fn evaluate(
-        tool: ToolDefinition,
+        tool: SkillToolPolicyTarget,
         active_policies: Vec<ResolvedSkillPermissionPolicy>,
     ) -> SkillToolPolicyOutcome {
         evaluate_skill_tool_call(&SkillToolPolicyRequest {
-            tool: tool.into(),
+            tool,
             active_policies,
         })
     }
@@ -1267,7 +1388,8 @@ mod tests {
         ) {
             let tool = tool_with_policy(
                 "tool.run",
-                bcode_tool::ToolPolicyMetadata {
+                SkillToolPolicyTarget {
+                    name: String::new(),
                     aliases: vec![alias.clone()],
                     compatibility_aliases: Vec::new(),
                     capabilities: Vec::new(),
@@ -1296,7 +1418,8 @@ mod tests {
         ) {
             let tool = tool_with_policy(
                 "tool.run",
-                bcode_tool::ToolPolicyMetadata {
+                SkillToolPolicyTarget {
+                    name: String::new(),
                     aliases: Vec::new(),
                     compatibility_aliases: Vec::new(),
                     capabilities: Vec::new(),
@@ -1325,7 +1448,8 @@ mod tests {
         ) {
             let tool = tool_with_policy(
                 "tool.run",
-                bcode_tool::ToolPolicyMetadata {
+                SkillToolPolicyTarget {
+                    name: String::new(),
                     aliases: Vec::new(),
                     compatibility_aliases: Vec::new(),
                     capabilities: vec![capability.clone()],
@@ -1356,7 +1480,8 @@ mod tests {
             let requested_ecosystem = ecosystem.to_uppercase();
             let tool = tool_with_policy(
                 "tool.run",
-                bcode_tool::ToolPolicyMetadata {
+                SkillToolPolicyTarget {
+                    name: String::new(),
                     aliases: Vec::new(),
                     compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new(&ecosystem, &alias_name)],
                     capabilities: Vec::new(),
@@ -1486,7 +1611,8 @@ mod tests {
     fn ambiguous_alias_resolution_is_not_silent_allow() {
         let tool_a = tool_with_policy(
             "tool.a",
-            bcode_tool::ToolPolicyMetadata {
+            SkillToolPolicyTarget {
+                name: String::new(),
                 aliases: vec!["same".to_string()],
                 compatibility_aliases: Vec::new(),
                 capabilities: Vec::new(),
@@ -1495,7 +1621,8 @@ mod tests {
         );
         let tool_b = tool_with_policy(
             "tool.b",
-            bcode_tool::ToolPolicyMetadata {
+            SkillToolPolicyTarget {
+                name: String::new(),
                 aliases: vec!["same".to_string()],
                 compatibility_aliases: Vec::new(),
                 capabilities: Vec::new(),

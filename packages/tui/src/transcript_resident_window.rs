@@ -238,8 +238,6 @@ mod tests {
                     tool_name: "test.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ));
             events.push(assistant(user_sequence.saturating_add(2)));

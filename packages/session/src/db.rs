@@ -26,7 +26,7 @@ use bcode_session_models::{
     SessionEvent, SessionEventCompatibilityIssue, SessionEventKind, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
     SessionInputHistoryEntry, SessionSummary, SessionTitleSource, SessionVisibility,
-    ToolInvocationResult, ToolInvocationStreamEvent, WorkId,
+    ToolInvocationResult, WorkId,
 };
 use switchy::{
     database::{
@@ -3807,24 +3807,6 @@ async fn project_event(
                 .await?;
             insert_transcript_item(db, event, "tool", "invocation", "running", None).await?;
         }
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            is_error,
-            semantic_result,
-            ..
-        } => {
-            db.update("tool_runs")
-                .value("event_seq_end", seq_to_value(event.sequence))
-                .value("status", if *is_error { "error" } else { "complete" })
-                .value("is_error", bool_to_value(*is_error))
-                .where_eq("tool_call_id", tool_call_id.clone())
-                .execute(db)
-                .await?;
-            if let Some(ToolInvocationResult::Artifact { artifact }) = semantic_result {
-                project_artifact_references(db, event.sequence, artifact).await?;
-            }
-            insert_tool_result_transcript_item(db, event, tool_call_id, *is_error).await?;
-        }
         SessionEventKind::ToolInvocationResultRecorded { record } => {
             db.update("tool_runs")
                 .value("event_seq_end", seq_to_value(event.sequence))
@@ -3896,10 +3878,6 @@ async fn project_event(
                 Some(serde_json::to_string(resolution)?),
             )
             .await?;
-        }
-        SessionEventKind::ToolInvocationStream { event: stream } => {
-            update_tool_transcript_item_end(db, tool_stream_tool_call_id(stream), event.sequence)
-                .await?;
         }
         SessionEventKind::RuntimeWorkStarted {
             work_id,
@@ -4043,37 +4021,6 @@ async fn insert_transcript_item_with_range(
     Ok(())
 }
 
-async fn insert_tool_result_transcript_item(
-    db: &dyn Database,
-    event: &SessionEvent,
-    tool_call_id: &str,
-    is_error: bool,
-) -> SessionDbResult<()> {
-    let row = db
-        .select("tool_runs")
-        .columns(&["event_seq_start"])
-        .where_eq("tool_call_id", tool_call_id.to_owned())
-        .execute_first(db)
-        .await?;
-    let event_seq_start = row
-        .as_ref()
-        .map(|row| required_i64(row, "event_seq_start").map(i64_to_u64))
-        .transpose()?
-        .unwrap_or(event.sequence);
-    insert_transcript_item_with_range(
-        db,
-        event.sequence,
-        event_seq_start,
-        event.sequence,
-        event_created_at_ms(event),
-        "tool",
-        "result",
-        if is_error { "error" } else { "complete" },
-        None,
-    )
-    .await
-}
-
 async fn finalize_tool_transcript_item(
     db: &dyn Database,
     tool_call_id: &str,
@@ -4103,45 +4050,6 @@ async fn finalize_tool_transcript_item(
     Ok(())
 }
 
-async fn update_tool_transcript_item_end(
-    db: &dyn Database,
-    tool_call_id: &str,
-    event_sequence: u64,
-) -> SessionDbResult<()> {
-    let row = db
-        .select("tool_runs")
-        .columns(&["event_seq_start"])
-        .where_eq("tool_call_id", tool_call_id.to_owned())
-        .execute_first(db)
-        .await?;
-    let Some(event_seq_start) = row
-        .as_ref()
-        .map(|row| required_i64(row, "event_seq_start").map(i64_to_u64))
-        .transpose()?
-    else {
-        return Ok(());
-    };
-    db.update("transcript_items")
-        .value("event_seq_end", seq_to_value(event_sequence))
-        .where_eq("transcript_seq", seq_to_value(event_seq_start))
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
-    match event {
-        ToolInvocationStreamEvent::Started { tool_call_id, .. }
-        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
-        | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::ArtifactUpdate { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
-        | ToolInvocationStreamEvent::LegacyTransientPruned { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
-    }
-}
-
 const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
     match kind {
         SessionEventKind::SessionCreated { .. } => "session_created",
@@ -4151,7 +4059,6 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
-        SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
@@ -4185,14 +4092,13 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
-        SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
-        SessionEventKind::LegacyEvent { .. } => "legacy_event",
+        SessionEventKind::OpaqueEvent { .. } => "opaque_event",
     }
 }
 
@@ -4374,7 +4280,6 @@ const fn context_history_role(kind: &SessionEventKind) -> ContextHistoryRole {
         SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::ToolCallRequested { .. }
-        | SessionEventKind::ToolCallFinished { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. }
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
@@ -4392,7 +4297,6 @@ const fn context_history_role_from_name(event_type: &str) -> ContextHistoryRole 
         b"user_message"
         | b"assistant_message"
         | b"tool_call_requested"
-        | b"tool_call_finished"
         | b"tool_invocation_result_recorded"
         | b"system_message"
         | b"working_directory_changed"
@@ -4414,25 +4318,6 @@ fn canonical_model_context_from_events(
     events: impl IntoIterator<Item = SessionEvent>,
 ) -> Vec<SessionEvent> {
     let events = events.into_iter().collect::<Vec<_>>();
-    let generic_result_invocations = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::ToolInvocationResultRecorded { record } => {
-                Some(record.invocation_id.clone())
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let events = events
-        .into_iter()
-        .filter(|event| {
-            !matches!(
-                &event.kind,
-                SessionEventKind::ToolCallFinished { tool_call_id, .. }
-                    if generic_result_invocations.contains(tool_call_id)
-            )
-        })
-        .collect::<Vec<_>>();
     let Some(marker) = events
         .iter()
         .filter(|event| {
@@ -4486,7 +4371,6 @@ const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static str 
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
-        SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
         SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
@@ -5144,7 +5028,7 @@ mod tests {
             .await
             .expect("open identity DB");
         let identity_payload =
-            include_str!("../fixtures/migrations/mismatched-session-id-v38.json");
+            include_str!("../fixtures/migrations/mismatched-session-id-v39.json");
         identity_db
             .database()
             .insert("events")
@@ -5168,7 +5052,7 @@ mod tests {
         let gap_db = SessionDb::open_turso_in_root(fixture_session, gap_root.path())
             .await
             .expect("open gap DB");
-        for payload in include_str!("../fixtures/migrations/sequence-gap-v38.jsonl").lines() {
+        for payload in include_str!("../fixtures/migrations/sequence-gap-v39.jsonl").lines() {
             let value: serde_json::Value = serde_json::from_str(payload).expect("gap fixture JSON");
             let sequence = value["sequence"].as_u64().expect("fixture sequence");
             let event_type = value["kind"]
@@ -5358,8 +5242,8 @@ mod tests {
             &db,
             session_id,
             2,
-            "tool_call_finished",
-            serde_json::json!({ "tool_call_finished": { "result": "missing call id" } }),
+            "tool_invocation_result_recorded",
+            serde_json::json!({ "tool_invocation_result_recorded": { "record": { "model_output": "missing invocation id" } } }),
         )
         .await;
         insert_event(
@@ -5404,7 +5288,7 @@ mod tests {
             .await
             .expect("future history should remain visible");
         assert_eq!(history_sequences(&history), vec![0, 1, 3]);
-        let SessionEventKind::LegacyEvent {
+        let SessionEventKind::OpaqueEvent {
             event_type,
             payload,
         } = &history[1].kind
@@ -5615,8 +5499,6 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_json: "{}".to_string(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
             },
         ))
         .await
@@ -5631,12 +5513,13 @@ mod tests {
         db.append_event(&event(
             session_id,
             1,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "tool-1".to_string(),
-                result: "done".to_string(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "tool-1".to_string(),
+                    model_output: "done".to_string(),
+                    is_error: false,
+                    result: None,
+                },
             },
         ))
         .await
@@ -5673,8 +5556,6 @@ mod tests {
                 tool_name: "example.tool".to_owned(),
                 arguments_json: "{}".to_owned(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
             },
         ))
         .await
@@ -5791,8 +5672,6 @@ mod tests {
                     tool_name: "future.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -6069,7 +5948,6 @@ mod tests {
     fn context_history_roles_separate_model_visible_structural_and_excluded_events() {
         assert!(is_model_context_event_type("model_turn_started"));
         assert!(is_model_context_event_type("model_turn_finished"));
-        assert!(!is_model_context_event_type("context_usage_observed"));
         assert!(!is_model_context_event_type("request_context_observed"));
     }
 
@@ -6345,68 +6223,28 @@ mod tests {
                 ExpectedHistory::Sequences(&[0]),
             ),
             (
-                "interactive-tool-request-created-v32.json",
-                include_str!("../fixtures/migrations/interactive-tool-request-created-v32.json"),
-                ExpectedHistory::Sequences(&[1158]),
-            ),
-            (
-                "interactive-tool-request-resolved-v32.json",
-                include_str!("../fixtures/migrations/interactive-tool-request-resolved-v32.json"),
-                ExpectedHistory::Sequences(&[1159]),
-            ),
-            (
-                "interactive-tool-request-unresolved-v32.json",
-                include_str!("../fixtures/migrations/interactive-tool-request-unresolved-v32.json"),
-                ExpectedHistory::Sequences(&[1]),
-            ),
-            (
-                "malformed-json-v38.json",
-                include_str!("../fixtures/migrations/malformed-json-v38.json"),
+                "malformed-json-v39.json",
+                include_str!("../fixtures/migrations/malformed-json-v39.json"),
                 ExpectedHistory::PersistedEventError,
             ),
             (
-                "mismatched-session-id-v38.json",
-                include_str!("../fixtures/migrations/mismatched-session-id-v38.json"),
+                "mismatched-session-id-v39.json",
+                include_str!("../fixtures/migrations/mismatched-session-id-v39.json"),
                 ExpectedHistory::SessionIdentityError,
             ),
             (
-                "plugin-automation-turn-finished-v29.json",
-                include_str!("../fixtures/migrations/plugin-automation-turn-finished-v29.json"),
-                ExpectedHistory::Sequences(&[42]),
-            ),
-            (
-                "plugin-automation-turn-started-v29.json",
-                include_str!("../fixtures/migrations/plugin-automation-turn-started-v29.json"),
-                ExpectedHistory::Sequences(&[41]),
-            ),
-            (
-                "plugin-status-note-v29.json",
-                include_str!("../fixtures/migrations/plugin-status-note-v29.json"),
+                "plugin-status-note-v39.json",
+                include_str!("../fixtures/migrations/plugin-status-note-v39.json"),
                 ExpectedHistory::Sequences(&[43]),
             ),
             (
-                "tool-presentation-diff-v25.json",
-                include_str!("../fixtures/migrations/tool-presentation-diff-v25.json"),
-                ExpectedHistory::Sequences(&[14260]),
-            ),
-            (
-                "unknown-future-event-kind-v38.json",
-                include_str!("../fixtures/migrations/unknown-future-event-kind-v38.json"),
+                "unknown-future-event-kind-v39.json",
+                include_str!("../fixtures/migrations/unknown-future-event-kind-v39.json"),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (
-                "unknown-old-event-kind-v32.json",
-                include_str!("../fixtures/migrations/unknown-old-event-kind-v32.json"),
-                ExpectedHistory::Sequences(&[0]),
-            ),
-            (
-                "mixed-interactive-history-v32-v35.jsonl",
-                include_str!("../fixtures/migrations/mixed-interactive-history-v32-v35.jsonl"),
-                ExpectedHistory::Sequences(&[0, 1, 2]),
-            ),
-            (
-                "sequence-gap-v38.jsonl",
-                include_str!("../fixtures/migrations/sequence-gap-v38.jsonl"),
+                "sequence-gap-v39.jsonl",
+                include_str!("../fixtures/migrations/sequence-gap-v39.jsonl"),
                 ExpectedHistory::Sequences(&[0, 2]),
             ),
         ];
@@ -6575,107 +6413,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-    }
-
-    #[tokio::test]
-    async fn explicit_reindex_accepts_retired_interactive_events_as_inert_history() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let session_id = SessionId::new();
-        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
-            .await
-            .expect("open session db");
-        db.append_event(&event(
-            session_id,
-            0,
-            SessionEventKind::SessionCreated {
-                name: Some("legacy interaction".to_owned()),
-                working_directory: temp_dir.path().to_path_buf(),
-            },
-        ))
-        .await
-        .expect("append session created");
-
-        for (sequence, fixture, event_type) in [
-            (
-                1,
-                include_str!("../fixtures/migrations/interactive-tool-request-created-v32.json"),
-                "interactive_tool_request_created",
-            ),
-            (
-                2,
-                include_str!("../fixtures/migrations/interactive-tool-request-resolved-v32.json"),
-                "interactive_tool_request_resolved",
-            ),
-        ] {
-            let mut payload: serde_json::Value =
-                serde_json::from_str(fixture).expect("fixture JSON");
-            payload["sequence"] = sequence.into();
-            payload["session_id"] = serde_json::to_value(session_id).expect("session id JSON");
-            db.database()
-                .insert("events")
-                .value("event_seq", seq_to_value(sequence))
-                .value("event_type", event_type)
-                .value("schema_version", DatabaseValue::Int32(32))
-                .value("created_at_ms", seq_to_value(sequence))
-                .value("payload", payload.to_string())
-                .execute(db.database())
-                .await
-                .expect("insert retired event");
-        }
-        db.database()
-            .delete("model_context_entries")
-            .execute(db.database())
-            .await
-            .expect("clear model context entries");
-        db.database()
-            .delete("model_context_projection_state")
-            .execute(db.database())
-            .await
-            .expect("clear model context state");
-
-        let canonical_tail = db
-            .last_event_sequence()
-            .await
-            .expect("canonical tail query")
-            .expect("canonical tail");
-        assert_eq!(canonical_tail, 2);
-        assert_eq!(
-            reindex_model_context_for_test(&db, temp_dir.path(), session_id).await,
-            3
-        );
-        assert_eq!(
-            db.model_context_projection_status()
-                .await
-                .expect("projection status"),
-            ModelContextProjectionStatus::Fresh {
-                checkpoint: canonical_tail,
-            }
-        );
-        assert!(
-            db.model_context_events()
-                .await
-                .expect("model context")
-                .is_empty()
-        );
-        let events = db.all_events_strict().await.expect("strict legacy history");
-        assert_eq!(history_sequences(&events), vec![0, 1, 2]);
-        assert!(matches!(
-            &events[1].kind,
-            SessionEventKind::LegacyEvent { event_type, .. }
-                if event_type == "interactive_tool_request_created"
-        ));
-        assert!(matches!(
-            &events[2].kind,
-            SessionEventKind::LegacyEvent { event_type, .. }
-                if event_type == "interactive_tool_request_resolved"
-        ));
-        assert!(
-            db.active_runtime_work()
-                .await
-                .expect("runtime work")
-                .is_empty()
-        );
-        assert!(db.active_tool_runs().await.expect("tool runs").is_empty());
     }
 
     #[tokio::test]
@@ -8485,110 +8222,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcript_window_tool_result_spans_raw_pty_stream_events() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let session_id = SessionId::new();
-        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
-            .await
-            .expect("open session db");
-
-        db.append_event(&event(
-            session_id,
-            0,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "shell-1".to_owned(),
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                tool_name: "shell.run".to_owned(),
-                arguments_json: r#"{"command":"printf hi"}"#.to_owned(),
-                working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
-            },
-        ))
-        .await
-        .expect("append request");
-        db.append_event(&event(
-            session_id,
-            1,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "shell-1".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(24),
-                    started_at_ms: Some(1),
-                },
-            },
-        ))
-        .await
-        .expect("append stream start");
-        db.append_event(&event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "shell-1".to_owned(),
-                    stream: bcode_session_models::ToolOutputStream::Pty,
-                    sequence: 1,
-                    text: "\u{1b}[31mhi\u{1b}[0m\n".to_owned(),
-                    byte_len: 12,
-                },
-            },
-        ))
-        .await
-        .expect("append pty output");
-        db.append_event(&event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Finished {
-                    tool_call_id: "shell-1".to_owned(),
-                    sequence: 2,
-                    is_error: false,
-                    finished_at_ms: Some(3),
-                },
-            },
-        ))
-        .await
-        .expect("append stream finish");
-        db.append_event(&event(
-            session_id,
-            4,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "shell-1".to_owned(),
-                result: "done".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
-            },
-        ))
-        .await
-        .expect("append tool finish");
-
-        let items = db
-            .transcript_items_for_latest_window(1, 1, usize::MAX)
-            .await
-            .expect("transcript window items");
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "result");
-        assert_eq!(items[0].event_seq_start, 0);
-        assert_eq!(items[0].event_seq_end, 4);
-        let events = db
-            .events_range(items[0].event_seq_start, items[0].event_seq_end, 10)
-            .await
-            .expect("events range");
-        assert!(events.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta { stream, .. }
-            } if *stream == bcode_session_models::ToolOutputStream::Pty
-        )));
-    }
-
-    #[tokio::test]
     async fn finalized_artifact_references_are_projected_for_bounded_lookup() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -8608,34 +8241,35 @@ mod tests {
         db.append_event(&event(
             session_id,
             1,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-1".to_owned(),
-                result: "done".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(ToolInvocationResult::Artifact {
-                    artifact: Box::new(bcode_session_models::ToolArtifact {
-                        artifact_id: "artifact-1".to_owned(),
-                        producer_plugin_id: "fixture.plugin".to_owned(),
-                        schema: "fixture.recording".to_owned(),
-                        schema_version: 3,
-                        tool_call_id: Some("call-1".to_owned()),
-                        title: None,
-                        metadata: serde_json::Value::Null,
-                        refs: vec![bcode_session_models::ToolArtifactRef {
-                            key: "recording".to_owned(),
-                            content_type: Some("application/octet-stream".to_owned()),
-                            storage_uri: Some("file:///tmp/recording".to_owned()),
-                            byte_len: Some(42),
-                            metadata: Some(serde_json::json!({
-                                "availability": "complete",
-                                "complete": true,
-                                "checksum_sha256": "abc123",
-                                "plugin_only": "must not be projected"
-                            })),
-                        }],
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "artifact-1".to_owned(),
+                            producer_plugin_id: "fixture.plugin".to_owned(),
+                            schema: "fixture.recording".to_owned(),
+                            schema_version: 3,
+                            tool_call_id: Some("call-1".to_owned()),
+                            title: None,
+                            metadata: serde_json::Value::Null,
+                            refs: vec![bcode_session_models::ToolArtifactRef {
+                                key: "recording".to_owned(),
+                                content_type: Some("application/octet-stream".to_owned()),
+                                storage_uri: Some("file:///tmp/recording".to_owned()),
+                                byte_len: Some(42),
+                                metadata: Some(serde_json::json!({
+                                    "availability": "complete",
+                                    "complete": true,
+                                    "checksum_sha256": "abc123",
+                                    "plugin_only": "must not be projected"
+                                })),
+                            }],
+                        }),
                     }),
-                }),
+                },
             },
         ))
         .await

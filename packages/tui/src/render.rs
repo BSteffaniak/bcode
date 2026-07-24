@@ -32,7 +32,6 @@ fn plugin_visual_context(
     })
 }
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
@@ -47,7 +46,7 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
-use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_policy};
+use super::app::{BmuxApp, DaemonConnectionState, composer_policy};
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::time_format::{format_millis, unix_time_millis};
 use super::tool_render_projection::{CanonicalPluginVisual, CanonicalToolVisual};
@@ -161,13 +160,6 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
 }
 
 impl FrameLayout {
-    /// Return the body area assigned to transcript projection and rendering.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn transcript_area(self) -> Rect {
-        self.body
-    }
-
     fn with_bottom_dock(self, app: &BmuxApp, requested_height: u16) -> (Self, Rect) {
         let full_body = self.body_without_latest_bar();
         let maximum_height = full_body.height.saturating_sub(1);
@@ -743,7 +735,6 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 
 pub fn transcript_item_rows(
     transcript: &[TranscriptItem],
-    live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
@@ -751,14 +742,7 @@ pub fn transcript_item_rows(
 ) -> Vec<Line> {
     DIFF_VIEWER_CONFIG.with(|config| config.set(diff_viewer_config));
     let mut rows = Vec::new();
-    push_transcript_item_rows(
-        &mut rows,
-        transcript,
-        live_tool_previews,
-        index,
-        width,
-        plugin_host,
-    );
+    push_transcript_item_rows(&mut rows, transcript, index, width, plugin_host);
     rows
 }
 
@@ -839,7 +823,6 @@ pub fn pending_submission_signature(
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
     transcript: &[TranscriptItem],
-    live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
@@ -859,31 +842,13 @@ fn push_transcript_item_rows(
             tool_call_id,
             producer_plugin_id: _,
             tool_name,
-            working_directory,
-            request_visual,
-            live_preview,
+            working_directory: _,
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
                 tool_name,
-                working_directory: working_directory.as_deref(),
-                request_visual: request_visual.as_ref(),
-                _live_preview: *live_preview,
-                plugin_host,
             };
             push_tool_request_rows(rows, item, &context, width);
-        }
-        TranscriptItemKind::LiveToolPreviewAnchor {
-            tool_call_id,
-            tool_name,
-        } => {
-            push_live_tool_preview_anchor_rows(
-                rows,
-                tool_name,
-                live_tool_previews.get(tool_call_id),
-                width,
-                plugin_host,
-            );
         }
         TranscriptItemKind::ToolResult {
             tool_call_id,
@@ -1070,10 +1035,6 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
 struct ToolRequestRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: &'a str,
-    working_directory: Option<&'a std::path::Path>,
-    request_visual: Option<&'a bcode_session_models::PluginVisualDescriptor>,
-    _live_preview: bool,
-    plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
 }
 
 fn push_tool_request_rows(
@@ -1082,39 +1043,6 @@ fn push_tool_request_rows(
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
-    if let Some(request_visual) = context.request_visual {
-        let visual = CanonicalToolVisual::from_plugin_descriptor(request_visual, false);
-        if canonical_plugin_visual_available(&visual, context.plugin_host) {
-            if let CanonicalToolVisual::Plugin(plugin_visual) = &visual
-                && canonical_plugin_visual_render_mode(plugin_visual, context.plugin_host)
-                    == Some(PluginTuiVisualRenderMode::TranscriptBlock)
-            {
-                push_plugin_transcript_block_rows(
-                    rows,
-                    PluginTranscriptBlockContext {
-                        title: request_visual.title.as_deref().unwrap_or(context.tool_name),
-                        visual: plugin_visual,
-                        working_directory: context.working_directory,
-                        plugin_host: context.plugin_host,
-                        streaming: item.streaming(),
-                        is_error: false,
-                        timing: item.tool_timing(),
-                    },
-                    width,
-                );
-                return;
-            }
-            push_canonical_tool_visual_rows(
-                rows,
-                &visual,
-                context.working_directory,
-                width,
-                context.plugin_host,
-            );
-            rows.push(Line::default());
-            return;
-        }
-    }
     let title = format!("Tool · {}", context.tool_name);
     let title_color = if item.streaming() {
         Color::Cyan
@@ -1147,45 +1075,6 @@ fn push_tool_request_rows(
             muted_style(),
         );
     }
-    rows.push(Line::default());
-}
-
-#[allow(clippy::too_many_lines)]
-fn push_live_tool_preview_anchor_rows(
-    rows: &mut Vec<Line>,
-    fallback_tool_name: &str,
-    state: Option<&LiveToolPreviewState>,
-    width: u16,
-    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
-) {
-    let Some(state) = state else {
-        push_wrapped_styled_text(
-            rows,
-            Vec::new(),
-            &format!("Tool call · {fallback_tool_name} · streaming preview"),
-            width,
-            Style::new().fg(Color::Cyan),
-            Style::new().fg(Color::Cyan),
-        );
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            "assembling arguments …",
-            width,
-            muted_style(),
-            muted_style(),
-        );
-        rows.push(Line::default());
-        return;
-    };
-    let visual = CanonicalToolVisual::from_live_preview(&state.tool_name, &state.preview);
-    push_canonical_tool_visual_rows(
-        rows,
-        &visual,
-        state.working_directory.as_deref(),
-        width,
-        plugin_host,
-    );
     rows.push(Line::default());
 }
 

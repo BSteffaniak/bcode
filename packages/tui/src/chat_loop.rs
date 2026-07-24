@@ -1801,7 +1801,7 @@ fn absorb_bcode_event(
                     event.kind,
                     SessionEventKind::RalphLifecycle { .. }
                         | SessionEventKind::PluginStatusNote { .. }
-                        | SessionEventKind::LegacyEvent { .. }
+                        | SessionEventKind::OpaqueEvent { .. }
                 ) {
                     loop_state.replace_effect(TuiEffect::LoadPluginStatus {
                         session_id: event.session_id,
@@ -1823,11 +1823,6 @@ fn absorb_bcode_event(
         }
         BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.session_id => {
             match &event.kind {
-                bcode_session_models::SessionLiveEventKind::ToolOutputDelta { event: stream } => {
-                    loop_state
-                        .artifact_stream
-                        .observe_live_event(event.session_id, stream);
-                }
                 bcode_session_models::SessionLiveEventKind::ToolContribution {
                     event: contribution,
                 } => loop_state
@@ -2217,56 +2212,6 @@ async fn handle_event<W: Write>(
             context
                 .terminal
                 .resize(Rect::new(0, 0, size.width, size.height));
-            if let Some(session_id) = chat.session_id {
-                let runtime = loop_state.plugin_runtime.get_or_insert_with(|| {
-                    super::plugin_tui::load_default_runtime_with_static_bundled(
-                        &bcode_bundled_plugins::static_bundled_plugins(),
-                    )
-                    .expect("load plugin runtime for visual inputs")
-                });
-                for (tool_call_id, visual) in chat.app.active_plugin_visuals() {
-                    let producer = visual.producer_plugin_id.as_deref();
-                    let Some(route) = runtime.visual_adapter(
-                        &visual.schema,
-                        visual.schema_version,
-                        "tui",
-                        producer,
-                    ) else {
-                        continue;
-                    };
-                    let Some(input) = chat
-                        .app
-                        .plugin_presentation()
-                        .and_then(|presentation| presentation.registry(&route.plugin_id))
-                        .and_then(|registry| {
-                            registry.visual_invocation_event_input(
-                                &tool_call_id,
-                                &route.schema,
-                                &visual.payload,
-                                &Event::Resize(size),
-                            )
-                        })
-                    else {
-                        continue;
-                    };
-                    if input.invocation_id != tool_call_id {
-                        tracing::warn!(
-                            expected = %tool_call_id,
-                            actual = %input.invocation_id,
-                            "visual adapter returned input for a different invocation"
-                        );
-                        continue;
-                    }
-                    if let Err(error) = context
-                        .services
-                        .client
-                        .send_invocation_input(session_id, input)
-                        .await
-                    {
-                        tracing::debug!(%error, "active plugin invocation did not accept visual input");
-                    }
-                }
-            }
             Ok(true)
         }
         Event::Mouse(mouse)
@@ -2836,6 +2781,8 @@ mod scheduler_tests {
             title: Some("Question".to_owned()),
             required: true,
             snapshot: Some(serde_json::json!({"questions": []})),
+            state: bcode_session_view_models::InteractionViewState::Pending,
+            status_detail: None,
             resolved: false,
             resolution: None,
         }

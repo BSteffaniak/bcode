@@ -1,24 +1,14 @@
 use bcode_agent_profile::{
-    ToolPolicyAuthorizationMetadata, ToolPolicyOperation, prepare_tool_policy,
-    tool_policy_authorization_metadata,
+    ToolPolicyAuthorizationMetadata, ToolPolicyIdentity, ToolPolicyOperation,
+    ToolPolicyPreparation, prepare_tool_policy, tool_policy_authorization_metadata,
 };
-use bcode_tool::{
-    ToolDefinition, ToolInvocationDescriptor, ToolPolicyMetadata, ToolPreparationRequest,
-    ToolUiMetadata,
-};
+use bcode_tool::{ToolDefinition, ToolInvocationDescriptor, ToolPreparationRequest};
 
 fn definition(name: &str) -> ToolDefinition {
     ToolDefinition {
         name: name.to_string(),
         description: "policy preparation test".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: true,
-        policy: ToolPolicyMetadata {
-            aliases: vec!["owner-alias".to_string()],
-            permission_category: Some("edit".to_string()),
-            ..ToolPolicyMetadata::default()
-        },
-        ui: ToolUiMetadata::default(),
     }
 }
 
@@ -38,8 +28,17 @@ fn metadata(
     definition: &ToolDefinition,
     operation: ToolPolicyOperation,
 ) -> ToolPolicyAuthorizationMetadata {
-    let prepared = prepare_tool_policy(request, definition, operation)
-        .expect("owner policy operation should encode");
+    let prepared = prepare_tool_policy(
+        request,
+        definition,
+        ToolPolicyPreparation::new(true, operation).with_identity(ToolPolicyIdentity {
+            aliases: vec!["prepared-alias".to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: vec!["prepared-capability".to_string()],
+            permission_category: Some("prepared-category".to_string()),
+        }),
+    )
+    .expect("owner policy operation should encode");
     tool_policy_authorization_metadata(&prepared.authorization, &definition.name)
         .expect("owner policy fact should decode")
 }
@@ -73,8 +72,12 @@ fn preparation_preserves_owner_computed_operations_and_resources() {
         );
         assert_eq!(actual.operation, operation);
         assert!(actual.requires_permission);
-        assert_eq!(actual.aliases, vec!["owner-alias"]);
-        assert_eq!(actual.permission_category.as_deref(), Some("edit"));
+        assert_eq!(actual.aliases, vec!["prepared-alias"]);
+        assert_eq!(actual.capabilities, vec!["prepared-capability"]);
+        assert_eq!(
+            actual.permission_category.as_deref(),
+            Some("prepared-category")
+        );
     }
 }
 
@@ -97,7 +100,7 @@ fn preparation_rejects_mismatched_tool_identity() {
     let error = prepare_tool_policy(
         &request("other.tool", serde_json::Value::Null),
         &definition("owner.tool"),
-        ToolPolicyOperation::ReadOnly,
+        bcode_agent_profile::ToolPolicyPreparation::read_only(),
     )
     .expect_err("mismatched tool identity must fail");
     assert!(error.contains("tool not found"));

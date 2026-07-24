@@ -111,8 +111,8 @@ fn worktree_command(id: &str, title: &str, description: &str) -> CommandContribu
 fn worktree_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
-    Ok(match definition.name.as_str() {
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let operation = match definition.name.as_str() {
         "worktree.list" => bcode_plugin_sdk::ToolPolicyOperation::ReadOnly,
         "worktree.create" => bcode_plugin_sdk::ToolPolicyOperation::Mutating,
         "worktree.remove" => {
@@ -130,7 +130,22 @@ fn worktree_policy_operation(
             }
         }
         name => return Err(format!("unsupported worktree policy operation: {name}")),
-    })
+    };
+    let category = match definition.name.as_str() {
+        "worktree.list" => "worktree.read",
+        "worktree.create" => "worktree.create",
+        "worktree.remove" => "worktree.remove",
+        name => return Err(format!("unsupported worktree policy operation: {name}")),
+    };
+    Ok(
+        bcode_plugin_sdk::ToolPolicyPreparation::new(definition.name != "worktree.list", operation)
+            .with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
+                aliases: vec![category.to_string()],
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
+                permission_category: Some(category.to_string()),
+            }),
+    )
 }
 
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -332,13 +347,6 @@ fn invoke_remove(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
     }
 }
 
-fn tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
-    bcode_tool::ToolUiMetadata {
-        activity_label: Some(activity_label.to_string()),
-        request_visual: None,
-    }
-}
-
 fn worktree_request_contribution(
     invocation_id: &str,
     operation: &str,
@@ -386,14 +394,6 @@ fn list_definition() -> ToolDefinition {
                 "cwd": { "type": "string", "description": "Optional repository discovery directory" }
             }
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata {
-            aliases: vec!["worktree.read".to_string()],
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some("worktree.read".to_string()),
-        },
-        ui: tool_ui("listing worktrees"),
     }
 }
 
@@ -416,14 +416,6 @@ fn create_definition() -> ToolDefinition {
                 "no_setup": { "type": "boolean" }
             }
         }),
-        requires_permission: true,
-        policy: bcode_tool::ToolPolicyMetadata {
-            aliases: vec!["worktree.create".to_string()],
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some("worktree.create".to_string()),
-        },
-        ui: tool_ui("creating worktree"),
     }
 }
 
@@ -440,14 +432,6 @@ fn remove_definition() -> ToolDefinition {
                 "force": { "type": "boolean" }
             }
         }),
-        requires_permission: true,
-        policy: bcode_tool::ToolPolicyMetadata {
-            aliases: vec!["worktree.remove".to_string()],
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some("worktree.remove".to_string()),
-        },
-        ui: tool_ui("removing worktree"),
     }
 }
 
@@ -1014,9 +998,6 @@ mod tests {
 
     #[test]
     fn worktree_requests_use_durable_generic_contributions_without_legacy_visuals() {
-        for definition in [list_definition(), create_definition(), remove_definition()] {
-            assert!(definition.ui.request_visual.is_none());
-        }
         let arguments = serde_json::json!({"name": "feature", "base_ref": "head"});
         let contribution = worktree_request_contribution("call-1", "worktree.create", &arguments);
         assert_eq!(contribution.invocation_id, "call-1");
@@ -1028,6 +1009,34 @@ mod tests {
         );
         assert_eq!(contribution.payload["operation"], "worktree.create");
         assert_eq!(contribution.payload["name"], "feature");
+    }
+
+    #[test]
+    fn worktree_owner_prepares_mixed_permission_policy() {
+        for (definition, arguments, expected_permission) in [
+            (list_definition(), serde_json::Value::Null, false),
+            (
+                create_definition(),
+                serde_json::json!({"name": "feature"}),
+                true,
+            ),
+            (
+                remove_definition(),
+                serde_json::json!({"path": "/tmp/worktree"}),
+                true,
+            ),
+        ] {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "call".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments,
+                },
+                host_context: Vec::new(),
+            };
+            let policy = worktree_policy_operation(&request, &definition).expect("worktree policy");
+            assert_eq!(policy.requires_permission, expected_permission);
+        }
     }
 
     #[test]

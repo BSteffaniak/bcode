@@ -44,7 +44,10 @@ use tracing::Instrument as _;
 
 pub use bcode_agent_permissions::{AgentPermissionPolicy, allow_all_agent_policy};
 pub use bcode_agent_policy::{Action, AgentConfig, AgentPermissionConfig, PermissionConfig};
-pub use bcode_agent_profile::{AgentDecision, EvaluateToolCallResponse, ToolPolicyOperation};
+pub use bcode_agent_profile::{
+    AgentDecision, EvaluateToolCallResponse, ToolPolicyIdentity, ToolPolicyOperation,
+    ToolPolicyPreparation,
+};
 #[cfg(feature = "testing")]
 pub mod testing;
 pub use bcode_agent_runtime::{
@@ -100,8 +103,8 @@ pub use bcode_tool::{
     ToolExchangeResponsePolicy, ToolExecutionOptions, ToolInvocationDescriptor,
     ToolInvocationInput, ToolInvocationInputResolution, ToolInvocationLifecycleEvent,
     ToolInvocationLifecycleStage, ToolInvocationResponse, ToolInvocationResult,
-    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolList, ToolPolicyMetadata,
-    ToolPreparationRequest, ToolPreparationResponse, ToolUiMetadata,
+    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolList,
+    ToolPreparationRequest, ToolPreparationResponse,
 };
 
 /// Result alias for Bcode SDK operations.
@@ -506,7 +509,7 @@ impl<S> TypedToolContext<S> {
 #[derive(Debug, Clone)]
 pub struct TypedTool<I, O> {
     definition: ToolDefinition,
-    policy_operation: ToolPolicyOperation,
+    policy_preparation: ToolPolicyPreparation,
     _types: std::marker::PhantomData<fn(I) -> O>,
 }
 
@@ -527,11 +530,8 @@ where
                 description: description.into(),
                 input_schema: serde_json::to_value(schemars::schema_for!(I))
                     .expect("schemars tool input schema should serialize to JSON"),
-                requires_permission: false,
-                policy: ToolPolicyMetadata::default(),
-                ui: ToolUiMetadata::default(),
             },
-            policy_operation: ToolPolicyOperation::ReadOnly,
+            policy_preparation: ToolPolicyPreparation::read_only(),
             _types: std::marker::PhantomData,
         }
     }
@@ -539,28 +539,21 @@ where
     /// Configure the owner-produced policy operation for preparation.
     #[must_use]
     pub fn policy_operation(mut self, operation: ToolPolicyOperation) -> Self {
-        self.policy_operation = operation;
+        self.policy_preparation.operation = operation;
         self
     }
 
     /// Configure whether the tool requires permission before execution.
     #[must_use]
     pub const fn requires_permission(mut self, requires_permission: bool) -> Self {
-        self.definition.requires_permission = requires_permission;
+        self.policy_preparation.requires_permission = requires_permission;
         self
     }
 
-    /// Configure plugin-compatible policy metadata for this inline tool.
+    /// Configure owner-produced policy identity for this inline tool.
     #[must_use]
-    pub fn policy(mut self, policy: ToolPolicyMetadata) -> Self {
-        self.definition.policy = policy;
-        self
-    }
-
-    /// Configure renderer-neutral UI metadata for this inline tool.
-    #[must_use]
-    pub fn ui(mut self, ui: ToolUiMetadata) -> Self {
-        self.definition.ui = ui;
+    pub fn policy(mut self, identity: ToolPolicyIdentity) -> Self {
+        self.policy_preparation.identity = identity;
         self
     }
 
@@ -2839,9 +2832,9 @@ type InlineToolFuture = std::pin::Pin<
 >;
 type InlineToolHandler =
     Arc<dyn Fn(ToolInvocationDescriptor, InvocationScope) -> InlineToolFuture + Send + Sync>;
-type InlineToolPolicyOperationFn =
-    dyn Fn(&ToolPreparationRequest) -> ToolPolicyOperation + Send + Sync;
-type InlineToolPolicyOperation = Arc<InlineToolPolicyOperationFn>;
+type InlineToolPolicyPreparationFn =
+    dyn Fn(&ToolPreparationRequest) -> ToolPolicyPreparation + Send + Sync;
+type InlineToolPolicyPreparation = Arc<InlineToolPolicyPreparationFn>;
 type ProviderFactory = Arc<dyn Fn() -> Box<dyn ModelProviderInvoker> + Send + Sync>;
 
 #[derive(Debug, Default)]
@@ -3399,7 +3392,7 @@ pub enum ToolFailurePolicy {
 #[derive(Clone)]
 struct SdkToolInvoker {
     handlers: BTreeMap<String, InlineToolHandler>,
-    policy_operations: BTreeMap<String, InlineToolPolicyOperation>,
+    policy_preparations: BTreeMap<String, InlineToolPolicyPreparation>,
     failure_policy: ToolFailurePolicy,
     #[cfg(feature = "embedded-plugins")]
     session_id: SessionId,
@@ -3412,8 +3405,8 @@ impl fmt::Debug for SdkToolInvoker {
         let mut debug = formatter.debug_struct("SdkToolInvoker");
         debug.field("tools", &self.handlers.keys().collect::<Vec<_>>());
         debug.field(
-            "policy_operations",
-            &self.policy_operations.keys().collect::<Vec<_>>(),
+            "policy_preparations",
+            &self.policy_preparations.keys().collect::<Vec<_>>(),
         );
         debug.field("failure_policy", &self.failure_policy);
         #[cfg(feature = "embedded-plugins")]
@@ -3434,17 +3427,17 @@ impl ToolInvoker for SdkToolInvoker {
         match &tool.source {
             ToolSource::Inline => {
                 let result = self
-                    .policy_operations
+                    .policy_preparations
                     .get(&tool.definition.name)
                     .ok_or_else(|| RuntimeError::ToolPreparation {
                         tool_name: request.invocation.tool_name.clone(),
-                        message: "inline tool policy operation not registered".to_owned(),
+                        message: "inline tool policy preparation not registered".to_owned(),
                     })
-                    .and_then(|prepare_operation| {
+                    .and_then(|prepare_policy| {
                         bcode_agent_profile::prepare_tool_policy(
                             request,
                             &tool.definition,
-                            prepare_operation(request),
+                            prepare_policy(request),
                         )
                         .map_err(|message| RuntimeError::ToolPreparation {
                             tool_name: request.invocation.tool_name.clone(),
@@ -6132,7 +6125,7 @@ pub struct Agent {
     cache_routing_identity: Option<String>,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
-    inline_tool_policy_operations: BTreeMap<String, InlineToolPolicyOperation>,
+    inline_tool_policy_preparations: BTreeMap<String, InlineToolPolicyPreparation>,
     hooks: AgentHooks,
     middleware: ModelMiddlewareStack,
     response_cache: Option<Arc<dyn ModelResponseCache>>,
@@ -6192,9 +6185,9 @@ impl fmt::Debug for Agent {
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
             )
             .field(
-                "inline_tool_policy_operations",
+                "inline_tool_policy_preparations",
                 &self
-                    .inline_tool_policy_operations
+                    .inline_tool_policy_preparations
                     .keys()
                     .collect::<Vec<_>>(),
             )
@@ -6839,7 +6832,7 @@ impl Agent {
         let invoker: Arc<dyn ToolInvoker> = self.tool_invoker.clone().unwrap_or_else(|| {
             Arc::new(SdkToolInvoker {
                 handlers: self.inline_tool_handlers.clone(),
-                policy_operations: self.inline_tool_policy_operations.clone(),
+                policy_preparations: self.inline_tool_policy_preparations.clone(),
                 failure_policy: self.tool_failure_policy,
                 #[cfg(feature = "embedded-plugins")]
                 session_id: self.session_id,
@@ -6921,7 +6914,7 @@ impl Agent {
     ) -> Result<ToolBatchExecutionOutput> {
         let default_invoker = SdkToolInvoker {
             handlers: self.inline_tool_handlers.clone(),
-            policy_operations: self.inline_tool_policy_operations.clone(),
+            policy_preparations: self.inline_tool_policy_preparations.clone(),
             failure_policy: self.tool_failure_policy,
             #[cfg(feature = "embedded-plugins")]
             session_id: self.session_id,
@@ -7074,7 +7067,7 @@ impl Agent {
         }
         let default_invoker = SdkToolInvoker {
             handlers: self.inline_tool_handlers.clone(),
-            policy_operations: self.inline_tool_policy_operations.clone(),
+            policy_preparations: self.inline_tool_policy_preparations.clone(),
             failure_policy: self.tool_failure_policy,
             #[cfg(feature = "embedded-plugins")]
             session_id: self.session_id,
@@ -7147,7 +7140,26 @@ impl Agent {
                     .is_none_or(|tools| tools.contains(&definition.name))
             })
             .filter(|definition| {
-                !self.read_only_tools || definition.side_effect == ToolSideEffect::ReadOnly
+                !self.read_only_tools
+                    || self
+                        .inline_tool_policy_preparations
+                        .get(&definition.name)
+                        .is_some_and(|prepare| {
+                            let request = ToolPreparationRequest {
+                                invocation: ToolInvocationDescriptor {
+                                    invocation_id: String::new(),
+                                    tool_name: definition.name.clone(),
+                                    arguments: serde_json::Value::Null,
+                                },
+                                host_context: Vec::new(),
+                            };
+                            matches!(
+                                prepare(&request).operation,
+                                ToolPolicyOperation::Web { .. }
+                                    | ToolPolicyOperation::Read { .. }
+                                    | ToolPolicyOperation::ReadOnly
+                            )
+                        })
             })
             .collect()
     }
@@ -7347,7 +7359,7 @@ pub struct AgentBuilder {
     cache_routing_identity: Option<String>,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
-    inline_tool_policy_operations: BTreeMap<String, InlineToolPolicyOperation>,
+    inline_tool_policy_preparations: BTreeMap<String, InlineToolPolicyPreparation>,
     hooks: AgentHooks,
     middleware: ModelMiddlewareStack,
     response_cache: Option<Arc<dyn ModelResponseCache>>,
@@ -7410,9 +7422,9 @@ impl fmt::Debug for AgentBuilder {
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
             )
             .field(
-                "inline_tool_policy_operations",
+                "inline_tool_policy_preparations",
                 &self
-                    .inline_tool_policy_operations
+                    .inline_tool_policy_preparations
                     .keys()
                     .collect::<Vec<_>>(),
             )
@@ -7478,7 +7490,7 @@ impl Default for AgentBuilder {
             cache_routing_identity: Some("direct".to_string()),
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
-            inline_tool_policy_operations: BTreeMap::new(),
+            inline_tool_policy_preparations: BTreeMap::new(),
             hooks: AgentHooks::new(),
             middleware: ModelMiddlewareStack::new(),
             response_cache: None,
@@ -7840,7 +7852,7 @@ impl AgentBuilder {
         F: Fn(I) -> std::result::Result<O, String> + Send + Sync + 'static,
     {
         let schema = tool.definition.input_schema.clone();
-        self.inline_tool_with_policy(tool.definition, tool.policy_operation, move |request| {
+        self.inline_tool_with_policy(tool.definition, tool.policy_preparation, move |request| {
             validate_typed_tool_input(&schema, &request.arguments)?;
             let input = serde_json::from_value(request.arguments)
                 .map_err(|error| format!("invalid typed tool arguments: {error}"))?;
@@ -7893,7 +7905,7 @@ impl AgentBuilder {
         let handler = Arc::new(handler);
         self.scoped_inline_tool_with_policy(
             tool.definition,
-            tool.policy_operation,
+            tool.policy_preparation,
             move |request, scope| {
                 let state = Arc::clone(&state);
                 let handler = Arc::clone(&handler);
@@ -7921,10 +7933,10 @@ impl AgentBuilder {
             + Sync
             + 'static,
     {
-        self.inline_tool_with_policy(definition, ToolPolicyOperation::ReadOnly, handler)
+        self.inline_tool_with_policy(definition, ToolPolicyPreparation::read_only(), handler)
     }
 
-    /// Register an inline SDK tool with an owner-produced policy operation.
+    /// Register an inline SDK tool with owner-produced policy preparation.
     ///
     /// The supplied definition is exposed to providers as a normal [`ToolDefinition`], while the
     /// handler executes in-process when the runtime routes a matching tool call.
@@ -7932,7 +7944,7 @@ impl AgentBuilder {
     pub fn inline_tool_with_policy<F>(
         mut self,
         definition: ToolDefinition,
-        operation: ToolPolicyOperation,
+        preparation: ToolPolicyPreparation,
         handler: F,
     ) -> Self
     where
@@ -7943,8 +7955,8 @@ impl AgentBuilder {
     {
         let name = definition.name.clone();
         self.tool_catalog.insert(RegisteredTool::inline(definition));
-        self.inline_tool_policy_operations
-            .insert(name.clone(), Arc::new(move |_request| operation.clone()));
+        self.inline_tool_policy_preparations
+            .insert(name.clone(), Arc::new(move |_request| preparation.clone()));
         self.inline_tool_handlers.insert(
             name,
             Arc::new(move |request, _scope| {
@@ -7964,15 +7976,15 @@ impl AgentBuilder {
             + Send
             + 'static,
     {
-        self.scoped_inline_tool_with_policy(definition, ToolPolicyOperation::ReadOnly, handler)
+        self.scoped_inline_tool_with_policy(definition, ToolPolicyPreparation::read_only(), handler)
     }
 
-    /// Register an asynchronous inline SDK tool with an owner-produced policy operation.
+    /// Register an asynchronous inline SDK tool with owner-produced policy preparation.
     #[must_use]
     pub fn scoped_inline_tool_with_policy<F, Fut>(
         mut self,
         definition: ToolDefinition,
-        operation: ToolPolicyOperation,
+        preparation: ToolPolicyPreparation,
         handler: F,
     ) -> Self
     where
@@ -7983,8 +7995,8 @@ impl AgentBuilder {
     {
         let name = definition.name.clone();
         self.tool_catalog.insert(RegisteredTool::inline(definition));
-        self.inline_tool_policy_operations
-            .insert(name.clone(), Arc::new(move |_request| operation.clone()));
+        self.inline_tool_policy_preparations
+            .insert(name.clone(), Arc::new(move |_request| preparation.clone()));
         self.inline_tool_handlers.insert(
             name,
             Arc::new(move |request, scope| Box::pin(handler(request, scope))),
@@ -8281,7 +8293,7 @@ impl AgentBuilder {
             cache_routing_identity: self.cache_routing_identity,
             tool_catalog: self.tool_catalog,
             inline_tool_handlers: self.inline_tool_handlers,
-            inline_tool_policy_operations: self.inline_tool_policy_operations,
+            inline_tool_policy_preparations: self.inline_tool_policy_preparations,
             hooks: self.hooks,
             middleware: self.middleware,
             response_cache: self.response_cache,

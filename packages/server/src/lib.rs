@@ -78,11 +78,11 @@ use bcode_session::{
 };
 use bcode_session_models::ExecutionSessionProvenance;
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveToolArgumentPreview, ModelTurnOutcome,
-    PluginVisualDescriptor, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkKind,
-    RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolContributionEvent,
-    ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, TraceRedaction, WorkId,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
+    ProviderToolCallProgress, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId,
+    SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
+    SessionTracePhase, ToolContributionEvent, ToolInvocationResult, TraceBlobRef, TraceRedaction,
+    WorkId,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -1018,7 +1018,6 @@ impl WorkflowPermissionResolver<'_> {
             producer_plugin_id: None,
             tool_name: "workflow.elevate".to_string(),
             arguments_json,
-            legacy_request_presentation: None,
             batch: None,
             policy_source: Some("workflow_policy".to_string()),
             policy_reason: pending.summary.policy_reason.clone(),
@@ -5716,27 +5715,7 @@ struct ActiveArtifactReference {
     revision: u64,
     finalized: bool,
     abandoned: bool,
-    contribution_snapshot: Option<bcode_session_models::ToolContributionEnvelope>,
-}
-
-impl ActiveArtifactReference {
-    fn stream_event(&self, key: &ActiveArtifactKey) -> ToolInvocationStreamEvent {
-        ToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id: key.tool_call_id.clone(),
-            sequence: 0,
-            artifact_id: key.artifact_id.clone(),
-            reference_key: key.reference_key.clone(),
-            producer_plugin_id: self.producer_plugin_id.clone(),
-            schema: self.schema.clone(),
-            schema_version: self.schema_version,
-            content_type: self.content_type.clone(),
-            storage_uri: String::new(),
-            committed_bytes: self.committed_bytes,
-            revision: self.revision,
-            availability: self.abandoned.then(|| "incomplete".to_owned()),
-            finalized: self.finalized,
-        }
-    }
+    contribution_snapshot: bcode_session_models::ToolContributionEnvelope,
 }
 
 const ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY: usize = 64;
@@ -5796,6 +5775,20 @@ impl Drop for ActivePluginInvocationRegistration {
             {
                 artifact.abandoned = true;
                 artifact.revision = artifact.revision.saturating_add(1);
+                artifact.contribution_snapshot.contribution.sequence = artifact
+                    .contribution_snapshot
+                    .contribution
+                    .sequence
+                    .saturating_add(1);
+                if let Some(snapshot) = artifact
+                    .contribution_snapshot
+                    .contribution
+                    .artifact
+                    .as_mut()
+                {
+                    snapshot.revision = artifact.revision;
+                    snapshot.availability = Some("incomplete".to_owned());
+                }
             }
         }
     }
@@ -10223,9 +10216,6 @@ struct ToolArgumentStreamProgress {
     last_emitted_at: Option<Instant>,
     emitted_progress_events: usize,
     force_emit_final: bool,
-    preview_fields: StreamingJsonStringFields,
-    preview_metadata: Option<bcode_tool::ToolPluginVisualMetadata>,
-    last_emitted_preview: Option<LiveToolArgumentPreview>,
 }
 
 #[derive(Debug, Default)]
@@ -10336,14 +10326,8 @@ impl ModelStreamProgress {
     const TOOL_PROGRESS_MIN_BYTES: usize = 1024;
     const TOOL_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_TOOL_PROGRESS_EVENTS: usize = 512;
-    const TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS: usize = 32 * 1024;
 
-    fn start_tool_call(
-        &mut self,
-        call_id: String,
-        name: String,
-        preview_metadata: Option<bcode_tool::ToolPluginVisualMetadata>,
-    ) {
+    fn start_tool_call(&mut self, call_id: String, name: String) {
         self.active_tool_call = Some(ToolArgumentStreamProgress {
             call_id,
             name,
@@ -10352,9 +10336,6 @@ impl ModelStreamProgress {
             last_emitted_at: None,
             emitted_progress_events: 0,
             force_emit_final: false,
-            preview_fields: StreamingJsonStringFields::default(),
-            preview_metadata,
-            last_emitted_preview: None,
         });
     }
 
@@ -10364,12 +10345,11 @@ impl ModelStreamProgress {
             .as_ref()
             .is_none_or(|active| active.call_id != call.id)
         {
-            self.start_tool_call(call.id.clone(), call.name.clone(), None);
+            self.start_tool_call(call.id.clone(), call.name.clone());
         }
         if let Some(active) = self.active_tool_call.as_mut() {
             active.argument_bytes = serialized_tool_argument_len(&call.arguments);
             active.force_emit_final = true;
-            active.preview_fields = StreamingJsonStringFields::from_json_value(&call.arguments);
         }
     }
 
@@ -10388,7 +10368,6 @@ impl ModelStreamProgress {
             && active.call_id == call_id
         {
             active.argument_bytes = active.argument_bytes.saturating_add(delta.len());
-            active.preview_fields.push(delta);
         }
     }
 
@@ -10429,23 +10408,6 @@ impl ModelStreamProgress {
         })
     }
 
-    fn take_tool_argument_preview(&mut self) -> Option<LiveToolArgumentPreview> {
-        let active = self.active_tool_call.as_mut()?;
-        let preview = live_tool_argument_preview_from_fields(
-            active.preview_metadata.as_ref()?,
-            &active.preview_fields,
-        )?;
-        if active
-            .last_emitted_preview
-            .as_ref()
-            .is_some_and(|last| last == &preview)
-        {
-            return None;
-        }
-        active.last_emitted_preview = Some(preview.clone());
-        Some(preview)
-    }
-
     fn tool_progress_snapshot(&self) -> Option<ProviderToolCallProgress> {
         let active = self.active_tool_call.as_ref()?;
         Some(ProviderToolCallProgress {
@@ -10458,363 +10420,6 @@ impl ModelStreamProgress {
 
 fn serialized_tool_argument_len(arguments: &serde_json::Value) -> usize {
     serde_json::to_vec(arguments).map_or(0, |encoded| encoded.len())
-}
-
-fn live_tool_argument_preview_from_fields(
-    metadata: &bcode_tool::ToolPluginVisualMetadata,
-    fields: &StreamingJsonStringFields,
-) -> Option<LiveToolArgumentPreview> {
-    let payload = resolve_visual_payload(fields, &metadata.payload)?;
-    Some(LiveToolArgumentPreview {
-        visual: PluginVisualDescriptor {
-            visual_id: None,
-            producer_plugin_id: metadata.producer_plugin_id.clone(),
-            schema: metadata.schema.clone(),
-            schema_version: metadata.schema_version,
-            title: metadata.title.clone(),
-            subtitle: metadata.subtitle.clone(),
-            payload,
-        },
-        streaming_status: metadata
-            .subtitle
-            .as_ref()
-            .map(|template| render_live_status_template(template, fields)),
-        argument_bytes: fields.input_bytes,
-    })
-}
-
-fn resolve_visual_payload(
-    fields: &StreamingJsonStringFields,
-    selectors: &BTreeMap<String, bcode_tool::ToolVisualPayloadSelector>,
-) -> Option<serde_json::Value> {
-    let mut payload = serde_json::Map::new();
-    for (key, selector) in selectors {
-        if let Some(value) = resolve_payload_selector(fields, selector) {
-            payload.insert(key.clone(), value);
-        } else if selector.required {
-            return None;
-        }
-    }
-    Some(serde_json::Value::Object(payload))
-}
-
-fn resolve_payload_selector(
-    fields: &StreamingJsonStringFields,
-    selector: &bcode_tool::ToolVisualPayloadSelector,
-) -> Option<serde_json::Value> {
-    fields
-        .field(
-            &selector
-                .fields
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        )
-        .map(|field| serde_json::Value::String(field.value))
-        .or_else(|| selector.literal.clone())
-}
-
-fn render_live_status_template(template: &str, fields: &StreamingJsonStringFields) -> String {
-    let mut rendered = template.replace("{bytes}", &fields.input_bytes.to_string());
-    for (name, field) in &fields.fields {
-        rendered = rendered.replace(&format!("{{{name}}}"), &field.value);
-    }
-    clean_unresolved_status_placeholders(&rendered)
-}
-
-fn clean_unresolved_status_placeholders(value: &str) -> String {
-    let mut cleaned = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '{' {
-            let mut placeholder = String::new();
-            let mut closed = false;
-            for next in chars.by_ref() {
-                if next == '}' {
-                    closed = true;
-                    break;
-                }
-                placeholder.push(next);
-            }
-            if closed && !placeholder.is_empty() {
-                continue;
-            }
-            cleaned.push('{');
-            cleaned.push_str(&placeholder);
-            if closed {
-                cleaned.push('}');
-            }
-        } else {
-            cleaned.push(ch);
-        }
-    }
-    cleaned
-        .split('·')
-        .map(|segment| segment.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-#[derive(Debug, Clone)]
-struct PartialJsonStringField {
-    value: String,
-    truncated: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct StreamingJsonStringFields {
-    input_bytes: usize,
-    fields: BTreeMap<String, PartialJsonStringField>,
-    parser: StreamingJsonStringFieldParser,
-}
-
-impl StreamingJsonStringFields {
-    const FIELD_VALUE_MAX_CHARS: usize = ModelStreamProgress::TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS;
-
-    fn from_json_value(value: &serde_json::Value) -> Self {
-        let mut fields = Self {
-            input_bytes: serialized_tool_argument_len(value),
-            ..Self::default()
-        };
-        if let serde_json::Value::Object(object) = value {
-            for (key, value) in object {
-                if let Some(value) = value.as_str() {
-                    fields.insert_field(key, value, false);
-                }
-            }
-        }
-        fields
-    }
-
-    fn push(&mut self, delta: &str) {
-        self.input_bytes = self.input_bytes.saturating_add(delta.len());
-        let updates = self.parser.push(delta);
-        for update in updates {
-            self.fields.insert(update.name, update.field);
-        }
-    }
-
-    fn field(&self, names: &[&str]) -> Option<PartialJsonStringField> {
-        names
-            .iter()
-            .find_map(|name| self.fields.get(*name).cloned())
-    }
-
-    fn insert_field(&mut self, name: &str, value: &str, truncated: bool) {
-        let mut field = decode_partial_json_string_from_value(value, Self::FIELD_VALUE_MAX_CHARS);
-        field.truncated |= truncated;
-        self.fields.insert(name.to_owned(), field);
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct StreamingJsonStringFieldParser {
-    state: JsonFieldParserState,
-    key: String,
-    value: String,
-    value_chars: usize,
-    value_truncated: bool,
-    escape: JsonStringEscapeState,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum JsonFieldParserState {
-    #[default]
-    SeekingKey,
-    InKey,
-    AfterKey,
-    BeforeValue,
-    InStringValue,
-    SkippingValue,
-}
-
-#[derive(Debug, Clone, Default)]
-enum JsonStringEscapeState {
-    #[default]
-    None,
-    Escape,
-    Unicode {
-        digits: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct StreamingJsonStringFieldUpdate {
-    name: String,
-    field: PartialJsonStringField,
-}
-
-impl StreamingJsonStringFieldParser {
-    fn push(&mut self, input: &str) -> Vec<StreamingJsonStringFieldUpdate> {
-        let mut updates = Vec::new();
-        for ch in input.chars() {
-            self.push_char(ch, &mut updates);
-        }
-        if matches!(self.state, JsonFieldParserState::InStringValue) {
-            updates.push(self.current_update(true));
-        }
-        updates
-    }
-
-    fn push_char(&mut self, ch: char, updates: &mut Vec<StreamingJsonStringFieldUpdate>) {
-        match self.state {
-            JsonFieldParserState::SeekingKey => {
-                if ch == '"' {
-                    self.key.clear();
-                    self.escape = JsonStringEscapeState::None;
-                    self.state = JsonFieldParserState::InKey;
-                }
-            }
-            JsonFieldParserState::InKey => match self.decode_string_char(ch) {
-                JsonStringChar::Char(decoded) => self.key.push(decoded),
-                JsonStringChar::End => self.state = JsonFieldParserState::AfterKey,
-                JsonStringChar::Pending => {}
-            },
-            JsonFieldParserState::AfterKey => {
-                if ch == ':' {
-                    self.state = JsonFieldParserState::BeforeValue;
-                } else if !ch.is_whitespace() {
-                    self.state = JsonFieldParserState::SeekingKey;
-                }
-            }
-            JsonFieldParserState::BeforeValue => {
-                if ch == '"' {
-                    self.value.clear();
-                    self.value_chars = 0;
-                    self.value_truncated = false;
-                    self.escape = JsonStringEscapeState::None;
-                    self.state = JsonFieldParserState::InStringValue;
-                } else if !ch.is_whitespace() {
-                    self.state = JsonFieldParserState::SkippingValue;
-                }
-            }
-            JsonFieldParserState::InStringValue => match self.decode_string_char(ch) {
-                JsonStringChar::Char(decoded) => self.push_value_char(decoded),
-                JsonStringChar::End => {
-                    updates.push(self.current_update(false));
-                    self.state = JsonFieldParserState::SeekingKey;
-                }
-                JsonStringChar::Pending => {}
-            },
-            JsonFieldParserState::SkippingValue => {
-                if ch == ',' || ch == '}' {
-                    self.state = JsonFieldParserState::SeekingKey;
-                }
-            }
-        }
-    }
-
-    fn push_value_char(&mut self, ch: char) {
-        if self.value_chars < StreamingJsonStringFields::FIELD_VALUE_MAX_CHARS {
-            self.value.push(ch);
-            self.value_chars = self.value_chars.saturating_add(1);
-        } else {
-            self.value_truncated = true;
-        }
-    }
-
-    fn current_update(&self, partial: bool) -> StreamingJsonStringFieldUpdate {
-        StreamingJsonStringFieldUpdate {
-            name: self.key.clone(),
-            field: PartialJsonStringField {
-                value: self.value.clone(),
-                truncated: self.value_truncated || partial,
-            },
-        }
-    }
-
-    fn decode_string_char(&mut self, ch: char) -> JsonStringChar {
-        match &mut self.escape {
-            JsonStringEscapeState::None => match ch {
-                '"' => JsonStringChar::End,
-                '\\' => {
-                    self.escape = JsonStringEscapeState::Escape;
-                    JsonStringChar::Pending
-                }
-                other => JsonStringChar::Char(other),
-            },
-            JsonStringEscapeState::Escape => match ch {
-                'n' => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char('\n')
-                }
-                'r' => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char('\r')
-                }
-                't' => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char('\t')
-                }
-                '"' => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char('"')
-                }
-                '\\' => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char('\\')
-                }
-                '/' => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char('/')
-                }
-                'b' => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char('\u{0008}')
-                }
-                'f' => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char('\u{000c}')
-                }
-                'u' => {
-                    self.escape = JsonStringEscapeState::Unicode {
-                        digits: String::new(),
-                    };
-                    JsonStringChar::Pending
-                }
-                other => {
-                    self.escape = JsonStringEscapeState::None;
-                    JsonStringChar::Char(other)
-                }
-            },
-            JsonStringEscapeState::Unicode { digits } => {
-                digits.push(ch);
-                if digits.len() < 4 {
-                    return JsonStringChar::Pending;
-                }
-                let decoded = u32::from_str_radix(digits, 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .unwrap_or('\u{FFFD}');
-                self.escape = JsonStringEscapeState::None;
-                JsonStringChar::Char(decoded)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JsonStringChar {
-    Char(char),
-    End,
-    Pending,
-}
-
-fn decode_partial_json_string_from_value(value: &str, max_chars: usize) -> PartialJsonStringField {
-    let mut truncated = false;
-    let mut output = String::new();
-    for (index, ch) in value.chars().enumerate() {
-        if index >= max_chars {
-            truncated = true;
-            break;
-        }
-        output.push(ch);
-    }
-    PartialJsonStringField {
-        value: output,
-        truncated,
-    }
 }
 
 #[derive(Default)]
@@ -12750,11 +12355,7 @@ async fn handle_provider_turn_event(
             .await;
         }
         ProviderTurnEvent::ToolCallStarted { call_id, name } => {
-            let preview_metadata = registered_server_tool(state, &name)
-                .await
-                .ok()
-                .and_then(|tool| tool.definition.ui.request_visual);
-            stream_progress.start_tool_call(call_id.clone(), name.clone(), preview_metadata);
+            stream_progress.start_tool_call(call_id.clone(), name.clone());
             publish_provider_stream_progress_live(
                 state,
                 session_id,
@@ -12776,20 +12377,6 @@ async fn handle_provider_turn_event(
         }
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
             stream_progress.record_tool_call_delta(&call_id, &delta);
-            if let Some(progress) = stream_progress.tool_progress_snapshot()
-                && let Some(preview) = stream_progress.take_tool_argument_preview()
-            {
-                publish_tool_argument_preview_live(
-                    state,
-                    session_id,
-                    turn_id,
-                    progress.tool_call_id,
-                    progress.tool_name,
-                    progress.argument_bytes,
-                    live_tool_argument_preview_with_bytes(preview, progress.argument_bytes),
-                )
-                .await;
-            }
             if let Some(progress) = stream_progress.take_tool_progress_event() {
                 publish_provider_stream_progress_live(
                     state,
@@ -12953,29 +12540,6 @@ async fn handle_provider_tool_call_finished_event(
         },
     )
     .await;
-    let preview_fields = StreamingJsonStringFields::from_json_value(&call.arguments);
-    let preview_metadata = registered_server_tool(state, &call.name)
-        .await
-        .ok()
-        .and_then(|tool| tool.definition.ui.request_visual);
-    if let Some(preview) = preview_metadata
-        .as_ref()
-        .and_then(|metadata| live_tool_argument_preview_from_fields(metadata, &preview_fields))
-    {
-        publish_tool_argument_preview_live(
-            state,
-            session_id,
-            turn_id,
-            call.id.clone(),
-            call.name.clone(),
-            serialized_tool_argument_len(&call.arguments),
-            live_tool_argument_preview_with_bytes(
-                preview,
-                serialized_tool_argument_len(&call.arguments),
-            ),
-        )
-        .await;
-    }
     publish_provider_stream_progress_live(
         state,
         session_id,
@@ -13050,38 +12614,6 @@ async fn publish_provider_stream_progress_live(
             SessionLiveEventKind::ProviderStreamProgress {
                 turn_id: turn_id.to_string(),
                 event,
-            },
-        )
-        .await;
-}
-
-const fn live_tool_argument_preview_with_bytes(
-    mut preview: LiveToolArgumentPreview,
-    argument_bytes: usize,
-) -> LiveToolArgumentPreview {
-    preview.argument_bytes = argument_bytes;
-    preview
-}
-
-async fn publish_tool_argument_preview_live(
-    state: &ServerState,
-    session_id: SessionId,
-    turn_id: &str,
-    tool_call_id: String,
-    tool_name: String,
-    argument_bytes: usize,
-    preview: LiveToolArgumentPreview,
-) {
-    let _ = state
-        .sessions
-        .publish_live_event(
-            session_id,
-            SessionLiveEventKind::ToolArgumentPreview {
-                turn_id: turn_id.to_string(),
-                tool_call_id,
-                tool_name,
-                argument_bytes,
-                preview,
             },
         )
         .await;
@@ -15069,15 +14601,6 @@ fn project_tool_result_for_model_context(
         .rev()
         .collect::<String>();
     format!("{head}{omission_marker}{tail}{footer}")
-}
-
-fn trace_blob_read_path(blob: &TraceBlobRef) -> PathBuf {
-    let path = PathBuf::from(&blob.path);
-    if path.is_absolute() {
-        path
-    } else {
-        default_trace_store_dir().join(path)
-    }
 }
 
 fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
@@ -17152,27 +16675,6 @@ async fn clear_active_contributions(
     }
 }
 
-fn contribution_artifact_stream_event(
-    event: &ToolContributionEvent,
-) -> Option<ToolInvocationStreamEvent> {
-    let artifact = event.artifact.as_ref()?;
-    Some(ToolInvocationStreamEvent::ArtifactUpdate {
-        tool_call_id: event.invocation_id.clone(),
-        sequence: event.sequence,
-        artifact_id: artifact.artifact_id.clone(),
-        reference_key: artifact.reference_key.clone(),
-        producer_plugin_id: event.producer_id.clone(),
-        schema: event.schema.clone(),
-        schema_version: event.schema_version,
-        content_type: artifact.content_type.clone(),
-        storage_uri: artifact.storage_uri.clone(),
-        committed_bytes: artifact.committed_bytes,
-        revision: artifact.revision,
-        availability: None,
-        finalized: artifact.finalized,
-    })
-}
-
 async fn append_tool_contribution_envelope(
     state: &ServerState,
     session_id: SessionId,
@@ -17199,9 +16701,8 @@ async fn append_tool_contribution_envelope(
         return;
     }
     if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
-        if let Some(artifact_event) = contribution_artifact_stream_event(event)
-            && let Err(error) =
-                update_active_artifact(state, session_id, &artifact_event, Some(envelope.clone()))
+        if event.artifact.is_some()
+            && let Err(error) = update_active_artifact(state, session_id, &envelope)
         {
             tracing::warn!(%error, "discarded placed contribution with invalid artifact revision");
             return;
@@ -17246,16 +16747,12 @@ async fn append_tool_contribution_event(
         return Err("tool contribution identity does not match the active invocation".to_owned());
     }
     if event.persistence == bcode_session_models::ToolContributionPersistence::Transient {
-        if let Some(artifact_event) = contribution_artifact_stream_event(&event)
-            && let Err(error) = update_active_artifact(
-                state,
-                session_id,
-                &artifact_event,
-                Some(bcode_session_models::ToolContributionEnvelope::new(
-                    bcode_session_models::ToolContributionPlacement::Hidden,
-                    event.clone(),
-                )),
-            )
+        let envelope = bcode_session_models::ToolContributionEnvelope::new(
+            bcode_session_models::ToolContributionPlacement::Hidden,
+            event.clone(),
+        );
+        if event.artifact.is_some()
+            && let Err(error) = update_active_artifact(state, session_id, &envelope)
         {
             return Err(error);
         }
@@ -17334,32 +16831,19 @@ async fn resolve_tool_exchange(
 fn update_active_artifact(
     state: &ServerState,
     session_id: SessionId,
-    event: &ToolInvocationStreamEvent,
-    contribution_snapshot: Option<bcode_session_models::ToolContributionEnvelope>,
+    envelope: &bcode_session_models::ToolContributionEnvelope,
 ) -> Result<(), String> {
-    let ToolInvocationStreamEvent::ArtifactUpdate {
-        tool_call_id,
-        artifact_id,
-        reference_key,
-        producer_plugin_id,
-        schema,
-        schema_version,
-        content_type,
-        storage_uri,
-        committed_bytes,
-        revision,
-        finalized,
-        ..
-    } = event
-    else {
-        return Ok(());
-    };
-    if artifact_id.trim().is_empty()
-        || reference_key.trim().is_empty()
-        || producer_plugin_id.trim().is_empty()
-        || schema.trim().is_empty()
-        || *schema_version == 0
-        || *revision == 0
+    let event = &envelope.contribution;
+    let artifact = event
+        .artifact
+        .as_ref()
+        .ok_or_else(|| "active artifact contribution is missing artifact metadata".to_owned())?;
+    if artifact.artifact_id.trim().is_empty()
+        || artifact.reference_key.trim().is_empty()
+        || event.producer_id.trim().is_empty()
+        || event.schema.trim().is_empty()
+        || event.schema_version == 0
+        || artifact.revision == 0
     {
         return Err("active artifact identity, schema, and revision must be valid".to_owned());
     }
@@ -17367,14 +16851,14 @@ fn update_active_artifact(
         .active_plugin_invocations
         .lock()
         .map_err(|_| "active plugin invocation registry poisoned".to_owned())?
-        .get(&(session_id, tool_call_id.clone()))
+        .get(&(session_id, event.invocation_id.clone()))
         .cloned()
         .ok_or_else(|| "active artifact invocation is not registered".to_owned())?;
-    if owner.producer_plugin_id != *producer_plugin_id {
+    if owner.producer_plugin_id != event.producer_id {
         return Err("active artifact producer does not own the invocation".to_owned());
     }
     let artifact_root = default_session_artifact_dir(session_id);
-    let path = artifact_reference_path(storage_uri, &artifact_root)?;
+    let path = artifact_reference_path(&artifact.storage_uri, &artifact_root)?;
     let canonical_root = artifact_root
         .canonicalize()
         .map_err(|error| format!("artifact root is unavailable: {error}"))?;
@@ -17387,16 +16871,17 @@ fn update_active_artifact(
     let file_bytes = std::fs::metadata(&canonical_path)
         .map_err(|error| error.to_string())?
         .len();
-    if *committed_bytes > file_bytes {
+    if artifact.committed_bytes > file_bytes {
         return Err(format!(
-            "active artifact committed length {committed_bytes} exceeds file length {file_bytes}"
+            "active artifact committed length {} exceeds file length {file_bytes}",
+            artifact.committed_bytes
         ));
     }
     let key = ActiveArtifactKey {
         session_id,
-        tool_call_id: tool_call_id.clone(),
-        artifact_id: artifact_id.clone(),
-        reference_key: reference_key.clone(),
+        tool_call_id: event.invocation_id.clone(),
+        artifact_id: artifact.artifact_id.clone(),
+        reference_key: artifact.reference_key.clone(),
     };
     let mut artifacts = state
         .active_artifacts
@@ -17406,18 +16891,25 @@ fn update_active_artifact(
         if existing.abandoned {
             return Err("active artifact producer is no longer available".to_owned());
         }
-        let path_changed_on_finalization = *finalized
+        let path_changed_on_finalization = artifact.finalized
             && existing.path != canonical_path
             && existing.path.parent() == canonical_path.parent();
-        if existing.producer_plugin_id != *producer_plugin_id
-            || existing.schema != *schema
-            || existing.schema_version != *schema_version
-            || existing.content_type != *content_type
-            || (existing.path != canonical_path && !path_changed_on_finalization)
+        let producer_changed = existing.producer_plugin_id != event.producer_id;
+        let schema_changed = existing.schema != event.schema;
+        let schema_version_changed = existing.schema_version != event.schema_version;
+        let content_type_changed = existing.content_type != artifact.content_type;
+        let path_changed = existing.path != canonical_path && !path_changed_on_finalization;
+        if producer_changed
+            || schema_changed
+            || schema_version_changed
+            || content_type_changed
+            || path_changed
         {
             return Err("active artifact immutable identity changed".to_owned());
         }
-        if *revision <= existing.revision || *committed_bytes < existing.committed_bytes {
+        if artifact.revision <= existing.revision
+            || artifact.committed_bytes < existing.committed_bytes
+        {
             return Err("active artifact revision and committed length must increase".to_owned());
         }
         if existing.finalized {
@@ -17427,16 +16919,16 @@ fn update_active_artifact(
     artifacts.insert(
         key,
         ActiveArtifactReference {
-            producer_plugin_id: producer_plugin_id.clone(),
-            schema: schema.clone(),
-            schema_version: *schema_version,
-            content_type: content_type.clone(),
+            producer_plugin_id: event.producer_id.clone(),
+            schema: event.schema.clone(),
+            schema_version: event.schema_version,
+            content_type: artifact.content_type.clone(),
             path: canonical_path,
-            committed_bytes: *committed_bytes,
-            revision: *revision,
-            finalized: *finalized,
+            committed_bytes: artifact.committed_bytes,
+            revision: artifact.revision,
+            finalized: artifact.finalized,
             abandoned: false,
-            contribution_snapshot,
+            contribution_snapshot: envelope.clone(),
         },
     );
     drop(artifacts);
@@ -17454,21 +16946,11 @@ fn active_artifact_snapshot_events(
     let events = artifacts
         .iter()
         .filter(|(key, _)| key.session_id == session_id)
-        .map(|(key, artifact)| {
-            artifact.contribution_snapshot.as_ref().map_or_else(
-                || bcode_session_models::SessionLiveEvent {
-                    session_id,
-                    kind: SessionLiveEventKind::ToolOutputDelta {
-                        event: artifact.stream_event(key),
-                    },
-                },
-                |envelope| bcode_session_models::SessionLiveEvent {
-                    session_id,
-                    kind: SessionLiveEventKind::ToolContributionPlaced {
-                        envelope: envelope.clone(),
-                    },
-                },
-            )
+        .map(|(_, artifact)| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolContributionPlaced {
+                envelope: artifact.contribution_snapshot.clone(),
+            },
         })
         .collect::<Vec<_>>();
     drop(artifacts);
@@ -17610,24 +17092,50 @@ fn git_root_for_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-async fn list_service_tools(state: &ServerState) -> Vec<ServiceToolDefinition> {
-    let mut tools = Vec::new();
-    for plugin_id in tool_provider_plugin_ids(state) {
-        match state
-            .plugins
-            .invoke_service_json::<_, ToolList>(
-                &plugin_id,
-                TOOL_SERVICE_INTERFACE_ID,
-                OP_LIST_TOOLS,
-                &ListToolsRequest::default(),
-            )
-            .await
-        {
-            Ok(list) => tools.extend(list.tools),
-            Err(error) => tracing::warn!("failed to list tools from {plugin_id}: {error}"),
+fn skill_tool_policy_target(
+    tool_name: impl Into<String>,
+    metadata: ToolPolicyAuthorizationMetadata,
+) -> SkillToolPolicyTarget {
+    SkillToolPolicyTarget {
+        name: tool_name.into(),
+        aliases: metadata.aliases,
+        compatibility_aliases: metadata.compatibility_aliases,
+        capabilities: metadata.capabilities,
+        permission_category: metadata.permission_category,
+    }
+}
+
+async fn owner_prepared_skill_tool_targets(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Vec<SkillToolPolicyTarget> {
+    let Ok(catalog) = collect_server_tool_catalog(state).await else {
+        return Vec::new();
+    };
+    let cancel_state = TurnCancelState::default();
+    let mut targets = Vec::new();
+    for tool in catalog.tools() {
+        let tool_name = tool.definition.name.clone();
+        let call = bcode_model::ToolCall {
+            id: format!("skill-catalog-{tool_name}"),
+            name: tool_name.clone(),
+            arguments: serde_json::Value::Null,
+        };
+        let preparation =
+            prepare_registered_server_tool(state, session_id, tool, &call, &cancel_state).await;
+        let metadata = preparation.and_then(|preparation| {
+            tool_policy_authorization_metadata(&preparation.authorization, &tool_name)
+        });
+        match metadata {
+            Ok(metadata) => targets.push(skill_tool_policy_target(tool_name, metadata)),
+            Err(error) => tracing::warn!(
+                tool_name,
+                %error,
+                "failed to prepare owner policy identity for skill catalog"
+            ),
         }
     }
-    tools
+    targets
 }
 
 async fn evaluate_active_skill_tool_policy_with_metadata(
@@ -17649,7 +17157,7 @@ async fn evaluate_active_skill_tool_policy_with_metadata(
     if skill_ids.is_empty() {
         return SkillToolPolicyOutcome::NoOpinion;
     }
-    let available_tools = list_service_tools(state).await;
+    let available_tools = owner_prepared_skill_tool_targets(state, session_id).await;
     let active_policies = skill_ids
         .into_iter()
         .filter_map(|skill_id| registry.describe(&skill_id).ok())
@@ -17657,13 +17165,7 @@ async fn evaluate_active_skill_tool_policy_with_metadata(
             resolve_skill_permission_policy(&manifest.permission_policy, &available_tools)
         })
         .collect();
-    let target = SkillToolPolicyTarget {
-        name: tool_name.to_string(),
-        aliases: metadata.aliases.clone(),
-        compatibility_aliases: metadata.compatibility_aliases.clone(),
-        capabilities: metadata.capabilities.clone(),
-        permission_category: metadata.permission_category.clone(),
-    };
+    let target = skill_tool_policy_target(tool_name, metadata.clone());
     evaluate_skill_tool_call(&SkillToolPolicyRequest {
         tool: target,
         active_policies,
@@ -17788,7 +17290,6 @@ async fn request_tool_permission(
         producer_plugin_id: Some(producer_plugin_id.to_owned()),
         tool_name: tool_name.to_string(),
         arguments_json,
-        legacy_request_presentation: None,
         batch: policy_context.batch.clone(),
         policy_source: policy_context.source,
         policy_reason: policy_context.reason,
@@ -18046,26 +17547,6 @@ fn session_events_to_sanitized_model_messages(
     format_version: Option<u16>,
     compatibility_key: Option<&str>,
 ) -> Vec<ModelMessage> {
-    let generic_result_invocations = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::ToolInvocationResultRecorded { record } => {
-                Some(record.invocation_id.as_str())
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let events = events
-        .iter()
-        .copied()
-        .filter(|event| {
-            !matches!(
-                &event.kind,
-                SessionEventKind::ToolCallFinished { tool_call_id, .. }
-                    if generic_result_invocations.contains(tool_call_id.as_str())
-            )
-        })
-        .collect::<Vec<_>>();
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
     let mut pending_tool_call_ids = Vec::<String>::new();
@@ -18106,45 +17587,6 @@ fn session_events_to_sanitized_model_messages(
                 });
                 seen_tool_call_ids.insert(tool_call_id.clone());
                 pending_tool_call_ids.push(tool_call_id.clone());
-            }
-            SessionEventKind::ToolCallFinished {
-                tool_call_id,
-                result,
-                is_error,
-                output,
-                ..
-            } => {
-                if pending_tool_call_ids
-                    .iter()
-                    .any(|pending| pending == tool_call_id)
-                {
-                    pending_tool_call_ids.retain(|pending| pending != tool_call_id);
-                    messages.push(ModelMessage {
-                        role: MessageRole::Tool,
-                        content: vec![ContentBlock::ToolResult {
-                            result: bcode_model::ToolResult {
-                                call_id: tool_call_id.clone(),
-                                output: project_tool_result_for_model_context(
-                                    result,
-                                    output.as_ref().map(trace_blob_read_path),
-                                    tool_output_context_chars,
-                                ),
-                                is_error: *is_error,
-                                content: tool_result_content_from_output(result),
-                            },
-                        }],
-                    });
-                } else {
-                    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
-                    messages.push(plain_context_message(format!(
-                        "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {tool_call_id}; error={is_error}; result: {}",
-                        project_tool_result_for_model_context(
-                            result,
-                            output.as_ref().map(trace_blob_read_path),
-                            tool_output_context_chars,
-                        ),
-                    )));
-                }
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
                 let tool_call_id = &record.invocation_id;
@@ -18446,22 +17888,6 @@ fn current_unix_millis() -> u64 {
         })
 }
 
-async fn tool_request_visual_descriptor(
-    state: &ServerState,
-    tool_name: &str,
-    arguments_json: &str,
-) -> Option<PluginVisualDescriptor> {
-    let metadata = registered_server_tool(state, tool_name)
-        .await
-        .ok()?
-        .definition
-        .ui
-        .request_visual?;
-    let arguments = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
-    let fields = StreamingJsonStringFields::from_json_value(&arguments);
-    live_tool_argument_preview_from_fields(&metadata, &fields).map(|preview| preview.visual)
-}
-
 async fn append_tool_invocation_lifecycle_event(
     state: &ServerState,
     session_id: SessionId,
@@ -18510,7 +17936,6 @@ async fn append_tool_request_event(
     producer_plugin_id: Option<String>,
     working_directory: &std::path::Path,
 ) {
-    let request_visual = tool_request_visual_descriptor(state, &tool_name, &arguments_json).await;
     let runtime_work_id = WorkId::new(format!("tool_{tool_call_id}"));
     let runtime_label = tool_name.clone();
     let runtime_tool_call_id = tool_call_id.clone();
@@ -18524,8 +17949,6 @@ async fn append_tool_request_event(
                 arguments_json,
                 producer_plugin_id,
                 working_directory: Some(working_directory.to_path_buf()),
-                request_visual,
-                legacy_request_presentation: None,
             },
         )
         .await
@@ -19350,7 +18773,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
-        SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
@@ -19384,14 +18806,13 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
-        SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
-        SessionEventKind::LegacyEvent { .. } => "legacy_event",
+        SessionEventKind::OpaqueEvent { .. } => "opaque_event",
     }
 }
 
@@ -20101,6 +19522,41 @@ mod tests {
         let terminal = wait_session_open_snapshot(&mut receiver, 4, 1_000).await;
         assert_eq!(terminal.revision, 4);
         assert!(terminal.outcome.is_some());
+    }
+
+    fn artifact_contribution_envelope(
+        tool_call_id: &str,
+        artifact_id: &str,
+        producer_plugin_id: &str,
+        storage_uri: String,
+        committed_bytes: u64,
+        revision: u64,
+        finalized: bool,
+    ) -> bcode_session_models::ToolContributionEnvelope {
+        bcode_session_models::ToolContributionEnvelope::new(
+            bcode_session_models::ToolContributionPlacement::Progress,
+            bcode_session_models::ToolContributionEvent {
+                invocation_id: tool_call_id.to_owned(),
+                contribution_id: "recording".to_owned(),
+                sequence: revision,
+                producer_id: producer_plugin_id.to_owned(),
+                schema: "fixture.recording".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                artifact: Some(bcode_session_models::ToolContributionArtifact {
+                    artifact_id: artifact_id.to_owned(),
+                    reference_key: "recording".to_owned(),
+                    content_type: Some("application/octet-stream".to_owned()),
+                    storage_uri,
+                    committed_bytes,
+                    revision,
+                    finalized,
+                    availability: None,
+                }),
+                payload: serde_json::Value::Null,
+            },
+        )
     }
 
     #[test]
@@ -21206,39 +20662,31 @@ library = "test"
             },
         )
         .expect("register invocation");
-        let update = ToolInvocationStreamEvent::ArtifactUpdate {
-            tool_call_id: tool_call_id.to_owned(),
-            sequence: 1,
-            artifact_id: "artifact-active".to_owned(),
-            reference_key: "recording".to_owned(),
-            producer_plugin_id: "fixture.plugin".to_owned(),
-            schema: "fixture.recording".to_owned(),
-            schema_version: 1,
-            content_type: Some("application/octet-stream".to_owned()),
-            storage_uri: url::Url::from_file_path(&path)
-                .expect("file URL")
-                .to_string(),
-            committed_bytes: 9,
-            revision: 1,
-            availability: None,
-            finalized: false,
-        };
-        update_active_artifact(&state, session_id, &update, None).expect("register artifact");
+        let storage_uri = url::Url::from_file_path(&path)
+            .expect("file URL")
+            .to_string();
+        let update = artifact_contribution_envelope(
+            tool_call_id,
+            "artifact-active",
+            "fixture.plugin",
+            storage_uri.clone(),
+            9,
+            1,
+            false,
+        );
+        update_active_artifact(&state, session_id, &update).expect("register artifact");
 
         let snapshots = active_artifact_snapshot_events(&state, session_id).expect("snapshots");
         assert_eq!(snapshots.len(), 1);
         let serialized_snapshot = serde_json::to_string(&snapshots[0]).expect("serialize snapshot");
-        assert!(!serialized_snapshot.contains("storage_uri"));
-        assert!(!serialized_snapshot.contains("active.bin"));
+        assert!(serialized_snapshot.contains("storage_uri"));
+        assert!(serialized_snapshot.contains("active.bin"));
         assert!(matches!(
             &snapshots[0].kind,
-            SessionLiveEventKind::ToolOutputDelta {
-                event: ToolInvocationStreamEvent::ArtifactUpdate {
-                    committed_bytes: 9,
-                    revision: 1,
-                    ..
-                }
-            }
+            SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.contribution.artifact.as_ref().is_some_and(|artifact| {
+                    artifact.committed_bytes == 9 && artifact.revision == 1
+                })
         ));
         let ResponsePayload::SessionArtifactRange {
             total_bytes,
@@ -21257,32 +20705,28 @@ library = "test"
         assert!(!finalized);
         assert_eq!(bytes, b"committed");
 
-        assert!(update_active_artifact(&state, session_id, &update, None).is_err());
-        let mut wrong_owner = update.clone();
-        if let ToolInvocationStreamEvent::ArtifactUpdate {
-            producer_plugin_id,
-            revision,
-            ..
-        } = &mut wrong_owner
-        {
-            *producer_plugin_id = "other.plugin".to_owned();
-            *revision = 2;
-        }
-        assert!(update_active_artifact(&state, session_id, &wrong_owner, None).is_err());
+        assert!(update_active_artifact(&state, session_id, &update).is_err());
+        let wrong_owner = artifact_contribution_envelope(
+            tool_call_id,
+            "artifact-active",
+            "other.plugin",
+            storage_uri.clone(),
+            9,
+            2,
+            false,
+        );
+        assert!(update_active_artifact(&state, session_id, &wrong_owner).is_err());
 
-        let mut finalized = update.clone();
-        if let ToolInvocationStreamEvent::ArtifactUpdate {
-            revision,
-            committed_bytes,
-            finalized: is_finalized,
-            ..
-        } = &mut finalized
-        {
-            *revision = 2;
-            *committed_bytes = 20;
-            *is_finalized = true;
-        }
-        update_active_artifact(&state, session_id, &finalized, None).expect("finalize artifact");
+        let finalized = artifact_contribution_envelope(
+            tool_call_id,
+            "artifact-active",
+            "fixture.plugin",
+            storage_uri,
+            20,
+            2,
+            true,
+        );
+        update_active_artifact(&state, session_id, &finalized).expect("finalize artifact");
         drop(registration);
         assert_eq!(
             active_artifact_snapshot_events(&state, session_id)
@@ -21349,8 +20793,6 @@ library = "test"
                     arguments_json: "{}".to_owned(),
                     producer_plugin_id: Some("fixture.plugin".to_owned()),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             )
             .await
@@ -21370,29 +20812,18 @@ library = "test"
             },
         )
         .expect("registration");
-        update_active_artifact(
-            &state,
-            session_id,
-            &ToolInvocationStreamEvent::ArtifactUpdate {
-                tool_call_id: "call-transition".to_owned(),
-                sequence: 1,
-                artifact_id: "artifact-transition".to_owned(),
-                reference_key: "recording".to_owned(),
-                producer_plugin_id: "fixture.plugin".to_owned(),
-                schema: "fixture.recording".to_owned(),
-                schema_version: 1,
-                content_type: Some("application/octet-stream".to_owned()),
-                storage_uri: url::Url::from_file_path(&path)
-                    .expect("file URL")
-                    .to_string(),
-                committed_bytes: 9,
-                revision: 1,
-                availability: None,
-                finalized: true,
-            },
-            None,
-        )
-        .expect("finalized live artifact");
+        let update = artifact_contribution_envelope(
+            "call-transition",
+            "artifact-transition",
+            "fixture.plugin",
+            url::Url::from_file_path(&path)
+                .expect("file URL")
+                .to_string(),
+            9,
+            1,
+            true,
+        );
+        update_active_artifact(&state, session_id, &update).expect("finalized live artifact");
         assert_eq!(
             active_artifact_snapshot_events(&state, session_id)
                 .expect("live snapshot")
@@ -21493,29 +20924,18 @@ library = "test"
             },
         )
         .expect("registration");
-        update_active_artifact(
-            &state,
-            session_id,
-            &ToolInvocationStreamEvent::ArtifactUpdate {
-                tool_call_id: "call-abandoned".to_owned(),
-                sequence: 1,
-                artifact_id: "artifact-abandoned".to_owned(),
-                reference_key: "recording".to_owned(),
-                producer_plugin_id: "fixture.plugin".to_owned(),
-                schema: "fixture.recording".to_owned(),
-                schema_version: 1,
-                content_type: Some("application/octet-stream".to_owned()),
-                storage_uri: url::Url::from_file_path(&path)
-                    .expect("file URL")
-                    .to_string(),
-                committed_bytes: 9,
-                revision: 1,
-                availability: None,
-                finalized: false,
-            },
-            None,
-        )
-        .expect("active artifact");
+        let update = artifact_contribution_envelope(
+            "call-abandoned",
+            "artifact-abandoned",
+            "fixture.plugin",
+            url::Url::from_file_path(&path)
+                .expect("file URL")
+                .to_string(),
+            9,
+            1,
+            false,
+        );
+        update_active_artifact(&state, session_id, &update).expect("active artifact");
         drop(registration);
 
         let error = read_session_artifact_range(
@@ -21533,13 +20953,12 @@ library = "test"
         assert_eq!(snapshots.len(), 1, "reattach retains degraded identity");
         assert!(matches!(
             &snapshots[0].kind,
-            SessionLiveEventKind::ToolOutputDelta {
-                event: ToolInvocationStreamEvent::ArtifactUpdate {
-                    availability: Some(availability),
-                    finalized: false,
-                    ..
-                }
-            } if availability == "incomplete"
+            SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.contribution.artifact.as_ref().is_some_and(|artifact| {
+                    artifact.availability.as_deref() == Some("incomplete")
+                        && !artifact.finalized
+                        && artifact.revision == 2
+                })
         ));
         remove_session_artifact_dir(&artifact_dir).expect("cleanup");
     }
@@ -21725,8 +21144,6 @@ library = "test"
                     tool_name: "test.large".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             )
             .await
@@ -21734,12 +21151,13 @@ library = "test"
         sessions
             .append_event(
                 session_id,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: tool_call_id.to_owned(),
-                    result,
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: tool_call_id.to_owned(),
+                        model_output: result,
+                        is_error: false,
+                        result: None,
+                    },
                 },
             )
             .await
@@ -23509,8 +22927,6 @@ library = "test"
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             session_event(
@@ -23550,19 +22966,18 @@ library = "test"
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             session_event(
                 session_id,
                 1,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_string(),
-                    result: "ok".to_string(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_string(),
+                        model_output: "ok".to_string(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             ),
         ];
@@ -23585,12 +23000,13 @@ library = "test"
         let history = vec![session_event(
             session_id,
             1,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-1".to_string(),
-                result: "orphaned output".to_string(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_string(),
+                    model_output: "orphaned output".to_string(),
+                    is_error: false,
+                    result: None,
+                },
             },
         )];
 
@@ -23618,8 +23034,6 @@ library = "test"
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{not-json".to_string(),
                 working_directory: None,
-                request_visual: None,
-                legacy_request_presentation: None,
             },
         )];
 
@@ -23730,19 +23144,18 @@ library = "test"
                     arguments_json: "{}".into(),
                     producer_plugin_id: None,
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ));
             history.push(session_event(
                 session_id,
                 sequence + 1,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: call.into(),
-                    result: "ok".into(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: call.into(),
+                        model_output: "ok".into(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             ));
         }
@@ -23780,8 +23193,6 @@ library = "test"
                     arguments_json: "{}".into(),
                     producer_plugin_id: None,
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             session_event(
@@ -24299,19 +23710,18 @@ library = "test"
                     arguments_json: "{}".to_string(),
                     producer_plugin_id: None,
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             session_event(
                 session_id,
                 3,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_string(),
-                    result: "done".to_string(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_string(),
+                        model_output: "done".to_string(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             ),
             session_event(
@@ -24366,8 +23776,6 @@ library = "test"
                     arguments_json: "{}".to_string(),
                     producer_plugin_id: None,
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
         ];
@@ -24407,8 +23815,6 @@ library = "test"
                     arguments_json: "{}".to_string(),
                     producer_plugin_id: None,
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             session_event(
@@ -24568,12 +23974,17 @@ library = "test"
                 session_event(
                     session_id,
                     2,
-                    SessionEventKind::ToolCallFinished {
-                        tool_call_id: "call-1".to_string(),
-                        result: format!("{}middle{}", "x".repeat(2_000), "y".repeat(2_000)),
-                        is_error: false,
-                        output: None,
-                        semantic_result: None,
+                    SessionEventKind::ToolInvocationResultRecorded {
+                        record: bcode_session_models::ToolInvocationResultRecord {
+                            invocation_id: "call-1".to_string(),
+                            model_output: format!(
+                                "{}middle{}",
+                                "x".repeat(2_000),
+                                "y".repeat(2_000)
+                            ),
+                            is_error: false,
+                            result: None,
+                        },
                     },
                 ),
                 session_event(
@@ -25682,15 +25093,6 @@ library = "test"
             provenance: None,
             kind,
         };
-        let visual = |marker: &str| bcode_session_models::PluginVisualDescriptor {
-            visual_id: Some(format!("visual-{marker}")),
-            producer_plugin_id: Some("test.plugin".to_owned()),
-            schema: "test.private-visual".to_owned(),
-            schema_version: 77,
-            title: Some(marker.to_owned()),
-            subtitle: None,
-            payload: serde_json::json!({"private": marker}),
-        };
         let events = vec![
             session_event(
                 1,
@@ -25700,25 +25102,6 @@ library = "test"
                     tool_name: "test.tool".to_owned(),
                     arguments_json: r#"{"model_visible":"safe-argument"}"#.to_owned(),
                     working_directory: None,
-                    request_visual: Some(visual("REQUEST_VISUAL_PRIVATE")),
-                    legacy_request_presentation: Some(
-                        bcode_session_models::LegacyToolRequestPresentationMetadata {
-                            title: "LEGACY_REQUEST_PRESENTATION_PRIVATE".to_owned(),
-                            fields: Vec::new(),
-                            preview: None,
-                        },
-                    ),
-                },
-            ),
-            session_event(
-                2,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::VisualUpdate {
-                        tool_call_id: "call-1".to_owned(),
-                        sequence: 1,
-                        visual: visual("LIVE_VISUAL_PRIVATE"),
-                        streaming: true,
-                    },
                 },
             ),
             session_event(
@@ -25755,7 +25138,6 @@ library = "test"
                     producer_plugin_id: Some("test.plugin".to_owned()),
                     tool_name: "test.tool".to_owned(),
                     arguments_json: "PERMISSION_PRESENTATION_PRIVATE".to_owned(),
-                    legacy_request_presentation: None,
                     batch: None,
                     policy_source: Some("PRIVATE_POLICY_SOURCE".to_owned()),
                     policy_reason: Some("PRIVATE_POLICY_REASON".to_owned()),
@@ -25830,12 +25212,13 @@ library = "test"
             ),
             session_event(
                 11,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_owned(),
-                    result: "safe-result".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "safe-result".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             ),
         ];
@@ -25847,7 +25230,6 @@ library = "test"
         for marker in [
             "REQUEST_VISUAL_PRIVATE",
             "LEGACY_REQUEST_PRESENTATION_PRIVATE",
-            "LIVE_VISUAL_PRIVATE",
             "EXCHANGE_REQUEST_PRIVATE",
             "EXCHANGE_RESPONSE_PRIVATE",
             "PERMISSION_PRESENTATION_PRIVATE",
@@ -25863,35 +25245,6 @@ library = "test"
         ] {
             assert!(!encoded.contains(marker), "model context leaked {marker}");
         }
-    }
-
-    #[test]
-    fn legacy_stream_presentation_payload_is_excluded_from_model_context() {
-        let marker = "LEGACY_STREAM_PRESENTATION_PRIVATE";
-        let event = bcode_session_models::SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id: SessionId::new(),
-            provenance: None,
-            kind: SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::LegacyPresentation {
-                    tool_call_id: "call-1".to_owned(),
-                    sequence: 1,
-                    presentation: bcode_session_models::LegacyToolPresentationEvent::Status(
-                        bcode_session_models::LegacyToolStatusPresentation {
-                            target: bcode_session_models::LegacyToolPresentationTarget::Activity,
-                            text: marker.to_owned(),
-                            level: bcode_session_models::LegacyToolPresentationLevel::Info,
-                        },
-                    ),
-                },
-            },
-        };
-
-        let encoded = serde_json::to_string(&session_events_to_model_messages(&[event]))
-            .expect("model messages serialize");
-        assert!(!encoded.contains(marker));
     }
 
     #[test]
@@ -26766,12 +26119,6 @@ library = "test"
                         == bcode_session_models::ToolInvocationLifecycleStage::Progress
                     && event.message.as_deref() == Some("list: scanning entries")
         )));
-        assert!(!history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Status { .. }
-            }
-        )));
     }
 
     #[cfg(unix)]
@@ -26822,9 +26169,6 @@ library = "test"
                     );
                     saw_recording_contribution |= envelope.contribution.artifact.is_some();
                 }
-                SessionLiveEventKind::ToolOutputDelta {
-                    event: ToolInvocationStreamEvent::ArtifactUpdate { .. },
-                } => panic!("shell emitted legacy artifact-update stream"),
                 _ => {}
             }
         }
@@ -28193,7 +27537,6 @@ library = "test"
                     producer_plugin_id: Some("test.plugin".to_owned()),
                     tool_name: "test.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
-                    legacy_request_presentation: None,
                     batch: None,
                     policy_source: None,
                     policy_reason: None,
@@ -28725,7 +28068,6 @@ library = "test"
                     producer_plugin_id: Some("test.plugin".to_owned()),
                     tool_name: "test.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
-                    legacy_request_presentation: None,
                     batch: None,
                     policy_source: None,
                     policy_reason: None,
@@ -29857,7 +29199,7 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn tool_call_request_events_do_not_persist_legacy_request_presentation() {
+    async fn tool_call_request_events_preserve_producer_plugin_id() {
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(Some("test".to_owned()), test_working_directory())
@@ -29882,22 +29224,17 @@ library = "test"
             .session_history(session_id)
             .await
             .expect("history should read");
-        let request_fields = history.iter().find_map(|event| {
+        let producer_plugin_id = history.iter().find_map(|event| {
             if let SessionEventKind::ToolCallRequested {
-                producer_plugin_id,
-                legacy_request_presentation,
-                ..
+                producer_plugin_id, ..
             } = &event.kind
             {
-                Some((producer_plugin_id, legacy_request_presentation))
+                Some(producer_plugin_id)
             } else {
                 None
             }
         });
-        assert_eq!(
-            request_fields,
-            Some((&Some("test.plugin".to_owned()), &None))
-        );
+        assert_eq!(producer_plugin_id, Some(&Some("test.plugin".to_owned())));
     }
 
     #[tokio::test]
@@ -30164,8 +29501,6 @@ library = "test"
                     arguments_json: r#"{"command":"false"}"#.to_string(),
                     producer_plugin_id: None,
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             )
             .await
@@ -30866,8 +30201,8 @@ library = "test"
             .expect("context");
         assert!(context.iter().any(|event| matches!(
             &event.kind,
-            SessionEventKind::ToolCallFinished { tool_call_id, .. }
-                if tool_call_id == "call-large"
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.invocation_id == "call-large"
         )));
         assert!(
             compacted
@@ -31927,7 +31262,7 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn permission_request_events_do_not_persist_legacy_request_presentation() {
+    async fn permission_request_events_preserve_producer_plugin_id() {
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(Some("test".to_owned()), test_working_directory())
@@ -31940,9 +31275,6 @@ library = "test"
             name: "example.tool".to_owned(),
             description: "example".to_owned(),
             input_schema: serde_json::json!({"type": "object"}),
-            requires_permission: true,
-            policy: bcode_tool::ToolPolicyMetadata::default(),
-            ui: bcode_tool::ToolUiMetadata::default(),
         };
         let call = bcode_model::ToolCall {
             id: "call-1".to_owned(),
@@ -31985,22 +31317,17 @@ library = "test"
             .session_history(session_id)
             .await
             .expect("history should read");
-        let request_fields = history.iter().find_map(|event| {
+        let producer_plugin_id = history.iter().find_map(|event| {
             if let SessionEventKind::PermissionRequested {
-                producer_plugin_id,
-                legacy_request_presentation,
-                ..
+                producer_plugin_id, ..
             } = &event.kind
             {
-                Some((producer_plugin_id, legacy_request_presentation))
+                Some(producer_plugin_id)
             } else {
                 None
             }
         });
-        assert_eq!(
-            request_fields,
-            Some((&Some("test.plugin".to_owned()), &None))
-        );
+        assert_eq!(producer_plugin_id, Some(&Some("test.plugin".to_owned())));
     }
 
     #[tokio::test]
@@ -32091,8 +31418,6 @@ library = "test"
                     tool_name: "fixture.run".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             },
             SessionEvent {
@@ -32101,29 +31426,30 @@ library = "test"
                 timestamp_ms: 2,
                 session_id,
                 provenance: None,
-                kind: SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-recording".to_owned(),
-                    result: "bounded useful result".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: Some(ToolInvocationResult::Artifact {
-                        artifact: Box::new(bcode_session_models::ToolArtifact {
-                            artifact_id: secret.to_owned(),
-                            producer_plugin_id: "fixture.plugin".to_owned(),
-                            schema: "fixture.recording".to_owned(),
-                            schema_version: 1,
-                            tool_call_id: Some("call-recording".to_owned()),
-                            title: Some(secret.to_owned()),
-                            metadata: serde_json::json!({"complete_recording": secret}),
-                            refs: vec![bcode_session_models::ToolArtifactRef {
-                                key: "recording".to_owned(),
-                                content_type: Some("application/octet-stream".to_owned()),
-                                storage_uri: Some(format!("file:///tmp/{secret}")),
-                                byte_len: Some(100_000_000),
-                                metadata: Some(serde_json::json!({"secret": secret})),
-                            }],
+                kind: SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-recording".to_owned(),
+                        model_output: "bounded useful result".to_owned(),
+                        is_error: false,
+                        result: Some(ToolInvocationResult::Artifact {
+                            artifact: Box::new(bcode_session_models::ToolArtifact {
+                                artifact_id: secret.to_owned(),
+                                producer_plugin_id: "fixture.plugin".to_owned(),
+                                schema: "fixture.recording".to_owned(),
+                                schema_version: 1,
+                                tool_call_id: Some("call-recording".to_owned()),
+                                title: Some(secret.to_owned()),
+                                metadata: serde_json::json!({"complete_recording": secret}),
+                                refs: vec![bcode_session_models::ToolArtifactRef {
+                                    key: "recording".to_owned(),
+                                    content_type: Some("application/octet-stream".to_owned()),
+                                    storage_uri: Some(format!("file:///tmp/{secret}")),
+                                    byte_len: Some(100_000_000),
+                                    metadata: Some(serde_json::json!({"secret": secret})),
+                                }],
+                            }),
                         }),
-                    }),
+                    },
                 },
             },
         ];
@@ -32151,8 +31477,6 @@ library = "test"
                     tool_name: "filesystem.read".to_string(),
                     arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             },
             SessionEvent {
@@ -32161,12 +31485,13 @@ library = "test"
                 timestamp_ms: 1,
                 session_id,
                 provenance: None,
-                kind: SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_string(),
-                    result: output,
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                kind: SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_string(),
+                        model_output: output,
+                        is_error: false,
+                        result: None,
+                    },
                 },
             },
         ];
@@ -32181,7 +31506,7 @@ library = "test"
     }
 
     #[test]
-    fn generic_final_result_is_model_visible_once_during_dual_write() {
+    fn generic_final_result_is_model_visible_exactly_once() {
         let session_id = SessionId::new();
         let history = vec![
             session_event(
@@ -32193,8 +31518,6 @@ library = "test"
                     tool_name: "example.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             session_event(
@@ -32212,12 +31535,13 @@ library = "test"
             session_event(
                 session_id,
                 3,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_owned(),
-                    result: "legacy duplicate".to_owned(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "legacy duplicate".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             ),
         ];
@@ -32381,19 +31705,18 @@ library = "test"
                     tool_name: "shell".to_string(),
                     arguments_json: r#"{"command":"pwd"}"#.to_string(),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             ),
             session_event(
                 session_id,
                 8,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-tail".to_string(),
-                    result: "workspace".to_string(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-tail".to_string(),
+                        model_output: "workspace".to_string(),
+                        is_error: false,
+                        result: None,
+                    },
                 },
             ),
         ];
@@ -32541,8 +31864,6 @@ library = "test"
                     arguments_json: "{}".to_owned(),
                     producer_plugin_id: Some("fixture.plugin".to_owned()),
                     working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
                 },
             )
             .await
@@ -32596,19 +31917,6 @@ library = "test"
         assert_eq!(reference.byte_len, Some(42));
         assert_eq!(reference.checksum_sha256.as_deref(), Some("abc123"));
 
-        let history = state
-            .sessions
-            .session_history(session_id)
-            .await
-            .expect("history");
-        assert!(!history.iter().any(|event| matches!(
-            event.kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::VisualUpdate { .. }
-                    | ToolInvocationStreamEvent::OutputDelta { .. }
-                    | ToolInvocationStreamEvent::ArtifactUpdate { .. }
-            }
-        )));
         let projection = state
             .sessions
             .session_projection_window(
@@ -32693,7 +32001,7 @@ library = "test"
             session_id,
             ToolFinishedEventInput {
                 tool_call_id: "call-semantic".to_owned(),
-                result: "legacy text".to_owned(),
+                result: "model fallback text".to_owned(),
                 is_error: false,
                 content: Vec::new(),
                 semantic_result: Some(semantic_result.clone()),
@@ -32711,18 +32019,10 @@ library = "test"
             &event.kind,
             SessionEventKind::ToolInvocationResultRecorded { record }
                 if record.invocation_id == "call-semantic"
-                    && record.model_output == "legacy text"
+                    && record.model_output == "model fallback text"
                     && record.result.as_ref() == Some(&semantic_result)
         )));
 
-        assert_eq!(
-            history
-                .iter()
-                .filter(|event| matches!(event.kind, SessionEventKind::ToolCallFinished { .. }))
-                .count(),
-            0,
-            "production result persistence must not dual-write the legacy finish event"
-        );
         assert_eq!(
             history
                 .iter()
@@ -32736,428 +32036,33 @@ library = "test"
         let SessionEventKind::ToolInvocationResultRecorded { record } = event.kind else {
             panic!("expected generic tool result event");
         };
-        assert_eq!(record.model_output, "legacy text");
+        assert_eq!(record.model_output, "model fallback text");
         assert_eq!(record.result, Some(semantic_result));
     }
 
     #[test]
-    fn live_status_template_omits_unresolved_placeholders() {
-        let mut fields = StreamingJsonStringFields::default();
-        fields.push(r#"{"contents":"hello"}"#);
-
-        let rendered = render_live_status_template("editing {path} · {bytes}", &fields);
-
-        assert_eq!(rendered, "editing · 20");
-    }
-
-    #[test]
-    fn live_preview_extraction_uses_plugin_visual_metadata() {
-        let metadata = bcode_tool::ToolPluginVisualMetadata {
-            producer_plugin_id: Some("bcode.shell".to_owned()),
-            schema: "bcode.tool.request.shell.run".to_owned(),
-            schema_version: 1,
-            title: Some("Shell command".to_owned()),
-            subtitle: Some("running {command} · {bytes}".to_owned()),
-            payload: BTreeMap::from([
-                (
-                    "command".to_owned(),
-                    bcode_tool::ToolVisualPayloadSelector {
-                        fields: vec!["command".to_owned()],
-                        literal: None,
-                        required: true,
-                    },
-                ),
-                (
-                    "cwd".to_owned(),
-                    bcode_tool::ToolVisualPayloadSelector {
-                        fields: vec!["cwd".to_owned()],
-                        literal: None,
-                        required: false,
-                    },
-                ),
-            ]),
-        };
-        let mut fields = StreamingJsonStringFields::default();
-        fields.push(r#"{"command":"cargo test","cwd":"/repo"}"#);
-
-        let preview = live_tool_argument_preview_from_fields(&metadata, &fields)
-            .expect("plugin visual preview");
-
-        assert_eq!(
-            preview.visual.producer_plugin_id.as_deref(),
-            Some("bcode.shell")
-        );
-        assert_eq!(preview.visual.schema, "bcode.tool.request.shell.run");
-        assert_eq!(preview.visual.schema_version, 1);
-        assert_eq!(
-            preview.streaming_status.as_deref(),
-            Some("running cargo test · 38")
-        );
-        assert_eq!(
-            preview
-                .visual
-                .payload
-                .get("command")
-                .and_then(serde_json::Value::as_str),
-            Some("cargo test")
-        );
-        assert_eq!(
-            preview
-                .visual
-                .payload
-                .get("cwd")
-                .and_then(serde_json::Value::as_str),
-            Some("/repo")
-        );
-    }
-
-    #[test]
-    fn live_preview_extraction_requires_required_visual_fields() {
-        let metadata = bcode_tool::ToolPluginVisualMetadata {
-            producer_plugin_id: Some("bcode.example".to_owned()),
-            schema: "bcode.example.request".to_owned(),
-            schema_version: 1,
-            title: None,
-            subtitle: None,
-            payload: BTreeMap::from([(
-                "query".to_owned(),
-                bcode_tool::ToolVisualPayloadSelector {
-                    fields: vec!["query".to_owned()],
-                    literal: None,
-                    required: true,
-                },
-            )]),
-        };
-        let mut fields = StreamingJsonStringFields::default();
-        fields.push(r#"{"other":"value"}"#);
-
-        assert!(live_tool_argument_preview_from_fields(&metadata, &fields).is_none());
-    }
-
-    #[test]
-    fn streaming_json_fields_truncate_large_values() {
-        let mut fields = StreamingJsonStringFields::default();
-        fields.push(r#"{"contents":""#);
-        fields.push(&"pub fn hello() {}\n".repeat(40_000));
-        fields.push("\",\"path\":\"src/hello.rs\"}");
-
-        let contents = fields.field(&["contents"]).expect("contents field");
-        assert!(contents.value.starts_with("pub fn hello"));
-        assert!(contents.truncated);
-        let path = fields.field(&["path"]).expect("path field");
-        assert_eq!(path.value, "src/hello.rs");
-    }
-
-    #[test]
-    fn streaming_json_fields_handle_split_names_and_escapes() {
-        let mut fields = StreamingJsonStringFields::default();
-        fields.push(r#"{"comm"#);
-        fields.push(r#"and":"echo \"hi\" \u263A"}"#);
-        let command = fields.field(&["command"]).expect("command field");
-        assert_eq!(command.value, "echo \"hi\" ☺");
-        assert!(!command.truncated);
-    }
-
-    #[test]
-    fn streaming_json_fields_handle_partial_escape_and_unicode() {
-        let mut fields = StreamingJsonStringFields::default();
-        fields.push(r#"{"command":"echo \"hi\" \u263A"#);
-        let command = fields.field(&["command"]).expect("partial command");
-        assert_eq!(command.value, "echo \"hi\" ☺");
-        assert!(command.truncated);
-
-        let mut fields = StreamingJsonStringFields::default();
-        fields.push(r#"{"command":"abcdef"}"#);
-        let command = fields.field(&["command"]).expect("command");
-        assert_eq!(command.value, "abcdef");
-        assert!(!command.truncated);
-    }
-
-    #[tokio::test]
-    async fn runtime_queue_prioritizes_cancellation_over_followup() {
-        let (followup_tx, mut followup_rx) = mpsc::channel(2);
-        let (cancel_tx, mut cancel_rx) = mpsc::channel(2);
-        let queued_followups = AtomicUsize::new(1);
-        followup_tx
-            .send(FollowupCommand::ExecuteTurn {
-                client_id: ClientId::new(),
-                runtime_context: None,
-                user_event: Box::new(session_event(
-                    SessionId::new(),
-                    1,
-                    SessionEventKind::UserMessage {
-                        client_id: ClientId::new(),
-                        text: "queued work".to_owned(),
-                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                    },
-                )),
-                queued_steering: None,
-                completion: None,
-            })
-            .await
-            .expect("followup");
-        let (response, _receiver) = oneshot::channel();
-        cancel_tx
-            .send(CancelCommand {
-                clear_queue: false,
-                requested_by: None,
-                response,
-            })
-            .await
-            .expect("cancel");
-
-        assert!(matches!(
-            next_runtime_queue_command(&mut cancel_rx, &mut followup_rx, &queued_followups).await,
-            Some(RuntimeQueueCommand::Cancel(_))
-        ));
-        assert_eq!(queued_followups.load(Ordering::Acquire), 1);
-        assert!(matches!(
-            next_runtime_queue_command(&mut cancel_rx, &mut followup_rx, &queued_followups).await,
-            Some(RuntimeQueueCommand::Followup(_))
-        ));
-        assert_eq!(queued_followups.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn split_runtime_queues_clear_only_drains_followups() {
-        let (followup_tx, mut followup_rx) = mpsc::channel(8);
-        let (cancel_tx, mut cancel_rx) = mpsc::channel(8);
-        let queued_followups = AtomicUsize::new(0);
-
-        queued_followups.fetch_add(1, Ordering::AcqRel);
-        followup_tx
-            .send(FollowupCommand::ExecuteTurn {
-                client_id: ClientId::new(),
-                runtime_context: None,
-                user_event: Box::new(session_event(
-                    SessionId::new(),
-                    1,
-                    SessionEventKind::UserMessage {
-                        client_id: ClientId::new(),
-                        text: "queued followup".to_owned(),
-                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                    },
-                )),
-                queued_steering: None,
-                completion: None,
-            })
-            .await
-            .expect("followup send should succeed");
-        let (response, _completion) = oneshot::channel();
-        cancel_tx
-            .send(CancelCommand {
-                clear_queue: true,
-                requested_by: None,
-                response,
-            })
-            .await
-            .expect("cancel send should succeed");
-
-        let cleared = drain_followup_commands(&mut followup_rx);
-        queued_followups.fetch_sub(cleared, Ordering::AcqRel);
-
-        assert_eq!(cleared, 1);
-        assert_eq!(queued_followups.load(Ordering::Acquire), 0);
-        assert!(followup_rx.try_recv().is_err());
-        assert!(matches!(
-            cancel_rx.try_recv(),
-            Ok(CancelCommand {
-                clear_queue: true,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn current_turn_transition_helpers_manage_provider_round_state() {
-        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
-        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
-        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
-        let current_turn = Arc::new(Mutex::new(None));
-        let context = RuntimeCommandContext::new(
-            &mut followup_rx,
-            &mut steering_rx,
-            &mut cancel_rx,
-            &queued_followups,
-            Arc::clone(&current_turn),
-        );
-        let cancel_state = Arc::new(TurnCancelState::default());
-
-        begin_current_turn(
-            &context,
-            ClientId::new(),
-            "turn-test".to_owned(),
-            Arc::clone(&cancel_state),
-        )
-        .await;
-        assert!(current_turn.lock().await.is_some());
-
-        let model_turn = ModelRequestAttempt {
-            identity: bcode_session_models::ModelRequestIdentity {
-                provider_plugin_id: "provider-test".to_owned(),
-                requested_model_id: None,
-                effective_model_id: "model-test".to_owned(),
-                request_id: "request-test".to_owned(),
-                model_turn_id: "model-turn-test".to_owned(),
-                round: 0,
-                request_fingerprint: "fingerprint-test".to_owned(),
-                effective_auth_profile: None,
-                context_format_version: None,
-                compatibility_key: None,
-                context_epoch: 0,
+    fn skill_policy_target_uses_only_owner_prepared_identity() {
+        let target = skill_tool_policy_target(
+            "shell.run",
+            ToolPolicyAuthorizationMetadata {
+                requires_permission: true,
+                aliases: vec!["command".to_owned()],
+                compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new(
+                    "claude", "Bash",
+                )],
+                capabilities: vec!["process.execute".to_owned()],
+                permission_category: Some("command".to_owned()),
+                operation: bcode_agent_profile::ToolPolicyOperation::Command { command: None },
             },
-            provider_turn_id: "provider-turn-test".to_owned(),
-            reuse_key: None,
-            request_message_count: 1,
-            context_through_sequence: 1,
-            portable_context: "context".to_owned(),
-            local_estimate: bcode_session_models::LocalContextEstimate {
-                tokens: 1,
-                algorithm_version: LOCAL_CONTEXT_ESTIMATOR_VERSION,
-            },
-            managed_compaction_persisted: false,
-        };
-        begin_provider_round(&context, model_turn.clone()).await;
-        let matched_request_id = current_turn
-            .lock()
-            .await
-            .as_ref()
-            .expect("current turn")
-            .model_attempt_for_provider_turn("provider-turn-test")
-            .map(|attempt| attempt.identity.request_id.clone());
-        assert_eq!(matched_request_id.as_deref(), Some("request-test"));
-        let request_id_matched = current_turn
-            .lock()
-            .await
-            .as_ref()
-            .expect("current turn")
-            .model_attempt_for_provider_turn("request-test")
-            .is_some();
-        assert!(!request_id_matched);
+        );
+        assert_eq!(target.name, "shell.run");
+        assert_eq!(target.aliases, vec!["command"]);
         assert_eq!(
-            current_turn
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|turn| turn.model.as_ref())
-                .map(|turn| turn.provider_turn_id.as_str()),
-            Some("provider-turn-test")
+            target.compatibility_aliases,
+            vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")]
         );
-
-        assert!(
-            take_managed_compaction_attempt(&context, "other-turn")
-                .await
-                .is_none()
-        );
-        let managed = take_managed_compaction_attempt(&context, "provider-turn-test")
-            .await
-            .expect("first managed compaction should own the request attempt");
-        assert_eq!(managed.identity.request_id, model_turn.identity.request_id);
-        assert!(
-            take_managed_compaction_attempt(&context, "provider-turn-test")
-                .await
-                .is_none()
-        );
-
-        let finished = finish_provider_round(&context)
-            .await
-            .expect("provider round should finish");
-        assert_eq!(finished.provider_turn_id, model_turn.provider_turn_id);
-        assert!(
-            current_turn
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|turn| turn.model.is_none())
-        );
-
-        finish_current_turn(&context).await;
-        assert!(current_turn.lock().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn multiple_steering_messages_during_active_work_preserve_acceptance_order() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions = SessionManager::persistent(temp.path()).expect("persistent sessions");
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session");
-        let state = Arc::new(test_server_state(sessions));
-        let (followup_tx, mut followup_rx) = mpsc::channel(4);
-        let (steering_tx, _steering_rx) = mpsc::channel(1);
-        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued = Arc::new(AtomicUsize::new(0));
-        let queued_steering = Arc::new(AtomicUsize::new(0));
-        let handle = SessionRuntimeHandle {
-            followup_commands: followup_tx,
-            steering_commands: steering_tx,
-            cancel_commands: cancel_tx,
-            queued_followups: Arc::clone(&queued),
-            queued_steering: Arc::clone(&queued_steering),
-            phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
-            current_turn: Arc::new(Mutex::new(None)),
-        };
-        let client_id = ClientId::new();
-
-        let first = enqueue_steering_message_command(
-            &state,
-            &handle,
-            summary.id,
-            client_id,
-            None,
-            "first".to_owned(),
-            SteeringWindow::ProviderInFlight,
-        )
-        .await
-        .expect("first steering");
-        let second = enqueue_steering_message_command(
-            &state,
-            &handle,
-            summary.id,
-            client_id,
-            None,
-            "second".to_owned(),
-            SteeringWindow::ProviderInFlight,
-        )
-        .await
-        .expect("second steering");
-
-        assert_eq!(first.queue_position, Some(1));
-        assert_eq!(second.queue_position, Some(2));
-        assert_eq!(queued.load(Ordering::Acquire), 2);
-        assert_eq!(queued_steering.load(Ordering::Acquire), 2);
-        for (index, expected) in ["first", "second"].into_iter().enumerate() {
-            let command =
-                next_runtime_queue_command(&mut cancel_rx, &mut followup_rx, queued.as_ref())
-                    .await
-                    .expect("queued steering");
-            let RuntimeQueueCommand::Followup(command) = command else {
-                panic!("expected followup");
-            };
-            let FollowupCommand::ExecuteTurn { user_event, .. } = *command else {
-                panic!("expected persisted steering continuation");
-            };
-            let SessionEventKind::UserMessage { text, .. } = &user_event.kind else {
-                panic!("expected steering user event");
-            };
-            assert_eq!(text, expected);
-            assert_eq!(queued_steering.load(Ordering::Acquire), 1 - index);
-        }
-        let history = state
-            .sessions
-            .session_history(summary.id)
-            .await
-            .expect("history");
-        let messages = history
-            .iter()
-            .filter_map(|event| match &event.kind {
-                SessionEventKind::UserMessage { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(messages, ["first", "second"]);
+        assert_eq!(target.capabilities, vec!["process.execute"]);
+        assert_eq!(target.permission_category.as_deref(), Some("command"));
     }
 
     fn policy_metadata(

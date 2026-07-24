@@ -10,23 +10,11 @@ use bcode_config::{
 };
 use bcode_plugin_sdk::path::display;
 use bcode_session_models::{
-    LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus,
-    SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
-    SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
+    SessionLiveEventKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    ToolInvocationResult,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveToolPreviewState {
-    pub tool_name: String,
-    pub argument_bytes: usize,
-    pub preview: LiveToolArgumentPreview,
-    pub working_directory: Option<std::path::PathBuf>,
-    pub revision: u64,
-    pub snapshots_received: u64,
-    pub duplicates_skipped: u64,
-    pub truncated_snapshots: u64,
-}
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::event::MouseEvent;
 use bmux_tui::geometry::Rect;
@@ -46,19 +34,13 @@ use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
-use super::tool_render_projection::semantic_result_supersedes_live_preview;
-use super::transcript::{
-    TranscriptItem, TranscriptItemKind, live_tool_preview_anchor_item, streaming_tool_visual_item,
-    terminal_item_from_shared,
-};
+use super::transcript::{TranscriptItem, TranscriptItemKind, terminal_item_from_shared};
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_resident_window::{TranscriptResidentWindow, TranscriptWindowPolicy};
 use super::transcript_viewport::TranscriptViewport;
 
 const MANUAL_TRANSCRIPT_SCROLL_GRACE: Duration = Duration::from_millis(450);
-const LIVE_PREVIEW_FRAME_INVALIDATION_KEY: &str = "live-preview-frame";
-const LIVE_PREVIEW_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
@@ -70,21 +52,6 @@ const TOOL_ELAPSED_INVALIDATION_PREFIX: &str = "tool-elapsed";
 const TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL: Duration = Duration::from_secs(1);
 const RESIDENT_TRANSCRIPT_MAX_EVENTS: usize = 1_024;
 const RESIDENT_TRANSCRIPT_TARGET_EVENTS: usize = 512;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LivePreviewFrameState {
-    dirty: bool,
-    next_frame_at: Option<Instant>,
-}
-
-impl LivePreviewFrameState {
-    const fn new() -> Self {
-        Self {
-            dirty: false,
-            next_frame_at: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingKeyActivation {
@@ -273,19 +240,12 @@ pub struct BmuxApp {
     transcript_window: TranscriptResidentWindow,
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
-    streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
-    active_artifact_revisions: BTreeMap<(String, String, String), u64>,
     transient_contribution_items:
         BTreeMap<String, (u64, Option<crate::transcript::TranscriptItemId>)>,
-    live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
-    live_preview_revision: u64,
-    live_preview_frames_requested: u64,
-    elapsed_layout_revision: u64,
-    elapsed_dirty_visuals: BTreeSet<String>,
-    live_preview_duplicates_skipped: u64,
-    live_preview_truncated_snapshots: u64,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
+    elapsed_layout_revision: u64,
+    elapsed_dirty_visuals: BTreeSet<String>,
     viewport: TranscriptViewport,
     manual_transcript_scroll_until: Option<Instant>,
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
@@ -297,7 +257,6 @@ pub struct BmuxApp {
     submitted_user_message_following: SubmittedUserMessageFollowing,
     assistant_scroll_anchor: AssistantScrollAnchorState,
     active_tool_calls: BTreeSet<String>,
-    active_plugin_visuals: BTreeMap<String, bcode_session_models::PluginVisualDescriptor>,
     tool_activity_seen: bool,
     pending_assistant_stream_anchor: bool,
     pending_transcript_top_anchor_sequence: Option<u64>,
@@ -312,7 +271,6 @@ pub struct BmuxApp {
     diff_viewer_layout_override: Option<TuiDiffViewerLayout>,
     exit: ExitState,
     cursor: CursorBlink,
-    live_preview_frame: LivePreviewFrameState,
     pending_key_activation: Option<PendingKeyActivation>,
     plugin_presentation: Option<Arc<crate::plugin_tui::PluginTuiPresentation>>,
 }
@@ -404,7 +362,6 @@ struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
     working_directory: Option<std::path::PathBuf>,
-    request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,21 +374,6 @@ struct PermissionRequestInput<'a> {
     policy_source: Option<&'a str>,
     policy_reason: Option<&'a str>,
     application: SessionEventApplication,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinishedStreamedToolOutput {
-    PlainToolResult,
-    Visual,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StreamedToolResultContext {
-    index: Option<usize>,
-    columns: u16,
-    rows: u16,
-    started_at_ms: Option<u64>,
-    saw_output: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,18 +425,11 @@ impl BmuxApp {
             transcript_window: TranscriptResidentWindow::default(),
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
-            streamed_tool_results: BTreeMap::new(),
-            active_artifact_revisions: BTreeMap::new(),
             transient_contribution_items: BTreeMap::new(),
-            live_tool_previews: BTreeMap::new(),
-            live_preview_revision: 0,
-            live_preview_frames_requested: 0,
-            elapsed_layout_revision: 0,
-            elapsed_dirty_visuals: BTreeSet::new(),
-            live_preview_duplicates_skipped: 0,
-            live_preview_truncated_snapshots: 0,
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
+            elapsed_layout_revision: 0,
+            elapsed_dirty_visuals: BTreeSet::new(),
             viewport: TranscriptViewport::default(),
             manual_transcript_scroll_until: None,
             transcript_scroll_animation: None,
@@ -506,7 +441,6 @@ impl BmuxApp {
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
             active_tool_calls: BTreeSet::new(),
-            active_plugin_visuals: BTreeMap::new(),
             tool_activity_seen: false,
             pending_assistant_stream_anchor: false,
             pending_transcript_top_anchor_sequence: None,
@@ -521,7 +455,6 @@ impl BmuxApp {
             diff_viewer_layout_override: None,
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
-            live_preview_frame: LivePreviewFrameState::new(),
             pending_key_activation: None,
             plugin_presentation: None,
         };
@@ -968,13 +901,10 @@ impl BmuxApp {
         self.elapsed_layout_revision
     }
 
-    /// Return revision for layout-affecting transcript collection changes excluding targeted time labels.
+    /// Return revision for transcript collection changes.
     #[must_use]
-    pub const fn transcript_structural_projection_revision(&self) -> u64 {
-        self.transcript
-            .revision()
-            .saturating_add(self.live_preview_revision)
-            .saturating_add(self.live_preview_frames_requested)
+    pub const fn transcript_projection_revision(&self) -> u64 {
+        self.transcript.revision()
     }
 
     /// Drain transcript invocation identifiers whose elapsed-time label changed.
@@ -986,12 +916,6 @@ impl BmuxApp {
     #[must_use]
     pub const fn pending_submissions_projection_revision(&self) -> u64 {
         self.pending_submissions.revision()
-    }
-
-    /// Return live preview state by tool call id.
-    #[must_use]
-    pub const fn live_tool_previews(&self) -> &BTreeMap<String, LiveToolPreviewState> {
-        &self.live_tool_previews
     }
 
     /// Extend composer selection with an editor motion.
@@ -1279,12 +1203,6 @@ impl BmuxApp {
     #[cfg(test)]
     pub fn resident_tool_call_context_count(&self) -> usize {
         self.tool_call_contexts.keys().count()
-    }
-
-    /// Return resident streamed tool result context count.
-    #[cfg(test)]
-    pub fn resident_streamed_tool_result_count(&self) -> usize {
-        self.streamed_tool_results.keys().count()
     }
 
     /// Return whether older history may be available.
@@ -1611,7 +1529,6 @@ impl BmuxApp {
         self.scroll_mode = TranscriptScrollMode::TransitionToEntry { sticky: false };
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.active_tool_calls.clear();
-        self.active_plugin_visuals.clear();
         self.tool_activity_seen = false;
         self.pending_submissions.stage(text);
         self.input_history.reset_navigation();
@@ -2001,17 +1918,6 @@ impl BmuxApp {
         }
     }
 
-    /// Return active plugin visual descriptors by invocation id.
-    #[must_use]
-    pub fn active_plugin_visuals(
-        &self,
-    ) -> Vec<(String, bcode_session_models::PluginVisualDescriptor)> {
-        self.active_plugin_visuals
-            .iter()
-            .map(|(tool_call_id, visual)| (tool_call_id.clone(), visual.clone()))
-            .collect()
-    }
-
     fn active_tool_loop(&self) -> bool {
         !self.active_tool_calls.is_empty()
     }
@@ -2060,11 +1966,7 @@ impl BmuxApp {
         self.session_view.clear_history_window();
         self.transcript.replace(Vec::new());
         self.tool_call_contexts.clear();
-        self.live_tool_previews.clear();
-        self.streamed_tool_results.clear();
-        self.active_artifact_revisions.clear();
         self.active_tool_calls.clear();
-        self.active_plugin_visuals.clear();
         for event in &events {
             self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
@@ -2112,10 +2014,6 @@ impl BmuxApp {
         let referenced = referenced_tool_call_ids(self.transcript.items());
         self.tool_call_contexts
             .retain(|tool_call_id, _| referenced.contains(tool_call_id));
-        self.live_tool_previews
-            .retain(|tool_call_id, _| referenced.contains(tool_call_id));
-        self.streamed_tool_results.clear();
-        self.active_artifact_revisions.clear();
     }
 
     /// Prepend older history and preserve the current viewport.
@@ -2222,14 +2120,6 @@ impl BmuxApp {
                 self.viewport.preserve_for_append();
                 self.push_live_reasoning_delta(text, SessionEventApplication::Live);
             }
-            SessionLiveEventKind::ToolOutputDelta { event } => {
-                self.pending_visual_overflow_bottom = Some(
-                    self.viewport
-                        .bottom_row(self.transcript_layout.total_rows()),
-                );
-                self.viewport.preserve_for_append();
-                self.apply_tool_stream_event(event, SessionEventApplication::Live);
-            }
             SessionLiveEventKind::ToolContribution {
                 event: contribution,
             } => self.apply_live_contribution(
@@ -2238,25 +2128,6 @@ impl BmuxApp {
             ),
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_live_contribution(&envelope.contribution, envelope.placement);
-            }
-            SessionLiveEventKind::ToolArgumentPreview {
-                tool_call_id,
-                tool_name,
-                argument_bytes,
-                preview,
-                ..
-            } => {
-                self.pending_visual_overflow_bottom = Some(
-                    self.viewport
-                        .bottom_row(self.transcript_layout.total_rows()),
-                );
-                self.viewport.preserve_for_append();
-                self.apply_live_tool_argument_preview(
-                    tool_call_id,
-                    tool_name,
-                    *argument_bytes,
-                    preview,
-                );
             }
             SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
             SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
@@ -2304,7 +2175,6 @@ impl BmuxApp {
                 .insert(key, (contribution.sequence, None));
             return;
         }
-        let backs_active_visual = self.contribution_backs_active_visual(contribution);
         let backs_existing_contribution = contribution.artifact.as_ref().is_some_and(|artifact| {
             let Some(presentation) = self.plugin_presentation() else {
                 return false;
@@ -2325,7 +2195,7 @@ impl BmuxApp {
                         )
                 })
         });
-        let backs_canonical_visual = backs_active_visual || backs_existing_contribution;
+        let backs_canonical_visual = backs_existing_contribution;
         let has_renderer = self.contribution_has_renderer(contribution);
         match contribution.operation {
             bcode_session_models::ToolContributionOperation::Remove => {
@@ -2406,32 +2276,6 @@ impl BmuxApp {
         self.push_required_shared_terminal_item(event_sequence, "durable tool contribution");
     }
 
-    fn contribution_backs_active_visual(
-        &self,
-        contribution: &bcode_session_models::ToolContributionEvent,
-    ) -> bool {
-        let Some(artifact) = contribution.artifact.as_ref() else {
-            return false;
-        };
-        let Some(visual) = self.active_plugin_visuals.get(&contribution.invocation_id) else {
-            return false;
-        };
-        let Some(presentation) = self.plugin_presentation() else {
-            return false;
-        };
-        let producer_plugin_id = visual
-            .producer_plugin_id
-            .as_deref()
-            .unwrap_or(&contribution.producer_id);
-        presentation.accepts_artifact_reference(
-            producer_plugin_id,
-            &visual.schema,
-            visual.schema_version,
-            &artifact.reference_key,
-            artifact.content_type.as_deref(),
-        )
-    }
-
     #[allow(clippy::too_many_lines)]
     fn apply_session_event(&mut self, event: &SessionEvent, application: SessionEventApplication) {
         if event_breaks_sticky_entry_anchor(event) {
@@ -2450,7 +2294,6 @@ impl BmuxApp {
         match &event.kind {
             SessionEventKind::UserMessage { text, .. } => {
                 self.active_tool_calls.clear();
-                self.active_plugin_visuals.clear();
                 self.tool_activity_seen = false;
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
                 self.pending_assistant_stream_anchor = false;
@@ -2489,7 +2332,6 @@ impl BmuxApp {
                 tool_name,
                 arguments_json,
                 working_directory,
-                request_visual,
                 ..
             } => {
                 self.record_shared_active_tool_requested(tool_call_id);
@@ -2500,26 +2342,6 @@ impl BmuxApp {
                     tool_name,
                     arguments_json,
                     working_directory.clone(),
-                    request_visual.as_ref(),
-                );
-            }
-            SessionEventKind::ToolCallFinished {
-                tool_call_id,
-                result,
-                is_error,
-                semantic_result,
-                ..
-            } => {
-                if application.live_activity() {
-                    self.set_activity(ActivityState::PreparingFollowUpRequest);
-                }
-                self.finish_shared_active_tool_call(tool_call_id);
-                self.push_tool_result(
-                    tool_call_id,
-                    result,
-                    *is_error,
-                    semantic_result.as_ref(),
-                    application,
                 );
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
@@ -2534,9 +2356,6 @@ impl BmuxApp {
                     record.result.as_ref(),
                     application,
                 );
-            }
-            SessionEventKind::ToolInvocationStream { event } => {
-                self.apply_tool_stream_event(event, application);
             }
             SessionEventKind::PermissionRequested {
                 permission_id,
@@ -2676,9 +2495,6 @@ impl BmuxApp {
                     self.apply_tool_started(
                         &lifecycle.invocation_id,
                         &context.tool_name,
-                        None,
-                        None,
-                        Some(event.timestamp_ms),
                         application,
                     );
                 }
@@ -2763,12 +2579,6 @@ impl BmuxApp {
                 self.next_latest_bar_invalidation(now),
             ));
         }
-        if self.live_preview_frame.dirty {
-            requests.push(InvalidationRequest::new(
-                InvalidationKey::new(LIVE_PREVIEW_FRAME_INVALIDATION_KEY),
-                self.live_preview_frame.next_frame_at.unwrap_or(now),
-            ));
-        }
         if self.theme_transition_active(now) {
             requests.push(InvalidationRequest::new(
                 InvalidationKey::new(THEME_TRANSITION_INVALIDATION_KEY),
@@ -2796,10 +2606,6 @@ impl BmuxApp {
                 }
             } else if is_latest_bar_animation_invalidation(key) {
                 invalidation.merge(UiInvalidation::Paint)
-            } else if is_live_preview_frame_invalidation(key) {
-                self.live_preview_frame.dirty = false;
-                self.live_preview_frame.next_frame_at = None;
-                invalidation.merge(UiInvalidation::Layout)
             } else if is_theme_transition_invalidation(key) {
                 self.update_theme_animation(now);
                 if !self.theme_transition_active(now) {
@@ -2817,15 +2623,6 @@ impl BmuxApp {
                 invalidation
             }
         })
-    }
-
-    fn mark_live_preview_dirty(&mut self) {
-        self.live_preview_frame.dirty = true;
-        self.live_preview_frames_requested = self.live_preview_frames_requested.saturating_add(1);
-        if self.live_preview_frame.next_frame_at.is_none() {
-            self.live_preview_frame.next_frame_at =
-                Some(Instant::now() + LIVE_PREVIEW_FRAME_INTERVAL);
-        }
     }
 
     fn latest_bar_active(&self, now: Instant) -> bool {
@@ -3207,35 +3004,6 @@ impl BmuxApp {
             })
     }
 
-    fn shared_tool_output_item(&self, tool_call_id: &str) -> Option<TranscriptItem> {
-        self.session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find(|item| {
-                matches!(
-                    &item.kind,
-                    bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
-                    | bcode_session_view_models::TranscriptViewItemKind::ToolRequest { tool }
-                        if tool.tool_call_id == tool_call_id
-                            && tool.result.is_none()
-                            && tool.output.as_ref().is_some_and(|output| !output.text.is_empty())
-                )
-            })
-            .map(terminal_item_from_shared)
-            .filter(|item| {
-                matches!(
-                    item.kind(),
-                    TranscriptItemKind::ToolResult {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } if item_tool_call_id == tool_call_id
-                )
-            })
-    }
-
     fn shared_tool_result_item(&self, tool_call_id: &str) -> Option<TranscriptItem> {
         self.session_view
             .snapshot()
@@ -3328,21 +3096,8 @@ impl BmuxApp {
         tool_name: &str,
         arguments_json: &str,
         working_directory: Option<std::path::PathBuf>,
-        request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
     ) -> ToolCallContext {
         let shared_tool = self.session_view.snapshot().tools.get(tool_call_id);
-        let request_visual = request_visual
-            .cloned()
-            .or_else(|| {
-                shared_tool
-                    .and_then(|tool| tool.request_visual.as_ref())
-                    .map(|visual| visual.descriptor.clone())
-            })
-            .or_else(|| {
-                self.live_tool_previews
-                    .get(tool_call_id)
-                    .map(|state| state.preview.visual.clone())
-            });
         ToolCallContext {
             tool_name: shared_tool
                 .and_then(|tool| tool.tool_name.clone())
@@ -3353,7 +3108,6 @@ impl BmuxApp {
             working_directory: shared_tool
                 .and_then(|tool| tool.working_directory.clone())
                 .or(working_directory),
-            request_visual,
         }
     }
 
@@ -3398,19 +3152,16 @@ impl BmuxApp {
         tool_name: &str,
         arguments_json: &str,
         working_directory: Option<std::path::PathBuf>,
-        request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
     ) {
         let projected_context = self.projected_tool_request_context(
             tool_call_id,
             tool_name,
             arguments_json,
             working_directory,
-            request_visual,
         );
-        let effective_request_visual = projected_context.request_visual.clone();
         self.tool_call_contexts
             .insert(tool_call_id.to_owned(), projected_context.clone());
-        let mut item = self
+        let item = self
             .shared_tool_request_item(event_metadata.0, tool_call_id)
             .unwrap_or_else(|| {
                 panic!(
@@ -3418,48 +3169,6 @@ impl BmuxApp {
                     event_metadata.0
                 )
             });
-        if let Some(visual) = effective_request_visual.clone() {
-            item.set_tool_request_visual(visual, false);
-        }
-        if let Some(context) = self.streamed_tool_results.get(tool_call_id)
-            && let Some(mut visual) = effective_request_visual
-        {
-            enrich_tool_request_visual_runtime(
-                &mut visual,
-                tool_call_id,
-                Some(context.columns),
-                Some(context.rows),
-            );
-            item.set_tool_request_visual(visual, true);
-            item.set_tool_started_at_ms(context.started_at_ms);
-        }
-        let has_live_preview_anchor = self
-            .transcript
-            .iter()
-            .any(|item| item.is_live_preview_anchor_for(tool_call_id));
-        if has_live_preview_anchor && request_visual.is_none() {
-            self.finish_tool_request_preview(tool_call_id);
-            self.set_activity(ActivityState::RunningTool {
-                name: projected_context.tool_name.clone(),
-            });
-            self.status = tool_request_status(&projected_context.arguments_json)
-                .unwrap_or_else(|| "started".to_owned());
-            return;
-        }
-        if has_live_preview_anchor {
-            self.transcript.mutate_rev_find(
-                |existing| existing.is_live_preview_anchor_for(tool_call_id),
-                |existing| *existing = item,
-            );
-            self.live_tool_previews.remove(tool_call_id);
-            self.mark_live_preview_dirty();
-            self.set_activity(ActivityState::RunningTool {
-                name: projected_context.tool_name.clone(),
-            });
-            self.status = tool_request_status(&projected_context.arguments_json)
-                .unwrap_or_else(|| "started".to_owned());
-            return;
-        }
         let replaced = self.transcript.mutate_rev_find(
             |existing| {
                 matches!(
@@ -3548,7 +3257,7 @@ impl BmuxApp {
             "permission denied"
         };
         if !approved && let Some(tool_call_id) = self.permission_tool_call_id(permission_id) {
-            self.finish_tool_request_preview(&tool_call_id);
+            self.finish_tool_request_streaming(&tool_call_id);
         }
         status.clone_into(&mut self.status);
         let item = self
@@ -3595,93 +3304,6 @@ impl BmuxApp {
         None
     }
 
-    fn record_live_preview_state(
-        &mut self,
-        tool_call_id: &str,
-        tool_name: &str,
-        argument_bytes: usize,
-        preview: &LiveToolArgumentPreview,
-    ) -> bool {
-        let truncated = live_tool_preview_truncated(preview);
-        if let Some(state) = self.live_tool_previews.get_mut(tool_call_id) {
-            state.snapshots_received = state.snapshots_received.saturating_add(1);
-            if state.preview == *preview && state.argument_bytes == argument_bytes {
-                state.duplicates_skipped = state.duplicates_skipped.saturating_add(1);
-                self.live_preview_duplicates_skipped =
-                    self.live_preview_duplicates_skipped.saturating_add(1);
-                return false;
-            }
-            tool_name.clone_into(&mut state.tool_name);
-            state.argument_bytes = argument_bytes;
-            state.preview = preview.clone();
-            state.revision = state.revision.saturating_add(1);
-            if truncated {
-                state.truncated_snapshots = state.truncated_snapshots.saturating_add(1);
-                self.live_preview_truncated_snapshots =
-                    self.live_preview_truncated_snapshots.saturating_add(1);
-            }
-        } else {
-            self.live_tool_previews.insert(
-                tool_call_id.to_owned(),
-                LiveToolPreviewState {
-                    tool_name: tool_name.to_owned(),
-                    argument_bytes,
-                    preview: preview.clone(),
-                    working_directory: self
-                        .tool_call_contexts
-                        .get(tool_call_id)
-                        .and_then(|context| context.working_directory.clone()),
-                    revision: 1,
-                    snapshots_received: 1,
-                    duplicates_skipped: 0,
-                    truncated_snapshots: u64::from(truncated),
-                },
-            );
-            if truncated {
-                self.live_preview_truncated_snapshots =
-                    self.live_preview_truncated_snapshots.saturating_add(1);
-            }
-        }
-        self.live_preview_revision = self.live_preview_revision.saturating_add(1);
-        true
-    }
-
-    fn finish_live_tool_output(
-        &mut self,
-        tool_call_id: &str,
-        is_error: Option<bool>,
-    ) -> Option<FinishedStreamedToolOutput> {
-        let context = self.streamed_tool_results.get(tool_call_id)?;
-        if !context.saw_output && is_error.is_some() {
-            return None;
-        }
-        let index = context.index?;
-        let output_kind = self.transcript.get(index).map_or(
-            FinishedStreamedToolOutput::PlainToolResult,
-            |item| {
-                if matches!(
-                    item.kind(),
-                    TranscriptItemKind::ToolResult {
-                        artifact: Some(_),
-                        ..
-                    }
-                ) {
-                    FinishedStreamedToolOutput::Visual
-                } else {
-                    FinishedStreamedToolOutput::PlainToolResult
-                }
-            },
-        );
-        if let Some(item) = self.transcript.get_mut(index) {
-            if let Some(tool) = self.session_view.snapshot().tools.get(tool_call_id) {
-                item.set_tool_started_at_ms(tool.timing.started_at_ms);
-                item.set_tool_finished_at_ms(tool.timing.finished_at_ms);
-            }
-            item.finish_streaming();
-        }
-        Some(output_kind)
-    }
-
     fn update_tool_result_status(
         &mut self,
         tool_call_id: &str,
@@ -3715,37 +3337,6 @@ impl BmuxApp {
         semantic_result: Option<&ToolInvocationResult>,
         application: SessionEventApplication,
     ) {
-        if semantic_result.is_some()
-            && self
-                .streamed_tool_results
-                .get(tool_call_id)
-                .is_some_and(|context| context.index.is_some() && !context.saw_output)
-        {
-            self.remove_streamed_tool_result(tool_call_id);
-            self.streamed_tool_results.remove(tool_call_id);
-        }
-        if semantic_result.is_none() {
-            if self
-                .finish_live_tool_output(tool_call_id, Some(is_error))
-                .is_some()
-            {
-                self.update_tool_result_status(tool_call_id, is_error, application);
-                self.finish_tool_request_preview(tool_call_id);
-                return;
-            }
-        } else if self
-            .finish_live_tool_output(tool_call_id, Some(is_error))
-            .is_some()
-        {
-            if semantic_result.is_some_and(artifact_result_replaces_streamed_visual) {
-                self.remove_streamed_tool_result(tool_call_id);
-            } else {
-                self.update_tool_result_status(tool_call_id, is_error, application);
-                self.finish_tool_request_preview(tool_call_id);
-                return;
-            }
-        }
-        self.supersede_matching_live_preview(tool_call_id, semantic_result);
         let mut item = self
             .shared_tool_result_item(tool_call_id)
             .unwrap_or_else(|| {
@@ -3764,193 +3355,16 @@ impl BmuxApp {
         }
         self.transcript.push(item);
         self.update_tool_result_status(tool_call_id, is_error, application);
-        self.finish_tool_request_preview(tool_call_id);
-    }
-
-    fn apply_tool_stream_event(
-        &mut self,
-        event: &ToolInvocationStreamEvent,
-        application: SessionEventApplication,
-    ) {
-        match event {
-            ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id,
-                stream,
-                text,
-                ..
-            } => self.push_tool_output_delta(tool_call_id, *stream, text),
-            ToolInvocationStreamEvent::Status { message, .. } => {
-                if application.live_activity() {
-                    message.clone_into(&mut self.status);
-                }
-            }
-            ToolInvocationStreamEvent::VisualUpdate {
-                tool_call_id,
-                visual,
-                streaming,
-                ..
-            } => self.apply_tool_visual_update(tool_call_id, visual, *streaming),
-            ToolInvocationStreamEvent::ArtifactUpdate {
-                tool_call_id,
-                artifact_id,
-                reference_key,
-                revision,
-                ..
-            } => {
-                let key = (
-                    tool_call_id.clone(),
-                    artifact_id.clone(),
-                    reference_key.clone(),
-                );
-                if self
-                    .active_artifact_revisions
-                    .get(&key)
-                    .is_none_or(|current| revision > current)
-                {
-                    self.active_artifact_revisions.insert(key, *revision);
-                }
-            }
-            ToolInvocationStreamEvent::Started {
-                tool_call_id,
-                tool_name,
-                columns,
-                rows,
-                started_at_ms,
-                ..
-            } => self.apply_tool_started(
-                tool_call_id,
-                tool_name,
-                *columns,
-                *rows,
-                *started_at_ms,
-                application,
-            ),
-            ToolInvocationStreamEvent::LegacyPresentation { .. }
-            | ToolInvocationStreamEvent::LegacyTransientPruned { .. } => {
-                Self::legacy_discard_tool_presentation_stream_event();
-            }
-            ToolInvocationStreamEvent::Finished {
-                tool_call_id,
-                is_error,
-                finished_at_ms,
-                ..
-            } => self.apply_tool_finished(tool_call_id, *is_error, *finished_at_ms, application),
-        }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    fn active_artifact_revision(
-        &self,
-        tool_call_id: &str,
-        artifact_id: &str,
-        reference_key: &str,
-    ) -> Option<u64> {
-        self.active_artifact_revisions
-            .get(&(
-                tool_call_id.to_owned(),
-                artifact_id.to_owned(),
-                reference_key.to_owned(),
-            ))
-            .copied()
-    }
-
-    fn apply_tool_visual_update(
-        &mut self,
-        tool_call_id: &str,
-        visual: &bcode_session_models::PluginVisualDescriptor,
-        streaming: bool,
-    ) {
-        if streaming {
-            self.active_plugin_visuals
-                .insert(tool_call_id.to_owned(), visual.clone());
-        } else {
-            self.active_plugin_visuals.remove(tool_call_id);
-        }
-        let tool_name = self
-            .tool_call_contexts
-            .get(tool_call_id)
-            .map(|context| context.tool_name.as_str());
-        let working_directory = self
-            .tool_call_contexts
-            .get(tool_call_id)
-            .and_then(|context| context.working_directory.as_deref());
-        let mut item = streaming_tool_visual_item(
-            tool_call_id,
-            tool_name,
-            working_directory,
-            visual,
-            streaming,
-        );
-        if let Some(context) = self.streamed_tool_results.get(tool_call_id) {
-            item.set_tool_started_at_ms(context.started_at_ms);
-        }
-        item.set_tool_timeout_ms(tool_visual_timeout_ms(visual));
-        let index = self.transcript.upsert_tool_visual_item(item);
-        self.live_tool_previews.remove(tool_call_id);
-        self.mark_live_preview_dirty();
-        let context = self
-            .streamed_tool_results
-            .entry(tool_call_id.to_owned())
-            .or_insert_with(|| StreamedToolResultContext {
-                index: Some(index),
-                columns: 0,
-                rows: 0,
-                started_at_ms: None,
-                saw_output: true,
-            });
-        context.index = Some(index);
-        context.saw_output = true;
+        self.finish_tool_request_streaming(tool_call_id);
     }
 
     fn apply_tool_started(
         &mut self,
         tool_call_id: &str,
         tool_name: &str,
-        columns: Option<u16>,
-        rows: Option<u16>,
-        started_at_ms: Option<u64>,
         application: SessionEventApplication,
     ) {
-        let context = self
-            .streamed_tool_results
-            .entry(tool_call_id.to_owned())
-            .or_insert_with(|| StreamedToolResultContext {
-                index: None,
-                columns: columns.unwrap_or(0),
-                rows: rows.unwrap_or(0),
-                started_at_ms,
-                saw_output: false,
-            });
-        context.columns = columns.unwrap_or(context.columns);
-        context.rows = rows.unwrap_or(context.rows);
-        context.started_at_ms = started_at_ms;
         self.active_tool_calls.insert(tool_call_id.to_owned());
-        if let Some(mut visual) = self
-            .tool_call_contexts
-            .get(tool_call_id)
-            .and_then(|context| context.request_visual.clone())
-        {
-            enrich_tool_request_visual_runtime(&mut visual, tool_call_id, columns, rows);
-            if let Some(context) = self.tool_call_contexts.get_mut(tool_call_id) {
-                context.request_visual = Some(visual.clone());
-            }
-            self.transcript.mutate_rev_find(
-                |item| {
-                    matches!(
-                        item.kind(),
-                        TranscriptItemKind::ToolRequest {
-                            tool_call_id: item_tool_call_id,
-                            ..
-                        } if item_tool_call_id == tool_call_id
-                    )
-                },
-                |item| item.set_tool_request_visual(visual.clone(), true),
-            );
-            self.active_plugin_visuals
-                .entry(tool_call_id.to_owned())
-                .or_insert(visual);
-        }
         self.tool_activity_seen = true;
         if application.live_activity() {
             self.set_activity_for_tool_call(tool_call_id, tool_name);
@@ -3960,149 +3374,6 @@ impl BmuxApp {
                 tool_name.clone_into(&mut self.status);
             }
         }
-    }
-
-    fn apply_tool_finished(
-        &mut self,
-        tool_call_id: &str,
-        is_error: bool,
-        finished_at_ms: Option<u64>,
-        application: SessionEventApplication,
-    ) {
-        self.active_tool_calls.remove(tool_call_id);
-        self.active_plugin_visuals.remove(tool_call_id);
-        if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id)
-            && let Some(index) = context.index
-            && let Some(item) = self.transcript.get_mut(index)
-        {
-            item.set_tool_started_at_ms(context.started_at_ms);
-            item.set_tool_finished_at_ms(finished_at_ms);
-            item.finish_streaming();
-        }
-        self.finish_tool_request_preview(tool_call_id);
-        if is_error {
-            if application.live_activity() {
-                "failed".clone_into(&mut self.status);
-            }
-        } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-            if application.live_activity() {
-                self.status = format!("applied · {status}");
-            }
-        } else if application.live_activity() {
-            "finished".clone_into(&mut self.status);
-        }
-    }
-
-    const fn legacy_discard_tool_presentation_stream_event() {}
-
-    fn push_tool_output_delta(
-        &mut self,
-        tool_call_id: &str,
-        _stream: ToolOutputStream,
-        text: &str,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        let shared_item = self.shared_tool_output_item(tool_call_id);
-        if let Some(context) = self.streamed_tool_results.get(tool_call_id)
-            && let Some(index) = context.index
-            && let Some(item) = self.transcript.get_mut(index)
-        {
-            self.tool_activity_seen = true;
-            let shared_item = shared_item.unwrap_or_else(|| {
-                panic!("shared session view must project tool output delta for {tool_call_id}")
-            });
-            item.copy_tool_timing_from(&shared_item);
-            item.replace_text(shared_item.text);
-            return;
-        }
-        self.tool_activity_seen = true;
-        let item = shared_item.unwrap_or_else(|| {
-            panic!("shared session view must project tool output delta for {tool_call_id}")
-        });
-        self.transcript.push(item);
-        self.streamed_tool_results.insert(
-            tool_call_id.to_owned(),
-            StreamedToolResultContext {
-                index: Some(self.transcript.len().saturating_sub(1)),
-                columns: 0,
-                rows: 0,
-                started_at_ms: None,
-                saw_output: true,
-            },
-        );
-    }
-
-    fn remove_streamed_tool_result(&mut self, tool_call_id: &str) {
-        self.transcript.retain(|item| {
-            !matches!(
-                item.kind(),
-                TranscriptItemKind::ToolResult {
-                    tool_call_id: item_tool_call_id,
-                    ..
-                } if item_tool_call_id == tool_call_id
-            )
-        });
-    }
-
-    fn supersede_matching_live_preview(
-        &mut self,
-        tool_call_id: &str,
-        semantic_result: Option<&ToolInvocationResult>,
-    ) {
-        let superseded = self
-            .live_tool_previews
-            .get(tool_call_id)
-            .is_some_and(|state| {
-                semantic_result_supersedes_live_preview(
-                    tool_call_id,
-                    &state.preview,
-                    semantic_result,
-                )
-            });
-        if !superseded {
-            return;
-        }
-        self.live_tool_previews.remove(tool_call_id);
-        self.transcript
-            .retain(|item| !item.is_live_preview_anchor_for(tool_call_id));
-        self.mark_live_preview_dirty();
-    }
-
-    fn apply_live_tool_argument_preview(
-        &mut self,
-        tool_call_id: &str,
-        tool_name: &str,
-        argument_bytes: usize,
-        preview: &LiveToolArgumentPreview,
-    ) {
-        if !self.record_live_preview_state(tool_call_id, tool_name, argument_bytes, preview) {
-            return;
-        }
-        self.ensure_live_tool_preview_anchor(tool_call_id, tool_name);
-        let bytes = format_provider_bytes(argument_bytes);
-        let status = preview.streaming_status.clone().map_or_else(
-            || format!("streaming {tool_name} · {bytes} received"),
-            |status| render_visual_status_template(&status, preview, &bytes),
-        );
-        self.set_activity(ActivityState::ProviderStream {
-            detail: status.clone(),
-        });
-        self.status = status;
-        self.mark_live_preview_dirty();
-    }
-
-    fn ensure_live_tool_preview_anchor(&mut self, tool_call_id: &str, tool_name: &str) {
-        if self
-            .transcript
-            .iter()
-            .any(|item| item.is_live_preview_anchor_for(tool_call_id))
-        {
-            return;
-        }
-        self.transcript
-            .push(live_tool_preview_anchor_item(tool_call_id, tool_name));
     }
 
     fn permission_tool_call_id(&self, permission_id: &str) -> Option<String> {
@@ -4130,7 +3401,7 @@ impl BmuxApp {
             })
     }
 
-    fn finish_tool_request_preview(&mut self, tool_call_id: &str) {
+    fn finish_tool_request_streaming(&mut self, tool_call_id: &str) {
         self.transcript.mutate_rev_find(
             |item| {
                 matches!(
@@ -4139,7 +3410,7 @@ impl BmuxApp {
                         tool_call_id: item_tool_call_id,
                         ..
                     } if item_tool_call_id == tool_call_id
-                ) || item.is_live_preview_anchor_for(tool_call_id)
+                )
             },
             TranscriptItem::finish_streaming,
         );
@@ -4362,8 +3633,7 @@ impl BmuxApp {
             SessionTracePayload::ToolInvocationFinished { .. } => {
                 self.set_activity(ActivityState::PreparingFollowUpRequest);
             }
-            SessionTracePayload::ToolPolicyEvaluated { .. }
-            | SessionTracePayload::ToolInvocationStreamEvent(_) => {}
+            SessionTracePayload::ToolPolicyEvaluated { .. } => {}
         }
     }
 
@@ -4493,10 +3763,6 @@ impl BmuxApp {
     }
 }
 
-const fn artifact_result_replaces_streamed_visual(result: &ToolInvocationResult) -> bool {
-    matches!(result, ToolInvocationResult::Artifact { .. })
-}
-
 fn tool_result_timed_out(result: &ToolInvocationResult) -> Option<bool> {
     let ToolInvocationResult::Artifact { artifact } = result else {
         return None;
@@ -4505,14 +3771,6 @@ fn tool_result_timed_out(result: &ToolInvocationResult) -> Option<bool> {
         .metadata
         .get("timed_out")
         .and_then(serde_json::Value::as_bool)
-}
-
-fn tool_visual_timeout_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
-    visual
-        .payload
-        .get("_bcode_runtime")
-        .and_then(|runtime| runtime.get("timeout_ms"))
-        .and_then(serde_json::Value::as_u64)
 }
 
 pub const fn composer_policy() -> TextInputPolicy {
@@ -4536,10 +3794,6 @@ fn tool_elapsed_invalidation_invocation_id(key: &InvalidationKey) -> Option<&str
 
 fn is_latest_bar_animation_invalidation(key: &InvalidationKey) -> bool {
     key.as_str() == LATEST_BAR_ANIMATION_INVALIDATION_KEY
-}
-
-fn is_live_preview_frame_invalidation(key: &InvalidationKey) -> bool {
-    key.as_str() == LIVE_PREVIEW_FRAME_INVALIDATION_KEY
 }
 
 fn is_theme_transition_invalidation(key: &InvalidationKey) -> bool {
@@ -4864,56 +4118,6 @@ fn format_usd_micros(micros: u64) -> String {
     }
 }
 
-fn render_visual_status_template(
-    template: &str,
-    preview: &LiveToolArgumentPreview,
-    bytes: &str,
-) -> String {
-    let mut rendered = template.replace(concat!("{", "bytes", "}"), bytes);
-    if let Some(object) = preview.visual.payload.as_object() {
-        for (key, value) in object {
-            if let Some(value) = value.as_str() {
-                rendered = rendered.replace(&format!("{{{key}}}"), value);
-            }
-        }
-    }
-    clean_unresolved_status_placeholders(&rendered)
-}
-
-fn clean_unresolved_status_placeholders(value: &str) -> String {
-    let mut cleaned = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '{' {
-            let mut placeholder = String::new();
-            let mut closed = false;
-            for next in chars.by_ref() {
-                if next == '}' {
-                    closed = true;
-                    break;
-                }
-                placeholder.push(next);
-            }
-            if closed && !placeholder.is_empty() {
-                continue;
-            }
-            cleaned.push('{');
-            cleaned.push_str(&placeholder);
-            if closed {
-                cleaned.push('}');
-            }
-        } else {
-            cleaned.push(ch);
-        }
-    }
-    cleaned
-        .split('·')
-        .map(|segment| segment.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
 fn format_provider_bytes(bytes: usize) -> String {
     const KIB: usize = 1024;
     const MIB: usize = KIB * 1024;
@@ -4936,50 +4140,10 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
 }
 
-fn enrich_tool_request_visual_runtime(
-    visual: &mut bcode_session_models::PluginVisualDescriptor,
-    tool_call_id: &str,
-    columns: Option<u16>,
-    rows: Option<u16>,
-) {
-    let runtime = visual
-        .payload
-        .as_object_mut()
-        .map(|payload| {
-            payload
-                .entry("_bcode_runtime")
-                .or_insert_with(|| serde_json::json!({}))
-        })
-        .and_then(serde_json::Value::as_object_mut);
-    if let Some(runtime) = runtime {
-        runtime.insert(
-            "live_state_key".to_owned(),
-            serde_json::Value::String(tool_call_id.to_owned()),
-        );
-        if let Some(columns) = columns {
-            runtime.insert("columns".to_owned(), serde_json::json!(columns));
-        }
-        if let Some(rows) = rows {
-            runtime.insert("rows".to_owned(), serde_json::json!(rows));
-        }
-        runtime.insert(
-            "output".to_owned(),
-            serde_json::Value::String(String::new()),
-        );
-        runtime.insert("streaming".to_owned(), serde_json::Value::Bool(true));
-    }
-}
-
-const fn live_tool_preview_truncated(_preview: &LiveToolArgumentPreview) -> bool {
-    false
-}
-
 const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
     matches!(
         &event.kind,
-        SessionEventKind::ToolCallRequested { .. }
-            | SessionEventKind::ToolInvocationStream { .. }
-            | SessionEventKind::PermissionRequested { .. }
+        SessionEventKind::ToolCallRequested { .. } | SessionEventKind::PermissionRequested { .. }
     )
 }
 
@@ -4988,7 +4152,6 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
     for item in items {
         match item.kind() {
             TranscriptItemKind::ToolRequest { tool_call_id, .. }
-            | TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. }
             | TranscriptItemKind::ToolResult { tool_call_id, .. }
             | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
                 ids.insert(tool_call_id.clone());
@@ -5016,7 +4179,6 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::ToolCallRequested { .. }
-        | SessionEventKind::ToolCallFinished { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. }
         | SessionEventKind::PermissionRequested { .. }
         | SessionEventKind::PermissionResolved { .. }
@@ -5036,13 +4198,12 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ToolExchangeRequested { .. }
         | SessionEventKind::ToolExchangeResolved { .. }
         | SessionEventKind::ToolInvocationLifecycle { .. }
-        | SessionEventKind::ToolInvocationStream { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::PluginStatusNote { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. }
         | SessionEventKind::ModelTurnFinished { .. }
-        | SessionEventKind::LegacyEvent { .. } => true,
+        | SessionEventKind::OpaqueEvent { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
         SessionEventKind::SessionCreated { .. }
         | SessionEventKind::ClientAttached { .. }
@@ -5172,149 +4333,6 @@ mod tests {
             bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
                 if message.text == "live"
         ));
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn shared_projection_matches_tui_semantics_for_migration_slices() {
-        let session_id = bcode_session_models::SessionId::new();
-        let event = |sequence, kind| bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        let events = [
-            event(
-                1,
-                SessionEventKind::AssistantReasoningMessage {
-                    text: "reasoned".to_owned(),
-                },
-            ),
-            event(
-                2,
-                SessionEventKind::ToolCallRequested {
-                    tool_call_id: "tool-1".to_owned(),
-                    producer_plugin_id: Some("shell".to_owned()),
-                    tool_name: "shell.run".to_owned(),
-                    arguments_json: "{}".to_owned(),
-                    working_directory: None,
-                    request_visual: None,
-                    legacy_request_presentation: None,
-                },
-            ),
-            event(
-                3,
-                SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "tool-1".to_owned(),
-                        sequence: 1,
-                        stream: ToolOutputStream::Stdout,
-                        text: "tool output".to_owned(),
-                        byte_len: 11,
-                    },
-                },
-            ),
-            event(
-                4,
-                SessionEventKind::PermissionRequested {
-                    permission_id: "permission-1".to_owned(),
-                    tool_call_id: "tool-1".to_owned(),
-                    producer_plugin_id: Some("shell".to_owned()),
-                    tool_name: "shell.run".to_owned(),
-                    arguments_json: "{}".to_owned(),
-                    legacy_request_presentation: None,
-                    batch: None,
-                    policy_source: None,
-                    policy_reason: None,
-                },
-            ),
-            event(
-                5,
-                SessionEventKind::PermissionResolved {
-                    permission_id: "permission-1".to_owned(),
-                    approved: true,
-                },
-            ),
-            event(
-                6,
-                SessionEventKind::RuntimeWorkStarted {
-                    work_id: bcode_session_models::WorkId::new("work-1"),
-                    kind: bcode_session_models::RuntimeWorkKind::Tool,
-                    label: "shell".to_owned(),
-                    tool_call_id: Some("tool-1".to_owned()),
-                    plugin_id: Some("shell".to_owned()),
-                    service_interface: None,
-                    operation: None,
-                    parent_work_id: None,
-                    started_at_ms: Some(6),
-                    cancellable: true,
-                },
-            ),
-            event(
-                7,
-                SessionEventKind::RuntimeWorkProgress {
-                    work_id: bcode_session_models::WorkId::new("work-1"),
-                    message: "halfway".to_owned(),
-                    completed_units: Some(1),
-                    total_units: Some(2),
-                    progress_at_ms: Some(7),
-                },
-            ),
-        ];
-        let mut app = BmuxApp::new_with_history(Some(session_id), &events[..5], &[], false);
-        for event in &events[5..] {
-            app.absorb_session_event(event);
-        }
-        let legacy = app.transcript();
-        let shared = app.session_view_snapshot();
-
-        assert!(legacy.iter().any(|item| matches!(
-            item.kind(),
-            super::super::transcript::TranscriptItemKind::ReasoningMessage
-        )));
-        assert!(shared.transcript.items.iter().any(|item| matches!(
-            &item.kind,
-            bcode_session_view_models::TranscriptViewItemKind::ReasoningMessage { message }
-                if message.text == "reasoned"
-        )));
-        assert!(legacy.iter().any(|item| matches!(
-            item.kind(),
-            super::super::transcript::TranscriptItemKind::ToolRequest { tool_call_id, .. }
-                if tool_call_id == "tool-1"
-        )));
-        assert_eq!(
-            shared
-                .tools
-                .get("tool-1")
-                .and_then(|tool| tool.output.as_ref())
-                .map(|output| output.text.as_str()),
-            Some("tool output")
-        );
-        assert!(legacy.iter().any(|item| matches!(
-            item.kind(),
-            super::super::transcript::TranscriptItemKind::PermissionResult { approved: true }
-        )));
-        assert!(shared.permissions.is_empty());
-        assert!(shared.transcript.items.iter().any(|item| matches!(
-            &item.kind,
-            bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
-                if permission.permission_id == "permission-1"
-                    && permission.resolved
-                    && permission.approved == Some(true)
-        )));
-        assert_eq!(
-            bcode_session_view_models::runtime_work_status_label(&shared.runtime_work).as_deref(),
-            Some("running tool: shell — halfway")
-        );
-        assert!(shared.runtime_work.iter().any(|work| {
-            work.work_id == bcode_session_models::WorkId::new("work-1")
-                && work.message.as_deref() == Some("halfway")
-                && work.completed_units == Some(1)
-                && work.total_units == Some(2)
-        }));
     }
 
     #[test]
@@ -6395,14 +5413,15 @@ mod tests {
 
         app.absorb_session_event(&event(
             2,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "tool-shared".to_owned(),
-                result: "shared result".to_owned(),
-                is_error: false,
-                semantic_result: Some(ToolInvocationResult::Text {
-                    text: "shared result".to_owned(),
-                }),
-                output: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "tool-shared".to_owned(),
+                    model_output: "shared result".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "shared result".to_owned(),
+                    }),
+                },
             },
         ));
 
@@ -6469,53 +5488,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_delta_consumes_shared_projection_text() {
-        let session_id = SessionId::new();
-        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
-
-        app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
-        app.absorb_session_event(&event(
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "tool-shared".to_owned(),
-                    sequence: 1,
-                    stream: ToolOutputStream::Stdout,
-                    text: "hello ".to_owned(),
-                    byte_len: 6,
-                },
-            },
-        ));
-        app.absorb_session_event(&event(
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "tool-shared".to_owned(),
-                    sequence: 2,
-                    stream: ToolOutputStream::Stdout,
-                    text: "world".to_owned(),
-                    byte_len: 5,
-                },
-            },
-        ));
-
-        let shared = app
-            .shared_tool_output_item("tool-shared")
-            .expect("shared tool output item");
-        assert_eq!(shared.text(), "hello world");
-        let actual = app
-            .transcript()
-            .iter()
-            .last()
-            .expect("terminal output item");
-        assert_eq!(actual.role(), shared.role());
-        assert_eq!(actual.text(), shared.text());
-        assert_eq!(actual.kind(), shared.kind());
-        assert!(actual.streaming());
-    }
-
-    #[test]
     fn tool_result_status_consumes_shared_projection() {
         let session_id = SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -6524,14 +5496,15 @@ mod tests {
         app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
         app.absorb_session_event(&event(
             2,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "tool-shared".to_owned(),
-                result: "shared failure".to_owned(),
-                is_error: true,
-                semantic_result: Some(ToolInvocationResult::Text {
-                    text: "shared failure".to_owned(),
-                }),
-                output: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "tool-shared".to_owned(),
+                    model_output: "shared failure".to_owned(),
+                    is_error: true,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "shared failure".to_owned(),
+                    }),
+                },
             },
         ));
 
@@ -6571,14 +5544,15 @@ mod tests {
         app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
         app.absorb_session_event(&event(
             2,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "tool-shared".to_owned(),
-                result: "shared result".to_owned(),
-                is_error: false,
-                semantic_result: Some(ToolInvocationResult::Text {
-                    text: "shared result".to_owned(),
-                }),
-                output: None,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "tool-shared".to_owned(),
+                    model_output: "shared result".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "shared result".to_owned(),
+                    }),
+                },
             },
         ));
 
@@ -6757,8 +5731,6 @@ mod tests {
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"printf shared"}"#.to_owned(),
             working_directory: None,
-            request_visual: None,
-            legacy_request_presentation: None,
         }
     }
 
@@ -6769,7 +5741,6 @@ mod tests {
             producer_plugin_id: Some("bcode.shell".to_owned()),
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"printf shared"}"#.to_owned(),
-            legacy_request_presentation: None,
             batch: None,
             policy_source: Some("ask".to_owned()),
             policy_reason: Some("needs confirmation".to_owned()),
@@ -6800,102 +5771,6 @@ mod tests {
             text: "plugin status".to_owned(),
             metadata: BTreeMap::new(),
         }
-    }
-
-    #[test]
-    fn tool_started_enriches_request_visual_for_artifact_driven_live_rendering() {
-        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-        let session_id = SessionId::new();
-        let event = |sequence, kind| bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        app.absorb_session_event(&event(
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call".to_owned(),
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                tool_name: "shell.run".to_owned(),
-                arguments_json: r#"{"command":"printf hello"}"#.to_owned(),
-                working_directory: None,
-                request_visual: Some(bcode_session_models::PluginVisualDescriptor {
-                    visual_id: None,
-                    producer_plugin_id: Some("bcode.shell".to_owned()),
-                    schema: "bcode.tool.request.shell.run".to_owned(),
-                    schema_version: 1,
-                    title: Some("Shell command".to_owned()),
-                    subtitle: None,
-                    payload: serde_json::json!({"command": "printf hello"}),
-                }),
-                legacy_request_presentation: None,
-            },
-        ));
-        app.absorb_session_event(&event(
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 1,
-                    terminal: true,
-                    columns: Some(91),
-                    rows: Some(37),
-                    started_at_ms: None,
-                },
-            },
-        ));
-        let visuals = app.active_plugin_visuals();
-        let runtime = visuals[0]
-            .1
-            .payload
-            .get("_bcode_runtime")
-            .expect("runtime metadata");
-        assert_eq!(
-            runtime
-                .get("live_state_key")
-                .and_then(serde_json::Value::as_str),
-            Some("call")
-        );
-        assert_eq!(
-            runtime.get("columns").and_then(serde_json::Value::as_u64),
-            Some(91)
-        );
-        assert_eq!(
-            runtime.get("rows").and_then(serde_json::Value::as_u64),
-            Some(37)
-        );
-        assert_eq!(
-            runtime
-                .get("streaming")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            runtime.get("output").and_then(serde_json::Value::as_str),
-            Some("")
-        );
-        let request_runtime = app
-            .transcript()
-            .iter()
-            .find_map(|item| match item.kind() {
-                TranscriptItemKind::ToolRequest {
-                    request_visual: Some(visual),
-                    ..
-                } => visual.payload.get("_bcode_runtime"),
-                _ => None,
-            })
-            .expect("transcript request runtime metadata");
-        assert_eq!(
-            request_runtime
-                .get("live_state_key")
-                .and_then(serde_json::Value::as_str),
-            Some("call")
-        );
-        assert!(app.transcript()[0].streaming());
     }
 
     #[test]
@@ -6977,66 +5852,6 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_start_enriches_the_canonical_tool_request_visual() {
-        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-        let session_id = bcode_session_models::SessionId::new();
-        let event = |sequence, kind| bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        app.absorb_session_event(&event(
-            1,
-            bcode_session_models::SessionEventKind::ToolCallRequested {
-                tool_call_id: "call".to_owned(),
-                tool_name: "shell.run".to_owned(),
-                arguments_json: "{\"command\":\"echo test\"}".to_owned(),
-                working_directory: None,
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                request_visual: Some(bcode_session_models::PluginVisualDescriptor {
-                    visual_id: None,
-                    producer_plugin_id: Some("bcode.shell".to_owned()),
-                    schema: "bcode.tool.request.shell.run".to_owned(),
-                    schema_version: 1,
-                    title: None,
-                    subtitle: None,
-                    payload: serde_json::json!({"command":"echo test"}),
-                }),
-                legacy_request_presentation: None,
-            },
-        ));
-        app.absorb_session_event(&event(
-            2,
-            bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
-                event: bcode_session_models::ToolInvocationLifecycleEvent {
-                    invocation_id: "call".to_owned(),
-                    sequence: 0,
-                    stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
-                    message: None,
-                    metadata: serde_json::Value::Null,
-                },
-            },
-        ));
-
-        let context = app
-            .tool_call_contexts
-            .get("call")
-            .expect("tool call context");
-        assert_eq!(
-            context
-                .request_visual
-                .as_ref()
-                .and_then(|visual| visual.payload.get("_bcode_runtime"))
-                .and_then(|runtime| runtime.get("live_state_key"))
-                .and_then(serde_json::Value::as_str),
-            Some("call")
-        );
-    }
-
-    #[test]
     fn legacy_shell_contribution_has_no_terminal_json_fallback() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         app.absorb_session_event(&bcode_session_models::SessionEvent {
@@ -7061,37 +5876,5 @@ mod tests {
             },
         });
         assert!(app.transcript().is_empty());
-    }
-
-    #[test]
-    fn active_artifact_revisions_ignore_stale_and_duplicate_updates() {
-        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-        let event = |revision| SessionLiveEvent {
-            session_id: SessionId::new(),
-            kind: SessionLiveEventKind::ToolOutputDelta {
-                event: ToolInvocationStreamEvent::ArtifactUpdate {
-                    tool_call_id: "call".to_owned(),
-                    sequence: revision,
-                    artifact_id: "artifact".to_owned(),
-                    reference_key: "recording".to_owned(),
-                    producer_plugin_id: "plugin".to_owned(),
-                    schema: "plugin.recording".to_owned(),
-                    schema_version: 1,
-                    content_type: None,
-                    storage_uri: String::new(),
-                    committed_bytes: revision,
-                    revision,
-                    availability: None,
-                    finalized: false,
-                },
-            },
-        };
-        app.absorb_session_live_event(&event(3));
-        app.absorb_session_live_event(&event(2));
-        app.absorb_session_live_event(&event(3));
-        assert_eq!(
-            app.active_artifact_revision("call", "artifact", "recording"),
-            Some(3)
-        );
     }
 }

@@ -23,6 +23,7 @@ impl TranscriptDocument {
     }
 
     /// Return item count.
+    #[cfg(test)]
     #[must_use]
     pub const fn len(&self) -> usize {
         self.items.len()
@@ -40,6 +41,7 @@ impl TranscriptDocument {
     }
 
     /// Return a mutable item by index and bump the collection revision if it exists.
+    #[cfg(test)]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut TranscriptItem> {
         self.bump_revision();
         self.items.get_mut(index)
@@ -84,13 +86,6 @@ impl TranscriptDocument {
     pub fn finish_streaming_item(&mut self, role: &'static str, text: &str) {
         super::transcript::finish_streaming_transcript_item(&mut self.items, role, text);
         self.bump_revision();
-    }
-
-    /// Upsert a plugin visual item and bump the collection revision.
-    pub fn upsert_tool_visual_item(&mut self, item: TranscriptItem) -> usize {
-        let index = super::transcript::upsert_tool_visual_item(&mut self.items, item);
-        self.bump_revision();
-        index
     }
 
     /// Push a transcript item and bump the collection revision.

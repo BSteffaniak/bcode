@@ -104,6 +104,20 @@ fn progress_lifecycle_event(
     }
 }
 
+fn ocr_policy_preparation(definition: &ToolDefinition) -> bcode_plugin_sdk::ToolPolicyPreparation {
+    let preparation = bcode_plugin_sdk::ToolPolicyPreparation::read_only();
+    if definition.name == "ocr.extract" {
+        preparation.with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
+            aliases: vec!["read".to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: vec!["ocr".to_string(), "read".to_string()],
+            permission_category: Some("read".to_string()),
+        })
+    } else {
+        preparation
+    }
+}
+
 impl OcrPlugin {
     fn invoke_tool_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         let request = &context.request;
@@ -112,7 +126,7 @@ impl OcrPlugin {
             bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
                 request,
                 [extract_tool_definition(), status_tool_definition()],
-                |_request, _definition| Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly),
+                |_request, definition| Ok(ocr_policy_preparation(definition)),
             ),
             OP_INVOKE_TOOL => self.invoke_tool(request, context.events),
             _ => ServiceResponse::error("unsupported_operation", "unsupported tool operation"),
@@ -629,17 +643,6 @@ fn extract_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata {
-            aliases: vec!["read".to_string()],
-            compatibility_aliases: Vec::new(),
-            capabilities: vec!["ocr".to_string(), "read".to_string()],
-            permission_category: Some("read".to_string()),
-        },
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("extracting OCR text".to_string()),
-            request_visual: None
-        },
     }
 }
 
@@ -648,12 +651,6 @@ fn status_tool_definition() -> ToolDefinition {
         name: "ocr.status".to_string(),
         description: "Report OCR engine availability and default OCR configuration.".to_string(),
         input_schema: json!({ "type": "object", "properties": {} }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("checking OCR status".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -890,14 +887,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ocr_tools_remove_legacy_request_visuals() {
+    fn ocr_tools_emit_request_contributions() {
         for definition in [extract_tool_definition(), status_tool_definition()] {
-            assert!(
-                definition.ui.request_visual.is_none(),
-                "{}",
-                definition.name
-            );
+            let encoded = serde_json::to_value(definition).expect("tool definition encodes");
+            assert!(encoded.get("ui").is_none());
         }
+    }
+
+    #[test]
+    fn ocr_owner_prepares_catalog_policy_identity() {
+        let extract = ocr_policy_preparation(&extract_tool_definition());
+        assert_eq!(extract.identity.aliases, vec!["read"]);
+        assert_eq!(extract.identity.capabilities, vec!["ocr", "read"]);
+        assert_eq!(
+            extract.identity.permission_category.as_deref(),
+            Some("read")
+        );
+        let status = ocr_policy_preparation(&status_tool_definition());
+        assert_eq!(
+            status.identity,
+            bcode_plugin_sdk::ToolPolicyIdentity::default()
+        );
     }
 
     #[test]

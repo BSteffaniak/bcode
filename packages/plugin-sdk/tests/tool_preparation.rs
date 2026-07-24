@@ -5,7 +5,7 @@ use bcode_agent_profile::{
 use bcode_plugin_sdk::{ServiceRequest, prepare_tool_from_definitions};
 use bcode_tool::{
     OP_PREPARE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationDescriptor,
-    ToolPolicyMetadata, ToolPreparationRequest, ToolUiMetadata,
+    ToolPreparationRequest,
 };
 
 fn definition() -> ToolDefinition {
@@ -13,9 +13,6 @@ fn definition() -> ToolDefinition {
         name: "owner.tool".to_string(),
         description: "test tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
-        requires_permission: true,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 
@@ -37,7 +34,10 @@ fn preparation_dispatches_to_owner_definition_without_transport_fields() {
 
     let response =
         prepare_tool_from_definitions(&service, [definition()], |_request, _definition| {
-            Ok(bcode_plugin_sdk::ToolPolicyOperation::Mutating)
+            Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
+                true,
+                bcode_plugin_sdk::ToolPolicyOperation::Mutating,
+            ))
         })
         .expect("owner preparation should succeed");
 
@@ -76,7 +76,7 @@ fn preparation_rejects_unknown_tool() {
     };
 
     let error = prepare_tool_from_definitions(&service, [definition()], |_request, _definition| {
-        Ok(bcode_plugin_sdk::ToolPolicyOperation::ReadOnly)
+        Ok(bcode_plugin_sdk::ToolPolicyPreparation::read_only())
     })
     .expect_err("unknown tool must fail preparation");
 

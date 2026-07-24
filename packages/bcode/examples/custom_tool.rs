@@ -1,8 +1,5 @@
 use bcode::{Agent, ToolCall};
-use bcode_tool::{
-    ToolDefinition, ToolInvocationDescriptor, ToolInvocationResponse, ToolPolicyMetadata,
-    ToolUiMetadata,
-};
+use bcode_tool::{ToolDefinition, ToolInvocationDescriptor, ToolInvocationResponse};
 
 fn uppercase_definition() -> ToolDefinition {
     ToolDefinition {
@@ -15,9 +12,6 @@ fn uppercase_definition() -> ToolDefinition {
             },
             "required": ["text"]
         }),
-        requires_permission: false,
-        policy: ToolPolicyMetadata::default(),
-        ui: ToolUiMetadata::default(),
     }
 }
 

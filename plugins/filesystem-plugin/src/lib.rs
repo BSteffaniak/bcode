@@ -329,7 +329,7 @@ fn invoke_filesystem_service(context: &NativeServiceContext) -> ServiceResponse 
 fn filesystem_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyOperation, String> {
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
     let path = request
         .invocation
         .arguments
@@ -337,24 +337,59 @@ fn filesystem_policy_operation(
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string);
     let paths = path.into_iter().collect::<Vec<_>>();
-    Ok(match definition.name.as_str() {
-        "filesystem.write" | "filesystem.edit" => bcode_plugin_sdk::ToolPolicyOperation::Write {
-            paths,
-            category: definition
-                .policy
-                .permission_category
-                .clone()
-                .unwrap_or_else(|| "write".to_owned()),
-        },
-        "filesystem.read" | "filesystem.exists" | "filesystem.list" | "filesystem.find"
-        | "filesystem.grep" | "filesystem.stat" => {
-            bcode_plugin_sdk::ToolPolicyOperation::Read { paths }
-        }
-        "artifact.metadata" | "artifact.read" | "artifact.grep" => {
-            bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
-        }
+    let (requires_permission, identity, operation) = match definition.name.as_str() {
+        "filesystem.write" => (
+            true,
+            path_policy(&["write"], "write"),
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths,
+                category: "write".to_owned(),
+            },
+        ),
+        "filesystem.edit" => (
+            true,
+            path_policy(&["edit"], "edit"),
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths,
+                category: "edit".to_owned(),
+            },
+        ),
+        "filesystem.read" | "filesystem.exists" => (
+            false,
+            path_policy(&["read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "filesystem.list" => (
+            false,
+            path_policy(&["ls", "read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "filesystem.find" => (
+            false,
+            path_policy(&["find", "read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "filesystem.grep" => (
+            false,
+            path_policy(&["grep", "read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "filesystem.stat" => (
+            false,
+            path_policy(&["stat", "read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "artifact.metadata" | "artifact.read" | "artifact.grep" => (
+            false,
+            bcode_plugin_sdk::ToolPolicyIdentity::default(),
+            bcode_plugin_sdk::ToolPolicyOperation::ReadOnly,
+        ),
         name => return Err(format!("unsupported filesystem policy operation: {name}")),
-    })
+    };
+    Ok(
+        bcode_plugin_sdk::ToolPolicyPreparation::new(requires_permission, operation)
+            .with_identity(identity),
+    )
 }
 
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -407,8 +442,8 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     })
 }
 
-fn path_policy(aliases: &[&str], category: &str) -> bcode_tool::ToolPolicyMetadata {
-    bcode_tool::ToolPolicyMetadata {
+fn path_policy(aliases: &[&str], category: &str) -> bcode_plugin_sdk::ToolPolicyIdentity {
+    bcode_plugin_sdk::ToolPolicyIdentity {
         aliases: aliases.iter().map(ToString::to_string).collect(),
         compatibility_aliases: compatibility_aliases_for(aliases),
         capabilities: aliases
@@ -435,21 +470,6 @@ fn compatibility_aliases_for(aliases: &[&str]) -> Vec<bcode_tool::ToolCompatibil
         .collect()
 }
 
-fn path_tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
-    bcode_tool::ToolUiMetadata {
-        activity_label: Some(activity_label.to_string()),
-        request_visual: None,
-    }
-}
-
-fn write_tool_ui(activity_label: &str, _preview_title: &str) -> bcode_tool::ToolUiMetadata {
-    path_tool_ui(activity_label)
-}
-
-fn edit_tool_ui(activity_label: &str, _preview_title: &str) -> bcode_tool::ToolUiMetadata {
-    path_tool_ui(activity_label)
-}
-
 fn read_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "filesystem.read".to_string(),
@@ -463,9 +483,6 @@ fn read_tool_definition() -> ToolDefinition {
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of text lines to return" }
             }
         }),
-        requires_permission: false,
-        policy: path_policy(&["read"], "read"),
-        ui: path_tool_ui("reading"),
     }
 }
 
@@ -487,9 +504,6 @@ fn write_tool_definition() -> ToolDefinition {
                 }
             }
         }),
-        requires_permission: true,
-        policy: path_policy(&["write"], "write"),
-        ui: write_tool_ui("writing", "Write preview"),
     }
 }
 
@@ -515,9 +529,6 @@ fn edit_tool_definition() -> ToolDefinition {
                 }
             }
         }),
-        requires_permission: true,
-        policy: path_policy(&["edit"], "edit"),
-        ui: edit_tool_ui("editing", "Edit preview"),
     }
 }
 
@@ -530,9 +541,6 @@ fn exists_tool_definition() -> ToolDefinition {
             "required": ["path"],
             "properties": { "path": { "type": "string" } }
         }),
-        requires_permission: false,
-        policy: path_policy(&["read"], "read"),
-        ui: path_tool_ui("checking"),
     }
 }
 
@@ -550,9 +558,6 @@ fn list_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        requires_permission: false,
-        policy: path_policy(&["ls", "read"], "read"),
-        ui: path_tool_ui("listing"),
     }
 }
 
@@ -570,12 +575,6 @@ fn find_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        requires_permission: false,
-        policy: path_policy(&["find", "read"], "read"),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("finding".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -595,12 +594,6 @@ fn grep_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        requires_permission: false,
-        policy: path_policy(&["grep", "read"], "read"),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("searching".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -613,9 +606,6 @@ fn stat_tool_definition() -> ToolDefinition {
             "required": ["path"],
             "properties": { "path": { "type": "string" } }
         }),
-        requires_permission: false,
-        policy: path_policy(&["stat", "read"], "read"),
-        ui: path_tool_ui("stat"),
     }
 }
 
@@ -628,12 +618,6 @@ fn artifact_metadata_tool_definition() -> ToolDefinition {
             "required": ["path"],
             "properties": { "path": { "type": "string" } }
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("reading artifact metadata".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -651,12 +635,6 @@ fn artifact_read_tool_definition() -> ToolDefinition {
                 "from_end": { "type": "boolean", "description": "Read the last max_bytes bytes of the artifact" }
             }
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("reading artifact".to_string()),
-            request_visual: None
-        },
     }
 }
 
@@ -675,12 +653,6 @@ fn artifact_grep_tool_definition() -> ToolDefinition {
                 "max_matches": { "type": "integer", "minimum": 1 }
             }
         }),
-        requires_permission: false,
-        policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("searching artifact".to_string()),
-            request_visual: None,
-        },
     }
 }
 
@@ -2494,6 +2466,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn filesystem_requests_use_durable_generic_contributions_without_legacy_visuals() {
+        let arguments = serde_json::json!({"path": "src/lib.rs", "offset": 2});
+        let contribution = filesystem_request_contribution("call-1", "filesystem.read", &arguments);
+        assert_eq!(contribution.invocation_id, "call-1");
+        assert_eq!(contribution.producer_id, FILESYSTEM_PLUGIN_ID);
+        assert_eq!(contribution.schema, FILESYSTEM_REQUEST_SCHEMA);
+        assert_eq!(
+            contribution.persistence,
+            ToolContributionPersistence::Durable
+        );
+        assert_eq!(contribution.payload["operation"], "filesystem.read");
+        assert_eq!(contribution.payload["path"], "src/lib.rs");
+        let write_arguments = serde_json::json!({"path": "new.rs", "contents": "fn main() {}"});
+        let write = filesystem_request_contribution("call-2", "filesystem.write", &write_arguments);
+        assert_eq!(write.schema, "bcode.filesystem.change");
+        assert_eq!(write.payload["old_text"], "");
+        assert_eq!(write.payload["new_text"], "fn main() {}");
+    }
+
+    #[test]
     fn filesystem_catalog_preparation_accepts_missing_resources() {
         for definition in [
             read_tool_definition(),
@@ -2534,14 +2526,24 @@ mod tests {
             };
             filesystem_policy_operation(&request, &definition).expect("filesystem policy")
         };
+        let read = operation(read_tool_definition(), json!({"path": "src/lib.rs"}));
+        assert!(!read.requires_permission);
+        assert_eq!(read.identity.aliases, vec!["read"]);
+        assert_eq!(read.identity.capabilities, vec!["filesystem.read"]);
+        assert_eq!(read.identity.permission_category.as_deref(), Some("read"));
         assert_eq!(
-            operation(read_tool_definition(), json!({"path": "src/lib.rs"})),
+            read.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Read {
                 paths: vec!["src/lib.rs".to_owned()],
             }
         );
+        let write = operation(write_tool_definition(), json!({"path": "src/lib.rs"}));
+        assert!(write.requires_permission);
+        assert_eq!(write.identity.aliases, vec!["write"]);
+        assert_eq!(write.identity.capabilities, vec!["filesystem.write"]);
+        assert_eq!(write.identity.permission_category.as_deref(), Some("write"));
         assert_eq!(
-            operation(write_tool_definition(), json!({"path": "src/lib.rs"})),
+            write.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Write {
                 paths: vec!["src/lib.rs".to_owned()],
                 category: "write".to_owned(),
@@ -2569,45 +2571,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
-    }
-
-    #[test]
-    fn filesystem_requests_use_durable_generic_contributions_without_legacy_visuals() {
-        for definition in [
-            read_tool_definition(),
-            write_tool_definition(),
-            edit_tool_definition(),
-            exists_tool_definition(),
-            list_tool_definition(),
-            find_tool_definition(),
-            grep_tool_definition(),
-            stat_tool_definition(),
-            artifact_metadata_tool_definition(),
-            artifact_read_tool_definition(),
-            artifact_grep_tool_definition(),
-        ] {
-            assert!(
-                definition.ui.request_visual.is_none(),
-                "{}",
-                definition.name
-            );
-        }
-        let arguments = serde_json::json!({"path": "src/lib.rs", "offset": 2});
-        let contribution = filesystem_request_contribution("call-1", "filesystem.read", &arguments);
-        assert_eq!(contribution.invocation_id, "call-1");
-        assert_eq!(contribution.producer_id, FILESYSTEM_PLUGIN_ID);
-        assert_eq!(contribution.schema, FILESYSTEM_REQUEST_SCHEMA);
-        assert_eq!(
-            contribution.persistence,
-            ToolContributionPersistence::Durable
-        );
-        assert_eq!(contribution.payload["operation"], "filesystem.read");
-        assert_eq!(contribution.payload["path"], "src/lib.rs");
-        let write_arguments = serde_json::json!({"path": "new.rs", "contents": "fn main() {}"});
-        let write = filesystem_request_contribution("call-2", "filesystem.write", &write_arguments);
-        assert_eq!(write.schema, "bcode.filesystem.change");
-        assert_eq!(write.payload["old_text"], "");
-        assert_eq!(write.payload["new_text"], "fn main() {}");
     }
 
     #[test]
