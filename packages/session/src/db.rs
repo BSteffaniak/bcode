@@ -22,8 +22,8 @@ use crate::persisted::{
 use bcode_database_observability::ObservedDatabase;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation, MetricsRegistry};
 use bcode_session_models::{
-    ExecutionSessionProvenance, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
-    SessionEventCompatibilityIssue, SessionEventKind, SessionHistoryCursor,
+    ExecutionSessionProvenance, RequestContextOccupancy, RuntimeWorkKind, RuntimeWorkStatus,
+    SessionEvent, SessionEventCompatibilityIssue, SessionEventKind, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
     SessionInputHistoryEntry, SessionSummary, SessionTitleSource, SessionVisibility,
     ToolInvocationResult, ToolInvocationStreamEvent, WorkId,
@@ -46,6 +46,13 @@ const GLOBAL_MIGRATIONS_TABLE: &str = "__bcode_global_migrations";
 const SESSION_MIGRATIONS_TABLE: &str = "__bcode_session_migrations";
 const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+#[cfg(test)]
+fn abort_at_migration_crash_boundary(boundary: &str) {
+    if std::env::var("BCODE_MIGRATION_CRASH_PHASE").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
+}
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Durable storage writer epoch understood by this session database implementation.
@@ -820,6 +827,8 @@ impl SessionDb {
     ) -> SessionDbResult<Self> {
         let path = session_db_path(root, session_id);
         let db = Self::open_existing_turso_observed(session_id, &path, metrics.clone()).await?;
+        #[cfg(test)]
+        abort_at_migration_crash_boundary("before_transaction");
         let tx = db.db.begin_transaction().await?;
         report_migration_stage(
             progress.as_ref(),
@@ -833,6 +842,8 @@ impl SessionDb {
             schema_timer.elapsed_ms(),
         );
         migrate_session_storage(&*tx, session_id, &metrics, progress.as_ref()).await?;
+        #[cfg(test)]
+        abort_at_migration_crash_boundary("during_transaction");
         report_migration_stage(
             progress.as_ref(),
             bcode_session_models::SessionMigrationStage::Committing,
@@ -840,6 +851,8 @@ impl SessionDb {
         );
         let commit_timer = metrics.timer();
         tx.commit().await?;
+        #[cfg(test)]
+        abort_at_migration_crash_boundary("after_commit");
         metrics.record_histogram(
             "session.migration.commit_duration_ms",
             commit_timer.elapsed_ms(),
@@ -2428,6 +2441,7 @@ async fn rebuild_migration_projections(
         db.delete(table).execute(db).await?;
     }
     let replay_timer = metrics.timer();
+    let mut state = MigrationProjectionState::new();
     let event_total = u64::try_from(events.len()).unwrap_or(u64::MAX);
     report_migration_progress(
         progress,
@@ -2437,7 +2451,7 @@ async fn rebuild_migration_projections(
         "Rebuilding session indexes",
     );
     for (index, (event, issue)) in events.iter().enumerate() {
-        project_migration_event(db, event, issue.as_ref(), metrics).await?;
+        project_migration_event(db, event, issue.as_ref(), metrics, &mut state).await?;
         let completed = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
         if completed == event_total || completed % 100 == 0 {
             report_migration_progress(
@@ -2448,6 +2462,9 @@ async fn rebuild_migration_projections(
                 "Rebuilding session indexes",
             );
         }
+    }
+    if let Some((tail, _)) = events.last() {
+        finalize_migration_context_occupancy(db, tail, &state).await?;
     }
     metrics.record_histogram(
         "session.migration.projection_rebuild_duration_ms",
@@ -2473,6 +2490,8 @@ async fn validate_migrated_storage(
         "Validating rebuilt session indexes",
     );
     if let Some((tail, _)) = events.last() {
+        finalize_migration_session_state(db, tail).await?;
+        finalize_migration_model_context(db, tail).await?;
         project_materialized_checkpoints_at_tail(db, tail).await?;
         project_session_compatibility_state(db, tail).await?;
     }
@@ -2514,11 +2533,28 @@ async fn validate_migrated_storage(
     Ok(())
 }
 
+struct MigrationProjectionState {
+    model_context_checkpoint: Option<u64>,
+    context_epoch: u64,
+    context_occupancy: Option<RequestContextOccupancy>,
+}
+
+impl MigrationProjectionState {
+    const fn new() -> Self {
+        Self {
+            model_context_checkpoint: None,
+            context_epoch: 0,
+            context_occupancy: None,
+        }
+    }
+}
+
 async fn project_migration_event(
     db: &dyn Database,
     event: &SessionEvent,
     issue: Option<&SessionEventCompatibilityIssue>,
     metrics: &MetricsRegistry,
+    state: &mut MigrationProjectionState,
 ) -> SessionDbResult<()> {
     let timer = metrics.timer();
     project_materialized_event_without_checkpoints(db, event).await?;
@@ -2527,13 +2563,13 @@ async fn project_migration_event(
         timer.elapsed_ms(),
     );
     let timer = metrics.timer();
-    project_model_context_event(db, event).await?;
+    project_migration_model_context_event(db, event, state).await?;
     metrics.record_histogram(
         "session.migration.projector.model_context_duration_ms",
         timer.elapsed_ms(),
     );
     let timer = metrics.timer();
-    project_context_occupancy_event(db, event).await?;
+    project_migration_context_occupancy_event(event, state);
     metrics.record_histogram(
         "session.migration.projector.context_occupancy_duration_ms",
         timer.elapsed_ms(),
@@ -3217,6 +3253,74 @@ fn compaction_boundary(event: &SessionEvent) -> SessionDbResult<Option<u64>> {
     Ok(Some(boundary))
 }
 
+async fn project_migration_model_context_event(
+    db: &dyn Database,
+    event: &SessionEvent,
+    state: &mut MigrationProjectionState,
+) -> SessionDbResult<()> {
+    if let Some(checkpoint) = state.model_context_checkpoint {
+        let expected = event.sequence.saturating_sub(1);
+        if event.sequence == 0 || checkpoint != expected {
+            return Err(SessionDbError::ModelContextProjectionStale {
+                checkpoint,
+                expected,
+            });
+        }
+    } else if event.sequence != 0 {
+        return Err(SessionDbError::ProjectionStale {
+            projection: "model_context",
+            checkpoint: None,
+            expected: event.sequence.saturating_sub(1),
+        });
+    }
+    let event_type = model_context_event_kind_name(&event.kind);
+    if !matches!(
+        context_history_role(&event.kind),
+        ContextHistoryRole::Excluded
+    ) {
+        if let Some(boundary) = compaction_boundary(event)? {
+            db.delete("model_context_entries")
+                .where_lte("event_seq", seq_to_value(boundary))
+                .execute(db)
+                .await?;
+            db.delete("model_context_entries")
+                .where_in(
+                    "event_type",
+                    vec![
+                        DatabaseValue::String("context_compacted".to_owned()),
+                        DatabaseValue::String("provider_context_compacted".to_owned()),
+                    ],
+                )
+                .execute(db)
+                .await?;
+        }
+        db.insert("model_context_entries")
+            .value("event_seq", seq_to_value(event.sequence))
+            .value("event_type", event_type)
+            .value("payload", encode_session_event(event)?)
+            .execute(db)
+            .await?;
+    }
+    state.model_context_checkpoint = Some(event.sequence);
+    Ok(())
+}
+
+async fn finalize_migration_model_context(
+    db: &dyn Database,
+    tail: &SessionEvent,
+) -> SessionDbResult<()> {
+    db.insert("model_context_projection_state")
+        .value("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+        .value(
+            "schema_version",
+            DatabaseValue::Int64(i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)),
+        )
+        .value("last_event_seq", seq_to_value(tail.sequence))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 async fn project_model_context_event(
     db: &dyn Database,
     event: &SessionEvent,
@@ -3293,6 +3397,55 @@ async fn project_model_context_event(
         .value("last_event_seq", seq_to_value(event.sequence))
         .execute(db)
         .await?;
+    Ok(())
+}
+
+fn project_migration_context_occupancy_event(
+    event: &SessionEvent,
+    state: &mut MigrationProjectionState,
+) {
+    let (context_epoch, occupancy) = match &event.kind {
+        SessionEventKind::ModelChanged { .. }
+        | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::ProviderContextCompacted { .. } => (event.sequence, None),
+        SessionEventKind::RequestContextObserved { observation } => (
+            state.context_epoch,
+            RequestContextOccupancy::reconcile(
+                state.context_occupancy.as_ref(),
+                state.context_epoch,
+                event.sequence,
+                observation.clone(),
+            ),
+        ),
+        _ => (state.context_epoch, state.context_occupancy.clone()),
+    };
+    state.context_epoch = context_epoch;
+    state.context_occupancy = occupancy;
+}
+
+async fn finalize_migration_context_occupancy(
+    db: &dyn Database,
+    tail: &SessionEvent,
+    state: &MigrationProjectionState,
+) -> SessionDbResult<()> {
+    db.insert("context_occupancy_projection")
+        .value("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
+        .value(
+            "schema_version",
+            DatabaseValue::Int64(i64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION)),
+        )
+        .value("context_epoch", seq_to_value(state.context_epoch))
+        .value(
+            "occupancy_json",
+            state
+                .context_occupancy
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
+        .execute(db)
+        .await?;
+    update_projection_checkpoint(db, MaterializedProjection::RequestContextOccupancy, tail).await?;
     Ok(())
 }
 
@@ -3454,7 +3607,20 @@ async fn project_materialized_event_without_checkpoints(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    project_event(db, event).await
+    project_event(db, event, false).await
+}
+
+async fn finalize_migration_session_state(
+    db: &dyn Database,
+    tail: &SessionEvent,
+) -> SessionDbResult<()> {
+    db.update("session_state")
+        .value("last_event_seq", seq_to_value(tail.sequence))
+        .value("updated_at_ms", seq_to_value(event_created_at_ms(tail)))
+        .where_eq("session_id", tail.session_id.to_string())
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 async fn project_materialized_checkpoints_at_tail(
@@ -3471,13 +3637,19 @@ async fn project_materialized_event(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    project_materialized_event_without_checkpoints(db, event).await?;
+    project_event(db, event, true).await?;
     project_materialized_checkpoints_at_tail(db, event).await
 }
 
 #[allow(clippy::too_many_lines)]
-async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
-    update_session_state(db, event).await?;
+async fn project_event(
+    db: &dyn Database,
+    event: &SessionEvent,
+    update_state: bool,
+) -> SessionDbResult<()> {
+    if update_state {
+        update_session_state(db, event).await?;
+    }
     match &event.kind {
         SessionEventKind::SessionCreated {
             name,
@@ -7299,6 +7471,120 @@ mod tests {
             .expect("projection row");
         assert_eq!(required_i64(&state, "schema_version").expect("schema"), 1);
         assert_eq!(required_i64(&state, "last_event_seq").expect("tail"), 0);
+    }
+
+    async fn create_legacy_crash_fixture(root: &Path) -> SessionId {
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, root)
+            .await
+            .expect("open crash fixture");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::AssistantMessage {
+                text: "survives migration crash".to_owned(),
+            },
+        ))
+        .await
+        .expect("append crash fixture event");
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
+            )
+            .execute(db.database())
+            .await
+            .expect("downgrade crash fixture writer epoch");
+        drop(db);
+        session_id
+    }
+
+    fn run_migration_crash_child(root: &Path, session_id: SessionId, phase: &str) {
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "db::tests::migration_crash_helper",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("BCODE_MIGRATION_CRASH_ROOT", root)
+                .env("BCODE_MIGRATION_CRASH_SESSION_ID", session_id.to_string())
+                .env("BCODE_MIGRATION_CRASH_PHASE", phase)
+                .status()
+                .expect("run migration crash child");
+        assert!(!status.success(), "crash helper must terminate abnormally");
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for migration_crash_boundaries_reclassify_durably"]
+    async fn migration_crash_helper() {
+        let root = std::env::var_os("BCODE_MIGRATION_CRASH_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("crash root");
+        let session_id = std::env::var("BCODE_MIGRATION_CRASH_SESSION_ID")
+            .expect("crash session id")
+            .parse::<SessionId>()
+            .expect("valid crash session id");
+        let _phase = std::env::var("BCODE_MIGRATION_CRASH_PHASE").expect("crash phase");
+        let maintenance = crate::lease::acquire_session_maintenance_guard(&root, session_id)
+            .expect("maintenance guard");
+        let write =
+            crate::lease::acquire_maintenance_session_write_lock(&maintenance, &root, session_id)
+                .expect("write guard");
+        SessionDb::migrate_turso_in_root_observed(
+            session_id,
+            &root,
+            &maintenance,
+            &write,
+            MetricsRegistry::disabled(),
+            None,
+        )
+        .await
+        .expect("migration crash phase must abort first");
+    }
+
+    #[tokio::test]
+    async fn migration_crash_boundaries_reclassify_durably() {
+        for phase in ["before_transaction", "during_transaction", "after_commit"] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let session_id = create_legacy_crash_fixture(temp_dir.path()).await;
+            run_migration_crash_child(temp_dir.path(), session_id, phase);
+
+            let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("reopen after migration crash");
+            match phase {
+                "before_transaction" | "during_transaction" => {
+                    assert!(matches!(
+                        reopened
+                            .storage_compatibility()
+                            .await
+                            .expect("classify interrupted migration"),
+                        SessionStorageCompatibility::KnownLegacy { .. }
+                    ));
+                    assert_eq!(
+                        reopened.storage_writer_epoch().await.expect("writer epoch"),
+                        u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+                    );
+                }
+                "after_commit" => {
+                    assert!(matches!(
+                        reopened
+                            .storage_compatibility()
+                            .await
+                            .expect("classify committed migration"),
+                        SessionStorageCompatibility::Current { .. }
+                    ));
+                    reopened
+                        .validate_write_readiness()
+                        .await
+                        .expect("committed migration remains write ready");
+                }
+                _ => unreachable!("fixed crash phase"),
+            }
+        }
     }
 
     #[tokio::test]
