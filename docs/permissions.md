@@ -33,7 +33,7 @@ edit  = { "**" = "deny" }
 
 ## Categories
 
-* `command` — patterns matched against `shell.run` command strings. Pi/OpenCode-style command globs.
+* `command` — Pi/OpenCode-style command globs matched independently against every executable subject extracted from `shell.run` POSIX syntax. Rules are not matched against a naively split raw string.
 * `read` — path globs for read-only filesystem tools (`filesystem.read`, `filesystem.list`, `filesystem.find`, `filesystem.grep`, `filesystem.stat`, `filesystem.exists`).
 * `write` — path globs for `filesystem.write`.
 * `edit` — path globs for `filesystem.edit`.
@@ -59,6 +59,24 @@ If no rule matches, the tool's side-effect falls back to:
 * Write/execute tools → `ask` if the tool is enabled for the agent, `deny` if disabled.
 
 Path globs use the same syntax as ripgrep (`globset`): `**` matches any number of path segments, `*` matches within a segment, `?` matches a single character, `[...]` character classes, `{a,b}` alternation.
+
+### Shell command analysis
+
+On Unix, `shell.run` is analyzed as one complete POSIX/`sh` program before authorization. Quotes, escapes, heredoc bodies, assignment prefixes, pipelines, lists, newlines, background execution, groups, loops, conditionals, subshells, and command substitutions are interpreted as shell syntax rather than split as plain text. Every executable leaf is evaluated independently, including leaves nested in control flow and substitutions. The aggregate decision is `deny > ask > allow`, so an allowed preamble or sibling can never hide a denied command.
+
+Input redirections with static paths are evaluated through `read` rules. Output, append, and read/write redirections with static paths are evaluated through `write` rules. Dynamic redirection targets fail closed. Heredoc bodies are data and are never reinterpreted as shell commands.
+
+Analysis is bounded. Syntax errors, missing or mismatched analysis, unsupported constructs, dynamic executable identities, dynamic shell source such as unresolved `eval` or `source`, and exceeded limits cannot produce automatic `allow`. Depending on the authorization path, they are denied or surfaced for explicit permission; Bcode never falls back to raw command splitting.
+
+A parser error means Bcode could not safely understand the shell program. A complete parse followed by denial may instead mean no configured command wildcard allows that executable subject. Add a narrow policy rule only after verifying the reported subject; parser correctness does not imply policy expansion.
+
+#### Canonical command candidates
+
+Bcode retains the exact original command subject and may add narrowly reviewed aliases. Alias candidates participate in normal specificity matching and cannot erase a more specific restrictive match against the original subject.
+
+The initial Git aliases remove only reviewed behavior-neutral global options before a subcommand: `--no-pager`, `--no-replace-objects`, `--literal-pathspecs`, `--no-optional-locks`, and explicit `--color=...`. Bcode does not remove behavior-changing options such as `-C`, `-c`, `--config-env`, `--git-dir`, `--work-tree`, `--exec-path`, or `--namespace`. Assignment-prefixed commands currently receive no alias, including `PATH=...`, pager, and color assignments.
+
+Rules that allow command runners or arbitrary execution remain powerful even when parsing is correct. Review broad rules for `python -c *`, `python3 -c *`, `cargo run *`, `go run *`, `find *`, `xargs *`, `curl *`, and `timeout *` carefully: each can execute arbitrary or mutating behavior. Bcode does not add implicit code-level allows for missing entries such as `printf *` or `command -v *`.
 
 ## Tool enablement
 
@@ -91,7 +109,7 @@ At load time, the state file is merged **on top of** `bcode.toml` per `(agent, c
 
 The rule is scoped to the currently selected agent, with category inferred from the tool:
 
-* `shell.run` → `command`. Persists **two** rules: the literal command (so the exact same invocation is remembered) and a broadened `<first-word> *` glob (so variations like `echo hello` after approving `echo hi` don't prompt again). If the literal command already contains a trailing `*`, only the literal rule is persisted.
+* `shell.run` → `command`. Persists the relevant executable subject shown in the permission prompt. Broaden command permissions deliberately with an explicit wildcard rule; Bcode does not derive remembered rules from assignment prefixes, shell keywords, dynamic executable names, or malformed raw fragments.
 * `filesystem.write` → `write` (literal path).
 * `filesystem.edit`  → `edit` (literal path).
 * `filesystem.{read,list,find,grep,stat,exists}` → `read` (literal path).

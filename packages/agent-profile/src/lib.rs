@@ -212,6 +212,33 @@ impl ToolPolicyAuthorizationMetadata {
     }
 }
 
+/// Prepare authorization using a tool-owner-supplied operation and identity.
+///
+/// This helper centralizes the standard authorization envelope while leaving domain extraction and
+/// analysis entirely with the tool owner.
+///
+/// # Errors
+///
+/// Returns an error when the requested tool name does not match `definition` or the authorization
+/// metadata cannot be encoded.
+pub fn prepare_tool_policy_with_operation(
+    request: &ToolPreparationRequest,
+    definition: &ToolDefinition,
+    requires_permission: bool,
+    identity: ToolPolicyIdentity,
+    operation: ToolPolicyOperation,
+) -> Result<ToolPreparationResponse, String> {
+    prepare_tool_policy(
+        request,
+        definition,
+        ToolPolicyPreparation {
+            requires_permission,
+            identity,
+            operation,
+        },
+    )
+}
+
 /// Prepare the standard agent-policy fact for one owner-supplied tool definition.
 ///
 /// # Errors

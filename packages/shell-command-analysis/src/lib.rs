@@ -459,21 +459,19 @@ impl<'a> Adapter<'a> {
             loop_depth: context.loop_depth,
             substitution_depth: context.substitution_depth,
         };
+        let match_candidates =
+            command_match_candidates(&source, executable_value, &arguments, &assignments);
         self.commands.push(ShellCommand {
             id,
             parent_id: context.parent_id,
             relation: context.relation,
             span,
-            source: source.clone(),
+            source,
             executable: executable_word,
             arguments,
             assignments,
             context: command_context,
-            match_candidates: vec![ShellCommandMatchCandidate {
-                subject: source,
-                kind: ShellCommandMatchCandidateKind::Original,
-                transformation: None,
-            }],
+            match_candidates,
         });
         self.redirections.extend(redirects);
         self.word_substitutions(executable, Some(id), context, depth)?;
@@ -869,6 +867,67 @@ impl<'a> Adapter<'a> {
     }
 }
 
+fn command_match_candidates(
+    source: &str,
+    executable: Option<&str>,
+    arguments: &[ShellWord],
+    assignments: &[ShellAssignment],
+) -> Vec<ShellCommandMatchCandidate> {
+    let mut candidates = vec![ShellCommandMatchCandidate {
+        subject: source.to_owned(),
+        kind: ShellCommandMatchCandidateKind::Original,
+        transformation: None,
+    }];
+    let Some("git") = executable else {
+        return candidates;
+    };
+    if !assignments.is_empty() {
+        return candidates;
+    }
+    let static_arguments = arguments
+        .iter()
+        .map(static_word_value)
+        .collect::<Option<Vec<_>>>();
+    let Some(arguments) = static_arguments else {
+        return candidates;
+    };
+    let mut index = 0;
+    let mut removed = Vec::new();
+    while index < arguments.len() {
+        match arguments[index] {
+            "--no-pager"
+            | "--no-replace-objects"
+            | "--literal-pathspecs"
+            | "--no-optional-locks" => {
+                removed.push(arguments[index]);
+                index += 1;
+            }
+            argument if argument.starts_with("--color=") => {
+                removed.push(argument);
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+    if removed.is_empty() || index == arguments.len() {
+        return candidates;
+    }
+    let mut subject = String::from("git");
+    for argument in &arguments[index..] {
+        subject.push(' ');
+        subject.push_str(argument);
+    }
+    candidates.push(ShellCommandMatchCandidate {
+        subject,
+        kind: ShellCommandMatchCandidateKind::DomainAlias,
+        transformation: Some(format!(
+            "removed reviewed behavior-neutral Git global option(s): {}",
+            removed.join(", ")
+        )),
+    });
+    candidates
+}
+
 fn static_word_value(word: &ShellWord) -> Option<&str> {
     match word {
         ShellWord::Static { value, .. } => Some(value),
@@ -1037,6 +1096,34 @@ mod tests {
             analysis.redirections[2].kind,
             ShellRedirectionKind::HereDocument
         );
+    }
+
+    #[test]
+    fn adds_only_reviewed_git_global_option_aliases() {
+        let analysis = analyze(&ShellAnalysisRequest::posix("git --no-pager diff --stat")).unwrap();
+        assert_eq!(analysis.commands[0].match_candidates.len(), 2);
+        assert_eq!(
+            analysis.commands[0].match_candidates[1].subject,
+            "git diff --stat"
+        );
+
+        for source in [
+            "git -C elsewhere diff",
+            "git -c core.pager=cat diff",
+            "git --config-env=x=y diff",
+            "git --git-dir=.git diff",
+            "git --work-tree=. diff",
+            "git --exec-path=/tmp diff",
+            "git --namespace=test diff",
+            "PATH=/tmp git --no-pager diff",
+        ] {
+            let analysis = analyze(&ShellAnalysisRequest::posix(source)).unwrap();
+            assert_eq!(
+                analysis.commands[0].match_candidates.len(),
+                1,
+                "unsafe alias for {source}"
+            );
+        }
     }
 
     #[test]

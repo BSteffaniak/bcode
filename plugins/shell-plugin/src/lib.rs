@@ -78,11 +78,7 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
 
     match context.request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(&context.request),
-        bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
-            &context.request,
-            [shell_tool_definition()],
-            |request, definition| Ok(shell_policy_preparation(request, definition)),
-        ),
+        bcode_tool::OP_PREPARE_TOOL => prepare_shell_tool(&context.request),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
@@ -91,22 +87,44 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
-fn shell_policy_preparation(
-    request: &bcode_tool::ToolPreparationRequest,
-    definition: &ToolDefinition,
-) -> bcode_plugin_sdk::ToolPolicyPreparation {
-    bcode_plugin_sdk::ToolPolicyPreparation::new(true, shell_policy_operation(request, definition))
-        .with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
-            aliases: Vec::new(),
-            compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
-            capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
-            permission_category: Some("command".to_string()),
-        })
+fn prepare_shell_tool(request: &ServiceRequest) -> ServiceResponse {
+    let preparation = match request.payload_json::<bcode_tool::ToolPreparationRequest>() {
+        Ok(preparation) => preparation,
+        Err(error) => return ServiceResponse::error("invalid_preparation", error.to_string()),
+    };
+    let definition = shell_tool_definition();
+    if preparation.invocation.tool_name != definition.name {
+        return ServiceResponse::error(
+            "invalid_preparation",
+            format!(
+                "tool not found during preparation: {}",
+                preparation.invocation.tool_name
+            ),
+        );
+    }
+    match bcode_agent_profile::prepare_tool_policy_with_operation(
+        &preparation,
+        &definition,
+        true,
+        shell_policy_identity(),
+        shell_policy_operation(&preparation),
+    ) {
+        Ok(response) => json_response(&response),
+        Err(message) => ServiceResponse::error("invalid_preparation", message),
+    }
+}
+
+fn shell_policy_identity() -> bcode_plugin_sdk::ToolPolicyIdentity {
+    bcode_plugin_sdk::ToolPolicyIdentity {
+        aliases: Vec::new(),
+        compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
+        capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
+        permission_category: Some("command".to_string()),
+    }
 }
 
 fn shell_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
-    _definition: &ToolDefinition,
 ) -> bcode_plugin_sdk::ToolPolicyOperation {
     let command = request
         .invocation
@@ -1643,6 +1661,84 @@ bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-
 mod tests {
     use super::*;
 
+    fn preparation_request(arguments: serde_json::Value) -> ServiceRequest {
+        let preparation = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "prepare-test".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments,
+            },
+            host_context: Vec::new(),
+        };
+        ServiceRequest {
+            interface_id: TOOL_SERVICE_INTERFACE_ID.to_owned(),
+            operation: bcode_tool::OP_PREPARE_TOOL.to_owned(),
+            payload: serde_json::to_vec(&preparation).expect("preparation request should encode"),
+        }
+    }
+
+    fn prepared_metadata(
+        arguments: serde_json::Value,
+    ) -> bcode_agent_profile::ToolPolicyAuthorizationMetadata {
+        let response = prepare_shell_tool(&preparation_request(arguments));
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let prepared = response
+            .payload_json::<bcode_tool::ToolPreparationResponse>()
+            .expect("preparation response should decode");
+        bcode_agent_profile::tool_policy_authorization_metadata(
+            &prepared.authorization,
+            "shell.run",
+        )
+        .expect("authorization metadata should decode")
+    }
+
+    #[test]
+    fn shell_preparation_encodes_complete_incomplete_and_invalid_analysis() {
+        let complete = prepared_metadata(serde_json::json!({"command": "printf hello"}));
+        let bcode_agent_profile::ToolPolicyOperation::Command {
+            analysis,
+            analysis_error,
+            ..
+        } = complete.operation
+        else {
+            panic!("shell preparation must produce command policy");
+        };
+        assert!(analysis.is_some_and(|analysis| analysis.completeness.is_complete()));
+        assert!(analysis_error.is_none());
+
+        let incomplete = prepared_metadata(serde_json::json!({
+            "command": "cmd=printf; \"$cmd\" hello"
+        }));
+        let bcode_agent_profile::ToolPolicyOperation::Command {
+            analysis,
+            analysis_error,
+            ..
+        } = incomplete.operation
+        else {
+            panic!("shell preparation must produce command policy");
+        };
+        assert!(analysis.is_some_and(|analysis| !analysis.completeness.is_complete()));
+        assert!(analysis_error.is_none());
+
+        for arguments in [
+            serde_json::Value::Null,
+            serde_json::json!({"command": 7}),
+            serde_json::json!({"command": "if true; then"}),
+        ] {
+            let invalid = prepared_metadata(arguments);
+            let bcode_agent_profile::ToolPolicyOperation::Command {
+                analysis,
+                analysis_error,
+                ..
+            } = invalid.operation
+            else {
+                panic!("shell preparation must produce command policy");
+            };
+            assert!(analysis.is_none());
+            assert!(analysis_error.is_some());
+        }
+    }
+
     #[test]
     fn shell_request_is_generic_contribution_only() {
         let encoded =
@@ -1659,7 +1755,7 @@ mod tests {
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "catalog".to_owned(),
-                tool_name: definition.name.clone(),
+                tool_name: definition.name,
                 arguments: serde_json::Value::Null,
             },
             host_context: Vec::new(),
@@ -1668,7 +1764,7 @@ mod tests {
             command,
             analysis,
             analysis_error,
-        } = shell_policy_operation(&request, &definition)
+        } = shell_policy_operation(&request)
         else {
             panic!("shell owner must produce command policy");
         };
@@ -1683,30 +1779,23 @@ mod tests {
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "call".to_owned(),
-                tool_name: definition.name.clone(),
+                tool_name: definition.name,
                 arguments: serde_json::json!({"command": "printf hello"}),
             },
             host_context: Vec::new(),
         };
-        let policy = shell_policy_preparation(&request, &definition);
-        assert!(policy.requires_permission);
+        let identity = shell_policy_identity();
         assert_eq!(
-            policy.identity.compatibility_aliases,
+            identity.compatibility_aliases,
             vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")]
         );
-        assert_eq!(
-            policy.identity.capabilities,
-            vec!["shell.run", "process.execute"]
-        );
-        assert_eq!(
-            policy.identity.permission_category.as_deref(),
-            Some("command")
-        );
+        assert_eq!(identity.capabilities, vec!["shell.run", "process.execute"]);
+        assert_eq!(identity.permission_category.as_deref(), Some("command"));
         let bcode_plugin_sdk::ToolPolicyOperation::Command {
             command,
             analysis,
             analysis_error,
-        } = policy.operation
+        } = shell_policy_operation(&request)
         else {
             panic!("shell owner must produce a command operation");
         };

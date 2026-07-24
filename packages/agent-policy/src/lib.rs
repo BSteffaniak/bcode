@@ -729,6 +729,74 @@ mod tests {
     }
 
     #[test]
+    fn git_reviewed_alias_uses_specificity_without_hiding_original_denies() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([("shell.run".to_owned(), true)]),
+            permission: PermissionConfig {
+                command: BTreeMap::from([
+                    ("git *".to_owned(), Action::Deny),
+                    ("git diff *".to_owned(), Action::Allow),
+                ]),
+                ..PermissionConfig::default()
+            },
+        };
+        let allowed = evaluate_tool_call(
+            &config,
+            &request(BUILD_AGENT, "git --no-pager diff --stat"),
+            Path::new("/tmp/project"),
+        );
+        assert_eq!(allowed.response.decision, AgentDecision::Allow);
+        assert_eq!(allowed.matched_rule.as_deref(), Some("git diff *"));
+
+        let config = AgentConfig {
+            permission: PermissionConfig {
+                command: BTreeMap::from([
+                    ("git *".to_owned(), Action::Allow),
+                    ("git --no-pager diff --stat".to_owned(), Action::Deny),
+                    ("git diff *".to_owned(), Action::Allow),
+                ]),
+                ..PermissionConfig::default()
+            },
+            ..config
+        };
+        let denied = evaluate_tool_call(
+            &config,
+            &request(BUILD_AGENT, "git --no-pager diff --stat"),
+            Path::new("/tmp/project"),
+        );
+        assert_eq!(denied.response.decision, AgentDecision::Deny);
+        assert_eq!(
+            denied.matched_rule.as_deref(),
+            Some("git --no-pager diff --stat")
+        );
+    }
+
+    #[test]
+    fn shell_analysis_mismatch_and_incompleteness_fail_closed() {
+        let config = agent_config(&default_config(), BUILD_AGENT);
+        let mut mismatched = request(BUILD_AGENT, "printf ok");
+        let ToolPolicyOperation::Command { analysis, .. } = &mut mismatched.operation else {
+            unreachable!();
+        };
+        analysis.as_mut().unwrap().source = "printf tampered".to_owned();
+        assert_eq!(
+            evaluate_tool_call(&config, &mismatched, Path::new("/tmp/project"))
+                .response
+                .decision,
+            AgentDecision::Deny
+        );
+
+        let dynamic = request(BUILD_AGENT, "cmd=printf; \"$cmd\" ok");
+        assert_eq!(
+            evaluate_tool_call(&config, &dynamic, Path::new("/tmp/project"))
+                .response
+                .decision,
+            AgentDecision::Deny
+        );
+    }
+
+    #[test]
     fn specificity_prefers_exact_and_longer_patterns() {
         let rules = vec![
             Rule {

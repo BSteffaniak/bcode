@@ -213,6 +213,12 @@ fi
 
 if rg -n 'request\.(arguments|policy|side_effect)|\bToolArgumentKind\b|\bToolSideEffect\b' \
   packages/agent-policy/src/lib.rs >/tmp/bcode-agent-policy-argument-inference.txt ||
+   rg -n 'command_parts|shell_part_writes_files|has_unquoted_write_redirection|starts_with_mutating_command|mutating_shell_command_part' \
+  packages/agent-policy/src/lib.rs >/tmp/bcode-agent-policy-shell-inference.txt ||
+   ! grep -F 'bcode_shell_command_analysis::analyze' plugins/shell-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'prepare_shell_tool(&context.request)' plugins/shell-plugin/src/lib.rs >/dev/null ||
+   rg -n 'brush_parser|brush-parser' packages plugins --glob '*.rs' --glob 'Cargo.toml' |
+     grep -v '^packages/shell-command-analysis/' >/tmp/bcode-shell-parser-leakage.txt ||
    ! grep -F 'operation: metadata.operation' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'operation: metadata.operation' packages/agent-permissions/src/lib.rs >/dev/null ||
    ! rg -U 'fn skill_tool_policy_target\([\s\S]{0,800}aliases: metadata\.aliases,[\s\S]{0,800}permission_category: metadata\.permission_category' packages/server/src/lib.rs >/dev/null ||
@@ -220,6 +226,8 @@ if rg -n 'request\.(arguments|policy|side_effect)|\bToolArgumentKind\b|\bToolSid
    rg -U 'SkillToolPolicyRequest \{[\s\S]{0,120}tool: (definition|tool\.clone\(\))' packages/server/src/lib.rs packages/skill/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: a policy decision bypasses owner-produced facts." >&2
   cat /tmp/bcode-agent-policy-argument-inference.txt 2>/dev/null >&2 || true
+  cat /tmp/bcode-agent-policy-shell-inference.txt 2>/dev/null >&2 || true
+  cat /tmp/bcode-shell-parser-leakage.txt 2>/dev/null >&2 || true
   violations=1
 fi
 
