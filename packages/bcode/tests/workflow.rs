@@ -7,7 +7,7 @@ use bcode::workflow::{
 
 use bcode::{
     ProviderError, ProviderErrorCategory, ProviderTurnEvent, StopReason, ToolApplicationError,
-    ToolSideEffect, TypedTool,
+    ToolCall, ToolSideEffect, TypedTool,
     testing::{ScriptedProviderTurn, ScriptedRequestExpectation},
 };
 use schemars::JsonSchema;
@@ -152,6 +152,67 @@ async fn agent_step_requests_and_validates_structured_output() {
             .expect("agent node")
             .configuration["agent_id"],
         "plan"
+    );
+}
+
+#[tokio::test]
+async fn read_only_reviewer_cannot_invoke_parent_build_tool() {
+    let provider = bcode::testing::ScriptedProvider::new([
+        ScriptedProviderTurn::new().events([
+            ProviderTurnEvent::TurnStarted,
+            ProviderTurnEvent::ToolCallFinished {
+                call: ToolCall {
+                    id: "call-mutate".to_string(),
+                    name: "mutate".to_string(),
+                    arguments: serde_json::Value::Null,
+                },
+            },
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolCall,
+            },
+        ]),
+        ScriptedProviderTurn::complete_text(r#"{"approved":true}"#),
+    ]);
+    let probe = provider.probe();
+    let workflow = WorkflowBuilder::new(
+        "read-only-child",
+        agent::<ReviewTask, Review, _, _>("review", move || provider.clone())
+            .agent_id("build")
+            .read_only()
+            .configure_agent(|agent| {
+                agent.typed_tool_async(
+                    TypedTool::<ToolInput, ToolOutput>::new("mutate", "Mutate")
+                        .side_effect(ToolSideEffect::WriteFiles),
+                    |_input, _context| async move {
+                        Err::<ToolOutput, ToolApplicationError<serde_json::Value>>(
+                            ToolApplicationError::new(
+                                "unexpected_mutation",
+                                "mutating tool must not execute in read-only child",
+                                "tool unavailable",
+                                serde_json::Value::Null,
+                            ),
+                        )
+                    },
+                )
+            })
+            .build(),
+    )
+    .build()
+    .expect("workflow builds");
+
+    let review = workflow
+        .run(ReviewTask {
+            diff: "+ safe".to_string(),
+        })
+        .await
+        .expect("missing mutating tool is model-visible and review completes");
+    assert_eq!(review, Review { approved: true });
+    let requests = probe.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.request.tools.is_empty())
     );
 }
 

@@ -70,6 +70,68 @@ pub fn list_worktrees(cwd: &Path) -> Result<WorktreeListResponse, WorktreeError>
     })
 }
 
+/// An owning-domain-validated registered Git worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredWorktree {
+    path: PathBuf,
+    repo_root: PathBuf,
+    commit: Option<String>,
+}
+
+impl RegisteredWorktree {
+    /// Return the canonical worktree directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the canonical main repository root.
+    #[must_use]
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    /// Return the worktree commit reported by Git, when available.
+    #[must_use]
+    pub fn commit(&self) -> Option<&str> {
+        self.commit.as_deref()
+    }
+}
+
+/// Validate that `path` is a registered worktree of the repository discovered from `cwd`.
+///
+/// The returned capability carries canonical paths and can be passed across host boundaries
+/// without allowing an arbitrary existing directory to masquerade as a declared worktree.
+///
+/// # Errors
+///
+/// Returns an error when repository discovery/listing fails, `path` cannot be canonicalized, or
+/// it is not registered with the discovered repository.
+pub fn validate_registered_worktree(
+    cwd: &Path,
+    path: &Path,
+) -> Result<RegisteredWorktree, WorktreeError> {
+    let listed = list_worktrees(cwd)?;
+    let requested = path.canonicalize()?;
+    let Some(worktree) = listed.worktrees.into_iter().find(|worktree| {
+        worktree
+            .path
+            .canonicalize()
+            .is_ok_and(|registered| registered == requested)
+    }) else {
+        return Err(WorktreeError::InvalidRequest(format!(
+            "{} is not a registered worktree of {}",
+            display_from_current_dir(path),
+            display_from_current_dir(&listed.repo_root)
+        )));
+    };
+    Ok(RegisteredWorktree {
+        path: requested,
+        repo_root: listed.repo_root.canonicalize()?,
+        commit: worktree.commit,
+    })
+}
+
 /// Create a worktree using Bcode defaults and configuration.
 ///
 /// # Errors
@@ -411,7 +473,10 @@ fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_worktree, direnv_file_for, list_worktrees, remove_worktree, slugify};
+    use super::{
+        create_worktree, direnv_file_for, list_worktrees, remove_worktree, slugify,
+        validate_registered_worktree,
+    };
     use bcode_worktree_models::WorktreeCreateRequest;
     use std::path::Path;
     use std::process::Command;
@@ -489,6 +554,31 @@ mod tests {
             repo.root.canonicalize().expect("temp root canonical")
         );
         assert!(response.worktrees.iter().any(|worktree| worktree.is_main));
+    }
+
+    #[test]
+    fn registered_worktree_validation_rejects_arbitrary_directory() {
+        let repo = TempRepo::init();
+        let arbitrary = tempfile::tempdir().expect("arbitrary directory");
+
+        let error = validate_registered_worktree(&repo.root, arbitrary.path())
+            .expect_err("unregistered directory rejected");
+
+        assert!(error.to_string().contains("not a registered worktree"));
+    }
+
+    #[test]
+    fn registered_worktree_validation_returns_canonical_identity() {
+        let repo = TempRepo::init();
+        let registered = validate_registered_worktree(&repo.root, &repo.root)
+            .expect("main worktree is registered");
+
+        assert_eq!(
+            registered.path(),
+            repo.root.canonicalize().expect("canonical root")
+        );
+        assert_eq!(registered.repo_root(), registered.path());
+        assert!(registered.commit().is_some());
     }
 
     #[test]

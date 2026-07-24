@@ -2726,8 +2726,8 @@ impl SessionManager {
 
     /// Create a fresh isolated execution session in an explicitly declared worktree.
     ///
-    /// `workspace_snapshot` remains the authoritative immutable snapshot identity, while
-    /// `worktree_directory` is the validated execution location supplied by the worktree owner.
+    /// This low-level boundary accepts only a path already validated by the owning worktree
+    /// domain. Product hosts must call `bcode_worktree::validate_registered_worktree` first.
     ///
     /// # Errors
     ///
@@ -2737,13 +2737,12 @@ impl SessionManager {
         &self,
         name: Option<String>,
         mut provenance: ExecutionSessionProvenance,
-        worktree_directory: PathBuf,
+        worktree_directory: &Path,
     ) -> Result<SessionSummary, SessionError> {
         provenance.context_mode = ExecutionSessionContextMode::FreshIsolated;
         provenance.parent_generation = None;
         self.session_summary(provenance.parent_session_id).await?;
-        let working_directory = require_declared_worktree_directory(&worktree_directory)?;
-        self.create_session_with_execution(name, working_directory, Some(provenance))
+        self.create_session_with_execution(name, worktree_directory.to_path_buf(), Some(provenance))
             .await
     }
 
@@ -2792,11 +2791,11 @@ impl SessionManager {
         name: Option<String>,
         mut provenance: ExecutionSessionProvenance,
         parent_generation: u64,
-        worktree_directory: PathBuf,
+        worktree_directory: &Path,
     ) -> Result<SessionSummary, SessionError> {
         provenance.context_mode = ExecutionSessionContextMode::FixedGenerationFork;
         provenance.parent_generation = Some(parent_generation);
-        let working_directory = require_declared_worktree_directory(&worktree_directory)?;
+        let working_directory = worktree_directory.to_path_buf();
         let events = self.session_history(provenance.parent_session_id).await?;
         let current = events.last().map_or(0, |event| event.sequence);
         if current != parent_generation {
@@ -4951,24 +4950,6 @@ fn usize_to_u64(value: usize) -> u64 {
 fn normalize_session_name(name: Option<String>) -> Option<String> {
     name.map(|value| squish_whitespace(&value))
         .filter(|value| !value.is_empty())
-}
-
-fn require_declared_worktree_directory(path: &Path) -> Result<PathBuf, SessionError> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        SessionError::InvalidExecutionSessionProvenance(format!(
-            "declared worktree directory is unavailable: {error}"
-        ))
-    })?;
-    if !metadata.is_dir() {
-        return Err(SessionError::InvalidExecutionSessionProvenance(
-            "declared worktree path is not a directory".to_string(),
-        ));
-    }
-    path.canonicalize().map_err(|error| {
-        SessionError::InvalidExecutionSessionProvenance(format!(
-            "declared worktree directory cannot be canonicalized: {error}"
-        ))
-    })
 }
 
 fn normalize_working_directory(path: &Path) -> PathBuf {
@@ -11501,14 +11482,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_worktree_execution_uses_canonical_directory() {
+    async fn worktree_execution_uses_owner_validated_directory() {
         let manager = SessionManager::default();
         let parent = manager
             .create_session(Some("parent".to_string()), test_working_directory())
             .await
             .expect("parent");
-        let worktree = unique_temp_dir();
-        std::fs::create_dir_all(&worktree).expect("worktree");
+        let worktree = test_working_directory();
         let provenance = ExecutionSessionProvenance {
             owner: "workflow".to_string(),
             run_id: "run-1".to_string(),
@@ -11523,15 +11503,11 @@ mod tests {
             .create_fresh_execution_session_in_worktree(
                 Some("review".to_string()),
                 provenance,
-                worktree.clone(),
+                &worktree,
             )
             .await
             .expect("worktree child");
-        assert_eq!(
-            child.working_directory,
-            worktree.canonicalize().expect("canonical worktree")
-        );
-        std::fs::remove_dir_all(worktree).expect("cleanup");
+        assert_eq!(child.working_directory, worktree);
     }
 
     #[tokio::test]

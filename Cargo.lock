@@ -2200,6 +2200,7 @@ dependencies = [
  "bcode_vim_edit_plugin",
  "bcode_web_render",
  "bcode_web_search_plugin",
+ "bcode_workflow",
  "bcode_worktree",
  "bcode_worktree_models",
  "futures 0.3.32",
@@ -2574,6 +2575,20 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "bcode_workflow_store"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_config",
+ "bcode_workflow",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

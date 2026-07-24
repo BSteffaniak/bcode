@@ -75,6 +75,7 @@ use bcode_session::{
     AppendToolCallRequestedInput, CatalogLoadStatus, SessionManager,
     lease::SessionLeaseOwnerContext,
 };
+use bcode_session_models::ExecutionSessionProvenance;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveToolArgumentPreview, ModelTurnOutcome,
     PluginVisualDescriptor, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkKind,
@@ -104,6 +105,10 @@ use bcode_tool::{
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
     ToolInvocationServiceResolution, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
     ToolList, ToolOutputStream, ToolPreparationRequest, ToolPreparationResponse, ToolResultContent,
+};
+use bcode_workflow::{
+    WorkflowApprovalResolver, WorkflowError, WorkflowGrantScope, WorkflowPolicyGrant,
+    WorkflowToolCapability,
 };
 use futures::{StreamExt, stream};
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
@@ -968,6 +973,105 @@ impl TraceStore {
     }
 }
 
+pub struct WorkflowPermissionResolver<'a> {
+    state: &'a ServerState,
+    session_id: SessionId,
+    agent_id: String,
+    cancellation: &'a bcode_workflow::WorkflowCancellation,
+}
+
+impl WorkflowPermissionResolver<'_> {
+    async fn request(
+        &self,
+        capability: WorkflowToolCapability,
+        scope: &WorkflowGrantScope,
+    ) -> Result<Option<WorkflowPolicyGrant>, WorkflowError> {
+        let permission_id = next_permission_id(self.state).await;
+        let tool_call_id = format!("workflow:{}:{}", scope.definition, scope.node);
+        let arguments_json =
+            serde_json::to_string(scope).map_err(|error| WorkflowError::Build {
+                path: scope.node.clone(),
+                message: format!("workflow permission scope serialization failed: {error}"),
+            })?;
+        let pending = PendingPermission {
+            summary: PermissionSummary {
+                permission_id: permission_id.clone(),
+                session_id: self.session_id,
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "workflow.elevate".to_string(),
+                arguments_json: arguments_json.clone(),
+                batch: None,
+                agent_id: self.agent_id.clone(),
+                policy_source: Some("workflow_policy".to_string()),
+                policy_reason: Some(format!(
+                    "{} v{} node {} requests {capability:?} capability",
+                    scope.definition, scope.definition_version, scope.node
+                )),
+                can_remember_policy: false,
+            },
+            decision: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+            skill_decision_key: None,
+        };
+        let event = SessionEventKind::PermissionRequested {
+            permission_id: permission_id.clone(),
+            tool_call_id,
+            producer_plugin_id: None,
+            tool_name: "workflow.elevate".to_string(),
+            arguments_json,
+            legacy_request_presentation: None,
+            batch: None,
+            policy_source: Some("workflow_policy".to_string()),
+            policy_reason: pending.summary.policy_reason.clone(),
+        };
+        if register_pending_permission(self.state, &pending, event)
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
+        loop {
+            let decision = *pending.decision.lock().await;
+            if let Some(approved) = decision {
+                return Ok(approved.then(|| WorkflowPolicyGrant {
+                    grant_id: permission_id.clone(),
+                    scope: scope.clone(),
+                    capability,
+                }));
+            }
+            tokio::select! {
+                () = pending.notify.notified() => {}
+                () = self.cancellation.cancelled() => {
+                    self.state.pending_permissions.lock().await.remove(&permission_id);
+                    append_permission_resolved_event(
+                        self.state,
+                        self.session_id,
+                        permission_id.clone(),
+                        false,
+                    ).await;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+impl WorkflowApprovalResolver for WorkflowPermissionResolver<'_> {
+    fn request_approval<'a>(
+        &'a self,
+        capability: WorkflowToolCapability,
+        scope: &'a WorkflowGrantScope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<WorkflowPolicyGrant>, WorkflowError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.request(capability, scope))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingPermission {
     summary: PermissionSummary,
@@ -1065,6 +1169,84 @@ struct ServerStateInit {
 }
 
 impl ServerState {
+    /// Create a fresh workflow execution session in a registered worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worktree is not registered with the parent's repository or the
+    /// session cannot be created.
+    pub async fn create_fresh_execution_session_in_registered_worktree(
+        &self,
+        name: Option<String>,
+        provenance: ExecutionSessionProvenance,
+        worktree_directory: &Path,
+    ) -> Result<bcode_session_models::SessionSummary, String> {
+        let parent = self
+            .sessions
+            .session_summary(provenance.parent_session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let worktree = bcode_worktree::validate_registered_worktree(
+            &parent.working_directory,
+            worktree_directory,
+        )
+        .map_err(|error| error.to_string())?;
+        self.sessions
+            .create_fresh_execution_session_in_worktree(name, provenance, worktree.path())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Create a fixed-generation workflow execution session in a registered worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worktree is not registered, the parent generation changed, or
+    /// the session cannot be created.
+    pub async fn create_fixed_generation_execution_session_in_registered_worktree(
+        &self,
+        name: Option<String>,
+        provenance: ExecutionSessionProvenance,
+        parent_generation: u64,
+        worktree_directory: &Path,
+    ) -> Result<bcode_session_models::SessionSummary, String> {
+        let parent = self
+            .sessions
+            .session_summary(provenance.parent_session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let worktree = bcode_worktree::validate_registered_worktree(
+            &parent.working_directory,
+            worktree_directory,
+        )
+        .map_err(|error| error.to_string())?;
+        self.sessions
+            .create_fixed_generation_execution_session_in_worktree(
+                name,
+                provenance,
+                parent_generation,
+                worktree.path(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Create a workflow elevation resolver backed by the server's normal permission queue.
+    #[must_use]
+    pub const fn workflow_permission_resolver<'a>(
+        &'a self,
+        session_id: SessionId,
+        agent_id: String,
+        cancellation: &'a bcode_workflow::WorkflowCancellation,
+    ) -> WorkflowPermissionResolver<'a> {
+        WorkflowPermissionResolver {
+            state: self,
+            session_id,
+            agent_id,
+            cancellation,
+        }
+    }
+
     fn new(
         sessions: SessionManager,
         plugins: bcode_plugin::PluginRuntimeHost,
@@ -29506,6 +29688,97 @@ library = "test"
                 ralph_store,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn workflow_elevation_uses_normal_pending_permission_path() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("workflow".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions));
+        let scope = WorkflowGrantScope {
+            definition: "review-flow".to_string(),
+            definition_version: 1,
+            workspace: "snapshot-1".to_string(),
+            node: "commit".to_string(),
+            run: Some("run-1".to_string()),
+        };
+        let request = bcode_workflow::WorkflowPolicyRequest {
+            initiating: WorkflowToolCapability::ReadOnly,
+            profile: WorkflowToolCapability::Mutating,
+            node: WorkflowToolCapability::Mutating,
+            scope: scope.clone(),
+            grant: None,
+        };
+        let task = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                bcode_workflow::authorize_workflow_policy(
+                    &request,
+                    &state.workflow_permission_resolver(
+                        session.id,
+                        "build".to_string(),
+                        &bcode_workflow::WorkflowCancellation::new(),
+                    ),
+                )
+                .await
+            })
+        };
+        let permission = loop {
+            let candidate = state
+                .pending_permissions
+                .lock()
+                .await
+                .values()
+                .next()
+                .cloned();
+            if let Some(permission) = candidate {
+                break permission;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(permission.summary.tool_name, "workflow.elevate");
+        assert_eq!(
+            permission.summary.policy_source.as_deref(),
+            Some("workflow_policy")
+        );
+        let event = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("history")
+            .into_iter()
+            .find(|event| matches!(event.kind, SessionEventKind::PermissionRequested { .. }))
+            .expect("permission event");
+        assert!(matches!(
+            event.kind,
+            SessionEventKind::PermissionRequested { policy_source, .. }
+                if policy_source.as_deref() == Some("workflow_policy")
+        ));
+        let pending =
+            take_pending_permission_for_individual(&state, &permission.summary.permission_id)
+                .await
+                .expect("pending permission");
+        resolve_pending_permission(&state, pending, true, false).await;
+        let (effective, audit) = task.await.expect("join").expect("authorized");
+        assert_eq!(effective, WorkflowToolCapability::Mutating);
+        assert!(audit.contains(&format!("grant={}", permission.summary.permission_id)));
+        assert!(state.pending_permissions.lock().await.is_empty());
+        assert!(
+            state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::PermissionResolved { permission_id, approved }
+                        if permission_id == &permission.summary.permission_id && *approved
+                ))
+        );
     }
 
     #[test]

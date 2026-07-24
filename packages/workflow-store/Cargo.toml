@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Durable workflow persistence for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "persistence", "workflow"]
+license     = { workspace = true }
+name        = "bcode_workflow_store"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_config   = { workspace = true }
+bcode_workflow = { workspace = true }
+rusqlite       = { workspace = true }
+serde          = { workspace = true, features = ["derive", "std"] }
+serde_json     = { workspace = true, features = ["std"] }
+sha2           = { workspace = true }
+thiserror      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
