@@ -5174,6 +5174,10 @@ mod tests {
             ))
             .await
             .expect("append source event");
+            let draft = format!("draft from epoch {source_writer_epoch}");
+            db.set_session_composer_draft(&draft, 42)
+                .await
+                .expect("persist authoritative source draft");
             db.database()
                 .update("session_storage_contract")
                 .value(
@@ -5210,6 +5214,13 @@ mod tests {
                 .validate_write_readiness()
                 .await
                 .expect("migrated source epoch should be writable");
+            assert_eq!(
+                migrated
+                    .session_composer_draft()
+                    .await
+                    .expect("read migrated authoritative draft"),
+                Some(draft)
+            );
             migrated
                 .append_event(&event(
                     session_id,

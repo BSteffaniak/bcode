@@ -472,6 +472,7 @@ if ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs
   || ! rg -q 'canonical_migration_page' packages/session/src/db.rs \
   || rg -q 'canonical_migration_history' packages/session/src/db.rs \
   || ! rg -q 'every_supported_source_epoch_migrates_to_current_writable_storage' packages/session/src/db.rs \
+  || ! rg -q 'read migrated authoritative draft' packages/session/src/db.rs \
   || ! rg -q 'migration_pages_more_than_one_thousand_events_without_gaps_or_duplicates' packages/session/src/lib.rs \
   || ! rg -q 'abort_at_migration_crash_boundary\("before_epoch_update"\)' packages/session/src/db.rs \
   || ! rg -q 'abort_at_migration_crash_boundary\("after_epoch_update_before_commit"\)' packages/session/src/db.rs \
