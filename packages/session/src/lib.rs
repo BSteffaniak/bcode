@@ -59,7 +59,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::spawn_blocking;
 
 /// Return the stable kind name when a session event is live-only and must not be persisted.
-const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'static str> {
+fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'static str> {
     match kind {
         SessionEventKind::ToolContribution { event }
             if matches!(
@@ -68,6 +68,19 @@ const fn live_only_session_event_kind(kind: &SessionEventKind) -> Option<&'stati
             ) =>
         {
             Some("tool_contribution")
+        }
+        SessionEventKind::ToolContributionPlaced { envelope }
+            if matches!(
+                envelope.contribution.persistence,
+                bcode_session_models::ToolContributionPersistence::Transient
+            ) =>
+        {
+            Some("tool_contribution_placed")
+        }
+        SessionEventKind::ToolContributionPlaced { envelope }
+            if envelope.placement == bcode_session_models::ToolContributionPlacement::Progress =>
+        {
+            Some("tool_contribution_progress")
         }
         _ => None,
     }
@@ -90,7 +103,10 @@ fn ensure_durable_session_event_kind(
         }
         return Err(SessionError::LiveEventPersistenceRejected { event_kind });
     }
-    if matches!(kind, SessionEventKind::ToolContribution { .. }) {
+    if matches!(
+        kind,
+        SessionEventKind::ToolContribution { .. } | SessionEventKind::ToolContributionPlaced { .. }
+    ) {
         let payload_bytes = serde_json::to_vec(kind)
             .map_err(|error| SessionError::EventSerialization(error.to_string()))?
             .len();
@@ -4060,25 +4076,6 @@ impl SessionManager {
             inner.sessions.get(&session_id).cloned()?
         };
         handle.publish_live_event(event).await.ok().flatten()
-    }
-
-    /// Publish a transient event to currently attached session subscribers without
-    /// appending it to durable history.
-    ///
-    /// This is intended for live-only data such as tool output deltas. Callers
-    /// must not use it for lifecycle or semantic events that should survive
-    /// session reloads.
-    /// Returns `None` when the session is not loaded or has no active subscribers.
-    pub async fn publish_transient_event(
-        &self,
-        session_id: SessionId,
-        kind: SessionEventKind,
-    ) -> Option<SessionEvent> {
-        let handle = {
-            let inner = self.inner.lock().await;
-            inner.sessions.get(&session_id).cloned()?
-        };
-        handle.publish_transient_event(kind).await.ok().flatten()
     }
 
     /// Append a runtime-work started event to a session.
@@ -9750,6 +9747,99 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.kind, SessionEventKind::ToolContribution { .. }))
         );
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    #[tokio::test]
+    async fn transient_placed_contribution_is_rejected_before_durable_append() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("persistent manager");
+        let session = manager
+            .create_session(
+                Some("transient placed contribution".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let result = manager
+            .append_event(
+                session.id,
+                SessionEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Progress,
+                        bcode_session_models::ToolContributionEvent {
+                            invocation_id: "call".to_owned(),
+                            contribution_id: "transient".to_owned(),
+                            sequence: 1,
+                            producer_id: "producer".to_owned(),
+                            schema: "example.transient".to_owned(),
+                            schema_version: 1,
+                            operation: bcode_session_models::ToolContributionOperation::Upsert,
+                            persistence:
+                                bcode_session_models::ToolContributionPersistence::Transient,
+                            artifact: None,
+                            payload: serde_json::json!({"must_not_persist": true}),
+                        },
+                    ),
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionError::LiveEventPersistenceRejected {
+                event_kind: "tool_contribution_placed"
+            })
+        ));
+        assert!(
+            !manager
+                .session_history(session.id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ToolContributionPlaced { .. }))
+        );
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    #[tokio::test]
+    async fn durable_progress_contribution_is_rejected_before_durable_append() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("persistent manager");
+        let session = manager
+            .create_session(
+                Some("durable progress contribution".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let result = manager
+            .append_event(
+                session.id,
+                SessionEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Progress,
+                        bcode_session_models::ToolContributionEvent {
+                            invocation_id: "call".to_owned(),
+                            contribution_id: "progress".to_owned(),
+                            sequence: 1,
+                            producer_id: "producer".to_owned(),
+                            schema: "example.progress".to_owned(),
+                            schema_version: 1,
+                            operation: bcode_session_models::ToolContributionOperation::Upsert,
+                            persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                            artifact: None,
+                            payload: serde_json::json!({"must_not_persist": true}),
+                        },
+                    ),
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionError::LiveEventPersistenceRejected {
+                event_kind: "tool_contribution_progress"
+            })
+        ));
         std::fs::remove_dir_all(root).expect("temp dir cleanup");
     }
 

@@ -4403,6 +4403,76 @@ fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
         .expect("static filesystem plugin should load")
 }
 
+#[test]
+fn live_progress_contribution_renders_replaces_in_place_and_removes() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    let progress =
+        |sequence, operation, entries: serde_json::Value| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-progress".to_owned(),
+                        contribution_id: "listing".to_owned(),
+                        sequence,
+                        producer_id: "bcode.filesystem".to_owned(),
+                        schema: "bcode.filesystem.list".to_owned(),
+                        schema_version: 1,
+                        operation,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({
+                            "entries": entries,
+                            "backend": "rust",
+                            "visited_entries": sequence,
+                            "partial": true,
+                            "message": null
+                        }),
+                    },
+                ),
+            },
+        };
+
+    app.absorb_session_live_event(&progress(
+        1,
+        bcode_session_models::ToolContributionOperation::Upsert,
+        serde_json::json!([{"path": "one.txt", "kind": "file"}]),
+    ));
+    let first = render_app_text(&mut app);
+    assert!(first.contains("Directory entries (1)"), "{first}");
+    assert!(first.contains("one.txt"), "{first}");
+
+    app.absorb_session_live_event(&progress(
+        2,
+        bcode_session_models::ToolContributionOperation::Upsert,
+        serde_json::json!([
+            {"path": "two.txt", "kind": "file"},
+            {"path": "three.txt", "kind": "file"}
+        ]),
+    ));
+    let second = render_app_text(&mut app);
+    assert!(second.contains("Directory entries (2)"), "{second}");
+    assert!(second.contains("two.txt"), "{second}");
+    assert!(!second.contains("one.txt"), "{second}");
+    assert_eq!(
+        second.matches("Directory entries (2)").count(),
+        1,
+        "{second}"
+    );
+
+    app.absorb_session_live_event(&progress(
+        3,
+        bcode_session_models::ToolContributionOperation::Remove,
+        serde_json::Value::Null,
+    ));
+    let removed = render_app_text(&mut app);
+    assert!(!removed.contains("Directory entries"), "{removed}");
+    assert!(!removed.contains("two.txt"), "{removed}");
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn live_shell_recording_chunk_renders_once_through_canonical_request_contribution() {

@@ -311,15 +311,6 @@ impl TranscriptItem {
         &self.text
     }
 
-    /// Replace display text.
-    pub fn replace_text(&mut self, text: String) {
-        if let TranscriptItemKind::ToolResult { result, .. } = &mut self.kind {
-            result.clone_from(&text);
-        }
-        self.text = text;
-        self.bump_revision();
-    }
-
     /// Append text to this transcript item.
     #[cfg(test)]
     pub fn append_text(&mut self, text: &str) {

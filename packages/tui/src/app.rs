@@ -2206,11 +2206,6 @@ impl BmuxApp {
                 .insert(key, (contribution.sequence, None));
             return;
         }
-        if placement == bcode_session_models::ToolContributionPlacement::Progress {
-            self.transient_contribution_items
-                .insert(key, (contribution.sequence, None));
-            return;
-        }
         let backs_existing_contribution = contribution.artifact.as_ref().is_some_and(|artifact| {
             let Some(presentation) = self.plugin_presentation() else {
                 return false;
@@ -2273,11 +2268,12 @@ impl BmuxApp {
                             contribution.sequence
                         )
                     });
-                let text = shared_item.text().to_owned();
                 if let Some((_, Some(id))) = self.transient_contribution_items.get(&key).copied() {
                     self.transcript.mutate_rev_find(
                         |item| item.id() == id,
-                        |item| item.replace_text(text.clone()),
+                        |item| {
+                            let _ = item.replace_from_shared(shared_item.clone());
+                        },
                     );
                     self.transient_contribution_items
                         .insert(key, (contribution.sequence, Some(id)));

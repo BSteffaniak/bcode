@@ -1,12 +1,11 @@
 //! Session actor, handle, and snapshot plumbing.
 
 use super::{
-    Arc, CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, Instant, PathBuf, ProjectionWindow,
-    ProjectionWindowRequest, SessionAttachment, SessionError, SessionEvent, SessionEventKind,
-    SessionEventProvenance, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind,
-    SessionLoadStatusKind, SessionState, SessionStoreExecutor, SessionSummary, current_unix_millis,
-    elapsed_ms, input_history_from_events, model_context_events_from_history,
-    title_from_first_prompt, usize_to_u64,
+    Arc, ClientId, Instant, PathBuf, ProjectionWindow, ProjectionWindowRequest, SessionAttachment,
+    SessionError, SessionEvent, SessionEventKind, SessionEventProvenance, SessionInputHistoryEntry,
+    SessionLiveEvent, SessionLiveEventKind, SessionLoadStatusKind, SessionState,
+    SessionStoreExecutor, SessionSummary, elapsed_ms, input_history_from_events,
+    model_context_events_from_history, title_from_first_prompt, usize_to_u64,
 };
 use crate::db::{MaterializedProjection, SessionDb, SessionDbError};
 use bcode_metrics::MetricsContext;
@@ -314,14 +313,6 @@ impl SessionHandle {
             .await
     }
 
-    pub async fn publish_transient_event(
-        &self,
-        kind: SessionEventKind,
-    ) -> Result<Option<SessionEvent>, SessionError> {
-        self.send(|reply| SessionCommand::PublishTransient { kind, reply })
-            .await
-    }
-
     pub async fn replace_state(&self, state: SessionState) -> Result<(), SessionError> {
         self.send(|reply| SessionCommand::ReplaceState {
             state: Box::new(state),
@@ -432,10 +423,6 @@ enum SessionCommand {
     PublishLive {
         event: SessionLiveEventKind,
         reply: oneshot::Sender<Option<SessionLiveEvent>>,
-    },
-    PublishTransient {
-        kind: SessionEventKind,
-        reply: oneshot::Sender<Option<SessionEvent>>,
     },
     ReplaceState {
         state: Box<SessionState>,
@@ -629,9 +616,6 @@ impl SessionActor {
             }
             SessionCommand::PublishLive { event, reply } => {
                 let _ = reply.send(self.publish_live_event(event));
-            }
-            SessionCommand::PublishTransient { kind, reply } => {
-                let _ = reply.send(self.publish_transient_event(kind));
             }
             SessionCommand::ReplaceState { state, reply } => {
                 self.replace_persisted_state(*state);
@@ -1413,22 +1397,6 @@ impl SessionActor {
             kind,
         };
         self.state.live_events.publish(event)
-    }
-
-    fn publish_transient_event(&self, kind: SessionEventKind) -> Option<SessionEvent> {
-        if self.state.sender.receiver_count() == 0 {
-            return None;
-        }
-        let event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: self.state.next_sequence,
-            timestamp_ms: current_unix_millis(),
-            session_id: self.state.summary.id,
-            provenance: None,
-            kind,
-        };
-        let _ = self.state.sender.send(event.clone());
-        Some(event)
     }
 }
 

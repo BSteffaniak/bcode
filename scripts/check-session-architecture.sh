@@ -3,6 +3,12 @@ set -euo pipefail
 
 violations=0
 
+if rg -n 'publish_transient_event|PublishTransient' packages/session/src --glob '*.rs' >/tmp/bcode-session-transient-durable-type.txt; then
+  echo "Session architecture violation: live-only publication must use SessionLiveEvent, not replayable SessionEvent types." >&2
+  cat /tmp/bcode-session-transient-durable-type.txt >&2
+  violations=1
+fi
+
 current_event_schema="$(sed -n 's/.*CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = \([0-9][0-9]*\).*/\1/p' packages/session/models/src/lib.rs)"
 fixture_baseline_schema="$(sed -n 's/Current fixture baseline schema: \*\*\([0-9][0-9]*\)\*\*.*/\1/p' packages/session/fixtures/migrations/README.md)"
 if [[ -z "$current_event_schema" || "$current_event_schema" != "$fixture_baseline_schema" ]]; then

@@ -82,9 +82,9 @@ use bcode_session_models::{
     ProviderToolCallProgress, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionLiveEventKind,
     SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolContributionEvent, ToolInvocationResult, TraceBlobRef, TraceRedaction,
-    TurnExecutionCorrelation, TurnExecutionOptions, TurnOrigin, TurnPriority,
-    TurnStructuredOutputRequest, TurnToolPolicy, WorkId,
+    ToolInvocationResult, TraceBlobRef, TraceRedaction, TurnExecutionCorrelation,
+    TurnExecutionOptions, TurnOrigin, TurnPriority, TurnStructuredOutputRequest, TurnToolPolicy,
+    WorkId,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -230,7 +230,7 @@ pub struct ServerState {
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
-    active_contributions: Arc<StdMutex<BTreeMap<ActiveContributionKey, ToolContributionEvent>>>,
+    active_contributions: Arc<StdMutex<ActiveContributionRegistry>>,
     next_permission_id: Mutex<u64>,
     next_permission_batch_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
@@ -5793,6 +5793,12 @@ struct ActiveContributionKey {
     session: SessionId,
     invocation: String,
     contribution: String,
+}
+
+#[derive(Debug, Default)]
+struct ActiveContributionRegistry {
+    envelopes: BTreeMap<ActiveContributionKey, bcode_session_models::ToolContributionEnvelope>,
+    session_bytes: BTreeMap<SessionId, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -17026,24 +17032,31 @@ async fn append_plugin_tool_lifecycle_event(
 
 const MAX_ACTIVE_CONTRIBUTION_BYTES: usize = 256 * 1024;
 const MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION: usize = 256;
+const MAX_ACTIVE_CONTRIBUTION_BYTES_PER_SESSION: usize = 8 * 1024 * 1024;
 
 fn update_active_contribution(
     state: &ServerState,
     session_id: SessionId,
-    event: &ToolContributionEvent,
+    envelope: &bcode_session_models::ToolContributionEnvelope,
 ) -> Result<bool, String> {
-    if event.invocation_id.trim().is_empty()
+    let event = &envelope.contribution;
+    if envelope.schema_version != bcode_session_models::ToolContributionEnvelope::SCHEMA_VERSION
+        || event.invocation_id.trim().is_empty()
         || event.contribution_id.trim().is_empty()
         || event.producer_id.trim().is_empty()
         || event.schema.trim().is_empty()
         || event.schema_version == 0
         || event.sequence == 0
         || event.sequence == u64::MAX
+        || event.persistence != bcode_session_models::ToolContributionPersistence::Transient
     {
-        return Err("active contribution identity, schema, and sequence must be valid".to_owned());
+        return Err(
+            "active contribution envelope identity, schema, sequence, and persistence must be valid"
+                .to_owned(),
+        );
     }
-    let encoded_bytes = serde_json::to_vec(event)
-        .map_err(|error| format!("failed to encode active contribution: {error}"))?
+    let encoded_bytes = serde_json::to_vec(envelope)
+        .map_err(|error| format!("failed to encode active contribution envelope: {error}"))?
         .len();
     if encoded_bytes > MAX_ACTIVE_CONTRIBUTION_BYTES {
         return Err(format!(
@@ -17055,37 +17068,68 @@ fn update_active_contribution(
         invocation: event.invocation_id.clone(),
         contribution: event.contribution_id.clone(),
     };
-    let mut contributions = state
+    let mut registry = state
         .active_contributions
         .lock()
         .map_err(|_| "active contribution registry poisoned".to_owned())?;
-    if let Some(current) = contributions.get(&key) {
-        if event.sequence <= current.sequence {
+    let replaced_bytes = if let Some(current) = registry.envelopes.get(&key) {
+        let current_event = &current.contribution;
+        if event.sequence <= current_event.sequence {
             return Ok(false);
         }
-        if event.producer_id != current.producer_id
-            || event.schema != current.schema
-            || event.schema_version != current.schema_version
-            || event.persistence != current.persistence
+        if event.producer_id != current_event.producer_id
+            || event.schema != current_event.schema
+            || event.schema_version != current_event.schema_version
+            || event.persistence != current_event.persistence
+            || envelope.placement != current.placement
         {
             return Err("active contribution immutable identity changed".to_owned());
         }
-    }
+        serde_json::to_vec(current)
+            .map_err(|error| format!("failed to measure active contribution envelope: {error}"))?
+            .len()
+    } else {
+        0
+    };
     if event.operation == bcode_session_models::ToolContributionOperation::Remove {
-        contributions.remove(&key);
+        if registry.envelopes.remove(&key).is_some() {
+            let session_bytes = registry.session_bytes.entry(session_id).or_default();
+            *session_bytes = session_bytes.saturating_sub(replaced_bytes);
+            if *session_bytes == 0 {
+                registry.session_bytes.remove(&session_id);
+            }
+        }
         return Ok(true);
     }
-    let session_count = contributions
+    let session_count = registry
+        .envelopes
         .keys()
         .filter(|existing| existing.session == session_id)
         .count();
-    if !contributions.contains_key(&key) && session_count >= MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION {
+    if !registry.envelopes.contains_key(&key)
+        && session_count >= MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION
+    {
         return Err(format!(
             "session has reached {MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION} active contributions"
         ));
     }
-    contributions.insert(key, event.clone());
-    drop(contributions);
+    let current_session_bytes = registry
+        .session_bytes
+        .get(&session_id)
+        .copied()
+        .unwrap_or_default();
+    let next_session_bytes = current_session_bytes
+        .saturating_sub(replaced_bytes)
+        .saturating_add(encoded_bytes);
+    if next_session_bytes > MAX_ACTIVE_CONTRIBUTION_BYTES_PER_SESSION {
+        return Err(format!(
+            "active contributions exceed the per-session {MAX_ACTIVE_CONTRIBUTION_BYTES_PER_SESSION} byte limit"
+        ));
+    }
+    registry.envelopes.insert(key, envelope.clone());
+    registry
+        .session_bytes
+        .insert(session_id, next_session_bytes);
     Ok(true)
 }
 
@@ -17093,17 +17137,18 @@ fn active_contribution_snapshot_events(
     state: &ServerState,
     session_id: SessionId,
 ) -> Result<Vec<bcode_session_models::SessionLiveEvent>, String> {
-    let contributions = state
+    let registry = state
         .active_contributions
         .lock()
         .map_err(|_| "active contribution registry poisoned".to_owned())?;
-    Ok(contributions
+    Ok(registry
+        .envelopes
         .iter()
         .filter(|(key, _)| key.session == session_id)
-        .map(|(_, event)| bcode_session_models::SessionLiveEvent {
+        .map(|(_, envelope)| bcode_session_models::SessionLiveEvent {
             session_id,
-            kind: SessionLiveEventKind::ToolContribution {
-                event: event.clone(),
+            kind: SessionLiveEventKind::ToolContributionPlaced {
+                envelope: envelope.clone(),
             },
         })
         .collect())
@@ -17116,29 +17161,46 @@ async fn clear_active_contributions(
 ) {
     let removed = state.active_contributions.lock().map_or_else(
         |_| Vec::new(),
-        |mut contributions| {
-            let mut removed = Vec::new();
-            contributions.retain(|key, event| {
-                let keep = key.session != session_id || key.invocation != invocation_id;
-                if !keep {
-                    removed.push(event.clone());
+        |mut registry| {
+            let keys = registry
+                .envelopes
+                .keys()
+                .filter(|key| key.session == session_id && key.invocation == invocation_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut removed = Vec::with_capacity(keys.len());
+            let mut removed_bytes = 0usize;
+            for key in keys {
+                if let Some(envelope) = registry.envelopes.remove(&key) {
+                    removed_bytes = removed_bytes.saturating_add(
+                        serde_json::to_vec(&envelope).map_or(0, |encoded| encoded.len()),
+                    );
+                    removed.push(envelope);
                 }
-                keep
-            });
+            }
+            if removed_bytes != 0 {
+                let session_bytes = registry.session_bytes.entry(session_id).or_default();
+                *session_bytes = session_bytes.saturating_sub(removed_bytes);
+                if *session_bytes == 0 {
+                    registry.session_bytes.remove(&session_id);
+                }
+            }
             removed
         },
     );
-    for mut event in removed {
-        event.sequence = event.sequence.saturating_add(1);
-        event.operation = bcode_session_models::ToolContributionOperation::Remove;
-        event.payload = serde_json::Value::Null;
+    for mut envelope in removed {
+        envelope.contribution.sequence = envelope.contribution.sequence.saturating_add(1);
+        envelope.contribution.operation = bcode_session_models::ToolContributionOperation::Remove;
+        envelope.contribution.payload = serde_json::Value::Null;
         state
             .sessions
-            .publish_live_event(session_id, SessionLiveEventKind::ToolContribution { event })
+            .publish_live_event(
+                session_id,
+                SessionLiveEventKind::ToolContributionPlaced { envelope },
+            )
             .await;
     }
 }
-
 async fn append_tool_contribution_envelope(
     state: &ServerState,
     session_id: SessionId,
@@ -17171,13 +17233,29 @@ async fn append_tool_contribution_envelope(
             tracing::warn!(%error, "discarded placed contribution with invalid artifact revision");
             return;
         }
-        let _ = state
-            .sessions
-            .publish_live_event(
-                session_id,
-                SessionLiveEventKind::ToolContributionPlaced { envelope },
-            )
-            .await;
+        match update_active_contribution(state, session_id, &envelope) {
+            Ok(true) => {
+                let _ = state
+                    .sessions
+                    .publish_live_event(
+                        session_id,
+                        SessionLiveEventKind::ToolContributionPlaced { envelope },
+                    )
+                    .await;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "discarded invalid active placed contribution");
+            }
+        }
+        return;
+    }
+    if envelope.placement == bcode_session_models::ToolContributionPlacement::Progress {
+        tracing::warn!(
+            invocation_id,
+            producer_id,
+            "discarded durable progress contribution"
+        );
         return;
     }
     match state
@@ -17220,7 +17298,7 @@ async fn append_tool_contribution_event(
         {
             return Err(error);
         }
-        match update_active_contribution(state, session_id, &event) {
+        match update_active_contribution(state, session_id, &envelope) {
             Ok(true) => {
                 state
                     .sessions
@@ -31029,10 +31107,12 @@ library = "test"
                 .await
                 .expect("terminal transient removal")
                 .kind,
-            SessionLiveEventKind::ToolContribution { event }
-                if event.invocation_id == "sink-call"
-                    && event.sequence == 2
-                    && event.operation
+            SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.placement
+                    == bcode_session_models::ToolContributionPlacement::Hidden
+                    && envelope.contribution.invocation_id == "sink-call"
+                    && envelope.contribution.sequence == 2
+                    && envelope.contribution.operation
                         == bcode_session_models::ToolContributionOperation::Remove
         ));
         assert!(attachment.live_events.try_recv().is_err());
@@ -31099,8 +31179,11 @@ library = "test"
                 .expect("active contribution snapshot"),
             vec![bcode_session_models::SessionLiveEvent {
                 session_id,
-                kind: SessionLiveEventKind::ToolContribution {
-                    event: contribution.clone(),
+                kind: SessionLiveEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Hidden,
+                        contribution.clone(),
+                    ),
                 },
             }]
         );
@@ -31161,10 +31244,153 @@ library = "test"
         );
         assert!(matches!(
             attachment.live_events.recv().await.expect("terminal removal").kind,
-            SessionLiveEventKind::ToolContribution { event }
-                if event.operation == bcode_session_models::ToolContributionOperation::Remove
-                    && event.sequence == 3
+            SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.placement
+                    == bcode_session_models::ToolContributionPlacement::Hidden
+                    && envelope.contribution.operation
+                        == bcode_session_models::ToolContributionOperation::Remove
+                    && envelope.contribution.sequence == 3
         ));
+    }
+
+    #[tokio::test]
+    async fn placed_transient_progress_preserves_placement_in_active_snapshots_and_cleanup() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("placed progress".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created")
+            .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call-progress".to_owned(),
+            contribution_id: "screen".to_owned(),
+            sequence: 1,
+            producer_id: "test.plugin".to_owned(),
+            schema: "test.progress".to_owned(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload: serde_json::json!({"frame": 1}),
+        };
+        let envelope = bcode_session_models::ToolContributionEnvelope::new(
+            bcode_session_models::ToolContributionPlacement::Progress,
+            contribution,
+        );
+
+        append_tool_contribution_envelope(
+            &state,
+            session_id,
+            "call-progress",
+            "test.plugin",
+            envelope.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            attachment
+                .live_events
+                .recv()
+                .await
+                .expect("placed progress")
+                .kind,
+            SessionLiveEventKind::ToolContributionPlaced {
+                envelope: envelope.clone(),
+            }
+        );
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("active contribution snapshot"),
+            vec![bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolContributionPlaced {
+                    envelope: envelope.clone(),
+                },
+            }]
+        );
+        assert!(
+            !state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ToolContributionPlaced { .. }))
+        );
+
+        clear_active_contributions(&state, session_id, "call-progress").await;
+        assert!(matches!(
+            attachment
+                .live_events
+                .recv()
+                .await
+                .expect("placed progress removal")
+                .kind,
+            SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.placement
+                    == bcode_session_models::ToolContributionPlacement::Progress
+                    && envelope.contribution.operation
+                        == bcode_session_models::ToolContributionOperation::Remove
+                    && envelope.contribution.sequence == 2
+        ));
+        assert!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("cleared snapshots")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_progress_contribution_is_rejected() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("durable progress".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created")
+            .id;
+        let state = test_server_state(sessions);
+        let envelope = bcode_session_models::ToolContributionEnvelope::new(
+            bcode_session_models::ToolContributionPlacement::Progress,
+            bcode_session_models::ToolContributionEvent {
+                invocation_id: "call-progress".to_owned(),
+                contribution_id: "screen".to_owned(),
+                sequence: 1,
+                producer_id: "test.plugin".to_owned(),
+                schema: "test.progress".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                artifact: None,
+                payload: serde_json::json!({"frame": 1}),
+            },
+        );
+
+        append_tool_contribution_envelope(
+            &state,
+            session_id,
+            "call-progress",
+            "test.plugin",
+            envelope,
+        )
+        .await;
+
+        assert!(
+            !state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ToolContributionPlaced { .. }))
+        );
     }
 
     #[tokio::test]

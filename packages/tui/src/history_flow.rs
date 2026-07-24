@@ -311,28 +311,50 @@ fn spawn_reconnecting_window_event_stream(
 enum SupersedableEventKey {
     Invocation(String),
     RuntimeWork(bcode_session_models::WorkId),
+    ToolContribution {
+        invocation_id: String,
+        contribution_id: String,
+    },
 }
 
 fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
-    let BcodeEvent::Session(event) = event else {
-        return None;
-    };
-    match &event.kind {
-        bcode_session_models::SessionEventKind::ToolInvocationLifecycle { event }
-            if matches!(
-                event.stage,
-                bcode_session_models::ToolInvocationLifecycleStage::Progress
-                    | bcode_session_models::ToolInvocationLifecycleStage::Waiting
-            ) =>
-        {
-            Some(SupersedableEventKey::Invocation(
-                event.invocation_id.clone(),
-            ))
-        }
-        bcode_session_models::SessionEventKind::RuntimeWorkProgress { work_id, .. } => {
-            Some(SupersedableEventKey::RuntimeWork(work_id.clone()))
-        }
-        _ => None,
+    match event {
+        BcodeEvent::Session(event) => match &event.kind {
+            bcode_session_models::SessionEventKind::ToolInvocationLifecycle { event }
+                if matches!(
+                    event.stage,
+                    bcode_session_models::ToolInvocationLifecycleStage::Progress
+                        | bcode_session_models::ToolInvocationLifecycleStage::Waiting
+                ) =>
+            {
+                Some(SupersedableEventKey::Invocation(
+                    event.invocation_id.clone(),
+                ))
+            }
+            bcode_session_models::SessionEventKind::RuntimeWorkProgress { work_id, .. } => {
+                Some(SupersedableEventKey::RuntimeWork(work_id.clone()))
+            }
+            _ => None,
+        },
+        BcodeEvent::SessionLive(event) => match &event.kind {
+            bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.contribution.persistence
+                    == bcode_session_models::ToolContributionPersistence::Transient
+                    && envelope.placement
+                        == bcode_session_models::ToolContributionPlacement::Progress
+                    && envelope.contribution.operation
+                        != bcode_session_models::ToolContributionOperation::Remove =>
+            {
+                Some(SupersedableEventKey::ToolContribution {
+                    invocation_id: envelope.contribution.invocation_id.clone(),
+                    contribution_id: envelope.contribution.contribution_id.clone(),
+                })
+            }
+            _ => None,
+        },
+        BcodeEvent::RuntimeWork(_)
+        | BcodeEvent::SessionViewResyncRequired { .. }
+        | BcodeEvent::SessionCatalogUpdated { .. } => None,
     }
 }
 
@@ -503,6 +525,33 @@ mod tests {
         })
     }
 
+    fn placed_progress_event(
+        session_id: SessionId,
+        sequence: u64,
+        operation: bcode_session_models::ToolContributionOperation,
+    ) -> BcodeEvent {
+        BcodeEvent::SessionLive(bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        contribution_id: "preview".to_owned(),
+                        sequence,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.progress".to_owned(),
+                        schema_version: 1,
+                        operation,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({"sequence": sequence}),
+                    },
+                ),
+            },
+        })
+    }
+
     #[test]
     fn progress_events_are_supersedable_but_boundaries_are_not() {
         let session_id = SessionId::new();
@@ -522,6 +571,60 @@ mod tests {
             ))
             .is_none()
         );
+        assert!(
+            supersedable_event_key(&placed_progress_event(
+                session_id,
+                1,
+                bcode_session_models::ToolContributionOperation::Upsert,
+            ))
+            .is_some()
+        );
+        assert!(
+            supersedable_event_key(&placed_progress_event(
+                session_id,
+                2,
+                bcode_session_models::ToolContributionOperation::Remove,
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn placed_progress_flood_collapses_to_latest_update() {
+        let session_id = SessionId::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut pending = BTreeMap::new();
+        for sequence in 1..=10_000 {
+            let event = placed_progress_event(
+                session_id,
+                sequence,
+                bcode_session_models::ToolContributionOperation::Upsert,
+            );
+            pending.insert(supersedable_event_key(&event).expect("progress key"), event);
+        }
+
+        assert!(flush_superseded_progress(&sender, &mut pending));
+        assert!(pending.is_empty());
+        let SessionStreamUpdate::Event(event) = receiver.try_recv().expect("latest progress")
+        else {
+            panic!("expected progress event");
+        };
+        assert!(matches!(
+            *event,
+            BcodeEvent::SessionLive(bcode_session_models::SessionLiveEvent {
+                kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope {
+                        contribution: bcode_session_models::ToolContributionEvent {
+                            sequence: 10_000,
+                            ..
+                        },
+                        ..
+                    },
+                },
+                ..
+            })
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
