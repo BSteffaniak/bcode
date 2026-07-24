@@ -2731,7 +2731,16 @@ fn render_comment_editor_header(
     popup: Rect,
     frame: &mut Frame<'_>,
 ) {
-    let title = if editor.preview {
+    let title = if matches!(
+        editor.mode,
+        crate::code_review_tui::ReviewCommentEditorMode::Edit { .. }
+    ) {
+        if editor.preview {
+            " Edit draft preview "
+        } else {
+            " Edit draft comment "
+        }
+    } else if editor.preview {
         if editor.existing_comment_count > 0 {
             " Reply preview "
         } else {

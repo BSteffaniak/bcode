@@ -9224,6 +9224,7 @@ impl ReviewApp {
             return true;
         }
         let comment = comments.remove(index);
+        let was_persisted = comment.persisted && comment.id.is_some();
         if comments.is_empty() {
             self.draft_comments.remove(&anchor);
             self.selected_view_target = None;
@@ -9234,7 +9235,11 @@ impl ReviewApp {
             anchor,
             comment,
         });
-        self.status_message = Some("deleted draft comment".to_string());
+        self.status_message = Some(if was_persisted {
+            "deleted draft comment; syncing delete".to_string()
+        } else {
+            "discarded unsaved draft comment".to_string()
+        });
         true
     }
 
@@ -9323,7 +9328,17 @@ impl ReviewApp {
         let comments = self.draft_comments.get(&anchor)?;
         let index = selected_index.unwrap_or_else(|| comments.len().saturating_sub(1));
         let comment = comments.get(index)?;
-        Some(format!("{} draft: {}", comments.len(), comment.body))
+        let persistence = if comment.persisted {
+            "saved"
+        } else {
+            "unsaved"
+        };
+        Some(format!(
+            "draft {}/{} ({persistence}): {}",
+            index.saturating_add(1),
+            comments.len(),
+            comment.body
+        ))
     }
 
     /// Return linked session id for the selected line's latest draft comment.
