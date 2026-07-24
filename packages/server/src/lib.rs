@@ -9912,7 +9912,7 @@ async fn handle_start_workflow_run(
         ),
     )
     .await;
-    let owner = WorkflowAgentTurnOwner { state };
+    let owner = WorkflowActivationOwner { state };
     let dispatch_summary = {
         let store_path = state
             .workflow_store
@@ -16340,6 +16340,53 @@ fn request_server_plugin_bridge(
     }
 }
 
+fn server_workflow_plugin_bridge(
+    parent_session_id: SessionId,
+    dispatch_identity: &str,
+) -> PluginInvocationBridge {
+    let dispatch_identity = dispatch_identity.to_string();
+    PluginInvocationBridge::new(move |request, cancellation| match request {
+        ServiceBridgeRequest::WriteArtifact(artifact)
+            if artifact.invocation_id == dispatch_identity =>
+        {
+            let cancel_state = TurnCancelState::default();
+            if cancellation.is_cancelled() {
+                cancel_state.close();
+            }
+            let scope = InvocationScope::new(
+                TurnScope::without_events(
+                    format!("workflow-artifact:{parent_session_id}"),
+                    TurnGeneration::new(0),
+                ),
+                dispatch_identity.clone(),
+            );
+            let sink = SessionArtifactSink::new(
+                default_session_artifact_dir(parent_session_id),
+                &dispatch_identity,
+                &cancel_state,
+            );
+            Ok(ServiceBridgeResponse::Artifact(
+                futures::executor::block_on(sink.write(artifact, scope.artifact_commit_guard())),
+            ))
+        }
+        ServiceBridgeRequest::WriteArtifact(_) => Ok(ServiceBridgeResponse::Artifact(
+            ToolArtifactWriteResolution::Failed {
+                code: "invocation_id_mismatch".to_string(),
+                message: "artifact does not belong to the workflow block invocation".to_string(),
+            },
+        )),
+        ServiceBridgeRequest::Exchange(_) => Ok(ServiceBridgeResponse::Exchange(
+            ToolExchangeResolution::NoCompatibleConsumer,
+        )),
+        ServiceBridgeRequest::ReceiveInput { .. } => Ok(ServiceBridgeResponse::Input(
+            ToolInvocationInputResolution::Closed,
+        )),
+        ServiceBridgeRequest::InvokeService(_) => Ok(ServiceBridgeResponse::Service(
+            ToolInvocationServiceResolution::Unsupported,
+        )),
+    })
+}
+
 struct ServerInputRouter<'a> {
     invocation_id: &'a str,
     inputs: &'a Mutex<mpsc::Receiver<ToolInvocationInput>>,
@@ -18968,6 +19015,14 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
         >,
     > {
         Box::pin(async move {
+            if request
+                .receipt
+                .get("owner")
+                .and_then(serde_json::Value::as_str)
+                == Some(bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            {
+                return observe_workflow_plugin_receipt(request);
+            }
             let session_id = request
                 .receipt
                 .get("session_id")
@@ -19001,6 +19056,66 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                 })?;
             observe_workflow_turn(self.state, session_id, turn_id, output_schema_id, request).await
         })
+    }
+}
+
+fn observe_workflow_plugin_receipt(
+    request: &bcode_workflow_store::AttemptReconciliationRequest,
+) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
+    let status = request
+        .receipt
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "workflow plugin receipt has no terminal status".to_string(),
+            )
+        })?;
+    match status {
+        "succeeded" => {
+            let output = request.receipt.get("output").cloned().ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "successful workflow plugin receipt has no output".to_string(),
+                )
+            })?;
+            let schema_id = request
+                .receipt
+                .get("output_schema_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "workflow plugin receipt has no output schema".to_string(),
+                    )
+                })?;
+            Ok(bcode_workflow_store::AttemptObservation::Succeeded {
+                output: bcode_workflow_store::ValidatedOutput {
+                    output_id: format!("{}:output", request.dispatch_identity),
+                    run_id: request.run_id.clone(),
+                    node_id: request.node_id.clone(),
+                    activation_id: request.activation_id.clone(),
+                    schema_id: schema_id.to_string(),
+                    schema_version: 1,
+                    value: output,
+                    artifact_reference: None,
+                    created_at_ms: request
+                        .receipt
+                        .get("terminal_at_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_else(current_unix_millis),
+                },
+            })
+        }
+        "failed" => Ok(bcode_workflow_store::AttemptObservation::Failed {
+            message: request
+                .receipt
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("workflow plugin block failed")
+                .to_string(),
+        }),
+        _ => Err(WorkflowStoreError::InvalidData(format!(
+            "invalid workflow plugin receipt status: {status}"
+        ))),
     }
 }
 
@@ -19108,6 +19223,226 @@ async fn observe_workflow_turn(
             message: message.unwrap_or_else(|| format!("workflow model turn ended: {outcome:?}")),
         }),
     }
+}
+
+struct WorkflowActivationOwner<'a> {
+    state: &'a Arc<ServerState>,
+}
+
+impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
+    fn plan(
+        &self,
+        activation: &bcode_workflow_store::PendingActivation,
+    ) -> Result<Option<bcode_workflow_store::ActivationDispatchPlan>, WorkflowStoreError> {
+        match activation.node.kind {
+            bcode_workflow::NodeKind::Agent => {
+                WorkflowAgentTurnOwner { state: self.state }.plan(activation)
+            }
+            bcode_workflow::NodeKind::PluginBlock => {
+                let block: bcode_workflow::WorkflowBlockDefinition =
+                    serde_json::from_value(activation.node.configuration.clone())?;
+                block
+                    .validate()
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                let manifest = self
+                    .state
+                    .plugins
+                    .registry()
+                    .manifests()
+                    .get(&block.plugin_id)
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(format!(
+                            "workflow block plugin is not loaded: {}",
+                            block.plugin_id
+                        ))
+                    })?;
+                let declared = manifest.services.iter().any(|service| {
+                    service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID
+                        && service
+                            .workflow_blocks
+                            .iter()
+                            .any(|candidate| candidate == &block)
+                });
+                if !declared {
+                    return Err(WorkflowStoreError::InvalidData(format!(
+                        "workflow block is not declared by plugin {}: {} v{}",
+                        block.plugin_id, block.block_id, block.block_version
+                    )));
+                }
+                if block.authorization.capability
+                    != bcode_workflow::WorkflowToolCapability::ReadOnly
+                    || block.authorization.explicit_grant_required
+                {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "workflow plugin block requires unsupported authorization elevation"
+                            .to_string(),
+                    ));
+                }
+                Ok(Some(bcode_workflow_store::ActivationDispatchPlan {
+                    side_effect: match block.effect {
+                        bcode_workflow::WorkflowBlockEffect::ReadOnly => {
+                            bcode_workflow_store::DispatchSideEffect::ReadOnly
+                        }
+                        bcode_workflow::WorkflowBlockEffect::Mutating => {
+                            bcode_workflow_store::DispatchSideEffect::Mutating
+                        }
+                    },
+                    intent: serde_json::json!({
+                        "owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+                        "block": block,
+                        "input": activation.input,
+                    }),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a bcode_workflow_store::PreparedActivationDispatch,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match request.activation.node.kind {
+                bcode_workflow::NodeKind::Agent => {
+                    dispatch_workflow_agent_turn(self.state, request).await
+                }
+                bcode_workflow::NodeKind::PluginBlock => {
+                    dispatch_workflow_plugin_block(self.state, request).await
+                }
+                _ => Err(WorkflowStoreError::InvalidData(
+                    "workflow activation has no production owner".to_string(),
+                )),
+            }
+        })
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+async fn dispatch_workflow_plugin_block(
+    state: &Arc<ServerState>,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+) -> Result<serde_json::Value, WorkflowStoreError> {
+    let block: bcode_workflow::WorkflowBlockDefinition =
+        serde_json::from_value(request.activation.node.configuration.clone())?;
+    let payload = serde_json::to_vec(request.activation.input.as_ref().ok_or_else(|| {
+        WorkflowStoreError::InvalidData("workflow plugin block activation has no input".to_string())
+    })?)?;
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(&request.activation.run_id)?
+        .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
+    let parent_session_id = run
+        .parent_session_id
+        .as_deref()
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow run has no parent session".to_string())
+        })
+        .and_then(|value| {
+            SessionId::from_str(value)
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
+        })?;
+    let run_work_id = WorkId::new(format!("workflow:{}", request.activation.run_id));
+    let mut invocation = state
+        .plugins
+        .invoke_service_with_events_and_bridge_scoped(
+            &block.plugin_id,
+            bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+            block.operation.clone(),
+            payload,
+            PluginInvocationScope::session(parent_session_id.to_string()),
+            Some(server_workflow_plugin_bridge(
+                parent_session_id,
+                &request.dispatch_identity,
+            )),
+        )
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let cancel = invocation.cancel.clone();
+    register_workflow_node_runtime_work(
+        state,
+        parent_session_id,
+        &run_work_id,
+        &request.dispatch_identity,
+        request.activation.node.name.clone(),
+        CancellationHandle::PluginInvocation(cancel),
+    )
+    .await;
+    let dispatch_identity = request.dispatch_identity.clone();
+    let timeout = Duration::from_millis(block.timeout_ms);
+    let terminal = tokio::time::timeout(timeout, async {
+        loop {
+            match invocation.next_event().await {
+                Ok(StreamingServiceInvocationEvent::Event(_)) => {}
+                Ok(StreamingServiceInvocationEvent::Response(response)) => break response,
+                Err(error) => break Err(error),
+            }
+        }
+    })
+    .await;
+    let (status, output, message, runtime_status) = match terminal {
+        Ok(Ok(response)) if response.error.is_none() => {
+            match serde_json::from_slice::<serde_json::Value>(&response.payload) {
+                Ok(value) => ("succeeded", Some(value), None, RuntimeWorkStatus::Completed),
+                Err(error) => (
+                    "failed",
+                    None,
+                    Some(error.to_string()),
+                    RuntimeWorkStatus::Failed,
+                ),
+            }
+        }
+        Ok(Ok(response)) => (
+            "failed",
+            None,
+            Some(response.error.map_or_else(
+                || "plugin workflow block failed".to_string(),
+                |error| error.message,
+            )),
+            RuntimeWorkStatus::Failed,
+        ),
+        Ok(Err(error)) => (
+            "failed",
+            None,
+            Some(error.to_string()),
+            RuntimeWorkStatus::Failed,
+        ),
+        Err(_) => {
+            invocation.cancel.cancel();
+            (
+                "failed",
+                None,
+                Some(format!(
+                    "workflow plugin block timed out after {} ms",
+                    block.timeout_ms
+                )),
+                RuntimeWorkStatus::TimedOut,
+            )
+        }
+    };
+    finish_registered_runtime_work(
+        state,
+        parent_session_id,
+        WorkId::new(dispatch_identity),
+        runtime_status,
+        message.clone(),
+    )
+    .await;
+    Ok(serde_json::json!({
+        "owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+        "plugin_id": block.plugin_id,
+        "block_id": block.block_id,
+        "block_version": block.block_version,
+        "operation": block.operation,
+        "status": status,
+        "output_schema_id": request.activation.node.output.type_name,
+        "output": output,
+        "message": message,
+        "terminal_at_ms": current_unix_millis(),
+    }))
 }
 
 struct WorkflowAgentTurnOwner<'a> {
@@ -19472,7 +19807,7 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .path()
         .to_path_buf();
-    let owner = WorkflowAgentTurnOwner { state };
+    let owner = WorkflowActivationOwner { state };
     match bcode_workflow_store::WorkflowStore::open_at_path(&store_path) {
         Ok(mut store) => {
             if let Err(error) = store
@@ -30458,6 +30793,29 @@ library = "test"
         server.abort();
     }
 
+    fn test_server_state_with_code_review_and_workflow_store(
+        sessions: SessionManager,
+        workflow_store: bcode_workflow_store::WorkflowStore,
+    ) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
+            bcode_code_review_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.code_review".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load code review plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state.workflow_store = StdMutex::new(workflow_store);
+        state
+    }
+
     fn test_server_state_with_fake_provider_and_workflow_store(
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
@@ -31202,6 +31560,201 @@ library = "test"
                 .status,
             bcode_workflow_store::RunStatus::Completed
         );
+    }
+
+    #[test]
+    fn workflow_plugin_artifact_bridge_writes_bounded_opaque_reference() {
+        let session_id = SessionId::new();
+        let invocation_id = "workflow-artifact-test";
+        let bridge = server_workflow_plugin_bridge(session_id, invocation_id);
+        let response = bridge
+            .request(
+                ServiceBridgeRequest::WriteArtifact(ToolArtifactWriteRequest {
+                    invocation_id: invocation_id.to_string(),
+                    artifact_id: "report".to_string(),
+                    content_type: "application/json".to_string(),
+                    bytes: br#"{"ok":true}"#.to_vec(),
+                    metadata: serde_json::json!({"schema": "test.report/v1"}),
+                }),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .expect("bridge");
+        let ServiceBridgeResponse::Artifact(ToolArtifactWriteResolution::Written {
+            byte_len,
+            reference,
+            ..
+        }) = response
+        else {
+            panic!("expected written artifact");
+        };
+        assert_eq!(byte_len, 11);
+        let uri = reference
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .expect("URI");
+        let path = artifact_reference_path(uri, &default_session_artifact_dir(session_id))
+            .expect("reference path");
+        assert_eq!(std::fs::read(path).expect("artifact"), br#"{"ok":true}"#);
+        let mismatch = bridge
+            .request(
+                ServiceBridgeRequest::WriteArtifact(ToolArtifactWriteRequest {
+                    invocation_id: "other".to_string(),
+                    artifact_id: "rejected".to_string(),
+                    content_type: "text/plain".to_string(),
+                    bytes: b"no".to_vec(),
+                    metadata: serde_json::Value::Null,
+                }),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .expect("bridge");
+        assert!(matches!(
+            mismatch,
+            ServiceBridgeResponse::Artifact(ToolArtifactWriteResolution::Failed { code, .. })
+                if code == "invocation_id_mismatch"
+        ));
+        let _ = remove_session_artifact_dir(&default_session_artifact_dir(session_id));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn code_review_workflow_block_dispatches_and_persists_validated_output() {
+        let repository = tempfile::tempdir().expect("repository");
+        std::fs::write(repository.path().join("tracked.txt"), "review me\n").expect("file");
+        for arguments in [
+            ["init"].as_slice(),
+            ["config", "user.email", "test@example.com"].as_slice(),
+            ["config", "user.name", "Bcode Test"].as_slice(),
+            ["add", "tracked.txt"].as_slice(),
+            ["commit", "-m", "initial"].as_slice(),
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(arguments)
+                    .current_dir(repository.path())
+                    .output()
+                    .expect("git")
+                    .status
+                    .success()
+            );
+        }
+        std::fs::write(
+            repository.path().join("tracked.txt"),
+            "review me\nchanged\n",
+        )
+        .expect("change");
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(
+                Some("workflow-parent".to_string()),
+                repository.path().to_path_buf(),
+            )
+            .await
+            .expect("parent");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("store");
+        let manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/code-review-plugin/bcode-plugin.toml"
+        ))
+        .expect("manifest");
+        let block = manifest
+            .services
+            .iter()
+            .flat_map(|service| &service.workflow_blocks)
+            .next()
+            .expect("block")
+            .clone();
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "review-block".to_string(),
+            input: block.input.clone(),
+            output: block.output.clone(),
+            nodes: BTreeMap::from([(
+                "code_review.bundle".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "code_review.bundle".to_string(),
+                    name: "code review bundle".to_string(),
+                    kind: bcode_workflow::NodeKind::PluginBlock,
+                    input: block.input.clone(),
+                    output: block.output.clone(),
+                    resources: block.resources.clone(),
+                    configuration: serde_json::to_value(&block).expect("block JSON"),
+                },
+            )]),
+            entries: vec!["code_review.bundle".to_string()],
+            exits: vec!["code_review.bundle".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("review-block", 1, &definition)
+            .expect("definition");
+        let input = bcode_code_review_models::PublishReviewRequest {
+            repo_path: repository.path().to_path_buf(),
+            target: bcode_code_review_models::ReviewTarget::WorkingTreeUnstaged,
+            workspace: None,
+            excluded_thread_anchors: Vec::new(),
+            publisher_id: "test".to_string(),
+            options: serde_json::Value::Null,
+        };
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "review-block-run".to_string(),
+                definition_id: "review-block".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: Some(parent.id.to_string()),
+                input: Some(serde_json::to_value(input).expect("input")),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let state = Arc::new(test_server_state_with_code_review_and_workflow_store(
+            sessions, store,
+        ));
+        register_workflow_runtime_work(
+            &state,
+            parent.id,
+            "review-block-run",
+            "review block".to_string(),
+        )
+        .await;
+        let owner = WorkflowActivationOwner { state: &state };
+        let store_path = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .path()
+            .to_path_buf();
+        let summary = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("scheduler")
+            .dispatch_pending_activations(&owner, 10, 2)
+            .await
+            .expect("dispatch");
+        assert_eq!(summary.admitted.len(), 1);
+        let observer = WorkflowTurnReceiptObserver { state: &state };
+        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("reconcile")
+            .reconcile_receipt_backed_attempts_async(&observer, 10, 3)
+            .await
+            .expect("observation");
+        let run = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .run_summary("review-block-run")
+            .expect("summary")
+            .expect("run");
+        assert_eq!(run.status, bcode_workflow_store::RunStatus::Completed);
+        let attempt = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attempt_history("review-block-run", None, 10)
+            .expect("attempt")
+            .pop()
+            .expect("row");
+        assert_eq!(attempt.status, "succeeded");
     }
 
     #[tokio::test]

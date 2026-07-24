@@ -50,6 +50,7 @@ use bcode_command::{
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
+use bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -149,6 +150,15 @@ impl RustPlugin for CodeReviewPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id == COMMAND_INTERFACE_ID {
             return invoke_command_service(&context.request);
+        }
+        if context.request.interface_id == WORKFLOW_BLOCK_INTERFACE_ID {
+            return match context.request.operation.as_str() {
+                OP_REVIEW_BUNDLE_GET => review_bundle_get(&context),
+                _ => ServiceResponse::error(
+                    "unsupported_operation",
+                    "unsupported code review workflow block operation",
+                ),
+            };
         }
         if context.request.interface_id != CODE_REVIEW_SERVICE_INTERFACE_ID {
             return ServiceResponse::error(

@@ -257,6 +257,9 @@ pub struct PluginService {
     pub concurrency: Option<PluginConcurrencyConfig>,
     #[serde(default)]
     pub class: Option<PluginInvocationClass>,
+    /// Workflow blocks exposed through this service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_blocks: Vec<bcode_workflow::WorkflowBlockDefinition>,
     /// Operations this service explicitly exposes to active tool invocations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invocation_operations: Vec<String>,
@@ -1638,7 +1641,12 @@ impl PluginInvocationBridge {
         }
     }
 
-    fn request(
+    /// Execute one host bridge request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured host handler rejects the request.
+    pub fn request(
         &self,
         request: ServiceBridgeRequest,
         cancellation: bcode_plugin_sdk::ServiceCancellation,
@@ -2048,6 +2056,24 @@ pub struct PluginRegistry {
 impl PluginRegistry {
     #[must_use]
     fn from_manifests(manifests: BTreeMap<String, PluginManifest>) -> Self {
+        for manifest in manifests.values() {
+            for service in &manifest.services {
+                for block in &service.workflow_blocks {
+                    assert_eq!(
+                        service.interface_id,
+                        bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+                        "plugin workflow blocks must use bcode.workflow-block/v1"
+                    );
+                    assert_eq!(
+                        block.plugin_id, manifest.id,
+                        "plugin workflow block owner must match manifest"
+                    );
+                    block
+                        .validate()
+                        .expect("manifest workflow block contract must be valid");
+                }
+            }
+        }
         let service_registry = PluginServiceRegistry::from_manifests(manifests.values());
         let mut service_policies = BTreeMap::new();
         for manifest in manifests.values() {
@@ -3828,6 +3854,28 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn code_review_manifest_declares_valid_workflow_block_contract() {
+        let manifest: PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/code-review-plugin/bcode-plugin.toml"
+        ))
+        .expect("code review manifest");
+        let service = manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("workflow block service");
+        assert_eq!(service.workflow_blocks.len(), 1);
+        let block = &service.workflow_blocks[0];
+        block.validate().expect("valid workflow block");
+        assert_eq!(block.plugin_id, manifest.id);
+        assert_eq!(block.operation, "review.bundle.get");
+        assert_eq!(
+            block.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
+        );
+    }
+
+    #[test]
     fn plugin_serialization_reason_is_only_reentrancy_exclusivity() {
         assert_eq!(
             plugin_serialization_reason(PluginConcurrency::Exclusive),
@@ -5108,6 +5156,7 @@ library = "libexample_plugin.dylib"
                     description: None,
                     concurrency: None,
                     class: None,
+                    workflow_blocks: Vec::new(),
                     invocation_operations: Vec::new(),
                 }],
                 tui_surfaces: Vec::new(),
@@ -5327,6 +5376,7 @@ library = "libexample_plugin.dylib"
                 name: Some("shell".to_string()),
                 description: None,
                 class: Some(PluginInvocationClass::ToolExecution),
+                workflow_blocks: Vec::new(),
                 invocation_operations: Vec::new(),
                 concurrency: None,
             }];
@@ -5459,6 +5509,7 @@ library = "libexample_plugin.dylib"
                 name: Some("model".to_string()),
                 description: None,
                 class: Some(PluginInvocationClass::ModelProvider),
+                workflow_blocks: Vec::new(),
                 invocation_operations: Vec::new(),
                 concurrency: None,
             }];
@@ -5768,6 +5819,7 @@ library = "libexample_plugin.dylib"
                 description: None,
                 concurrency: None,
                 class: None,
+                workflow_blocks: Vec::new(),
                 invocation_operations: Vec::new(),
             }],
             tui_surfaces: Vec::new(),

@@ -61,6 +61,8 @@ bcode_bundled_plugins = { workspace = true, features = [
     "static-bundled-question-plugin",
 ] }
 bcode_client = { workspace = true }
+bcode_code_review_models = { workspace = true }
+bcode_code_review_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_hyperchad = { workspace = true, features = [

@@ -35,7 +35,7 @@ enum CliError {
     #[error("code review error: {0}")]
     Review(String),
 }
-pub(super) fn registration() -> StaticCliRegistration {
+pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
         requires_daemon: true,
         command: ReviewCli::command,

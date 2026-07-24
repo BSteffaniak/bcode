@@ -792,6 +792,104 @@ impl ArtifactReference {
     }
 }
 
+/// Stable plugin workflow-block service interface.
+pub const WORKFLOW_BLOCK_INTERFACE_ID: &str = "bcode.workflow-block/v1";
+
+/// Side-effect declaration for one plugin-owned workflow block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowBlockEffect {
+    ReadOnly,
+    Mutating,
+}
+
+/// Authorization facts required before a block may be invoked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowBlockAuthorization {
+    /// Maximum tool capability required by the block.
+    pub capability: WorkflowToolCapability,
+    /// Whether an exact scoped grant is required even when the initiating context is sufficient.
+    #[serde(default)]
+    pub explicit_grant_required: bool,
+}
+
+/// Durable idempotency and restart reconciliation declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowBlockReconciliation {
+    /// Repeating the same dispatch identity is safe and byte-equivalent.
+    IdempotentReplay,
+    /// The owner returns a durable receipt that can be observed after restart.
+    ReceiptStatus,
+    /// An unknown outcome must stop for explicit repair.
+    RepairRequired,
+}
+
+/// One real plugin-owned workflow block contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowBlockDefinition {
+    pub block_id: String,
+    pub block_version: u32,
+    pub plugin_id: String,
+    pub operation: String,
+    pub input: ValueSchema,
+    pub output: ValueSchema,
+    pub effect: WorkflowBlockEffect,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceClaim>,
+    pub authorization: WorkflowBlockAuthorization,
+    pub timeout_ms: u64,
+    pub cancellation_supported: bool,
+    pub reconciliation: WorkflowBlockReconciliation,
+}
+
+impl WorkflowBlockDefinition {
+    /// Validate bounded identity, policy, timeout, and reconciliation invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity/version/timeout is invalid, resource declarations conflict,
+    /// cancellation is unsupported, or a mutating block claims unsafe replay.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        for (label, value) in [
+            ("block_id", self.block_id.as_str()),
+            ("plugin_id", self.plugin_id.as_str()),
+            ("operation", self.operation.as_str()),
+        ] {
+            if value.trim().is_empty() || value.len() > 256 {
+                return Err(WorkflowError::Build {
+                    path: self.block_id.clone(),
+                    message: format!("{label} must contain 1..=256 bytes"),
+                });
+            }
+        }
+        if self.block_version == 0 || self.timeout_ms == 0 {
+            return Err(WorkflowError::Build {
+                path: self.block_id.clone(),
+                message: "block version and timeout must be positive".to_string(),
+            });
+        }
+        if !self.cancellation_supported {
+            return Err(WorkflowError::Build {
+                path: self.block_id.clone(),
+                message: "workflow blocks must support cancellation".to_string(),
+            });
+        }
+        normalize_resource_claims(self.resources.clone())?;
+        if self.effect == WorkflowBlockEffect::Mutating
+            && self.reconciliation == WorkflowBlockReconciliation::IdempotentReplay
+        {
+            return Err(WorkflowError::Build {
+                path: self.block_id.clone(),
+                message:
+                    "mutating blocks must use receipt status or repair-required reconciliation"
+                        .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Serializable schema identity for one typed workflow boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValueSchema {
@@ -802,7 +900,13 @@ pub struct ValueSchema {
 }
 
 impl ValueSchema {
-    fn of<T: JsonSchema>() -> Self {
+    /// Construct the durable schema identity for a Rust boundary type.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the generated `schemars` schema cannot be represented as JSON.
+    #[must_use]
+    pub fn of<T: JsonSchema>() -> Self {
         Self {
             type_name: std::any::type_name::<T>().to_string(),
             schema: serde_json::to_value(schemars::schema_for!(T))
@@ -1127,6 +1231,8 @@ pub enum NodeKind {
     Parallel,
     /// Homogeneous bounded fan-out.
     FanOut,
+    /// Typed operation owned by a manifest-declared plugin workflow block.
+    PluginBlock,
     /// Durable external input gate resolved by the workflow host.
     Input,
     /// Durable human approval gate resolved by the workflow host.
@@ -1376,6 +1482,44 @@ where
     I: JsonSchema + Send + 'static,
     O: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
 {
+    /// Create a typed plugin-owned workflow block step.
+    ///
+    /// The in-process operation is supplied explicitly for local SDK execution. Durable hosts use
+    /// only the validated serializable block contract and invoke the declared plugin operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the block contract is invalid or its schemas do not match `I` and `O`.
+    #[must_use]
+    pub fn plugin_block<F, Fut>(block: WorkflowBlockDefinition, operation: F) -> Self
+    where
+        F: Fn(I, StepContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, WorkflowError>> + Send + 'static,
+    {
+        block
+            .validate()
+            .expect("plugin workflow block must be valid");
+        assert_eq!(
+            block.input,
+            ValueSchema::of::<I>(),
+            "plugin block input schema mismatch"
+        );
+        assert_eq!(
+            block.output,
+            ValueSchema::of::<O>(),
+            "plugin block output schema mismatch"
+        );
+        let name = block.block_id.clone();
+        let resources = block.resources.clone();
+        Self::configured_task(
+            name,
+            NodeKind::PluginBlock,
+            serde_json::to_value(block).expect("workflow block contract should serialize"),
+            operation,
+        )
+        .resources(resources)
+    }
+
     /// Create a durable external-input gate.
     ///
     /// The in-process operation is an identity mapping so the same definition remains executable
@@ -2294,6 +2438,7 @@ impl WorkflowPlan {
                             | NodeKind::Repeat
                             | NodeKind::Retry
                             | NodeKind::FanOut
+                            | NodeKind::PluginBlock
                             | NodeKind::Input
                             | NodeKind::Approval
                     )

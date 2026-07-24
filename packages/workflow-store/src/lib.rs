@@ -1795,6 +1795,41 @@ impl WorkflowStore {
         receipt_backed_attempts(&self.connection, bounded_limit(limit)?)
     }
 
+    /// Persist one exact owner observation for a receipt-backed attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is missing/not receipt-backed or the durable terminal
+    /// transition fails validation.
+    pub fn apply_attempt_observation(
+        &mut self,
+        dispatch_identity: &str,
+        observation: AttemptObservation,
+        observed_at_ms: u64,
+    ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError> {
+        validate_id("dispatch_identity", dispatch_identity)?;
+        let requests = receipt_backed_attempts(&self.connection, i64::from(1_000))?;
+        let request = requests
+            .into_iter()
+            .find(|request| request.dispatch_identity == dispatch_identity)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "receipt-backed workflow attempt not found: {dispatch_identity}"
+                ))
+            })?;
+        let transaction = self.connection.transaction()?;
+        let mut summary = ReceiptReconciliationSummary::default();
+        apply_attempt_observation(
+            &transaction,
+            &request,
+            observation,
+            observed_at_ms,
+            &mut summary,
+        )?;
+        transaction.commit()?;
+        Ok(summary)
+    }
+
     /// Reconcile receipt-backed admitted/running attempts through a bounded owner status API.
     ///
     /// Observation is read-only. Each returned state is then persisted atomically. Unknown

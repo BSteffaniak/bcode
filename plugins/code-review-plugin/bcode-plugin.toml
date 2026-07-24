@@ -13,6 +13,46 @@ description  = "Local Git code review services"
 interface_id = "bcode.code_review/v1"
 name         = "Code Review"
 
+[[services]]
+class        = "service"
+description  = "Typed read-only workflow blocks for review materialization"
+interface_id = "bcode.workflow-block/v1"
+name         = "Code Review Workflow Blocks"
+
+[[services.workflow_blocks]]
+block_id               = "code_review.bundle"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "review.bundle.get"
+plugin_id              = "bcode.code_review"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema    = { type = "object", required = ["repo_path", "target", "publisher_id"] }
+type_name = "bcode.code_review.publish_request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "review_id",
+    "title",
+    "repo_root",
+    "target",
+    "files",
+    "threads",
+    "generated_at_ms",
+] }
+type_name = "bcode.code_review.bundle/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "repository"
+
 [[tui_surfaces]]
 description = "Full-screen local Git code review home/picker UI"
 kind        = "code-review-home"
