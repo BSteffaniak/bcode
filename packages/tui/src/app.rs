@@ -1444,7 +1444,25 @@ impl BmuxApp {
 
     /// Append a system-style transcript note.
     pub fn push_system_note(&mut self, text: String) {
-        self.transcript.push(TranscriptItem::new("System", text));
+        self.push_system_plain(text);
+    }
+
+    /// Append a plain-text system-style transcript note.
+    pub fn push_system_plain(&mut self, text: String) {
+        self.transcript.push(TranscriptItem::with_format(
+            "System",
+            text,
+            bcode_session_view_models::TextFormat::PlainText,
+        ));
+    }
+
+    /// Append a Markdown system-style transcript note.
+    pub fn push_system_markdown(&mut self, text: String) {
+        self.transcript.push(TranscriptItem::with_format(
+            "System",
+            text,
+            bcode_session_view_models::TextFormat::Markdown,
+        ));
     }
 
     /// Replace the current status line.
@@ -2857,8 +2875,12 @@ impl BmuxApp {
         self.remove_pending_submission(text);
         if sequence == 0 {
             self.transcript.push(
-                TranscriptItem::new("You", text.to_owned())
-                    .with_event_metadata(sequence, timestamp_ms),
+                TranscriptItem::with_format(
+                    "You",
+                    text.to_owned(),
+                    bcode_session_view_models::TextFormat::Markdown,
+                )
+                .with_event_metadata(sequence, timestamp_ms),
             );
             return;
         }

@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
+use bcode_session_view_models::TextFormat;
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
@@ -783,12 +784,13 @@ pub fn transcript_item_signature(
     _inline_view_config: (),
 ) -> TranscriptLayoutSignature {
     TranscriptLayoutSignature::new(format!(
-        "item:{}:{}:{width}::{}:{}:{:?}:{}:{}",
+        "item:{}:{}:{width}::{}:{}:{:?}:{:?}:{}:{}",
         item.id().get(),
         item.revision(),
         item.role(),
         item.streaming(),
         item.kind(),
+        item.text_format(),
         item.text(),
         terminal_elapsed_signature_fragment(item).unwrap_or_default()
     ))
@@ -830,7 +832,15 @@ fn push_transcript_item_rows(
     let item = &transcript[index];
     match item.kind() {
         TranscriptItemKind::UserMessage => {
-            push_message_block(rows, &item.display_role(), item.text(), Color::Blue, width);
+            push_formatted_block(
+                rows,
+                &item.display_role(),
+                item.text(),
+                item.text_format(),
+                Color::Blue,
+                true,
+                width,
+            );
         }
         TranscriptItemKind::AssistantMessage => {
             push_assistant_rows(rows, item, width);
@@ -897,7 +907,15 @@ fn push_transcript_item_rows(
             );
         }
         TranscriptItemKind::System => {
-            push_detail_block(rows, "System", item.text(), Color::BrightBlack, width);
+            push_formatted_block(
+                rows,
+                &item.display_role(),
+                item.text(),
+                item.text_format(),
+                Color::BrightBlack,
+                false,
+                width,
+            );
         }
         TranscriptItemKind::Meta => {
             push_meta_block(rows, item.text(), width);
@@ -961,10 +979,42 @@ fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     } else {
         Color::Green
     };
-    push_markdown_message_block(rows, title, item.text(), color, width, true);
+    push_formatted_block(
+        rows,
+        title,
+        item.text(),
+        item.text_format(),
+        color,
+        true,
+        width,
+    );
 }
 
-fn push_markdown_message_block(
+fn push_formatted_block(
+    rows: &mut Vec<Line>,
+    title: &str,
+    body: &str,
+    text_format: TextFormat,
+    color: Color,
+    prominent: bool,
+    width: u16,
+) {
+    match text_format {
+        TextFormat::Markdown => {
+            push_markdown_block(rows, title, body, color, width, prominent);
+        }
+        TextFormat::PlainText => push_block(rows, title, body, color, prominent, width),
+        TextFormat::Json => {
+            let body = serde_json::from_str::<serde_json::Value>(body).map_or_else(
+                |_| body.to_owned(),
+                |value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_owned()),
+            );
+            push_block(rows, title, &body, color, prominent, width);
+        }
+    }
+}
+
+fn push_markdown_block(
     rows: &mut Vec<Line>,
     title: &str,
     body: &str,
@@ -1009,7 +1059,7 @@ fn push_markdown_message_block(
 #[test]
 fn tui_markdown_message_block_indents_content_and_reserves_width() {
     let mut rows = Vec::new();
-    push_markdown_message_block(&mut rows, "Bcode", "1234567890", Color::Green, 8, true);
+    push_markdown_block(&mut rows, "Bcode", "1234567890", Color::Green, 8, true);
 
     let text = rows
         .iter()
@@ -1029,7 +1079,7 @@ fn tui_markdown_message_block_indents_content_and_reserves_width() {
 #[test]
 fn tui_markdown_message_block_preserves_table_borders_after_indent() {
     let mut rows = Vec::new();
-    push_markdown_message_block(
+    push_markdown_block(
         &mut rows,
         "Bcode",
         "| A | B |\n|---|---|\n| 1 | 2 |",
@@ -1053,13 +1103,94 @@ fn tui_markdown_message_block_preserves_table_borders_after_indent() {
     assert!(text.iter().all(|line| line.chars().count() <= 20));
 }
 
+#[cfg(test)]
+#[test]
+fn pending_and_finalized_user_markdown_share_body_layout() {
+    let markdown = "- one\n- two\n\n```text\nvalue\n```";
+    let pending = PendingSubmission::new(markdown.to_owned());
+    let pending_rows = pending_submission_rows(&pending, 30);
+    let finalized = TranscriptItem::with_format("You", markdown.to_owned(), TextFormat::Markdown);
+    let finalized_rows =
+        transcript_item_rows(&[finalized], 0, 30, None, TuiDiffViewerConfig::default());
+
+    assert_eq!(&pending_rows[1..], &finalized_rows[1..]);
+}
+
+#[cfg(test)]
+#[test]
+fn format_aware_blocks_distinguish_markdown_plain_text_and_json() {
+    let source = "* value";
+    let render = |format| {
+        let mut rows = Vec::new();
+        push_formatted_block(&mut rows, "You", source, format, Color::Blue, true, 30);
+        rows.into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(render(TextFormat::Markdown), ["You", "  •  value", ""]);
+    assert_eq!(render(TextFormat::PlainText), ["You", "  * value", ""]);
+    assert_eq!(render(TextFormat::Json), ["You", "  * value", ""]);
+}
+
+#[cfg(test)]
+#[test]
+fn format_aware_json_pretty_prints_valid_values() {
+    let mut rows = Vec::new();
+    push_formatted_block(
+        &mut rows,
+        "Data",
+        r#"{"value":[1,2]}"#,
+        TextFormat::Json,
+        Color::Blue,
+        true,
+        30,
+    );
+    let text = rows
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        text,
+        [
+            "Data",
+            "  {",
+            "    \"value\": [",
+            "      1,",
+            "      2",
+            "    ]",
+            "  }",
+            ""
+        ]
+    );
+}
+
 fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
     let title = if item.streaming() {
         "Reasoning …"
     } else {
         "Reasoning"
     };
-    push_markdown_message_block(rows, title, item.text(), Color::BrightBlack, width, false);
+    push_formatted_block(
+        rows,
+        title,
+        item.text(),
+        item.text_format(),
+        Color::BrightBlack,
+        false,
+        width,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -1546,11 +1677,15 @@ fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmissio
         return;
     }
     let title = format!("You · {}", pending_label(pending.state()));
-    push_message_block(rows, &title, pending.text(), Color::Blue, width);
-}
-
-fn push_message_block(rows: &mut Vec<Line>, title: &str, body: &str, color: Color, width: u16) {
-    push_block(rows, title, body, color, true, width);
+    push_formatted_block(
+        rows,
+        &title,
+        pending.text(),
+        TextFormat::Markdown,
+        Color::Blue,
+        true,
+        width,
+    );
 }
 
 fn push_detail_block(rows: &mut Vec<Line>, title: &str, body: &str, color: Color, width: u16) {

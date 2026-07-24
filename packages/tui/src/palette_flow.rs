@@ -474,12 +474,13 @@ fn start_compact_context(chat: &mut ActiveChat) {
 }
 
 fn show_bmux_help(chat: &mut ActiveChat) {
-    chat.app.push_system_note(
+    chat.app.push_system_markdown(
         [
-            "TUI help",
-            "* Use the command palette for sessions, plugin commands, cancel, and compact.",
+            "# TUI help",
+            "",
+            "* Use the command palette for sessions, plugin commands, cancellation, and context compaction.",
             "* Transcript scrolling, composer history, session picker, and permissions honor configured keybindings where wired.",
-            "* Permission dialogs: approve/deny or move focus and confirm.",
+            "* In permission dialogs, approve or deny directly, or move focus and confirm.",
         ]
         .join("\n"),
     );

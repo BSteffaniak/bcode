@@ -286,13 +286,14 @@ async fn describe_skill(
         .description
         .as_deref()
         .unwrap_or("no description");
-    chat.app.push_system_note(format!(
-        "Skill: {}\nName: {}\nDescription: {description}\nSource: {}\nInstructions:\n{}",
-        manifest.summary.id,
-        manifest.summary.name,
-        manifest.summary.source.label,
-        truncate_for_status(&manifest.instructions, 2_000)
-    ));
+    chat.app
+        .push_system_markdown(super::slash_commands::format_skill_details_markdown(
+            &manifest.summary.name,
+            manifest.summary.id.as_str(),
+            &manifest.summary.source.label,
+            Some(description),
+            &truncate_for_status(&manifest.instructions, 2_000),
+        ));
     chat.app.set_status(format!("shown skill {skill_id}"));
     Ok(())
 }

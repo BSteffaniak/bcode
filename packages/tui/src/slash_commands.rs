@@ -108,8 +108,10 @@ pub enum SlashCommandOutcome {
     SetThinkingDisplay(bool),
     /// Toggle local reasoning output display.
     ToggleThinkingDisplay,
-    /// Show a system note.
-    SystemNote(String),
+    /// Show a Markdown system note.
+    SystemMarkdown(String),
+    /// Show a plain-text system note.
+    SystemPlain(String),
     /// Unknown slash command.
     Unknown(String),
 }
@@ -120,18 +122,30 @@ async fn describe_skill(
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     let skill_id = bcode_skill_models::SkillId::new(skill_id);
     let manifest = client.describe_skill(skill_id).await?;
-    Ok(SlashCommandOutcome::SystemNote(format!(
-        "Skill: {}\nName: {}\nDescription: {}\nSource: {}\nInstructions:\n{}",
-        manifest.summary.id,
-        manifest.summary.name,
-        manifest
-            .summary
-            .description
-            .as_deref()
-            .unwrap_or("no description"),
-        manifest.summary.source.label,
-        manifest.instructions
-    )))
+    Ok(SlashCommandOutcome::SystemMarkdown(
+        format_skill_details_markdown(
+            &manifest.summary.name,
+            manifest.summary.id.as_str(),
+            &manifest.summary.source.label,
+            manifest.summary.description.as_deref(),
+            &manifest.instructions,
+        ),
+    ))
+}
+
+/// Format a skill description as a Markdown transcript document.
+#[must_use]
+pub fn format_skill_details_markdown(
+    name: &str,
+    id: &str,
+    source: &str,
+    description: Option<&str>,
+    instructions: &str,
+) -> String {
+    format!(
+        "# {name}\n\n* **ID:** `{id}`\n* **Source:** {source}\n\n{}\n\n## Instructions\n\n{instructions}",
+        description.unwrap_or("No description.")
+    )
 }
 
 async fn runtime_status(
@@ -450,7 +464,7 @@ async fn worktree_command(
                     display_from_current_dir(&worktree.path)
                 )
             }));
-            Ok(SlashCommandOutcome::SystemNote(lines.join("\n")))
+            Ok(SlashCommandOutcome::SystemPlain(lines.join("\n")))
         }
         Some("create") | None => Ok(SlashCommandOutcome::OpenWorktreeCreateDialog),
         Some("attach") if parts.len() > 2 => {
@@ -809,6 +823,22 @@ async fn execute_builtin(
 mod tests {
     use super::*;
     use bcode_ralph::RalphPromptKind;
+
+    #[test]
+    fn skill_details_formatter_preserves_markdown_instructions() {
+        let output = format_skill_details_markdown(
+            "Review",
+            "review",
+            "user config",
+            Some("Review code."),
+            "## Steps\n\n1. Read [guide](https://example.com).\n2. Run:\n\n```sh\ncargo test\n```",
+        );
+
+        assert!(output.starts_with("# Review\n\n"));
+        assert!(output.contains("* **ID:** `review`"));
+        assert!(output.contains("## Instructions\n\n## Steps"));
+        assert!(output.contains("```sh\ncargo test\n```"));
+    }
 
     #[test]
     fn ralph_start_routes_to_start_dialog() {

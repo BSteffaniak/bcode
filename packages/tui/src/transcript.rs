@@ -6,8 +6,8 @@ use bcode_session_models::{SessionTokenUsage, ToolArtifact, ToolInvocationResult
 #[cfg(test)]
 use bcode_session_view::SessionView;
 use bcode_session_view_models::{
-    InteractionViewSummary, RuntimeWorkView, ToolInvocationView, ToolInvocationViewStatus,
-    ToolResultView, TranscriptViewItem, TranscriptViewItemKind,
+    InteractionViewSummary, RuntimeWorkView, TextFormat, ToolInvocationView,
+    ToolInvocationViewStatus, ToolResultView, TranscriptViewItem, TranscriptViewItemKind,
 };
 
 /// Generic timing metadata for a tool invocation.
@@ -128,6 +128,7 @@ pub struct TranscriptItem {
     pub role: &'static str,
     pub text: String,
     pub streaming: bool,
+    text_format: TextFormat,
     display_label: Option<String>,
     event_sequence: Option<u64>,
     timestamp_ms: Option<u64>,
@@ -136,12 +137,24 @@ pub struct TranscriptItem {
 
 impl TranscriptItem {
     pub fn new(role: &'static str, text: String) -> Self {
-        Self::with_identity(role, text, false, kind_for_role(role))
+        Self::with_identity(
+            role,
+            text,
+            false,
+            TextFormat::PlainText,
+            kind_for_role(role),
+        )
+    }
+
+    /// Create a local transcript item with an explicit text format.
+    #[must_use]
+    pub fn with_format(role: &'static str, text: String, text_format: TextFormat) -> Self {
+        Self::with_identity(role, text, false, text_format, kind_for_role(role))
     }
 
     #[cfg(test)]
     pub fn new_streaming(role: &'static str, text: String) -> Self {
-        Self::with_identity(role, text, true, kind_for_role(role))
+        Self::with_identity(role, text, true, TextFormat::PlainText, kind_for_role(role))
     }
 
     pub(crate) fn with_kind(
@@ -150,13 +163,14 @@ impl TranscriptItem {
         streaming: bool,
         kind: TranscriptItemKind,
     ) -> Self {
-        Self::with_identity(role, text, streaming, kind)
+        Self::with_identity(role, text, streaming, TextFormat::PlainText, kind)
     }
 
     fn with_identity(
         role: &'static str,
         text: String,
         streaming: bool,
+        text_format: TextFormat,
         kind: TranscriptItemKind,
     ) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -168,6 +182,7 @@ impl TranscriptItem {
             role,
             text,
             streaming,
+            text_format,
             display_label: None,
             event_sequence: None,
             timestamp_ms: None,
@@ -238,6 +253,7 @@ impl TranscriptItem {
         self.role = replacement.role;
         self.text = replacement.text;
         self.streaming = replacement.streaming;
+        self.text_format = replacement.text_format;
         self.display_label = replacement.display_label;
         self.event_sequence = replacement.event_sequence;
         self.timestamp_ms = replacement.timestamp_ms;
@@ -362,6 +378,12 @@ impl TranscriptItem {
     #[must_use]
     pub const fn kind(&self) -> &TranscriptItemKind {
         &self.kind
+    }
+
+    /// Return the renderer-neutral text format.
+    #[must_use]
+    pub const fn text_format(&self) -> TextFormat {
+        self.text_format
     }
 
     /// Return whether this item is currently streaming.
@@ -700,7 +722,8 @@ fn message_text_item(
     streaming: bool,
     kind: TranscriptItemKind,
 ) -> TranscriptItem {
-    let item = TranscriptItem::with_kind(role, message.text.clone(), streaming, kind);
+    let item =
+        TranscriptItem::with_identity(role, message.text.clone(), streaming, message.format, kind);
     if let Some(label) = &message.display_label {
         item.with_display_label(label.clone())
     } else {
@@ -1026,6 +1049,58 @@ fn kind_for_role(role: &str) -> TranscriptItemKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_message_projection_preserves_all_text_formats() {
+        for format in [
+            TextFormat::Markdown,
+            TextFormat::PlainText,
+            TextFormat::Json,
+        ] {
+            let item = TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("message"),
+                revision: 0,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                streaming: false,
+                kind: TranscriptViewItemKind::UserMessage {
+                    message: bcode_session_view_models::ChatMessageView {
+                        text: "* value".to_owned(),
+                        display_label: None,
+                        format,
+                    },
+                },
+            };
+
+            assert_eq!(terminal_item_from_shared(&item).text_format(), format);
+        }
+    }
+
+    #[test]
+    fn replacing_shared_item_updates_text_format() {
+        let source_id = bcode_session_view_models::TranscriptViewItemId::new("message");
+        let item = |revision, format| TranscriptViewItem {
+            id: source_id.clone(),
+            revision,
+            sequence: Some(1),
+            timestamp_ms: Some(1),
+            streaming: false,
+            kind: TranscriptViewItemKind::UserMessage {
+                message: bcode_session_view_models::ChatMessageView {
+                    text: "* value".to_owned(),
+                    display_label: None,
+                    format,
+                },
+            },
+        };
+        let mut terminal = terminal_item_from_shared(&item(0, TextFormat::PlainText));
+
+        assert!(
+            terminal
+                .replace_from_shared(terminal_item_from_shared(&item(1, TextFormat::Markdown,)))
+        );
+        assert_eq!(terminal.text_format(), TextFormat::Markdown);
+    }
 
     #[test]
     fn pending_interaction_summary_avoids_duplicate_raw_form_payload() {
