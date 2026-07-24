@@ -110,10 +110,9 @@ use bcode_workflow::{
     WorkflowApprovalResolver, WorkflowError, WorkflowGrantScope, WorkflowPolicyGrant,
     WorkflowToolCapability,
 };
+use bcode_workflow_store::WorkflowStoreError;
 #[cfg(test)]
-use bcode_workflow_store::{
-    ActiveAttemptCancellation, AttemptCancellationOwner, WorkflowStoreError,
-};
+use bcode_workflow_store::{ActiveAttemptCancellation, AttemptCancellationOwner};
 use futures::StreamExt;
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
@@ -175,6 +174,8 @@ pub enum ServerError {
     DaemonLifecycle(#[from] bcode_daemon_lifecycle::DaemonLifecycleError),
     #[error("blocking task join error: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
+    #[error("workflow store error: {0}")]
+    WorkflowStore(#[from] bcode_workflow_store::WorkflowStoreError),
     #[error("model catalog error: {0}")]
     ModelCatalog(#[from] bcode_model_catalog::Error),
     #[error("model turn completion channel closed: {0}")]
@@ -212,6 +213,7 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
+    workflow_store: StdMutex<bcode_workflow_store::WorkflowStore>,
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
@@ -513,21 +515,26 @@ impl SessionTurnPermit {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct WorkflowRunCancelState {
-    token: CancellationToken,
+#[derive(Debug, Clone)]
+struct WorkflowRunCancellationHandle {
+    run_id: String,
+    store_path: PathBuf,
 }
 
-#[cfg(test)]
-impl WorkflowRunCancelState {
-    fn cancel(&self) {
-        self.token.cancel();
-    }
-
-    #[cfg(test)]
-    fn is_cancelled(&self) -> bool {
-        self.token.is_cancelled()
+impl WorkflowRunCancellationHandle {
+    async fn cancel(&self) -> Result<(), String> {
+        let run_id = self.run_id.clone();
+        let store_path = self.store_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+                .map_err(|error| error.to_string())?;
+            store
+                .request_cancellation(&run_id, current_unix_millis())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 }
 
@@ -1185,6 +1192,7 @@ struct ServerStateInit {
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
     metrics: MetricsRegistry,
+    workflow_store: Option<bcode_workflow_store::WorkflowStore>,
     ralph_store: bcode_ralph::RalphStateStore,
 }
 
@@ -1305,6 +1313,10 @@ impl ServerState {
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
             turn_admission_locks: Mutex::default(),
+            workflow_store: StdMutex::new(init.workflow_store.unwrap_or_else(|| {
+                bcode_workflow_store::WorkflowStore::open_default()
+                    .expect("default workflow store must open")
+            })),
             runtime_work: RuntimeWorkManager::with_metrics(init.metrics.clone()),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
@@ -2303,6 +2315,7 @@ pub async fn run_with_static_bundled(
                 &daemon_record.namespace,
             )),
             metrics,
+            workflow_store: None,
             ralph_store: bcode_ralph::RalphStateStore::default(),
         },
     ));
@@ -2529,6 +2542,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::RuntimeWorkHistory { session_id, .. }
         | Request::SubscribeRuntimeWork { session_id }
         | Request::AttachSessionProjectionWindow { session_id, .. } => Some(*session_id),
+        Request::StartWorkflowRun(request) => Some(request.parent_session_id),
         Request::ForkSession {
             source_session_id, ..
         }
@@ -2599,6 +2613,16 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
+        Request::StartWorkflowRun(_) => "start_workflow_run",
+        Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
+        Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
+        Request::WorkflowRunStatus { .. } => "workflow_run_status",
+        Request::ListWorkflowRuns { .. } => "list_workflow_runs",
+        Request::CancelWorkflowRun { .. } => "cancel_workflow_run",
+        Request::PauseWorkflowRun { .. } => "pause_workflow_run",
+        Request::ResumeWorkflowRun { .. } => "resume_workflow_run",
+        Request::WorkflowAttemptHistory { .. } => "workflow_attempt_history",
+        Request::WorkflowEventHistory { .. } => "workflow_event_history",
         Request::SubscribeRuntimeWork { .. } => "subscribe_runtime_work",
         Request::SubscribeCatalogUpdates => "subscribe_catalog_updates",
         Request::SetComposerDraft { .. } => "set_composer_draft",
@@ -3012,6 +3036,49 @@ async fn handle_request_inner(
             work_id,
         } => {
             handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
+                .await
+        }
+        Request::StartWorkflowRun(request) => {
+            handle_start_workflow_run(request_id, state, writer, request).await
+        }
+        Request::ListWorkflowDefinitions { limit } => {
+            handle_list_workflow_definitions(request_id, state, writer, limit).await
+        }
+        Request::DescribeWorkflowDefinition {
+            definition_id,
+            version,
+        } => {
+            handle_describe_workflow_definition(request_id, state, writer, definition_id, version)
+                .await
+        }
+        Request::WorkflowRunStatus { run_id } => {
+            handle_workflow_run_status(request_id, state, writer, run_id).await
+        }
+        Request::ListWorkflowRuns { limit } => {
+            handle_list_workflow_runs(request_id, state, writer, limit).await
+        }
+        Request::CancelWorkflowRun { run_id } => {
+            handle_cancel_workflow_run(request_id, state, writer, run_id).await
+        }
+        Request::PauseWorkflowRun { run_id } => {
+            handle_pause_workflow_run(request_id, state, writer, run_id).await
+        }
+        Request::ResumeWorkflowRun { run_id } => {
+            handle_resume_workflow_run(request_id, state, writer, run_id).await
+        }
+        Request::WorkflowAttemptHistory {
+            run_id,
+            cursor,
+            limit,
+        } => {
+            handle_workflow_attempt_history(request_id, state, writer, run_id, cursor, limit).await
+        }
+        Request::WorkflowEventHistory {
+            run_id,
+            after_sequence,
+            limit,
+        } => {
+            handle_workflow_event_history(request_id, state, writer, run_id, after_sequence, limit)
                 .await
         }
         Request::ListRuntimeWork { session_id } => {
@@ -9660,6 +9727,242 @@ async fn handle_cancel_session_turn(
         writer,
         request_id,
         Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled }),
+    )
+    .await
+}
+
+async fn handle_start_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: bcode_ipc::WorkflowRunStartRequest,
+) -> Result<(), ServerError> {
+    let parent_session = state
+        .sessions
+        .session_summary(request.parent_session_id)
+        .await?;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let created_at_ms = current_unix_millis();
+    let run = {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.create_run(&bcode_workflow_store::NewWorkflowRun {
+            run_id: run_id.clone(),
+            definition_id: request.definition_id.clone(),
+            definition_version: request.definition_version,
+            workspace_snapshot: request.workspace_snapshot,
+            parent_session_id: Some(request.parent_session_id.to_string()),
+            input: request.input,
+            created_at_ms,
+            limits: request.limits,
+        })?;
+        store
+            .run_summary(&run_id)?
+            .expect("newly created workflow run must be readable")
+    };
+    let runtime_work_id = register_workflow_runtime_work(
+        state,
+        parent_session.id,
+        &run_id,
+        format!(
+            "workflow {} v{}",
+            request.definition_id, request.definition_version
+        ),
+    )
+    .await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunStarted(
+            bcode_ipc::WorkflowRunStartResponse {
+                run,
+                runtime_work_id,
+            },
+        )),
+    )
+    .await
+}
+
+async fn handle_list_workflow_definitions(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let definitions = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .list_definitions(limit)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowDefinitionList { definitions }),
+    )
+    .await
+}
+
+async fn handle_describe_workflow_definition(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    definition_id: String,
+    version: u32,
+) -> Result<(), ServerError> {
+    let definition = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .definition(&definition_id, version)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowDefinitionDescription { definition }),
+    )
+    .await
+}
+
+async fn handle_workflow_run_status(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+) -> Result<(), ServerError> {
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(&run_id)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunStatus { run }),
+    )
+    .await
+}
+
+async fn handle_list_workflow_runs(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let runs = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .list_runs(limit)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunList { runs }),
+    )
+    .await
+}
+
+async fn handle_cancel_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+) -> Result<(), ServerError> {
+    let (recorded, attempts) = {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = store.request_cancellation(&run_id, current_unix_millis())?;
+        let attempts = store.active_attempt_cancellations(&run_id, 1_000)?;
+        drop(store);
+        (recorded, attempts)
+    };
+    propagate_persisted_workflow_cancellation(state, attempts).await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunCancellationRequested { recorded }),
+    )
+    .await
+}
+
+async fn handle_pause_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+) -> Result<(), ServerError> {
+    let changed = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pause_run(&run_id, current_unix_millis())?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunPaused { changed }),
+    )
+    .await
+}
+
+async fn handle_resume_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+) -> Result<(), ServerError> {
+    let changed = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resume_run(&run_id, current_unix_millis())?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunResumed { changed }),
+    )
+    .await
+}
+
+async fn handle_workflow_attempt_history(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+    cursor: Option<bcode_workflow_store::AttemptCursor>,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let attempts = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .attempt_history(&run_id, cursor.as_ref(), limit)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowAttemptHistory { attempts }),
+    )
+    .await
+}
+
+async fn handle_workflow_event_history(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+    after_sequence: Option<u64>,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let events = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .event_history(&run_id, after_sequence, limit)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowEventHistory { events }),
     )
     .await
 }
@@ -18279,15 +18582,19 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
     }
 }
 
-#[cfg(test)]
 async fn register_workflow_runtime_work(
     state: &ServerState,
     session_id: SessionId,
     run_id: &str,
     label: String,
-    cancel_state: Arc<WorkflowRunCancelState>,
 ) -> WorkId {
     let work_id = WorkId::new(format!("workflow:{run_id}"));
+    let store_path = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .path()
+        .to_path_buf();
     register_runtime_work(
         state,
         session_id,
@@ -18295,7 +18602,10 @@ async fn register_workflow_runtime_work(
             work_id.clone(),
             RuntimeWorkKind::Workflow,
             label,
-            CancellationHandle::WorkflowRun(cancel_state),
+            CancellationHandle::WorkflowRun(WorkflowRunCancellationHandle {
+                run_id: run_id.to_string(),
+                store_path,
+            }),
         ),
     )
     .await;
@@ -18327,6 +18637,52 @@ async fn register_workflow_node_runtime_work(
     work_id
 }
 
+async fn signal_workflow_attempt_cancellation(
+    state: &ServerState,
+    attempt: &bcode_workflow_store::ActiveAttemptCancellation,
+) -> Result<(), WorkflowStoreError> {
+    let work_id = WorkId::new(attempt.dispatch_identity.clone());
+    let cancelled = state
+        .runtime_work
+        .cancel_global_with_children(&work_id)
+        .await;
+    if cancelled.is_empty() {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "active runtime work not found for workflow dispatch: {}",
+            attempt.dispatch_identity
+        )));
+    }
+    for cancelled_work in cancelled {
+        append_runtime_work_cancel_requested_event(
+            state,
+            cancelled_work.session_id,
+            cancelled_work.work_id,
+            None,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn propagate_persisted_workflow_cancellation(
+    state: &ServerState,
+    attempts: Vec<bcode_workflow_store::ActiveAttemptCancellation>,
+) -> Result<Vec<String>, WorkflowStoreError> {
+    let mut signalled = Vec::new();
+    for attempt in attempts {
+        signal_workflow_attempt_cancellation(state, &attempt).await?;
+        let changed = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_cancellation_signalled(&attempt.dispatch_identity, current_unix_millis())?;
+        if changed {
+            signalled.push(attempt.dispatch_identity);
+        }
+    }
+    Ok(signalled)
+}
+
 #[cfg(test)]
 struct WorkflowRuntimeWorkCancellationOwner<'a> {
     state: &'a ServerState,
@@ -18338,30 +18694,7 @@ impl AttemptCancellationOwner for WorkflowRuntimeWorkCancellationOwner<'_> {
         &'a self,
         request: &'a ActiveAttemptCancellation,
     ) -> Pin<Box<dyn Future<Output = Result<(), WorkflowStoreError>> + Send + 'a>> {
-        Box::pin(async move {
-            let work_id = WorkId::new(request.dispatch_identity.clone());
-            let cancelled = self
-                .state
-                .runtime_work
-                .cancel_global_with_children(&work_id)
-                .await;
-            if cancelled.is_empty() {
-                return Err(WorkflowStoreError::InvalidData(format!(
-                    "active runtime work not found for workflow dispatch: {}",
-                    request.dispatch_identity
-                )));
-            }
-            for cancelled_work in cancelled {
-                append_runtime_work_cancel_requested_event(
-                    self.state,
-                    cancelled_work.session_id,
-                    cancelled_work.work_id,
-                    None,
-                )
-                .await;
-            }
-            Ok(())
-        })
+        Box::pin(async move { signal_workflow_attempt_cancellation(self.state, request).await })
     }
 }
 
@@ -28949,9 +29282,144 @@ library = "test"
                 },
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                workflow_store: Some(
+                    bcode_workflow_store::WorkflowStore::open_in_state_dir(
+                        tempfile::tempdir()
+                            .expect("workflow state")
+                            .keep()
+                            .as_path(),
+                    )
+                    .expect("workflow store"),
+                ),
                 ralph_store,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn workflow_run_start_persists_context_and_registers_parent_work() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("workflow".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+        let definition = bcode_workflow::WorkflowBuilder::new(
+            "start-api",
+            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone();
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_definition("start-api", 1, &definition)
+            .expect("definition");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: run_id.clone(),
+                    definition_id: "start-api".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: Some(session.id.to_string()),
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 1,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+        }
+        let work_id = register_workflow_runtime_work(
+            &state,
+            session.id,
+            &run_id,
+            "workflow start-api v1".to_string(),
+        )
+        .await;
+        let run = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .run_summary(&run_id)
+            .expect("summary")
+            .expect("run");
+        assert_eq!(run.workspace_snapshot, "snapshot-1");
+        assert_eq!(run.parent_session_id, Some(session.id.to_string()));
+        assert_eq!(work_id, WorkId::new(format!("workflow:{run_id}")));
+        assert!(
+            state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::RuntimeWorkStarted {
+                        work_id: started,
+                        kind: RuntimeWorkKind::Workflow,
+                        ..
+                    } if started == &work_id
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_read_api_handlers_use_bounded_canonical_store_queries() {
+        let sessions = SessionManager::default();
+        let state = test_server_state(sessions);
+        let definition = bcode_workflow::WorkflowBuilder::new(
+            "read-api",
+            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone();
+        {
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store
+                .persist_definition("read-api", 1, &definition)
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: "run-read".to_string(),
+                    definition_id: "read-api".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: None,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 1,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+        }
+        let definitions = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list_definitions(10)
+            .expect("definitions");
+        assert_eq!(definitions.len(), 1);
+        let runs = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list_runs(10)
+            .expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, "run-read");
     }
 
     #[tokio::test]
@@ -28962,16 +29430,39 @@ library = "test"
             .await
             .expect("session");
         let state = test_server_state(sessions);
-        let run_cancel = Arc::new(WorkflowRunCancelState::default());
         let node_cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let run_work_id = register_workflow_runtime_work(
-            &state,
-            session.id,
-            "run-1",
-            "workflow run".to_string(),
-            Arc::clone(&run_cancel),
-        )
-        .await;
+        {
+            let definition = bcode_workflow::WorkflowBuilder::new(
+                "runtime-work",
+                bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+            )
+            .build()
+            .expect("workflow")
+            .definition()
+            .clone();
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store
+                .persist_definition("runtime-work", 1, &definition)
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: "run-1".to_string(),
+                    definition_id: "runtime-work".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: Some(session.id.to_string()),
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 1,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+        }
+        let run_work_id =
+            register_workflow_runtime_work(&state, session.id, "run-1", "workflow run".to_string())
+                .await;
         let node_work_id = register_workflow_node_runtime_work(
             &state,
             session.id,
@@ -29010,9 +29501,19 @@ library = "test"
             "parent workflow cancellation should recursively signal its node"
         );
         tokio::time::timeout(Duration::from_secs(1), async {
-            while node_cancelled.load(std::sync::atomic::Ordering::SeqCst) != 1
-                || !run_cancel.is_cancelled()
-            {
+            loop {
+                let cancelled = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .run_summary("run-1")
+                    .expect("summary")
+                    .expect("run")
+                    .cancellation_requested_at_ms
+                    .is_some();
+                if node_cancelled.load(std::sync::atomic::Ordering::SeqCst) == 1 && cancelled {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
@@ -29050,6 +29551,7 @@ library = "test"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(session.id.to_string()),
+                input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -31659,6 +32161,15 @@ library = "test"
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                workflow_store: Some(
+                    bcode_workflow_store::WorkflowStore::open_in_state_dir(
+                        tempfile::tempdir()
+                            .expect("workflow state")
+                            .keep()
+                            .as_path(),
+                    )
+                    .expect("workflow store"),
+                ),
                 ralph_store: bcode_ralph::RalphStateStore::default(),
             },
         );
@@ -32272,6 +32783,15 @@ library = "test"
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                workflow_store: Some(
+                    bcode_workflow_store::WorkflowStore::open_in_state_dir(
+                        tempfile::tempdir()
+                            .expect("workflow state")
+                            .keep()
+                            .as_path(),
+                    )
+                    .expect("workflow store"),
+                ),
                 ralph_store: bcode_ralph::RalphStateStore::default(),
             },
         );

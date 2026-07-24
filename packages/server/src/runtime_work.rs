@@ -23,8 +23,7 @@ pub enum CancellationHandle {
         run_id: String,
     },
     /// Cancel a server-hosted durable workflow run.
-    #[cfg(test)]
-    WorkflowRun(Arc<crate::WorkflowRunCancelState>),
+    WorkflowRun(crate::WorkflowRunCancellationHandle),
     /// Test/no-op cancellation hook.
     #[cfg(test)]
     Test(Arc<std::sync::atomic::AtomicUsize>),
@@ -51,11 +50,7 @@ impl CancellationHandle {
             Self::RalphRun { store, run_id } => store
                 .request_run_cancel(run_id)
                 .map_err(|error| error.to_string()),
-            #[cfg(test)]
-            Self::WorkflowRun(cancel_state) => {
-                cancel_state.cancel();
-                Ok(())
-            }
+            Self::WorkflowRun(cancellation) => cancellation.cancel().await,
             #[cfg(test)]
             Self::Test(count) => {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -77,9 +72,10 @@ impl CancellationHandle {
     /// Runtime work with a handle is cancellable.
     pub const fn is_cancellable(&self) -> bool {
         match self {
-            Self::SessionTurn(_) | Self::PluginInvocation(_) | Self::RalphRun { .. } => true,
-            #[cfg(test)]
-            Self::WorkflowRun(_) => true,
+            Self::SessionTurn(_)
+            | Self::PluginInvocation(_)
+            | Self::RalphRun { .. }
+            | Self::WorkflowRun(_) => true,
             #[cfg(test)]
             Self::Test(_) | Self::TestBlocked(_) | Self::TestFailed(_) => true,
         }
@@ -139,7 +135,6 @@ struct ActiveRuntimeWork {
 }
 
 /// Active runtime-work identity returned by recursive cancellation routing.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelledRuntimeWork {
     pub session_id: SessionId,
@@ -195,7 +190,6 @@ impl RuntimeWorkManager {
     }
 
     /// Cancel active work by exact ID across sessions and return every work item newly signalled.
-    #[cfg(test)]
     pub async fn cancel_global_with_children(&self, work_id: &WorkId) -> Vec<CancelledRuntimeWork> {
         let session_ids = self
             .active

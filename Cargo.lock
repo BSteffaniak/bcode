@@ -1509,6 +1509,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_skill_models",
  "bcode_tool",
+ "bcode_workflow_store",
  "serde_json",
  "sshenv_vault",
  "thiserror 2.0.19",
@@ -1831,6 +1832,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_skill_models",
  "bcode_tool",
+ "bcode_workflow_store",
  "bcode_worktree_models",
  "bmux_codec",
  "bmux_ipc",
@@ -2562,6 +2564,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
  "bcode_workflow",
+ "jsonschema",
  "rusqlite",
  "serde",
  "serde_json",

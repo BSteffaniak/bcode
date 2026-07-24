@@ -1887,6 +1887,194 @@ impl BcodeClient {
         }
     }
 
+    /// Start one durable workflow from a registered exact definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the immutable execution
+    /// context, definition identity, or run limits.
+    pub async fn start_workflow_run(
+        &self,
+        request: bcode_ipc::WorkflowRunStartRequest,
+    ) -> Result<bcode_ipc::WorkflowRunStartResponse, ClientError> {
+        match self
+            .send_request(Request::StartWorkflowRun(request))
+            .await?
+        {
+            ResponsePayload::WorkflowRunStarted(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List bounded, checksum-verified durable workflow definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn list_workflow_definitions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow_store::StoredWorkflowDefinition>, ClientError> {
+        match self
+            .send_request(Request::ListWorkflowDefinitions { limit })
+            .await?
+        {
+            ResponsePayload::WorkflowDefinitionList { definitions } => Ok(definitions),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Describe one exact durable workflow definition version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn describe_workflow_definition(
+        &self,
+        definition_id: String,
+        version: u32,
+    ) -> Result<Option<bcode_workflow_store::StoredWorkflowDefinition>, ClientError> {
+        match self
+            .send_request(Request::DescribeWorkflowDefinition {
+                definition_id,
+                version,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowDefinitionDescription { definition } => Ok(definition),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return one durable workflow run summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn workflow_run_status(
+        &self,
+        run_id: String,
+    ) -> Result<Option<bcode_workflow_store::WorkflowRunSummary>, ClientError> {
+        match self
+            .send_request(Request::WorkflowRunStatus { run_id })
+            .await?
+        {
+            ResponsePayload::WorkflowRunStatus { run } => Ok(run),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List bounded durable workflow run summaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn list_workflow_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow_store::WorkflowRunSummary>, ClientError> {
+        match self
+            .send_request(Request::ListWorkflowRuns { limit })
+            .await?
+        {
+            ResponsePayload::WorkflowRunList { runs } => Ok(runs),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request durable cancellation for one workflow run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn cancel_workflow_run(&self, run_id: String) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::CancelWorkflowRun { run_id })
+            .await?
+        {
+            ResponsePayload::WorkflowRunCancellationRequested { recorded } => Ok(recorded),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Pause one running workflow before further scheduler admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the transition.
+    pub async fn pause_workflow_run(&self, run_id: String) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::PauseWorkflowRun { run_id })
+            .await?
+        {
+            ResponsePayload::WorkflowRunPaused { changed } => Ok(changed),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resume one paused workflow for subsequent scheduler admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the transition.
+    pub async fn resume_workflow_run(&self, run_id: String) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::ResumeWorkflowRun { run_id })
+            .await?
+        {
+            ResponsePayload::WorkflowRunResumed { changed } => Ok(changed),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return one bounded page of workflow attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn workflow_attempt_history(
+        &self,
+        run_id: String,
+        cursor: Option<bcode_workflow_store::AttemptCursor>,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow_store::AttemptSummary>, ClientError> {
+        match self
+            .send_request(Request::WorkflowAttemptHistory {
+                run_id,
+                cursor,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowAttemptHistory { attempts } => Ok(attempts),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return one bounded page of workflow events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn workflow_event_history(
+        &self,
+        run_id: String,
+        after_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow_store::WorkflowEventRow>, ClientError> {
+        match self
+            .send_request(Request::WorkflowEventHistory {
+                run_id,
+                after_sequence,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowEventHistory { events } => Ok(events),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Request cancellation of a specific active runtime-work item.
     ///
     /// # Errors

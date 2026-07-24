@@ -23,6 +23,7 @@ bcode_provider_auth    = { workspace = true }
 bcode_session_models   = { workspace = true }
 bcode_skill_models     = { workspace = true }
 bcode_tool             = { workspace = true }
+bcode_workflow_store   = { workspace = true }
 serde_json             = { workspace = true }
 sshenv_vault           = { workspace = true }
 thiserror              = { workspace = true }

@@ -83,6 +83,17 @@ pub struct WorkflowRunSummary {
     pub updated_at_ms: u64,
 }
 
+/// Bounded pending activation ready for host admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingActivation {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub dependency_generation: u64,
+    pub node: bcode_workflow::NodeDefinition,
+    pub created_at_ms: u64,
+}
+
 /// Keyset cursor for bounded attempt history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptCursor {
@@ -155,6 +166,8 @@ pub struct NewWorkflowRun {
     pub workspace_snapshot: String,
     /// Optional parent session identity serialized without coupling this store to session logic.
     pub parent_session_id: Option<String>,
+    /// Optional bounded initial input validated against the definition input schema.
+    pub input: Option<serde_json::Value>,
     /// Creation timestamp supplied by the host clock.
     pub created_at_ms: u64,
     /// Persisted execution limits enforced by durable admission.
@@ -424,6 +437,14 @@ pub struct RepairResult {
     pub run_status: RunStatus,
 }
 
+/// Result of atomically persisting output and materializing direct successors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputPersistenceResult {
+    pub completed_activation_id: String,
+    pub activated: Vec<NewActivation>,
+    pub run_status: RunStatus,
+}
+
 /// Durable validated output persisted before downstream activation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatedOutput {
@@ -483,6 +504,18 @@ impl WorkflowStore {
     /// Returns an error when the directory/database cannot be opened or migrations fail.
     pub fn open_in_state_dir(state_dir: &Path) -> Result<Self, WorkflowStoreError> {
         Self::open_at(&workflow_database_path(state_dir))
+    }
+
+    /// Open an explicit workflow database path.
+    ///
+    /// This is used by host cancellation handles that must reopen the same canonical database
+    /// without borrowing a live connection across an async boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory/database cannot be opened or migrations fail.
+    pub fn open_at_path(path: &Path) -> Result<Self, WorkflowStoreError> {
+        Self::open_at(path)
     }
 
     /// Open the production-default workflow database.
@@ -548,6 +581,40 @@ impl WorkflowStore {
         Ok(stored)
     }
 
+    /// Return a bounded definition list ordered by identity and newest version first.
+    ///
+    /// Each row is checksum-verified before it is returned. This normal discovery path performs no
+    /// replay, repair, or external work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `limit` is invalid, a checksum is inconsistent, or the bounded query
+    /// fails.
+    pub fn list_definitions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredWorkflowDefinition>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT definition_id, version, checksum_sha256, definition_json \
+             FROM workflow_definitions ORDER BY definition_id, version DESC LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| {
+                Ok(StoredWorkflowDefinition {
+                    definition_id: row.get(0)?,
+                    version: row.get(1)?,
+                    checksum_sha256: row.get(2)?,
+                    definition_json: row.get(3)?,
+                })
+            })?
+            .map(|row| {
+                let stored = row?;
+                verify_stored_definition(stored)
+            })
+            .collect()
+    }
+
     /// Load one exact definition version with checksum verification.
     ///
     /// # Errors
@@ -574,15 +641,7 @@ impl WorkflowStore {
                 },
             )
             .optional()?;
-        if let Some(stored) = &stored
-            && sha256_hex(stored.definition_json.as_bytes()) != stored.checksum_sha256
-        {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "definition checksum mismatch: {} v{}",
-                stored.definition_id, stored.version
-            )));
-        }
-        Ok(stored)
+        stored.map(verify_stored_definition).transpose()
     }
 
     /// Create one durable workflow run bound to an existing exact definition version.
@@ -594,32 +653,39 @@ impl WorkflowStore {
     pub fn create_run(&mut self, run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
         validate_run(run)?;
         let transaction = self.connection.transaction()?;
-        let definition_exists = transaction
+        let definition_json = transaction
             .query_row(
-                "SELECT 1 FROM workflow_definitions WHERE definition_id = ?1 AND version = ?2",
+                "SELECT definition_json FROM workflow_definitions \
+                 WHERE definition_id = ?1 AND version = ?2",
                 (&run.definition_id, run.definition_version),
-                |_| Ok(()),
+                |row| row.get::<_, String>(0),
             )
-            .optional()?
-            .is_some();
-        if !definition_exists {
+            .optional()?;
+        let Some(definition_json) = definition_json else {
             return Err(WorkflowStoreError::InvalidData(format!(
                 "workflow definition not found: {} v{}",
                 run.definition_id, run.definition_version
             )));
-        }
+        };
+        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+        let input_json = run
+            .input
+            .as_ref()
+            .map(|input| validate_run_input(&definition, input))
+            .transpose()?;
         transaction.execute(
             "INSERT INTO workflow_runs \
              (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
-              status, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
+              input_json, status, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
               created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
             (
                 &run.run_id,
                 &run.definition_id,
                 run.definition_version,
                 &run.workspace_snapshot,
                 &run.parent_session_id,
+                &input_json,
                 RunStatus::Running.as_str(),
                 run.limits.deadline_at_ms,
                 run.limits.node_execution_cap,
@@ -636,6 +702,34 @@ impl WorkflowStore {
             &serde_json::to_string(run)?,
             run.created_at_ms,
         )?;
+        if definition.entries.is_empty() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow definition has no entry nodes".to_string(),
+            ));
+        }
+        if definition.entries.len()
+            > usize::try_from(run.limits.concurrency_cap).unwrap_or(usize::MAX)
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow entry set exceeds run concurrency cap".to_string(),
+            ));
+        }
+        for node_id in &definition.entries {
+            if !definition.nodes.contains_key(node_id) {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "workflow entry node is missing: {node_id}"
+                )));
+            }
+            let activation = NewActivation {
+                run_id: run.run_id.clone(),
+                node_id: node_id.clone(),
+                activation_id: activation_identity(&run.run_id, node_id, 0),
+                dependency_generation: 0,
+                created_at_ms: run.created_at_ms,
+            };
+            validate_activation(&activation)?;
+            insert_activation(&transaction, &activation)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -653,25 +747,7 @@ impl WorkflowStore {
         validate_activation(activation)?;
         enforce_activation_limits(&self.connection, activation)?;
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO workflow_activations \
-             (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
-            (
-                &activation.run_id,
-                &activation.node_id,
-                &activation.activation_id,
-                activation.dependency_generation,
-                activation.created_at_ms,
-            ),
-        )?;
-        append_event(
-            &transaction,
-            &activation.run_id,
-            "activation_created",
-            &serde_json::to_string(activation)?,
-            activation.created_at_ms,
-        )?;
+        insert_activation(&transaction, activation)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1161,12 +1237,12 @@ impl WorkflowStore {
     pub fn persist_validated_output(
         &mut self,
         output: &ValidatedOutput,
-    ) -> Result<(), WorkflowStoreError> {
+    ) -> Result<OutputPersistenceResult, WorkflowStoreError> {
         validate_output(output)?;
         let transaction = self.connection.transaction()?;
-        persist_validated_output_transaction(&transaction, output)?;
+        let result = persist_validated_output_transaction(&transaction, output)?;
         transaction.commit()?;
-        Ok(())
+        Ok(result)
     }
 
     /// Persist an external admission/service receipt after dispatch.
@@ -1568,6 +1644,54 @@ impl WorkflowStore {
         })
     }
 
+    /// Pause one running workflow before any further activation or attempt admission.
+    ///
+    /// Active external attempts are not cancelled; they remain observable and reconcilable. Calling
+    /// this for an already-paused run is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, missing/terminal/cancelling run, or database
+    /// failure.
+    pub fn pause_run(
+        &mut self,
+        run_id: &str,
+        paused_at_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        transition_run_control_state(
+            &mut self.connection,
+            run_id,
+            RunStatus::Running,
+            RunStatus::Paused,
+            "run_paused",
+            paused_at_ms,
+        )
+    }
+
+    /// Resume one paused workflow for subsequent scheduler admission.
+    ///
+    /// Calling this for an already-running run is idempotent. A cancellation request permanently
+    /// prevents resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, missing/terminal/cancelling run, or database
+    /// failure.
+    pub fn resume_run(
+        &mut self,
+        run_id: &str,
+        resumed_at_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        transition_run_control_state(
+            &mut self.connection,
+            run_id,
+            RunStatus::Paused,
+            RunStatus::Running,
+            "run_resumed",
+            resumed_at_ms,
+        )
+    }
+
     /// Persist cancellation intent before an executor signals active children.
     ///
     /// The returned value indicates whether this call recorded the first cancellation request.
@@ -1665,6 +1789,53 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Mark one successfully signalled active attempt as cancelling.
+    ///
+    /// This is the durable second half of host-side two-phase cancellation propagation. Calling it
+    /// again for an already-cancelling attempt is idempotent and does not append a duplicate event.
+    /// Terminal attempts are reported as unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, missing cancellation intent, or database failure.
+    pub fn mark_cancellation_signalled(
+        &mut self,
+        dispatch_identity: &str,
+        signalled_at_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_id("dispatch_identity", dispatch_identity)?;
+        let transaction = self.connection.transaction()?;
+        let run_id = transaction
+            .query_row(
+                "SELECT run_id FROM workflow_attempts WHERE dispatch_identity = ?1",
+                [dispatch_identity],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow attempt not found: {dispatch_identity}"
+                ))
+            })?;
+        require_cancellation_requested(&transaction, &run_id)?;
+        let changed = transaction.execute(
+            "UPDATE workflow_attempts SET status = 'cancelling' \
+             WHERE dispatch_identity = ?1 AND status IN ('prepared', 'admitted', 'running')",
+            [dispatch_identity],
+        )?;
+        if changed == 1 {
+            append_event(
+                &transaction,
+                &run_id,
+                "attempt_cancellation_signalled",
+                &serde_json::json!({"dispatch_identity": dispatch_identity}).to_string(),
+                signalled_at_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     /// Signal active attempt owners after durable cancellation intent is confirmed.
     ///
     /// Signaling occurs outside a database transaction. Successful signals are marked
@@ -1689,27 +1860,11 @@ impl WorkflowStore {
         let mut summary = CancellationPropagationSummary::default();
         for attempt in attempts {
             owner.cancel_attempt(&attempt).await?;
-            let transaction = self.connection.transaction()?;
-            let changed = transaction.execute(
-                "UPDATE workflow_attempts SET status = 'cancelling' \
-                 WHERE dispatch_identity = ?1 \
-                 AND status IN ('prepared', 'admitted', 'running')",
-                [&attempt.dispatch_identity],
-            )?;
-            if changed == 1 {
-                append_event(
-                    &transaction,
-                    run_id,
-                    "attempt_cancellation_signalled",
-                    &serde_json::json!({"dispatch_identity": attempt.dispatch_identity})
-                        .to_string(),
-                    signalled_at_ms,
-                )?;
+            if self.mark_cancellation_signalled(&attempt.dispatch_identity, signalled_at_ms)? {
                 summary.signalled.push(attempt.dispatch_identity);
             } else {
                 summary.already_terminal.push(attempt.dispatch_identity);
             }
-            transaction.commit()?;
         }
         Ok(summary)
     }
@@ -1756,6 +1911,63 @@ impl WorkflowStore {
             .optional()?
             .map(parse_run_summary)
             .transpose()
+    }
+
+    /// Return bounded pending activations with exact compiled node definitions.
+    ///
+    /// This normal scheduler read uses normalized rows and one exact stored definition per run. It
+    /// performs no event replay, repair, or external dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `limit` is invalid, persisted definitions are malformed, a node is
+    /// missing, or the bounded query fails.
+    pub fn pending_activations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingActivation>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT activation.run_id, activation.node_id, activation.activation_id, \
+             activation.dependency_generation, activation.created_at_ms, definition.definition_json \
+             FROM workflow_activations activation \
+             JOIN workflow_runs run ON run.run_id = activation.run_id \
+             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+               AND definition.version = run.definition_version \
+             WHERE activation.status = 'pending' AND run.status = 'running' \
+               AND run.cancellation_requested_at_ms IS NULL \
+             ORDER BY activation.created_at_ms, activation.run_id, activation.node_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .map(|row| {
+                let (run_id, node_id, activation_id, dependency_generation, created_at_ms, json) =
+                    row?;
+                let definition: WorkflowDefinition = serde_json::from_str(&json)?;
+                let node = definition.node(&node_id).cloned().ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "workflow activation references missing node: {node_id}"
+                    ))
+                })?;
+                Ok(PendingActivation {
+                    run_id,
+                    node_id,
+                    activation_id,
+                    dependency_generation,
+                    node,
+                    created_at_ms,
+                })
+            })
+            .collect()
     }
 
     /// Return a bounded newest-first run list without replaying workflow events.
@@ -1863,7 +2075,7 @@ impl WorkflowStore {
 fn persist_validated_output_transaction(
     transaction: &Transaction<'_>,
     output: &ValidatedOutput,
-) -> Result<(), WorkflowStoreError> {
+) -> Result<OutputPersistenceResult, WorkflowStoreError> {
     validate_output(output)?;
     let value_json = serde_json::to_string(&output.value)?;
     if value_json.len() > MAX_INLINE_JSON_BYTES {
@@ -1913,7 +2125,125 @@ fn persist_validated_output_transaction(
         &serde_json::to_string(output)?,
         output.created_at_ms,
     )?;
-    Ok(())
+    let (activated, completed_is_exit) = materialize_direct_successors(transaction, output)?;
+    let active_count: u64 = transaction.query_row(
+        "SELECT COUNT(*) FROM workflow_activations WHERE run_id = ?1 \
+         AND status IN ('pending', 'running')",
+        [&output.run_id],
+        |row| row.get(0),
+    )?;
+    let run_status = if active_count == 0 && completed_is_exit {
+        transaction.execute(
+            "UPDATE workflow_runs SET status = 'completed', updated_at_ms = ?2 \
+             WHERE run_id = ?1 AND status = 'running'",
+            (&output.run_id, output.created_at_ms),
+        )?;
+        append_event(
+            transaction,
+            &output.run_id,
+            "run_completed",
+            "{}",
+            output.created_at_ms,
+        )?;
+        RunStatus::Completed
+    } else {
+        RunStatus::Running
+    };
+    Ok(OutputPersistenceResult {
+        completed_activation_id: output.activation_id.clone(),
+        activated,
+        run_status,
+    })
+}
+
+fn materialize_direct_successors(
+    transaction: &Transaction<'_>,
+    output: &ValidatedOutput,
+) -> Result<(Vec<NewActivation>, bool), WorkflowStoreError> {
+    let (definition_json, generation): (String, u64) = transaction.query_row(
+        "SELECT definition.definition_json, activation.dependency_generation \
+         FROM workflow_runs run \
+         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+           AND definition.version = run.definition_version \
+         JOIN workflow_activations activation ON activation.run_id = run.run_id \
+           AND activation.node_id = ?2 AND activation.activation_id = ?3 \
+         WHERE run.run_id = ?1",
+        (&output.run_id, &output.node_id, &output.activation_id),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+    let completed_is_exit = definition
+        .exits
+        .iter()
+        .any(|node_id| node_id == &output.node_id);
+    let mut targets = definition
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.from == output.node_id && matches!(edge.kind, bcode_workflow::EdgeKind::Direct)
+        })
+        .map(|edge| edge.to.clone())
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    let mut activated = Vec::new();
+    for node_id in targets {
+        let dependencies = definition
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.to == node_id && matches!(edge.kind, bcode_workflow::EdgeKind::Direct)
+            })
+            .map(|edge| edge.from.as_str())
+            .collect::<Vec<_>>();
+        let mut ready = true;
+        for dependency in dependencies {
+            let completed = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 \
+                 AND node_id = ?2 AND dependency_generation = ?3 AND status = 'completed')",
+                (&output.run_id, dependency, generation),
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !completed {
+                ready = false;
+                break;
+            }
+        }
+        if !ready {
+            continue;
+        }
+        let activation = NewActivation {
+            run_id: output.run_id.clone(),
+            node_id: node_id.clone(),
+            activation_id: activation_identity(&output.run_id, &node_id, generation),
+            dependency_generation: generation,
+            created_at_ms: output.created_at_ms,
+        };
+        let changed = transaction.execute(
+            "INSERT INTO workflow_activations \
+             (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5) \
+             ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
+            (
+                &activation.run_id,
+                &activation.node_id,
+                &activation.activation_id,
+                activation.dependency_generation,
+                activation.created_at_ms,
+            ),
+        )?;
+        if changed == 1 {
+            append_event(
+                transaction,
+                &activation.run_id,
+                "activation_created",
+                &serde_json::to_string(&activation)?,
+                activation.created_at_ms,
+            )?;
+            activated.push(activation);
+        }
+    }
+    Ok((activated, completed_is_exit))
 }
 
 fn receipt_backed_attempts(
@@ -2069,11 +2399,17 @@ fn enforce_activation_limits(
     connection: &Connection,
     activation: &NewActivation,
 ) -> Result<(), WorkflowStoreError> {
-    let cycle_cap: u64 = connection.query_row(
-        "SELECT cycle_cap FROM workflow_runs WHERE run_id = ?1",
+    let (cycle_cap, status, cancellation_requested): (u64, String, bool) = connection.query_row(
+        "SELECT cycle_cap, status, cancellation_requested_at_ms IS NOT NULL \
+         FROM workflow_runs WHERE run_id = ?1",
         [&activation.run_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
+    if cancellation_requested || status != RunStatus::Running.as_str() {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow run does not accept activations while {status}"
+        )));
+    }
     if activation.dependency_generation >= cycle_cap {
         return Err(WorkflowStoreError::InvalidData(
             "workflow cycle cap exceeded".to_string(),
@@ -2296,6 +2632,37 @@ fn parse_attempt_summary(raw: RawAttemptSummary) -> Result<AttemptSummary, Workf
     })
 }
 
+fn insert_activation(
+    transaction: &Transaction<'_>,
+    activation: &NewActivation,
+) -> Result<(), WorkflowStoreError> {
+    transaction.execute(
+        "INSERT INTO workflow_activations \
+         (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+        (
+            &activation.run_id,
+            &activation.node_id,
+            &activation.activation_id,
+            activation.dependency_generation,
+            activation.created_at_ms,
+        ),
+    )?;
+    append_event(
+        transaction,
+        &activation.run_id,
+        "activation_created",
+        &serde_json::to_string(activation)?,
+        activation.created_at_ms,
+    )
+}
+
+/// Return the stable identity for one node activation generation.
+#[must_use]
+pub fn activation_identity(run_id: &str, node_id: &str, generation: u64) -> String {
+    sha256_hex(format!("{run_id}\0{node_id}\0{generation}").as_bytes())
+}
+
 /// Return the stable idempotency identity for one durable attempt.
 #[must_use]
 pub fn dispatch_identity(run_id: &str, node_id: &str, activation_id: &str, attempt: u32) -> String {
@@ -2306,6 +2673,18 @@ pub fn dispatch_identity(run_id: &str, node_id: &str, activation_id: &str, attem
 #[must_use]
 pub fn workflow_database_path(state_dir: &Path) -> PathBuf {
     state_dir.join("workflows").join(DATABASE_FILE)
+}
+
+fn verify_stored_definition(
+    stored: StoredWorkflowDefinition,
+) -> Result<StoredWorkflowDefinition, WorkflowStoreError> {
+    if sha256_hex(stored.definition_json.as_bytes()) != stored.checksum_sha256 {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "definition checksum mismatch: {} v{}",
+            stored.definition_id, stored.version
+        )));
+    }
+    Ok(stored)
 }
 
 fn append_event(
@@ -2350,6 +2729,55 @@ fn repair_required_attempt(
                 "repair-required workflow attempt not found: {dispatch_identity}"
             ))
         })
+}
+
+fn transition_run_control_state(
+    connection: &mut Connection,
+    run_id: &str,
+    expected: RunStatus,
+    target: RunStatus,
+    event_type: &str,
+    changed_at_ms: u64,
+) -> Result<bool, WorkflowStoreError> {
+    validate_id("run_id", run_id)?;
+    let transaction = connection.transaction()?;
+    let (status, cancellation_requested) = transaction
+        .query_row(
+            "SELECT status, cancellation_requested_at_ms IS NOT NULL FROM workflow_runs WHERE run_id = ?1",
+            [run_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}")))?;
+    let status = parse_run_status(&status)?;
+    if cancellation_requested {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow cancellation prevents run state changes".to_string(),
+        ));
+    }
+    if status == target {
+        return Ok(false);
+    }
+    if status != expected {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow run cannot transition from {} to {}",
+            status.as_str(),
+            target.as_str()
+        )));
+    }
+    transaction.execute(
+        "UPDATE workflow_runs SET status = ?2, updated_at_ms = ?3 WHERE run_id = ?1",
+        (run_id, target.as_str(), changed_at_ms),
+    )?;
+    append_event(
+        &transaction,
+        run_id,
+        event_type,
+        &serde_json::json!({"status": target.as_str()}).to_string(),
+        changed_at_ms,
+    )?;
+    transaction.commit()?;
+    Ok(true)
 }
 
 fn require_cancellation_requested(
@@ -2526,6 +2954,22 @@ fn validate_bounded_message(label: &str, value: &str) -> Result<(), WorkflowStor
     Ok(())
 }
 
+fn validate_run_input(
+    definition: &WorkflowDefinition,
+    input: &serde_json::Value,
+) -> Result<String, WorkflowStoreError> {
+    let input_json = bounded_json("workflow run input", input)?;
+    let validator = jsonschema::validator_for(&definition.input.schema).map_err(|error| {
+        WorkflowStoreError::InvalidData(format!("workflow input schema is invalid: {error}"))
+    })?;
+    if let Err(error) = validator.validate(input) {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow run input failed schema validation: {error}"
+        )));
+    }
+    Ok(input_json)
+}
+
 fn validate_run(run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
     validate_id("run_id", &run.run_id)?;
     validate_id("definition_id", &run.definition_id)?;
@@ -2671,6 +3115,7 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              definition_version INTEGER NOT NULL,\
              workspace_snapshot TEXT NOT NULL,\
              parent_session_id TEXT,\
+             input_json TEXT,\
              status TEXT NOT NULL,\
              cancellation_requested_at_ms INTEGER,\
              deadline_at_ms INTEGER,\
@@ -2818,8 +3263,56 @@ mod tests {
         WorkflowBuilder::new(
             name,
             Step::task(
-                "increment",
+                "review",
                 |value: u32, _context| async move { Ok(value + 1) },
+            ),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone()
+    }
+
+    fn sequential_definition() -> WorkflowDefinition {
+        WorkflowBuilder::new(
+            "sequential",
+            Step::task("first", |value: u32, _context| async move { Ok(value + 1) }).then(
+                Step::task(
+                    "second",
+                    |value: u32, _context| async move { Ok(value + 1) },
+                ),
+            ),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone()
+    }
+
+    fn parallel_join_definition() -> WorkflowDefinition {
+        let left = Step::task("left", |value: u32, _context| async move { Ok(value + 1) });
+        let right = Step::task("right", |value: u32, _context| async move { Ok(value + 2) });
+        WorkflowBuilder::new(
+            "parallel",
+            bcode_workflow::parallel_named("join", left, right),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone()
+    }
+
+    fn conditional_definition() -> WorkflowDefinition {
+        let inspect = Step::task("inspect", |value: u32, _context| async move { Ok(value) });
+        let selected = Step::task("selected", |value: u32, _context| async move { Ok(value) });
+        let other = Step::task("other", |value: u32, _context| async move { Ok(value) });
+        WorkflowBuilder::new(
+            "conditional",
+            inspect.branch(
+                "choose",
+                bcode_workflow::field::<u32>("").eq(1_u32),
+                selected,
+                other,
             ),
         )
         .build()
@@ -2835,16 +3328,21 @@ mod tests {
             definition_version: 1,
             workspace_snapshot: "snapshot-1".to_string(),
             parent_session_id: Some("session-1".to_string()),
+            input: Some(serde_json::json!(1)),
             created_at_ms: 10,
             limits: WorkflowRunLimits::default(),
         }
+    }
+
+    fn activation_id() -> String {
+        activation_identity("run-1", "review", 0)
     }
 
     fn new_activation() -> NewActivation {
         NewActivation {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             dependency_generation: 0,
             created_at_ms: 11,
         }
@@ -2863,9 +3361,6 @@ mod tests {
             .expect("definition");
         store.create_run(&new_run()).expect("run");
         store
-            .create_activation(&new_activation())
-            .expect("activation");
-        store
     }
 
     fn prepare_receipt_backed_attempt(
@@ -2875,7 +3370,7 @@ mod tests {
         let attempt = PreparedAttempt {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             attempt: 1,
             side_effect,
             intent: serde_json::json!({"operation": "review"}),
@@ -2902,7 +3397,7 @@ mod tests {
         let attempt = PreparedAttempt {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             attempt: 1,
             side_effect: DispatchSideEffect::Mutating,
             intent: serde_json::json!({"operation": "apply"}),
@@ -2913,7 +3408,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first,
-            dispatch_identity("run-1", "review", "activation-1", 1)
+            dispatch_identity("run-1", "review", activation_id().as_str(), 1)
         );
         let error = store
             .prepare_attempt(&PreparedAttempt {
@@ -2930,7 +3425,7 @@ mod tests {
         let attempt = PreparedAttempt {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             attempt: 1,
             side_effect: DispatchSideEffect::ReadOnly,
             intent: serde_json::json!({"operation": "review"}),
@@ -2965,7 +3460,7 @@ mod tests {
         let mutating = PreparedAttempt {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             attempt: 1,
             side_effect: DispatchSideEffect::Mutating,
             intent: serde_json::json!({"operation": "apply"}),
@@ -2996,7 +3491,7 @@ mod tests {
         let attempt = PreparedAttempt {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             attempt: 1,
             side_effect: DispatchSideEffect::ReadOnly,
             intent: serde_json::json!({"operation": "review"}),
@@ -3103,6 +3598,59 @@ mod tests {
     }
 
     #[test]
+    fn pause_and_resume_are_durable_idempotent_admission_gates() {
+        let (_temp, mut store) = initialized_store();
+        assert!(store.pause_run("run-1", 20).expect("pause"));
+        assert!(!store.pause_run("run-1", 21).expect("idempotent pause"));
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Paused
+        );
+        assert!(
+            store
+                .create_activation(&NewActivation {
+                    node_id: "later".to_string(),
+                    activation_id: "activation-2".to_string(),
+                    created_at_ms: 22,
+                    ..new_activation()
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_attempt(&PreparedAttempt {
+                    run_id: "run-1".to_string(),
+                    node_id: "review".to_string(),
+                    activation_id: activation_id(),
+                    attempt: 1,
+                    side_effect: DispatchSideEffect::ReadOnly,
+                    intent: serde_json::json!({}),
+                    prepared_at_ms: 22,
+                })
+                .is_err()
+        );
+        assert!(store.resume_run("run-1", 23).expect("resume"));
+        assert!(!store.resume_run("run-1", 24).expect("idempotent resume"));
+        store
+            .prepare_attempt(&PreparedAttempt {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: 1,
+                side_effect: DispatchSideEffect::ReadOnly,
+                intent: serde_json::json!({}),
+                prepared_at_ms: 25,
+            })
+            .expect("admission after resume");
+        store.request_cancellation("run-1", 26).expect("cancel");
+        assert!(store.pause_run("run-1", 27).is_err());
+    }
+
+    #[test]
     fn cancellation_intent_is_persisted_before_further_admission() {
         let (_temp, mut store) = initialized_store();
         assert!(store.request_cancellation("run-1", 20).expect("first"));
@@ -3113,7 +3661,7 @@ mod tests {
             .prepare_attempt(&PreparedAttempt {
                 run_id: "run-1".to_string(),
                 node_id: "review".to_string(),
-                activation_id: "activation-1".to_string(),
+                activation_id: activation_id(),
                 attempt: 1,
                 side_effect: DispatchSideEffect::ReadOnly,
                 intent: serde_json::json!({}),
@@ -3233,7 +3781,7 @@ mod tests {
             .prepare_attempt(&PreparedAttempt {
                 run_id: "run-1".to_string(),
                 node_id: "review".to_string(),
-                activation_id: "activation-1".to_string(),
+                activation_id: activation_id(),
                 attempt: 1,
                 side_effect: DispatchSideEffect::ReadOnly,
                 intent: serde_json::json!({}),
@@ -3266,13 +3814,10 @@ mod tests {
             retry_cap: 0,
         };
         store.create_run(&run).expect("run");
-        store
-            .create_activation(&new_activation())
-            .expect("activation");
         let attempt = PreparedAttempt {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             attempt: 1,
             side_effect: DispatchSideEffect::ReadOnly,
             intent: serde_json::json!({}),
@@ -3314,7 +3859,7 @@ mod tests {
             .prepare_attempt(&PreparedAttempt {
                 run_id: "run-1".to_string(),
                 node_id: "review".to_string(),
-                activation_id: "activation-1".to_string(),
+                activation_id: activation_id(),
                 attempt: 1,
                 side_effect: DispatchSideEffect::Mutating,
                 intent: serde_json::json!({"operation": "apply"}),
@@ -3375,7 +3920,7 @@ mod tests {
             .prepare_attempt(&PreparedAttempt {
                 run_id: "run-1".to_string(),
                 node_id: "review".to_string(),
-                activation_id: "activation-1".to_string(),
+                activation_id: activation_id(),
                 attempt: 1,
                 side_effect: DispatchSideEffect::Mutating,
                 intent: serde_json::json!({"operation": "apply"}),
@@ -3393,7 +3938,7 @@ mod tests {
                         output_id: "output-1".to_string(),
                         run_id: "wrong-run".to_string(),
                         node_id: "review".to_string(),
-                        activation_id: "activation-1".to_string(),
+                        activation_id: activation_id(),
                         schema_id: "review/v1".to_string(),
                         schema_version: 1,
                         value: serde_json::json!({"approved": true}),
@@ -3414,7 +3959,7 @@ mod tests {
                         output_id: "output-1".to_string(),
                         run_id: "run-1".to_string(),
                         node_id: "review".to_string(),
-                        activation_id: "activation-1".to_string(),
+                        activation_id: activation_id(),
                         schema_id: "review/v1".to_string(),
                         schema_version: 1,
                         value: serde_json::json!({"approved": true}),
@@ -3450,7 +3995,7 @@ mod tests {
         let attempt = PreparedAttempt {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             attempt: 1,
             side_effect: DispatchSideEffect::Mutating,
             intent: serde_json::json!({"operation": "apply"}),
@@ -3516,7 +4061,7 @@ mod tests {
         let attempt = PreparedAttempt {
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             attempt: 1,
             side_effect: DispatchSideEffect::Mutating,
             intent: serde_json::json!({"operation": "apply"}),
@@ -3603,7 +4148,7 @@ mod tests {
             let first = PreparedAttempt {
                 run_id: "run-1".to_string(),
                 node_id: "review".to_string(),
-                activation_id: "activation-1".to_string(),
+                activation_id: activation_id(),
                 attempt: 1,
                 side_effect: DispatchSideEffect::ReadOnly,
                 intent: serde_json::json!({"operation": "review"}),
@@ -3714,7 +4259,7 @@ mod tests {
             lease_id: "lease-read-1".to_string(),
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
-            activation_id: "activation-1".to_string(),
+            activation_id: activation_id(),
             resource_key: "repository".to_string(),
             mode: ResourceLeaseMode::Read,
             acquired_at_ms: 14,
@@ -3787,6 +4332,147 @@ mod tests {
     }
 
     #[test]
+    fn validated_output_atomically_activates_direct_successor_and_completes_run() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("sequential", 1, &sequential_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "sequential".to_string();
+        run.run_id = "sequential-run".to_string();
+        store.create_run(&run).expect("run");
+        let first_id = activation_identity("sequential-run", "first", 0);
+        let first = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-output".to_string(),
+                run_id: "sequential-run".to_string(),
+                node_id: "first".to_string(),
+                activation_id: first_id,
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("first output");
+        assert_eq!(first.run_status, RunStatus::Running);
+        assert_eq!(first.activated.len(), 1);
+        assert_eq!(first.activated[0].node_id, "second");
+        let second = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "second-output".to_string(),
+                run_id: "sequential-run".to_string(),
+                node_id: "second".to_string(),
+                activation_id: activation_identity("sequential-run", "second", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(3),
+                artifact_reference: None,
+                created_at_ms: 21,
+            })
+            .expect("second output");
+        assert_eq!(second.run_status, RunStatus::Completed);
+        assert!(second.activated.is_empty());
+        assert_eq!(
+            store
+                .run_summary("sequential-run")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn join_activates_once_only_after_all_direct_dependencies_complete() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let definition = parallel_join_definition();
+        store
+            .persist_definition("parallel", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "parallel-run".to_string();
+        run.definition_id = "parallel".to_string();
+        store.create_run(&run).expect("run");
+        for (node_id, output_id, timestamp) in
+            [("left", "left-output", 20), ("right", "right-output", 21)]
+        {
+            let result = store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: output_id.to_string(),
+                    run_id: "parallel-run".to_string(),
+                    node_id: node_id.to_string(),
+                    activation_id: activation_identity("parallel-run", node_id, 0),
+                    schema_id: "u32".to_string(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: timestamp,
+                })
+                .expect("branch output");
+            if node_id == "left" {
+                assert!(result.activated.is_empty());
+            } else {
+                assert_eq!(result.activated.len(), 1);
+                assert_eq!(result.activated[0].node_id, "join");
+            }
+        }
+        let join_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_activations WHERE run_id = 'parallel-run' AND node_id = 'join'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("join count");
+        assert_eq!(join_count, 1);
+    }
+
+    #[test]
+    fn controller_completion_without_selected_successor_does_not_complete_run() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("conditional", 1, &conditional_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "conditional-run".to_string();
+        run.definition_id = "conditional".to_string();
+        store.create_run(&run).expect("run");
+        let inspect = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "inspect-output".to_string(),
+                run_id: "conditional-run".to_string(),
+                node_id: "inspect".to_string(),
+                activation_id: activation_identity("conditional-run", "inspect", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(1),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("inspect output");
+        assert_eq!(inspect.activated[0].node_id, "choose");
+        let choose = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "choose-output".to_string(),
+                run_id: "conditional-run".to_string(),
+                node_id: "choose".to_string(),
+                activation_id: activation_identity("conditional-run", "choose", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(1),
+                artifact_reference: None,
+                created_at_ms: 21,
+            })
+            .expect("controller output");
+        assert_eq!(choose.run_status, RunStatus::Running);
+        assert!(choose.activated.is_empty());
+    }
+
+    #[test]
     fn validated_output_and_activation_complete_atomically() {
         let (_temp, mut store) = initialized_store();
         store
@@ -3794,7 +4480,7 @@ mod tests {
                 output_id: "output-1".to_string(),
                 run_id: "run-1".to_string(),
                 node_id: "review".to_string(),
-                activation_id: "activation-1".to_string(),
+                activation_id: activation_id(),
                 schema_id: "review/v1".to_string(),
                 schema_version: 1,
                 value: serde_json::json!({"approved": true}),
@@ -3811,6 +4497,75 @@ mod tests {
             )
             .expect("status");
         assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn pending_activation_reads_are_bounded_and_definition_backed() {
+        let (_temp, mut store) = initialized_store();
+        let pending = store.pending_activations(10).expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].node_id, "review");
+        assert_eq!(pending[0].node.kind, bcode_workflow::NodeKind::Task);
+        store.pause_run("run-1", 20).expect("pause");
+        assert!(store.pending_activations(10).expect("paused").is_empty());
+        store.resume_run("run-1", 21).expect("resume");
+        assert_eq!(store.pending_activations(10).expect("resumed").len(), 1);
+        store.request_cancellation("run-1", 22).expect("cancel");
+        assert!(store.pending_activations(10).expect("cancelled").is_empty());
+    }
+
+    #[test]
+    fn run_creation_atomically_materializes_stable_entry_activations() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let activation: (String, String, u64, String) = store
+            .connection
+            .query_row(
+                "SELECT node_id, activation_id, dependency_generation, status \
+                 FROM workflow_activations WHERE run_id = 'run-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("activation");
+        assert_eq!(activation.0, "review");
+        assert_eq!(activation.1, activation_identity("run-1", "review", 0));
+        assert_eq!(activation.2, 0);
+        assert_eq!(activation.3, "pending");
+        let events = store.event_history("run-1", None, 10).expect("events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "run_created");
+        assert_eq!(events[1].event_type, "activation_created");
+    }
+
+    #[test]
+    fn run_input_is_bounded_and_validated_against_registered_definition() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let mut invalid = new_run();
+        invalid.input = Some(serde_json::json!("not-a-number"));
+        assert!(store.create_run(&invalid).is_err());
+        let mut valid = new_run();
+        valid.run_id = "run-valid".to_string();
+        store.create_run(&valid).expect("valid input");
+        let stored: String = store
+            .connection
+            .query_row(
+                "SELECT input_json FROM workflow_runs WHERE run_id = 'run-valid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("input");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).expect("json"),
+            serde_json::json!(1)
+        );
     }
 
     #[test]
@@ -3833,7 +4588,11 @@ mod tests {
             .persist_definition("example", 1, &definition)
             .expect("idempotent");
         assert_eq!(first, second);
-        assert_eq!(store.definition("example", 1).expect("load"), Some(first));
+        assert_eq!(
+            store.definition("example", 1).expect("load"),
+            Some(first.clone())
+        );
+        assert_eq!(store.list_definitions(10).expect("list"), [first]);
     }
 
     #[test]

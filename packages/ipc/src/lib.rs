@@ -281,6 +281,51 @@ pub enum Request {
         session_id: SessionId,
         work_id: WorkId,
     },
+    /// Start one durable workflow from an existing exact definition.
+    StartWorkflowRun(WorkflowRunStartRequest),
+    /// List bounded, checksum-verified durable workflow definitions.
+    ListWorkflowDefinitions {
+        limit: usize,
+    },
+    /// Describe one exact durable workflow definition version.
+    DescribeWorkflowDefinition {
+        definition_id: String,
+        version: u32,
+    },
+    /// Return one bounded durable workflow run summary.
+    WorkflowRunStatus {
+        run_id: String,
+    },
+    /// List bounded durable workflow run summaries.
+    ListWorkflowRuns {
+        limit: usize,
+    },
+    /// Request durable cancellation of one workflow run.
+    CancelWorkflowRun {
+        run_id: String,
+    },
+    /// Pause one running workflow before further scheduler admission.
+    PauseWorkflowRun {
+        run_id: String,
+    },
+    /// Resume one paused workflow for subsequent scheduler admission.
+    ResumeWorkflowRun {
+        run_id: String,
+    },
+    /// Return one bounded page of durable workflow attempts.
+    WorkflowAttemptHistory {
+        run_id: String,
+        #[serde(default)]
+        cursor: Option<bcode_workflow_store::AttemptCursor>,
+        limit: usize,
+    },
+    /// Return one bounded page of durable workflow events.
+    WorkflowEventHistory {
+        run_id: String,
+        #[serde(default)]
+        after_sequence: Option<u64>,
+        limit: usize,
+    },
     CompactSession {
         session_id: SessionId,
     },
@@ -1044,6 +1089,29 @@ pub struct RalphRunStatusResponse {
     pub interrupted_runs: Vec<RalphRunSummary>,
 }
 
+/// Generic request to start one durable workflow from a registered exact definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunStartRequest {
+    pub definition_id: String,
+    pub definition_version: u32,
+    /// Immutable repository/worktree snapshot identity required for every durable run.
+    pub workspace_snapshot: String,
+    /// Session used for compact generic runtime-work presentation.
+    pub parent_session_id: bcode_session_models::SessionId,
+    /// Optional typed input validated against the registered definition input schema.
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub limits: bcode_workflow_store::WorkflowRunLimits,
+}
+
+/// Successful durable workflow run start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunStartResponse {
+    pub run: bcode_workflow_store::WorkflowRunSummary,
+    pub runtime_work_id: WorkId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkSnapshot {
     pub work_id: WorkId,
@@ -1213,6 +1281,34 @@ pub enum ResponsePayload {
     },
     RuntimeWorkCancellationRequested {
         cancelled: bool,
+    },
+    WorkflowRunStarted(WorkflowRunStartResponse),
+    WorkflowDefinitionList {
+        definitions: Vec<bcode_workflow_store::StoredWorkflowDefinition>,
+    },
+    WorkflowDefinitionDescription {
+        definition: Option<bcode_workflow_store::StoredWorkflowDefinition>,
+    },
+    WorkflowRunStatus {
+        run: Option<bcode_workflow_store::WorkflowRunSummary>,
+    },
+    WorkflowRunList {
+        runs: Vec<bcode_workflow_store::WorkflowRunSummary>,
+    },
+    WorkflowRunCancellationRequested {
+        recorded: bool,
+    },
+    WorkflowRunPaused {
+        changed: bool,
+    },
+    WorkflowRunResumed {
+        changed: bool,
+    },
+    WorkflowAttemptHistory {
+        attempts: Vec<bcode_workflow_store::AttemptSummary>,
+    },
+    WorkflowEventHistory {
+        events: Vec<bcode_workflow_store::WorkflowEventRow>,
     },
     RuntimeWorkHistory {
         events: Vec<SessionEvent>,
@@ -2031,6 +2127,74 @@ mod tests {
         let decoded: PermissionSummary =
             serde_json::from_value(value).expect("summary without batch should decode");
         assert_eq!(decoded.batch, None);
+    }
+
+    #[test]
+    fn workflow_requests_and_responses_round_trip_renderer_neutrally() {
+        let requests = [
+            Request::StartWorkflowRun(WorkflowRunStartRequest {
+                definition_id: "review".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: SessionId::new(),
+                input: Some(serde_json::json!(1)),
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            }),
+            Request::ListWorkflowDefinitions { limit: 25 },
+            Request::DescribeWorkflowDefinition {
+                definition_id: "review".to_string(),
+                version: 1,
+            },
+            Request::WorkflowRunStatus {
+                run_id: "run-1".to_string(),
+            },
+            Request::ListWorkflowRuns { limit: 25 },
+            Request::CancelWorkflowRun {
+                run_id: "run-1".to_string(),
+            },
+            Request::PauseWorkflowRun {
+                run_id: "run-1".to_string(),
+            },
+            Request::ResumeWorkflowRun {
+                run_id: "run-1".to_string(),
+            },
+            Request::WorkflowAttemptHistory {
+                run_id: "run-1".to_string(),
+                cursor: Some(bcode_workflow_store::AttemptCursor {
+                    prepared_at_ms: 10,
+                    dispatch_identity: "dispatch-1".to_string(),
+                }),
+                limit: 25,
+            },
+            Request::WorkflowEventHistory {
+                run_id: "run-1".to_string(),
+                after_sequence: Some(10),
+                limit: 25,
+            },
+        ];
+        for request in requests {
+            let encoded = encode_request(&request).expect("encode request");
+            assert_eq!(decode_request(&encoded).expect("decode request"), request);
+        }
+
+        let response = Response::Ok(ResponsePayload::WorkflowRunList {
+            runs: vec![bcode_workflow_store::WorkflowRunSummary {
+                run_id: "run-1".to_string(),
+                definition_id: "review".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: None,
+                status: bcode_workflow_store::RunStatus::Running,
+                cancellation_requested_at_ms: None,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }],
+        });
+        let encoded = encode_response(&response).expect("encode response");
+        assert_eq!(
+            decode_response(&encoded).expect("decode response"),
+            response
+        );
     }
 
     #[test]
