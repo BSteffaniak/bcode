@@ -381,9 +381,10 @@ if ! rg -q 'pub async fn prepare_session_open' packages/session/src/lib.rs \
 fi
 
 if ! rg -q 'project_materialized_event_without_checkpoints\(db, event\)' packages/session/src/db.rs \
-  || ! rg -q 'project_materialized_checkpoints_at_tail\(db, tail\)' packages/session/src/db.rs \
+  || ! rg -q 'project_migration_materialized_checkpoints_at_tail\(db, tail\)' packages/session/src/db.rs \
+  || ! rg -q 'upsert_multi\("projection_checkpoints"\)' packages/session/src/db.rs \
   || ! rg -q 'BCODE_MIGRATION_BENCHMARK_PROFILE' packages/session/src/lib.rs; then
-  echo "Session migration replay violation: migration must retain tail-only base checkpoint writes and focused generated profiling." >&2
+  echo "Session migration replay violation: migration must retain one batched tail checkpoint write and focused generated profiling." >&2
   violations=1
 fi
 

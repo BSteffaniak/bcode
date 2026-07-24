@@ -2504,7 +2504,7 @@ async fn validate_migrated_storage(
     if let Some(tail) = tail {
         finalize_migration_session_state(db, tail).await?;
         finalize_migration_model_context(db, tail).await?;
-        project_materialized_checkpoints_at_tail(db, tail).await?;
+        project_migration_materialized_checkpoints_at_tail(db, tail).await?;
         project_session_compatibility_state(db, tail).await?;
     }
     let canonical_tail = tail.map(|event| event.sequence);
@@ -3637,13 +3637,34 @@ async fn finalize_migration_session_state(
     Ok(())
 }
 
-async fn project_materialized_checkpoints_at_tail(
+async fn project_migration_materialized_checkpoints_at_tail(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    for projection in BASE_MATERIALIZED_PROJECTIONS {
-        update_projection_checkpoint(db, projection, event).await?;
-    }
+    let rows = BASE_MATERIALIZED_PROJECTIONS
+        .into_iter()
+        .map(|projection| {
+            vec![
+                (
+                    "projection_name",
+                    DatabaseValue::String(projection.as_str().to_owned()),
+                ),
+                ("last_event_seq", seq_to_value(event.sequence)),
+                (
+                    "projection_version",
+                    DatabaseValue::Int64(i64::from(projection.schema_version())),
+                ),
+                ("updated_at_ms", seq_to_value(event_created_at_ms(event))),
+            ]
+        })
+        .collect();
+    let mut statement = db.upsert_multi("projection_checkpoints");
+    statement
+        .values(rows)
+        .unique(vec![Box::new(switchy::database::query::identifier(
+            "projection_name",
+        ))]);
+    statement.execute(db).await?;
     Ok(())
 }
 
@@ -3652,7 +3673,10 @@ async fn project_materialized_event(
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
     project_event(db, event, true).await?;
-    project_materialized_checkpoints_at_tail(db, event).await
+    for projection in BASE_MATERIALIZED_PROJECTIONS {
+        update_projection_checkpoint(db, projection, event).await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
