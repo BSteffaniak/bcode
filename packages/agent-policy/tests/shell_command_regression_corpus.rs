@@ -2,8 +2,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bcode_agent_policy::{Action, AgentConfig, PermissionConfig, evaluate_tool_call};
+use bcode_agent_profile::{AgentDecision, EvaluateToolCallRequest, ToolPolicyOperation};
+use bcode_shell_command_analysis::analyze;
+use bcode_shell_command_analysis_models::ShellAnalysisRequest;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -210,6 +215,83 @@ fn policy_gaps_are_distinct_from_parser_defects() {
     {
         assert_eq!(case.expected.completeness, "complete", "{}", case.id);
         assert_ne!(case.expected.policy, "allow", "{}", case.id);
+    }
+}
+
+fn action(value: &str) -> Action {
+    match value {
+        "allow" => Action::Allow,
+        "ask" => Action::Ask,
+        "deny" => Action::Deny,
+        other => panic!("unknown action: {other}"),
+    }
+}
+
+fn evaluate(case: &Case) -> AgentDecision {
+    let analysis_result = analyze(&ShellAnalysisRequest::posix(&case.source));
+    let (analysis, analysis_error) = match analysis_result {
+        Ok(analysis) => (Some(analysis), None),
+        Err(error) => (None, Some(error)),
+    };
+    let config = AgentConfig {
+        accent: None,
+        tools: BTreeMap::from([("shell.run".to_owned(), true)]),
+        permission: PermissionConfig {
+            command: case
+                .policy
+                .rules
+                .iter()
+                .map(|rule| (rule.pattern.clone(), action(&rule.action)))
+                .chain(std::iter::once((
+                    "*".to_owned(),
+                    action(&case.policy.default_action),
+                )))
+                .collect(),
+            read: case
+                .policy
+                .read_rules
+                .iter()
+                .map(|rule| (rule.pattern.clone(), action(&rule.action)))
+                .collect(),
+            write: case
+                .policy
+                .write_rules
+                .iter()
+                .map(|rule| (rule.pattern.clone(), action(&rule.action)))
+                .collect(),
+            ..PermissionConfig::default()
+        },
+    };
+    let request = EvaluateToolCallRequest {
+        session_id: bcode_session_models::SessionId::new(),
+        agent_id: "corpus".to_owned(),
+        tool_name: "shell.run".to_owned(),
+        operation: ToolPolicyOperation::Command {
+            command: Some(case.source.clone()),
+            analysis,
+            analysis_error,
+        },
+        aliases: Vec::new(),
+        requires_permission: true,
+        cwd: Some("/tmp/project".to_owned()),
+    };
+    evaluate_tool_call(&config, &request, Path::new("/tmp/project"))
+        .response
+        .decision
+}
+
+#[test]
+fn structured_policy_matches_every_reviewed_corpus_outcome() {
+    let corpus = corpus();
+    for case in &corpus.cases {
+        let expected = match case.expected.policy.as_str() {
+            "allow" => AgentDecision::Allow,
+            "ask" => AgentDecision::Ask,
+            "deny" => AgentDecision::Deny,
+            other => panic!("unknown expected decision: {other}"),
+        };
+        let actual = evaluate(case);
+        assert_eq!(actual, expected, "corpus case {}", case.id);
     }
 }
 

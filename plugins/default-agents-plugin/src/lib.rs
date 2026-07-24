@@ -231,6 +231,7 @@ fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
         return json_response(&EvaluateToolCallResponse {
             decision: AgentDecision::Ask,
             reason: Some("tool policy requires an explicit session working directory".to_string()),
+            shell: None,
         });
     };
     let (config, _) = load_config();

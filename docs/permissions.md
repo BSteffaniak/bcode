@@ -99,7 +99,14 @@ Any single `[agent.<id>]` section in `bcode.toml` replaces the full built-in set
 
 Any `[agent.<id>]` you declare is usable via `/agent <id>` in the TUI and the CLI. If no agent-profile plugin registers the ID, Bcode logs a warning at startup (`agent defined in bcode.toml but not registered by any agent-profile plugin`), and the agent won't appear in agent pickers, but policy evaluation and `/agent <id>` switching still work.
 
+### Authorization fact schema migration
+
+Shell authorization facts use schema version 2 because command operations now carry owner-produced structured analysis. Version 1 facts are rejected explicitly as unsupported; they never fall back to legacy command splitting. Static and dynamic bundled shell plugins must be rebuilt together with the host so they emit schema version 2. There is no compatibility window for authorizing version 1 shell facts.
+
+Existing declarative command wildcard syntax does not need migration. Runtime rules that were remembered from raw full commands or broadened first words remain ordinary wildcard rules, but users should review and remove misleading entries. New prompts identify the executable subject; broaden behavior deliberately with explicit command rules rather than relying on old first-word derivation.
+
 ## Runtime rule persistence
+
 
 The TUI permission prompt offers an "always allow" / "always deny" action that writes a rule into a **runtime state file**, never into `bcode.toml`. This means Nix / home-manager users (and anyone with a read-only declarative config) can still click "always allow" without their config being touched.
 

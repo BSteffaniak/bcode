@@ -9,7 +9,8 @@ pub use bcode_agent_policy_models::{
 };
 
 use bcode_agent_profile::{
-    AgentDecision, EvaluateToolCallRequest, EvaluateToolCallResponse, ToolPolicyOperation,
+    AgentDecision, EvaluateToolCallRequest, EvaluateToolCallResponse, ShellPolicyDiagnostic,
+    ShellPolicySubjectKind, ToolPolicyOperation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -310,6 +311,16 @@ fn url_argument(request: &EvaluateToolCallRequest) -> Option<&str> {
     }
 }
 
+#[derive(Debug)]
+struct ShellSubjectDecision {
+    action: Action,
+    rule: Rule,
+    candidate: String,
+    subject: String,
+    span: Option<bcode_shell_command_analysis_models::ShellSourceSpan>,
+    kind: ShellPolicySubjectKind,
+}
+
 #[allow(clippy::too_many_lines)]
 fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
     let ToolPolicyOperation::Command {
@@ -373,7 +384,14 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
                 subject.source.as_str(),
             )
         });
-        results.push((action, rule, candidate.to_owned(), subject.source.clone()));
+        results.push(ShellSubjectDecision {
+            action,
+            rule,
+            candidate: candidate.to_owned(),
+            subject: subject.source.clone(),
+            span: Some(subject.span),
+            kind: ShellPolicySubjectKind::Command,
+        });
     }
 
     for redirect in &analysis.redirections {
@@ -407,47 +425,93 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         };
         let compiled = compile_path_rules(rules);
         let action = matching_path_rule(&compiled, path).map_or(fallback, |rule| rule.action);
-        results.push((
+        results.push(ShellSubjectDecision {
             action,
-            Rule {
+            rule: Rule {
                 pattern: format!("redirection:{path}"),
                 action,
                 specificity: usize::MAX,
             },
-            path.to_owned(),
-            path.to_owned(),
-        ));
+            candidate: path.to_owned(),
+            subject: path.to_owned(),
+            span: Some(redirect.span),
+            kind: ShellPolicySubjectKind::Redirection,
+        });
     }
 
-    let (action, rule, candidate, source) = results
+    let winner = results
         .into_iter()
-        .max_by_key(|(action, _, _, _)| action_precedence(*action))
+        .max_by_key(|result| action_precedence(result.action))
         .expect("shell analysis contains at least one command result");
+    let decision = agent_decision(winner.action);
+    let aggregate_reason = format!(
+        "{} shell program: {} '{}' at bytes {}..{} using candidate '{}' matched rule '{}' ({:?}); aggregate precedence deny > ask > allow selected {:?}",
+        match decision {
+            AgentDecision::Allow => "allowed",
+            AgentDecision::Ask => "asks before",
+            AgentDecision::Deny => "denied",
+        },
+        match winner.kind {
+            ShellPolicySubjectKind::Command => "command subject",
+            ShellPolicySubjectKind::Redirection => "redirection",
+        },
+        winner.subject,
+        winner.span.map_or(0, |span| span.start),
+        winner.span.map_or(0, |span| span.end),
+        winner.candidate,
+        winner.rule.pattern,
+        analysis.dialect,
+        decision,
+    );
+    let diagnostic = ShellPolicyDiagnostic {
+        original_source: analysis.source.clone(),
+        subject: winner.subject.clone(),
+        span: winner.span,
+        dialect: analysis.dialect,
+        match_candidate: winner.candidate,
+        matched_rule: winner.rule.pattern.clone(),
+        subject_kind: winner.kind,
+        subject_decision: decision,
+        aggregate_decision: decision,
+        remember_patterns: shell_remember_patterns(winner.kind, &analysis.commands, winner.span),
+        aggregate_reason: aggregate_reason.clone(),
+    };
+    shell_evaluation(
+        decision,
+        aggregate_reason,
+        Some(winner.rule.pattern),
+        Some(winner.subject),
+        diagnostic,
+    )
+}
+
+fn shell_remember_patterns(
+    kind: ShellPolicySubjectKind,
+    commands: &[bcode_shell_command_analysis_models::ShellCommand],
+    span: Option<bcode_shell_command_analysis_models::ShellSourceSpan>,
+) -> Vec<String> {
+    if kind != ShellPolicySubjectKind::Command {
+        return Vec::new();
+    }
+    let Some(command) = span.and_then(|span| commands.iter().find(|command| command.span == span))
+    else {
+        return Vec::new();
+    };
+    let bcode_shell_command_analysis_models::ShellWord::Static { value, .. } = &command.executable
+    else {
+        return Vec::new();
+    };
+    if !command.assignments.is_empty() || value.is_empty() {
+        return Vec::new();
+    }
+    vec![command.source.clone(), format!("{value} *")]
+}
+
+const fn agent_decision(action: Action) -> AgentDecision {
     match action {
-        Action::Allow => evaluation(
-            AgentDecision::Allow,
-            String::new(),
-            Some(rule.pattern),
-            Some(source),
-        ),
-        Action::Ask => evaluation(
-            AgentDecision::Ask,
-            format!(
-                "{} agent asks before shell subject '{}' (candidate '{}', rule '{}')",
-                request.agent_id, source, candidate, rule.pattern
-            ),
-            Some(rule.pattern),
-            Some(source),
-        ),
-        Action::Deny => evaluation(
-            AgentDecision::Deny,
-            format!(
-                "{} agent denied shell subject '{}' (candidate '{}', rule '{}')",
-                request.agent_id, source, candidate, rule.pattern
-            ),
-            Some(rule.pattern),
-            Some(source),
-        ),
+        Action::Allow => AgentDecision::Allow,
+        Action::Ask => AgentDecision::Ask,
+        Action::Deny => AgentDecision::Deny,
     }
 }
 
@@ -468,6 +532,24 @@ fn shell_fact_denied(request: &EvaluateToolCallRequest, reason: &str) -> PolicyE
     )
 }
 
+const fn shell_evaluation(
+    decision: AgentDecision,
+    reason: String,
+    matched_rule: Option<String>,
+    command_part: Option<String>,
+    shell: ShellPolicyDiagnostic,
+) -> PolicyEvaluation {
+    PolicyEvaluation {
+        response: EvaluateToolCallResponse {
+            decision,
+            reason: Some(reason),
+            shell: Some(shell),
+        },
+        matched_rule,
+        command_part,
+    }
+}
+
 fn evaluation(
     decision: AgentDecision,
     reason: String,
@@ -478,6 +560,7 @@ fn evaluation(
         response: EvaluateToolCallResponse {
             decision,
             reason: (!reason.is_empty()).then_some(reason),
+            shell: None,
         },
         matched_rule,
         command_part,
@@ -726,6 +809,83 @@ mod tests {
         let tools = active_tools_for(&config);
 
         assert_eq!(tools, vec!["example.read".to_string()]);
+    }
+
+    #[test]
+    fn shell_diagnostic_contains_complete_winning_context() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([("shell.run".to_owned(), true)]),
+            permission: PermissionConfig {
+                command: BTreeMap::from([
+                    ("printf *".to_owned(), Action::Allow),
+                    ("rm *".to_owned(), Action::Deny),
+                ]),
+                ..PermissionConfig::default()
+            },
+        };
+        let source = "printf ok; rm generated";
+        let result = evaluate_tool_call(
+            &config,
+            &request(BUILD_AGENT, source),
+            Path::new("/tmp/project"),
+        );
+        let diagnostic = result.response.shell.expect("shell diagnostic");
+        assert_eq!(diagnostic.original_source, source);
+        assert_eq!(diagnostic.subject, "rm generated");
+        assert_eq!(
+            diagnostic
+                .span
+                .map(|span| &source[span.start as usize..span.end as usize]),
+            Some("rm generated")
+        );
+        assert_eq!(
+            diagnostic.dialect,
+            bcode_shell_command_analysis_models::ShellDialect::Posix
+        );
+        assert_eq!(diagnostic.match_candidate, "rm generated");
+        assert_eq!(diagnostic.matched_rule, "rm *");
+        assert_eq!(diagnostic.subject_kind, ShellPolicySubjectKind::Command);
+        assert_eq!(diagnostic.subject_decision, AgentDecision::Deny);
+        assert_eq!(diagnostic.aggregate_decision, AgentDecision::Deny);
+        assert_eq!(diagnostic.remember_patterns, vec!["rm generated", "rm *"]);
+        assert!(diagnostic.aggregate_reason.contains("deny > ask > allow"));
+        assert_eq!(result.command_part.as_deref(), Some("rm generated"));
+    }
+
+    #[test]
+    fn remembered_patterns_require_static_unprefixed_executable_subjects() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([("shell.run".to_owned(), true)]),
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Ask)]),
+                ..PermissionConfig::default()
+            },
+        };
+        let static_result = evaluate_tool_call(
+            &config,
+            &request(BUILD_AGENT, "printf ok"),
+            Path::new("/tmp/project"),
+        );
+        assert_eq!(
+            static_result.response.shell.unwrap().remember_patterns,
+            vec!["printf ok", "printf *"]
+        );
+        for source in ["GIT_PAGER=cat git show HEAD", "\"$cmd\" ok"] {
+            let result = evaluate_tool_call(
+                &config,
+                &request(BUILD_AGENT, source),
+                Path::new("/tmp/project"),
+            );
+            assert!(
+                result
+                    .response
+                    .shell
+                    .is_none_or(|diagnostic| diagnostic.remember_patterns.is_empty()),
+                "unsafe remembered pattern for {source}"
+            );
+        }
     }
 
     #[test]

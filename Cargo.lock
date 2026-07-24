@@ -1335,6 +1335,7 @@ dependencies = [
  "bcode_shell_command_analysis",
  "bcode_shell_command_analysis_models",
  "globset",
+ "proptest",
  "serde",
  "serde_json",
 ]
@@ -2327,6 +2328,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_shell_command_analysis_models",
  "brush-parser",
+ "proptest",
  "serde",
  "serde_json",
 ]

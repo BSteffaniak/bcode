@@ -17425,6 +17425,7 @@ async fn evaluate_agent_tool_policy_with_metadata(
                 AgentDecision::Allow
             },
             reason: None,
+            shell: None,
         })
 }
 

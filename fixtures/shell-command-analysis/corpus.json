@@ -99,8 +99,8 @@
       "classification": "canonicalization_defect",
       "source": "GIT_PAGER=cat git show --stat HEAD",
       "policy": {"rules": [{"pattern": "git show *", "action": "allow"}, {"pattern": "git *", "action": "deny"}], "default_action": "deny"},
-      "expected": {"commands": ["GIT_PAGER=cat git show --stat HEAD"], "executables": ["git"], "assignments": ["GIT_PAGER=cat"], "redirections": [], "completeness": "complete", "policy": "ask"},
-      "notes": "Alias safety for GIT_PAGER remains a review decision; parsing must still identify git rather than the assignment."
+      "expected": {"commands": ["GIT_PAGER=cat git show --stat HEAD"], "executables": ["git"], "assignments": ["GIT_PAGER=cat"], "redirections": [], "completeness": "complete", "policy": "deny"},
+      "notes": "Assignment-prefixed commands receive no aliases in the initial implementation; parsing identifies git correctly, but authorization remains conservative."
     },
     {
       "id": "missing-printf-policy",
@@ -149,7 +149,7 @@
       "classification": "dynamic_unsupported_fail_closed",
       "source": "cat <(printf '%s\\n' data)",
       "policy": {"rules": [{"pattern": "cat *", "action": "allow"}, {"pattern": "printf *", "action": "allow"}], "default_action": "deny"},
-      "expected": {"commands": ["cat <(printf '%s\\n' data)", "printf '%s\\n' data"], "redirections": [], "completeness": "incomplete", "policy": "ask"},
+      "expected": {"commands": ["cat <(printf '%s\\n' data)", "printf '%s\\n' data"], "redirections": [], "completeness": "incomplete", "policy": "deny"},
       "notes": "Process substitution is outside POSIX sh and must fail closed unless the execution dialect and parser explicitly support it."
     },
     {
@@ -164,14 +164,14 @@
       "classification": "dynamic_unsupported_fail_closed",
       "source": "eval \"$SCRIPT\"",
       "policy": {"rules": [{"pattern": "eval *", "action": "allow"}], "default_action": "deny"},
-      "expected": {"commands": ["eval \"$SCRIPT\""], "redirections": [], "completeness": "incomplete", "policy": "ask"}
+      "expected": {"commands": ["eval \"$SCRIPT\""], "redirections": [], "completeness": "incomplete", "policy": "deny"}
     },
     {
       "id": "source-is-dynamic",
       "classification": "dynamic_unsupported_fail_closed",
       "source": ". \"$SCRIPT_PATH\"",
       "policy": {"rules": [{"pattern": ". *", "action": "allow"}], "default_action": "deny"},
-      "expected": {"commands": [". \"$SCRIPT_PATH\""], "redirections": [], "completeness": "incomplete", "policy": "ask"}
+      "expected": {"commands": [". \"$SCRIPT_PATH\""], "redirections": [], "completeness": "incomplete", "policy": "deny"}
     },
     {
       "id": "output-redirection-write",

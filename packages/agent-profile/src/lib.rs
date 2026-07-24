@@ -335,6 +335,46 @@ pub struct EvaluateToolCallRequest {
     pub cwd: Option<String>,
 }
 
+/// Structured shell-policy diagnostic for permission prompts, traces, and debugging.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellPolicyDiagnostic {
+    /// Complete original shell source.
+    pub original_source: String,
+    /// Exact command subject source slice or redirection path that determined the result.
+    pub subject: String,
+    /// Source span for the determining subject when it came from shell syntax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<bcode_shell_command_analysis_models::ShellSourceSpan>,
+    /// Analyzed shell dialect.
+    pub dialect: bcode_shell_command_analysis_models::ShellDialect,
+    /// Match candidate evaluated against policy.
+    pub match_candidate: String,
+    /// Winning policy rule or explicit missing-rule marker.
+    pub matched_rule: String,
+    /// Whether the subject is a command or redirection.
+    pub subject_kind: ShellPolicySubjectKind,
+    /// Decision for the determining command or redirection.
+    pub subject_decision: AgentDecision,
+    /// Aggregate shell-program decision.
+    pub aggregate_decision: AgentDecision,
+    /// Safe literal and broadened patterns that may be persisted from a permission prompt.
+    /// Empty when the subject has no static executable identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remember_patterns: Vec<String>,
+    /// Human-readable aggregate explanation.
+    pub aggregate_reason: String,
+}
+
+/// Kind of shell-policy subject that determined an aggregate decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellPolicySubjectKind {
+    /// Independently executable command leaf.
+    Command,
+    /// Syntax-derived filesystem redirection.
+    Redirection,
+}
+
 /// Agent policy decision for a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -355,6 +395,9 @@ pub struct EvaluateToolCallResponse {
     /// Optional user/model-facing reason.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Structured shell diagnostic when shell policy determined the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellPolicyDiagnostic>,
 }
 
 /// Agent policy provider status.
