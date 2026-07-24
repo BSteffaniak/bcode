@@ -1820,15 +1820,21 @@ fn render_inline_agent_thread_line(
         .as_ref()
         .is_some_and(|text| !text.is_empty());
     let has_activity = state.activity.as_ref().is_some_and(|text| !text.is_empty());
+    let has_context = !state.context_summary.is_empty();
     let answer_line_index = body_line_index
         .saturating_sub(1)
+        .saturating_sub(usize::from(has_context))
         .saturating_sub(usize::from(has_warning))
         .saturating_sub(usize::from(has_activity));
     let prefix = if body_line_index == 0 {
         format!("   │ 🤖 Bcode · {} ", state.live_state_label())
-    } else if has_warning && body_line_index == 1 {
+    } else if has_context && body_line_index == 1 {
+        "   │  context ".to_string()
+    } else if has_warning && body_line_index == 1 + usize::from(has_context) {
         "   │  ⚠ stream ".to_string()
-    } else if has_activity && body_line_index == 1 + usize::from(has_warning) {
+    } else if has_activity
+        && body_line_index == 1 + usize::from(has_context) + usize::from(has_warning)
+    {
         "   │  activity ".to_string()
     } else if body_line_index.saturating_add(1) == body_line_count {
         "   ╰─ answer ".to_string()
@@ -1840,9 +1846,13 @@ fn render_inline_agent_thread_line(
             .error
             .as_ref()
             .map_or(state.status.as_str(), String::as_str)
-    } else if has_warning && body_line_index == 1 {
+    } else if has_context && body_line_index == 1 {
+        state.context_summary.as_str()
+    } else if has_warning && body_line_index == 1 + usize::from(has_context) {
         state.stream_warning.as_deref().unwrap_or_default()
-    } else if has_activity && body_line_index == 1 + usize::from(has_warning) {
+    } else if has_activity
+        && body_line_index == 1 + usize::from(has_context) + usize::from(has_warning)
+    {
         state.activity.as_deref().unwrap_or_default()
     } else {
         state
@@ -2418,6 +2428,7 @@ const DIFF_HELP_LINES: &[&str] = &[
     " A                   expand/collapse linked Bcode answer",
     " Y                   copy linked Bcode answer",
     " s                   suggest comment from linked Bcode answer",
+    " 1/2/3/4/5           explain/risk/suggest/tests/summarize with Bcode",
     " o                   open linked Bcode session",
     " e                   edit selected/latest draft",
     " D                   delete selected/latest draft",

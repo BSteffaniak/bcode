@@ -10,17 +10,20 @@ use std::sync::{Arc, RwLock};
 use crate::async_values::{AsyncValue, AsyncValueStore};
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
-    CODE_REVIEW_SERVICE_INTERFACE_ID, MaterializeReviewWorkspaceRequest,
+    CODE_REVIEW_SERVICE_INTERFACE_ID, DraftAnchor as ModelDraftAnchor,
+    ListReviewSuggestionsRequest, ListReviewSuggestionsResponse, MaterializeReviewWorkspaceRequest,
     MaterializeReviewWorkspaceResponse, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
     OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST,
     OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST,
-    OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE,
-    REVIEW_PUBLISHER_INTERFACE_ID, ReviewAnchorKind, ReviewBundle, ReviewRepositoryCommit,
-    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
-    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
+    OP_REVIEW_REPO_FILE_GET, OP_REVIEW_SUGGESTION_SAVE, OP_REVIEW_SUGGESTIONS_LIST,
+    OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
+    ReviewAnchorKind, ReviewBundle, ReviewRepositoryCommit, ReviewScope as ModelReviewScope,
+    ReviewSource, ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind,
+    ReviewSuggestion as ModelReviewSuggestion,
+    ReviewSuggestionStatus as ModelReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind,
     ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewThreadKind,
     ReviewThreadSeverity, ReviewWorkspace, SavePublishRecordRequest, SavePublishRecordResponse,
-    UpdateReviewWorkspaceRequest,
+    SaveReviewSuggestionRequest, SaveReviewSuggestionResponse, UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{
@@ -66,6 +69,11 @@ const REVIEW_PUBLISHER_MANIFEST_OPERATION: &str = OP_REVIEW_PUBLISHER_MANIFEST;
 const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISHER_PREVIEW;
 const REVIEW_PUBLISHER_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISHER_SUBMIT;
 const DEFAULT_PUBLISHER_ID: &str = "markdown_file";
+const MAX_AI_THREAD_SUMMARIES: usize = 12;
+const MAX_AI_THREAD_BODY_CHARS: usize = 160;
+const MAX_AI_SELECTED_LINES: usize = 80;
+const MAX_AI_HUNK_LINES: usize = 120;
+const MAX_AI_CONTEXT_CHARS: usize = 12_000;
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 
 #[allow(dead_code)]
@@ -239,6 +247,13 @@ impl CodeReviewSurface {
             }
             needs_redraw = true;
         }
+        needs_redraw |= drain_pending_suggestion_saves(
+            &self.client,
+            &self.repo_path,
+            &self.review_target,
+            &mut self.app,
+        )
+        .await;
         if let Some(resolve) = self.app.take_pending_thread_resolve() {
             match resolve_thread(&self.client, self.repo_path.clone(), resolve.clone()).await {
                 Ok(()) => {
@@ -613,6 +628,13 @@ async fn load_review_app(
     };
     let drafts = load_drafts(
         client,
+        repo_path.clone(),
+        review_target.clone(),
+        workspace.as_ref().map(review_scope_for_workspace),
+    )
+    .await;
+    let suggestions = load_suggestions(
+        client,
         repo_path,
         review_target,
         workspace.as_ref().map(review_scope_for_workspace),
@@ -628,6 +650,12 @@ async fn load_review_app(
         Ok(drafts) => app.load_persisted_drafts(drafts),
         Err(error) => {
             app.status_message = Some(format!("failed to load persisted drafts: {error}"));
+        }
+    }
+    match suggestions {
+        Ok(suggestions) => app.load_persisted_suggestions(suggestions),
+        Err(error) => {
+            app.status_message = Some(format!("failed to load persisted suggestions: {error}"));
         }
     }
     Ok(app)
@@ -1289,6 +1317,103 @@ async fn load_drafts(
     Ok(response.drafts)
 }
 
+async fn drain_pending_suggestion_saves(
+    client: &BcodeClient,
+    repo_path: &Path,
+    review_target: &ReviewOpenTarget,
+    app: &mut ReviewApp,
+) -> bool {
+    let mut changed = false;
+    while let Some(suggestion) = app.take_pending_suggestion_save() {
+        let suggestion_id = suggestion.suggestion_id.clone();
+        match save_suggestion(
+            client,
+            repo_path.to_path_buf(),
+            review_target.clone(),
+            Some(review_scope_for_workspace(&app.workspace)),
+            suggestion,
+        )
+        .await
+        {
+            Ok(persisted) => {
+                app.mark_suggestion_persisted(&persisted);
+                app.status_message = Some("saved suggested comment".to_string());
+            }
+            Err(error) => {
+                app.requeue_suggestion_save(&suggestion_id);
+                app.status_message = Some(format!(
+                    "failed to save suggested comment; will retry: {error}"
+                ));
+                return true;
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
+async fn load_suggestions(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewOpenTarget,
+    scope: Option<ModelReviewScope>,
+) -> Result<Vec<ModelReviewSuggestion>, TuiError> {
+    let payload = serde_json::to_vec(&ListReviewSuggestionsRequest {
+        repo_path,
+        target,
+        scope,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_SUGGESTIONS_LIST.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ListReviewSuggestionsResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.suggestions)
+}
+
+async fn save_suggestion(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewOpenTarget,
+    scope: Option<ModelReviewScope>,
+    suggestion: ModelReviewSuggestion,
+) -> Result<ModelReviewSuggestion, TuiError> {
+    let payload = serde_json::to_vec(&SaveReviewSuggestionRequest {
+        repo_path,
+        target,
+        scope,
+        suggestion,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_SUGGESTION_SAVE.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: SaveReviewSuggestionResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.suggestion)
+}
+
 async fn save_draft(
     client: &BcodeClient,
     repo_path: PathBuf,
@@ -1839,6 +1964,11 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('m') => app.convert_agent_answer_to_draft_at_selection(),
         KeyCode::Char('y') => app.retry_linked_session_stream_at_selection(),
         KeyCode::Char('o') => app.open_linked_session_at_selection(),
+        KeyCode::Char('1') => app.run_ai_command_at_selection(ReviewAiCommand::ExplainChange),
+        KeyCode::Char('2') => app.run_ai_command_at_selection(ReviewAiCommand::FindRisk),
+        KeyCode::Char('3') => app.run_ai_command_at_selection(ReviewAiCommand::SuggestComment),
+        KeyCode::Char('4') => app.run_ai_command_at_selection(ReviewAiCommand::CheckTests),
+        KeyCode::Char('5') => app.run_ai_command_at_selection(ReviewAiCommand::SummarizeFile),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
             true
@@ -2232,6 +2362,51 @@ struct ListDraftsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct SaveDraftResponse {
     draft: DraftComment,
+}
+
+impl From<ReviewCommentAnchor> for ModelDraftAnchor {
+    fn from(anchor: ReviewCommentAnchor) -> Self {
+        let local: DraftAnchor = anchor.into();
+        Self {
+            kind: local.kind,
+            file_path: local.file_path,
+            diff_row: local.diff_row,
+            start_diff_row: local.start_diff_row,
+            end_diff_row: local.end_diff_row,
+            old_start: local.old_start,
+            old_end: local.old_end,
+            new_start: local.new_start,
+            new_end: local.new_end,
+            old_line: local.old_line,
+            new_line: local.new_line,
+            line_kind: local.line_kind.to_model(),
+            is_file_anchor: local.is_file_anchor,
+            surface_id: local.surface_id,
+            source_id: local.source_id,
+        }
+    }
+}
+
+impl From<ModelDraftAnchor> for DraftAnchor {
+    fn from(anchor: ModelDraftAnchor) -> Self {
+        Self {
+            kind: anchor.kind,
+            file_path: anchor.file_path,
+            diff_row: anchor.diff_row,
+            start_diff_row: anchor.start_diff_row,
+            end_diff_row: anchor.end_diff_row,
+            old_start: anchor.old_start,
+            old_end: anchor.old_end,
+            new_start: anchor.new_start,
+            new_end: anchor.new_end,
+            old_line: anchor.old_line,
+            new_line: anchor.new_line,
+            line_kind: ReviewLineKind::from_model(anchor.line_kind),
+            is_file_anchor: anchor.is_file_anchor,
+            surface_id: anchor.surface_id,
+            source_id: anchor.source_id,
+        }
+    }
 }
 
 impl From<ReviewCommentAnchor> for DraftAnchor {
@@ -2688,6 +2863,14 @@ pub enum ReviewLineKind {
 }
 
 impl ReviewLineKind {
+    const fn to_model(self) -> bcode_code_review_models::ReviewLineKind {
+        match self {
+            Self::Context => bcode_code_review_models::ReviewLineKind::Context,
+            Self::Added => bcode_code_review_models::ReviewLineKind::Added,
+            Self::Removed => bcode_code_review_models::ReviewLineKind::Removed,
+        }
+    }
+
     const fn from_model(kind: bcode_code_review_models::ReviewLineKind) -> Self {
         match kind {
             bcode_code_review_models::ReviewLineKind::Context => Self::Context,
@@ -2790,6 +2973,28 @@ pub enum ReviewSuggestionStatus {
     Rejected,
 }
 
+impl From<ReviewSuggestionStatus> for ModelReviewSuggestionStatus {
+    fn from(status: ReviewSuggestionStatus) -> Self {
+        match status {
+            ReviewSuggestionStatus::Suggested => Self::Suggested,
+            ReviewSuggestionStatus::Refining => Self::Refining,
+            ReviewSuggestionStatus::Accepted => Self::Accepted,
+            ReviewSuggestionStatus::Rejected => Self::Rejected,
+        }
+    }
+}
+
+impl From<ModelReviewSuggestionStatus> for ReviewSuggestionStatus {
+    fn from(status: ModelReviewSuggestionStatus) -> Self {
+        match status {
+            ModelReviewSuggestionStatus::Suggested => Self::Suggested,
+            ModelReviewSuggestionStatus::Refining => Self::Refining,
+            ModelReviewSuggestionStatus::Accepted => Self::Accepted,
+            ModelReviewSuggestionStatus::Rejected => Self::Rejected,
+        }
+    }
+}
+
 /// Local AI-suggested review comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewSuggestedComment {
@@ -2803,6 +3008,10 @@ pub struct ReviewSuggestedComment {
     pub status: ReviewSuggestionStatus,
     /// Optional short rationale or provenance.
     pub rationale: Option<String>,
+    /// Creation timestamp in milliseconds since Unix epoch, when persisted.
+    pub created_at_ms: Option<u64>,
+    /// Last update timestamp in milliseconds since Unix epoch, when persisted.
+    pub updated_at_ms: Option<u64>,
 }
 
 /// Review draft comment metadata.
@@ -2924,6 +3133,35 @@ impl LocalReviewThread {
     }
 }
 
+fn bounded_lines(text: &str, max_lines: usize) -> String {
+    let mut lines = text.lines();
+    let bounded = lines
+        .by_ref()
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.next().is_some() {
+        format!("{bounded}\n… (context truncated)")
+    } else {
+        bounded
+    }
+}
+
+fn truncate_chars(mut text: String, max_chars: usize) -> String {
+    const MARKER: &str = "\n… (context truncated)";
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let keep_chars = max_chars.saturating_sub(MARKER.chars().count());
+    let boundary = text
+        .char_indices()
+        .nth(keep_chars)
+        .map_or(text.len(), |(index, _)| index);
+    text.truncate(boundary);
+    text.push_str(MARKER);
+    text
+}
+
 fn parse_range_spec(text: &str) -> Option<(&str, &str, bool)> {
     text.split_once("...")
         .map(|(base, head)| (base, head, true))
@@ -3036,6 +3274,57 @@ pub struct PendingThreadResolve {
     pub resolved: bool,
 }
 
+/// Structured AI review action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewAiCommand {
+    /// General free-form review analysis.
+    Analyze,
+    /// Explain the selected change.
+    ExplainChange,
+    /// Identify concrete review risks.
+    FindRisk,
+    /// Produce a concise review comment suggestion.
+    SuggestComment,
+    /// Evaluate test coverage and missing tests.
+    CheckTests,
+    /// Summarize the selected file/change.
+    SummarizeFile,
+}
+
+impl ReviewAiCommand {
+    const fn instruction(self) -> &'static str {
+        match self {
+            Self::Analyze => "Analyze this review thread and answer the reviewer's question.",
+            Self::ExplainChange => {
+                "Explain what the selected change does, why it may exist, and any important behavior changes."
+            }
+            Self::FindRisk => {
+                "Identify concrete correctness, security, performance, and maintainability risks in the selected change."
+            }
+            Self::SuggestComment => {
+                "Draft one concise, actionable code review comment for the strongest supported issue; say when no comment is warranted."
+            }
+            Self::CheckTests => {
+                "Assess test coverage for the selected change and identify specific missing or weak tests."
+            }
+            Self::SummarizeFile => {
+                "Summarize the selected file's changes, intent, and review-relevant consequences."
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Analyze => "analyze",
+            Self::ExplainChange => "explain change",
+            Self::FindRisk => "find risk",
+            Self::SuggestComment => "suggest comment",
+            Self::CheckTests => "check tests",
+            Self::SummarizeFile => "summarize file",
+        }
+    }
+}
+
 /// Pending Bcode agent session request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAgentSession {
@@ -3043,6 +3332,8 @@ pub struct PendingAgentSession {
     pub anchor: ReviewCommentAnchor,
     /// Optional selected draft body.
     pub draft_body: Option<String>,
+    /// Structured review action for the request.
+    pub command: ReviewAiCommand,
 }
 
 /// Lifecycle phase for a linked Bcode review thread.
@@ -3083,6 +3374,8 @@ pub struct ReviewAgentThreadState {
     pub session_id: Option<String>,
     /// User question that started or continued the session.
     pub question: String,
+    /// Compact metadata describing review context sent to Bcode.
+    pub context_summary: String,
     /// Latest short status message.
     pub status: String,
     /// Latest assistant answer preview.
@@ -3103,6 +3396,7 @@ impl ReviewAgentThreadState {
             phase: ReviewAgentThreadPhase::Pending,
             session_id: None,
             question,
+            context_summary: String::new(),
             status: "looking into this…".to_string(),
             answer: String::new(),
             stream_warning: None,
@@ -3971,6 +4265,8 @@ pub struct ReviewApp {
     pub suggested_comments: BTreeMap<ReviewCommentAnchor, Vec<ReviewSuggestedComment>>,
     /// Text awaiting a host clipboard write.
     pub pending_clipboard_text: Option<String>,
+    /// Suggestions awaiting durable persistence, keyed by suggestion id.
+    pub pending_suggestion_saves: BTreeMap<String, ReviewCommentAnchor>,
     /// Active draft editor, if open.
     pub comment_editor: Option<ReviewCommentEditor>,
     /// Draft comment awaiting persistence.
@@ -4077,6 +4373,7 @@ impl ReviewApp {
             draft_comments: BTreeMap::new(),
             suggested_comments: BTreeMap::new(),
             pending_clipboard_text: None,
+            pending_suggestion_saves: BTreeMap::new(),
             comment_editor: None,
             pending_draft_save: None,
             pending_draft_delete: None,
@@ -7924,6 +8221,61 @@ impl ReviewApp {
             .as_deref()
     }
 
+    fn queue_suggestion_save(&mut self, anchor: ReviewCommentAnchor, id: String) {
+        self.pending_suggestion_saves.insert(id, anchor);
+    }
+
+    /// Take the next suggestion awaiting durable persistence.
+    pub fn take_pending_suggestion_save(&mut self) -> Option<ModelReviewSuggestion> {
+        let id = self.pending_suggestion_saves.keys().next()?.clone();
+        let anchor = self.pending_suggestion_saves.remove(&id)?;
+        let suggestion = self
+            .suggested_comments
+            .get(&anchor)?
+            .iter()
+            .find(|suggestion| suggestion.id == id)?;
+        Some(ModelReviewSuggestion {
+            suggestion_id: suggestion.id.clone(),
+            anchor: anchor.into(),
+            body: suggestion.body.clone(),
+            session_id: suggestion.session_id.clone(),
+            status: suggestion.status.into(),
+            rationale: suggestion.rationale.clone(),
+            created_at_ms: suggestion.created_at_ms.unwrap_or(0),
+            updated_at_ms: suggestion.updated_at_ms.unwrap_or(0),
+        })
+    }
+
+    /// Requeue a failed suggestion persistence attempt.
+    pub fn requeue_suggestion_save(&mut self, suggestion_id: &str) {
+        if let Some(anchor) = self
+            .suggested_comments
+            .iter()
+            .find_map(|(anchor, suggestions)| {
+                suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.id == suggestion_id)
+                    .then(|| anchor.clone())
+            })
+        {
+            self.queue_suggestion_save(anchor, suggestion_id.to_string());
+        }
+    }
+
+    /// Apply timestamps returned after persisting a suggestion.
+    pub fn mark_suggestion_persisted(&mut self, persisted: &ModelReviewSuggestion) {
+        for suggestions in self.suggested_comments.values_mut() {
+            if let Some(suggestion) = suggestions
+                .iter_mut()
+                .find(|suggestion| suggestion.id == persisted.suggestion_id)
+            {
+                suggestion.created_at_ms = Some(persisted.created_at_ms);
+                suggestion.updated_at_ms = Some(persisted.updated_at_ms);
+                return;
+            }
+        }
+    }
+
     fn latest_pending_suggestion_mut(
         &mut self,
         anchor: &ReviewCommentAnchor,
@@ -7952,7 +8304,9 @@ impl ReviewApp {
         };
         let body = suggestion.body.clone();
         let session_id = suggestion.session_id.clone();
+        let suggestion_id = suggestion.id.clone();
         suggestion.status = ReviewSuggestionStatus::Accepted;
+        self.queue_suggestion_save(anchor.clone(), suggestion_id);
         self.draft_comments
             .entry(anchor.clone())
             .or_default()
@@ -7983,7 +8337,9 @@ impl ReviewApp {
             return true;
         };
         let body = suggestion.body.clone();
+        let suggestion_id = suggestion.id.clone();
         suggestion.status = ReviewSuggestionStatus::Refining;
+        self.queue_suggestion_save(anchor.clone(), suggestion_id);
         let question = format!(
             "Refine this suggested review comment. Keep it concise, actionable, and suitable for a code review comment.\n\n{body}"
         );
@@ -8002,7 +8358,9 @@ impl ReviewApp {
             self.status_message = Some("selected thread has no pending suggestion".to_string());
             return true;
         };
+        let suggestion_id = suggestion.id.clone();
         suggestion.status = ReviewSuggestionStatus::Rejected;
+        self.queue_suggestion_save(anchor.clone(), suggestion_id);
         self.sync_selected_thread_to_anchor();
         self.status_message = Some("rejected suggested comment".to_string());
         true
@@ -8070,12 +8428,15 @@ impl ReviewApp {
             suggestions.len().saturating_add(1)
         );
         suggestions.push(ReviewSuggestedComment {
-            id,
+            id: id.clone(),
             body,
             session_id,
             status: ReviewSuggestionStatus::Suggested,
             rationale: Some("from linked Bcode answer".to_string()),
+            created_at_ms: None,
+            updated_at_ms: None,
         });
+        self.queue_suggestion_save(anchor.clone(), id);
         self.sync_selected_thread_to_anchor();
         self.status_message = Some("added suggested review comment".to_string());
         true
@@ -8862,6 +9223,44 @@ impl ReviewApp {
         true
     }
 
+    /// Run a structured AI review action at the selected anchor.
+    pub fn run_ai_command_at_selection(&mut self, command: ReviewAiCommand) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some(format!(
+                "select a review line, range, or thread to {}",
+                command.label()
+            ));
+            return true;
+        };
+        let question = command.instruction().to_string();
+        let existing_session = self.session_id_for_anchor(&anchor).map(ToString::to_string);
+        let ask = PendingAgentSession {
+            anchor: anchor.clone(),
+            draft_body: Some(question.clone()),
+            command,
+        };
+        self.pending_agent_session = Some(ask.clone());
+        let mut state = ReviewAgentThreadState::pending(question);
+        state.context_summary = self.ai_context_summary(&anchor);
+        let prompt_preview = self.agent_session_prompt(&ask);
+        state.context_summary = format!(
+            "{} · {} chars",
+            state.context_summary,
+            prompt_preview.chars().count()
+        );
+        if let Some(session_id) = existing_session {
+            state.session_id = Some(session_id);
+            state.phase = ReviewAgentThreadPhase::Running;
+            state.status = format!("sending {} request…", command.label());
+        }
+        self.agent_thread_states
+            .insert(Self::thread_key_for_anchor(&anchor), state);
+        self.touch_agent_state();
+        self.sync_selected_thread_to_specific_anchor(&anchor);
+        self.status_message = Some(format!("asked Bcode to {}", command.label()));
+        true
+    }
+
     /// Ask Bcode about the selected review line/thread.
     pub fn ask_bcode_about_selection(&mut self) -> bool {
         self.open_comment_editor_with_action(ReviewCommentAction::AskBcode)
@@ -8882,11 +9281,18 @@ impl ReviewApp {
                 thread_kind: ReviewThreadKind::Question,
                 severity: ReviewThreadSeverity::Info,
             });
-        self.pending_agent_session = Some(PendingAgentSession {
+        let ask = PendingAgentSession {
             anchor: anchor.clone(),
             draft_body: Some(question.clone()),
-        });
+            command: ReviewAiCommand::Analyze,
+        };
+        self.pending_agent_session = Some(ask.clone());
         let mut state = ReviewAgentThreadState::pending(question);
+        state.context_summary = format!(
+            "{} · {} chars",
+            self.ai_context_summary(anchor),
+            self.agent_session_prompt(&ask).chars().count()
+        );
         if let Some(session_id) = &existing_session {
             state.session_id = Some(session_id.clone());
             state.phase = ReviewAgentThreadPhase::Running;
@@ -9127,17 +9533,22 @@ impl ReviewApp {
     /// Return a prompt for a pending Bcode agent session.
     #[must_use]
     pub fn agent_session_prompt(&self, ask: &PendingAgentSession) -> String {
-        let hunk = self.hunk_context_for_anchor(&ask.anchor);
-        let selected_lines = self.selected_lines_for_anchor(&ask.anchor);
-        let other_comment_count = self.draft_comment_count().saturating_sub(usize::from(
-            self.draft_comments
-                .get(&ask.anchor)
-                .is_some_and(|comments| !comments.is_empty()),
-        ));
-        format!(
-            "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nFile: {}\nDiff rows: {}-{}\nOld range: {}-{}\nNew range: {}-{}\nLine kind: {:?}\nOther draft comment threads in this review: {}\n\nCurrent draft/comment:\n{}\n\nSelected diff lines:\n```diff\n{}\n```\n\nNearby diff hunk/context:\n```diff\n{}\n```\n\nReview context is also available through the code-review plugin service. The relevant interface is `bcode.code_review/v1`; useful operations are `review.context.get`, `review.comments.list`, `review.thread.get`, and `review.diff.get`. Request payloads include `repo_path` plus the review `target`; `review.thread.get` accepts `thread_id` or `anchor`, and `review.diff.get` accepts optional `file_path`.\n\nPlease analyze this review thread. Keep the anchored file and line context in mind. If broader context is needed, inspect the repository from the session working directory.",
+        let hunk = bounded_lines(
+            &self.hunk_context_for_anchor(&ask.anchor),
+            MAX_AI_HUNK_LINES,
+        );
+        let selected_lines = bounded_lines(
+            &self.selected_lines_for_anchor(&ask.anchor),
+            MAX_AI_SELECTED_LINES,
+        );
+        let thread_summaries = self.bounded_thread_summaries(&ask.anchor);
+        let source_summary = self.review_source_summary();
+        let context_summary = self.ai_context_summary(&ask.anchor);
+        let prompt = format!(
+            "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nTarget/sources: {}\nFile: {}\nDiff rows: {}-{}\nOld range: {}-{}\nNew range: {}-{}\nLine kind: {:?}\nContext sent: {}\n\nOther review threads (bounded):\n{}\n\nCurrent draft/comment:\n{}\n\nSelected diff lines:\n```diff\n{}\n```\n\nNearby diff hunk/context:\n```diff\n{}\n```\n\nReview context is also available through the code-review plugin service. The relevant interface is `bcode.code_review/v1`; useful operations are `review.context.get`, `review.comments.list`, `review.thread.get`, and `review.diff.get`. Request payloads include `repo_path` plus the review `target`; `review.thread.get` accepts `thread_id` or `anchor`, and `review.diff.get` accepts optional `file_path`.\n\nRequested review action: {}\nKeep the anchored file and line context in mind. If broader context is needed, query the typed review services or inspect the repository from the session working directory.",
             self.review.title,
             display_from_current_dir(&self.review.repo_root),
+            source_summary,
             ask.anchor.path,
             ask.anchor.start_diff_row(),
             ask.anchor.end_diff_row(),
@@ -9154,11 +9565,75 @@ impl ReviewApp {
                 .new_end
                 .map_or_else(|| "none".to_string(), |line| line.to_string()),
             ask.anchor.line_kind,
-            other_comment_count,
+            context_summary,
+            thread_summaries,
             ask.draft_body.as_deref().unwrap_or("(no draft body yet)"),
             selected_lines,
             hunk,
+            ask.command.instruction(),
+        );
+        truncate_chars(prompt, MAX_AI_CONTEXT_CHARS)
+    }
+
+    /// Return compact user-facing metadata for context sent at an anchor.
+    #[must_use]
+    pub fn ai_context_summary(&self, anchor: &ReviewCommentAnchor) -> String {
+        let thread_count = self.thread_summaries().len();
+        let included_sources = self
+            .workspace
+            .sources
+            .iter()
+            .filter(|source| source.included)
+            .count();
+        format!(
+            "{} selected row(s), nearby hunk, {}/{} thread summaries, {} source(s)",
+            anchor
+                .end_diff_row()
+                .saturating_sub(anchor.start_diff_row())
+                .saturating_add(1),
+            thread_count.min(MAX_AI_THREAD_SUMMARIES),
+            thread_count,
+            included_sources,
         )
+    }
+
+    fn review_source_summary(&self) -> String {
+        let labels = self
+            .workspace
+            .sources
+            .iter()
+            .filter(|source| source.included)
+            .map(|source| source.kind.label())
+            .take(8)
+            .collect::<Vec<_>>();
+        if labels.is_empty() {
+            self.review.title.clone()
+        } else {
+            labels.join(", ")
+        }
+    }
+
+    fn bounded_thread_summaries(&self, current: &ReviewCommentAnchor) -> String {
+        let summaries = self
+            .thread_summaries()
+            .into_iter()
+            .filter(|thread| thread.anchor != *current)
+            .take(MAX_AI_THREAD_SUMMARIES)
+            .map(|thread| {
+                let state = if thread.resolved { "resolved" } else { "open" };
+                format!(
+                    "* {}:{} [{state}] {}",
+                    thread.anchor.scope_label(),
+                    thread.line_label(),
+                    truncate_chars(thread.latest_body, MAX_AI_THREAD_BODY_CHARS),
+                )
+            })
+            .collect::<Vec<_>>();
+        if summaries.is_empty() {
+            "* none".to_string()
+        } else {
+            summaries.join("\n")
+        }
     }
 
     fn selected_lines_for_anchor(&self, anchor: &ReviewCommentAnchor) -> String {
@@ -9361,6 +9836,38 @@ impl ReviewApp {
         let comments = self.draft_comments.get(&anchor)?;
         let index = selected_index.unwrap_or_else(|| comments.len().saturating_sub(1));
         comments.get(index)?.session_id.as_deref()
+    }
+
+    /// Load persisted suggested comments into local state.
+    fn load_persisted_suggestions(&mut self, suggestions: Vec<ModelReviewSuggestion>) {
+        for suggestion in suggestions {
+            let draft = DraftComment {
+                comment_id: String::new(),
+                thread_id: String::new(),
+                anchor: suggestion.anchor.clone().into(),
+                body: String::new(),
+                created_at_ms: suggestion.created_at_ms,
+                updated_at_ms: suggestion.updated_at_ms,
+                session_id: suggestion.session_id.clone(),
+                resolved_at_ms: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
+            };
+            if let Some(anchor) = self.anchor_from_persisted_draft(&draft) {
+                self.suggested_comments
+                    .entry(anchor)
+                    .or_default()
+                    .push(ReviewSuggestedComment {
+                        id: suggestion.suggestion_id,
+                        body: suggestion.body,
+                        session_id: suggestion.session_id,
+                        status: suggestion.status.into(),
+                        rationale: suggestion.rationale,
+                        created_at_ms: Some(suggestion.created_at_ms),
+                        updated_at_ms: Some(suggestion.updated_at_ms),
+                    });
+            }
+        }
     }
 
     /// Load persisted draft comments into local state.
@@ -11365,6 +11872,194 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_lifecycle_queues_every_persistence_transition() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("editor should open")
+            .buffer
+            .insert_str("Can Bcode check this?");
+        assert!(app.save_comment_editor());
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        let key = ReviewApp::thread_key_for_anchor(&anchor);
+        app.agent_thread_states.insert(
+            key,
+            ReviewAgentThreadState {
+                phase: ReviewAgentThreadPhase::Complete,
+                session_id: Some(SessionId::new().to_string()),
+                question: "Can Bcode check this?".to_string(),
+                context_summary: String::new(),
+                status: "answered".to_string(),
+                answer: "Handle this error explicitly.".to_string(),
+                stream_warning: None,
+                activity: None,
+                error: None,
+            },
+        );
+
+        assert!(app.suggest_comment_from_agent_answer_at_selection());
+        let suggested = app.take_pending_suggestion_save().expect("suggestion save");
+        assert_eq!(suggested.status, ModelReviewSuggestionStatus::Suggested);
+        app.mark_suggestion_persisted(&ModelReviewSuggestion {
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            ..suggested
+        });
+
+        assert!(app.refine_suggestion_at_selection());
+        let refining = app.take_pending_suggestion_save().expect("refining save");
+        assert_eq!(refining.status, ModelReviewSuggestionStatus::Refining);
+        assert_eq!(refining.created_at_ms, 10);
+
+        assert!(app.reject_suggestion_at_selection());
+        let rejected = app.take_pending_suggestion_save().expect("rejected save");
+        assert_eq!(rejected.status, ModelReviewSuggestionStatus::Rejected);
+    }
+
+    #[test]
+    fn persisted_suggestions_restore_all_lifecycle_states() {
+        let mut app = sample_app();
+        let anchor = ModelDraftAnchor {
+            kind: ReviewAnchorKind::Range,
+            file_path: "a.rs".to_string(),
+            diff_row: 2,
+            start_diff_row: Some(2),
+            end_diff_row: Some(2),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            old_line: None,
+            new_line: Some(1),
+            line_kind: bcode_code_review_models::ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let statuses = [
+            ModelReviewSuggestionStatus::Suggested,
+            ModelReviewSuggestionStatus::Refining,
+            ModelReviewSuggestionStatus::Accepted,
+            ModelReviewSuggestionStatus::Rejected,
+        ];
+        app.load_persisted_suggestions(
+            statuses
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| ModelReviewSuggestion {
+                    suggestion_id: format!("suggestion-{index}"),
+                    anchor: anchor.clone(),
+                    body: format!("body-{index}"),
+                    session_id: None,
+                    status,
+                    rationale: None,
+                    created_at_ms: 10,
+                    updated_at_ms: 20,
+                })
+                .collect(),
+        );
+
+        let restored = app
+            .suggested_comments
+            .values()
+            .next()
+            .expect("restored suggestions");
+        assert_eq!(restored.len(), 4);
+        assert_eq!(restored[0].status, ReviewSuggestionStatus::Suggested);
+        assert_eq!(restored[1].status, ReviewSuggestionStatus::Refining);
+        assert_eq!(restored[2].status, ReviewSuggestionStatus::Accepted);
+        assert_eq!(restored[3].status, ReviewSuggestionStatus::Rejected);
+        assert!(app.pending_suggestion_saves.is_empty());
+    }
+
+    #[test]
+    fn ai_prompt_contains_bounded_context_and_source_metadata() {
+        let mut app = sample_app();
+        app.workspace.sources = vec![ReviewSource {
+            id: "source-1".to_string(),
+            kind: ReviewSourceKind::BranchCompare {
+                base_branch: "main".to_string(),
+                head_branch: "feature".to_string(),
+                merge_base: true,
+            },
+            label: "feature comparison".to_string(),
+            included: true,
+        }];
+        app.selected_diff_line = 2;
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        for index in 0_usize..30 {
+            let thread_anchor = ReviewCommentAnchor {
+                diff_row: index.saturating_add(10),
+                new_line: u32::try_from(index.saturating_add(10)).ok(),
+                new_start: u32::try_from(index.saturating_add(10)).ok(),
+                new_end: u32::try_from(index.saturating_add(10)).ok(),
+                ..anchor.clone()
+            };
+            app.draft_comments.insert(
+                thread_anchor.clone(),
+                vec![ReviewDraftComment {
+                    id: Some(format!("comment-{index}")),
+                    body: "x".repeat(500),
+                    persisted: true,
+                    created_at_ms: Some(1),
+                    updated_at_ms: Some(1),
+                    session_id: None,
+                    thread_kind: ReviewThreadKind::Finding,
+                    severity: ReviewThreadSeverity::Warning,
+                }],
+            );
+            if index % 2 == 0 {
+                app.resolved_review_threads
+                    .insert(ReviewApp::thread_key_for_anchor(&thread_anchor));
+            }
+        }
+        let ask = PendingAgentSession {
+            anchor,
+            draft_body: Some("Review this change".to_string()),
+            command: ReviewAiCommand::FindRisk,
+        };
+
+        let prompt = app.agent_session_prompt(&ask);
+
+        assert!(prompt.contains("Target/sources: Compare main...feature"));
+        assert!(prompt.contains("Other review threads (bounded):"));
+        assert!(prompt.contains("[open]") || prompt.contains("[resolved]"));
+        assert!(prompt.contains(ReviewAiCommand::FindRisk.instruction()));
+        assert!(prompt.chars().count() <= MAX_AI_CONTEXT_CHARS);
+        assert!(prompt.matches("\n* ").count() <= MAX_AI_THREAD_SUMMARIES);
+    }
+
+    #[test]
+    fn structured_ai_commands_queue_expected_action_and_context_metadata() {
+        let commands = [
+            ReviewAiCommand::ExplainChange,
+            ReviewAiCommand::FindRisk,
+            ReviewAiCommand::SuggestComment,
+            ReviewAiCommand::CheckTests,
+            ReviewAiCommand::SummarizeFile,
+        ];
+        for command in commands {
+            let mut app = sample_app();
+            app.selected_diff_line = 2;
+
+            assert!(app.run_ai_command_at_selection(command));
+
+            let queued = app
+                .take_pending_agent_session()
+                .expect("AI action should queue a session");
+            assert_eq!(queued.command, command);
+            assert_eq!(queued.draft_body.as_deref(), Some(command.instruction()));
+            let state = app
+                .agent_state_for_anchor(&queued.anchor)
+                .expect("agent state");
+            assert!(state.context_summary.contains("selected row(s)"));
+            assert!(state.context_summary.contains("chars"));
+        }
+    }
+
+    #[test]
     fn copies_agent_answer_through_tui_host() {
         let mut app = sample_app();
         app.selected_diff_line = 2;
@@ -11383,6 +12078,7 @@ mod tests {
                 phase: ReviewAgentThreadPhase::Complete,
                 session_id: None,
                 question: "Can Bcode check this?".to_string(),
+                context_summary: String::new(),
                 status: "answered".to_string(),
                 answer: "  Use a clearer error message.  ".to_string(),
                 stream_warning: None,
@@ -11425,6 +12121,7 @@ mod tests {
                 phase: ReviewAgentThreadPhase::Complete,
                 session_id: app.session_id_for_anchor(&anchor).map(ToString::to_string),
                 question: "Can Bcode check this?".to_string(),
+                context_summary: String::new(),
                 status: "answered".to_string(),
                 answer: "Use a clearer error message.".to_string(),
                 stream_warning: None,

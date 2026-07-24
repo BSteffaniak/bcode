@@ -37,6 +37,10 @@ pub const OP_REVIEW_WORKSPACE_ARCHIVE: &str = "review.workspace.archive";
 pub const OP_REVIEW_WORKSPACE_MATERIALIZE: &str = "review.workspace.materialize";
 /// Operation that returns repository file content for review browsing.
 pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
+/// Operation that lists durable AI-suggested review comments.
+pub const OP_REVIEW_SUGGESTIONS_LIST: &str = "review.suggestions.list";
+/// Operation that creates or updates a durable AI-suggested review comment.
+pub const OP_REVIEW_SUGGESTION_SAVE: &str = "review.suggestion.save";
 /// Operation that returns an external publisher manifest.
 pub const OP_REVIEW_PUBLISHER_MANIFEST: &str = "review.publisher.manifest";
 /// Operation that previews an external publisher request.
@@ -608,6 +612,83 @@ pub struct GetReviewThreadRequest {
     pub anchor: Option<DraftAnchor>,
 }
 
+/// Request payload for `review.suggestions.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReviewSuggestionsRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped suggestions.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+}
+
+/// Request payload for `review.suggestion.save`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewSuggestionRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped suggestions.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+    /// Suggestion to create or update.
+    pub suggestion: ReviewSuggestion,
+}
+
+/// Response payload for `review.suggestions.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReviewSuggestionsResponse {
+    /// Persisted suggestions.
+    pub suggestions: Vec<ReviewSuggestion>,
+}
+
+/// Response payload for `review.suggestion.save`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewSuggestionResponse {
+    /// Persisted suggestion.
+    pub suggestion: ReviewSuggestion,
+}
+
+/// Durable AI-suggested review comment lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSuggestionStatus {
+    /// Suggested but not yet accepted or rejected.
+    Suggested,
+    /// A refinement request is in progress.
+    Refining,
+    /// Accepted into a normal draft comment.
+    Accepted,
+    /// Rejected by the reviewer and retained for audit/undo visibility.
+    Rejected,
+}
+
+/// Provider-neutral durable AI-suggested review comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSuggestion {
+    /// Stable suggestion id.
+    pub suggestion_id: String,
+    /// Review anchor.
+    pub anchor: DraftAnchor,
+    /// Suggested Markdown body.
+    pub body: String,
+    /// Linked Bcode session id that produced the suggestion.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Suggestion lifecycle state.
+    pub status: ReviewSuggestionStatus,
+    /// Optional short rationale or provenance.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// Creation timestamp in milliseconds since Unix epoch.
+    pub created_at_ms: u64,
+    /// Last update timestamp in milliseconds since Unix epoch.
+    pub updated_at_ms: u64,
+}
+
 /// Request payload for `review.diff.get`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetReviewDiffRequest {
@@ -1144,4 +1225,59 @@ pub struct PublishReviewResponse {
 
 const fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_suggestion_models_round_trip_json() {
+        let suggestion = ReviewSuggestion {
+            suggestion_id: "suggestion-1".to_string(),
+            anchor: DraftAnchor {
+                kind: ReviewAnchorKind::Range,
+                file_path: "src/lib.rs".to_string(),
+                diff_row: 3,
+                start_diff_row: Some(3),
+                end_diff_row: Some(4),
+                old_start: Some(2),
+                old_end: Some(2),
+                new_start: Some(3),
+                new_end: Some(4),
+                old_line: None,
+                new_line: None,
+                line_kind: ReviewLineKind::Added,
+                is_file_anchor: false,
+                surface_id: Some("surface-1".to_string()),
+                source_id: Some("source-1".to_string()),
+            },
+            body: "Handle the error explicitly.".to_string(),
+            session_id: Some("session-1".to_string()),
+            status: ReviewSuggestionStatus::Rejected,
+            rationale: Some("AI review".to_string()),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        };
+
+        let json = serde_json::to_string(&suggestion).expect("serialize suggestion");
+        let decoded: ReviewSuggestion =
+            serde_json::from_str(&json).expect("deserialize suggestion");
+
+        assert_eq!(decoded, suggestion);
+    }
+
+    #[test]
+    fn review_suggestion_status_uses_provider_neutral_wire_values() {
+        assert_eq!(
+            serde_json::to_string(&ReviewSuggestionStatus::Refining)
+                .expect("serialize suggestion status"),
+            "\"refining\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ReviewSuggestionStatus>("\"accepted\"")
+                .expect("deserialize suggestion status"),
+            ReviewSuggestionStatus::Accepted
+        );
+    }
 }

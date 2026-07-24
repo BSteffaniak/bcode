@@ -23,7 +23,8 @@ use bcode_code_review_models::{
     DraftComment, GetReviewDiffRequest, GetReviewThreadRequest, GetReviewWorkspaceRequest,
     GetReviewWorkspaceResponse, LinkThreadSessionRequest, LinkThreadSessionResponse,
     ListDraftsRequest, ListDraftsResponse, ListReviewPublishersResponse,
-    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, MaterializeReviewWorkspaceRequest,
+    ListReviewSuggestionsRequest, ListReviewSuggestionsResponse, ListReviewWorkspacesRequest,
+    ListReviewWorkspacesResponse, MaterializeReviewWorkspaceRequest,
     MaterializeReviewWorkspaceResponse, OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_REPO_FILE_GET,
     OP_REVIEW_WORKSPACE_ARCHIVE, OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET,
     OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE,
@@ -33,11 +34,12 @@ use bcode_code_review_models::{
     ReviewFile, ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
     ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
     ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
-    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
-    ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem,
-    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, SavePublishRecordRequest,
-    SavePublishRecordResponse, UpdateDraftRequest, UpdateDraftResponse,
-    UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus,
+    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind, ReviewThreadSeverity,
+    ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest,
+    SaveDraftResponse, SavePublishRecordRequest, SavePublishRecordResponse,
+    SaveReviewSuggestionRequest, SaveReviewSuggestionResponse, UpdateDraftRequest,
+    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
@@ -158,6 +160,8 @@ impl RustPlugin for CodeReviewPlugin {
             OP_DRAFT_SAVE => save_draft(&context),
             OP_DRAFT_DELETE => delete_draft(&context),
             OP_DRAFT_UPDATE => update_draft(&context),
+            bcode_code_review_models::OP_REVIEW_SUGGESTIONS_LIST => list_suggestions(&context),
+            bcode_code_review_models::OP_REVIEW_SUGGESTION_SAVE => save_suggestion(&context),
             OP_THREAD_LINK_SESSION => link_thread_session(&context),
             OP_THREAD_RESOLVE => resolve_thread(&context),
             OP_REVIEW_CONTEXT_GET => review_context_get(&context),
@@ -540,6 +544,42 @@ fn update_draft(context: &NativeServiceContext) -> ServiceResponse {
     match update_draft_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("draft_update_failed", error.to_string()),
+    }
+}
+
+fn list_suggestions(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<ListReviewSuggestionsRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match list_suggestions_for_request(&request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("suggestion_list_failed", error.to_string()),
+    }
+}
+
+fn save_suggestion(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<SaveReviewSuggestionRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match save_suggestion_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("suggestion_save_failed", error.to_string()),
     }
 }
 
@@ -1840,6 +1880,47 @@ fn list_drafts_for_request(
     Ok(ListDraftsResponse { drafts })
 }
 
+fn list_suggestions_for_request(
+    request: &ListReviewSuggestionsRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ListReviewSuggestionsResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
+    let suggestions = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .list_suggestions(&review_key)
+                .await
+        })
+    })?;
+    Ok(ListReviewSuggestionsResponse { suggestions })
+}
+
+fn save_suggestion_for_request(
+    request: SaveReviewSuggestionRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<SaveReviewSuggestionResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let db_repo_root = repo_root.clone();
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
+    let target_kind = target_kind(&request.target).to_string();
+    let target_json = serde_json::to_string(&request.target)?;
+    let suggestion = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .save_suggestion(
+                    &review_key,
+                    &db_repo_root,
+                    &target_kind,
+                    &target_json,
+                    request.suggestion,
+                )
+                .await
+        })
+    })?;
+    Ok(SaveReviewSuggestionResponse { suggestion })
+}
+
 fn save_draft_for_request(
     request: SaveDraftRequest,
     config: &CodeReviewPluginConfig,
@@ -2457,6 +2538,86 @@ impl<'a> CodeReviewDb<'a> {
         Ok(true)
     }
 
+    async fn list_suggestions(
+        &self,
+        review_key: &str,
+    ) -> Result<Vec<ReviewSuggestion>, ReviewError> {
+        let rows = self
+            .db
+            .select("review_suggestions")
+            .columns(&[
+                "suggestion_id",
+                "anchor_json",
+                "body",
+                "session_id",
+                "status",
+                "rationale",
+                "created_at_ms",
+                "updated_at_ms",
+            ])
+            .filter(Box::new(where_eq("review_key", review_key)))
+            .execute(self.db)
+            .await?;
+        rows.iter().map(suggestion_from_row).collect()
+    }
+
+    async fn save_suggestion(
+        &self,
+        review_key: &str,
+        repo_root: &Path,
+        target_kind: &str,
+        target_json: &str,
+        mut suggestion: ReviewSuggestion,
+    ) -> Result<ReviewSuggestion, ReviewError> {
+        let now = now_ms();
+        self.ensure_review(review_key, repo_root, target_kind, target_json, now)
+            .await?;
+        let existing = self
+            .db
+            .select("review_suggestions")
+            .columns(&["suggestion_id", "created_at_ms"])
+            .filter(Box::new(where_eq(
+                "suggestion_id",
+                suggestion.suggestion_id.clone(),
+            )))
+            .execute_first(self.db)
+            .await?;
+        suggestion.updated_at_ms = now;
+        if let Some(row) = existing {
+            suggestion.created_at_ms = i64_to_u64(required_i64(&row, "created_at_ms")?);
+            self.db
+                .update("review_suggestions")
+                .value("anchor_json", serde_json::to_string(&suggestion.anchor)?)
+                .value("body", suggestion.body.clone())
+                .value("session_id", suggestion.session_id.clone())
+                .value("status", suggestion_status_to_str(suggestion.status))
+                .value("rationale", suggestion.rationale.clone())
+                .value("updated_at_ms", u64_to_i64(now))
+                .filter(Box::new(where_eq(
+                    "suggestion_id",
+                    suggestion.suggestion_id.clone(),
+                )))
+                .execute(self.db)
+                .await?;
+        } else {
+            suggestion.created_at_ms = now;
+            self.db
+                .insert("review_suggestions")
+                .value("suggestion_id", suggestion.suggestion_id.clone())
+                .value("review_key", review_key.to_string())
+                .value("anchor_json", serde_json::to_string(&suggestion.anchor)?)
+                .value("body", suggestion.body.clone())
+                .value("session_id", suggestion.session_id.clone())
+                .value("status", suggestion_status_to_str(suggestion.status))
+                .value("rationale", suggestion.rationale.clone())
+                .value("created_at_ms", u64_to_i64(now))
+                .value("updated_at_ms", u64_to_i64(now))
+                .execute(self.db)
+                .await?;
+        }
+        Ok(suggestion)
+    }
+
     async fn list_drafts(&self, review_key: &str) -> Result<Vec<DraftComment>, ReviewError> {
         let thread_rows = self
             .db
@@ -3045,7 +3206,6 @@ fn workspace_table_migration() -> CodeMigration<'static> {
                 .column(int_column("created_at_ms"))
                 .column(int_column("updated_at_ms"))
                 .column(nullable_int_column("archived_at_ms"))
-                .column(text_column("viewed_files_json"))
                 .primary_key("workspace_id"),
         ),
         None,
@@ -3144,14 +3304,11 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
                 .if_not_exists(true)
                 .column(text_column("thread_id"))
                 .column(text_column("review_key"))
-                .column(text_column("anchor_kind"))
                 .column(text_column("file_path"))
                 .column(int_column("diff_row"))
                 .column(nullable_int_column("old_line"))
                 .column(nullable_int_column("new_line"))
                 .column(text_column("line_kind"))
-                .column(text_column("thread_kind"))
-                .column(text_column("severity"))
                 .column(int_column("created_at_ms"))
                 .column(int_column("updated_at_ms"))
                 .primary_key("thread_id"),
@@ -3212,7 +3369,29 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(publish_records_table_migration());
     source.add_migration(thread_anchor_kind_column_migration());
     source.add_migration(thread_metadata_columns_migration());
+    source.add_migration(review_suggestions_table_migration());
     source
+}
+
+fn review_suggestions_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "013_review_suggestions_table".to_string(),
+        Box::new(
+            create_table("review_suggestions")
+                .if_not_exists(true)
+                .column(text_column("suggestion_id"))
+                .column(text_column("review_key"))
+                .column(text_column("anchor_json"))
+                .column(text_column("body"))
+                .column(nullable_text_column("session_id"))
+                .column(text_column("status"))
+                .column(nullable_text_column("rationale"))
+                .column(int_column("created_at_ms"))
+                .column(int_column("updated_at_ms"))
+                .primary_key("suggestion_id"),
+        ),
+        None,
+    )
 }
 
 fn thread_surface_anchor_columns_migration() -> CodeMigration<'static> {
@@ -3278,6 +3457,40 @@ fn publish_record_from_row(row: &Row) -> Result<ReviewPublishRecord, ReviewError
         message: required_text(row, "message")?,
         created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
     })
+}
+
+fn suggestion_from_row(row: &Row) -> Result<ReviewSuggestion, ReviewError> {
+    Ok(ReviewSuggestion {
+        suggestion_id: required_text(row, "suggestion_id")?,
+        anchor: serde_json::from_str(&required_text(row, "anchor_json")?)?,
+        body: required_text(row, "body")?,
+        session_id: optional_text(row, "session_id"),
+        status: suggestion_status_from_str(&required_text(row, "status")?)?,
+        rationale: optional_text(row, "rationale"),
+        created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
+        updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
+    })
+}
+
+const fn suggestion_status_to_str(status: ReviewSuggestionStatus) -> &'static str {
+    match status {
+        ReviewSuggestionStatus::Suggested => "suggested",
+        ReviewSuggestionStatus::Refining => "refining",
+        ReviewSuggestionStatus::Accepted => "accepted",
+        ReviewSuggestionStatus::Rejected => "rejected",
+    }
+}
+
+fn suggestion_status_from_str(value: &str) -> Result<ReviewSuggestionStatus, ReviewError> {
+    match value {
+        "suggested" => Ok(ReviewSuggestionStatus::Suggested),
+        "refining" => Ok(ReviewSuggestionStatus::Refining),
+        "accepted" => Ok(ReviewSuggestionStatus::Accepted),
+        "rejected" => Ok(ReviewSuggestionStatus::Rejected),
+        _ => Err(ReviewError::InvalidRequest(format!(
+            "unsupported review suggestion status: {value}"
+        ))),
+    }
 }
 
 fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, ReviewError> {
@@ -3876,6 +4089,107 @@ bcode_plugin_sdk::export_plugin!(CodeReviewPlugin, include_str!("../bcode-plugin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggestion_persistence_round_trips_and_updates_lifecycle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("run git init");
+        assert!(init.success());
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(temp.path().join("state")),
+        };
+        let anchor = DraftAnchor {
+            kind: ReviewAnchorKind::Range,
+            file_path: "src/lib.rs".to_string(),
+            diff_row: 2,
+            start_diff_row: Some(2),
+            end_diff_row: Some(2),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            old_line: None,
+            new_line: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let scope = Some(ReviewScope::Workspace {
+            workspace_id: "workspace-1".to_string(),
+            target: ReviewTarget::WorkingTreeUnstaged,
+        });
+        let suggestion = ReviewSuggestion {
+            suggestion_id: "suggestion-1".to_string(),
+            anchor,
+            body: "Handle this error.".to_string(),
+            session_id: Some("session-1".to_string()),
+            status: ReviewSuggestionStatus::Suggested,
+            rationale: Some("AI review".to_string()),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let saved = save_suggestion_for_request(
+            SaveReviewSuggestionRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::WorkingTreeUnstaged,
+                scope: scope.clone(),
+                suggestion,
+            },
+            &config,
+        )
+        .expect("save suggestion")
+        .suggestion;
+        assert!(saved.created_at_ms > 0);
+        assert_eq!(saved.created_at_ms, saved.updated_at_ms);
+
+        let listed = list_suggestions_for_request(
+            &ListReviewSuggestionsRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::WorkingTreeUnstaged,
+                scope: scope.clone(),
+            },
+            &config,
+        )
+        .expect("list suggestions");
+        assert_eq!(listed.suggestions, vec![saved.clone()]);
+
+        let mut rejected = saved.clone();
+        rejected.status = ReviewSuggestionStatus::Rejected;
+        let updated = save_suggestion_for_request(
+            SaveReviewSuggestionRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::WorkingTreeUnstaged,
+                scope: scope.clone(),
+                suggestion: rejected,
+            },
+            &config,
+        )
+        .expect("update suggestion")
+        .suggestion;
+        assert_eq!(updated.status, ReviewSuggestionStatus::Rejected);
+        assert_eq!(updated.created_at_ms, saved.created_at_ms);
+        assert!(updated.updated_at_ms >= saved.updated_at_ms);
+
+        let reopened = list_suggestions_for_request(
+            &ListReviewSuggestionsRequest {
+                repo_path: repo,
+                target: ReviewTarget::WorkingTreeUnstaged,
+                scope,
+            },
+            &config,
+        )
+        .expect("reopen suggestions");
+        assert_eq!(reopened.suggestions, vec![updated]);
+    }
 
     #[test]
     fn default_state_path_uses_user_bcode_state_dir() {
